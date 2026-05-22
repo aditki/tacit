@@ -1,0 +1,72 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DashForge Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy to dashforge.yaml (or set DASHFORGE_CONFIG=/path/to/config.yaml)
+#
+# Loading priority (last wins):
+#   1. Defaults (in code)
+#   2. This YAML file
+#   3. .env file
+#   4. Environment variables
+#
+# SECRETS (api keys, tokens) should go in .env or env vars, NOT here.
+# This file is for non-sensitive, environment-specific configuration.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── LLM ──────────────────────────────────────────────────────────────────────
+llm:
+  provider: openai            # anthropic | openai | azure | ollama
+  model: gpt-4o               # model name (provider-specific)
+  api_base: ""                 # custom endpoint (Azure, Ollama, vLLM, etc.)
+  # api_key: use LLM_API_KEY env var
+
+# ── Grafana ──────────────────────────────────────────────────────────────────
+grafana:
+  url: http://localhost:3000
+  org_id: 1
+  # api_key: use GRAFANA_API_KEY env var
+
+# ── Slack ────────────────────────────────────────────────────────────────────
+# slack:
+#   bot_token: use SLACK_BOT_TOKEN env var
+#   app_token: use SLACK_APP_TOKEN env var
+#   signing_secret: use SLACK_SIGNING_SECRET env var
+
+# ── Context Enrichment (Knowledge Base) ──────────────────────────────────────
+context:
+  provider: none               # none | mcp | a2a | rag_api
+  max_chunks: 10               # max context chunks per query
+  # api_key: use CONTEXT_API_KEY env var
+
+  # MCP provider
+  mcp_server_url: ""           # e.g. http://mcp-server.internal:8080
+  mcp_tool_name: search        # MCP tool name for retrieval
+
+  # A2A provider
+  a2a_agent_url: ""            # e.g. http://knowledge-agent.internal:9000
+
+  # RAG API provider
+  rag_api_url: ""              # e.g. https://rag.corp.internal/api/v1
+
+# ── Pipeline Tuning ──────────────────────────────────────────────────────────
+pipeline:
+  max_concurrent: 5            # max simultaneous pipeline runs
+  timeout_seconds: 120         # overall pipeline timeout
+
+# ── Datasource Adapters ─────────────────────────────────────────────────────
+adapter:
+  max_concurrent: 5            # max simultaneous datasource adapter calls
+  timeout_seconds: 30          # per-adapter timeout
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+max_metric_catalog_size: 300   # total metrics across all datasources sent to LLM
+
+# ── HTTP API Auth ────────────────────────────────────────────────────────────
+api:
+  auth_enabled: false          # set true to require X-API-Key header
+  # auth_key: use API_AUTH_KEY env var
+
+# ── App ──────────────────────────────────────────────────────────────────────
+log_level: INFO
+dashforge_dashboard_folder: DashForge
+dashforge_default_timerange: 1h

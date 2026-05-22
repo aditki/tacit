@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.env
+dashforge.yaml
+dashforge.yml
+config/
+.venv/
+venv/
+*.log
+.DS_Store
+grafana_data/

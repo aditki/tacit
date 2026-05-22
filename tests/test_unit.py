@@ -1,0 +1,542 @@
+"""Unit tests for DashForge core modules."""
+import json
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from dashforge.models.schemas import (
+    DashboardSpec,
+    DashRequest,
+    DashResponse,
+    DatasourceInfo,
+    DiscoveredMetric,
+    Intent,
+    MetricEntry,
+    MetricsDiscoveryResult,
+    PanelQuery,
+    PanelSpec,
+    SignalType,
+)
+from dashforge.grafana.dashboard import build_dashboard_json, TIMERANGE_MAP
+from dashforge.grafana.datasource import (
+    filter_datasources_by_signal,
+    filter_searchable_datasources,
+)
+from dashforge.grafana.adapters.registry import get_adapter, get_adapter_for_type, supported_datasource_types
+from dashforge.grafana.adapters.cloudwatch import _select_namespaces
+from dashforge.agents.metrics_discovery import _keyword_filter as md_keyword_filter
+from dashforge.context.enrichment import format_context_for_prompt, enrich_context
+from dashforge.context.registry import get_context_provider
+from dashforge.models.schemas import ContextChunk
+
+
+def test_intent_model():
+    intent = Intent(
+        summary="High latency on checkout service",
+        domain="application",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["latency", "p99", "error_rate"],
+        timerange="1h",
+    )
+    assert intent.domain == "application"
+    assert len(intent.keywords) == 3
+    assert intent.signals == [SignalType.METRICS]
+    print("[PASS] test_intent_model")
+
+
+def test_dashboard_spec_model():
+    spec = DashboardSpec(
+        title="Test Dashboard",
+        tags=["test"],
+        timerange="1h",
+        panels=[
+            PanelSpec(
+                title="Request Rate",
+                description="HTTP request rate",
+                panel_type="timeseries",
+                queries=[
+                    PanelQuery(
+                        expr="rate(http_requests_total[5m])",
+                        legend_format="{{method}}",
+                        datasource_uid="prom-1",
+                        datasource_type="prometheus",
+                    )
+                ],
+                unit="reqps",
+            ),
+        ],
+    )
+    assert len(spec.panels) == 1
+    assert spec.panels[0].queries[0].datasource_uid == "prom-1"
+    print("[PASS] test_dashboard_spec_model")
+
+
+def test_build_dashboard_json():
+    spec = DashboardSpec(
+        title="Test Dashboard",
+        tags=["test"],
+        timerange="1h",
+        panels=[
+            PanelSpec(
+                title="Request Rate",
+                panel_type="timeseries",
+                queries=[
+                    PanelQuery(
+                        expr="rate(http_requests_total[5m])",
+                        legend_format="{{method}}",
+                        datasource_uid="prom-1",
+                        datasource_type="prometheus",
+                    )
+                ],
+                unit="reqps",
+            ),
+            PanelSpec(
+                title="Error Rate",
+                panel_type="stat",
+                queries=[
+                    PanelQuery(
+                        expr='sum(rate(http_requests_total{status=~"5.."}[5m]))',
+                        legend_format="errors",
+                        datasource_uid="prom-1",
+                        datasource_type="prometheus",
+                    )
+                ],
+                unit="percentunit",
+            ),
+        ],
+    )
+
+    result = build_dashboard_json(spec)
+
+    assert result["title"] == "Test Dashboard"
+    assert "dashforge" in result["tags"]
+    assert result["time"]["from"] == "now-1h"
+    assert len(result["panels"]) == 2
+
+    # Check grid layout (2 panels side by side, 12 cols each)
+    assert result["panels"][0]["gridPos"] == {"x": 0, "y": 0, "w": 12, "h": 8}
+    assert result["panels"][1]["gridPos"] == {"x": 12, "y": 0, "w": 12, "h": 8}
+
+    # Check targets
+    assert result["panels"][0]["targets"][0]["refId"] == "A"
+    assert result["panels"][0]["targets"][0]["datasource"]["uid"] == "prom-1"
+
+    # Check units
+    assert result["panels"][0]["fieldConfig"]["defaults"]["unit"] == "reqps"
+    assert result["panels"][1]["fieldConfig"]["defaults"]["unit"] == "percentunit"
+
+    print("[PASS] test_build_dashboard_json")
+
+
+def test_build_dashboard_json_wraps_rows():
+    """Three panels should wrap: two on first row, one on second."""
+    panels = [
+        PanelSpec(
+            title=f"Panel {i}",
+            panel_type="timeseries",
+            queries=[
+                PanelQuery(
+                    expr="up",
+                    datasource_uid="p1",
+                    datasource_type="prometheus",
+                )
+            ],
+        )
+        for i in range(3)
+    ]
+    spec = DashboardSpec(title="Wrap Test", panels=panels, timerange="30m")
+    result = build_dashboard_json(spec)
+
+    assert result["panels"][0]["gridPos"]["x"] == 0
+    assert result["panels"][0]["gridPos"]["y"] == 0
+    assert result["panels"][1]["gridPos"]["x"] == 12
+    assert result["panels"][1]["gridPos"]["y"] == 0
+    assert result["panels"][2]["gridPos"]["x"] == 0
+    assert result["panels"][2]["gridPos"]["y"] == 8
+
+    assert result["time"]["from"] == "now-30m"
+    print("[PASS] test_build_dashboard_json_wraps_rows")
+
+
+def test_filter_datasources_by_signal():
+    datasources = [
+        DatasourceInfo(uid="1", name="Prom", type="prometheus"),
+        DatasourceInfo(uid="2", name="Loki", type="loki"),
+        DatasourceInfo(uid="3", name="Tempo", type="tempo"),
+        DatasourceInfo(uid="4", name="Mimir", type="mimir"),
+        DatasourceInfo(uid="5", name="CW", type="cloudwatch"),
+        DatasourceInfo(uid="6", name="ES", type="elasticsearch"),
+    ]
+
+    # Metrics now includes prometheus, mimir, cloudwatch, elasticsearch
+    metrics_ds = filter_datasources_by_signal(datasources, ["metrics"])
+    assert {d.type for d in metrics_ds} == {"prometheus", "mimir", "cloudwatch", "elasticsearch"}
+
+    # Logs includes loki AND elasticsearch
+    logs_ds = filter_datasources_by_signal(datasources, ["logs"])
+    assert {d.type for d in logs_ds} == {"loki", "elasticsearch"}
+
+    traces_ds = filter_datasources_by_signal(datasources, ["traces"])
+    assert len(traces_ds) == 1
+    assert traces_ds[0].type == "tempo"
+
+    all_ds = filter_datasources_by_signal(datasources, ["metrics", "logs", "traces"])
+    assert len(all_ds) == 6
+
+    print("[PASS] test_filter_datasources_by_signal")
+
+
+def test_keyword_filter():
+    metrics = [
+        "http_requests_total",
+        "http_request_duration_seconds",
+        "process_cpu_seconds_total",
+        "node_memory_MemAvailable_bytes",
+        "go_goroutines",
+        "up",
+    ]
+
+    result = md_keyword_filter(metrics, ["cpu", "memory"])
+    assert "process_cpu_seconds_total" in result
+    assert "node_memory_MemAvailable_bytes" in result
+    assert "up" not in result
+    assert "go_goroutines" not in result
+
+    result2 = md_keyword_filter(metrics, ["http", "request"])
+    assert "http_requests_total" in result2
+    assert "http_request_duration_seconds" in result2
+
+    print("[PASS] test_keyword_filter")
+
+
+def test_dash_request_response_models():
+    req = DashRequest(prompt="high CPU on web servers", channel_id="C123", user_id="U456")
+    assert req.prompt == "high CPU on web servers"
+    assert req.thread_ts == ""
+
+    resp = DashResponse(
+        dashboard_url="http://grafana:3000/d/abc",
+        dashboard_uid="abc",
+        panel_count=5,
+        summary="Created dashboard",
+    )
+    assert resp.panel_count == 5
+    print("[PASS] test_dash_request_response_models")
+
+
+def test_timerange_map():
+    assert TIMERANGE_MAP["1h"] == "now-1h"
+    assert TIMERANGE_MAP["5m"] == "now-5m"
+    assert TIMERANGE_MAP["24h"] == "now-24h"
+    assert TIMERANGE_MAP["7d"] == "now-7d"
+    print("[PASS] test_timerange_map")
+
+
+def test_metric_entry_model():
+    entry = MetricEntry(
+        name="AWS/ApplicationELB/HTTPCode_ELB_5XX",
+        datasource_uid="cw-1",
+        datasource_name="CloudWatch",
+        datasource_type="cloudwatch",
+        query_language="cloudwatch",
+        namespace="AWS/ApplicationELB",
+        dimensions=["LoadBalancer", "TargetGroup"],
+    )
+    assert entry.query_language == "cloudwatch"
+    assert entry.namespace == "AWS/ApplicationELB"
+    assert len(entry.dimensions) == 2
+    print("[PASS] test_metric_entry_model")
+
+
+def test_discovered_metric_with_type():
+    m = DiscoveredMetric(
+        metric_name="HTTPCode_ELB_5XX",
+        datasource_uid="cw-1",
+        datasource_name="CloudWatch",
+        datasource_type="cloudwatch",
+        query_language="cloudwatch",
+        namespace="AWS/ApplicationELB",
+        relevance_reason="Tracks ALB 5xx errors",
+    )
+    assert m.datasource_type == "cloudwatch"
+    assert m.query_language == "cloudwatch"
+    print("[PASS] test_discovered_metric_with_type")
+
+
+def test_adapter_registry():
+    supported = supported_datasource_types()
+    assert "prometheus" in supported
+    assert "cloudwatch" in supported
+    assert "loki" in supported
+    assert "elasticsearch" in supported
+    assert "graphite" in supported
+    assert "influxdb" in supported
+    assert "mimir" in supported
+    assert "cortex" in supported
+    assert "thanos" in supported
+    assert "opensearch" in supported
+
+    # get_adapter_for_type
+    prom = get_adapter_for_type("prometheus")
+    assert prom is not None
+    assert prom.query_language == "promql"
+
+    cw = get_adapter_for_type("cloudwatch")
+    assert cw is not None
+    assert cw.query_language == "cloudwatch"
+
+    loki = get_adapter_for_type("loki")
+    assert loki is not None
+    assert loki.query_language == "logql"
+
+    es = get_adapter_for_type("elasticsearch")
+    assert es is not None
+    assert es.query_language == "elasticsearch"
+
+    assert get_adapter_for_type("unknown_type") is None
+
+    # get_adapter with DatasourceInfo
+    ds = DatasourceInfo(uid="1", name="MyProm", type="prometheus")
+    adapter = get_adapter(ds)
+    assert adapter is not None
+    assert adapter.query_language == "promql"
+
+    print("[PASS] test_adapter_registry")
+
+
+def test_filter_searchable_datasources():
+    datasources = [
+        DatasourceInfo(uid="1", name="Prom", type="prometheus"),
+        DatasourceInfo(uid="2", name="CW", type="cloudwatch"),
+        DatasourceInfo(uid="3", name="Tempo", type="tempo"),  # no adapter
+        DatasourceInfo(uid="4", name="Jaeger", type="jaeger"),  # no adapter
+        DatasourceInfo(uid="5", name="Loki", type="loki"),
+        DatasourceInfo(uid="6", name="Custom", type="my-custom-plugin"),  # no adapter
+    ]
+    searchable = filter_searchable_datasources(datasources)
+    assert {d.type for d in searchable} == {"prometheus", "cloudwatch", "loki"}
+    print("[PASS] test_filter_searchable_datasources")
+
+
+def test_cloudwatch_namespace_selection():
+    available = [
+        "AWS/EC2", "AWS/ApplicationELB", "AWS/RDS", "AWS/Lambda",
+        "AWS/SQS", "AWS/DynamoDB", "AWS/S3",
+    ]
+
+    # 5xx keyword should match ALB namespaces
+    result = _select_namespaces(["5xx", "error"], available)
+    assert "AWS/ApplicationELB" in result
+
+    # database keyword
+    result2 = _select_namespaces(["database"], available)
+    assert "AWS/RDS" in result2 or "AWS/DynamoDB" in result2
+
+    # cpu keyword
+    result3 = _select_namespaces(["cpu"], available)
+    assert "AWS/EC2" in result3
+
+    # empty keywords should still return results (priority namespaces)
+    result4 = _select_namespaces([], available)
+    assert len(result4) > 0
+
+    print("[PASS] test_cloudwatch_namespace_selection")
+
+
+def test_datasource_info_with_json_data():
+    ds = DatasourceInfo(
+        uid="cw-1",
+        name="CloudWatch",
+        type="cloudwatch",
+        json_data={"defaultRegion": "us-west-2"},
+    )
+    assert ds.json_data["defaultRegion"] == "us-west-2"
+    print("[PASS] test_datasource_info_with_json_data")
+
+
+def test_context_chunk_model():
+    chunk = ContextChunk(
+        content="When checkout errors spike, check ELB drain count and target health.",
+        source="runbook:checkout-service",
+        relevance_score=0.92,
+        metadata={"page": 3, "section": "troubleshooting"},
+    )
+    assert chunk.relevance_score == 0.92
+    assert chunk.source == "runbook:checkout-service"
+    assert chunk.metadata["page"] == 3
+    print("[PASS] test_context_chunk_model")
+
+
+def test_format_context_for_prompt():
+    chunks = [
+        ContextChunk(
+            content="Checkout service depends on payment-api and inventory-db.",
+            source="wiki:checkout-architecture",
+            relevance_score=0.9,
+        ),
+        ContextChunk(
+            content="Known issue: ELB 5xx spikes during deploys. Check drain count.",
+            source="runbook:checkout-deploy",
+            relevance_score=0.85,
+        ),
+    ]
+    result = format_context_for_prompt(chunks)
+    assert "## Knowledge Base Context" in result
+    assert "checkout-architecture" in result
+    assert "ELB 5xx spikes" in result
+    assert "### Context 1" in result
+    assert "### Context 2" in result
+
+    # Empty chunks should return empty string
+    assert format_context_for_prompt([]) == ""
+    print("[PASS] test_format_context_for_prompt")
+
+
+def test_context_provider_disabled_by_default():
+    # Default config has context_provider="none"
+    provider = get_context_provider()
+    assert provider is None
+    print("[PASS] test_context_provider_disabled_by_default")
+
+
+def test_enrich_context_noop_when_disabled():
+    import asyncio
+    intent = Intent(
+        summary="High CPU",
+        domain="infrastructure",
+        keywords=["cpu"],
+    )
+    result = asyncio.run(enrich_context(intent))
+    assert result == []
+    print("[PASS] test_enrich_context_noop_when_disabled")
+
+
+def test_prompt_sanitization():
+    from dashforge.main import _sanitize_prompt, MAX_PROMPT_LENGTH
+
+    # Normal prompt passes through
+    assert _sanitize_prompt("high latency on checkout") == "high latency on checkout"
+
+    # Truncation at MAX_PROMPT_LENGTH
+    long = "a" * (MAX_PROMPT_LENGTH + 500)
+    assert len(_sanitize_prompt(long)) == MAX_PROMPT_LENGTH
+
+    # Control characters stripped
+    assert _sanitize_prompt("hello\x00world\x01\x02") == "helloworld"
+
+    # Newlines preserved
+    assert _sanitize_prompt("line1\nline2") == "line1\nline2"
+
+    # Empty / whitespace
+    assert _sanitize_prompt("   ") == ""
+    assert _sanitize_prompt("") == ""
+
+    print("[PASS] test_prompt_sanitization")
+
+
+def test_secrets_not_in_repr():
+    from dashforge.config import Settings
+    s = Settings(
+        llm_api_key="sk-secret-key-123",
+        grafana_api_key="glsa_secret",
+        slack_bot_token="xoxb-secret",
+        context_api_key="ctx-secret",
+        api_auth_key="auth-secret",
+    )
+    r = repr(s)
+    assert "sk-secret-key-123" not in r
+    assert "glsa_secret" not in r
+    assert "xoxb-secret" not in r
+    assert "ctx-secret" not in r
+    assert "auth-secret" not in r
+    print("[PASS] test_secrets_not_in_repr")
+
+
+def test_llm_error_classes():
+    from dashforge.agents.llm import LLMTransientError, LLMParseError
+
+    # LLMTransientError is retryable
+    try:
+        raise LLMTransientError("rate limited")
+    except LLMTransientError as e:
+        assert "rate limited" in str(e)
+
+    # LLMParseError is NOT retryable
+    try:
+        raise LLMParseError("invalid json")
+    except LLMParseError as e:
+        assert "invalid json" in str(e)
+
+    # They should NOT be caught by each other
+    try:
+        raise LLMParseError("bad output")
+    except LLMTransientError:
+        assert False, "LLMParseError should not be caught as LLMTransientError"
+    except LLMParseError:
+        pass
+
+    print("[PASS] test_llm_error_classes")
+
+
+def test_intent_prompt_has_security_rules():
+    from dashforge.agents.intent import SYSTEM_PROMPT
+    assert "SECURITY RULES" in SYSTEM_PROMPT
+    assert "UNTRUSTED DATA" in SYSTEM_PROMPT
+    assert "NEVER" in SYSTEM_PROMPT
+    print("[PASS] test_intent_prompt_has_security_rules")
+
+
+def test_metrics_discovery_prompt_has_security():
+    from dashforge.agents.metrics_discovery import SYSTEM_PROMPT
+    assert "SECURITY" in SYSTEM_PROMPT
+    assert "never invent metric names" in SYSTEM_PROMPT.lower() or "never invent" in SYSTEM_PROMPT.lower()
+    print("[PASS] test_metrics_discovery_prompt_has_security")
+
+
+def test_query_builder_prompt_has_security():
+    from dashforge.agents.query_builder import SYSTEM_PROMPT
+    assert "SECURITY" in SYSTEM_PROMPT
+    assert "Never invent UIDs" in SYSTEM_PROMPT
+    print("[PASS] test_query_builder_prompt_has_security")
+
+
+def test_config_concurrency_defaults():
+    from dashforge.config import settings
+    assert settings.pipeline_max_concurrent >= 1
+    assert settings.pipeline_timeout_seconds >= 30
+    assert settings.adapter_max_concurrent >= 1
+    assert settings.adapter_timeout_seconds >= 10
+    assert settings.max_metric_catalog_size >= 50
+    assert settings.api_auth_enabled is False
+    print("[PASS] test_config_concurrency_defaults")
+
+
+if __name__ == "__main__":
+    test_intent_model()
+    test_dashboard_spec_model()
+    test_build_dashboard_json()
+    test_build_dashboard_json_wraps_rows()
+    test_filter_datasources_by_signal()
+    test_keyword_filter()
+    test_dash_request_response_models()
+    test_timerange_map()
+    test_metric_entry_model()
+    test_discovered_metric_with_type()
+    test_adapter_registry()
+    test_filter_searchable_datasources()
+    test_cloudwatch_namespace_selection()
+    test_datasource_info_with_json_data()
+    test_context_chunk_model()
+    test_format_context_for_prompt()
+    test_context_provider_disabled_by_default()
+    test_enrich_context_noop_when_disabled()
+    test_prompt_sanitization()
+    test_secrets_not_in_repr()
+    test_llm_error_classes()
+    test_intent_prompt_has_security_rules()
+    test_metrics_discovery_prompt_has_security()
+    test_query_builder_prompt_has_security()
+    test_config_concurrency_defaults()
+    print("\n=== All tests passed ===")
