@@ -24,12 +24,25 @@ Return a JSON object with these fields:
   (e.g. "latency", "error_rate", "cpu", "memory", "disk", "requests", "5xx",
    "queue_depth", "saturation", "throughput", "p99")
 - "timerange": suggested lookback window (e.g. "15m", "1h", "6h", "24h")
-- "problem_type": classify the investigation type. Choose the BEST match from:
-  - "latency_investigation" — high latency, slow requests, p99 spikes
-  - "error_spike" — 5xx errors, error rate increase, failed requests
-  - "golden_signals" — SRE golden signals overview, service health, general service overview
+- "problem_type": the BEST single archetype match (kept for backward compatibility)
+- "archetypes": list of ALL plausible investigation archetypes with confidence
+  scores. Incidents often span multiple domains — a latency spike may be caused
+  by resource saturation, which also triggers errors. Return every relevant
+  archetype, ordered by confidence (highest first). Format:
+  [{"type": "<archetype_id>", "confidence": <0.0-1.0>}, ...]
+
+  Available archetypes:
+  - "latency_investigation" — high latency, slow requests, p99 spikes, timeouts
+  - "error_spike" — 5xx errors, error rate increase, failed requests, retries
+  - "golden_signals" — SRE golden signals overview, service health, SLO review
   - "resource_saturation" — high CPU, high memory, OOM, memory leaks, CPU throttling
   - "general" — does not fit any specific pattern above
+
+  Confidence guidelines:
+  - 0.9+ : primary investigation type, explicitly stated
+  - 0.6-0.9 : strongly implied or commonly co-occurring
+  - 0.3-0.6 : plausible secondary investigation
+  - <0.3 : omit (not relevant enough)
 
 Be thorough with keywords — include both generic terms and any specific metric
 name fragments the user might be referring to.
@@ -54,10 +67,20 @@ async def classify_intent(prompt: str) -> Intent:
         response_model=Intent,
         temperature=0.1,
     )
+
+    # Backfill: sync problem_type from top archetype for backward compat
+    if intent.archetypes and not intent.problem_type:
+        intent.problem_type = intent.archetypes[0].type
+    elif intent.problem_type and not intent.archetypes:
+        # LLM returned old-style single label — wrap it
+        from dashforge.models.schemas import ArchetypeMatch
+        intent.archetypes = [ArchetypeMatch(type=intent.problem_type, confidence=0.9)]
+
     logger.info(
         "intent_agent_done",
         domain=intent.domain,
         keywords=intent.keywords,
         services=intent.services,
+        archetypes=[(a.type, a.confidence) for a in intent.archetypes],
     )
     return intent

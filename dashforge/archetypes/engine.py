@@ -195,3 +195,87 @@ def compile_archetype(
     )
 
     return spec
+
+
+def blend_archetypes(
+    ranked_archetypes: list[tuple["InvestigationArchetype", float]],
+    intent: Intent,
+    catalog: list[MetricEntry],
+    secondary_min_confidence: float = 0.4,
+) -> DashboardSpec:
+    """Blend panels from multiple archetypes into a single dashboard.
+
+    The primary (highest-confidence) archetype contributes all its panels.
+    Secondary archetypes contribute panels whose titles don't duplicate the
+    primary's, giving broader investigation coverage without redundancy.
+
+    Parameters
+    ----------
+    ranked_archetypes : list[tuple[InvestigationArchetype, float]]
+        (archetype, confidence) pairs, highest confidence first.
+    intent : Intent
+        The classified user intent.
+    catalog : list[MetricEntry]
+        Discovered metrics from Grafana datasources.
+    secondary_min_confidence : float
+        Minimum confidence for secondary archetypes to contribute panels.
+    """
+    if not ranked_archetypes:
+        raise ValueError("blend_archetypes called with empty archetype list")
+
+    primary_arch, primary_conf = ranked_archetypes[0]
+    primary_spec = compile_archetype(primary_arch, intent, catalog)
+
+    # Track existing panel titles to avoid duplicates
+    existing_titles: set[str] = {p.title.lower() for p in primary_spec.panels}
+    blended_panels = list(primary_spec.panels)
+    blended_tags = list(primary_spec.tags)
+
+    for arch, conf in ranked_archetypes[1:]:
+        if conf < secondary_min_confidence:
+            continue
+
+        secondary_spec = compile_archetype(arch, intent, catalog)
+        added = 0
+        for panel in secondary_spec.panels:
+            if panel.title.lower() not in existing_titles:
+                # Tag panel with its source archetype for traceability
+                panel_with_row = panel.model_copy(
+                    update={"row": panel.row or arch.name}
+                )
+                blended_panels.append(panel_with_row)
+                existing_titles.add(panel.title.lower())
+                added += 1
+
+        if added > 0:
+            blended_tags.extend(arch.tags)
+            logger.info(
+                "archetype_blended",
+                secondary=arch.id,
+                confidence=conf,
+                panels_added=added,
+            )
+
+    # Build final title
+    service_name = intent.services[0] if intent.services else "Service"
+    arch_names = " + ".join(
+        a.name for a, c in ranked_archetypes[:3] if c >= secondary_min_confidence
+    )
+    title = f"{service_name.title()} — {arch_names}"
+
+    spec = DashboardSpec(
+        title=title,
+        tags=list(dict.fromkeys(blended_tags)),  # dedupe preserving order
+        timerange=intent.timerange or primary_arch.default_timerange,
+        panels=blended_panels,
+    )
+
+    logger.info(
+        "archetype_blend_complete",
+        primary=primary_arch.id,
+        primary_confidence=primary_conf,
+        total_archetypes=len(ranked_archetypes),
+        total_panels=len(blended_panels),
+    )
+
+    return spec

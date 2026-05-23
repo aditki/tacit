@@ -12,3 +12,5 @@ venv/
 *.log
 .DS_Store
 grafana_data/
+data/
+results.json

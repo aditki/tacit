@@ -9,8 +9,8 @@ import structlog
 from dashforge.agents.intent import classify_intent
 from dashforge.agents.metrics_discovery import discover_metrics
 from dashforge.agents.query_builder import build_dashboard
-from dashforge.archetypes.engine import compile_archetype
-from dashforge.archetypes.templates import get_archetype
+from dashforge.archetypes.engine import blend_archetypes, compile_archetype
+from dashforge.archetypes.templates import get_archetype, get_archetypes_by_confidence
 from dashforge.cache import llm_cache, make_cache_key
 from dashforge.config import settings
 from dashforge.context.enrichment import enrich_context
@@ -128,16 +128,35 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 "Verify your datasources are configured and have data.",
             )
 
-        # ── 4a. Check for investigation archetype match ────────────────
+        # ── 4a. Multi-label archetype matching ──────────────────────────
         t0 = time.monotonic()
-        archetype = get_archetype(intent.problem_type)
+        ranked_archetypes = get_archetypes_by_confidence(
+            intent.archetypes, min_confidence=0.3
+        )
+        # Fallback: try legacy single-label lookup
+        if not ranked_archetypes:
+            legacy = get_archetype(intent.problem_type)
+            if legacy is not None:
+                ranked_archetypes = [(legacy, 0.9)]
 
-        if archetype is not None:
+        if ranked_archetypes:
+            primary_arch, primary_conf = ranked_archetypes[0]
             # ── ARCHETYPE PATH: deterministic, no LLM needed ──────────
-            logger.info("pipeline_step", step="archetype_compile",
-                        archetype=archetype.id,
+            logger.info("pipeline_step", step="archetype_match",
+                        primary=primary_arch.id,
+                        primary_confidence=primary_conf,
+                        total_matches=len(ranked_archetypes),
                         problem_type=intent.problem_type)
-            dashboard_spec = compile_archetype(archetype, intent, metric_catalog)
+
+            if len(ranked_archetypes) > 1:
+                # Blend panels from multiple archetypes
+                dashboard_spec = blend_archetypes(
+                    ranked_archetypes, intent, metric_catalog
+                )
+            else:
+                dashboard_spec = compile_archetype(
+                    primary_arch, intent, metric_catalog
+                )
             timings["archetype_compile"] = time.monotonic() - t0
         else:
             # ── FREEFORM PATH: LLM-driven discovery + query generation ─
@@ -225,10 +244,10 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         url, uid = await publish_dashboard(client, dashboard_spec)
         timings["publish"] = time.monotonic() - t0
 
-        path_used = "archetype" if archetype else "freeform"
+        path_used = "archetype" if ranked_archetypes else "freeform"
         ds_info = (
             ", ".join({e.datasource_name for e in metric_catalog[:5]})
-            if archetype
+            if ranked_archetypes
             else ", ".join({m.datasource_name for m in discovery.metrics})
         )
         summary = (
@@ -252,6 +271,35 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             path=path_used,
             timings=timings_rounded,
         )
+
+        # ── 8. Record provenance for feedback system ──────────────────
+        try:
+            from dashforge.feedback import get_feedback_store
+            store = get_feedback_store()
+            # Extract metric names from panel queries
+            metrics_used = list({
+                q.expr.split("{")[0].split("(")[-1].strip()
+                for p in dashboard_spec.panels
+                for q in p.queries
+                if q.expr
+            })
+            store.record_provenance(
+                dashboard_uid=uid,
+                prompt=request.prompt,
+                problem_type=intent.problem_type,
+                archetypes=[
+                    {"type": a.type, "confidence": a.confidence}
+                    for a in intent.archetypes
+                ],
+                metrics_used=metrics_used,
+                panel_count=len(dashboard_spec.panels),
+                path_used=path_used,
+                dashboard_url=url,
+                user_id=request.user_id,
+                channel_id=request.channel_id,
+            )
+        except Exception:
+            logger.warning("provenance_record_failed", exc_info=True)
 
         return DashResponse(
             dashboard_url=url,

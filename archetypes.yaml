@@ -1,0 +1,255 @@
+# DashForge Investigation Archetypes
+#
+# Engineers: edit this file to add/remove panels, adjust queries, or create new
+# archetypes. Changes take effect on next server restart (no code change needed).
+#
+# Template placeholders:
+#   {service_filter}    → e.g. job="checkout-service"
+#   {container_filter}  → e.g. container="checkout-service"
+#   {rate_interval}     → e.g. 5m
+#
+# Panel types: timeseries, stat, gauge, table, logs
+# Units: reqps, s, bytes, percentunit, short, none
+
+archetypes:
+
+  - id: latency_investigation
+    name: Latency Investigation
+    description: Diagnose high latency / slow requests for a service
+    problem_types:
+      - latency_investigation
+      - slow_requests
+      - high_latency
+      - p99_spike
+    required_metrics:
+      - http_request_duration_seconds
+      - http_requests_total
+    tags: [latency, performance]
+    default_timerange: "1h"
+    panels:
+      - title: Request Rate
+        description: HTTP request throughput by status code
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}])) by (status)'
+            legend_format: "{{status}}"
+      - title: Error Rate (5xx)
+        description: Rate of server errors
+        row: Errors
+        unit: percentunit
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}])) / sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: error ratio
+      - title: P50 / P95 / P99 Latency
+        description: Request duration percentiles
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p50
+          - expr: 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p95
+          - expr: 'histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p99
+      - title: In-Flight Requests
+        description: Current request concurrency (saturation signal)
+        row: Saturation
+        queries:
+          - expr: 'http_requests_in_flight{{{service_filter}}}'
+            legend_format: in-flight
+      - title: CPU Usage
+        description: Container CPU consumption
+        row: Resources
+        unit: s
+        queries:
+          - expr: 'rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])'
+            legend_format: cpu
+      - title: Memory Usage
+        description: Container memory working set
+        row: Resources
+        unit: bytes
+        queries:
+          - expr: 'container_memory_working_set_bytes{{{container_filter}}}'
+            legend_format: memory
+
+  - id: error_spike
+    name: Error Spike Investigation
+    description: Diagnose a spike in errors / 5xx responses
+    problem_types:
+      - error_spike
+      - 5xx_errors
+      - error_rate
+      - failed_requests
+    required_metrics:
+      - http_requests_total
+    tags: [errors, 5xx]
+    default_timerange: "30m"
+    panels:
+      - title: Error Rate Over Time
+        description: 5xx error rate as a ratio of total requests
+        row: Errors
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}]))'
+            legend_format: 5xx rate
+          - expr: 'sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: total rate
+      - title: Error Ratio
+        description: Percentage of requests returning 5xx
+        row: Errors
+        panel_type: stat
+        unit: percentunit
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}])) / sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: error ratio
+      - title: Errors by Status Code
+        description: Breakdown of error responses by HTTP status
+        row: Errors
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}, status=~"[45].."}}[{rate_interval}])) by (status)'
+            legend_format: "{{status}}"
+      - title: Errors by Path
+        description: Which endpoints are failing
+        row: Breakdown
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}])) by (path)'
+            legend_format: "{{path}}"
+      - title: Request Latency During Errors
+        description: p95 latency — often spikes correlate with errors
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p95
+      - title: Pod Restarts
+        description: Container restarts may indicate crash loops causing errors
+        row: Resources
+        queries:
+          - expr: 'increase(kube_pod_container_restarts_total{{{container_filter}}}[{rate_interval}])'
+            legend_format: restarts
+
+  - id: golden_signals
+    name: SRE Golden Signals
+    description: "The four golden signals: latency, traffic, errors, saturation"
+    problem_types:
+      - golden_signals
+      - sre_overview
+      - service_health
+      - service_overview
+    required_metrics:
+      - http_requests_total
+      - http_request_duration_seconds
+    tags: [golden-signals, sre]
+    default_timerange: "1h"
+    panels:
+      - title: Request Throughput
+        description: Total request rate — traffic signal
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}])) by (method)'
+            legend_format: "{{method}}"
+      - title: Request Latency (p50 / p95 / p99)
+        description: Duration percentiles — latency signal
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p50
+          - expr: 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p95
+          - expr: 'histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p99
+      - title: Error Rate (5xx / total)
+        description: Server error ratio — errors signal
+        row: Errors
+        unit: percentunit
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}])) / sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: error ratio
+      - title: Errors by Status
+        description: Error breakdown by HTTP status code
+        row: Errors
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}, status=~"[45].."}}[{rate_interval}])) by (status)'
+            legend_format: "{{status}}"
+      - title: In-Flight Requests
+        description: Concurrent request count — saturation signal
+        row: Saturation
+        queries:
+          - expr: 'http_requests_in_flight{{{service_filter}}}'
+            legend_format: in-flight
+      - title: CPU Usage
+        description: Container CPU — resource saturation
+        row: Saturation
+        unit: s
+        queries:
+          - expr: 'rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])'
+            legend_format: cpu
+      - title: Memory Usage
+        description: Container memory — resource saturation
+        row: Saturation
+        unit: bytes
+        queries:
+          - expr: 'container_memory_working_set_bytes{{{container_filter}}}'
+            legend_format: memory
+
+  - id: resource_saturation
+    name: Resource Saturation Investigation
+    description: "Diagnose CPU, memory, or connection pool exhaustion"
+    problem_types:
+      - resource_saturation
+      - high_cpu
+      - high_memory
+      - oom
+      - memory_leak
+      - cpu_throttling
+    required_metrics:
+      - container_cpu_usage_seconds_total
+      - container_memory_working_set_bytes
+    tags: [resources, saturation]
+    default_timerange: "1h"
+    panels:
+      - title: CPU Usage
+        description: Container CPU consumption rate
+        row: CPU
+        unit: s
+        queries:
+          - expr: 'rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])'
+            legend_format: "{{container}}"
+      - title: Memory Working Set
+        description: Active memory usage
+        row: Memory
+        unit: bytes
+        queries:
+          - expr: 'container_memory_working_set_bytes{{{container_filter}}}'
+            legend_format: "{{container}}"
+      - title: Database Connections
+        description: Active database connection pool usage
+        row: Connections
+        queries:
+          - expr: 'db_connections_active{{{service_filter}}}'
+            legend_format: active
+      - title: DB Query Latency
+        description: Average database query duration
+        row: Connections
+        unit: s
+        queries:
+          - expr: 'rate(db_query_duration_seconds_sum{{{service_filter}}}[{rate_interval}]) / rate(db_query_duration_seconds_count{{{service_filter}}}[{rate_interval}])'
+            legend_format: avg query time
+      - title: In-Flight Requests
+        description: Concurrency pressure
+        row: Saturation
+        queries:
+          - expr: 'http_requests_in_flight{{{service_filter}}}'
+            legend_format: in-flight
+      - title: Pod Restarts
+        description: OOM kills and crash loops
+        row: Stability
+        queries:
+          - expr: 'increase(kube_pod_container_restarts_total{{{container_filter}}}[{rate_interval}])'
+            legend_format: restarts

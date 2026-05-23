@@ -20,7 +20,7 @@ DashForge is an AI-powered observability navigation layer that lets on-call engi
 └──────┬────────────┘
        ▼
 ┌──────────────────┐
-│ Intent Agent     │  LLM classifies domain, services, signals, problem_type
+│ Intent Agent     │  LLM classifies domain, services, signals, multi-label archetypes
 └──────┬───────────┘
        ▼
 ┌───────────────────────┐
@@ -36,11 +36,11 @@ DashForge is an AI-powered observability navigation layer that lets on-call engi
 └──────┬────────────────┘
        ▼
        ├─────────────────────────────────────┐
-       │ Archetype match?                    │ No match
+       │ Archetype confidence > 0.3?         │ No match
        ▼                                     ▼
 ┌─────────────────────┐           ┌───────────────────────┐
 │ Archetype Engine    │           │ Metrics Discovery LLM │
-│ (deterministic)     │           └──────┬────────────────┘
+│ (blend if multi)    │           └──────┬────────────────┘
 └──────┬──────────────┘                  ▼
        │                          ┌───────────────────────┐
        │                          │ Post-Validation       │
@@ -105,6 +105,23 @@ Grafana is auto-provisioned with a Prometheus datasource. The fake app simulates
 three services (`checkout-service`, `payment-api`, `inventory-db`) with HTTP, CPU,
 memory, database, and pod metrics.
 
+### API Documentation
+
+Once the stack is running, interactive API docs are available at:
+
+| URL | Format |
+|-----|--------|
+| [http://localhost:8000/docs](http://localhost:8000/docs) | **Swagger UI** — interactive, try-it-out |
+| [http://localhost:8000/redoc](http://localhost:8000/redoc) | **ReDoc** — clean reference docs |
+| [http://localhost:8000/openapi.json](http://localhost:8000/openapi.json) | Raw OpenAPI 3.1 JSON schema |
+
+Endpoints are grouped into:
+- **Dashboard Generation** — `POST /api/v1/chart`
+- **Feedback** — submit and retrieve human evaluation ratings
+- **Insights** — aggregate stats and actionable analysis/recommendations
+- **Archetypes** — list and hot-reload investigation templates
+- **System** — health check
+
 ### 3. Create a Grafana service account token
 
 1. Open Grafana → Administration → Service Accounts
@@ -168,11 +185,11 @@ The bot will reply with a link to the freshly created Grafana dashboard.
 | Component | Description |
 |---|---|
 | **Prompt Sanitizer** | Length caps, control-char removal, prompt injection guardrails |
-| **Intent Agent** | LLM classifies domain, services, keywords, signal types, timerange, and `problem_type` |
+| **Intent Agent** | LLM classifies domain, services, keywords, signal types, timerange, and multi-label archetypes with confidence scores |
 | **Context Enrichment** | Pluggable knowledge base lookup (MCP, A2A, RAG API) — disabled by default |
 | **Datasource Discovery** | Auto-discovers all Grafana datasources, filters by signal type |
 | **Metric Catalog Fetch** | Per-datasource adapters query metric names + per-metric label names/values |
-| **Archetype Engine** | Deterministic dashboard compilation for known investigation patterns (latency, error spike, golden signals, resource saturation). Skips LLM query generation entirely |
+| **Archetype Engine** | Deterministic dashboard compilation for known investigation patterns. Multi-label: blends panels from multiple archetypes based on confidence (e.g. latency primary + saturation secondary). Skips LLM query generation entirely |
 | **Metrics Discovery LLM** | *(freeform fallback)* Selects the most relevant metrics from the full catalog |
 | **Post-Validation** | Drops hallucinated datasource UIDs, verifies metrics exist in catalog |
 | **Query Builder LLM** | *(freeform fallback)* Generates PromQL/LogQL with accurate label selectors |
@@ -185,7 +202,7 @@ provider-agnostic — set `LLM_PROVIDER` to `anthropic`, `openai`, `azure`, or `
 
 ### Key design decisions
 
-- **Investigation archetypes** — known problem types (latency, error spike, golden signals, resource saturation) are compiled deterministically from parameterized PromQL templates. No LLM needed for query generation, ~75% faster, zero hallucination risk.
+- **Multi-label investigation archetypes** — incidents are inherently overlapping. The intent agent returns multiple archetypes with confidence scores (e.g. `latency_investigation: 0.91, resource_saturation: 0.62`). The archetype engine blends panels from multiple templates, giving broader investigation coverage. Known patterns are compiled deterministically — no LLM needed for query generation, ~75% faster, zero hallucination risk.
 - **Query validation** — before publishing, every panel query is tested against the live datasource. Panels with no matching series are dropped. If all panels are empty, no dashboard is created and the user gets a clear error.
 - **Per-metric label discovery** — the Prometheus adapter fetches actual label names and values for each metric via `/api/v1/series`, so the LLM writes queries with correct selectors instead of guessing.
 - **Hallucination post-validation** — after the Metrics Discovery LLM runs, any metric referencing a datasource UID not in the real catalog is silently dropped.
@@ -261,16 +278,21 @@ dashforge/
 │   ├── integrations/
 │   │   └── slack.py         # Slack Bolt bot
 │   ├── models/
-│   │   └── schemas.py       # Pydantic models (Intent includes problem_type)
+│   │   └── schemas.py       # Pydantic models (Intent, ArchetypeMatch, DashboardSpec)
 │   └── static/
 │       └── index.html       # Web UI for testing
+├── tests/                   # Validation & testing
+│   ├── validate.py          # Validation suite (archetype + pipeline accuracy)
+│   ├── dashforge_validation_prompts.csv  # 100-prompt test dataset
+│   ├── test_unit.py         # Unit tests
+│   └── README.md            # Validation documentation
 ├── dev/                     # Local dev environment
 │   ├── fake_app/           # Fake metrics exporter (checkout, payment, inventory)
 │   ├── prometheus/         # Prometheus config
 │   └── grafana/            # Grafana provisioning
 ├── docker-compose.yml
 ├── Dockerfile
-├── requirements.txt
+├── pyproject.toml           # Project metadata & deps (uv)
 ├── dashforge.yaml.example   # Reference YAML config (schema-validated)
 └── .env.example             # Reference env vars (secrets go here)
 ```
@@ -293,6 +315,9 @@ dashforge/
 - [x] Investigation archetypes — deterministic dashboard compilation for known problem types (latency, error spike, golden signals, resource saturation). ~75% faster, zero hallucination
 - [x] Query validation — pre-publish verification that queries return real data. Empty panels dropped, empty dashboards blocked
 - [x] Schema-validated YAML config — layered `dashforge.yaml` + env var overrides, replacing fragile flat `.env`
+- [x] Multi-label archetypes with confidence scores — incidents span multiple domains; intent agent returns ranked archetypes, engine blends panels from multiple templates
+- [x] Tiered validation suite — archetype accuracy (strict + soft), metric recall, critical metric recall, weighted recall, signal-to-noise ratio
+- [x] `uv`-based dependency management — faster installs, reproducible lockfile
 
 ### Personal Use — Near Term
 

@@ -14,6 +14,21 @@ class SignalType(str, Enum):
     TRACES = "traces"
 
 
+class ArchetypeMatch(BaseModel):
+    """A single archetype classification with confidence score.
+
+    Archetypes are treated as *retrieval priors* — they influence metric
+    ranking and template selection, not hard-route the pipeline.
+    """
+
+    type: str = Field(description="Archetype identifier, e.g. 'latency_investigation'")
+    confidence: float = Field(
+        description="Confidence score 0.0–1.0",
+        ge=0.0,
+        le=1.0,
+    )
+
+
 class Intent(BaseModel):
     """Output of the Intent Agent."""
 
@@ -31,6 +46,12 @@ class Intent(BaseModel):
         "golden_signals, sre_overview, service_health, service_overview, "
         "resource_saturation, high_cpu, high_memory, oom, memory_leak, "
         "cpu_throttling, general"
+    )
+    archetypes: list[ArchetypeMatch] = Field(
+        default_factory=list,
+        description="Multi-label archetype classifications ordered by confidence "
+        "(highest first). Used as retrieval priors for metric ranking "
+        "and template blending.",
     )
 
 
@@ -119,14 +140,101 @@ class DashboardSpec(BaseModel):
 class DashRequest(BaseModel):
     """Inbound request from Slack (or HTTP)."""
 
-    prompt: str
-    channel_id: str = ""
-    user_id: str = ""
-    thread_ts: str = ""
+    prompt: str = Field(description="Natural-language description of the dashboard you need")
+    channel_id: str = Field(default="", description="Slack channel ID (set automatically by Slack integration)")
+    user_id: str = Field(default="", description="User identifier for provenance tracking")
+    thread_ts: str = Field(default="", description="Slack thread timestamp (set automatically by Slack integration)")
+
+    model_config = {"json_schema_extra": {"examples": [{
+        "prompt": "High 5xx error rate on checkout-service in the last 30 minutes",
+        "user_id": "web-ui",
+    }]}}
 
 
 class DashResponse(BaseModel):
-    dashboard_url: str
-    dashboard_uid: str
-    panel_count: int
-    summary: str
+    """Result of a successful dashboard generation."""
+
+    dashboard_url: str = Field(description="Full Grafana URL to the published dashboard")
+    dashboard_uid: str = Field(description="Unique Grafana dashboard UID")
+    panel_count: int = Field(description="Number of panels in the generated dashboard")
+    summary: str = Field(description="Human-readable summary of what was generated")
+
+
+# ── Feedback ────────────────────────────────────────────────────────────────
+
+class FeedbackRequest(BaseModel):
+    """Human evaluation of a generated dashboard."""
+
+    dashboard_uid: str = Field(description="UID of the dashboard being reviewed")
+    symptom_visibility: int | None = Field(
+        default=None, ge=1, le=5,
+        description="How well did the dashboard surface the symptom? (1=not at all, 5=immediately obvious)",
+    )
+    root_cause_support: int | None = Field(
+        default=None, ge=1, le=5,
+        description="Did the dashboard help identify root cause? (1=no help, 5=pointed directly to it)",
+    )
+    noise_level: int | None = Field(
+        default=None, ge=1, le=5,
+        description="How much irrelevant information? (1=very noisy, 5=all signal)",
+    )
+    investigation_speed: int | None = Field(
+        default=None, ge=1, le=5,
+        description="Did it accelerate the investigation? (1=slowed down, 5=significantly faster)",
+    )
+    overall_useful: bool | None = Field(
+        default=None,
+        description="Would you use this dashboard in a real incident?",
+    )
+    comment: str = Field(default="", description="Free-text feedback")
+    reviewer: str = Field(default="", description="Reviewer identifier (user ID or email)")
+
+
+class FeedbackResponse(BaseModel):
+    """Response after submitting feedback."""
+
+    feedback_id: int = Field(description="Auto-generated ID of the stored feedback record")
+    dashboard_uid: str = Field(description="UID of the dashboard that was reviewed")
+    message: str = Field(default="Feedback recorded", description="Confirmation message")
+
+
+# ── Response models for untyped endpoints ──────────────────────────────────
+
+class HealthResponse(BaseModel):
+    """Health check response."""
+    status: str = Field(description="Server status", examples=["ok"])
+
+
+class FeedbackStatsResponse(BaseModel):
+    """Aggregate feedback statistics."""
+    total_feedback: int = Field(description="Total number of feedback submissions")
+    total_dashboards: int = Field(description="Number of distinct dashboards reviewed")
+    useful_rate: float | None = Field(description="Fraction of dashboards rated as useful (0.0-1.0)")
+    avg_symptom_visibility: float | None = Field(description="Average symptom visibility score (1-5)")
+    avg_root_cause_support: float | None = Field(description="Average root cause support score (1-5)")
+    avg_noise_level: float | None = Field(description="Average signal clarity score (1-5)")
+    avg_investigation_speed: float | None = Field(description="Average investigation speed score (1-5)")
+
+
+class ArchetypeSummary(BaseModel):
+    """Summary of a single investigation archetype."""
+    id: str = Field(description="Unique archetype identifier")
+    name: str = Field(description="Human-readable archetype name")
+    description: str = Field(description="What this archetype investigates")
+    problem_types: list[str] = Field(description="Intent problem_type values that map to this archetype")
+    panel_count: int = Field(description="Number of panels in this archetype")
+    panels: list[str] = Field(description="Panel titles")
+    tags: list[str] = Field(description="Archetype tags")
+
+
+class ArchetypeListResponse(BaseModel):
+    """List of all loaded investigation archetypes."""
+    count: int = Field(description="Number of loaded archetypes")
+    archetypes: list[ArchetypeSummary]
+
+
+class ArchetypeReloadResponse(BaseModel):
+    """Result of an archetype hot-reload operation."""
+    message: str = Field(description="Status message")
+    count: int = Field(description="Number of archetypes loaded")
+    archetypes: list[dict[str, Any]] = Field(description="Summary of each loaded archetype")

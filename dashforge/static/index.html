@@ -21,153 +21,213 @@
       font-weight: 700;
       margin-bottom: 0.25rem;
       background: linear-gradient(135deg, #6366f1, #22d3ee);
+      background-clip: text;
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
     }
-    .subtitle { color: #9ca3af; font-size: 0.9rem; margin-bottom: 2rem; }
+    .subtitle { color: #9ca3af; font-size: 0.9rem; margin-bottom: 1.5rem; }
+
+    /* Tabs */
+    .tabs { display: flex; gap: 0.25rem; margin-bottom: 1.5rem; }
+    .tab {
+      padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem;
+      cursor: pointer; color: #9ca3af; background: transparent; border: 1px solid transparent;
+      font-weight: 500; transition: all 0.15s;
+    }
+    .tab:hover { color: #e4e6eb; }
+    .tab.active { background: #1a1d27; border-color: #3b3f54; color: #c7d2fe; }
+    .tab-content { display: none; width: 100%; max-width: 640px; }
+    .tab-content.active { display: block; }
+
     .card {
-      background: #1a1d27;
-      border: 1px solid #2d3040;
-      border-radius: 12px;
-      padding: 1.5rem;
-      width: 100%;
-      max-width: 640px;
+      background: #1a1d27; border: 1px solid #2d3040; border-radius: 12px;
+      padding: 1.5rem; width: 100%; max-width: 640px;
     }
     textarea {
-      width: 100%;
-      min-height: 100px;
-      background: #0f1117;
-      border: 1px solid #3b3f54;
-      border-radius: 8px;
-      color: #e4e6eb;
-      padding: 0.75rem;
-      font-size: 0.95rem;
-      resize: vertical;
-      font-family: inherit;
+      width: 100%; min-height: 100px; background: #0f1117;
+      border: 1px solid #3b3f54; border-radius: 8px; color: #e4e6eb;
+      padding: 0.75rem; font-size: 0.95rem; resize: vertical; font-family: inherit;
     }
     textarea:focus { outline: none; border-color: #6366f1; }
     textarea::placeholder { color: #6b7280; }
     .actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
     button {
-      padding: 0.6rem 1.2rem;
-      border: none;
-      border-radius: 8px;
-      font-size: 0.9rem;
-      cursor: pointer;
-      font-weight: 600;
-      transition: opacity 0.15s;
+      padding: 0.6rem 1.2rem; border: none; border-radius: 8px; font-size: 0.9rem;
+      cursor: pointer; font-weight: 600; transition: opacity 0.15s;
     }
     button:hover { opacity: 0.85; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
     .btn-primary { background: #6366f1; color: #fff; }
     .btn-secondary { background: #2d3040; color: #9ca3af; }
-    .examples {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.4rem;
-      margin-top: 1rem;
-    }
+    .btn-sm { padding: 0.4rem 0.8rem; font-size: 0.8rem; }
+    .btn-success { background: #22c55e; color: #fff; }
+    .examples { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 1rem; }
     .example-chip {
-      background: #2d3040;
-      border: 1px solid #3b3f54;
-      border-radius: 20px;
-      padding: 0.35rem 0.75rem;
-      font-size: 0.8rem;
-      color: #9ca3af;
-      cursor: pointer;
-      transition: all 0.15s;
+      background: #2d3040; border: 1px solid #3b3f54; border-radius: 20px;
+      padding: 0.35rem 0.75rem; font-size: 0.8rem; color: #9ca3af;
+      cursor: pointer; transition: all 0.15s;
     }
     .example-chip:hover { border-color: #6366f1; color: #c7d2fe; }
-    .result {
-      margin-top: 1.5rem;
-      width: 100%;
-      max-width: 640px;
-    }
+    .result { margin-top: 1.5rem; width: 100%; max-width: 640px; }
     .result-card {
-      background: #1a1d27;
-      border: 1px solid #2d3040;
-      border-radius: 12px;
-      padding: 1.25rem;
-      margin-top: 0.5rem;
+      background: #1a1d27; border: 1px solid #2d3040; border-radius: 12px;
+      padding: 1.25rem; margin-top: 0.5rem;
     }
     .result-card.error { border-color: #ef4444; }
     .result-card.success { border-color: #22c55e; }
-    .result-label { font-size: 0.75rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
-    .result-url a {
-      color: #6366f1;
-      text-decoration: none;
-      font-weight: 600;
-      font-size: 1rem;
+    .result-label {
+      font-size: 0.75rem; color: #6b7280; text-transform: uppercase;
+      letter-spacing: 0.05em; margin-bottom: 0.5rem;
     }
+    .result-url a { color: #6366f1; text-decoration: none; font-weight: 600; font-size: 1rem; }
     .result-url a:hover { text-decoration: underline; }
     .result-meta { font-size: 0.85rem; color: #9ca3af; margin-top: 0.5rem; line-height: 1.5; }
     .spinner {
-      display: inline-block;
-      width: 16px; height: 16px;
-      border: 2px solid #3b3f54;
-      border-top-color: #6366f1;
-      border-radius: 50%;
-      animation: spin 0.6s linear infinite;
-      margin-right: 0.5rem;
-      vertical-align: middle;
+      display: inline-block; width: 16px; height: 16px;
+      border: 2px solid #3b3f54; border-top-color: #6366f1; border-radius: 50%;
+      animation: spin 0.6s linear infinite; margin-right: 0.5rem; vertical-align: middle;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
     .status { margin-top: 0.75rem; font-size: 0.85rem; color: #9ca3af; }
+
+    /* Feedback form */
+    .feedback-form { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #2d3040; }
+    .feedback-form h3 { font-size: 0.85rem; color: #9ca3af; margin-bottom: 0.75rem; }
+    .rating-row {
+      display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;
+      font-size: 0.85rem;
+    }
+    .rating-row label { width: 160px; color: #9ca3af; flex-shrink: 0; }
+    .rating-stars { display: flex; gap: 0.2rem; }
+    .star {
+      width: 28px; height: 28px; border-radius: 6px; border: 1px solid #3b3f54;
+      background: #0f1117; color: #6b7280; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.8rem; font-weight: 600; transition: all 0.15s;
+    }
+    .star:hover, .star.active { background: #6366f1; border-color: #6366f1; color: #fff; }
+    .fb-comment {
+      width: 100%; background: #0f1117; border: 1px solid #3b3f54;
+      border-radius: 8px; color: #e4e6eb; padding: 0.5rem; font-size: 0.85rem;
+      font-family: inherit; margin-top: 0.5rem; resize: vertical; min-height: 50px;
+    }
+    .fb-comment:focus { outline: none; border-color: #6366f1; }
+    .fb-actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; align-items: center; }
+    .fb-status { font-size: 0.8rem; color: #22c55e; }
+
+    /* Stats */
+    .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-top: 1rem; }
+    .stat-card {
+      background: #0f1117; border: 1px solid #2d3040; border-radius: 8px; padding: 1rem;
+    }
+    .stat-value { font-size: 1.5rem; font-weight: 700; color: #c7d2fe; }
+    .stat-label { font-size: 0.75rem; color: #6b7280; margin-top: 0.25rem; }
+    .rec-list { margin-top: 1rem; }
+    .rec-item {
+      background: #0f1117; border: 1px solid #2d3040; border-radius: 8px;
+      padding: 0.75rem; margin-bottom: 0.5rem; font-size: 0.85rem; color: #9ca3af;
+    }
+    .rec-item strong { color: #fbbf24; }
+
+    /* Archetype list */
+    .arch-card {
+      background: #0f1117; border: 1px solid #2d3040; border-radius: 8px;
+      padding: 1rem; margin-bottom: 0.75rem;
+    }
+    .arch-card h3 { font-size: 0.95rem; color: #c7d2fe; margin-bottom: 0.25rem; }
+    .arch-card .arch-desc { font-size: 0.8rem; color: #6b7280; margin-bottom: 0.5rem; }
+    .arch-card .arch-panels { font-size: 0.8rem; color: #9ca3af; }
+    .arch-tag {
+      display: inline-block; background: #2d3040; border-radius: 12px;
+      padding: 0.15rem 0.5rem; font-size: 0.7rem; color: #9ca3af; margin-right: 0.3rem;
+    }
   </style>
 </head>
 <body>
   <h1>DashForge</h1>
   <p class="subtitle">Natural language &rarr; Grafana dashboards</p>
 
-  <div class="card">
-    <textarea id="prompt" placeholder="Describe the dashboard you need...&#10;&#10;e.g. High 5xx error rate on checkout-service in the last 30 minutes"></textarea>
-    <div class="actions">
-      <button class="btn-primary" id="generate" onclick="submit()">Generate Dashboard</button>
-      <button class="btn-secondary" onclick="document.getElementById('prompt').value=''">Clear</button>
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('generate')">Generate</div>
+    <div class="tab" onclick="switchTab('insights')">Insights</div>
+    <div class="tab" onclick="switchTab('archetypes')">Archetypes</div>
+  </div>
+
+  <!-- Generate tab -->
+  <div class="tab-content active" id="tab-generate">
+    <div class="card">
+      <textarea id="prompt" placeholder="Describe the dashboard you need...&#10;&#10;e.g. High 5xx error rate on checkout-service in the last 30 minutes"></textarea>
+      <div class="actions">
+        <button class="btn-primary" id="generate-btn" onclick="submitPrompt()">Generate Dashboard</button>
+        <button class="btn-secondary" onclick="document.getElementById('prompt').value=''">Clear</button>
+      </div>
+      <div class="examples">
+        <span class="example-chip" onclick="fill(this)">5xx errors on checkout-service</span>
+        <span class="example-chip" onclick="fill(this)">High latency on payment-api last 1h</span>
+        <span class="example-chip" onclick="fill(this)">CPU and memory overview for all services</span>
+        <span class="example-chip" onclick="fill(this)">Database connection pool and query latency</span>
+      </div>
     </div>
-    <div class="examples">
-      <span class="example-chip" onclick="fill(this)">5xx errors on checkout-service</span>
-      <span class="example-chip" onclick="fill(this)">High latency on payment-api last 1h</span>
-      <span class="example-chip" onclick="fill(this)">CPU and memory overview for all services</span>
-      <span class="example-chip" onclick="fill(this)">Database connection pool and query latency</span>
+    <div class="result" id="result"></div>
+  </div>
+
+  <!-- Insights tab -->
+  <div class="tab-content" id="tab-insights">
+    <div class="card">
+      <div class="result-label">Feedback Overview</div>
+      <div id="stats-content"><div class="status">Loading...</div></div>
     </div>
   </div>
 
-  <div class="result" id="result"></div>
+  <!-- Archetypes tab -->
+  <div class="tab-content" id="tab-archetypes">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+        <div class="result-label" style="margin:0">Investigation Archetypes</div>
+        <button class="btn-secondary btn-sm" onclick="reloadArchetypes()">Reload YAML</button>
+      </div>
+      <div id="archetypes-content"><div class="status">Loading...</div></div>
+    </div>
+  </div>
 
   <script>
-    const API_URL = window.location.origin + '/api/v1/chart';
+    const BASE = window.location.origin;
+    let lastDashboardUid = null;
 
-    function fill(el) {
-      document.getElementById('prompt').value = el.textContent;
+    /* ── Tabs ──────────────────────────────────────────────────── */
+    function switchTab(name) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+      document.querySelector(`#tab-${name}`).classList.add('active');
+      document.querySelectorAll('.tab')[['generate','insights','archetypes'].indexOf(name)].classList.add('active');
+      if (name === 'insights') loadInsights();
+      if (name === 'archetypes') loadArchetypes();
     }
 
-    async function submit() {
+    function fill(el) { document.getElementById('prompt').value = el.textContent; }
+
+    /* ── Generate ──────────────────────────────────────────────── */
+    async function submitPrompt() {
       const prompt = document.getElementById('prompt').value.trim();
       if (!prompt) return;
-
-      const btn = document.getElementById('generate');
+      const btn = document.getElementById('generate-btn');
       const result = document.getElementById('result');
-
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span>Generating...';
       result.innerHTML = '<div class="status"><span class="spinner"></span>Running pipeline &mdash; this takes 15-30s...</div>';
 
       try {
-        const resp = await fetch(API_URL, {
+        const resp = await fetch(`${BASE}/api/v1/chart`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ prompt, user_id: 'web-ui', channel_id: 'web' }),
         });
-
         if (!resp.ok) {
           const err = await resp.json().catch(() => ({ detail: resp.statusText }));
           throw new Error(err.detail || `HTTP ${resp.status}`);
         }
-
         const data = await resp.json();
-
-        // Replace localhost URL with current origin's host for Grafana link
+        lastDashboardUid = data.dashboard_uid;
         const dashUrl = data.dashboard_url.replace('http://localhost:3000', 'http://' + window.location.hostname + ':3000');
 
         result.innerHTML = `
@@ -178,24 +238,170 @@
               <strong>${data.panel_count}</strong> panels<br>
               ${data.summary.replace(/\n/g, '<br>')}
             </div>
-          </div>
-        `;
+            <div class="feedback-form" id="feedback-form">
+              <h3>Rate this dashboard</h3>
+              ${ratingRow('symptom', 'Symptom visibility')}
+              ${ratingRow('rootcause', 'Root cause support')}
+              ${ratingRow('noise', 'Signal clarity')}
+              ${ratingRow('speed', 'Investigation speed')}
+              <div class="rating-row">
+                <label>Overall useful?</label>
+                <button class="btn-sm btn-secondary" onclick="setUseful(true)" id="useful-yes">Yes</button>
+                <button class="btn-sm btn-secondary" onclick="setUseful(false)" id="useful-no">No</button>
+              </div>
+              <textarea class="fb-comment" id="fb-comment" placeholder="Optional comment..."></textarea>
+              <div class="fb-actions">
+                <button class="btn-primary btn-sm" onclick="submitFeedback()">Submit Feedback</button>
+                <span class="fb-status" id="fb-status"></span>
+              </div>
+            </div>
+          </div>`;
       } catch (e) {
         result.innerHTML = `
           <div class="result-card error">
             <div class="result-label">Error</div>
             <div class="result-meta" style="color:#fca5a5">${e.message}</div>
-          </div>
-        `;
+          </div>`;
       } finally {
         btn.disabled = false;
         btn.textContent = 'Generate Dashboard';
       }
     }
 
+    /* ── Rating helpers ────────────────────────────────────────── */
+    const ratings = { symptom: 0, rootcause: 0, noise: 0, speed: 0 };
+    let usefulVal = null;
+
+    function ratingRow(key, label) {
+      let stars = '';
+      for (let i = 1; i <= 5; i++) {
+        stars += `<div class="star" data-key="${key}" data-val="${i}" onclick="setRating('${key}',${i})">${i}</div>`;
+      }
+      return `<div class="rating-row"><label>${label}</label><div class="rating-stars">${stars}</div></div>`;
+    }
+
+    function setRating(key, val) {
+      ratings[key] = val;
+      document.querySelectorAll(`.star[data-key="${key}"]`).forEach(s => {
+        s.classList.toggle('active', parseInt(s.dataset.val) <= val);
+      });
+    }
+
+    function setUseful(val) {
+      usefulVal = val;
+      document.getElementById('useful-yes').classList.toggle('btn-success', val === true);
+      document.getElementById('useful-yes').classList.toggle('btn-secondary', val !== true);
+      document.getElementById('useful-no').classList.toggle('btn-success', val === false);
+      document.getElementById('useful-no').classList.toggle('btn-secondary', val !== false);
+    }
+
+    async function submitFeedback() {
+      if (!lastDashboardUid) return;
+      const body = {
+        dashboard_uid: lastDashboardUid,
+        symptom_visibility: ratings.symptom || null,
+        root_cause_support: ratings.rootcause || null,
+        noise_level: ratings.noise || null,
+        investigation_speed: ratings.speed || null,
+        overall_useful: usefulVal,
+        comment: document.getElementById('fb-comment').value.trim(),
+        reviewer: 'web-ui',
+      };
+      try {
+        const resp = await fetch(`${BASE}/api/v1/feedback`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (resp.ok) {
+          document.getElementById('fb-status').textContent = 'Feedback submitted!';
+          document.getElementById('feedback-form').querySelectorAll('button,textarea').forEach(el => el.disabled = true);
+        }
+      } catch(e) {
+        document.getElementById('fb-status').textContent = 'Failed to submit';
+        document.getElementById('fb-status').style.color = '#ef4444';
+      }
+    }
+
+    /* ── Insights tab ──────────────────────────────────────────── */
+    async function loadInsights() {
+      const el = document.getElementById('stats-content');
+      el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      try {
+        const [statsResp, analysisResp] = await Promise.all([
+          fetch(`${BASE}/api/v1/feedback/stats`),
+          fetch(`${BASE}/api/v1/feedback/analysis`),
+        ]);
+        const stats = await statsResp.json();
+        const analysis = await analysisResp.json();
+
+        if (!stats.total_feedback && stats.total_feedback !== 0) {
+          el.innerHTML = '<div class="status">No feedback collected yet. Generate a dashboard and rate it!</div>';
+          return;
+        }
+
+        let html = `<div class="stats-grid">
+          <div class="stat-card"><div class="stat-value">${stats.total_feedback || 0}</div><div class="stat-label">Total reviews</div></div>
+          <div class="stat-card"><div class="stat-value">${stats.total_dashboards || 0}</div><div class="stat-label">Dashboards reviewed</div></div>
+          <div class="stat-card"><div class="stat-value">${stats.useful_rate != null ? (stats.useful_rate * 100).toFixed(0) + '%' : '--'}</div><div class="stat-label">Useful rate</div></div>
+          <div class="stat-card"><div class="stat-value">${stats.avg_noise_level || '--'}</div><div class="stat-label">Avg signal clarity</div></div>
+        </div>`;
+
+        if (analysis.recommendations && analysis.recommendations.length > 0) {
+          html += '<div class="rec-list"><div class="result-label" style="margin-top:1rem">Recommendations</div>';
+          for (const r of analysis.recommendations) {
+            const parts = r.split(':');
+            html += `<div class="rec-item"><strong>${parts[0]}:</strong>${parts.slice(1).join(':')}</div>`;
+          }
+          html += '</div>';
+        }
+
+        if (analysis.per_archetype_quality && analysis.per_archetype_quality.length > 0) {
+          html += '<div class="result-label" style="margin-top:1rem">Per-archetype quality</div>';
+          for (const a of analysis.per_archetype_quality) {
+            html += `<div class="rec-item">${a.archetype}: useful=${(a.useful_rate*100).toFixed(0)}%, noise=${a.avg_noise}/5, symptom=${a.avg_symptom}/5 (n=${a.count})</div>`;
+          }
+        }
+
+        el.innerHTML = html;
+      } catch (e) {
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${e.message}</div>`;
+      }
+    }
+
+    /* ── Archetypes tab ────────────────────────────────────────── */
+    async function loadArchetypes() {
+      const el = document.getElementById('archetypes-content');
+      el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      try {
+        const resp = await fetch(`${BASE}/api/v1/archetypes`);
+        const data = await resp.json();
+        let html = '';
+        for (const a of data.archetypes) {
+          const tags = a.tags.map(t => `<span class="arch-tag">${t}</span>`).join('');
+          const panels = a.panels.map(p => `<li>${p}</li>`).join('');
+          html += `<div class="arch-card">
+            <h3>${a.name} <span style="font-size:0.75rem;color:#6b7280">(${a.id})</span></h3>
+            <div class="arch-desc">${a.description} ${tags}</div>
+            <div class="arch-panels">${a.panel_count} panels: <ul style="margin:0.25rem 0 0 1.25rem;font-size:0.8rem">${panels}</ul></div>
+          </div>`;
+        }
+        el.innerHTML = html || '<div class="status">No archetypes loaded</div>';
+      } catch (e) {
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${e.message}</div>`;
+      }
+    }
+
+    async function reloadArchetypes() {
+      try {
+        await fetch(`${BASE}/api/v1/archetypes/reload`, { method: 'POST' });
+        loadArchetypes();
+      } catch(e) { alert('Reload failed: ' + e.message); }
+    }
+
     // Submit on Ctrl+Enter
     document.getElementById('prompt').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) submit();
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) submitPrompt();
     });
   </script>
 </body>

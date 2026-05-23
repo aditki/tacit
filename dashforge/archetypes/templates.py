@@ -2,14 +2,26 @@
 
 Each archetype encodes known-good investigation patterns that SREs use daily.
 Query templates use {placeholders} resolved from the intent + discovered labels.
+
+Archetypes are loaded from ``archetypes.yaml`` if it exists (project root or
+``DASHFORGE_ARCHETYPES_PATH`` env var).  Otherwise, the hardcoded definitions
+below are used as the default.  This lets engineers edit templates without
+touching Python code — just edit the YAML and restart.
 """
 from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import structlog
 
 from dashforge.archetypes.schema import (
     InvestigationArchetype,
     PanelTemplate,
     QueryTemplate,
 )
+
+logger = structlog.get_logger()
 
 # ── Latency Investigation ────────────────────────────────────────────────────
 
@@ -340,25 +352,138 @@ RESOURCE_SATURATION = InvestigationArchetype(
     ],
 )
 
-# ── Registry ─────────────────────────────────────────────────────────────────
+# ── YAML loader ──────────────────────────────────────────────────────────────
 
-ALL_ARCHETYPES: list[InvestigationArchetype] = [
-    LATENCY_INVESTIGATION,
-    ERROR_SPIKE,
-    GOLDEN_SIGNALS,
-    RESOURCE_SATURATION,
+_DEFAULT_YAML_PATHS = [
+    Path(__file__).resolve().parent.parent.parent / "archetypes.yaml",  # project root
+    Path("archetypes.yaml"),  # cwd
 ]
 
-# Build lookup: problem_type → archetype
-_ARCHETYPE_BY_PROBLEM: dict[str, InvestigationArchetype] = {}
-for _arch in ALL_ARCHETYPES:
-    for _pt in _arch.problem_types:
-        _ARCHETYPE_BY_PROBLEM[_pt] = _arch
+
+def _load_archetypes_from_yaml(path: Path) -> list[InvestigationArchetype]:
+    """Parse archetypes.yaml into InvestigationArchetype objects."""
+    import yaml
+
+    with open(path, "r") as f:
+        data = yaml.safe_load(f)
+
+    archetypes = []
+    for entry in data.get("archetypes", []):
+        panels = []
+        for p in entry.get("panels", []):
+            queries = [
+                QueryTemplate(
+                    expr=q["expr"],
+                    legend_format=q.get("legend_format", ""),
+                    datasource_type=q.get("datasource_type", "prometheus"),
+                )
+                for q in p.get("queries", [])
+            ]
+            panels.append(PanelTemplate(
+                title=p["title"],
+                description=p.get("description", ""),
+                panel_type=p.get("panel_type", "timeseries"),
+                row=p.get("row", ""),
+                queries=queries,
+                unit=p.get("unit", ""),
+            ))
+        archetypes.append(InvestigationArchetype(
+            id=entry["id"],
+            name=entry["name"],
+            description=entry.get("description", ""),
+            problem_types=entry.get("problem_types", []),
+            required_metrics=entry.get("required_metrics", []),
+            panels=panels,
+            tags=entry.get("tags", []),
+            default_timerange=entry.get("default_timerange", "1h"),
+        ))
+    return archetypes
+
+
+def _build_registry() -> tuple[list[InvestigationArchetype], dict[str, InvestigationArchetype]]:
+    """Build archetype registry. YAML first, Python fallback."""
+    yaml_path = os.environ.get("DASHFORGE_ARCHETYPES_PATH")
+    if yaml_path:
+        candidates = [Path(yaml_path)]
+    else:
+        candidates = _DEFAULT_YAML_PATHS
+
+    for path in candidates:
+        if path.is_file():
+            try:
+                archetypes = _load_archetypes_from_yaml(path)
+                by_problem: dict[str, InvestigationArchetype] = {}
+                for arch in archetypes:
+                    for pt in arch.problem_types:
+                        by_problem[pt] = arch
+                logger.info(
+                    "archetypes_loaded_from_yaml",
+                    path=str(path),
+                    count=len(archetypes),
+                    problem_types=len(by_problem),
+                )
+                return archetypes, by_problem
+            except Exception as e:
+                logger.warning("archetypes_yaml_load_failed", path=str(path), error=str(e))
+
+    # Fallback to hardcoded Python definitions
+    archetypes = [LATENCY_INVESTIGATION, ERROR_SPIKE, GOLDEN_SIGNALS, RESOURCE_SATURATION]
+    by_problem = {}
+    for arch in archetypes:
+        for pt in arch.problem_types:
+            by_problem[pt] = arch
+    logger.info("archetypes_loaded_from_python", count=len(archetypes))
+    return archetypes, by_problem
+
+
+ALL_ARCHETYPES, _ARCHETYPE_BY_PROBLEM = _build_registry()
+
+
+def reload_archetypes() -> None:
+    """Hot-reload archetypes from YAML. Call after editing archetypes.yaml."""
+    global ALL_ARCHETYPES, _ARCHETYPE_BY_PROBLEM
+    ALL_ARCHETYPES, _ARCHETYPE_BY_PROBLEM = _build_registry()
+    logger.info("archetypes_reloaded", count=len(ALL_ARCHETYPES))
 
 
 def get_archetype(problem_type: str) -> InvestigationArchetype | None:
     """Look up an archetype by problem_type. Returns None if no match."""
     return _ARCHETYPE_BY_PROBLEM.get(problem_type)
+
+
+def get_archetypes_by_confidence(
+    archetype_matches: list,
+    min_confidence: float = 0.3,
+) -> list[tuple[InvestigationArchetype, float]]:
+    """Resolve multi-label archetypes to templates above *min_confidence*.
+
+    Parameters
+    ----------
+    archetype_matches : list[ArchetypeMatch]
+        From ``intent.archetypes`` — already sorted by confidence desc.
+    min_confidence : float
+        Minimum confidence to include (default 0.3).
+
+    Returns
+    -------
+    list[tuple[InvestigationArchetype, float]]
+        Matching (archetype_template, confidence) pairs, highest first.
+        Deduplicates: if two problem_types map to the same template,
+        only the higher-confidence entry is kept.
+    """
+    seen_ids: set[str] = set()
+    results: list[tuple[InvestigationArchetype, float]] = []
+
+    for match in archetype_matches:
+        if match.confidence < min_confidence:
+            continue
+        arch = _ARCHETYPE_BY_PROBLEM.get(match.type)
+        if arch is None or arch.id in seen_ids:
+            continue
+        seen_ids.add(arch.id)
+        results.append((arch, match.confidence))
+
+    return results
 
 
 def list_problem_types() -> list[str]:
