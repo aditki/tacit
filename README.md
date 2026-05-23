@@ -318,20 +318,26 @@ dashforge/
 - [x] Multi-label archetypes with confidence scores — incidents span multiple domains; intent agent returns ranked archetypes, engine blends panels from multiple templates
 - [x] Tiered validation suite — archetype accuracy (strict + soft), metric recall, critical metric recall, weighted recall, signal-to-noise ratio
 - [x] `uv`-based dependency management — faster installs, reproducible lockfile
+- [x] Production feedback system — dimensional SRE ratings (symptom visibility, root cause support, noise level, investigation speed, overall usefulness), SQLite-backed provenance tracking, aggregate stats
+- [x] Closed-loop metric ranking — feedback-driven quality scores automatically boost/penalize metrics in pre-ranking. No model retraining needed
+- [x] Feedback analysis & recommendations — per-archetype quality, noisy dashboard detection, archetype gap identification, metric quality scoring, confidence calibration, actionable recommendations (PRUNE, ADD SIGNAL, NEW ARCHETYPE, DEPRIORITIZE, RECALIBRATE)
+- [x] YAML archetype templates — editable `archetypes.yaml` with hot-reload API endpoint. Engineers update investigation templates without touching Python code
+- [x] Interactive API documentation — Swagger UI (`/docs`) and ReDoc (`/redoc`) with grouped endpoints, response schemas, and examples
+- [x] Input validation & SQL injection hardening — parameterized queries, UID regex validation, path parameter constraints
 
 ### Personal Use — Near Term
 
 - [ ] Ephemeral dashboard garbage collection (TTL-based cleanup)
 - [ ] Loki (log panel) support
 - [ ] Tempo (trace) support
-- [ ] Feedback loop: refine dashboards via follow-up messages
-- [ ] Alert context ingestion: auto-read alert payload as prompt
+- [ ] Conversational refinement — refine dashboards via follow-up messages (zoom, pivot, drill-down)
+- [ ] Alert context ingestion — auto-read alert payload as prompt
 - [ ] Dashboard versioning / history
 
 ### Enterprise — Architecture Evolution
 
 - [ ] **Metadata indexing layer** — background indexer → vector/relational metadata store, replacing live datasource introspection per request. Store metric names, label keys, common values, descriptions, usage frequency, service ownership, embeddings. Moves system from O(all metrics) to O(relevant metrics).
-- [ ] **Semantic retrieval before reasoning** — BM25 + embedding hybrid search to narrow 50k+ metrics → top 50 candidates before LLM. Mandatory for cost/latency/quality at scale.
+- [ ] **Semantic retrieval before reasoning** — BM25 + embedding hybrid search to narrow 50k+ metrics → top 50 candidates before LLM. Mandatory for cost/latency/quality at scale. (Current pre-ranking uses keyword/service relevance; embeddings would improve recall.)
 - [ ] **Deterministic query compiler** — extend archetype engine to full AST-based compilation for freeform path. LLM emits semantic intent AST, deterministic code generates validated PromQL/LogQL.
 - [ ] **Canonical Observability IR** — intermediate representation (`signal_type`, `resource_type`, `aggregation`, `scope`) that each datasource adapter maps to native queries. Scales portability without accumulating datasource-specific prompt hacks.
 - [ ] **Query cost planner** — cardinality estimation, time-range scoring, query complexity analysis, datasource load awareness. Like a database optimizer for observability queries.
@@ -342,20 +348,19 @@ dashforge/
 - [ ] **Query allowlists** — allowed metric families, labels, aggregations, functions. Compile from AST templates, not raw text.
 - [ ] **Multi-tenant RBAC** — RBAC-aware retrieval filtering by user/team/org/datasource permissions at every step, not just dashboard publishing.
 - [ ] **Slack hardening** — per-user/channel/workspace rate limits, approval workflows for production datasources, query cost estimation before execution.
-- [ ] **Audit logging & compliance** — dashboard provenance, prompt audit trail, PII exposure controls, data residency, LLM vendor routing.
+- [ ] **Audit logging & compliance** — PII exposure controls, data residency, LLM vendor routing. (Dashboard provenance and prompt audit trail already implemented via feedback store.)
 
 ### Enterprise — Reliability & Cost
 
 - [ ] **Circuit breakers & degradation** — retries with jitter, partial degradation, fallbacks, cancellation propagation for Grafana/Prometheus/CloudWatch/LLM failures.
-- [ ] **LLM cost optimization** — classifier models + local embeddings for intent/ranking, reserve large LLMs only for layout reasoning. Caching for common dashboard patterns.
-- [ ] **Self-observability** — DashForge exposes Prometheus metrics: prompt latency, query success rate, hallucination rate, dashboard usefulness, token cost, cache hit rate.
+- [ ] **LLM cost optimization** — classifier models + local embeddings for intent/ranking, reserve large LLMs only for layout reasoning. (Pre-ranking and LLM response caching already reduce token cost; next step is smaller models for classification.)
+- [ ] **Self-observability** — DashForge exposes Prometheus metrics: prompt latency, query success rate, hallucination rate, dashboard usefulness, token cost, cache hit rate. (Per-step pipeline telemetry already logged; next step is Prometheus `/metrics` endpoint.)
 - [ ] **Correctness validation** — heuristics for SRE best practices (counter vs gauge, correct aggregation, valid RED/USE metrics), golden dashboard templates, domain-specific validation rules.
 
 ### Enterprise — Integrations
 
 - [ ] Webex / Zoom integrations
 - [ ] Vendor-specific dashboards (Datadog, New Relic)
-- [ ] Conversational refinement (zoom, pivot, drill-down, compare time windows)
 
 ## License
 
