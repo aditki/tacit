@@ -198,13 +198,23 @@ curl -X POST http://localhost:8000/api/v1/chart \
 3. Add Bot Token Scopes: `app_mentions:read`, `chat:write`, `commands`
 4. Install the app to your workspace
 5. (Optional) Create a `/dashforge` slash command
-6. Set the three Slack env vars in `.env`:
+6. Add the Slack tokens to your config:
+
+   **Option A: CLI** — `dashforge init` will prompt for Slack tokens during interactive setup. They are stored in `~/.dashforge/.env`.
+
+   **Option B: Manual** — add to `~/.dashforge/.env` or your project `.env`:
    ```
    SLACK_BOT_TOKEN=xoxb-...
    SLACK_APP_TOKEN=xapp-...
    SLACK_SIGNING_SECRET=...
    ```
-7. Restart: `docker compose restart dashforge`
+
+7. Start the server:
+   ```bash
+   dashforge serve              # Slack enabled by default
+   dashforge serve --no-slack   # disable Slack integration
+   ```
+   Or with Docker: `docker compose restart dashforge`
 
 ### Usage
 
