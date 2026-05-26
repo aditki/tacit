@@ -232,6 +232,31 @@ Or use the slash command:
 
 The bot will reply with a link to the freshly created Grafana dashboard.
 
+## Splunk SignalFx (Direct Integration)
+
+DashForge can publish dashboards **directly to Splunk Observability Cloud** (SignalFx),
+in addition to Grafana. When enabled, each pipeline run creates both a Grafana dashboard
+and a native SignalFx dashboard with SignalFlow charts.
+
+### Setup
+
+1. Get a SignalFx API access token from **Settings → Access Tokens** in Splunk Observability Cloud
+2. Configure via `dashforge init` or add to `~/.dashforge/.env`:
+   ```
+   SIGNALFX_API_TOKEN=<your-token>
+   ```
+   And in `~/.dashforge/config.yaml`:
+   ```yaml
+   signalfx:
+     enabled: true
+     realm: us1       # us0, us1, us2, eu0, jp0, au0
+     dashboard_group: DashForge
+   ```
+3. Run `dashforge doctor` to verify connectivity
+
+When enabled, the API response includes `signalfx_url` and `signalfx_dashboard_id`
+alongside the standard Grafana fields.
+
 ## Architecture
 
 | Component | Description |
@@ -247,6 +272,7 @@ The bot will reply with a link to the freshly created Grafana dashboard.
 | **Query Builder LLM** | *(freeform fallback)* Generates PromQL/LogQL with accurate label selectors |
 | **Query Validation** | Verifies all panel queries return real series data; drops empty panels, blocks empty dashboards |
 | **Dashboard Publisher** | Assembles Grafana JSON model, creates/updates dashboards via API |
+| **SignalFx Publisher** | *(when enabled)* Creates native SignalFx charts + dashboards via v2 REST API |
 | **Web UI** | Simple browser interface at `/` for testing prompts |
 
 All agents use structured JSON output with Pydantic validation. The LLM layer is
@@ -276,6 +302,7 @@ pod-level metrics, Elasticsearch for log-derived data — all at once.
 | **Elasticsearch / OpenSearch** | Lucene | APM data, log fields |
 | **Graphite** | Graphite functions | Legacy dot-path metrics |
 | **InfluxDB** | InfluxQL / Flux | Time-series measurements |
+| **Splunk SignalFx** | SignalFlow | Splunk Observability Cloud, infrastructure & APM metrics |
 
 Each datasource type has a dedicated adapter that knows how to discover metrics
 through Grafana's proxy/resource APIs.  The LLM selects the best metrics across
@@ -294,6 +321,10 @@ dashforge/
 │   ├── cache.py             # TTL-based metadata & LLM response cache
 │   ├── ranking.py           # Pre-ranking: narrows metric catalog before LLM
 │   ├── history.py           # Investigation history store (SQLite)
+│   ├── signalfx/            # Direct Splunk SignalFx integration
+│   │   ├── client.py        # Async SignalFx v2 REST API client
+│   │   ├── discovery.py     # Direct metric discovery (reuses adapter's keyword map)
+│   │   └── publisher.py     # DashboardSpec → native SignalFx charts + dashboards
 │   ├── agents/
 │   │   ├── llm.py           # Provider-agnostic LLM helpers
 │   │   ├── intent.py        # Intent classification agent

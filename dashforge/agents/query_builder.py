@@ -56,6 +56,18 @@ Your job:
 - **influxql** (datasource_type: influxdb):
   Example: "SELECT mean(\"value\") FROM \"cpu\" WHERE host =~ /web/"
 
+- **signalflow** (datasource_type: grafana-signalfx-datasource/signalfx):
+  Use SignalFlow streaming analytics syntax. The "expr" field should be a
+  valid SignalFlow program.
+  Common functions: data(), filter(), publish(), mean(), sum(), count(),
+  percentile(), rate(), rollup(), timeshift(), alerts().
+  Use filter() for dimension filtering, not curly braces.
+  Example: data('cpu.utilization', filter=filter('host', 'web-*')).mean().publish(label='CPU')
+  Example: data('service.request.count', filter=filter('sf_environment', 'production')).sum().publish(label='Requests')
+  Example: (data('service.request.count', filter=filter('sf_error', 'true')) / data('service.request.count')).scale(100).publish(label='Error Rate %')
+  For rollups use: data('metric.name', rollup='rate').publish()
+  For percentiles: data('service.request.duration').percentile(pct=99).publish(label='P99')
+
 Panel construction rules:
 - Group related metrics into logical panels (e.g. combine request rate +
   error rate into one panel with two queries, even if from different datasources).

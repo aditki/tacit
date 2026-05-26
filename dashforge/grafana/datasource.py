@@ -18,6 +18,7 @@ SIGNAL_TYPE_MAP: dict[str, set[str]] = {
         "prometheus", "mimir", "cortex", "thanos",
         "cloudwatch", "graphite", "influxdb",
         "elasticsearch", "opensearch",
+        "grafana-signalfx-datasource", "signalfx",
     },
     "logs": {"loki", "elasticsearch", "opensearch"},
     "traces": {"tempo", "jaeger", "zipkin"},

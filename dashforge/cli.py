@@ -186,6 +186,17 @@ def _interactive_setup() -> dict:
         config["slack_app_token"] = _prompt("App token (xapp-...)", "")
         config["slack_signing_secret"] = _prompt("Signing secret", "")
 
+    # ── Splunk SignalFx (optional) ──
+    console.print()
+    if _confirm("Configure Splunk SignalFx (Observability Cloud) integration?", default=False):
+        _header("Splunk SignalFx")
+        config["signalfx_enabled"] = True
+        config["signalfx_api_token"] = _prompt("API token (SFx access token)", "")
+        config["signalfx_realm"] = _prompt("Realm (us0, us1, us2, eu0, jp0, au0)", "us1")
+        config["signalfx_dashboard_group"] = _prompt("Dashboard group name", "DashForge")
+    else:
+        config["signalfx_enabled"] = False
+
     config["log_level"] = "INFO"
     return config
 
@@ -198,6 +209,7 @@ def _split_config(config: dict) -> tuple[dict, dict]:
         "slack_bot_token": "SLACK_BOT_TOKEN",
         "slack_app_token": "SLACK_APP_TOKEN",
         "slack_signing_secret": "SLACK_SIGNING_SECRET",
+        "signalfx_api_token": "SIGNALFX_API_TOKEN",
     }
     yaml_config: dict = {}
     secrets: dict = {}
@@ -223,6 +235,19 @@ def _split_config(config: dict) -> tuple[dict, dict]:
     api_base = yaml_config.pop("llm_api_base", "")
     if api_base:
         structured["llm"]["api_base"] = api_base
+
+    # SignalFx config
+    sfx_enabled = yaml_config.pop("signalfx_enabled", False)
+    sfx_realm = yaml_config.pop("signalfx_realm", "")
+    sfx_group = yaml_config.pop("signalfx_dashboard_group", "")
+    if sfx_enabled or sfx_realm:
+        structured["signalfx"] = {
+            "enabled": sfx_enabled,
+        }
+        if sfx_realm:
+            structured["signalfx"]["realm"] = sfx_realm
+        if sfx_group:
+            structured["signalfx"]["dashboard_group"] = sfx_group
 
     structured["log_level"] = yaml_config.pop("log_level", "INFO")
 
@@ -274,7 +299,19 @@ def doctor():
     if arch_ok:
         checks_passed += 1
 
-    # 6. Cache dir
+    # 6. SignalFx connectivity (if enabled)
+    _check_signalfx_result = None
+    try:
+        from dashforge.config import settings as _sfx_settings
+        if _sfx_settings.signalfx_enabled and _sfx_settings.signalfx_api_token:
+            checks_total += 1
+            _check_signalfx_result = _check_signalfx()
+            if _check_signalfx_result:
+                checks_passed += 1
+    except Exception:
+        pass
+
+    # 7. Cache dir
     checks_total += 1
     data_dir = Path("data")
     if data_dir.exists():
@@ -416,6 +453,38 @@ def _check_archetypes() -> bool:
         return False
 
 
+def _check_signalfx() -> bool:
+    try:
+        import httpx
+        from dashforge.config import settings
+        realm = settings.signalfx_realm
+        token = settings.signalfx_api_token
+        if not token:
+            _warn("SignalFx: no API token configured")
+            return False
+
+        resp = httpx.get(
+            f"https://api.{realm}.signalfx.com/v2/metric",
+            headers={"X-SF-TOKEN": token},
+            params={"query": "*", "limit": 1},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            count = data.get("count", "?")
+            _success(f"SignalFx: connected to realm {realm} ({count} metrics)")
+            return True
+        elif resp.status_code == 401:
+            _fail(f"SignalFx: authentication failed (HTTP 401) — check API token")
+            return False
+        else:
+            _fail(f"SignalFx: HTTP {resp.status_code} from api.{realm}.signalfx.com")
+            return False
+    except Exception as e:
+        _fail(f"SignalFx: {e}")
+        return False
+
+
 # ── dashforge connect grafana ────────────────────────────────────────────────
 @cli.group()
 def connect():
@@ -470,6 +539,56 @@ def connect_grafana(url: Optional[str], api_key: Optional[str]):
         _ensure_config()
         _update_config({"grafana": {"url": url}})
         _update_env({"GRAFANA_API_KEY": api_key})
+        _success("Connection saved!")
+        _info("Run `dashforge doctor` to verify full setup")
+
+
+@connect.command("signalfx")
+@click.option("--token", default=None, help="SignalFx API access token")
+@click.option("--realm", default=None, help="SignalFx realm (us0, us1, us2, eu0, jp0, au0)")
+def connect_signalfx(token: Optional[str], realm: Optional[str]):
+    """Test and persist Splunk SignalFx connection."""
+    _header("Connect to Splunk SignalFx")
+    _load_env()
+
+    if realm is None:
+        realm = _prompt("Realm (us0, us1, us2, eu0, jp0, au0)", "us1")
+    if token is None:
+        token = _prompt("API access token", "")
+
+    if not token:
+        _fail("API token is required")
+        return
+
+    # Test connection
+    import httpx
+    try:
+        resp = httpx.get(
+            f"https://api.{realm}.signalfx.com/v2/metric",
+            headers={"X-SF-TOKEN": token},
+            params={"query": "*", "limit": 1},
+            timeout=10,
+        )
+        if resp.status_code == 401:
+            _fail("Authentication failed — check your API token")
+            return
+        if resp.status_code != 200:
+            _fail(f"Connection failed: HTTP {resp.status_code}")
+            return
+        data = resp.json()
+        count = data.get("count", "?")
+        _success(f"Connected to realm {realm} ({count} metrics available)")
+    except Exception as e:
+        _fail(f"Connection failed: {e}")
+        return
+
+    group_name = _prompt("Dashboard group name", "DashForge")
+
+    # Persist
+    if _confirm("Save this connection?", default=True):
+        _ensure_config()
+        _update_config({"signalfx": {"enabled": True, "realm": realm, "dashboard_group": group_name}})
+        _update_env({"SIGNALFX_API_TOKEN": token})
         _success("Connection saved!")
         _info("Run `dashforge doctor` to verify full setup")
 
@@ -604,6 +723,10 @@ def serve(host: str, port: int, reload: bool, no_slack: bool):
         _info("Slack: enabled")
     else:
         _info("Slack: disabled")
+    if settings.signalfx_enabled:
+        _info(f"SignalFx: enabled (realm={settings.signalfx_realm})")
+    else:
+        _info("SignalFx: disabled")
     console.print()
 
     uvicorn.run(

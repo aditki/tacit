@@ -91,6 +91,12 @@ class Settings(BaseSettings):
     grafana_api_key: str = Field(default="", repr=False)
     grafana_org_id: int = 1
 
+    # Splunk SignalFx (direct integration — publishes natively to Observability Cloud)
+    signalfx_enabled: bool = False
+    signalfx_api_token: str = Field(default="", repr=False)
+    signalfx_realm: str = "us1"  # us0, us1, us2, eu0, jp0, au0
+    signalfx_dashboard_group: str = "DashForge"
+
     # Slack
     slack_bot_token: str = Field(default="", repr=False)
     slack_app_token: str = Field(default="", repr=False)

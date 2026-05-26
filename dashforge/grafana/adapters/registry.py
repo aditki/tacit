@@ -10,6 +10,7 @@ from dashforge.grafana.adapters.graphite import GraphiteAdapter
 from dashforge.grafana.adapters.influxdb import InfluxDBAdapter
 from dashforge.grafana.adapters.loki import LokiAdapter
 from dashforge.grafana.adapters.prometheus import PrometheusAdapter
+from dashforge.grafana.adapters.signalfx import SignalFxAdapter
 from dashforge.models.schemas import DatasourceInfo
 
 logger = structlog.get_logger()
@@ -21,6 +22,7 @@ _ALL_ADAPTERS: list[DatasourceAdapter] = [
     ElasticsearchAdapter(),
     GraphiteAdapter(),
     InfluxDBAdapter(),
+    SignalFxAdapter(),
 ]
 
 _TYPE_MAP: dict[str, DatasourceAdapter] = {}

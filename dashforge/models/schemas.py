@@ -84,7 +84,7 @@ class MetricEntry(BaseModel):
     datasource_uid: str
     datasource_name: str
     datasource_type: str = Field(description="Grafana datasource type")
-    query_language: str = Field(description="Query language: promql, logql, cloudwatch, elasticsearch, graphite, influxql, flux")
+    query_language: str = Field(description="Query language: promql, logql, cloudwatch, elasticsearch, graphite, influxql, flux, signalflow")
     namespace: str = Field(default="", description="Metric namespace or group (e.g. 'AWS/ELB', 'node_exporter', 'kube-state-metrics')")
     dimensions: list[str] = Field(default_factory=list, description="Available dimensions / label names")
 
@@ -158,6 +158,8 @@ class DashResponse(BaseModel):
     dashboard_uid: str = Field(description="Unique Grafana dashboard UID")
     panel_count: int = Field(description="Number of panels in the generated dashboard")
     summary: str = Field(description="Human-readable summary of what was generated")
+    signalfx_url: str = Field(default="", description="SignalFx dashboard URL (when signalfx_enabled)")
+    signalfx_dashboard_id: str = Field(default="", description="SignalFx dashboard ID (when signalfx_enabled)")
 
 
 # ── Feedback ────────────────────────────────────────────────────────────────

@@ -287,6 +287,7 @@
           <div class="result-card success">
             <div class="result-label">Dashboard created</div>
             <div class="result-url"><a href="${dashUrl}" target="_blank">${data.dashboard_uid} &mdash; Open in Grafana &rarr;</a></div>
+            ${data.signalfx_url ? `<div class="result-url" style="margin-top:4px"><a href="${data.signalfx_url}" target="_blank">Open in SignalFx &rarr;</a></div>` : ''}
             <div class="result-meta">
               <strong>${data.panel_count}</strong> panels<br>
               ${data.summary.replace(/\n/g, '<br>')}

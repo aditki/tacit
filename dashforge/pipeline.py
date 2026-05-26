@@ -308,19 +308,39 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         url, uid = await publish_dashboard(client, dashboard_spec)
         timings["publish"] = time.monotonic() - t0
 
+        # ── 7b. Publish to SignalFx (if enabled) ─────────────────────
+        sfx_url, sfx_id = "", ""
+        if settings.signalfx_enabled and settings.signalfx_api_token:
+            t0 = time.monotonic()
+            logger.info("pipeline_step", step="signalfx_publish")
+            try:
+                from dashforge.signalfx.client import SignalFxClient
+                from dashforge.signalfx.publisher import publish_dashboard as sfx_publish
+                sfx_client = SignalFxClient()
+                try:
+                    sfx_url, sfx_id = await sfx_publish(sfx_client, dashboard_spec)
+                finally:
+                    await sfx_client.close()
+            except Exception:
+                logger.warning("signalfx_publish_failed", exc_info=True)
+            timings["signalfx_publish"] = time.monotonic() - t0
+
         path_used = "archetype" if ranked_archetypes else "freeform"
         ds_info = (
             ", ".join({e.datasource_name for e in metric_catalog[:5]})
             if ranked_archetypes
             else ", ".join({m.datasource_name for m in discovery.metrics})
         )
-        summary = (
+        summary_parts = [
             f"Created dashboard **{dashboard_spec.title}** with "
-            f"{len(dashboard_spec.panels)} panels.\n"
-            f"Timerange: last {dashboard_spec.timerange}\n"
-            f"Datasources used: {ds_info}\n"
-            f"Path: {path_used}"
-        )
+            f"{len(dashboard_spec.panels)} panels.",
+            f"Timerange: last {dashboard_spec.timerange}",
+            f"Datasources used: {ds_info}",
+            f"Path: {path_used}",
+        ]
+        if sfx_url:
+            summary_parts.append(f"SignalFx: {sfx_url}")
+        summary = "\n".join(summary_parts)
 
         total_s = time.monotonic() - t_start
         timings["total"] = total_s
@@ -395,6 +415,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             dashboard_uid=uid,
             panel_count=len(dashboard_spec.panels),
             summary=summary,
+            signalfx_url=sfx_url,
+            signalfx_dashboard_id=sfx_id,
         )
 
     finally:

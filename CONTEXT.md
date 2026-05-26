@@ -421,6 +421,7 @@ Each datasource type has a dedicated adapter in `dashforge/grafana/adapters/`:
 | Elasticsearch / OpenSearch | `elasticsearch.py` | Lucene |
 | Graphite | `graphite.py` | Graphite functions |
 | InfluxDB | `influxdb.py` | InfluxQL / Flux |
+| Splunk SignalFx | `signalfx.py` | SignalFlow |
 
 Adapters implement a common interface (`base.py`) for metric discovery through Grafana's
 proxy/resource APIs.
@@ -441,6 +442,10 @@ dashforge/
 │   ├── ranking.py           # Pre-ranking + feedback-driven quality scoring
 │   ├── feedback.py          # SQLite feedback store + analysis engine
 │   ├── history.py           # SQLite investigation history (full pipeline telemetry)
+│   ├── signalfx/            # Direct Splunk SignalFx integration
+│   │   ├── client.py        # Async SignalFx v2 REST API client
+│   │   ├── discovery.py     # Direct metric discovery (reuses adapter keyword map)
+│   │   └── publisher.py     # DashboardSpec → native SignalFx charts + dashboards
 │   ├── agents/
 │   │   ├── llm.py           # Provider-agnostic LLM caller (structured output)
 │   │   ├── intent.py        # Intent classification (multi-label archetypes)
@@ -579,6 +584,10 @@ python tests/validate.py --mode pipeline --api-url http://localhost:8000 --revie
 - **Investigation history** — full pipeline telemetry persisted in SQLite (`data/dashforge_history.db`).
   Stores: prompt, intent, archetypes, datasources, metrics catalog, selected metrics,
   generated queries, validation warnings, per-step timings, failures, dashboard URLs.
+- **Splunk SignalFx direct integration** — dual-publish to Splunk Observability Cloud.
+  Creates native SignalFx charts (SignalFlow) + dashboards via v2 REST API.
+  Config: `signalfx_enabled`, `signalfx_realm`, `signalfx_api_token`.
+  Reuses keyword→metric mapping from the Grafana adapter.
 
 ### Known Gaps / TODOs
 - `critical_metrics` column in test CSV is empty (validation falls back to unweighted)

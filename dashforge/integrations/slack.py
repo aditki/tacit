@@ -1,7 +1,6 @@
 """Slack Bot integration using Slack Bolt (Socket Mode)."""
 from __future__ import annotations
 
-import asyncio
 import re
 
 import structlog
@@ -25,6 +24,25 @@ def _strip_mention(text: str) -> str:
     return re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
 
 
+def _build_action_buttons(response) -> list[dict]:
+    """Build Slack action buttons for Grafana (and optionally SignalFx)."""
+    buttons = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Open in Grafana"},
+            "url": response.dashboard_url,
+            "style": "primary",
+        }
+    ]
+    if response.signalfx_url:
+        buttons.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Open in SignalFx"},
+            "url": response.signalfx_url,
+        })
+    return buttons
+
+
 @app.event("app_mention")
 async def handle_mention(event: dict, say):
     """Respond to @DashForge mentions in channels."""
@@ -41,7 +59,6 @@ async def handle_mention(event: dict, say):
         )
         return
 
-    # Acknowledge immediately
     await say(
         text=f"🔍 Analyzing: _{prompt}_\nBuilding your dashboard — this takes ~15-30 seconds…",
         thread_ts=thread_ts,
@@ -65,17 +82,7 @@ async def handle_mention(event: dict, say):
                         "text": f"✅ *Dashboard ready!*\n{response.summary}",
                     },
                 },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Open Dashboard"},
-                            "url": response.dashboard_url,
-                            "style": "primary",
-                        }
-                    ],
-                },
+                {"type": "actions", "elements": _build_action_buttons(response)},
             ]
             await say(blocks=blocks, text=response.summary, thread_ts=thread_ts)
         else:
@@ -119,17 +126,7 @@ async def handle_slash_command(ack, command, say):
                         "text": f"✅ *Dashboard ready!*\n{response.summary}",
                     },
                 },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Open Dashboard"},
-                            "url": response.dashboard_url,
-                            "style": "primary",
-                        }
-                    ],
-                },
+                {"type": "actions", "elements": _build_action_buttons(response)},
             ]
             await say(blocks=blocks, text=response.summary)
         else:
