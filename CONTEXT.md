@@ -581,5 +581,7 @@ python tests/validate.py --mode pipeline --api-url http://localhost:8000 --revie
 ### Roadmap (see README.md for full list)
 - **Near term**: Ephemeral dashboard TTL, Loki/Tempo support, conversational refinement,
   alert context ingestion, dashboard versioning
+- **Highest-leverage**: Grafana App Plugin — native "Investigate with DashForge" side panel
+  inside Grafana. Shifts from external service to native workflow. Zero context switch.
 - **Enterprise**: Metadata indexing, semantic retrieval, AST query compiler,
   Observability IR, query cost planner, RBAC, circuit breakers, self-observability

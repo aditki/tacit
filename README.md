@@ -406,6 +406,7 @@ dashforge/
 
 ### Enterprise — Integrations
 
+- [ ] **Grafana App Plugin** *(highest-leverage UX move)* — native "Investigate with DashForge" side panel inside Grafana. Shifts DashForge from external AI service to native Grafana workflow. Engineers trust tools inside Grafana far more than external systems. Plugin surfaces a prompt input in Grafana's sidebar, calls DashForge API, and opens the generated dashboard in-place — zero context switch.
 - [ ] Webex / Zoom integrations
 - [ ] Vendor-specific dashboards (Datadog, New Relic)
 
