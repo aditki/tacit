@@ -17,7 +17,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # ── Config file discovery ──────────────────────────────────────────────────
 # Priority: DASHFORGE_CONFIG env var → ./dashforge.yaml → ./dashforge.yml → None
 
-_CONFIG_SEARCH_PATHS = ["dashforge.yaml", "dashforge.yml", "config/dashforge.yaml"]
+_CONFIG_SEARCH_PATHS = [
+    "dashforge.yaml",
+    "dashforge.yml",
+    "config/dashforge.yaml",
+    str(Path.home() / ".dashforge" / "config.yaml"),
+]
 
 
 def _find_config_file() -> Path | None:
@@ -69,7 +74,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=[".env", str(Path.home() / ".dashforge" / ".env")],
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",

@@ -26,10 +26,12 @@ decomposition pattern.
 - **HTTP client**: httpx
 - **Logging**: structlog (structured JSON)
 - **Slack**: slack-bolt + slack-sdk (socket mode)
-- **Config**: Layered YAML (`dashforge.yaml`) + env vars + Pydantic Settings
+- **CLI**: Click + Rich — `dashforge init/doctor/connect/test/serve`
+- **Config**: Layered YAML (`dashforge.yaml` or `~/.dashforge/config.yaml`) + env vars + Pydantic Settings
 - **Persistence**: SQLite (feedback store) — in-memory TTLCache for metrics/LLM cache
 - **Dependency management**: `uv` with `pyproject.toml` + `uv.lock`
 - **SSL**: `truststore` package for system certificate store integration
+- **Binary distribution**: PyInstaller spec for single-binary builds
 
 ### Key Env Vars
 
@@ -135,6 +137,7 @@ for SRE teams.
 - Template placeholders: `{service_filter}`, `{container_filter}`, `{rate_interval}`
 - Panel types: timeseries, stat, gauge, table, logs
 - Hot reload: `reload_archetypes()` function, exposed via API
+- **Current count**: 41 archetypes, 176 panels, 153 problem_types
 
 **Tradeoff**: YAML is less expressive than Python for complex query logic — but
 investigation templates are fundamentally declarative (title + expression + unit), so
@@ -202,7 +205,8 @@ with config.
 env vars, non-sensitive config in YAML.
 
 **Implementation** (`config.py`):
-- Config file discovery: `DASHFORGE_CONFIG` env var → `./dashforge.yaml` → `./dashforge.yml`
+- Config file discovery: `DASHFORGE_CONFIG` env var → `./dashforge.yaml` → `./dashforge.yml` → `~/.dashforge/config.yaml`
+- Secrets loaded from `.env` and `~/.dashforge/.env`
 - Pydantic Settings with `SettingsConfigDict` for validation
 - YAML sections flattened: `{llm: {provider: x}}` → `{llm_provider: x}`
 
@@ -425,6 +429,7 @@ proxy/resource APIs.
 ```
 dashforge/
 ├── dashforge/
+│   ├── cli.py               # CLI: init, doctor, connect, test, serve (Click + Rich)
 │   ├── main.py              # FastAPI entrypoint (routes, auth, lifespan)
 │   ├── config.py            # Layered config: YAML + env vars + Pydantic
 │   ├── pipeline.py          # Orchestration: prompt → dashboard (8 steps)
@@ -459,8 +464,11 @@ dashforge/
 │   ├── dashforge_validation_prompts.csv  # 100-prompt test dataset
 │   └── README.md            # Validation documentation
 ├── dev/                     # Docker dev environment (Grafana, Prometheus, fake app)
-├── archetypes.yaml          # Editable investigation templates
+├── archetypes.yaml          # Editable investigation templates (41 archetypes)
 ├── dashforge.yaml.example   # Reference config
+├── dashforge.spec           # PyInstaller spec for single-binary builds
+├── scripts/
+│   └── build.sh             # Build single binary
 ├── docker-compose.yml
 ├── pyproject.toml           # uv-managed deps
 └── uv.lock                  # Reproducible lockfile
@@ -470,26 +478,65 @@ dashforge/
 
 ## 13. Running the Project
 
-```bash
-# Install deps
-uv sync
+### Option A: CLI (Recommended)
 
-# Start supporting services
+```bash
+# Install
+pip install -e .
+
+# Interactive setup — creates ~/.dashforge/config.yaml + .env
+dashforge init
+
+# Validate your setup
+dashforge doctor
+
+# Connect to Grafana (interactive)
+dashforge connect grafana
+
+# Run a sample investigation (opens dashboard in browser)
+dashforge test
+
+# Start the API server
+dashforge serve
+dashforge serve --port 9000 --reload  # dev mode
+dashforge serve --no-slack             # disable Slack
+```
+
+### Option B: Docker
+
+```bash
+# Start supporting services + DashForge
 docker compose up -d
 
 # Create Grafana service account token (Editor role)
 # Set GRAFANA_API_KEY in .env
+```
 
-# Run the server
-cd dashforge
-python -c "from dashforge.main import main; main()"
-# OR: dashforge (if installed as script)
+### Access Points
 
-# Access:
-# Web UI:   http://localhost:8000
-# Swagger:  http://localhost:8000/docs
-# ReDoc:    http://localhost:8000/redoc
-# Grafana:  http://localhost:3000 (admin/admin)
+| URL | Purpose |
+|---|---|
+| http://localhost:8000 | Web UI |
+| http://localhost:8000/docs | Swagger UI |
+| http://localhost:8000/redoc | ReDoc |
+| http://localhost:3000 | Grafana (admin/admin) |
+
+### CLI Commands Reference
+
+| Command | Purpose |
+|---|---|
+| `dashforge init` | Interactive setup wizard → `~/.dashforge/config.yaml` + `.env` |
+| `dashforge doctor` | Validate Grafana, datasources, LLM, archetypes, cache |
+| `dashforge connect grafana` | Test and persist Grafana connection |
+| `dashforge test [-p "prompt"]` | Run sample investigation, open dashboard in browser |
+| `dashforge serve [--port --reload --no-slack]` | Start API + Slack server |
+
+### Single Binary Distribution
+
+```bash
+./scripts/build.sh              # builds dist/dashforge
+sudo cp dist/dashforge /usr/local/bin/
+dashforge init && dashforge serve
 ```
 
 ### Validation
@@ -511,7 +558,7 @@ python tests/validate.py --mode pipeline --api-url http://localhost:8000 --revie
 
 ### What Works
 - Full pipeline: prompt → intent → metrics → query → dashboard → Grafana
-- Multi-label archetype blending
+- Multi-label archetype blending (41 archetypes, 176 panels, 153 problem types)
 - Pre-ranking with feedback-driven quality scoring
 - Feedback collection, analysis, and recommendations
 - YAML archetype templates with hot-reload
@@ -519,6 +566,9 @@ python tests/validate.py --mode pipeline --api-url http://localhost:8000 --revie
 - Swagger/ReDoc API documentation
 - Query validation (drops panels with no data)
 - 100-prompt validation suite with tiered metrics
+- **CLI** — `dashforge init/doctor/connect/test/serve` with Rich terminal UI
+- **Config discovery** — `~/.dashforge/config.yaml` + `~/.dashforge/.env`
+- **Single-binary distribution** — PyInstaller spec for macOS/Linux/Windows
 
 ### Known Gaps / TODOs
 - `critical_metrics` column in test CSV is empty (validation falls back to unweighted)

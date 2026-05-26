@@ -101,69 +101,67 @@ Inspired by [Uber's QueryGPT](https://www.uber.com/us/en/blog/query-gpt/) multi-
 
 ## Quick Start
 
-### Prerequisites
-
-- Docker & Docker Compose
-- An LLM API key (Anthropic, OpenAI, or a local Ollama instance)
-- (Optional) Slack Bot & App tokens for the Slack integration
-
-### 1. Clone & configure
+### Option A: CLI (Recommended)
 
 ```bash
-cd dashforge
+pip install -e .
 
-# Option A: YAML config (recommended) + env vars for secrets
-cp dashforge.yaml.example dashforge.yaml
-# Edit dashforge.yaml for non-sensitive settings
+# Interactive setup — walks you through Grafana URL, API key, LLM provider
+dashforge init
 
-# Option B: Flat .env file (still supported)
-cp .env.example .env
+# Validate everything is connected
+dashforge doctor
 
-# Either way, set secrets as env vars or in .env:
-#   LLM_API_KEY, GRAFANA_API_KEY, SLACK_BOT_TOKEN, etc.
+# Run a sample investigation (opens dashboard in your browser)
+dashforge test
+
+# Start the server
+dashforge serve
 ```
 
-### 2. Start the stack
+That's it. Three commands from zero to dashboard.
+
+### CLI Commands
+
+| Command | What it does |
+|---|---|
+| `dashforge init` | Interactive setup wizard → `~/.dashforge/config.yaml` + secrets in `~/.dashforge/.env` |
+| `dashforge doctor` | Validates Grafana connectivity, datasource permissions, LLM key, archetypes, cache state |
+| `dashforge connect grafana` | Test & persist a Grafana connection (interactive or `--url` / `--api-key` flags) |
+| `dashforge test [-p "custom prompt"]` | Runs a full investigation pipeline and opens the resulting dashboard |
+| `dashforge serve` | Starts the API server (+ Slack if configured) |
+
+`dashforge serve` options: `--host`, `--port`, `--reload` (dev mode), `--no-slack`.
+
+### Option B: Docker
 
 ```bash
 docker compose up -d
 ```
 
-This starts:
-- **Grafana** on [http://localhost:3000](http://localhost:3000) (admin/admin)
-- **Prometheus** on [http://localhost:9090](http://localhost:9090)
-- **Fake Metrics App** on [http://localhost:9091](http://localhost:9091) — generates realistic microservice metrics
-- **DashForge API + Web UI** on [http://localhost:8000](http://localhost:8000)
+This starts Grafana (`:3000`), Prometheus (`:9090`), a fake metrics app (`:9091`), and DashForge (`:8000`). Grafana is auto-provisioned with a Prometheus datasource and three simulated services.
 
-Grafana is auto-provisioned with a Prometheus datasource. The fake app simulates
-three services (`checkout-service`, `payment-api`, `inventory-db`) with HTTP, CPU,
-memory, database, and pod metrics.
+### Single Binary (no Python required)
 
-### API Documentation
+```bash
+# Build
+./scripts/build.sh
 
-Once the stack is running, interactive API docs are available at:
+# Install
+sudo cp dist/dashforge /usr/local/bin/
 
-| URL | Format |
-|-----|--------|
-| [http://localhost:8000/docs](http://localhost:8000/docs) | **Swagger UI** — interactive, try-it-out |
-| [http://localhost:8000/redoc](http://localhost:8000/redoc) | **ReDoc** — clean reference docs |
-| [http://localhost:8000/openapi.json](http://localhost:8000/openapi.json) | Raw OpenAPI 3.1 JSON schema |
+# Use
+dashforge init
+dashforge serve
+```
 
-Endpoints are grouped into:
-- **Dashboard Generation** — `POST /api/v1/chart`
-- **Feedback** — submit and retrieve human evaluation ratings
-- **Insights** — aggregate stats and actionable analysis/recommendations
-- **Archetypes** — list and hot-reload investigation templates
-- **System** — health check
-
-### 3. Create a Grafana service account token
+### Grafana Service Account
 
 1. Open Grafana → Administration → Service Accounts
 2. Create a service account with **Editor** role
-3. Generate a token and put it in `.env` as `GRAFANA_API_KEY`
-4. Restart: `docker compose restart dashforge`
+3. Generate a token — `dashforge init` will prompt for it, or set `GRAFANA_API_KEY` in your env
 
-### 4. Try it via the HTTP API
+### Try the HTTP API
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/chart \
@@ -171,7 +169,6 @@ curl -X POST http://localhost:8000/api/v1/chart \
   -d '{"prompt": "high CPU usage on prometheus server in the last 30 minutes"}'
 ```
 
-Response:
 ```json
 {
   "dashboard_url": "http://localhost:3000/d/abc123/...",
@@ -180,6 +177,14 @@ Response:
   "summary": "Created dashboard **CPU Investigation — prometheus** with 6 panels."
 }
 ```
+
+### API Documentation
+
+| URL | Format |
+|---|---|
+| [localhost:8000/docs](http://localhost:8000/docs) | **Swagger UI** — interactive |
+| [localhost:8000/redoc](http://localhost:8000/redoc) | **ReDoc** — reference docs |
+| [localhost:8000/openapi.json](http://localhost:8000/openapi.json) | OpenAPI 3.1 JSON |
 
 ## Slack Integration
 
@@ -268,6 +273,7 @@ through Grafana's proxy/resource APIs.  The LLM selects the best metrics across
 ```
 dashforge/
 ├── dashforge/
+│   ├── cli.py               # CLI: init, doctor, connect, test, serve (Click + Rich)
 │   ├── main.py              # FastAPI + Slack bot startup
 │   ├── config.py            # Layered config: YAML + env vars + Pydantic validation
 │   ├── pipeline.py          # Orchestration: prompt → dashboard
@@ -328,6 +334,9 @@ dashforge/
 ├── Dockerfile
 ├── pyproject.toml           # Project metadata & deps (uv)
 ├── dashforge.yaml.example   # Reference YAML config (schema-validated)
+├── dashforge.spec           # PyInstaller spec for single-binary builds
+├── scripts/
+│   └── build.sh             # Build single binary
 └── .env.example             # Reference env vars (secrets go here)
 ```
 
@@ -358,6 +367,10 @@ dashforge/
 - [x] YAML archetype templates — editable `archetypes.yaml` with hot-reload API endpoint. Engineers update investigation templates without touching Python code
 - [x] Interactive API documentation — Swagger UI (`/docs`) and ReDoc (`/redoc`) with grouped endpoints, response schemas, and examples
 - [x] Input validation & SQL injection hardening — parameterized queries, UID regex validation, path parameter constraints
+- [x] CLI (`dashforge init/doctor/connect/test/serve`) — Click + Rich, interactive setup wizard, connection validation, single-command startup
+- [x] Config discovery (`~/.dashforge/config.yaml` + `~/.dashforge/.env`) — secrets isolated at 0600 permissions
+- [x] Single-binary distribution — PyInstaller spec for macOS/Linux/Windows, `./scripts/build.sh`
+- [x] 41 investigation archetypes with 176 panels covering latency, errors, golden signals, Kubernetes, Kafka (5 archetypes), Redis, SQS, Lambda, DDoS, mTLS, capacity planning, and more
 
 ### Personal Use — Near Term
 
