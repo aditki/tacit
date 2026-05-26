@@ -615,6 +615,176 @@ def serve(host: str, port: int, reload: bool, no_slack: bool):
     )
 
 
+# ── dashforge history ─────────────────────────────────────────────────────
+@cli.group()
+def history():
+    """View investigation history and pipeline telemetry."""
+    pass
+
+
+@history.command("list")
+@click.option("--limit", "-n", default=20, type=int, help="Number of records")
+@click.option("--status", type=click.Choice(["success", "failed", "timeout"]), default=None)
+@click.option("--user", default=None, help="Filter by user ID")
+def history_list(limit: int, status: Optional[str], user: Optional[str]):
+    """List recent investigations."""
+    _load_env()
+    from dashforge.history import get_investigation_store
+    store = get_investigation_store()
+    investigations = store.list_recent(limit=limit, status=status, user_id=user)
+
+    if not investigations:
+        _info("No investigations found.")
+        return
+
+    if Table is not None:
+        table = Table(title=f"Recent Investigations ({len(investigations)})")
+        table.add_column("ID", style="dim", width=16)
+        table.add_column("Status", width=8)
+        table.add_column("Prompt", max_width=40)
+        table.add_column("Path", width=10)
+        table.add_column("Panels", justify="right", width=6)
+        table.add_column("Time", justify="right", width=7)
+        table.add_column("Archetypes", max_width=30)
+
+        for inv in investigations:
+            status_style = {
+                "success": "[green]success[/]",
+                "failed": "[red]failed[/]",
+                "timeout": "[yellow]timeout[/]",
+            }.get(inv["status"], inv["status"])
+
+            archetypes = inv.get("archetypes", [])
+            arch_str = ", ".join(
+                f"{a['type']}({a['confidence']:.0%})" for a in archetypes[:2]
+            ) if archetypes else "—"
+
+            table.add_row(
+                inv["id"],
+                status_style,
+                (inv["prompt"][:37] + "...") if len(inv["prompt"]) > 40 else inv["prompt"],
+                inv.get("path_used", "—"),
+                str(inv.get("panel_count", 0)),
+                f"{inv.get('total_time', 0):.1f}s",
+                arch_str,
+            )
+        console.print(table)
+    else:
+        for inv in investigations:
+            click.echo(f"  {inv['id']}  {inv['status']:8s}  {inv['prompt'][:50]}")
+
+
+@history.command("show")
+@click.argument("investigation_id")
+def history_show(investigation_id: str):
+    """Show full details of a single investigation."""
+    _load_env()
+    from dashforge.history import get_investigation_store
+    store = get_investigation_store()
+    inv = store.get(investigation_id)
+
+    if inv is None:
+        _fail(f"Investigation {investigation_id} not found")
+        return
+
+    _header(f"Investigation {inv['id']}")
+
+    # Status
+    status = inv["status"]
+    if status == "success":
+        _success(f"Status: {status}")
+    elif status == "failed":
+        _fail(f"Status: {status} — {inv.get('error', '')}")
+    else:
+        _warn(f"Status: {status}")
+
+    console.print()
+    _info(f"Prompt: {inv['prompt']}")
+    _info(f"User: {inv.get('user_id', '—')}")
+    _info(f"Time: {inv.get('total_time', 0):.2f}s")
+
+    # Intent
+    console.print()
+    _header("Intent")
+    _info(f"Summary: {inv.get('intent_summary', '—')}")
+    _info(f"Domain: {inv.get('intent_domain', '—')}")
+    _info(f"Services: {inv.get('intent_services', [])}")
+    _info(f"Keywords: {inv.get('intent_keywords', [])}")
+    _info(f"Problem type: {inv.get('problem_type', '—')}")
+    archetypes = inv.get("archetypes", [])
+    if archetypes:
+        arch_str = ", ".join(f"{a['type']} ({a['confidence']:.0%})" for a in archetypes)
+        _info(f"Archetypes: {arch_str}")
+
+    # Discovery
+    console.print()
+    _header("Discovery")
+    _info(f"Datasources: {inv.get('datasources_found', 0)} ({inv.get('datasource_types', [])})")
+    _info(f"Metric catalog: {inv.get('metrics_catalog_size', 0)} metrics")
+    _info(f"After ranking: {inv.get('metrics_ranked_size', 0)} metrics")
+    _info(f"Selected: {inv.get('metrics_selected', [])}")
+
+    # Queries
+    console.print()
+    _header("Queries")
+    _info(f"Path: {inv.get('path_used', '—')}")
+    _info(f"Panels: {inv.get('panel_count', 0)}")
+    queries = inv.get("generated_queries", [])
+    for q in queries[:10]:
+        _info(f"  [{q.get('panel_title', '?')}] {q.get('expr', '')[:80]}")
+    if len(queries) > 10:
+        _info(f"  ... and {len(queries) - 10} more")
+
+    # Validation
+    warnings = inv.get("validation_warnings", [])
+    if warnings:
+        console.print()
+        _header("Validation")
+        _info(f"Panels dropped: {inv.get('panels_dropped', 0)}")
+        for w in warnings[:5]:
+            _warn(w)
+
+    # Timings
+    timings = inv.get("timings", {})
+    if timings:
+        console.print()
+        _header("Timings")
+        for step, secs in timings.items():
+            _info(f"  {step}: {secs:.2f}s")
+
+    # Result
+    if inv.get("dashboard_url"):
+        console.print()
+        _success(f"Dashboard: {inv['dashboard_url']}")
+
+
+@history.command("stats")
+def history_stats():
+    """Show aggregate investigation statistics."""
+    _load_env()
+    from dashforge.history import get_investigation_store
+    store = get_investigation_store()
+    s = store.stats()
+
+    _header("Investigation Stats")
+    total = s.get("total", 0)
+    if total == 0:
+        _info("No investigations recorded yet.")
+        return
+
+    _info(f"Total: {total}")
+    _success(f"Succeeded: {s.get('succeeded', 0)}")
+    _fail(f"Failed: {s.get('failed', 0)}")
+    _warn(f"Timed out: {s.get('timed_out', 0)}")
+    console.print()
+    _info(f"Avg time: {s.get('avg_time', 0):.2f}s")
+    _info(f"Avg panels: {s.get('avg_panels', 0):.1f}")
+    _info(f"Avg catalog size: {s.get('avg_catalog_size', 0):.0f} metrics")
+    console.print()
+    _info(f"Archetype path: {s.get('archetype_path', 0)}")
+    _info(f"Freeform path: {s.get('freeform_path', 0)}")
+
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 def main():
     cli()

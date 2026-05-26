@@ -130,6 +130,9 @@ That's it. Three commands from zero to dashboard.
 | `dashforge connect grafana` | Test & persist a Grafana connection (interactive or `--url` / `--api-key` flags) |
 | `dashforge test [-p "custom prompt"]` | Runs a full investigation pipeline and opens the resulting dashboard |
 | `dashforge serve` | Starts the API server (+ Slack if configured) |
+| `dashforge history list` | List recent investigations with status, timings, archetypes |
+| `dashforge history show <id>` | Full investigation detail (intent → metrics → queries → result) |
+| `dashforge history stats` | Aggregate stats: success rates, avg time, path distribution |
 
 `dashforge serve` options: `--host`, `--port`, `--reload` (dev mode), `--no-slack`.
 
@@ -273,13 +276,14 @@ through Grafana's proxy/resource APIs.  The LLM selects the best metrics across
 ```
 dashforge/
 ├── dashforge/
-│   ├── cli.py               # CLI: init, doctor, connect, test, serve (Click + Rich)
+│   ├── cli.py               # CLI: init, doctor, connect, test, serve, history
 │   ├── main.py              # FastAPI + Slack bot startup
 │   ├── config.py            # Layered config: YAML + env vars + Pydantic validation
 │   ├── pipeline.py          # Orchestration: prompt → dashboard
 │   ├── validation.py        # Pre-publish query validation
 │   ├── cache.py             # TTL-based metadata & LLM response cache
 │   ├── ranking.py           # Pre-ranking: narrows metric catalog before LLM
+│   ├── history.py           # Investigation history store (SQLite)
 │   ├── agents/
 │   │   ├── llm.py           # Provider-agnostic LLM helpers
 │   │   ├── intent.py        # Intent classification agent
@@ -371,6 +375,7 @@ dashforge/
 - [x] Config discovery (`~/.dashforge/config.yaml` + `~/.dashforge/.env`) — secrets isolated at 0600 permissions
 - [x] Single-binary distribution — PyInstaller spec for macOS/Linux/Windows, `./scripts/build.sh`
 - [x] 41 investigation archetypes with 176 panels covering latency, errors, golden signals, Kubernetes, Kafka (5 archetypes), Redis, SQS, Lambda, DDoS, mTLS, capacity planning, and more
+- [x] Investigation history — full pipeline telemetry persisted in SQLite: prompt, intent, archetypes, datasources, metrics, queries, validation, per-step timings, failures, dashboard URLs. API + CLI (`dashforge history list/show/stats`)
 
 ### Personal Use — Near Term
 

@@ -240,6 +240,9 @@ dashboard_uid values.
 | `GET` | `/api/v1/feedback/{dashboard_uid}` | Feedback | Provenance + feedback for a dashboard |
 | `POST` | `/api/v1/archetypes/reload` | Archetypes | Hot-reload from YAML |
 | `GET` | `/api/v1/archetypes` | Archetypes | List loaded archetypes |
+| `GET` | `/api/v1/investigations` | History | List recent investigations (filter by status, user) |
+| `GET` | `/api/v1/investigations/stats` | History | Aggregate investigation stats |
+| `GET` | `/api/v1/investigations/{id}` | History | Full investigation detail |
 
 **Auth**: Optional `X-API-Key` header (when `API_AUTH_ENABLED=true`).
 
@@ -429,7 +432,7 @@ proxy/resource APIs.
 ```
 dashforge/
 ├── dashforge/
-│   ├── cli.py               # CLI: init, doctor, connect, test, serve (Click + Rich)
+│   ├── cli.py               # CLI: init, doctor, connect, test, serve, history (Click + Rich)
 │   ├── main.py              # FastAPI entrypoint (routes, auth, lifespan)
 │   ├── config.py            # Layered config: YAML + env vars + Pydantic
 │   ├── pipeline.py          # Orchestration: prompt → dashboard (8 steps)
@@ -437,6 +440,7 @@ dashforge/
 │   ├── cache.py             # In-memory TTL cache (metric_cache + llm_cache)
 │   ├── ranking.py           # Pre-ranking + feedback-driven quality scoring
 │   ├── feedback.py          # SQLite feedback store + analysis engine
+│   ├── history.py           # SQLite investigation history (full pipeline telemetry)
 │   ├── agents/
 │   │   ├── llm.py           # Provider-agnostic LLM caller (structured output)
 │   │   ├── intent.py        # Intent classification (multi-label archetypes)
@@ -530,6 +534,9 @@ docker compose up -d
 | `dashforge connect grafana` | Test and persist Grafana connection |
 | `dashforge test [-p "prompt"]` | Run sample investigation, open dashboard in browser |
 | `dashforge serve [--port --reload --no-slack]` | Start API + Slack server |
+| `dashforge history list [-n --status --user]` | List recent investigations (Rich table) |
+| `dashforge history show <id>` | Full investigation detail (intent, metrics, queries, timings) |
+| `dashforge history stats` | Aggregate stats (success/fail rates, avg time, path distribution) |
 
 ### Single Binary Distribution
 
@@ -566,9 +573,12 @@ python tests/validate.py --mode pipeline --api-url http://localhost:8000 --revie
 - Swagger/ReDoc API documentation
 - Query validation (drops panels with no data)
 - 100-prompt validation suite with tiered metrics
-- **CLI** — `dashforge init/doctor/connect/test/serve` with Rich terminal UI
+- **CLI** — `dashforge init/doctor/connect/test/serve/history` with Rich terminal UI
 - **Config discovery** — `~/.dashforge/config.yaml` + `~/.dashforge/.env`
 - **Single-binary distribution** — PyInstaller spec for macOS/Linux/Windows
+- **Investigation history** — full pipeline telemetry persisted in SQLite (`data/dashforge_history.db`).
+  Stores: prompt, intent, archetypes, datasources, metrics catalog, selected metrics,
+  generated queries, validation warnings, per-step timings, failures, dashboard URLs.
 
 ### Known Gaps / TODOs
 - `critical_metrics` column in test CSV is empty (validation falls back to unweighted)

@@ -24,6 +24,7 @@ from dashforge.grafana.datasource import (
     list_datasources,
 )
 from dashforge.models.schemas import DashRequest, DashResponse
+from dashforge.history import get_investigation_store
 from dashforge.ranking import prerank_metrics
 
 logger = structlog.get_logger()
@@ -50,6 +51,12 @@ async def run_pipeline(request: DashRequest) -> DashResponse:
             )
         except asyncio.TimeoutError:
             logger.error("pipeline_timeout", user=request.user_id, timeout=settings.pipeline_timeout_seconds)
+            try:
+                store = get_investigation_store()
+                inv_id = store.start(request.prompt, request.user_id, request.channel_id)
+                store.finish(inv_id, status="timeout", error=f"Timed out after {settings.pipeline_timeout_seconds}s")
+            except Exception:
+                pass
             return DashResponse(
                 dashboard_url="",
                 dashboard_uid="",
@@ -64,6 +71,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
     client = GrafanaClient()
     t_start = time.monotonic()
     timings: dict[str, float] = {}
+    history = get_investigation_store()
+    inv_id = history.start(request.prompt, request.user_id or "", request.channel_id or "")
 
     try:
         # ── 1. Intent Agent ──────────────────────────────────────────
@@ -74,6 +83,21 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     channel_id=request.channel_id)
         intent = await classify_intent(request.prompt)
         timings["intent"] = time.monotonic() - t0
+
+        try:
+            history.record_intent(
+                inv_id,
+                summary=intent.summary,
+                domain=intent.domain,
+                services=intent.services,
+                keywords=intent.keywords,
+                signals=[s.value for s in intent.signals],
+                problem_type=intent.problem_type,
+                archetypes=[{"type": a.type, "confidence": a.confidence} for a in intent.archetypes],
+                timerange=intent.timerange,
+            )
+        except Exception:
+            logger.warning("history_record_intent_failed", exc_info=True)
 
         # ── 2. Context enrichment (optional) ───────────────────
         t0 = time.monotonic()
@@ -99,6 +123,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             searchable_ds = filter_searchable_datasources(all_ds)
 
         if not searchable_ds:
+            history.finish(inv_id, status="failed", error="No searchable datasources found",
+                           timings=timings, total_time=time.monotonic() - t_start)
             return DashResponse(
                 dashboard_url="",
                 dashboard_uid="",
@@ -119,7 +145,19 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         metric_catalog = await discover_all_metrics(client, searchable_ds, intent.keywords)
         timings["metrics_fetch"] = time.monotonic() - t0
 
+        try:
+            history.record_discovery(
+                inv_id,
+                datasources_found=len(searchable_ds),
+                datasource_types=ds_types,
+                metrics_catalog_size=len(metric_catalog),
+            )
+        except Exception:
+            logger.warning("history_record_discovery_failed", exc_info=True)
+
         if not metric_catalog:
+            history.finish(inv_id, status="failed", error="No metrics found",
+                           timings=timings, total_time=time.monotonic() - t_start)
             return DashResponse(
                 dashboard_url="",
                 dashboard_uid="",
@@ -185,6 +223,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     llm_cache.set(discovery_cache_key, discovery)
 
             if not discovery.metrics:
+                history.finish(inv_id, status="failed", error="No relevant metrics found by LLM",
+                               timings=timings, total_time=time.monotonic() - t_start)
                 return DashResponse(
                     dashboard_url="",
                     dashboard_uid="",
@@ -205,6 +245,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 logger.warning("llm_hallucinated_uids_dropped", dropped=dropped)
 
             if not discovery.metrics:
+                history.finish(inv_id, status="failed", error="All LLM-selected metrics had invalid datasource UIDs",
+                               timings=timings, total_time=time.monotonic() - t_start)
                 return DashResponse(
                     dashboard_url="",
                     dashboard_uid="",
@@ -227,7 +269,29 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         )
         timings["query_validation"] = time.monotonic() - t0
 
+        # Record queries before validation
+        try:
+            queries_for_history = [
+                {"expr": q.expr, "panel_title": p.title}
+                for p in dashboard_spec.panels for q in p.queries if q.expr
+            ]
+            metrics_for_history = list({
+                q.expr.split("{")[0].split("(")[-1].strip()
+                for p in dashboard_spec.panels for q in p.queries if q.expr
+            })
+            history.record_queries(
+                inv_id,
+                metrics_selected=metrics_for_history,
+                generated_queries=queries_for_history,
+                panel_count=len(dashboard_spec.panels),
+                path_used="archetype" if ranked_archetypes else "freeform",
+            )
+        except Exception:
+            logger.warning("history_record_queries_failed", exc_info=True)
+
         if not dashboard_spec.panels:
+            history.finish(inv_id, status="failed", error="All panels empty after validation",
+                           timings=timings, total_time=time.monotonic() - t_start)
             return DashResponse(
                 dashboard_url="",
                 dashboard_uid="",
@@ -262,6 +326,18 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         timings["total"] = total_s
         timings_rounded = {k: round(v, 2) for k, v in timings.items()}
 
+        # Record validation results
+        try:
+            pre_validation_panels = len(dashboard_spec.panels) + len(validation_warnings)
+            history.record_validation(
+                inv_id,
+                warnings=validation_warnings,
+                panels_dropped=pre_validation_panels - len(dashboard_spec.panels),
+                final_panel_count=len(dashboard_spec.panels),
+            )
+        except Exception:
+            logger.warning("history_record_validation_failed", exc_info=True)
+
         logger.info(
             "pipeline_complete",
             user_id=request.user_id,
@@ -271,6 +347,19 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             path=path_used,
             timings=timings_rounded,
         )
+
+        # Record final result
+        try:
+            history.finish(
+                inv_id,
+                status="success",
+                dashboard_uid=uid,
+                dashboard_url=url,
+                timings=timings_rounded,
+                total_time=total_s,
+            )
+        except Exception:
+            logger.warning("history_finish_failed", exc_info=True)
 
         # ── 8. Record provenance for feedback system ──────────────────
         try:

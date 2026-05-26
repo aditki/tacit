@@ -332,6 +332,65 @@ async def list_archetypes():
     }
 
 
+# ── Investigation history ─────────────────────────────────────────────────
+
+@app.get(
+    "/api/v1/investigations",
+    dependencies=[Depends(verify_api_key)],
+    tags=["History"],
+    summary="List recent investigations",
+    response_description="Investigation history with intent, metrics, queries, timings, and results",
+)
+async def list_investigations(
+    limit: int = 50,
+    offset: int = 0,
+    status: str | None = None,
+    user_id: str | None = None,
+):
+    """List recent investigation runs, newest first.
+
+    Includes full pipeline telemetry: intent classification, datasource discovery,
+    metric selection, generated queries, validation warnings, timings, and results."""
+    from dashforge.history import get_investigation_store
+    store = get_investigation_store()
+    investigations = store.list_recent(limit=limit, offset=offset, status=status, user_id=user_id)
+    return {"count": len(investigations), "investigations": investigations}
+
+
+@app.get(
+    "/api/v1/investigations/stats",
+    dependencies=[Depends(verify_api_key)],
+    tags=["History"],
+    summary="Investigation aggregate stats",
+    response_description="Aggregate statistics across all investigations",
+)
+async def investigation_stats():
+    """Aggregate stats: success/failure rates, avg timings, path distribution."""
+    from dashforge.history import get_investigation_store
+    store = get_investigation_store()
+    return store.stats()
+
+
+@app.get(
+    "/api/v1/investigations/{investigation_id}",
+    dependencies=[Depends(verify_api_key)],
+    tags=["History"],
+    summary="Get investigation details",
+    response_description="Full investigation record with all pipeline data",
+)
+async def get_investigation(investigation_id: str):
+    """Get full details of a single investigation by ID.
+
+    Returns the complete pipeline trace: prompt, intent, archetypes,
+    datasources, metrics, queries, validation, timings, and result."""
+    from dashforge.history import get_investigation_store
+    store = get_investigation_store()
+    inv = store.get(investigation_id)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    return inv
+
+
 def main():
     log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
     structlog.configure(

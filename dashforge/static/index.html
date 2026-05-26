@@ -141,6 +141,38 @@
       display: inline-block; background: #2d3040; border-radius: 12px;
       padding: 0.15rem 0.5rem; font-size: 0.7rem; color: #9ca3af; margin-right: 0.3rem;
     }
+
+    /* History */
+    .hist-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    .hist-table th {
+      text-align: left; padding: 0.5rem; color: #6b7280; border-bottom: 1px solid #2d3040;
+      font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .hist-table td { padding: 0.5rem; border-bottom: 1px solid #1a1d27; color: #9ca3af; }
+    .hist-table tr:hover td { background: #1a1d27; }
+    .hist-table .prompt-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .badge {
+      display: inline-block; padding: 0.15rem 0.5rem; border-radius: 10px;
+      font-size: 0.7rem; font-weight: 600;
+    }
+    .badge-success { background: #064e3b; color: #34d399; }
+    .badge-failed { background: #450a0a; color: #fca5a5; }
+    .badge-timeout { background: #451a03; color: #fbbf24; }
+    .badge-running { background: #1e1b4b; color: #a5b4fc; }
+    .hist-detail { background: #0f1117; border: 1px solid #2d3040; border-radius: 8px; padding: 1rem; margin-top: 0.75rem; }
+    .hist-detail h4 { font-size: 0.8rem; color: #6b7280; text-transform: uppercase; margin: 0.75rem 0 0.3rem; letter-spacing: 0.04em; }
+    .hist-detail h4:first-child { margin-top: 0; }
+    .hist-detail .kv { font-size: 0.82rem; color: #9ca3af; line-height: 1.6; }
+    .hist-detail .kv strong { color: #c7d2fe; }
+    .hist-query { background: #1a1d27; border-radius: 6px; padding: 0.4rem 0.6rem; margin: 0.2rem 0; font-size: 0.78rem; font-family: 'SF Mono', monospace; color: #a5b4fc; word-break: break-all; }
+    .hist-timing { display: inline-block; background: #1a1d27; border-radius: 6px; padding: 0.2rem 0.5rem; margin: 0.15rem; font-size: 0.75rem; color: #9ca3af; }
+    .hist-controls { display: flex; gap: 0.5rem; margin-bottom: 1rem; align-items: center; flex-wrap: wrap; }
+    .hist-controls select {
+      background: #0f1117; border: 1px solid #3b3f54; border-radius: 6px;
+      color: #e4e6eb; padding: 0.35rem 0.6rem; font-size: 0.82rem;
+    }
+    .hist-back { cursor: pointer; color: #6366f1; font-size: 0.82rem; }
+    .hist-back:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -151,6 +183,7 @@
     <div class="tab active" onclick="switchTab('generate')">Generate</div>
     <div class="tab" onclick="switchTab('insights')">Insights</div>
     <div class="tab" onclick="switchTab('archetypes')">Archetypes</div>
+    <div class="tab" onclick="switchTab('history')">History</div>
   </div>
 
   <!-- Generate tab -->
@@ -179,6 +212,25 @@
     </div>
   </div>
 
+  <!-- History tab -->
+  <div class="tab-content" id="tab-history">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+        <div class="result-label" style="margin:0">Investigation History</div>
+        <div class="hist-controls" style="margin:0">
+          <select id="hist-status" onchange="loadHistory()">
+            <option value="">All statuses</option>
+            <option value="success">Success</option>
+            <option value="failed">Failed</option>
+            <option value="timeout">Timeout</option>
+          </select>
+          <button class="btn-secondary btn-sm" onclick="loadHistoryStats()">Stats</button>
+        </div>
+      </div>
+      <div id="history-content"><div class="status">Click to load history</div></div>
+    </div>
+  </div>
+
   <!-- Archetypes tab -->
   <div class="tab-content" id="tab-archetypes">
     <div class="card">
@@ -199,9 +251,10 @@
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
       document.querySelector(`#tab-${name}`).classList.add('active');
-      document.querySelectorAll('.tab')[['generate','insights','archetypes'].indexOf(name)].classList.add('active');
+      document.querySelectorAll('.tab')[['generate','insights','archetypes','history'].indexOf(name)].classList.add('active');
       if (name === 'insights') loadInsights();
       if (name === 'archetypes') loadArchetypes();
+      if (name === 'history') loadHistory();
     }
 
     function fill(el) { document.getElementById('prompt').value = el.textContent; }
@@ -398,6 +451,151 @@
         loadArchetypes();
       } catch(e) { alert('Reload failed: ' + e.message); }
     }
+
+    /* ── History tab ──────────────────────────────────────────── */
+    async function loadHistory() {
+      const el = document.getElementById('history-content');
+      el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      const status = document.getElementById('hist-status').value;
+      const qs = status ? `?status=${status}&limit=50` : '?limit=50';
+      try {
+        const resp = await fetch(`${BASE}/api/v1/investigations${qs}`);
+        const data = await resp.json();
+        if (!data.investigations || data.investigations.length === 0) {
+          el.innerHTML = '<div class="status">No investigations yet. Generate a dashboard to see history.</div>';
+          return;
+        }
+        let html = `<table class="hist-table"><thead><tr>
+          <th>Status</th><th>Prompt</th><th>Path</th><th>Panels</th><th>Time</th><th>Archetypes</th><th></th>
+        </tr></thead><tbody>`;
+        for (const inv of data.investigations) {
+          const badge = statusBadge(inv.status);
+          const prompt = inv.prompt.length > 50 ? inv.prompt.slice(0, 47) + '...' : inv.prompt;
+          const archs = (inv.archetypes || []).slice(0, 2).map(a => `${a.type}(${Math.round(a.confidence*100)}%)`).join(', ') || '—';
+          html += `<tr>
+            <td>${badge}</td>
+            <td class="prompt-cell" title="${esc(inv.prompt)}">${esc(prompt)}</td>
+            <td>${inv.path_used || '—'}</td>
+            <td>${inv.panel_count}</td>
+            <td>${inv.total_time ? inv.total_time.toFixed(1) + 's' : '—'}</td>
+            <td style="font-size:0.75rem">${esc(archs)}</td>
+            <td><span class="hist-back" onclick="showInvestigation('${inv.id}')">Details</span></td>
+          </tr>`;
+        }
+        html += '</tbody></table>';
+        el.innerHTML = html;
+      } catch (e) {
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${e.message}</div>`;
+      }
+    }
+
+    async function showInvestigation(id) {
+      const el = document.getElementById('history-content');
+      el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      try {
+        const resp = await fetch(`${BASE}/api/v1/investigations/${id}`);
+        if (!resp.ok) throw new Error('Not found');
+        const inv = await resp.json();
+        const badge = statusBadge(inv.status);
+        const archs = (inv.archetypes || []).map(a => `${a.type} (${Math.round(a.confidence*100)}%)`).join(', ') || '—';
+        const metrics = (inv.metrics_selected || []).join(', ') || '—';
+        const dsTypes = (inv.datasource_types || []).join(', ') || '—';
+
+        let queriesHtml = '';
+        for (const q of (inv.generated_queries || []).slice(0, 15)) {
+          queriesHtml += `<div class="hist-query"><strong>${esc(q.panel_title || '?')}:</strong> ${esc(q.expr || '')}</div>`;
+        }
+        if ((inv.generated_queries || []).length > 15) queriesHtml += `<div style="font-size:0.78rem;color:#6b7280">... and ${inv.generated_queries.length - 15} more</div>`;
+
+        let timingsHtml = '';
+        for (const [step, secs] of Object.entries(inv.timings || {})) {
+          timingsHtml += `<span class="hist-timing">${step}: ${Number(secs).toFixed(2)}s</span>`;
+        }
+
+        let warningsHtml = '';
+        for (const w of (inv.validation_warnings || []).slice(0, 5)) {
+          warningsHtml += `<div style="font-size:0.78rem;color:#fbbf24">⚠ ${esc(w)}</div>`;
+        }
+
+        el.innerHTML = `
+          <span class="hist-back" onclick="loadHistory()">&larr; Back to list</span>
+          <div class="hist-detail">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <span style="font-size:0.75rem;color:#6b7280">${inv.id}</span>
+              ${badge}
+            </div>
+            ${inv.error ? `<div style="color:#fca5a5;font-size:0.82rem;margin-top:0.3rem">${esc(inv.error)}</div>` : ''}
+
+            <h4>Prompt</h4>
+            <div class="kv">${esc(inv.prompt)}</div>
+
+            <h4>Intent</h4>
+            <div class="kv">
+              <strong>Summary:</strong> ${esc(inv.intent_summary || '—')}<br>
+              <strong>Domain:</strong> ${esc(inv.intent_domain || '—')}<br>
+              <strong>Services:</strong> ${esc((inv.intent_services || []).join(', ') || '—')}<br>
+              <strong>Keywords:</strong> ${esc((inv.intent_keywords || []).join(', ') || '—')}<br>
+              <strong>Problem type:</strong> ${esc(inv.problem_type || '—')}<br>
+              <strong>Archetypes:</strong> ${esc(archs)}<br>
+              <strong>Timerange:</strong> ${esc(inv.timerange || '—')}
+            </div>
+
+            <h4>Discovery</h4>
+            <div class="kv">
+              <strong>Datasources:</strong> ${inv.datasources_found || 0} (${esc(dsTypes)})<br>
+              <strong>Metric catalog:</strong> ${inv.metrics_catalog_size || 0} metrics<br>
+              <strong>After ranking:</strong> ${inv.metrics_ranked_size || 0}<br>
+              <strong>Selected:</strong> ${esc(metrics)}
+            </div>
+
+            <h4>Queries (${inv.panel_count || 0} panels, ${esc(inv.path_used || '—')} path)</h4>
+            ${queriesHtml || '<div class="kv">No queries recorded</div>'}
+
+            ${warningsHtml ? `<h4>Validation</h4><div class="kv"><strong>Panels dropped:</strong> ${inv.panels_dropped || 0}</div>${warningsHtml}` : ''}
+
+            <h4>Timings</h4>
+            <div>${timingsHtml || '<span class="kv">—</span>'}</div>
+
+            ${inv.dashboard_url ? `<h4>Result</h4><div class="kv"><a href="${inv.dashboard_url}" target="_blank" style="color:#6366f1">${inv.dashboard_url} &rarr;</a></div>` : ''}
+          </div>`;
+      } catch (e) {
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${e.message}</div>`;
+      }
+    }
+
+    async function loadHistoryStats() {
+      const el = document.getElementById('history-content');
+      el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      try {
+        const resp = await fetch(`${BASE}/api/v1/investigations/stats`);
+        const s = await resp.json();
+        if (!s.total) {
+          el.innerHTML = '<div class="status">No investigations recorded yet.</div>';
+          return;
+        }
+        el.innerHTML = `
+          <span class="hist-back" onclick="loadHistory()">&larr; Back to list</span>
+          <div class="stats-grid" style="margin-top:0.75rem">
+            <div class="stat-card"><div class="stat-value">${s.total}</div><div class="stat-label">Total investigations</div></div>
+            <div class="stat-card"><div class="stat-value" style="color:#34d399">${s.succeeded || 0}</div><div class="stat-label">Succeeded</div></div>
+            <div class="stat-card"><div class="stat-value" style="color:#fca5a5">${s.failed || 0}</div><div class="stat-label">Failed</div></div>
+            <div class="stat-card"><div class="stat-value" style="color:#fbbf24">${s.timed_out || 0}</div><div class="stat-label">Timed out</div></div>
+            <div class="stat-card"><div class="stat-value">${s.avg_time ? s.avg_time.toFixed(1) + 's' : '—'}</div><div class="stat-label">Avg time</div></div>
+            <div class="stat-card"><div class="stat-value">${s.avg_panels ? s.avg_panels.toFixed(1) : '—'}</div><div class="stat-label">Avg panels</div></div>
+            <div class="stat-card"><div class="stat-value">${s.avg_catalog_size ? Math.round(s.avg_catalog_size) : '—'}</div><div class="stat-label">Avg catalog size</div></div>
+            <div class="stat-card"><div class="stat-value">${s.archetype_path || 0} / ${s.freeform_path || 0}</div><div class="stat-label">Archetype / Freeform</div></div>
+          </div>`;
+      } catch (e) {
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${e.message}</div>`;
+      }
+    }
+
+    function statusBadge(status) {
+      const cls = { success: 'badge-success', failed: 'badge-failed', timeout: 'badge-timeout', running: 'badge-running' }[status] || 'badge-running';
+      return `<span class="badge ${cls}">${status}</span>`;
+    }
+
+    function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
     // Submit on Ctrl+Enter
     document.getElementById('prompt').addEventListener('keydown', (e) => {
