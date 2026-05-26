@@ -9,6 +9,40 @@ DashForge is an AI-powered observability navigation layer that lets on-call engi
 
 ---
 
+## Why?
+
+### The Core Reality
+
+Most observability vendors are currently optimizing **signal surfacing** — things like:
+
+- Anomaly detection
+- Root cause hints
+- Topology maps
+- AI summaries
+- Automatic correlations
+- Natural language querying
+
+These are useful. But on-call pain is often **not** "I cannot see metrics."
+
+It's:
+
+> **I don't know where to look next at 3AM.**
+
+Even advanced systems today are mostly doing one thing well:
+
+| System | Behavior |
+|---|---|
+| Datadog AI | Summarize |
+| New Relic AI | Correlate |
+| Grafana Assistant | Query |
+| CloudWatch Investigations | Suggest |
+| Dynatrace Davis | Infer |
+| Splunk AI | Explain |
+
+But the operator still performs **navigation**, **prioritization**, **hypothesis sequencing**, and **drilldown orchestration** — and that cognitive load is enormous during incidents.
+
+DashForge closes this gap by turning a problem statement into a ready-made investigation dashboard in seconds.
+
 ## How it works
 
 ```

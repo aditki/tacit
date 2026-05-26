@@ -35,7 +35,44 @@ Return a JSON object with these fields:
   - "latency_investigation" — high latency, slow requests, p99 spikes, timeouts
   - "error_spike" — 5xx errors, error rate increase, failed requests, retries
   - "golden_signals" — SRE golden signals overview, service health, SLO review
-  - "resource_saturation" — high CPU, high memory, OOM, memory leaks, CPU throttling
+  - "resource_saturation" — high CPU, high memory, OOM, CPU throttling
+  - "kubernetes_investigation" — pod instability, scheduling failures, crashloopbackoff, node pressure
+  - "memory_leak_investigation" — gradual memory growth, OOM kills, heap growth
+  - "api_response_time_spike" — API endpoint latency spikes, slow endpoints
+  - "message_queue_backlog" — Kafka lag, SQS backlog, RabbitMQ queue growth
+  - "dns_certificate_failures" — DNS lookup failures, TLS certificate expiry, handshake errors
+  - "deployment_regression" — performance regression after deploy, canary issues, rollback
+  - "redis_saturation" — Redis latency, cache stampede, eviction storms, cache miss spikes
+  - "db_connection_pool_exhaustion" — DB pool exhaustion, connection timeouts, connection starvation
+  - "kubernetes_networking" — CNI failures, service mesh latency, kube-dns failures
+  - "ingress_load_balancer_failures" — ingress controller errors, ALB/NLB 5xx, LB latency
+  - "autoscaling_instability" — HPA thrashing, scaling oscillations, replica flapping
+  - "threadpool_starvation" — thread pool exhaustion, deadlocks, worker starvation
+  - "storage_io_bottleneck" — IO wait, disk saturation, storage latency, filesystem full
+  - "gpu_inference_pipeline" — GPU saturation, inference latency, model request queueing
+  - "third_party_dependency_degradation" — external API latency, upstream errors, circuit breaker trips
+  - "regional_az_outage" — AZ outage, regional degradation, multi-region failures
+  - "authentication_identity_failures" — auth failures, OAuth errors, token validation failures
+  - "websocket_streaming_instability" — WebSocket disconnects, stream instability, streaming latency
+  - "event_pipeline_stalls" — event processing delays, DAG backpressure, Airflow task failures
+  - "distributed_tracing_investigation" — slow spans, trace latency, downstream trace failures
+  - "noisy_neighbor_contention" — multi-tenant resource contention, noisy neighbor interference
+  - "prometheus_cardinality_explosion" — runaway label cardinality, TSDB pressure, Prometheus memory growth
+  - "alert_storms" — alert floods, cascading failures, pager storms
+  - "rate_limiting_investigation" — API throttling, blocked requests, rate limit enforcement
+  - "captcha_human_verification" — CAPTCHA spikes, bot detection, WAF triggers
+  - "ddos_investigation" — volumetric attacks, request floods, abusive traffic
+  - "mtls_rejections" — mTLS handshake failures, certificate validation, trust issues
+  - "capacity_planning" — resource growth trends, scaling forecasts, saturation projections
+  - "serverless_lambda_investigation" — Lambda cold starts, throttles, invocation failures
+  - "state_machine_investigation" — Step Functions failures, workflow timeouts, orchestration errors
+  - "sqs_investigation" — SQS queue depth, delayed messages, DLQ growth
+  - "emr_pipeline_investigation" — Spark job failures, slow stages, EMR cluster instability
+  - "kafka_broker_health" — broker failures, under-replicated partitions, ISR shrinks, disk pressure
+  - "kafka_consumer_group_issues" — consumer rebalancing, commit lag, partition skew, stuck consumers
+  - "kafka_producer_failures" — producer send failures, retry storms, batch timeouts
+  - "kafka_connect_streams_failures" — connector task failures, Kafka Streams lag, rebalancing
+  - "kafka_topic_throughput" — topic throughput imbalance, partition hotspots, message size anomalies
   - "general" — does not fit any specific pattern above
 
   Confidence guidelines:

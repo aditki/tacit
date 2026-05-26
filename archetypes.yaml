@@ -206,7 +206,6 @@ archetypes:
       - high_cpu
       - high_memory
       - oom
-      - memory_leak
       - cpu_throttling
     required_metrics:
       - container_cpu_usage_seconds_total
@@ -253,3 +252,1529 @@ archetypes:
         queries:
           - expr: 'increase(kube_pod_container_restarts_total{{{container_filter}}}[{rate_interval}])'
             legend_format: restarts
+  
+  - id: kubernetes_investigation
+    name: Kubernetes Cluster Investigation
+    description: Diagnose pod instability, scheduling failures, and cluster health issues
+    problem_types:
+      - kubernetes_investigation
+      - pod_instability
+      - scheduling_failures
+      - crashloopbackoff
+      - node_pressure
+    required_metrics:
+      - kube_pod_status_phase
+      - kube_node_status_condition
+      - container_cpu_usage_seconds_total
+    tags: [kubernetes, cluster, pods]
+    default_timerange: "1h"
+    panels:
+      - title: Pod Restarts
+        row: Pods
+        unit: short
+        queries:
+          - expr: 'increase(kube_pod_container_status_restarts_total{{{service_filter}}}[{rate_interval}])'
+            legend_format: "{{pod}}"
+      - title: CrashLoopBackOff Pods
+        row: Pods
+        unit: short
+        queries:
+          - expr: 'kube_pod_container_status_waiting_reason{{reason="CrashLoopBackOff"}}'
+            legend_format: "{{pod}}"
+      - title: Pending Pods
+        row: Scheduling
+        unit: short
+        queries:
+          - expr: 'count(kube_pod_status_phase{{phase="Pending"}}) by (namespace)'
+            legend_format: "{{namespace}}"
+      - title: Node Pressure Conditions
+        row: Nodes
+        unit: short
+        queries:
+          - expr: 'kube_node_status_condition{{status="true",condition=~"MemoryPressure|DiskPressure|PIDPressure"}}'
+            legend_format: "{{node}} {{condition}}"
+
+  - id: memory_leak_investigation
+    name: Memory Leak Investigation
+    description: Detect gradual memory growth and OOM risks
+    problem_types:
+      - memory_leak
+      - oom_kills
+      - heap_growth
+      - increasing_memory_usage
+    required_metrics:
+      - container_memory_working_set_bytes
+      - process_resident_memory_bytes
+      - container_oom_events_total
+    tags: [memory, oom, leaks]
+    default_timerange: "6h"
+    panels:
+      - title: Container Memory Usage
+        row: Memory
+        unit: bytes
+        queries:
+          - expr: 'container_memory_working_set_bytes{{{container_filter}}}'
+            legend_format: "{{pod}}"
+      - title: RSS Memory
+        row: Memory
+        unit: bytes
+        queries:
+          - expr: 'process_resident_memory_bytes{{{service_filter}}}'
+            legend_format: rss
+      - title: OOM Events
+        row: Failures
+        unit: short
+        queries:
+          - expr: 'increase(container_oom_events_total{{{container_filter}}}[{rate_interval}])'
+            legend_format: oom
+
+  - id: api_response_time_spike
+    name: API Response Time Spike
+    description: Investigate sudden increases in API response latency
+    problem_types:
+      - api_latency_spike
+      - response_time_spike
+      - slow_api
+      - endpoint_latency
+    required_metrics:
+      - http_request_duration_seconds
+      - http_requests_total
+    tags: [api, latency, http]
+    default_timerange: "2h"
+    panels:
+      - title: P95 Latency by Endpoint
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le,path))'
+            legend_format: "{{path}}"
+      - title: Slowest Endpoints
+        row: Breakdown
+        unit: s
+        queries:
+          - expr: 'topk(10, histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le,path)))'
+            legend_format: "{{path}}"
+      - title: Request Volume
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}])) by (path)'
+            legend_format: "{{path}}"
+
+  - id: message_queue_backlog
+    name: Message Queue Backlog
+    description: Diagnose queue growth, consumer lag, and throughput imbalance
+    problem_types:
+      - queue_backlog
+      - kafka_lag
+      - sqs_backlog
+      - rabbitmq_queue_growth
+    required_metrics:
+      - kafka_consumer_lag
+      - kafka_messages_in_total
+      - queue_depth
+    tags: [queues, kafka, async]
+    default_timerange: "4h"
+    panels:
+      - title: Consumer Lag
+        row: Lag
+        unit: short
+        queries:
+          - expr: 'sum(kafka_consumer_lag{{{service_filter}}}) by (consumer_group)'
+            legend_format: "{{consumer_group}}"
+      - title: Queue Depth
+        row: Queue
+        unit: short
+        queries:
+          - expr: 'queue_depth{{{service_filter}}}'
+            legend_format: queue depth
+      - title: Producer vs Consumer Throughput
+        row: Throughput
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(kafka_messages_in_total[{rate_interval}]))'
+            legend_format: produced
+          - expr: 'sum(rate(kafka_messages_consumed_total[{rate_interval}]))'
+            legend_format: consumed
+
+  - id: dns_certificate_failures
+    name: DNS & Certificate Failures
+    description: Investigate DNS lookup failures and TLS certificate issues
+    problem_types:
+      - dns_failures
+      - tls_expiry
+      - certificate_failures
+      - name_resolution_errors
+    required_metrics:
+      - dns_lookup_failures_total
+      - tls_certificate_expiry_timestamp
+      - tls_handshake_errors_total
+    tags: [dns, tls, certificates]
+    default_timerange: "24h"
+    panels:
+      - title: DNS Lookup Failures
+        row: DNS
+        unit: short
+        queries:
+          - expr: 'increase(dns_lookup_failures_total[{rate_interval}])'
+            legend_format: failures
+      - title: TLS Handshake Errors
+        row: TLS
+        unit: short
+        queries:
+          - expr: 'increase(tls_handshake_errors_total[{rate_interval}])'
+            legend_format: handshake errors
+      - title: Certificate Expiry Countdown
+        row: Certificates
+        unit: s
+        queries:
+          - expr: 'tls_certificate_expiry_timestamp - time()'
+            legend_format: "{{common_name}}"
+
+  - id: deployment_regression
+    name: Deployment Regression
+    description: Investigate performance or stability regressions after deployment
+    problem_types:
+      - deployment_regression
+      - release_failure
+      - canary_issue
+      - rollback_required
+    required_metrics:
+      - deployment_rollouts_total
+      - http_request_duration_seconds
+      - http_requests_total
+    tags: [deployments, releases, regressions]
+    default_timerange: "6h"
+    panels:
+      - title: Deployment Events
+        row: Deployments
+        unit: short
+        queries:
+          - expr: 'increase(deployment_rollouts_total[{rate_interval}])'
+            legend_format: rollouts
+      - title: Error Rate After Deploy
+        row: Errors
+        unit: percentunit
+        queries:
+          - expr: 'sum(rate(http_requests_total{{status=~"5..",{service_filter}}}[{rate_interval}])) / sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: error ratio
+      - title: Latency After Deploy
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p95
+
+
+  - id: redis_saturation
+    name: Redis Saturation & Cache Stampede
+    description: Diagnose Redis saturation, eviction storms, and cache miss spikes
+    problem_types:
+      - redis_latency
+      - cache_stampede
+      - redis_saturation
+      - cache_miss_spike
+    required_metrics:
+      - redis_connected_clients
+      - redis_evicted_keys_total
+      - redis_keyspace_hits_total
+      - redis_keyspace_misses_total
+    tags: [redis, cache, saturation]
+    default_timerange: "2h"
+    panels:
+      - title: Connected Clients
+        row: Connections
+        unit: short
+        queries:
+          - expr: 'redis_connected_clients{{{service_filter}}}'
+            legend_format: clients
+      - title: Cache Hit Rate
+        row: Cache
+        unit: percentunit
+        queries:
+          - expr: 'rate(redis_keyspace_hits_total{{{service_filter}}}[{rate_interval}]) / (rate(redis_keyspace_hits_total{{{service_filter}}}[{rate_interval}]) + rate(redis_keyspace_misses_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: hit rate
+      - title: Eviction Rate
+        row: Cache
+        unit: short
+        queries:
+          - expr: 'rate(redis_evicted_keys_total{{{service_filter}}}[{rate_interval}])'
+            legend_format: evictions/s
+      - title: Memory Usage
+        row: Resources
+        unit: bytes
+        queries:
+          - expr: 'redis_memory_used_bytes{{{service_filter}}}'
+            legend_format: used
+          - expr: 'redis_memory_max_bytes{{{service_filter}}}'
+            legend_format: max
+      - title: Command Latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'rate(redis_commands_duration_seconds_total{{{service_filter}}}[{rate_interval}]) / rate(redis_commands_processed_total{{{service_filter}}}[{rate_interval}])'
+            legend_format: avg latency
+
+  - id: db_connection_pool_exhaustion
+    name: Database Connection Pool Exhaustion
+    description: Investigate exhausted DB pools, connection waits, and timeout spikes
+    problem_types:
+      - db_pool_exhaustion
+      - connection_timeout
+      - db_connection_starvation
+    required_metrics:
+      - db_connections_active
+      - db_connections_waiting
+      - db_query_duration_seconds
+    tags: [database, postgres, mysql, pools]
+    default_timerange: "2h"
+    panels:
+      - title: Active Connections
+        row: Pool
+        unit: short
+        queries:
+          - expr: 'db_connections_active{{{service_filter}}}'
+            legend_format: active
+      - title: Waiting Connections
+        row: Pool
+        unit: short
+        queries:
+          - expr: 'db_connections_waiting{{{service_filter}}}'
+            legend_format: waiting
+      - title: Pool Utilization
+        row: Pool
+        unit: percentunit
+        queries:
+          - expr: 'db_connections_active{{{service_filter}}} / db_connections_max{{{service_filter}}}'
+            legend_format: utilization
+      - title: Query Latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'rate(db_query_duration_seconds_sum{{{service_filter}}}[{rate_interval}]) / rate(db_query_duration_seconds_count{{{service_filter}}}[{rate_interval}])'
+            legend_format: avg query time
+
+  - id: kubernetes_networking
+    name: Kubernetes Networking & Service Mesh
+    description: Diagnose CNI issues, DNS failures, and service mesh latency
+    problem_types:
+      - cni_failures
+      - service_mesh_latency
+      - pod_networking
+      - kube_dns_failures
+    required_metrics:
+      - coredns_dns_requests_total
+      - istio_request_duration_milliseconds
+      - container_network_receive_errors_total
+    tags: [kubernetes, networking, istio]
+    default_timerange: "1h"
+    panels:
+      - title: CoreDNS Request Rate
+        row: DNS
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(coredns_dns_requests_total[{rate_interval}])) by (type)'
+            legend_format: "{{type}}"
+      - title: CoreDNS Errors
+        row: DNS
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(coredns_dns_responses_total{{rcode=~"SERVFAIL|NXDOMAIN"}}[{rate_interval}])) by (rcode)'
+            legend_format: "{{rcode}}"
+      - title: Network Receive Errors
+        row: Network
+        unit: short
+        queries:
+          - expr: 'rate(container_network_receive_errors_total{{{container_filter}}}[{rate_interval}])'
+            legend_format: "{{pod}}"
+      - title: Network Transmit Errors
+        row: Network
+        unit: short
+        queries:
+          - expr: 'rate(container_network_transmit_errors_total{{{container_filter}}}[{rate_interval}])'
+            legend_format: "{{pod}}"
+      - title: Istio Request Latency
+        row: Service Mesh
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{{{service_filter}}}[{rate_interval}])) by (le)) / 1000'
+            legend_format: p95
+
+  - id: ingress_load_balancer_failures
+    name: Ingress & Load Balancer Failures
+    description: Investigate ingress controller failures and LB instability
+    problem_types:
+      - ingress_failures
+      - alb_5xx
+      - nginx_ingress_errors
+      - load_balancer_latency
+    required_metrics:
+      - nginx_ingress_controller_requests
+      - aws_alb_httpcode_elb_5xx
+      - request_duration_seconds
+    tags: [ingress, loadbalancer, nginx, alb]
+    default_timerange: "2h"
+    panels:
+      - title: Ingress Request Rate
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(nginx_ingress_controller_requests{{{service_filter}}}[{rate_interval}])) by (status)'
+            legend_format: "{{status}}"
+      - title: Ingress 5xx Rate
+        row: Errors
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(nginx_ingress_controller_requests{{status=~"5.."}}[{rate_interval}]))'
+            legend_format: 5xx
+      - title: Ingress Latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(nginx_ingress_controller_request_duration_seconds_bucket[{rate_interval}])) by (le))'
+            legend_format: p95
+      - title: Upstream Connection Errors
+        row: Errors
+        unit: short
+        queries:
+          - expr: 'sum(rate(nginx_ingress_controller_nginx_process_connections{{state="waiting"}}[{rate_interval}]))'
+            legend_format: waiting connections
+
+  - id: autoscaling_instability
+    name: Autoscaling Instability
+    description: Diagnose HPA thrashing and scaling oscillations
+    problem_types:
+      - autoscaling_flaps
+      - hpa_instability
+      - scale_oscillation
+    required_metrics:
+      - kube_horizontalpodautoscaler_status_current_replicas
+      - kube_horizontalpodautoscaler_status_desired_replicas
+      - cpu_usage_seconds_total
+    tags: [autoscaling, hpa, kubernetes]
+    default_timerange: "4h"
+    panels:
+      - title: Current vs Desired Replicas
+        row: HPA
+        unit: short
+        queries:
+          - expr: 'kube_horizontalpodautoscaler_status_current_replicas{{{service_filter}}}'
+            legend_format: current
+          - expr: 'kube_horizontalpodautoscaler_status_desired_replicas{{{service_filter}}}'
+            legend_format: desired
+      - title: HPA Min / Max Bounds
+        row: HPA
+        unit: short
+        queries:
+          - expr: 'kube_horizontalpodautoscaler_spec_min_replicas{{{service_filter}}}'
+            legend_format: min
+          - expr: 'kube_horizontalpodautoscaler_spec_max_replicas{{{service_filter}}}'
+            legend_format: max
+      - title: CPU Utilization vs Target
+        row: Resources
+        unit: percentunit
+        queries:
+          - expr: 'sum(rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])) / sum(kube_pod_container_resource_requests{{resource="cpu",{container_filter}}})'
+            legend_format: actual
+          - expr: 'kube_horizontalpodautoscaler_spec_target_metric{{{service_filter}}}'
+            legend_format: target
+
+  - id: threadpool_starvation
+    name: Thread Pool Starvation & Deadlocks
+    description: Investigate worker exhaustion and blocked execution pools
+    problem_types:
+      - threadpool_starvation
+      - deadlocks
+      - worker_exhaustion
+    required_metrics:
+      - process_threads
+      - threadpool_queue_depth
+      - request_queue_depth
+    tags: [threads, java, concurrency]
+    default_timerange: "2h"
+    panels:
+      - title: Thread Count
+        row: Threads
+        unit: short
+        queries:
+          - expr: 'process_threads{{{service_filter}}}'
+            legend_format: threads
+      - title: Thread Pool Queue Depth
+        row: Queues
+        unit: short
+        queries:
+          - expr: 'threadpool_queue_depth{{{service_filter}}}'
+            legend_format: queued tasks
+      - title: Request Queue Depth
+        row: Queues
+        unit: short
+        queries:
+          - expr: 'request_queue_depth{{{service_filter}}}'
+            legend_format: pending requests
+      - title: Request Latency
+        row: Impact
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p95
+
+  - id: storage_io_bottleneck
+    name: Storage & Disk IO Bottlenecks
+    description: Diagnose slow disks, IO wait, and filesystem saturation
+    problem_types:
+      - io_wait
+      - disk_saturation
+      - storage_latency
+    required_metrics:
+      - node_disk_io_time_seconds_total
+      - node_filesystem_avail_bytes
+      - node_disk_read_time_seconds_total
+    tags: [storage, io, disks]
+    default_timerange: "6h"
+    panels:
+      - title: Disk IO Utilization
+        row: IO
+        unit: percentunit
+        queries:
+          - expr: 'rate(node_disk_io_time_seconds_total[{rate_interval}])'
+            legend_format: "{{device}}"
+      - title: Disk Read/Write Throughput
+        row: IO
+        unit: bytes
+        queries:
+          - expr: 'rate(node_disk_read_bytes_total[{rate_interval}])'
+            legend_format: "read {{device}}"
+          - expr: 'rate(node_disk_written_bytes_total[{rate_interval}])'
+            legend_format: "write {{device}}"
+      - title: Filesystem Available
+        row: Filesystem
+        unit: bytes
+        queries:
+          - expr: 'node_filesystem_avail_bytes{{mountpoint="/",fstype!="tmpfs"}}'
+            legend_format: "{{mountpoint}}"
+      - title: Filesystem Usage
+        row: Filesystem
+        unit: percentunit
+        queries:
+          - expr: '1 - (node_filesystem_avail_bytes{{fstype!="tmpfs"}} / node_filesystem_size_bytes{{fstype!="tmpfs"}})'
+            legend_format: "{{mountpoint}}"
+
+  - id: gpu_inference_pipeline
+    name: GPU & Inference Pipeline Investigation
+    description: Diagnose GPU saturation and inference bottlenecks
+    problem_types:
+      - gpu_saturation
+      - inference_latency
+      - model_queueing
+    required_metrics:
+      - gpu_utilization_percent
+      - inference_latency_seconds
+      - request_queue_depth
+    tags: [gpu, inference, ml]
+    default_timerange: "1h"
+    panels:
+      - title: GPU Utilization
+        row: GPU
+        unit: percentunit
+        queries:
+          - expr: 'gpu_utilization_percent{{{service_filter}}} / 100'
+            legend_format: "{{gpu}}"
+      - title: GPU Memory Usage
+        row: GPU
+        unit: bytes
+        queries:
+          - expr: 'gpu_memory_used_bytes{{{service_filter}}}'
+            legend_format: "{{gpu}}"
+      - title: Inference Latency
+        row: Inference
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(inference_latency_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p95
+          - expr: 'histogram_quantile(0.50, sum(rate(inference_latency_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p50
+      - title: Request Queue Depth
+        row: Inference
+        unit: short
+        queries:
+          - expr: 'request_queue_depth{{{service_filter}}}'
+            legend_format: queued
+
+  - id: third_party_dependency_degradation
+    name: Third-Party Dependency Degradation
+    description: Investigate external API latency and dependency instability
+    problem_types:
+      - external_api_latency
+      - dependency_failures
+      - upstream_errors
+    required_metrics:
+      - upstream_request_duration_seconds
+      - upstream_http_errors_total
+      - circuit_breaker_open_total
+    tags: [dependencies, external, upstream]
+    default_timerange: "2h"
+    panels:
+      - title: Upstream Latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(upstream_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le,upstream))'
+            legend_format: "p95 {{upstream}}"
+      - title: Upstream Error Rate
+        row: Errors
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(upstream_http_errors_total{{{service_filter}}}[{rate_interval}])) by (upstream)'
+            legend_format: "{{upstream}}"
+      - title: Circuit Breaker State
+        row: Circuit Breakers
+        unit: short
+        queries:
+          - expr: 'circuit_breaker_open_total{{{service_filter}}}'
+            legend_format: "{{upstream}} open"
+      - title: Upstream Request Rate
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(upstream_request_duration_seconds_count{{{service_filter}}}[{rate_interval}])) by (upstream)'
+            legend_format: "{{upstream}}"
+
+  - id: regional_az_outage
+    name: Regional / Availability Zone Outage
+    description: Correlate failures across regions or availability zones
+    problem_types:
+      - az_outage
+      - regional_degradation
+      - multi_region_failures
+    required_metrics:
+      - http_requests_total
+      - node_unreachable_total
+      - availability_zone_health
+    tags: [regional, outages, cloud]
+    default_timerange: "12h"
+    panels:
+      - title: Request Rate by Region
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total[{rate_interval}])) by (region)'
+            legend_format: "{{region}}"
+      - title: Error Rate by Region
+        row: Errors
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total{{status=~"5.."}}[{rate_interval}])) by (region)'
+            legend_format: "{{region}}"
+      - title: Node Health by AZ
+        row: Infrastructure
+        unit: short
+        queries:
+          - expr: 'count(kube_node_status_condition{{status="true",condition="Ready"}}) by (topology_kubernetes_io_zone)'
+            legend_format: "ready {{topology_kubernetes_io_zone}}"
+      - title: Pod Restarts by AZ
+        row: Infrastructure
+        unit: short
+        queries:
+          - expr: 'sum(increase(kube_pod_container_status_restarts_total[{rate_interval}])) by (topology_kubernetes_io_zone)'
+            legend_format: "{{topology_kubernetes_io_zone}}"
+
+  - id: authentication_identity_failures
+    name: Authentication & Identity Failures
+    description: Diagnose auth latency, token failures, and login spikes
+    problem_types:
+      - auth_failures
+      - oauth_errors
+      - token_validation_failures
+    required_metrics:
+      - auth_requests_total
+      - failed_login_attempts_total
+      - auth_latency_seconds
+    tags: [auth, identity, security]
+    default_timerange: "2h"
+    panels:
+      - title: Auth Request Rate
+        row: Auth
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(auth_requests_total{{{service_filter}}}[{rate_interval}])) by (result)'
+            legend_format: "{{result}}"
+      - title: Failed Login Attempts
+        row: Auth
+        unit: short
+        queries:
+          - expr: 'sum(increase(failed_login_attempts_total{{{service_filter}}}[{rate_interval}])) by (reason)'
+            legend_format: "{{reason}}"
+      - title: Auth Latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(auth_latency_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p95
+      - title: Token Validation Errors
+        row: Tokens
+        unit: short
+        queries:
+          - expr: 'sum(increase(auth_requests_total{{result="error",{service_filter}}}[{rate_interval}])) by (error_type)'
+            legend_format: "{{error_type}}"
+
+  - id: websocket_streaming_instability
+    name: WebSocket & Streaming Instability
+    description: Investigate dropped streams and unstable websocket sessions
+    problem_types:
+      - websocket_disconnects
+      - stream_instability
+      - streaming_latency
+    required_metrics:
+      - websocket_active_connections
+      - websocket_disconnects_total
+      - stream_latency_seconds
+    tags: [websocket, streaming, realtime]
+    default_timerange: "2h"
+    panels:
+      - title: Active Connections
+        row: Connections
+        unit: short
+        queries:
+          - expr: 'websocket_active_connections{{{service_filter}}}'
+            legend_format: active
+      - title: Disconnect Rate
+        row: Connections
+        unit: short
+        queries:
+          - expr: 'rate(websocket_disconnects_total{{{service_filter}}}[{rate_interval}])'
+            legend_format: disconnects/s
+      - title: Stream Latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(stream_latency_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p95
+      - title: Message Throughput
+        row: Throughput
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(websocket_messages_sent_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: sent
+          - expr: 'sum(rate(websocket_messages_received_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: received
+
+  - id: event_pipeline_stalls
+    name: Event Pipeline Stalls
+    description: Diagnose stuck event processors and DAG backpressure
+    problem_types:
+      - pipeline_stalls
+      - event_processing_delay
+      - airflow_backpressure
+    required_metrics:
+      - event_processing_latency_seconds
+      - queue_depth
+      - task_failures_total
+    tags: [events, airflow, pipelines]
+    default_timerange: "6h"
+    panels:
+      - title: Processing Latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(event_processing_latency_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))'
+            legend_format: p95
+      - title: Queue Depth
+        row: Queues
+        unit: short
+        queries:
+          - expr: 'queue_depth{{{service_filter}}}'
+            legend_format: depth
+      - title: Task Failure Rate
+        row: Failures
+        unit: short
+        queries:
+          - expr: 'sum(rate(task_failures_total{{{service_filter}}}[{rate_interval}])) by (task_type)'
+            legend_format: "{{task_type}}"
+      - title: Processing Throughput
+        row: Throughput
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(event_processing_latency_seconds_count{{{service_filter}}}[{rate_interval}]))'
+            legend_format: events/s
+
+  - id: distributed_tracing_investigation
+    name: Distributed Tracing Investigation
+    description: Investigate slow spans and trace bottlenecks
+    problem_types:
+      - slow_spans
+      - trace_latency
+      - downstream_trace_failures
+    required_metrics:
+      - tempo_span_latency_seconds
+      - trace_error_total
+      - trace_request_count
+    tags: [tracing, tempo, distributed]
+    default_timerange: "1h"
+    panels:
+      - title: Span Latency (p95)
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(tempo_span_latency_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le,service))'
+            legend_format: "{{service}}"
+      - title: Trace Error Rate
+        row: Errors
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(trace_error_total{{{service_filter}}}[{rate_interval}])) by (service)'
+            legend_format: "{{service}}"
+      - title: Trace Request Volume
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(trace_request_count{{{service_filter}}}[{rate_interval}])) by (service)'
+            legend_format: "{{service}}"
+      - title: Span Duration by Operation
+        row: Breakdown
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(tempo_span_latency_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le,operation))'
+            legend_format: "{{operation}}"
+
+  - id: noisy_neighbor_contention
+    name: Noisy Neighbor / Multi-Tenant Contention
+    description: Diagnose tenant interference and shared resource contention
+    problem_types:
+      - noisy_neighbor
+      - tenant_contention
+      - shared_resource_saturation
+    required_metrics:
+      - cpu_usage_seconds_total
+      - memory_working_set_bytes
+      - tenant_request_rate
+    tags: [multi-tenant, contention, saturation]
+    default_timerange: "4h"
+    panels:
+      - title: CPU Usage by Tenant
+        row: Resources
+        unit: s
+        queries:
+          - expr: 'sum(rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])) by (namespace)'
+            legend_format: "{{namespace}}"
+      - title: Memory by Tenant
+        row: Resources
+        unit: bytes
+        queries:
+          - expr: 'sum(container_memory_working_set_bytes{{{container_filter}}}) by (namespace)'
+            legend_format: "{{namespace}}"
+      - title: Request Rate by Tenant
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total[{rate_interval}])) by (namespace)'
+            legend_format: "{{namespace}}"
+      - title: Latency by Tenant
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[{rate_interval}])) by (le,namespace))'
+            legend_format: "{{namespace}}"
+
+  - id: prometheus_cardinality_explosion
+    name: High Cardinality Prometheus Explosion
+    description: Diagnose runaway label cardinality and Prometheus stress
+    problem_types:
+      - cardinality_explosion
+      - prom_memory_growth
+      - tsdb_pressure
+    required_metrics:
+      - prometheus_tsdb_head_series
+      - prometheus_engine_queries
+      - prometheus_tsdb_symbol_table_size_bytes
+    tags: [prometheus, cardinality, monitoring]
+    default_timerange: "6h"
+    panels:
+      - title: Active Time Series
+        row: Cardinality
+        unit: short
+        queries:
+          - expr: 'prometheus_tsdb_head_series'
+            legend_format: head series
+      - title: Series Created Rate
+        row: Cardinality
+        unit: short
+        queries:
+          - expr: 'rate(prometheus_tsdb_head_series_created_total[{rate_interval}])'
+            legend_format: created/s
+          - expr: 'rate(prometheus_tsdb_head_series_removed_total[{rate_interval}])'
+            legend_format: removed/s
+      - title: Prometheus Memory Usage
+        row: Resources
+        unit: bytes
+        queries:
+          - expr: 'process_resident_memory_bytes{{job="prometheus"}}'
+            legend_format: RSS
+          - expr: 'prometheus_tsdb_symbol_table_size_bytes'
+            legend_format: symbol table
+      - title: Query Engine Load
+        row: Queries
+        unit: short
+        queries:
+          - expr: 'rate(prometheus_engine_queries_concurrent_max[{rate_interval}])'
+            legend_format: max concurrent
+          - expr: 'rate(prometheus_engine_query_duration_seconds_count[{rate_interval}])'
+            legend_format: queries/s
+
+  - id: alert_storms
+    name: Alert Storms & Cascading Failures
+    description: Investigate alert floods and cascading system degradation
+    problem_types:
+      - alert_storm
+      - cascading_failures
+      - pager_flood
+    required_metrics:
+      - alertmanager_alerts_received_total
+      - http_5xx_errors_total
+      - pod_restarts_total
+    tags: [alerts, incidents, cascading]
+    default_timerange: "2h"
+    panels:
+      - title: Alerts Received Rate
+        row: Alerts
+        unit: short
+        queries:
+          - expr: 'sum(rate(alertmanager_alerts_received_total[{rate_interval}])) by (alertname)'
+            legend_format: "{{alertname}}"
+      - title: Active Alerts
+        row: Alerts
+        unit: short
+        queries:
+          - expr: 'count(ALERTS{{alertstate="firing"}}) by (alertname)'
+            legend_format: "{{alertname}}"
+      - title: 5xx Error Rate
+        row: Impact
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total{{status=~"5.."}}[{rate_interval}])) by (job)'
+            legend_format: "{{job}}"
+      - title: Pod Restarts
+        row: Impact
+        unit: short
+        queries:
+          - expr: 'sum(increase(kube_pod_container_status_restarts_total[{rate_interval}])) by (namespace)'
+            legend_format: "{{namespace}}"
+
+  - id: rate_limiting_investigation
+    name: Rate Limiting & Throttling Investigation
+    description: Diagnose API throttling, blocked requests, and rate limit enforcement
+    problem_types:
+      - rate_limiting
+      - throttling
+      - blocked_requests
+      - api_quota_exceeded
+    required_metrics:
+      - rate_limited_requests_total
+      - http_requests_total
+      - api_gateway_throttled_requests
+    tags: [rate-limit, api, throttling]
+    default_timerange: "2h"
+    panels:
+      - title: Rate Limited Requests
+        row: Rate Limits
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(rate_limited_requests_total{{{service_filter}}}[{rate_interval}])) by (endpoint)'
+            legend_format: "{{endpoint}}"
+      - title: Throttle Rate vs Total Requests
+        row: Rate Limits
+        unit: percentunit
+        queries:
+          - expr: 'sum(rate(rate_limited_requests_total{{{service_filter}}}[{rate_interval}])) / sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: throttle ratio
+      - title: Request Rate
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}])) by (status)'
+            legend_format: "{{status}}"
+      - title: API Gateway Throttled Requests
+        row: Gateway
+        unit: short
+        queries:
+          - expr: 'sum(rate(api_gateway_throttled_requests[{rate_interval}])) by (api)'
+            legend_format: "{{api}}"
+
+  - id: captcha_human_verification
+    name: CAPTCHA & Human Verification Investigation
+    description: Investigate spikes in CAPTCHA challenges and bot mitigation triggers
+    problem_types:
+      - captcha_spike
+      - human_check_triggered
+      - bot_detection
+      - anti_abuse
+    required_metrics:
+      - captcha_challenges_total
+      - blocked_bot_requests_total
+      - waf_suspicious_requests_total
+    tags: [captcha, waf, anti-bot]
+    default_timerange: "2h"
+    panels:
+      - title: CAPTCHA Challenge Rate
+        row: Challenges
+        unit: short
+        queries:
+          - expr: 'sum(rate(captcha_challenges_total{{{service_filter}}}[{rate_interval}])) by (result)'
+            legend_format: "{{result}}"
+      - title: Blocked Bot Requests
+        row: Bot Detection
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(blocked_bot_requests_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: blocked bots
+      - title: WAF Suspicious Requests
+        row: WAF
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(waf_suspicious_requests_total[{rate_interval}])) by (rule)'
+            legend_format: "{{rule}}"
+      - title: Challenge Pass Rate
+        row: Challenges
+        unit: percentunit
+        queries:
+          - expr: 'sum(rate(captcha_challenges_total{{result="pass"}}[{rate_interval}])) / sum(rate(captcha_challenges_total[{rate_interval}]))'
+            legend_format: pass rate
+
+  - id: ddos_investigation
+    name: DDoS & Traffic Flood Investigation
+    description: Diagnose volumetric attacks, request floods, and abusive traffic patterns
+    problem_types:
+      - ddos_attack
+      - traffic_flood
+      - request_spike
+      - abuse_traffic
+    required_metrics:
+      - requests_per_second
+      - blocked_requests_total
+      - network_bandwidth_usage_bytes
+      - waf_blocked_requests_total
+    tags: [ddos, waf, networking, abuse]
+    default_timerange: "1h"
+    panels:
+      - title: Request Rate
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total[{rate_interval}]))'
+            legend_format: total rps
+      - title: Blocked Requests
+        row: Mitigation
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(waf_blocked_requests_total[{rate_interval}])) by (rule)'
+            legend_format: "{{rule}}"
+      - title: Network Bandwidth
+        row: Network
+        unit: bytes
+        queries:
+          - expr: 'sum(rate(network_bandwidth_usage_bytes[{rate_interval}])) by (direction)'
+            legend_format: "{{direction}}"
+      - title: Request Rate by Source
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'topk(10, sum(rate(http_requests_total[{rate_interval}])) by (remote_ip))'
+            legend_format: "{{remote_ip}}"
+
+  - id: mtls_rejections
+    name: mTLS Rejections & Certificate Validation Failures
+    description: Diagnose mutual TLS handshake failures and certificate trust issues
+    problem_types:
+      - mtls_rejections
+      - certificate_validation_failure
+      - tls_handshake_failure
+    required_metrics:
+      - mtls_handshake_failures_total
+      - tls_certificate_expiry_timestamp
+      - rejected_client_connections_total
+    tags: [mtls, tls, certificates, security]
+    default_timerange: "6h"
+    panels:
+      - title: mTLS Handshake Failures
+        row: TLS
+        unit: short
+        queries:
+          - expr: 'sum(rate(mtls_handshake_failures_total{{{service_filter}}}[{rate_interval}])) by (reason)'
+            legend_format: "{{reason}}"
+      - title: Rejected Client Connections
+        row: TLS
+        unit: short
+        queries:
+          - expr: 'sum(rate(rejected_client_connections_total{{{service_filter}}}[{rate_interval}])) by (peer)'
+            legend_format: "{{peer}}"
+      - title: Certificate Expiry Countdown
+        row: Certificates
+        unit: s
+        queries:
+          - expr: 'tls_certificate_expiry_timestamp{{{service_filter}}} - time()'
+            legend_format: "{{common_name}}"
+      - title: Successful vs Failed Handshakes
+        row: TLS
+        unit: percentunit
+        queries:
+          - expr: 'sum(rate(mtls_handshake_failures_total{{{service_filter}}}[{rate_interval}])) / (sum(rate(mtls_handshake_failures_total{{{service_filter}}}[{rate_interval}])) + sum(rate(mtls_handshake_success_total{{{service_filter}}}[{rate_interval}])))'
+            legend_format: failure ratio
+
+  - id: capacity_planning
+    name: Capacity Planning & Forecasting
+    description: Analyze resource growth trends and future scaling requirements
+    problem_types:
+      - capacity_planning
+      - growth_forecasting
+      - infra_scaling
+      - saturation_forecast
+    required_metrics:
+      - cpu_usage_seconds_total
+      - memory_working_set_bytes
+      - disk_usage_bytes
+      - request_rate
+    tags: [capacity, forecasting, scaling]
+    default_timerange: "7d"
+    panels:
+      - title: CPU Usage Trend
+        row: Compute
+        unit: s
+        queries:
+          - expr: 'avg(rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])) by (namespace)'
+            legend_format: "{{namespace}}"
+      - title: Memory Usage Trend
+        row: Compute
+        unit: bytes
+        queries:
+          - expr: 'sum(container_memory_working_set_bytes{{{container_filter}}}) by (namespace)'
+            legend_format: "{{namespace}}"
+      - title: Disk Usage
+        row: Storage
+        unit: bytes
+        queries:
+          - expr: 'node_filesystem_size_bytes{{fstype!="tmpfs"}} - node_filesystem_avail_bytes{{fstype!="tmpfs"}}'
+            legend_format: "{{mountpoint}}"
+      - title: Request Growth Rate
+        row: Traffic
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: rps
+
+  - id: serverless_lambda_investigation
+    name: Serverless & Lambda Investigation
+    description: Diagnose Lambda cold starts, throttles, and invocation failures
+    problem_types:
+      - lambda_throttling
+      - cold_starts
+      - invocation_failures
+      - serverless_latency
+    required_metrics:
+      - aws_lambda_duration
+      - aws_lambda_errors
+      - aws_lambda_throttles
+      - aws_lambda_concurrent_executions
+    tags: [lambda, serverless, aws]
+    default_timerange: "2h"
+    panels:
+      - title: Invocation Duration
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'aws_lambda_duration_average{{{service_filter}}} / 1000'
+            legend_format: avg
+          - expr: 'aws_lambda_duration_maximum{{{service_filter}}} / 1000'
+            legend_format: max
+      - title: Error Count
+        row: Errors
+        unit: short
+        queries:
+          - expr: 'aws_lambda_errors_sum{{{service_filter}}}'
+            legend_format: errors
+      - title: Throttled Invocations
+        row: Throttling
+        unit: short
+        queries:
+          - expr: 'aws_lambda_throttles_sum{{{service_filter}}}'
+            legend_format: throttles
+      - title: Concurrent Executions
+        row: Concurrency
+        unit: short
+        queries:
+          - expr: 'aws_lambda_concurrent_executions_maximum{{{service_filter}}}'
+            legend_format: concurrent
+
+  - id: state_machine_investigation
+    name: State Machine & Step Functions Investigation
+    description: Diagnose workflow execution failures and stalled state transitions
+    problem_types:
+      - step_function_failures
+      - state_machine_stalls
+      - workflow_timeouts
+      - orchestration_errors
+    required_metrics:
+      - stepfunctions_execution_failed
+      - stepfunctions_execution_timed_out
+      - stepfunctions_execution_succeeded
+    tags: [step-functions, workflows, orchestration]
+    default_timerange: "4h"
+    panels:
+      - title: Execution Outcomes
+        row: Executions
+        unit: short
+        queries:
+          - expr: 'sum(rate(stepfunctions_execution_succeeded[{rate_interval}]))'
+            legend_format: succeeded
+          - expr: 'sum(rate(stepfunctions_execution_failed[{rate_interval}]))'
+            legend_format: failed
+          - expr: 'sum(rate(stepfunctions_execution_timed_out[{rate_interval}]))'
+            legend_format: timed out
+      - title: Failure Rate
+        row: Executions
+        unit: percentunit
+        queries:
+          - expr: 'sum(rate(stepfunctions_execution_failed[{rate_interval}])) / (sum(rate(stepfunctions_execution_succeeded[{rate_interval}])) + sum(rate(stepfunctions_execution_failed[{rate_interval}])))'
+            legend_format: failure ratio
+      - title: Execution Duration
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'histogram_quantile(0.95, sum(rate(stepfunctions_execution_duration_seconds_bucket[{rate_interval}])) by (le))'
+            legend_format: p95
+      - title: Running Executions
+        row: Concurrency
+        unit: short
+        queries:
+          - expr: 'stepfunctions_executions_running'
+            legend_format: running
+
+  - id: sqs_investigation
+    name: SQS Queue Investigation
+    description: Diagnose SQS backlog growth, delayed processing, and DLQ spikes
+    problem_types:
+      - sqs_queue_depth
+      - delayed_messages
+      - dead_letter_queue_growth
+      - consumer_lag
+    required_metrics:
+      - aws_sqs_approximate_number_of_messages_visible
+      - aws_sqs_number_of_messages_deleted
+      - aws_sqs_approximate_age_of_oldest_message
+    tags: [sqs, queues, async]
+    default_timerange: "4h"
+    panels:
+      - title: Messages Visible (Queue Depth)
+        row: Queue
+        unit: short
+        queries:
+          - expr: 'aws_sqs_approximate_number_of_messages_visible_average{{{service_filter}}}'
+            legend_format: "{{queue_name}}"
+      - title: Oldest Message Age
+        row: Queue
+        unit: s
+        queries:
+          - expr: 'aws_sqs_approximate_age_of_oldest_message_maximum{{{service_filter}}}'
+            legend_format: "{{queue_name}}"
+      - title: Messages Processed
+        row: Throughput
+        unit: short
+        queries:
+          - expr: 'aws_sqs_number_of_messages_deleted_sum{{{service_filter}}}'
+            legend_format: "deleted {{queue_name}}"
+          - expr: 'aws_sqs_number_of_messages_sent_sum{{{service_filter}}}'
+            legend_format: "sent {{queue_name}}"
+      - title: Dead Letter Queue Depth
+        row: DLQ
+        unit: short
+        queries:
+          - expr: 'aws_sqs_approximate_number_of_messages_visible_average{{queue_name=~".*-dlq.*"}}'
+            legend_format: "{{queue_name}}"
+
+  - id: emr_pipeline_investigation
+    name: EMR & Data Pipeline Investigation
+    description: Diagnose Spark job failures, slow stages, and EMR cluster instability
+    problem_types:
+      - spark_job_failures
+      - emr_cluster_instability
+      - slow_spark_stages
+      - pipeline_delays
+    required_metrics:
+      - spark_executor_cpu_time
+      - spark_stage_duration_seconds
+      - emr_cluster_memory_available
+      - failed_jobs_total
+    tags: [emr, spark, pipelines, big-data]
+    default_timerange: "12h"
+    panels:
+      - title: Spark Stage Duration
+        row: Spark
+        unit: s
+        queries:
+          - expr: 'spark_stage_duration_seconds{{{service_filter}}}'
+            legend_format: "stage {{stage_id}}"
+      - title: Executor CPU Time
+        row: Spark
+        unit: s
+        queries:
+          - expr: 'rate(spark_executor_cpu_time{{{service_filter}}}[{rate_interval}]) / 1e9'
+            legend_format: "{{executor_id}}"
+      - title: EMR Cluster Memory Available
+        row: Cluster
+        unit: bytes
+        queries:
+          - expr: 'emr_cluster_memory_available{{{service_filter}}}'
+            legend_format: available
+      - title: Failed Jobs
+        row: Failures
+        unit: short
+        queries:
+          - expr: 'sum(increase(failed_jobs_total{{{service_filter}}}[{rate_interval}])) by (job_name)'
+            legend_format: "{{job_name}}"
+
+  - id: kafka_broker_health
+    name: Kafka Broker Health Investigation
+    description: Diagnose broker instability, under-replicated partitions, ISR shrinks, and disk pressure
+    problem_types:
+      - kafka_broker_failure
+      - under_replicated_partitions
+      - isr_shrink
+      - kafka_disk_pressure
+      - kafka_leader_election
+    required_metrics:
+      - kafka_server_replicamanager_underreplicatedpartitions
+      - kafka_server_replicamanager_isrshrinks_total
+      - kafka_server_brokertopicmetrics_messagesin_total
+      - kafka_log_log_size
+    tags: [kafka, broker, replication]
+    default_timerange: "2h"
+    panels:
+      - title: Under-Replicated Partitions
+        row: Replication
+        unit: short
+        queries:
+          - expr: 'kafka_server_replicamanager_underreplicatedpartitions'
+            legend_format: "broker {{instance}}"
+      - title: ISR Shrink / Expand Rate
+        row: Replication
+        unit: short
+        queries:
+          - expr: 'rate(kafka_server_replicamanager_isrshrinks_total[{rate_interval}])'
+            legend_format: "shrinks {{instance}}"
+          - expr: 'rate(kafka_server_replicamanager_isrexpands_total[{rate_interval}])'
+            legend_format: "expands {{instance}}"
+      - title: Offline Partitions
+        row: Replication
+        unit: short
+        queries:
+          - expr: 'kafka_controller_kafkacontroller_offlinepartitionscount'
+            legend_format: offline partitions
+      - title: Log Size per Broker
+        row: Storage
+        unit: bytes
+        queries:
+          - expr: 'sum(kafka_log_log_size) by (instance)'
+            legend_format: "{{instance}}"
+      - title: Active Controller Count
+        row: Cluster
+        unit: short
+        queries:
+          - expr: 'kafka_controller_kafkacontroller_activecontrollercount'
+            legend_format: active controllers
+      - title: Broker Network Request Rate
+        row: Network
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(kafka_network_requestmetrics_requests_total[{rate_interval}])) by (instance,request)'
+            legend_format: "{{instance}} {{request}}"
+
+  - id: kafka_consumer_group_issues
+    name: Kafka Consumer Group Investigation
+    description: Diagnose consumer rebalancing storms, commit lag, partition assignment skew, and stuck consumers
+    problem_types:
+      - kafka_rebalancing
+      - consumer_group_lag
+      - partition_skew
+      - stuck_consumers
+      - kafka_commit_failures
+    required_metrics:
+      - kafka_consumergroup_lag
+      - kafka_consumergroup_members
+      - kafka_consumer_fetch_manager_records_lag
+    tags: [kafka, consumer, rebalancing]
+    default_timerange: "2h"
+    panels:
+      - title: Consumer Group Lag by Topic
+        row: Lag
+        unit: short
+        queries:
+          - expr: 'sum(kafka_consumergroup_lag{{{service_filter}}}) by (topic,consumergroup)'
+            legend_format: "{{consumergroup}} / {{topic}}"
+      - title: Consumer Group Lag by Partition
+        row: Lag
+        unit: short
+        queries:
+          - expr: 'kafka_consumergroup_lag{{{service_filter}}}'
+            legend_format: "{{topic}}-{{partition}}"
+      - title: Consumer Group Members
+        row: Group
+        unit: short
+        queries:
+          - expr: 'kafka_consumergroup_members{{{service_filter}}}'
+            legend_format: "{{consumergroup}}"
+      - title: Records Consumed Rate
+        row: Throughput
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(kafka_consumer_fetch_manager_records_consumed_total{{{service_filter}}}[{rate_interval}])) by (consumergroup)'
+            legend_format: "{{consumergroup}}"
+      - title: Fetch Latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'kafka_consumer_fetch_manager_fetch_latency_avg{{{service_filter}}} / 1000'
+            legend_format: "{{consumergroup}}"
+
+  - id: kafka_producer_failures
+    name: Kafka Producer Failures Investigation
+    description: Diagnose producer send failures, high retry rates, batch timeouts, and record error spikes
+    problem_types:
+      - kafka_producer_errors
+      - kafka_send_failures
+      - kafka_producer_retries
+      - kafka_batch_timeout
+    required_metrics:
+      - kafka_producer_record_error_total
+      - kafka_producer_record_send_total
+      - kafka_producer_request_latency_avg
+    tags: [kafka, producer, reliability]
+    default_timerange: "2h"
+    panels:
+      - title: Record Send Rate
+        row: Throughput
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(kafka_producer_record_send_total{{{service_filter}}}[{rate_interval}])) by (topic)'
+            legend_format: "{{topic}}"
+      - title: Record Error Rate
+        row: Errors
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(kafka_producer_record_error_total{{{service_filter}}}[{rate_interval}])) by (topic)'
+            legend_format: "{{topic}}"
+      - title: Error Ratio
+        row: Errors
+        unit: percentunit
+        queries:
+          - expr: 'sum(rate(kafka_producer_record_error_total{{{service_filter}}}[{rate_interval}])) / sum(rate(kafka_producer_record_send_total{{{service_filter}}}[{rate_interval}]))'
+            legend_format: error ratio
+      - title: Producer Request Latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'kafka_producer_request_latency_avg{{{service_filter}}} / 1000'
+            legend_format: "avg {{client_id}}"
+      - title: Retry Rate
+        row: Retries
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(kafka_producer_record_retry_total{{{service_filter}}}[{rate_interval}])) by (topic)'
+            legend_format: "{{topic}}"
+      - title: Batch Size
+        row: Batching
+        unit: bytes
+        queries:
+          - expr: 'kafka_producer_batch_size_avg{{{service_filter}}}'
+            legend_format: "avg {{client_id}}"
+
+  - id: kafka_connect_streams_failures
+    name: Kafka Connect & Streams Failures Investigation
+    description: Diagnose connector task failures, stream processing lag, rebalancing, and dead letter routing
+    problem_types:
+      - kafka_connect_failure
+      - connector_task_failure
+      - kafka_streams_lag
+      - kafka_streams_rebalancing
+    required_metrics:
+      - kafka_connect_connector_status
+      - kafka_connect_task_status
+      - kafka_streams_process_latency
+    tags: [kafka, connect, streams, connectors]
+    default_timerange: "4h"
+    panels:
+      - title: Connector Status
+        row: Connectors
+        unit: short
+        queries:
+          - expr: 'kafka_connect_connector_status{{{service_filter}}}'
+            legend_format: "{{connector}} ({{status}})"
+      - title: Failed Tasks
+        row: Connectors
+        unit: short
+        queries:
+          - expr: 'kafka_connect_task_status{{status="failed",{service_filter}}}'
+            legend_format: "{{connector}}/{{task}}"
+      - title: Connector Error Rate
+        row: Errors
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(kafka_connect_connector_total_record_errors{{{service_filter}}}[{rate_interval}])) by (connector)'
+            legend_format: "{{connector}}"
+      - title: Streams Process Latency
+        row: Streams
+        unit: s
+        queries:
+          - expr: 'kafka_streams_process_latency_avg{{{service_filter}}} / 1000'
+            legend_format: "{{application_id}}"
+      - title: Streams Records Processed Rate
+        row: Streams
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(kafka_streams_process_total{{{service_filter}}}[{rate_interval}])) by (application_id)'
+            legend_format: "{{application_id}}"
+
+  - id: kafka_topic_throughput
+    name: Kafka Topic Throughput & Partition Analysis
+    description: Diagnose per-topic throughput imbalances, partition hotspots, and message size anomalies
+    problem_types:
+      - kafka_topic_imbalance
+      - kafka_partition_hotspot
+      - kafka_throughput_drop
+      - kafka_message_size_spike
+    required_metrics:
+      - kafka_server_brokertopicmetrics_messagesin_total
+      - kafka_server_brokertopicmetrics_bytesin_total
+      - kafka_server_brokertopicmetrics_bytesout_total
+    tags: [kafka, topics, partitions, throughput]
+    default_timerange: "4h"
+    panels:
+      - title: Messages In per Topic
+        row: Throughput
+        unit: reqps
+        queries:
+          - expr: 'sum(rate(kafka_server_brokertopicmetrics_messagesin_total[{rate_interval}])) by (topic)'
+            legend_format: "{{topic}}"
+      - title: Bytes In / Out per Topic
+        row: Throughput
+        unit: bytes
+        queries:
+          - expr: 'sum(rate(kafka_server_brokertopicmetrics_bytesin_total[{rate_interval}])) by (topic)'
+            legend_format: "in {{topic}}"
+          - expr: 'sum(rate(kafka_server_brokertopicmetrics_bytesout_total[{rate_interval}])) by (topic)'
+            legend_format: "out {{topic}}"
+      - title: Partition Message Rate (Hotspot Detection)
+        row: Partitions
+        unit: reqps
+        queries:
+          - expr: 'rate(kafka_log_log_logendoffset[{rate_interval}])'
+            legend_format: "{{topic}}-{{partition}}"
+      - title: Average Message Size
+        row: Messages
+        unit: bytes
+        queries:
+          - expr: 'sum(rate(kafka_server_brokertopicmetrics_bytesin_total[{rate_interval}])) by (topic) / sum(rate(kafka_server_brokertopicmetrics_messagesin_total[{rate_interval}])) by (topic)'
+            legend_format: "{{topic}}"
+      - title: Log End Offset Growth
+        row: Partitions
+        unit: short
+        queries:
+          - expr: 'kafka_log_log_logendoffset{topic!=""}'
+            legend_format: "{{topic}}-{{partition}}"
