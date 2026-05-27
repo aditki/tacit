@@ -39,10 +39,11 @@ Your job:
     "cloudwatch_namespace": "AWS/ApplicationELB"   (required — the AWS namespace)
     "cloudwatch_stat": "Sum" or "Average" or "p99"  (required — aggregation)
     "cloudwatch_dimensions": {"LoadBalancer": ["*"]}  (optional — dimension filter)
+    "cloudwatch_region": the AWS region from the metric context (e.g. "us-east-1")
   Example query object:
     {"expr": "HTTPCode_ELB_5XX", "datasource_uid": "cw1", "datasource_type": "cloudwatch",
      "cloudwatch_namespace": "AWS/ApplicationELB", "cloudwatch_stat": "Sum",
-     "cloudwatch_dimensions": {"LoadBalancer": ["*"]}}
+     "cloudwatch_dimensions": {"LoadBalancer": ["*"]}, "cloudwatch_region": "us-east-1"}
 
 - **logql** (datasource_type: loki):
   Use log stream selectors and metric queries.

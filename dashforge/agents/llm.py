@@ -53,6 +53,19 @@ async def call_llm(
             logger.warning("llm_rate_or_server_error", status=exc.response.status_code)
             raise LLMTransientError(str(exc)) from exc
         raise  # 401, 403, 400 etc. are not retryable
+    except Exception as exc:
+        # Catch botocore/boto3 transient errors (throttling, service unavailable)
+        exc_name = type(exc).__name__
+        if exc_name in ("ClientError", "EndpointConnectionError", "ReadTimeoutError"):
+            err_code = ""
+            if hasattr(exc, "response"):
+                err_code = exc.response.get("Error", {}).get("Code", "")
+            _RETRYABLE_CODES = {"ThrottlingException", "TooManyRequestsException",
+                                "ServiceUnavailableException", "InternalServerException"}
+            if err_code in _RETRYABLE_CODES or exc_name in ("EndpointConnectionError", "ReadTimeoutError"):
+                logger.warning("llm_boto_transient_error", error=str(exc), code=err_code)
+                raise LLMTransientError(str(exc)) from exc
+        raise
 
     logger.debug("llm_raw_response", raw=raw[:500])
 

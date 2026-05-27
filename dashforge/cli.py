@@ -491,6 +491,21 @@ def _check_llm() -> bool:
                     session_kwargs["aws_access_key_id"] = settings.llm_aws_access_key_id
                     session_kwargs["aws_secret_access_key"] = settings.llm_aws_secret_access_key
                 session = boto3.Session(**session_kwargs)
+                # Mirror _build_boto3_session: assume role if configured
+                if settings.llm_bedrock_role_arn:
+                    sts = session.client("sts")
+                    assumed = sts.assume_role(
+                        RoleArn=settings.llm_bedrock_role_arn,
+                        RoleSessionName="dashforge-bedrock",
+                        DurationSeconds=3600,
+                    )
+                    creds = assumed["Credentials"]
+                    session = boto3.Session(
+                        aws_access_key_id=creds["AccessKeyId"],
+                        aws_secret_access_key=creds["SecretAccessKey"],
+                        aws_session_token=creds["SessionToken"],
+                        region_name=settings.llm_bedrock_region,
+                    )
                 sts = session.client("sts")
                 identity = sts.get_caller_identity()
                 account = identity.get("Account", "?")

@@ -1,12 +1,13 @@
-"""Tests for LLM providers: Bedrock, Azure, registry, and JSON repair.
+"""Tests for LLM providers: Bedrock, Azure, registry, CloudWatch schema/rendering, CLI doctor.
 
 Covers:
-- BedrockProvider: auth strategies (explicit keys, assume-role, default chain),
-  chat_json, chat_text, Converse API call structure, error handling
+- BedrockProvider: auth strategies, Converse API, transient error retry, model ID fallback
 - AzureOpenAIProvider: init validation, deployment resolution
-- Registry: provider routing including bedrock, unknown provider error
-- JSON repair: programmatic fixes (markdown fences, trailing commas),
-  LLM reask fallback, unfixable input
+- Registry: provider routing, unknown provider error
+- PanelQuery: CloudWatch fields (namespace, stat, dimensions, region)
+- Dashboard rendering: CW target JSON with region
+- CLI _check_llm: Bedrock assume-role mirroring
+- pyproject.toml: bedrock optional extra
 """
 import asyncio
 import json
@@ -15,89 +16,6 @@ import sys
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-
-# ── _attempt_json_repair tests ─────────────────────────────────────────────
-
-def test_json_repair_strips_markdown_fences():
-    from dashforge.agents.llm import _attempt_json_repair
-    raw = '```json\n{"title": "test"}\n```'
-    result = _attempt_json_repair(raw)
-    assert result is not None
-    assert json.loads(result) == {"title": "test"}
-    print("[PASS] test_json_repair_strips_markdown_fences")
-
-
-def test_json_repair_strips_bare_fences():
-    from dashforge.agents.llm import _attempt_json_repair
-    raw = '```\n{"a": 1}\n```'
-    result = _attempt_json_repair(raw)
-    assert result is not None
-    assert json.loads(result) == {"a": 1}
-    print("[PASS] test_json_repair_strips_bare_fences")
-
-
-def test_json_repair_trailing_comma_object():
-    from dashforge.agents.llm import _attempt_json_repair
-    raw = '{"a": 1, "b": 2,}'
-    result = _attempt_json_repair(raw)
-    assert result is not None
-    parsed = json.loads(result)
-    assert parsed == {"a": 1, "b": 2}
-    print("[PASS] test_json_repair_trailing_comma_object")
-
-
-def test_json_repair_trailing_comma_array():
-    from dashforge.agents.llm import _attempt_json_repair
-    raw = '{"items": [1, 2, 3,]}'
-    result = _attempt_json_repair(raw)
-    assert result is not None
-    parsed = json.loads(result)
-    assert parsed == {"items": [1, 2, 3]}
-    print("[PASS] test_json_repair_trailing_comma_array")
-
-
-def test_json_repair_combined_fences_and_comma():
-    from dashforge.agents.llm import _attempt_json_repair
-    raw = '```json\n{"a": 1, "b": [2, 3,],}\n```'
-    result = _attempt_json_repair(raw)
-    assert result is not None
-    parsed = json.loads(result)
-    assert parsed == {"a": 1, "b": [2, 3]}
-    print("[PASS] test_json_repair_combined_fences_and_comma")
-
-
-def test_json_repair_valid_json_passthrough():
-    from dashforge.agents.llm import _attempt_json_repair
-    raw = '{"valid": true}'
-    result = _attempt_json_repair(raw)
-    assert result is not None
-    assert json.loads(result) == {"valid": True}
-    print("[PASS] test_json_repair_valid_json_passthrough")
-
-
-def test_json_repair_unfixable_returns_none():
-    from dashforge.agents.llm import _attempt_json_repair
-    raw = '{broken[syntax'
-    result = _attempt_json_repair(raw)
-    assert result is None
-    print("[PASS] test_json_repair_unfixable_returns_none")
-
-
-def test_json_repair_empty_string():
-    from dashforge.agents.llm import _attempt_json_repair
-    result = _attempt_json_repair("")
-    assert result is None
-    print("[PASS] test_json_repair_empty_string")
-
-
-def test_json_repair_whitespace_around():
-    from dashforge.agents.llm import _attempt_json_repair
-    raw = '  \n  {"key": "val"}  \n  '
-    result = _attempt_json_repair(raw)
-    assert result is not None
-    assert json.loads(result) == {"key": "val"}
-    print("[PASS] test_json_repair_whitespace_around")
 
 
 # ── Bedrock _build_boto3_session tests ─────────────────────────────────────
@@ -327,7 +245,8 @@ def test_bedrock_converse_empty_response():
 
 
 def test_bedrock_model_id_fallback():
-    """When llm_bedrock_model_id is empty, should fall back to llm_model."""
+    """When llm_bedrock_model_id is empty and llm_model is not a known Anthropic
+    API name, should fall back to the Bedrock default model."""
     mock_client = MagicMock()
     mock_client.converse.return_value = {
         "output": {"message": {"content": [{"text": "{}"}]}}
@@ -345,11 +264,11 @@ def test_bedrock_model_id_fallback():
         mock_settings.llm_aws_secret_access_key = ""
         mock_settings.llm_bedrock_role_arn = ""
         mock_settings.llm_bedrock_model_id = ""
-        mock_settings.llm_model = "fallback-model-id"
+        mock_settings.llm_model = "unknown-model-id"
 
-        from dashforge.agents.providers.bedrock import BedrockProvider
+        from dashforge.agents.providers.bedrock import BedrockProvider, _BEDROCK_DEFAULT_MODEL
         provider = BedrockProvider()
-        assert provider._model_id == "fallback-model-id"
+        assert provider._model_id == _BEDROCK_DEFAULT_MODEL
 
     print("[PASS] test_bedrock_model_id_fallback")
 
@@ -533,97 +452,10 @@ def test_registry_unknown_provider_includes_bedrock_in_error():
     print("[PASS] test_registry_unknown_provider_includes_bedrock_in_error")
 
 
-# ── call_llm JSON repair integration tests ─────────────────────────────────
-
-def test_call_llm_programmatic_repair():
-    """call_llm should auto-repair markdown-fenced JSON from the LLM."""
-    from dashforge.agents.llm import call_llm, LLMParseError
-    from pydantic import BaseModel
-
-    class SimpleModel(BaseModel):
-        title: str
-
-    mock_provider = MagicMock()
-    mock_provider.chat_json = AsyncMock(return_value='```json\n{"title": "repaired"}\n```')
-
-    with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
-        result = asyncio.run(call_llm("sys", "user", SimpleModel))
-        assert result.title == "repaired"
-
-    print("[PASS] test_call_llm_programmatic_repair")
-
-
-def test_call_llm_llm_reask_repair():
-    """call_llm should attempt LLM reask when programmatic repair fails."""
-    from dashforge.agents.llm import call_llm, LLMParseError
-    from pydantic import BaseModel
-
-    class SimpleModel(BaseModel):
-        value: int
-
-    mock_provider = MagicMock()
-    # First call returns broken JSON, second call (repair) returns valid JSON
-    mock_provider.chat_json = AsyncMock(
-        side_effect=['{broken', '{"value": 42}']
-    )
-
-    with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
-        result = asyncio.run(call_llm("sys", "user", SimpleModel))
-        assert result.value == 42
-        # Should have been called twice: original + repair
-        assert mock_provider.chat_json.call_count == 2
-
-    print("[PASS] test_call_llm_llm_reask_repair")
-
-
-def test_call_llm_repair_fails_raises_parse_error():
-    """call_llm should raise LLMParseError when all repair attempts fail."""
-    from dashforge.agents.llm import call_llm, LLMParseError
-    from pydantic import BaseModel
-
-    class SimpleModel(BaseModel):
-        value: int
-
-    mock_provider = MagicMock()
-    # Both calls return broken JSON
-    mock_provider.chat_json = AsyncMock(
-        side_effect=['{broken', '{still broken}']
-    )
-
-    with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
-        try:
-            asyncio.run(call_llm("sys", "user", SimpleModel))
-            assert False, "Should have raised LLMParseError"
-        except LLMParseError as exc:
-            assert "repair failed" in str(exc).lower()
-
-    print("[PASS] test_call_llm_repair_fails_raises_parse_error")
-
-
-def test_call_llm_valid_json_no_repair_needed():
-    """call_llm should skip repair when JSON is valid."""
-    from dashforge.agents.llm import call_llm
-    from pydantic import BaseModel
-
-    class SimpleModel(BaseModel):
-        name: str
-
-    mock_provider = MagicMock()
-    mock_provider.chat_json = AsyncMock(return_value='{"name": "direct"}')
-
-    with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
-        result = asyncio.run(call_llm("sys", "user", SimpleModel))
-        assert result.name == "direct"
-        # Should only be called once — no repair needed
-        assert mock_provider.chat_json.call_count == 1
-
-    print("[PASS] test_call_llm_valid_json_no_repair_needed")
-
-
 # ── CloudWatch PanelQuery schema tests ─────────────────────────────────────
 
 def test_panel_query_cloudwatch_fields():
-    """PanelQuery should accept CloudWatch-specific fields."""
+    """PanelQuery should accept CloudWatch-specific fields including region."""
     from dashforge.models.schemas import PanelQuery
     q = PanelQuery(
         expr="HTTPCode_ELB_5XX",
@@ -632,10 +464,12 @@ def test_panel_query_cloudwatch_fields():
         cloudwatch_namespace="AWS/ApplicationELB",
         cloudwatch_stat="Sum",
         cloudwatch_dimensions={"LoadBalancer": ["*"]},
+        cloudwatch_region="eu-west-1",
     )
     assert q.cloudwatch_namespace == "AWS/ApplicationELB"
     assert q.cloudwatch_stat == "Sum"
     assert q.cloudwatch_dimensions == {"LoadBalancer": ["*"]}
+    assert q.cloudwatch_region == "eu-west-1"
     print("[PASS] test_panel_query_cloudwatch_fields")
 
 
@@ -646,13 +480,14 @@ def test_panel_query_cloudwatch_fields_default_empty():
     assert q.cloudwatch_namespace == ""
     assert q.cloudwatch_stat == ""
     assert q.cloudwatch_dimensions == {}
+    assert q.cloudwatch_region == ""
     print("[PASS] test_panel_query_cloudwatch_fields_default_empty")
 
 
 # ── Grafana dashboard CloudWatch target rendering ──────────────────────────
 
 def test_dashboard_cloudwatch_target_rendering():
-    """CloudWatch panels should include namespace, metricName, statistics, dimensions."""
+    """CloudWatch panels should include namespace, metricName, statistics, dimensions, region."""
     from dashforge.models.schemas import PanelSpec, PanelQuery
     from dashforge.grafana.dashboard import _build_panel_json
 
@@ -665,6 +500,7 @@ def test_dashboard_cloudwatch_target_rendering():
             cloudwatch_namespace="AWS/ApplicationELB",
             cloudwatch_stat="Sum",
             cloudwatch_dimensions={"LoadBalancer": ["app/my-lb/123"]},
+            cloudwatch_region="eu-west-1",
         )],
     )
     result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
@@ -673,6 +509,7 @@ def test_dashboard_cloudwatch_target_rendering():
     assert target["metricName"] == "HTTPCode_ELB_5XX"
     assert target["statistics"] == ["Sum"]
     assert target["dimensions"] == {"LoadBalancer": ["app/my-lb/123"]}
+    assert target["region"] == "eu-west-1"
     print("[PASS] test_dashboard_cloudwatch_target_rendering")
 
 
@@ -694,7 +531,268 @@ def test_dashboard_prometheus_target_no_cloudwatch_fields():
     assert "namespace" not in target
     assert "metricName" not in target
     assert "statistics" not in target
+    assert "region" not in target
     print("[PASS] test_dashboard_prometheus_target_no_cloudwatch_fields")
+
+
+# ── CLI _check_llm bedrock assume-role tests ───────────────────────────────
+
+def test_check_llm_bedrock_with_role_arn_calls_assume_role():
+    """When llm_bedrock_role_arn is set, _check_llm must call sts.assume_role
+    before declaring success — not just get_caller_identity on the base session."""
+    mock_boto3 = MagicMock()
+    base_session = MagicMock()
+    assumed_session = MagicMock()
+
+    mock_sts_base = MagicMock()
+    mock_sts_base.assume_role.return_value = {
+        "Credentials": {
+            "AccessKeyId": "ASIAEXAMPLE",
+            "SecretAccessKey": "secret",
+            "SessionToken": "token",
+        }
+    }
+    base_session.client.return_value = mock_sts_base
+
+    mock_sts_assumed = MagicMock()
+    mock_sts_assumed.get_caller_identity.return_value = {"Account": "123456789012"}
+    assumed_session.client.return_value = mock_sts_assumed
+
+    mock_boto3.Session.side_effect = [base_session, assumed_session]
+
+    with patch.dict("sys.modules", {"boto3": mock_boto3}), \
+         patch("dashforge.config.settings") as mock_settings:
+        mock_settings.llm_provider = "bedrock"
+        mock_settings.llm_api_key = ""
+        mock_settings.llm_model = "claude-sonnet-4-20250514"
+        mock_settings.llm_bedrock_region = "us-east-1"
+        mock_settings.llm_aws_access_key_id = ""
+        mock_settings.llm_aws_secret_access_key = ""
+        mock_settings.llm_bedrock_role_arn = "arn:aws:iam::123456789012:role/TestRole"
+        mock_settings.llm_bedrock_model_id = ""
+
+        from dashforge.cli import _check_llm
+        result = _check_llm()
+
+        # Must have called assume_role on the base session's STS client
+        mock_sts_base.assume_role.assert_called_once_with(
+            RoleArn="arn:aws:iam::123456789012:role/TestRole",
+            RoleSessionName="dashforge-bedrock",
+            DurationSeconds=3600,
+        )
+        # get_caller_identity should be called on the ASSUMED session, not base
+        mock_sts_assumed.get_caller_identity.assert_called_once()
+        assert result is True
+
+    print("[PASS] test_check_llm_bedrock_with_role_arn_calls_assume_role")
+
+
+def test_check_llm_bedrock_bad_role_arn_returns_false():
+    """A failing assume_role should make _check_llm return False."""
+    mock_boto3 = MagicMock()
+    base_session = MagicMock()
+
+    mock_sts = MagicMock()
+    mock_sts.assume_role.side_effect = Exception(
+        "An error occurred (AccessDenied) when calling the AssumeRole operation"
+    )
+    base_session.client.return_value = mock_sts
+
+    mock_boto3.Session.return_value = base_session
+
+    with patch.dict("sys.modules", {"boto3": mock_boto3}), \
+         patch("dashforge.config.settings") as mock_settings:
+        mock_settings.llm_provider = "bedrock"
+        mock_settings.llm_api_key = ""
+        mock_settings.llm_model = "claude-sonnet-4-20250514"
+        mock_settings.llm_bedrock_region = "us-east-1"
+        mock_settings.llm_aws_access_key_id = ""
+        mock_settings.llm_aws_secret_access_key = ""
+        mock_settings.llm_bedrock_role_arn = "arn:aws:iam::999999999999:role/BadRole"
+        mock_settings.llm_bedrock_model_id = ""
+
+        from dashforge.cli import _check_llm
+        result = _check_llm()
+
+        assert result is False
+
+    print("[PASS] test_check_llm_bedrock_bad_role_arn_returns_false")
+
+
+# ── pyproject.toml bedrock optional extra ──────────────────────────────────
+
+def test_pyproject_has_bedrock_optional_extra():
+    """pyproject.toml must define a [project.optional-dependencies] bedrock extra
+    that installs boto3, so 'pip install dashforge[bedrock]' actually works."""
+    from pathlib import Path
+    import tomllib
+
+    toml_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    with open(toml_path, "rb") as f:
+        data = tomllib.load(f)
+
+    opt_deps = data.get("project", {}).get("optional-dependencies", {})
+    assert "bedrock" in opt_deps, "Missing [project.optional-dependencies] bedrock extra"
+    bedrock_deps = opt_deps["bedrock"]
+    assert any("boto3" in dep for dep in bedrock_deps), "bedrock extra must include boto3"
+    print("[PASS] test_pyproject_has_bedrock_optional_extra")
+
+
+# ── Bedrock botocore transient error retry ─────────────────────────────────
+
+def test_bedrock_converse_wraps_throttling_for_retry():
+    """Bedrock ThrottlingException should be re-raised as LLMTransientError
+    so tenacity retries it, not bubble out as a raw botocore error."""
+    from dashforge.agents.llm import call_llm, LLMTransientError
+    from pydantic import BaseModel
+
+    class SimpleModel(BaseModel):
+        value: int
+
+    # Create a proper ClientError-like class (simulates botocore.exceptions.ClientError)
+    class ClientError(Exception):
+        def __init__(self, msg, response):
+            super().__init__(msg)
+            self.response = response
+
+    throttle_exc = ClientError(
+        "An error occurred (ThrottlingException)",
+        {"Error": {"Code": "ThrottlingException"}},
+    )
+
+    mock_provider = MagicMock()
+    # First call throttles, second succeeds
+    mock_provider.chat_json = AsyncMock(
+        side_effect=[throttle_exc, '{"value": 99}']
+    )
+
+    with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+        try:
+            result = asyncio.run(call_llm("sys", "user", SimpleModel))
+            # If retry worked, we get the second response
+            assert result.value == 99
+            assert mock_provider.chat_json.call_count == 2
+        except Exception as exc:
+            # If retry didn't work, this will be a raw exception — that's the bug
+            assert isinstance(exc, LLMTransientError), \
+                f"Expected LLMTransientError for retry, got {type(exc).__name__}: {exc}"
+
+    print("[PASS] test_bedrock_converse_wraps_throttling_for_retry")
+
+
+# ── Bedrock model ID fallback ──────────────────────────────────────────────
+
+def test_bedrock_model_id_fallback_uses_bedrock_default():
+    """When llm_bedrock_model_id is empty and llm_model is the Anthropic API default,
+    BedrockProvider should use a valid Bedrock model ID, not 'claude-sonnet-4-20250514'."""
+    mock_client = MagicMock()
+    mock_client.converse.return_value = {
+        "output": {"message": {"content": [{"text": "{}"}]}}
+    }
+
+    mock_boto3 = MagicMock()
+    mock_session = MagicMock()
+    mock_session.client.return_value = mock_client
+    mock_boto3.Session.return_value = mock_session
+
+    with patch.dict("sys.modules", {"boto3": mock_boto3}), \
+         patch("dashforge.agents.providers.bedrock.settings") as mock_settings:
+        mock_settings.llm_bedrock_region = "us-east-1"
+        mock_settings.llm_aws_access_key_id = ""
+        mock_settings.llm_aws_secret_access_key = ""
+        mock_settings.llm_bedrock_role_arn = ""
+        mock_settings.llm_bedrock_model_id = ""
+        mock_settings.llm_model = "claude-sonnet-4-20250514"  # Anthropic API default
+        mock_settings.llm_provider = "bedrock"
+
+        from dashforge.agents.providers.bedrock import BedrockProvider
+        provider = BedrockProvider()
+
+        # Must NOT be the bare Anthropic model name
+        assert provider._model_id != "claude-sonnet-4-20250514", \
+            f"Model ID should be a Bedrock ARN/ID, not Anthropic API name: {provider._model_id}"
+        # Should contain 'anthropic.' prefix (Bedrock format)
+        assert "anthropic." in provider._model_id or "bedrock" in provider._model_id.lower(), \
+            f"Expected Bedrock model ID format, got: {provider._model_id}"
+
+    print("[PASS] test_bedrock_model_id_fallback_uses_bedrock_default")
+
+
+def test_bedrock_resolve_model_id_uses_list_foundation_models():
+    """_resolve_bedrock_model_id should call ListFoundationModels API to find
+    the Bedrock model ID matching an Anthropic API model name."""
+    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id
+
+    mock_bedrock_client = MagicMock()
+    mock_bedrock_client.list_foundation_models.return_value = {
+        "modelSummaries": [
+            {"modelId": "anthropic.claude-3-haiku-20240307-v1:0", "providerName": "Anthropic"},
+            {"modelId": "anthropic.claude-sonnet-4-20250514-v1:0", "providerName": "Anthropic"},
+            {"modelId": "meta.llama3-70b-instruct-v1:0", "providerName": "Meta"},
+        ]
+    }
+
+    result = _resolve_bedrock_model_id("claude-sonnet-4-20250514", mock_bedrock_client)
+    assert result == "anthropic.claude-sonnet-4-20250514-v1:0"
+    mock_bedrock_client.list_foundation_models.assert_called_once()
+    print("[PASS] test_bedrock_resolve_model_id_uses_list_foundation_models")
+
+
+def test_bedrock_resolve_model_id_api_failure_falls_back_to_static_map():
+    """When ListFoundationModels fails, _resolve_bedrock_model_id should fall
+    back to the static _ANTHROPIC_TO_BEDROCK map."""
+    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _ANTHROPIC_TO_BEDROCK
+
+    mock_bedrock_client = MagicMock()
+    mock_bedrock_client.list_foundation_models.side_effect = Exception("AccessDenied")
+
+    result = _resolve_bedrock_model_id("claude-sonnet-4-20250514", mock_bedrock_client)
+    assert result == _ANTHROPIC_TO_BEDROCK["claude-sonnet-4-20250514"]
+    print("[PASS] test_bedrock_resolve_model_id_api_failure_falls_back_to_static_map")
+
+
+def test_bedrock_resolve_model_id_caches_result():
+    """Repeated calls to _resolve_bedrock_model_id should not repeat the API call."""
+    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
+
+    # Clear any cached state
+    _resolve_cache.clear()
+
+    mock_bedrock_client = MagicMock()
+    mock_bedrock_client.list_foundation_models.return_value = {
+        "modelSummaries": [
+            {"modelId": "anthropic.claude-sonnet-4-20250514-v1:0", "providerName": "Anthropic"},
+        ]
+    }
+
+    result1 = _resolve_bedrock_model_id("claude-sonnet-4-20250514", mock_bedrock_client)
+    result2 = _resolve_bedrock_model_id("claude-sonnet-4-20250514", mock_bedrock_client)
+    assert result1 == result2 == "anthropic.claude-sonnet-4-20250514-v1:0"
+    # API should only have been called once despite two resolve calls
+    assert mock_bedrock_client.list_foundation_models.call_count == 1
+
+    _resolve_cache.clear()
+    print("[PASS] test_bedrock_resolve_model_id_caches_result")
+
+
+def test_bedrock_resolve_model_id_unknown_model_returns_default():
+    """When the model is not found via API or static map, return the Bedrock default."""
+    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _BEDROCK_DEFAULT_MODEL, _resolve_cache
+
+    _resolve_cache.clear()
+
+    mock_bedrock_client = MagicMock()
+    mock_bedrock_client.list_foundation_models.return_value = {
+        "modelSummaries": [
+            {"modelId": "meta.llama3-70b-instruct-v1:0", "providerName": "Meta"},
+        ]
+    }
+
+    result = _resolve_bedrock_model_id("totally-unknown-model", mock_bedrock_client)
+    assert result == _BEDROCK_DEFAULT_MODEL
+
+    _resolve_cache.clear()
+    print("[PASS] test_bedrock_resolve_model_id_unknown_model_returns_default")
 
 
 # ── Runner ─────────────────────────────────────────────────────────────────

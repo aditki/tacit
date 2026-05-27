@@ -25,6 +25,9 @@ dependencies = [
     "rich>=13.0.0",
 ]
 
+[project.optional-dependencies]
+bedrock = ["boto3>=1.34.0"]
+
 [project.scripts]
 dashforge = "dashforge.cli:main"
 

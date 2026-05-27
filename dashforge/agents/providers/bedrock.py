@@ -24,6 +24,53 @@ _ANTHROPIC_MODEL_PREFIXES = ("anthropic.",)
 _META_MODEL_PREFIXES = ("meta.",)
 _MISTRAL_MODEL_PREFIXES = ("mistral.",)
 
+# Map common Anthropic API model names to their Bedrock model IDs
+_ANTHROPIC_TO_BEDROCK: dict[str, str] = {
+    "claude-sonnet-4-20250514": "anthropic.claude-sonnet-4-20250514-v1:0",
+    "claude-3-5-sonnet-20241022": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    "claude-3-5-haiku-20241022": "anthropic.claude-3-5-haiku-20241022-v1:0",
+    "claude-3-opus-20240229": "anthropic.claude-3-opus-20240229-v1:0",
+    "claude-3-haiku-20240307": "anthropic.claude-3-haiku-20240307-v1:0",
+}
+
+_BEDROCK_DEFAULT_MODEL = "anthropic.claude-sonnet-4-20250514-v1:0"
+
+# Cache for resolved model IDs — avoids repeated ListFoundationModels calls
+_resolve_cache: dict[str, str] = {}
+
+
+def _resolve_bedrock_model_id(anthropic_model_name: str, bedrock_client) -> str:
+    """Resolve an Anthropic API model name to a Bedrock model ID.
+
+    Strategy:
+    1. Check cache
+    2. Call ListFoundationModels API to find a matching model ID
+    3. Fall back to static _ANTHROPIC_TO_BEDROCK map
+    4. Fall back to _BEDROCK_DEFAULT_MODEL
+    """
+    if anthropic_model_name in _resolve_cache:
+        return _resolve_cache[anthropic_model_name]
+
+    # Try runtime resolution via ListFoundationModels
+    try:
+        resp = bedrock_client.list_foundation_models()
+        for model in resp.get("modelSummaries", []):
+            model_id = model.get("modelId", "")
+            if anthropic_model_name in model_id:
+                _resolve_cache[anthropic_model_name] = model_id
+                logger.info("bedrock_model_resolved", source="api",
+                            input=anthropic_model_name, resolved=model_id)
+                return model_id
+    except Exception as exc:
+        logger.debug("bedrock_list_models_failed", error=str(exc))
+
+    # Fall back to static map, then default
+    resolved = _ANTHROPIC_TO_BEDROCK.get(anthropic_model_name, _BEDROCK_DEFAULT_MODEL)
+    _resolve_cache[anthropic_model_name] = resolved
+    logger.info("bedrock_model_resolved", source="static_map",
+                input=anthropic_model_name, resolved=resolved)
+    return resolved
+
 
 def _build_boto3_session():
     """Build a boto3.Session with the appropriate credentials."""
@@ -81,7 +128,15 @@ class BedrockProvider(LLMProvider):
     def __init__(self):
         session = _build_boto3_session()
         self._client = session.client("bedrock-runtime")
-        self._model_id = settings.llm_bedrock_model_id or settings.llm_model
+        if settings.llm_bedrock_model_id:
+            self._model_id = settings.llm_bedrock_model_id
+        else:
+            # Resolve Anthropic API model name to Bedrock model ID
+            # Uses ListFoundationModels API with fallback to static map
+            bedrock_ctrl = session.client("bedrock")
+            self._model_id = _resolve_bedrock_model_id(
+                settings.llm_model, bedrock_ctrl
+            )
         logger.info(
             "bedrock_init",
             model_id=self._model_id,

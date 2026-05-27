@@ -106,12 +106,17 @@ class MetricsDiscoveryResult(BaseModel):
 # ── Query Builder ────────────────────────────────────────────────────────────
 
 class PanelQuery(BaseModel):
-    """A single PromQL / LogQL expression with context."""
+    """A single query expression for any supported datasource."""
 
-    expr: str = Field(description="PromQL or LogQL expression")
+    expr: str = Field(description="Query expression (PromQL, LogQL, SignalFlow, Lucene, metric name for CloudWatch, etc.)")
     legend_format: str = Field(default="{{instance}}", description="Legend template")
     datasource_uid: str
     datasource_type: str = "prometheus"
+    # CloudWatch-specific fields (only set when datasource_type='cloudwatch')
+    cloudwatch_namespace: str = Field(default="", description="AWS CloudWatch namespace, e.g. 'AWS/ApplicationELB'")
+    cloudwatch_stat: str = Field(default="", description="CloudWatch statistic: Sum, Average, p99, etc.")
+    cloudwatch_dimensions: dict[str, list[str]] = Field(default_factory=dict, description="CloudWatch dimensions, e.g. {'LoadBalancer': ['*']}")
+    cloudwatch_region: str = Field(default="", description="AWS region for this CloudWatch query, e.g. 'us-east-1'")
 
 
 class PanelSpec(BaseModel):
