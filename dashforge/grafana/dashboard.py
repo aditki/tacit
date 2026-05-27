@@ -39,6 +39,7 @@ def _build_panel_json(panel: PanelSpec, panel_id: int, grid_pos: dict) -> dict[s
         if q.cloudwatch_namespace:
             target["namespace"] = q.cloudwatch_namespace
             target["metricName"] = q.expr  # expr holds the CW metric name
+            target["region"] = q.cloudwatch_region or "default"
             target["statistics"] = [q.cloudwatch_stat or "Average"]
             if q.cloudwatch_dimensions:
                 target["dimensions"] = q.cloudwatch_dimensions

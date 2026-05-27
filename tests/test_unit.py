@@ -18,7 +18,7 @@ from dashforge.models.schemas import (
     PanelSpec,
     SignalType,
 )
-from dashforge.grafana.dashboard import build_dashboard_json, TIMERANGE_MAP
+from dashforge.grafana.dashboard import build_dashboard_json, _build_panel_json, TIMERANGE_MAP
 from dashforge.grafana.datasource import (
     filter_datasources_by_signal,
     filter_searchable_datasources,
@@ -513,6 +513,66 @@ def test_config_concurrency_defaults():
     print("[PASS] test_config_concurrency_defaults")
 
 
+def test_cloudwatch_panel_query_region_field():
+    """PanelQuery must accept a cloudwatch_region field for CW targets."""
+    q = PanelQuery(
+        expr="HTTPCode_ELB_5XX",
+        datasource_uid="cw-1",
+        datasource_type="cloudwatch",
+        cloudwatch_namespace="AWS/ApplicationELB",
+        cloudwatch_stat="Sum",
+        cloudwatch_region="us-west-2",
+    )
+    assert q.cloudwatch_region == "us-west-2"
+    # Default should be empty when not supplied
+    q2 = PanelQuery(expr="up", datasource_uid="p1")
+    assert q2.cloudwatch_region == ""
+    print("[PASS] test_cloudwatch_panel_query_region_field")
+
+
+def test_cloudwatch_target_includes_region():
+    """Grafana CW target JSON must contain region when cloudwatch_namespace is set."""
+    panel = PanelSpec(
+        title="5xx Errors",
+        queries=[PanelQuery(
+            expr="HTTPCode_ELB_5XX",
+            datasource_uid="cw-1",
+            datasource_type="cloudwatch",
+            cloudwatch_namespace="AWS/ApplicationELB",
+            cloudwatch_stat="Sum",
+            cloudwatch_region="eu-west-1",
+            cloudwatch_dimensions={"LoadBalancer": ["*"]},
+        )],
+    )
+    result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    target = result["targets"][0]
+    assert target["region"] == "eu-west-1", f"Expected region 'eu-west-1', got {target.get('region')}"
+    assert target["namespace"] == "AWS/ApplicationELB"
+    assert target["metricName"] == "HTTPCode_ELB_5XX"
+    assert target["statistics"] == ["Sum"]
+    assert target["dimensions"] == {"LoadBalancer": ["*"]}
+    print("[PASS] test_cloudwatch_target_includes_region")
+
+
+def test_prometheus_target_excludes_cloudwatch_fields():
+    """Non-CloudWatch targets must NOT include region, namespace, etc."""
+    panel = PanelSpec(
+        title="Request Rate",
+        queries=[PanelQuery(
+            expr='rate(http_requests_total[5m])',
+            datasource_uid="prom-1",
+            datasource_type="prometheus",
+        )],
+    )
+    result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    target = result["targets"][0]
+    assert "region" not in target
+    assert "namespace" not in target
+    assert "metricName" not in target
+    assert "statistics" not in target
+    print("[PASS] test_prometheus_target_excludes_cloudwatch_fields")
+
+
 if __name__ == "__main__":
     test_intent_model()
     test_dashboard_spec_model()
@@ -539,4 +599,7 @@ if __name__ == "__main__":
     test_metrics_discovery_prompt_has_security()
     test_query_builder_prompt_has_security()
     test_config_concurrency_defaults()
+    test_cloudwatch_panel_query_region_field()
+    test_cloudwatch_target_includes_region()
+    test_prometheus_target_excludes_cloudwatch_fields()
     print("\n=== All tests passed ===")
