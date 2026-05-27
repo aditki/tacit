@@ -543,7 +543,7 @@ def test_cloudwatch_target_includes_region():
             cloudwatch_namespace="AWS/ApplicationELB",
             cloudwatch_stat="Sum",
             cloudwatch_region="eu-west-1",
-            cloudwatch_dimensions={"LoadBalancer": ["*"]},
+            cloudwatch_dimensions={"LoadBalancer": "*"},
         )],
     )
     result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
@@ -552,7 +552,7 @@ def test_cloudwatch_target_includes_region():
     assert target["namespace"] == "AWS/ApplicationELB"
     assert target["metricName"] == "HTTPCode_ELB_5XX"
     assert target["statistics"] == ["Sum"]
-    assert target["dimensions"] == {"LoadBalancer": ["*"]}
+    assert target["dimensions"] == {"LoadBalancer": "*"}
     print("[PASS] test_cloudwatch_target_includes_region")
 
 
@@ -789,6 +789,78 @@ def test_provider_sdk_transient_error_in_repair_retried():
     print("[PASS] test_provider_sdk_transient_error_in_repair_retried")
 
 
+def test_cloudwatch_metric_name_strips_namespace_prefix():
+    """When expr contains the catalog-style 'Namespace/MetricName', _build_panel_json
+    must strip the namespace prefix so metricName is just 'MetricName'."""
+    panel = PanelSpec(
+        title="5xx Errors",
+        queries=[PanelQuery(
+            expr="AWS/ApplicationELB/HTTPCode_ELB_5XX",
+            datasource_uid="cw-1",
+            datasource_type="cloudwatch",
+            cloudwatch_namespace="AWS/ApplicationELB",
+            cloudwatch_stat="Sum",
+        )],
+    )
+    result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    target = result["targets"][0]
+    assert target["metricName"] == "HTTPCode_ELB_5XX", (
+        f"Expected stripped metricName 'HTTPCode_ELB_5XX', got {target['metricName']!r}"
+    )
+    # When expr is already bare, should pass through unchanged
+    panel2 = PanelSpec(
+        title="5xx Errors",
+        queries=[PanelQuery(
+            expr="HTTPCode_ELB_5XX",
+            datasource_uid="cw-1",
+            datasource_type="cloudwatch",
+            cloudwatch_namespace="AWS/ApplicationELB",
+            cloudwatch_stat="Sum",
+        )],
+    )
+    result2 = _build_panel_json(panel2, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    assert result2["targets"][0]["metricName"] == "HTTPCode_ELB_5XX"
+    print("[PASS] test_cloudwatch_metric_name_strips_namespace_prefix")
+
+
+def test_cloudwatch_dimensions_are_string_valued():
+    """CloudWatch dimensions must be dict[str, str], not dict[str, list[str]].
+    Grafana expects string values per dimension key."""
+    q = PanelQuery(
+        expr="HTTPCode_ELB_5XX",
+        datasource_uid="cw-1",
+        datasource_type="cloudwatch",
+        cloudwatch_namespace="AWS/ApplicationELB",
+        cloudwatch_stat="Sum",
+        cloudwatch_dimensions={"LoadBalancer": "*", "AvailabilityZone": "us-east-1a"},
+    )
+    assert q.cloudwatch_dimensions == {"LoadBalancer": "*", "AvailabilityZone": "us-east-1a"}
+
+    # Verify _build_panel_json emits string values
+    panel = PanelSpec(title="Test", queries=[q])
+    result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    dims = result["targets"][0]["dimensions"]
+    for k, v in dims.items():
+        assert isinstance(v, str), f"Dimension {k!r} should be str, got {type(v).__name__}: {v!r}"
+    print("[PASS] test_cloudwatch_dimensions_are_string_valued")
+
+
+def test_signalfx_discovery_normalized_keywords_match_cache():
+    """SignalFx discovery must use normalized keywords for both the cache key
+    and the API search, so whitespace-containing keywords don't poison the cache."""
+    from dashforge.signalfx.discovery import _normalize_keywords
+
+    raw = [" CPU ", "High", "cpu"]
+    norm = _normalize_keywords(raw)
+    assert norm == ["cpu", "high"], f"Expected ['cpu', 'high'], got {norm}"
+
+    # Verify the same keywords in different order/case produce same result
+    raw2 = ["high", "CPU"]
+    norm2 = _normalize_keywords(raw2)
+    assert norm == norm2, f"Expected same normalization, got {norm} vs {norm2}"
+    print("[PASS] test_signalfx_discovery_normalized_keywords_match_cache")
+
+
 if __name__ == "__main__":
     test_intent_model()
     test_dashboard_spec_model()
@@ -824,4 +896,7 @@ if __name__ == "__main__":
     test_cloudwatch_validation_is_skipped_for_prometheus_probe()
     test_prometheus_validation_still_uses_proxy_query()
     test_provider_sdk_transient_error_in_repair_retried()
+    test_cloudwatch_metric_name_strips_namespace_prefix()
+    test_cloudwatch_dimensions_are_string_valued()
+    test_signalfx_discovery_normalized_keywords_match_cache()
     print("\n=== All tests passed ===")

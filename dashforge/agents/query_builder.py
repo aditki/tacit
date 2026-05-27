@@ -38,7 +38,7 @@ Your job:
   Also set these fields in the query object:
     "cloudwatch_namespace": "AWS/ApplicationELB"
     "cloudwatch_stat": "Sum" or "Average" or "p99" etc.
-    "cloudwatch_dimensions": {"LoadBalancer": ["*"]}  (or specific values)
+    "cloudwatch_dimensions": {"LoadBalancer": "*"}  (or specific resource name)
   Example expr: "HTTPCode_ELB_5XX"
 
 - **logql** (datasource_type: loki):

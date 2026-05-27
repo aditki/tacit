@@ -92,7 +92,7 @@ async def discover_metrics(
     # Build search queries from keywords (reusing adapter's mapping)
     # SignalFx /v2/metric requires 'name:' prefix for metric name searches.
     search_queries: set[str] = set()
-    kw_lower = [k.lower() for k in keywords]
+    kw_lower = norm_kw  # use normalized keywords so search matches cache key
     for kw in kw_lower:
         search_queries.add(f"name:*{kw}*")
         for pattern, prefixes in KEYWORD_METRIC_MAP.items():
