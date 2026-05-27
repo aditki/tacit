@@ -35,11 +35,14 @@ Your job:
 
 - **cloudwatch** (datasource_type: cloudwatch):
   The "expr" field should be the CloudWatch metric name (e.g. "HTTPCode_ELB_5XX").
-  Also set these fields in the query object:
-    "cloudwatch_namespace": "AWS/ApplicationELB"
-    "cloudwatch_stat": "Sum" or "Average" or "p99" etc.
-    "cloudwatch_dimensions": {"LoadBalancer": ["*"]}  (or specific values)
-  Example expr: "HTTPCode_ELB_5XX"
+  You MUST also set these query-level fields:
+    "cloudwatch_namespace": "AWS/ApplicationELB"   (required — the AWS namespace)
+    "cloudwatch_stat": "Sum" or "Average" or "p99"  (required — aggregation)
+    "cloudwatch_dimensions": {"LoadBalancer": ["*"]}  (optional — dimension filter)
+  Example query object:
+    {"expr": "HTTPCode_ELB_5XX", "datasource_uid": "cw1", "datasource_type": "cloudwatch",
+     "cloudwatch_namespace": "AWS/ApplicationELB", "cloudwatch_stat": "Sum",
+     "cloudwatch_dimensions": {"LoadBalancer": ["*"]}}
 
 - **logql** (datasource_type: loki):
   Use log stream selectors and metric queries.
