@@ -87,6 +87,7 @@ class Settings(BaseSettings):
     llm_api_base: str = ""  # optional: custom endpoint (Azure, Ollama, vLLM, etc.)
 
     # Grafana
+    grafana_enabled: bool = True
     grafana_url: str = "http://localhost:3000"
     grafana_api_key: str = Field(default="", repr=False)
     grafana_org_id: int = 1

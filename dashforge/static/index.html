@@ -143,14 +143,15 @@
     }
 
     /* History */
-    .hist-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    .hist-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; table-layout: fixed; }
     .hist-table th {
       text-align: left; padding: 0.5rem; color: #6b7280; border-bottom: 1px solid #2d3040;
       font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;
     }
-    .hist-table td { padding: 0.5rem; border-bottom: 1px solid #1a1d27; color: #9ca3af; }
+    .hist-table td { padding: 0.5rem; border-bottom: 1px solid #1a1d27; color: #9ca3af; vertical-align: top; }
     .hist-table tr:hover td { background: #1a1d27; }
-    .hist-table .prompt-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .hist-table .prompt-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .hist-table .arch-cell { word-break: break-word; white-space: normal; line-height: 1.3; overflow-wrap: anywhere; }
     .badge {
       display: inline-block; padding: 0.15rem 0.5rem; border-radius: 10px;
       font-size: 0.7rem; font-weight: 600;
@@ -281,13 +282,15 @@
         }
         const data = await resp.json();
         lastDashboardUid = data.dashboard_uid;
-        const dashUrl = data.dashboard_url.replace('http://localhost:3000', 'http://' + window.location.hostname + ':3000');
+        const dashUrl = data.dashboard_url ? data.dashboard_url.replace('http://localhost:3000', 'http://' + window.location.hostname + ':3000') : '';
+        const grafanaLink = dashUrl ? `<div class="result-url"><a href="${dashUrl}" target="_blank">${data.dashboard_uid} &mdash; Open in Grafana &rarr;</a></div>` : '';
+        const sfxLink = data.signalfx_url ? `<div class="result-url" style="margin-top:4px"><a href="${data.signalfx_url}" target="_blank">Open in SignalFx &rarr;</a></div>` : '';
 
         result.innerHTML = `
           <div class="result-card success">
             <div class="result-label">Dashboard created</div>
-            <div class="result-url"><a href="${dashUrl}" target="_blank">${data.dashboard_uid} &mdash; Open in Grafana &rarr;</a></div>
-            ${data.signalfx_url ? `<div class="result-url" style="margin-top:4px"><a href="${data.signalfx_url}" target="_blank">Open in SignalFx &rarr;</a></div>` : ''}
+            ${grafanaLink}
+            ${sfxLink}
             <div class="result-meta">
               <strong>${data.panel_count}</strong> panels<br>
               ${data.summary.replace(/\n/g, '<br>')}
@@ -350,7 +353,12 @@
     }
 
     async function submitFeedback() {
-      if (!lastDashboardUid) return;
+      const statusEl = document.getElementById('fb-status');
+      if (!lastDashboardUid) {
+        statusEl.textContent = 'No dashboard ID available';
+        statusEl.style.color = '#ef4444';
+        return;
+      }
       const body = {
         dashboard_uid: lastDashboardUid,
         symptom_visibility: ratings.symptom || null,
@@ -362,18 +370,25 @@
         reviewer: 'web-ui',
       };
       try {
+        statusEl.textContent = 'Submitting...';
+        statusEl.style.color = '#9ca3af';
         const resp = await fetch(`${BASE}/api/v1/feedback`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
         if (resp.ok) {
-          document.getElementById('fb-status').textContent = 'Feedback submitted!';
+          statusEl.textContent = 'Feedback submitted!';
+          statusEl.style.color = '#34d399';
           document.getElementById('feedback-form').querySelectorAll('button,textarea').forEach(el => el.disabled = true);
+        } else {
+          const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+          statusEl.textContent = `Error: ${err.detail || resp.statusText}`;
+          statusEl.style.color = '#ef4444';
         }
       } catch(e) {
-        document.getElementById('fb-status').textContent = 'Failed to submit';
-        document.getElementById('fb-status').style.color = '#ef4444';
+        statusEl.textContent = 'Failed to submit: ' + e.message;
+        statusEl.style.color = '#ef4444';
       }
     }
 
@@ -467,7 +482,7 @@
           return;
         }
         let html = `<table class="hist-table"><thead><tr>
-          <th>Status</th><th>Prompt</th><th>Path</th><th>Panels</th><th>Time</th><th>Archetypes</th><th></th>
+          <th style="width:70px">Status</th><th style="width:30%">Prompt</th><th style="width:65px">Path</th><th style="width:50px">Panels</th><th style="width:50px">Time</th><th style="width:25%">Archetypes</th><th style="width:55px"></th>
         </tr></thead><tbody>`;
         for (const inv of data.investigations) {
           const badge = statusBadge(inv.status);
@@ -479,7 +494,7 @@
             <td>${inv.path_used || '—'}</td>
             <td>${inv.panel_count}</td>
             <td>${inv.total_time ? inv.total_time.toFixed(1) + 's' : '—'}</td>
-            <td style="font-size:0.75rem">${esc(archs)}</td>
+            <td class="arch-cell" style="font-size:0.75rem">${esc(archs)}</td>
             <td><span class="hist-back" onclick="showInvestigation('${inv.id}')">Details</span></td>
           </tr>`;
         }

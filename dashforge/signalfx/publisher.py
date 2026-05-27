@@ -9,6 +9,7 @@ Flow: DashboardSpec → create charts → create dashboard → link charts → r
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -60,21 +61,198 @@ _TIMERANGE_MS = {
 }
 
 
+# ── PromQL → SignalFlow translator ────────────────────────────────────────────
+
+# Regex to parse PromQL label matchers: {key="val", key=~"regex", ...}
+_LABEL_RE = re.compile(r'(\w+)\s*(=~|!=|=)\s*"([^"]*?)"')
+# Regex to detect PromQL patterns (curly-brace selectors, rate(), sum(), etc.)
+_PROMQL_INDICATORS = re.compile(r'\b(rate|sum|increase|histogram_quantile|count|avg|topk|bottomk)\s*\(')
+
+
+def _is_promql(expr: str) -> bool:
+    """Heuristic: does this look like PromQL rather than SignalFlow?"""
+    # SignalFlow uses data('...'), PromQL uses metric_name{...} and functions like rate()
+    if "data(" in expr:
+        return False
+    if _PROMQL_INDICATORS.search(expr):
+        return True
+    # Bare metric with label selectors: metric_name{key="val"}
+    if re.search(r'\w+\{.*?\}', expr) and "filter(" not in expr:
+        return True
+    return False
+
+
+def _parse_labels(label_str: str) -> list[tuple[str, str, str]]:
+    """Parse PromQL label matchers into (key, operator, value) tuples."""
+    return [(m[0], m[1], m[2]) for m in _LABEL_RE.findall(label_str)]
+
+
+def _labels_to_filter(labels: list[tuple[str, str, str]]) -> str:
+    """Convert parsed labels to SignalFlow filter expression."""
+    parts = []
+    for key, op, val in labels:
+        if op == "=~":
+            # Regex match → SignalFlow doesn't have native regex, use filter with
+            # a simplified approach: if it's a simple alternation, use OR filters.
+            # Otherwise fall back to a broad filter.
+            if val.startswith("[") or "|" in val:
+                parts.append(f"filter('{key}', '*')")
+            else:
+                parts.append(f"filter('{key}', '{val}')")
+        elif op == "!=":
+            parts.append(f"not filter('{key}', '{val}')")
+        else:  # =
+            parts.append(f"filter('{key}', '{val}')")
+    return " and ".join(parts) if parts else ""
+
+
+def _promql_to_signalflow(expr: str, label: str = "A") -> str:
+    """Best-effort translation of a PromQL expression to SignalFlow.
+
+    Handles the common patterns found in DashForge archetypes:
+    - metric{labels}  →  data('metric', filter=...)
+    - rate(metric{labels}[5m])  →  data('metric', filter=..., rollup='rate')
+    - sum(rate(...)) by (x)  →  data(...).sum(by=['x'])
+    - increase(metric{labels}[5m])  →  data('metric', filter=..., rollup='delta')
+    - histogram_quantile(0.95, sum(rate(metric_bucket{...}[5m])) by (le))
+      →  data('metric', filter=...).percentile(pct=95)
+    """
+    expr = expr.strip()
+
+    # ── histogram_quantile → percentile ──
+    hq_match = re.match(
+        r'histogram_quantile\(([\d.]+),\s*sum\(rate\((\w+?)_bucket\{(.*?)\}\[(\w+)\]\)\)\s*by\s*\(le(?:,\s*(\w+))?\)\)',
+        expr
+    )
+    if hq_match:
+        pct = int(float(hq_match.group(1)) * 100)
+        metric = hq_match.group(2)
+        labels = _parse_labels(hq_match.group(3))
+        filt = _labels_to_filter(labels)
+        by_dim = hq_match.group(5)
+        base = f"data('{metric}'"
+        if filt:
+            base += f", filter={filt}"
+        base += ")"
+        chain = f"{base}.percentile(pct={pct})"
+        if by_dim:
+            chain = f"{base}.percentile(pct={pct}, by=['{by_dim}'])"
+        return f"{chain}.publish(label='{label}')"
+
+    # ── topk → top ──
+    topk_match = re.match(r'topk\((\d+),\s*(.+)\)$', expr, re.DOTALL)
+    if topk_match:
+        k = topk_match.group(1)
+        inner = _promql_to_signalflow(topk_match.group(2), label)
+        # Strip .publish(...) from inner, add .top(count=k)
+        inner = re.sub(r"\.publish\([^)]*\)$", "", inner)
+        return f"{inner}.top(count={k}).publish(label='{label}')"
+
+    # ── sum/avg/count/min/max wrapping rate/increase ──
+    agg_rate_match = re.match(
+        r'(sum|avg|count|min|max)\((rate|increase)\((\w+)\{(.*?)\}\[(\w+)\]\)\)(?:\s*by\s*\(([^)]+)\))?',
+        expr
+    )
+    if agg_rate_match:
+        agg = agg_rate_match.group(1)
+        func = agg_rate_match.group(2)
+        metric = agg_rate_match.group(3)
+        labels = _parse_labels(agg_rate_match.group(4))
+        by_dims = agg_rate_match.group(6)
+        filt = _labels_to_filter(labels)
+        rollup = "rate" if func == "rate" else "delta"
+        base = f"data('{metric}'"
+        if filt:
+            base += f", filter={filt}"
+        base += f", rollup='{rollup}')"
+        if by_dims:
+            dims = [d.strip() for d in by_dims.split(",") if d.strip() != "le"]
+            if dims:
+                base += f".{agg}(by={dims})"
+            else:
+                base += f".{agg}()"
+        else:
+            base += f".{agg}()"
+        return f"{base}.publish(label='{label}')"
+
+    # ── sum/avg of two aggregated expressions (ratio) ──
+    ratio_match = re.match(
+        r'(sum|avg)\(rate\((\w+)\{(.*?)\}\[(\w+)\]\)\)\s*/\s*(sum|avg)\(rate\((\w+)\{(.*?)\}\[(\w+)\]\)\)',
+        expr
+    )
+    if ratio_match:
+        m1 = ratio_match.group(2)
+        l1 = _parse_labels(ratio_match.group(3))
+        m2 = ratio_match.group(6)
+        l2 = _parse_labels(ratio_match.group(7))
+        f1 = _labels_to_filter(l1)
+        f2 = _labels_to_filter(l2)
+        num = f"data('{m1}'"
+        if f1:
+            num += f", filter={f1}"
+        num += ", rollup='rate').sum()"
+        den = f"data('{m2}'"
+        if f2:
+            den += f", filter={f2}"
+        den += ", rollup='rate').sum()"
+        return f"({num} / {den}).publish(label='{label}')"
+
+    # ── bare rate/increase ──
+    rate_match = re.match(r'(rate|increase)\((\w+)\{(.*?)\}\[(\w+)\]\)', expr)
+    if rate_match:
+        func = rate_match.group(1)
+        metric = rate_match.group(2)
+        labels = _parse_labels(rate_match.group(3))
+        filt = _labels_to_filter(labels)
+        rollup = "rate" if func == "rate" else "delta"
+        base = f"data('{metric}'"
+        if filt:
+            base += f", filter={filt}"
+        base += f", rollup='{rollup}')"
+        return f"{base}.publish(label='{label}')"
+
+    # ── simple metric{labels} ──
+    simple_match = re.match(r'(\w+)\{(.*?)\}$', expr)
+    if simple_match:
+        metric = simple_match.group(1)
+        labels = _parse_labels(simple_match.group(2))
+        filt = _labels_to_filter(labels)
+        base = f"data('{metric}'"
+        if filt:
+            base += f", filter={filt}"
+        base += ")"
+        return f"{base}.publish(label='{label}')"
+
+    # ── bare metric name ──
+    bare_match = re.match(r'^(\w+)$', expr)
+    if bare_match:
+        return f"data('{bare_match.group(1)}').publish(label='{label}')"
+
+    # Fallback: wrap in data() and hope for the best
+    logger.warning("promql_to_signalflow_fallback", expr=expr[:100])
+    return f"data('{expr}').publish(label='{label}')"
+
+
 def _build_chart_json(panel: PanelSpec) -> dict[str, Any]:
     """Convert a PanelSpec into a SignalFx chart create payload."""
     chart_type = _PANEL_TYPE_MAP.get(panel.panel_type, "TimeSeriesChart")
 
-    # Build SignalFlow program from panel queries
+    # Build SignalFlow program from panel queries.
+    # The archetype engine generates SignalFlow natively when target_language
+    # is 'signalflow'. The fallback converter is a safety net only.
     program_lines = []
     for idx, q in enumerate(panel.queries):
-        # The expr should already be SignalFlow from the query builder
         expr = q.expr.strip()
         if not expr:
             continue
 
-        # If the expression doesn't end with .publish(), add it
-        if ".publish(" not in expr:
-            label = q.legend_format or f"Query {chr(65 + idx)}"
+        label = q.legend_format or f"Query {chr(65 + idx)}"
+
+        if _is_promql(expr):
+            # Safety net: should not happen if engine compiled correctly
+            logger.warning("publisher_promql_fallback", expr=expr[:80])
+            expr = _promql_to_signalflow(expr, label)
+        elif ".publish(" not in expr:
             expr = f"{expr}.publish(label='{label}')"
 
         program_lines.append(expr)

@@ -1,7 +1,8 @@
 """Archetype engine — resolves templates into concrete DashboardSpec.
 
 Given an archetype + intent + discovered label values, deterministically
-compiles query templates into real PromQL. No LLM needed for query generation.
+compiles query templates into real PromQL or SignalFlow depending on the
+target backend. No LLM needed for query generation.
 """
 from __future__ import annotations
 
@@ -30,24 +31,21 @@ def _re2_escape(s: str) -> str:
     return "".join(f"\\{c}" if c in _RE2_SPECIAL else c for c in s)
 
 
-def _resolve_service_filter(
+def _find_best_label(
     intent: Intent,
     catalog: list[MetricEntry],
-) -> str:
-    """Build the PromQL label selector for the target service.
+    label_priority: dict[str, int] | None = None,
+    restrict_to: set[str] | None = None,
+) -> tuple[str, str] | None:
+    """Find the best (label_name, value) pair for the target service.
 
-    Looks at the catalog's dimensions to find the correct label name
-    and value for the service the user is asking about.
-    Prefers the 'service' label over others like 'container' or 'pod'.
+    Shared logic for both PromQL and SignalFlow filter resolution.
     """
     if not intent.services:
-        return ""
+        return None
 
     target = intent.services[0].lower().replace(" ", "-")
-
-    # Collect all matching (label_name, value) pairs
-    # Prefer: service > app > container > anything else
-    _LABEL_PRIORITY = {"service": 0, "app": 1, "application": 1, "container": 2, "pod": 3}
+    _LABEL_PRIORITY = label_priority or {"service": 0, "app": 1, "application": 1, "container": 2, "pod": 3}
     candidates: list[tuple[int, str, str]] = []
 
     for entry in catalog:
@@ -56,6 +54,8 @@ def _resolve_service_filter(
             if not match:
                 continue
             label_name, values_str = match.group(1), match.group(2)
+            if restrict_to and label_name not in restrict_to:
+                continue
             values = [v.strip() for v in values_str.split(",")]
             for val in values:
                 val_normalized = val.lower().replace("_", "-")
@@ -65,10 +65,23 @@ def _resolve_service_filter(
 
     if candidates:
         candidates.sort(key=lambda x: x[0])
-        _, label_name, val = candidates[0]
+        return candidates[0][1], candidates[0][2]
+    return None
+
+
+def _resolve_service_filter(
+    intent: Intent,
+    catalog: list[MetricEntry],
+) -> str:
+    """Build the PromQL label selector for the target service."""
+    result = _find_best_label(intent, catalog)
+    if result:
+        label_name, val = result
         return f'{label_name}="{val}"'
 
-    # Fallback: use service label with best-guess value
+    if not intent.services:
+        return ""
+    target = intent.services[0].lower().replace(" ", "-")
     return f'service=~".*{_re2_escape(target)}.*"'
 
 
@@ -77,25 +90,14 @@ def _resolve_container_filter(
     catalog: list[MetricEntry],
 ) -> str:
     """Build PromQL label selector for container-level metrics."""
+    result = _find_best_label(intent, catalog, restrict_to={"container", "pod"})
+    if result:
+        label_name, val = result
+        return f'{label_name}="{val}"'
+
     if not intent.services:
         return ""
-
     target = intent.services[0].lower().replace(" ", "-")
-
-    for entry in catalog:
-        for dim in entry.dimensions:
-            match = re.match(r"(\w+)=\{(.+)\}", dim)
-            if not match:
-                continue
-            label_name, values_str = match.group(1), match.group(2)
-            if label_name not in ("container", "pod"):
-                continue
-            values = [v.strip() for v in values_str.split(",")]
-            for val in values:
-                val_normalized = val.lower().replace("_", "-")
-                if target in val_normalized or val_normalized in target:
-                    return f'{label_name}="{val}"'
-
     return f'container=~".*{_re2_escape(target)}.*"'
 
 
@@ -116,21 +118,241 @@ def _resolve_rate_interval(intent: Intent) -> str:
     return "5m"
 
 
+# ── SignalFlow filter resolvers ──────────────────────────────────────────────
+
+def _resolve_sfx_service_filter(intent: Intent, catalog: list[MetricEntry]) -> str:
+    """Build a SignalFlow filter() expression for the target service."""
+    result = _find_best_label(intent, catalog)
+    if result:
+        label_name, val = result
+        return f"filter('{label_name}', '{val}')"
+    if not intent.services:
+        return ""
+    target = intent.services[0].lower().replace(" ", "-")
+    return f"filter('service', '*{target}*')"
+
+
+def _resolve_sfx_container_filter(intent: Intent, catalog: list[MetricEntry]) -> str:
+    """Build a SignalFlow filter() expression for container-level metrics."""
+    result = _find_best_label(intent, catalog, restrict_to={"container", "pod"})
+    if result:
+        label_name, val = result
+        return f"filter('{label_name}', '{val}')"
+    if not intent.services:
+        return ""
+    target = intent.services[0].lower().replace(" ", "-")
+    return f"filter('container', '*{target}*')"
+
+
+def _promql_template_to_signalflow(
+    expr_template: str,
+    service_filter: str,
+    container_filter: str,
+    legend: str,
+) -> str:
+    """Convert a PromQL archetype template expression directly to SignalFlow.
+
+    Handles the archetype patterns deterministically:
+    - histogram_quantile(X, sum(rate(metric_bucket{filter}[interval])) by (le))
+      → data('metric', filter=...).percentile(pct=X*100)
+    - sum(rate(metric{filter}[interval])) by (dim)
+      → data('metric', filter=..., rollup='rate').sum(by=['dim'])
+    - rate(metric{filter}[interval])
+      → data('metric', filter=..., rollup='rate')
+    - increase(metric{filter}[interval])
+      → data('metric', filter=..., rollup='delta')
+    - metric{filter}
+      → data('metric', filter=...)
+    - ratio: expr / expr
+      → (A / B)
+    """
+    expr = expr_template.strip()
+
+    # Helper: extract filter string from {service_filter} or {container_filter}
+    def _filter_for(content: str) -> str:
+        """Map placeholder content to the resolved SignalFlow filter."""
+        content = content.strip()
+        if not content:
+            return ""
+        if "container_filter" in expr_template and content == container_filter.replace("filter(", "").rstrip(")"):
+            return container_filter
+        return service_filter
+
+    def _build_sfx_filter(label_block: str) -> str:
+        """Parse a PromQL label block and return a SignalFlow filter."""
+        # The label block has already had {service_filter} etc. substituted
+        # with the SignalFlow filter() strings. We just need to join them.
+        parts = []
+        # Split on comma, but respect nested parens
+        depth = 0
+        current = ""
+        for ch in label_block:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            if ch == ',' and depth == 0:
+                current = current.strip()
+                if current:
+                    parts.append(current)
+                current = ""
+            else:
+                current += ch
+        current = current.strip()
+        if current:
+            parts.append(current)
+
+        filters = []
+        for p in parts:
+            p = p.strip()
+            if p.startswith("filter("):
+                filters.append(p)
+            elif "=~" in p:
+                # status=~"5.." → filter('status', '*')
+                k, _ = p.split("=~", 1)
+                filters.append(f"filter('{k.strip()}', '*')")
+            elif "=" in p:
+                k, v = p.split("=", 1)
+                v = v.strip().strip('"')
+                filters.append(f"filter('{k.strip()}', '{v}')")
+        return " and ".join(filters) if filters else ""
+
+    # ── ratio: expr / expr ──
+    # Split on top-level /
+    slash_pos = _find_top_level_slash(expr)
+    if slash_pos is not None:
+        left = _promql_template_to_signalflow(expr[:slash_pos].strip(), service_filter, container_filter, "_num")
+        right = _promql_template_to_signalflow(expr[slash_pos + 1:].strip(), service_filter, container_filter, "_den")
+        # Strip .publish() from sub-expressions
+        left = re.sub(r"\.publish\([^)]*\)$", "", left)
+        right = re.sub(r"\.publish\([^)]*\)$", "", right)
+        return f"({left} / {right}).publish(label='{legend}')"
+
+    # ── histogram_quantile ──
+    hq = re.match(
+        r'histogram_quantile\(([\d.]+),\s*sum\(rate\((\w+?)_bucket\{(.*?)\}\[.*?\]\)\)\s*by\s*\(le(?:,\s*(\w+))?\)\)',
+        expr
+    )
+    if hq:
+        pct = int(float(hq.group(1)) * 100)
+        metric = hq.group(2)
+        filt = _build_sfx_filter(hq.group(3))
+        base = f"data('{metric}'"
+        if filt:
+            base += f", filter={filt}"
+        base += ")"
+        by_dim = hq.group(4)
+        if by_dim and by_dim != "le":
+            return f"{base}.percentile(pct={pct}, by=['{by_dim}']).publish(label='{legend}')"
+        return f"{base}.percentile(pct={pct}).publish(label='{legend}')"
+
+    # ── topk ──
+    topk = re.match(r'topk\((\d+),\s*(.+)\)$', expr, re.DOTALL)
+    if topk:
+        k = topk.group(1)
+        inner = _promql_template_to_signalflow(topk.group(2), service_filter, container_filter, legend)
+        inner = re.sub(r"\.publish\([^)]*\)$", "", inner)
+        return f"{inner}.top(count={k}).publish(label='{legend}')"
+
+    # ── agg(rate/increase(metric{labels}[interval])) by (dims) ──
+    agg = re.match(
+        r'(sum|avg|count|min|max)\((rate|increase)\((\w+)\{(.*?)\}\[.*?\]\)\)(?:\s*by\s*\(([^)]+)\))?',
+        expr
+    )
+    if agg:
+        agg_fn = agg.group(1)
+        func = agg.group(2)
+        metric = agg.group(3)
+        filt = _build_sfx_filter(agg.group(4))
+        by_dims = agg.group(5)
+        rollup = "rate" if func == "rate" else "delta"
+        base = f"data('{metric}'"
+        if filt:
+            base += f", filter={filt}"
+        base += f", rollup='{rollup}')"
+        if by_dims:
+            dims = [d.strip() for d in by_dims.split(",") if d.strip() != "le"]
+            if dims:
+                base += f".{agg_fn}(by={dims})"
+            else:
+                base += f".{agg_fn}()"
+        else:
+            base += f".{agg_fn}()"
+        return f"{base}.publish(label='{legend}')"
+
+    # ── bare rate/increase ──
+    rate = re.match(r'(rate|increase)\((\w+)\{(.*?)\}\[.*?\]\)', expr)
+    if rate:
+        func = rate.group(1)
+        metric = rate.group(2)
+        filt = _build_sfx_filter(rate.group(3))
+        rollup = "rate" if func == "rate" else "delta"
+        base = f"data('{metric}'"
+        if filt:
+            base += f", filter={filt}"
+        base += f", rollup='{rollup}')"
+        return f"{base}.publish(label='{legend}')"
+
+    # ── simple metric{labels} ──
+    simple = re.match(r'(\w+)\{(.*?)\}$', expr)
+    if simple:
+        metric = simple.group(1)
+        filt = _build_sfx_filter(simple.group(2))
+        base = f"data('{metric}'"
+        if filt:
+            base += f", filter={filt}"
+        base += ")"
+        return f"{base}.publish(label='{legend}')"
+
+    # ── bare metric name ──
+    bare = re.match(r'^(\w+)$', expr)
+    if bare:
+        return f"data('{bare.group(1)}').publish(label='{legend}')"
+
+    # Fallback
+    logger.warning("signalflow_compile_fallback", expr=expr[:100])
+    return f"data('{expr}').publish(label='{legend}')"
+
+
+def _find_top_level_slash(expr: str) -> int | None:
+    """Find position of top-level '/' operator (not inside parens)."""
+    depth = 0
+    for i, ch in enumerate(expr):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif ch == '/' and depth == 0 and i > 0:
+            return i
+    return None
+
+
 def compile_archetype(
     archetype: InvestigationArchetype,
     intent: Intent,
     catalog: list[MetricEntry],
+    target_language: str = "promql",
 ) -> DashboardSpec:
     """Compile an archetype template into a concrete DashboardSpec.
 
     This is fully deterministic — no LLM call needed.
     Resolves {service_filter}, {container_filter}, {rate_interval}
     from the intent and catalog.
+
+    target_language: 'promql' (default) or 'signalflow'
     """
-    service_filter = _resolve_service_filter(intent, catalog)
-    container_filter = _resolve_container_filter(intent, catalog)
     rate_interval = _resolve_rate_interval(intent)
-    datasource_uid = _get_datasource_uid(catalog)
+
+    if target_language == "signalflow":
+        service_filter = _resolve_sfx_service_filter(intent, catalog)
+        container_filter = _resolve_sfx_container_filter(intent, catalog)
+        datasource_uid = "signalfx-direct"
+        datasource_type = "signalfx"
+    else:
+        service_filter = _resolve_service_filter(intent, catalog)
+        container_filter = _resolve_container_filter(intent, catalog)
+        datasource_uid = _get_datasource_uid(catalog)
+        datasource_type = "prometheus"
 
     # Available metric names for validation
     available_metrics = {e.name for e in catalog}
@@ -145,7 +367,6 @@ def compile_archetype(
     skipped = 0
 
     for pt in archetype.panels:
-        # Check if required metrics exist in the catalog
         panel_queries: list[PanelQuery] = []
         for qt in pt.queries:
             try:
@@ -154,11 +375,18 @@ def compile_archetype(
                 logger.warning("archetype_placeholder_missing", panel=pt.title, key=str(e))
                 continue
 
+            if target_language == "signalflow":
+                # Compile the resolved PromQL template directly to SignalFlow
+                legend = qt.legend_format or pt.title
+                expr = _promql_template_to_signalflow(
+                    expr, service_filter, container_filter, legend
+                )
+
             panel_queries.append(PanelQuery(
                 expr=expr,
                 legend_format=qt.legend_format,
                 datasource_uid=datasource_uid,
-                datasource_type=qt.datasource_type,
+                datasource_type=datasource_type,
             ))
 
         if not panel_queries:
@@ -192,6 +420,7 @@ def compile_archetype(
         skipped=skipped,
         service_filter=service_filter,
         rate_interval=rate_interval,
+        language=target_language,
     )
 
     return spec
@@ -202,6 +431,7 @@ def blend_archetypes(
     intent: Intent,
     catalog: list[MetricEntry],
     secondary_min_confidence: float = 0.4,
+    target_language: str = "promql",
 ) -> DashboardSpec:
     """Blend panels from multiple archetypes into a single dashboard.
 
@@ -216,15 +446,17 @@ def blend_archetypes(
     intent : Intent
         The classified user intent.
     catalog : list[MetricEntry]
-        Discovered metrics from Grafana datasources.
+        Discovered metrics from datasources.
     secondary_min_confidence : float
         Minimum confidence for secondary archetypes to contribute panels.
+    target_language : str
+        'promql' (default) or 'signalflow'
     """
     if not ranked_archetypes:
         raise ValueError("blend_archetypes called with empty archetype list")
 
     primary_arch, primary_conf = ranked_archetypes[0]
-    primary_spec = compile_archetype(primary_arch, intent, catalog)
+    primary_spec = compile_archetype(primary_arch, intent, catalog, target_language=target_language)
 
     # Track existing panel titles to avoid duplicates
     existing_titles: set[str] = {p.title.lower() for p in primary_spec.panels}
@@ -235,7 +467,7 @@ def blend_archetypes(
         if conf < secondary_min_confidence:
             continue
 
-        secondary_spec = compile_archetype(arch, intent, catalog)
+        secondary_spec = compile_archetype(arch, intent, catalog, target_language=target_language)
         added = 0
         for panel in secondary_spec.panels:
             if panel.title.lower() not in existing_titles:
