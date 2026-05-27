@@ -1,8 +1,8 @@
 # DashForge
 
-**Natural language → Grafana dashboards.**
+**Natural language → observability dashboards.**
 
-DashForge is an AI-powered observability navigation layer that lets on-call engineers describe a problem in plain English (via Slack or HTTP API) and instantly get a purpose-built Grafana dashboard populated with the most relevant metrics. No more hunting through static dashboards during an incident.
+DashForge is an AI-powered observability navigation layer that lets on-call engineers describe a problem in plain English (via Slack or HTTP API) and instantly get a purpose-built dashboard populated with the most relevant metrics. It publishes to **Grafana**, **Splunk Observability Cloud (SignalFx)**, or both simultaneously — with a pluggable backend adapter pattern that makes adding new vendors straightforward. No more hunting through static dashboards during an incident.
 
 > *"High latency on the checkout service in the last hour"*
 > → a dashboard with request rate, error rate, p99 latency, CPU, memory, and pod restarts — all wired up and ready.
@@ -62,11 +62,8 @@ DashForge closes this gap by turning a problem statement into a ready-made inves
 └──────┬────────────────┘
        ▼
 ┌───────────────────────┐
-│ Datasource Discovery  │  Finds all Grafana datasources, filters by signal type
-└──────┬────────────────┘
-       ▼
-┌───────────────────────┐
-│ Metric Catalog Fetch  │  Per-datasource adapter queries metrics + per-metric labels
+│ Backend Adapters      │  Each enabled backend (Grafana, SignalFx, …) contributes
+│ discover_metrics()    │  metrics from its own datasources in parallel
 └──────┬────────────────┘
        ▼
        ├─────────────────────────────────────┐
@@ -87,15 +84,23 @@ DashForge closes this gap by turning a problem statement into a ready-made inves
        ├─────────────────────────────────┘
        ▼
 ┌───────────────────────┐
-│ Query Validation      │  Verifies queries return real series data
+│ Backend Adapters      │  Primary backend validates queries return real data
+│ validate_queries()    │
 └──────┬────────────────┘
        ▼
 ┌───────────────────────┐
-│ Dashboard Publisher   │  Builds Grafana JSON, creates/updates via API
+│ Backend Adapters      │  Each backend publishes independently:
+│ publish()             │  Grafana JSON, SignalFx charts, or both
 └──────┬────────────────┘
        ▼
- Dashboard URL → Slack / Web UI / API response
+ Dashboard URLs → Slack / Web UI / API response
 ```
+
+The pipeline is **vendor-agnostic**. Each backend (Grafana, SignalFx) implements
+the same `DashboardBackend` protocol — `discover_metrics()`, `validate_queries()`,
+`publish()`, `close()`. The pipeline iterates over enabled backends with zero
+vendor-specific conditionals. Adding a new backend means implementing one adapter
+class and registering it in the config.
 
 Inspired by [Uber's QueryGPT](https://www.uber.com/us/en/blog/query-gpt/) multi-agent decomposition pattern.
 
@@ -126,8 +131,9 @@ That's it. Three commands from zero to dashboard.
 | Command | What it does |
 |---|---|
 | `dashforge init` | Interactive setup wizard → `~/.dashforge/config.yaml` + secrets in `~/.dashforge/.env` |
-| `dashforge doctor` | Validates Grafana connectivity, datasource permissions, LLM key, archetypes, cache state |
+| `dashforge doctor` | Validates Grafana + SignalFx connectivity, datasource permissions, LLM key, archetypes, cache state |
 | `dashforge connect grafana` | Test & persist a Grafana connection (interactive or `--url` / `--api-key` flags) |
+| `dashforge connect signalfx` | Test & persist a Splunk SignalFx connection (interactive or `--realm` / `--token` flags) |
 | `dashforge test [-p "custom prompt"]` | Runs a full investigation pipeline and opens the resulting dashboard |
 | `dashforge serve` | Starts the API server (+ Slack if configured) |
 | `dashforge history list` | List recent investigations with status, timings, archetypes |
@@ -264,15 +270,15 @@ alongside the standard Grafana fields.
 | **Prompt Sanitizer** | Length caps, control-char removal, prompt injection guardrails |
 | **Intent Agent** | LLM classifies domain, services, keywords, signal types, timerange, and multi-label archetypes with confidence scores |
 | **Context Enrichment** | Pluggable knowledge base lookup (MCP, A2A, RAG API) — disabled by default |
-| **Datasource Discovery** | Auto-discovers all Grafana datasources, filters by signal type |
+| **Backend Adapters** | Pluggable `DashboardBackend` protocol (Grafana, SignalFx). Each backend discovers metrics, validates queries, and publishes dashboards independently. Pipeline iterates over enabled backends — zero vendor-specific branching |
+| **Datasource Discovery** | Grafana: auto-discovers all datasources, filters by signal type. SignalFx: keyword search via v2 metadata API |
 | **Metric Catalog Fetch** | Per-datasource adapters query metric names + per-metric label names/values |
 | **Archetype Engine** | Deterministic dashboard compilation for known investigation patterns. Multi-label: blends panels from multiple archetypes based on confidence (e.g. latency primary + saturation secondary). Skips LLM query generation entirely |
 | **Metrics Discovery LLM** | *(freeform fallback)* Selects the most relevant metrics from the full catalog |
 | **Post-Validation** | Drops hallucinated datasource UIDs, verifies metrics exist in catalog |
 | **Query Builder LLM** | *(freeform fallback)* Generates PromQL/LogQL with accurate label selectors |
-| **Query Validation** | Verifies all panel queries return real series data; drops empty panels, blocks empty dashboards |
-| **Dashboard Publisher** | Assembles Grafana JSON model, creates/updates dashboards via API |
-| **SignalFx Publisher** | *(when enabled)* Creates native SignalFx charts + dashboards via v2 REST API |
+| **Query Validation** | Primary backend verifies all panel queries return real data (PromQL via datasource proxy, SignalFlow via metric existence check); drops empty panels, blocks empty dashboards |
+| **Dashboard Publisher** | Each enabled backend publishes independently — Grafana JSON via API, SignalFx charts via v2 REST API, or both |
 | **Web UI** | Simple browser interface at `/` for testing prompts |
 
 All agents use structured JSON output with Pydantic validation. The LLM layer is
@@ -288,9 +294,21 @@ provider-agnostic — set `LLM_PROVIDER` to `anthropic`, `openai`, `azure`, or `
 - **Concurrency & timeout guards** — pipeline runs are bounded by a semaphore and a configurable timeout to prevent runaway LLM calls.
 - **Security hardening** — all three agent system prompts include injection guardrails; API key auth is optional but built-in.
 
-## Supported Datasources
+## Supported Backends & Datasources
 
-DashForge searches **all** datasources registered in Grafana, not just Prometheus.
+DashForge publishes to multiple backends simultaneously. Each backend discovers
+metrics from its own sources, validates queries, and publishes dashboards independently.
+
+| Backend | Discovery | Query Language | Publishing |
+|---|---|---|---|
+| **Grafana** | Searches all registered datasources (see table below) | PromQL, LogQL, CW JSON, Lucene, Graphite, InfluxQL/Flux | Grafana JSON API |
+| **Splunk SignalFx** | Keyword search via v2 metadata API | SignalFlow | Native v2 REST API |
+
+When both are enabled, a single prompt creates dashboards in **both** systems.
+
+### Grafana Datasources
+
+When Grafana is enabled, DashForge searches **all** registered datasources, not just Prometheus.
 When you say "5xx on checkout", it searches CloudWatch for ALB errors, Prometheus for
 pod-level metrics, Elasticsearch for log-derived data — all at once.
 
@@ -304,9 +322,10 @@ pod-level metrics, Elasticsearch for log-derived data — all at once.
 | **InfluxDB** | InfluxQL / Flux | Time-series measurements |
 | **Splunk SignalFx** | SignalFlow | Splunk Observability Cloud, infrastructure & APM metrics |
 
-Each datasource type has a dedicated adapter that knows how to discover metrics
-through Grafana's proxy/resource APIs.  The LLM selects the best metrics across
-*all* datasources and generates the correct query language for each.
+Grafana datasource types have dedicated adapters that discover metrics through
+Grafana's proxy/resource APIs. SignalFx uses its own v2 metadata API. The LLM
+selects the best metrics across *all* backends and datasources and generates
+the correct query language for each.
 
 ## Project Structure
 
@@ -316,8 +335,13 @@ dashforge/
 │   ├── cli.py               # CLI: init, doctor, connect, test, serve, history
 │   ├── main.py              # FastAPI + Slack bot startup
 │   ├── config.py            # Layered config: YAML + env vars + Pydantic validation
-│   ├── pipeline.py          # Orchestration: prompt → dashboard
-│   ├── validation.py        # Pre-publish query validation
+│   ├── pipeline.py          # Orchestration: prompt → dashboard (vendor-agnostic)
+│   ├── validation.py        # Pre-publish query validation (PromQL + SignalFlow)
+│   ├── backends/            # Backend adapter pattern
+│   │   ├── base.py          # DashboardBackend Protocol + PublishResult
+│   │   ├── grafana.py       # GrafanaBackend adapter
+│   │   ├── signalfx.py      # SignalFxBackend adapter
+│   │   └── __init__.py      # Registry: get_active_backends()
 │   ├── cache.py             # TTL-based metadata & LLM response cache
 │   ├── ranking.py           # Pre-ranking: narrows metric catalog before LLM
 │   ├── history.py           # Investigation history store (SQLite)
@@ -412,7 +436,8 @@ dashforge/
 - [x] YAML archetype templates — editable `archetypes.yaml` with hot-reload API endpoint. Engineers update investigation templates without touching Python code
 - [x] Interactive API documentation — Swagger UI (`/docs`) and ReDoc (`/redoc`) with grouped endpoints, response schemas, and examples
 - [x] Input validation & SQL injection hardening — parameterized queries, UID regex validation, path parameter constraints
-- [x] CLI (`dashforge init/doctor/connect/test/serve`) — Click + Rich, interactive setup wizard, connection validation, single-command startup
+- [x] CLI (`dashforge init/doctor/connect grafana/connect signalfx/test/serve`) — Click + Rich, interactive setup wizard, connection validation, single-command startup
+- [x] Backend adapter pattern — `DashboardBackend` protocol with pluggable adapters (Grafana, SignalFx). Pipeline iterates over enabled backends for discovery, validation, and publishing — zero vendor-specific branching
 - [x] Config discovery (`~/.dashforge/config.yaml` + `~/.dashforge/.env`) — secrets isolated at 0600 permissions
 - [x] Single-binary distribution — PyInstaller spec for macOS/Linux/Windows, `./scripts/build.sh`
 - [x] 41 investigation archetypes with 176 panels covering latency, errors, golden signals, Kubernetes, Kafka (5 archetypes), Redis, SQS, Lambda, DDoS, mTLS, capacity planning, and more
