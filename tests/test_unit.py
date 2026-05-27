@@ -667,6 +667,128 @@ def test_prometheus_target_excludes_cloudwatch_fields():
     print("[PASS] test_prometheus_target_excludes_cloudwatch_fields")
 
 
+def test_cloudwatch_validation_is_skipped_for_prometheus_probe():
+    """CloudWatch panels should not be probed through Prometheus api/v1/query."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from dashforge.validation import validate_dashboard_queries
+
+    client = type("Client", (), {})()
+    client.datasource_proxy_get = AsyncMock(return_value={"data": {"result": []}})
+
+    spec = DashboardSpec(
+        title="cw",
+        panels=[PanelSpec(
+            title="ELB 5xx",
+            queries=[PanelQuery(
+                expr="HTTPCode_ELB_5XX",
+                datasource_uid="cw-1",
+                datasource_type="cloudwatch",
+                cloudwatch_namespace="AWS/ApplicationELB",
+            )],
+        )],
+    )
+
+    filtered, warnings = asyncio.run(validate_dashboard_queries(client, spec))
+
+    assert len(filtered.panels) == 1
+    assert warnings == []
+    client.datasource_proxy_get.assert_not_called()
+    print("[PASS] test_cloudwatch_validation_is_skipped_for_prometheus_probe")
+
+
+def test_prometheus_validation_still_uses_proxy_query():
+    """Prometheus panels should continue using api/v1/query validation."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from dashforge.validation import validate_dashboard_queries
+
+    client = type("Client", (), {})()
+    client.datasource_proxy_get = AsyncMock(return_value={"data": {"result": [{"metric": {}}]}})
+
+    spec = DashboardSpec(
+        title="prom",
+        panels=[PanelSpec(
+            title="Request Rate",
+            queries=[PanelQuery(
+                expr='rate(http_requests_total[5m])',
+                datasource_uid="prom-1",
+                datasource_type="prometheus",
+            )],
+        )],
+    )
+
+    filtered, warnings = asyncio.run(validate_dashboard_queries(client, spec))
+
+    assert len(filtered.panels) == 1
+    assert warnings == []
+    client.datasource_proxy_get.assert_called_once()
+    print("[PASS] test_prometheus_validation_still_uses_proxy_query")
+
+
+def test_provider_sdk_transient_error_in_repair_retried():
+    """When the LLM repair call raises a provider SDK exception (e.g.
+    OpenAI RateLimitError), it must be classified as LLMTransientError
+    so tenacity retries, not swallowed as LLMParseError."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from dashforge.agents.llm import call_llm, LLMTransientError
+    from pydantic import BaseModel
+    from tenacity import RetryError, wait_none
+
+    class Simple(BaseModel):
+        v: int
+
+    # Simulate a provider SDK rate-limit exception (not httpx, not ClientError)
+    class RateLimitError(Exception):
+        """Simulates openai.RateLimitError."""
+        def __init__(self):
+            super().__init__("Rate limit exceeded")
+            self.status_code = 429
+
+    mock_provider = MagicMock()
+    mock_provider.chat_json = AsyncMock(
+        side_effect=[
+            '{broken json',       # attempt 1: primary
+            RateLimitError(),     # attempt 1: repair → transient
+            '{broken json',       # attempt 2: primary
+            RateLimitError(),     # attempt 2: repair → transient
+            '{broken json',       # attempt 3: primary
+            RateLimitError(),     # attempt 3: repair → transient
+        ]
+    )
+
+    original_wait = call_llm.retry.wait
+    call_llm.retry.wait = wait_none()
+
+    try:
+        with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+            try:
+                asyncio.run(call_llm("sys", "user", Simple))
+                assert False, "Should have raised"
+            except RetryError as re:
+                last = re.last_attempt.exception()
+                assert isinstance(last, LLMTransientError), (
+                    f"Expected LLMTransientError (retryable), "
+                    f"got {type(last).__name__}: {last}"
+                )
+            except LLMTransientError:
+                pass  # also acceptable
+            except Exception as exc:
+                assert False, (
+                    f"Provider SDK rate-limit error should be LLMTransientError, "
+                    f"got {type(exc).__name__}: {exc}"
+                )
+        assert mock_provider.chat_json.call_count == 6, (
+            f"Expected 6 calls (3 attempts × 2), got {mock_provider.chat_json.call_count}"
+        )
+    finally:
+        call_llm.retry.wait = original_wait
+    print("[PASS] test_provider_sdk_transient_error_in_repair_retried")
+
+
 if __name__ == "__main__":
     test_intent_model()
     test_dashboard_spec_model()
@@ -699,4 +821,7 @@ if __name__ == "__main__":
     test_json_repair_path_reraises_transient_errors()
     test_cloudwatch_region_defaults_to_datasource_default()
     test_query_builder_prompt_does_not_instruct_region_guessing()
+    test_cloudwatch_validation_is_skipped_for_prometheus_probe()
+    test_prometheus_validation_still_uses_proxy_query()
+    test_provider_sdk_transient_error_in_repair_retried()
     print("\n=== All tests passed ===")

@@ -117,7 +117,37 @@ async def call_llm(
                     raise LLMTransientError(str(repair_exc)) from repair_exc
                 logger.error("llm_json_repair_failed", error=str(repair_exc), raw=raw[:300])
                 raise LLMParseError(f"LLM returned invalid JSON (repair failed): {repair_exc}") from repair_exc
-            except (json.JSONDecodeError, Exception) as repair_exc:
+            except json.JSONDecodeError as repair_exc:
+                logger.error("llm_json_repair_failed", error=str(repair_exc), raw=raw[:300])
+                raise LLMParseError(f"LLM returned invalid JSON (repair failed): {repair_exc}") from repair_exc
+            except Exception as repair_exc:
+                # Provider SDK exceptions (OpenAI APIConnectionError, Anthropic
+                # rate limits, botocore throttling, etc.) that aren't httpx types.
+                # Check if the exception looks transient before giving up.
+                _TRANSIENT_EXC_NAMES = {
+                    "APIConnectionError", "APITimeoutError", "RateLimitError",
+                    "InternalServerError", "ServiceUnavailableError",
+                    "ThrottlingException", "TooManyRequestsException",
+                    "ServiceUnavailableException", "ModelTimeoutException",
+                    "EndpointConnectionError", "ReadTimeoutError",
+                    "ConnectTimeoutError",
+                }
+                exc_name = type(repair_exc).__name__
+                if exc_name in _TRANSIENT_EXC_NAMES:
+                    logger.warning("llm_repair_transient_error", error=str(repair_exc), exc_type=exc_name)
+                    raise LLMTransientError(str(repair_exc)) from repair_exc
+                # Check for response-based error codes (botocore ClientError)
+                if hasattr(repair_exc, "response") and isinstance(repair_exc.response, dict):
+                    err_code = repair_exc.response.get("Error", {}).get("Code", "")
+                    if err_code in {"ThrottlingException", "TooManyRequestsException",
+                                    "ServiceUnavailableException", "InternalServerException"}:
+                        logger.warning("llm_repair_transient_error", error=str(repair_exc), code=err_code)
+                        raise LLMTransientError(str(repair_exc)) from repair_exc
+                # Check for status_code attribute (common in provider SDKs)
+                status = getattr(repair_exc, "status_code", None) or getattr(repair_exc, "status", None)
+                if isinstance(status, int) and status in {429, 500, 502, 503, 529}:
+                    logger.warning("llm_repair_transient_error", error=str(repair_exc), status=status)
+                    raise LLMTransientError(str(repair_exc)) from repair_exc
                 logger.error("llm_json_repair_failed", error=str(repair_exc), raw=raw[:300])
                 raise LLMParseError(f"LLM returned invalid JSON (repair failed): {repair_exc}") from repair_exc
 
