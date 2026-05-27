@@ -35,6 +35,13 @@ _ANTHROPIC_TO_BEDROCK: dict[str, str] = {
 
 _BEDROCK_DEFAULT_MODEL = "anthropic.claude-sonnet-4-20250514-v1:0"
 
+# Known Bedrock provider prefixes — if llm_model starts with one of these,
+# it's already a valid Bedrock model ID and should be used as-is.
+_BEDROCK_PROVIDER_PREFIXES = (
+    "anthropic.", "meta.", "mistral.", "amazon.", "cohere.",
+    "ai21.", "stability.", "us.", "eu.",
+)
+
 # Cache for resolved model IDs — avoids repeated ListFoundationModels calls
 _resolve_cache: dict[str, str] = {}
 
@@ -43,11 +50,18 @@ def _resolve_bedrock_model_id(anthropic_model_name: str, bedrock_client) -> str:
     """Resolve an Anthropic API model name to a Bedrock model ID.
 
     Strategy:
+    0. If already provider-prefixed (e.g. meta.llama3-*), use as-is
     1. Check cache
     2. Call ListFoundationModels API to find a matching model ID
     3. Fall back to static _ANTHROPIC_TO_BEDROCK map
     4. Fall back to _BEDROCK_DEFAULT_MODEL
     """
+    # Already a valid Bedrock model ID — pass through
+    if anthropic_model_name.startswith(_BEDROCK_PROVIDER_PREFIXES):
+        logger.info("bedrock_model_resolved", source="passthrough",
+                    input=anthropic_model_name, resolved=anthropic_model_name)
+        return anthropic_model_name
+
     if anthropic_model_name in _resolve_cache:
         return _resolve_cache[anthropic_model_name]
 
@@ -97,22 +111,41 @@ def _build_boto3_session():
         session = boto3.Session(**session_kwargs)
         logger.info("bedrock_auth", method="default_chain", region=settings.llm_bedrock_region)
 
-    # Strategy 2: assume-role (can layer on top of either strategy above)
+    # Strategy 2: assume-role with auto-refreshable credentials
+    # Uses botocore RefreshableCredentials so the singleton provider
+    # doesn't expire after DurationSeconds in long-running processes.
     if settings.llm_bedrock_role_arn:
+        from botocore.credentials import RefreshableCredentials
+        import botocore.session
+
         sts = session.client("sts")
-        assumed = sts.assume_role(
-            RoleArn=settings.llm_bedrock_role_arn,
-            RoleSessionName="dashforge-bedrock",
-            DurationSeconds=3600,
+
+        def _refresh_credentials():
+            assumed = sts.assume_role(
+                RoleArn=settings.llm_bedrock_role_arn,
+                RoleSessionName="dashforge-bedrock",
+                DurationSeconds=3600,
+            )
+            creds = assumed["Credentials"]
+            return {
+                "access_key": creds["AccessKeyId"],
+                "secret_key": creds["SecretAccessKey"],
+                "token": creds["SessionToken"],
+                "expiry_time": creds["Expiration"].isoformat(),
+            }
+
+        refreshable_creds = RefreshableCredentials.create_from_metadata(
+            metadata=_refresh_credentials(),
+            refresh_using=_refresh_credentials,
+            method="sts-assume-role",
         )
-        creds = assumed["Credentials"]
-        session = boto3.Session(
-            aws_access_key_id=creds["AccessKeyId"],
-            aws_secret_access_key=creds["SecretAccessKey"],
-            aws_session_token=creds["SessionToken"],
-            region_name=settings.llm_bedrock_region,
-        )
-        logger.info("bedrock_auth", method="assume_role",
+
+        botocore_sess = botocore.session.get_session()
+        botocore_sess._credentials = refreshable_creds
+        botocore_sess.set_config_variable("region", settings.llm_bedrock_region)
+        session = boto3.Session(botocore_session=botocore_sess)
+
+        logger.info("bedrock_auth", method="assume_role_refreshable",
                      role_arn=settings.llm_bedrock_role_arn)
 
     return session

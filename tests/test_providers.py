@@ -69,25 +69,39 @@ def test_bedrock_session_default_chain():
 
 
 def test_bedrock_session_assume_role():
-    """Strategy 2: assume-role layers STS on top of base session."""
+    """Strategy 2: assume-role uses RefreshableCredentials via botocore."""
     mock_boto3 = MagicMock()
     base_session = MagicMock()
-    assumed_session = MagicMock()
+    refreshed_session = MagicMock()
 
     mock_sts_client = MagicMock()
+    from datetime import datetime, timezone, timedelta
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
     mock_sts_client.assume_role.return_value = {
         "Credentials": {
             "AccessKeyId": "ASIAEXAMPLE",
             "SecretAccessKey": "secretexample",
             "SessionToken": "tokenexample",
+            "Expiration": future,
         }
     }
     base_session.client.return_value = mock_sts_client
 
-    # First call returns base_session, second returns assumed_session
-    mock_boto3.Session.side_effect = [base_session, assumed_session]
+    mock_boto3.Session.side_effect = [base_session, refreshed_session]
 
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), \
+    mock_botocore_session = MagicMock()
+    mock_refreshable = MagicMock()
+    mock_botocore_creds_mod = MagicMock()
+    mock_botocore_creds_mod.RefreshableCredentials.create_from_metadata.return_value = mock_refreshable
+    mock_botocore_sess_mod = MagicMock()
+    mock_botocore_sess_mod.get_session.return_value = mock_botocore_session
+
+    with patch.dict("sys.modules", {
+             "boto3": mock_boto3,
+             "botocore": MagicMock(),
+             "botocore.credentials": mock_botocore_creds_mod,
+             "botocore.session": mock_botocore_sess_mod,
+         }), \
          patch("dashforge.agents.providers.bedrock.settings") as mock_settings:
         mock_settings.llm_bedrock_region = "us-east-1"
         mock_settings.llm_aws_access_key_id = ""
@@ -103,12 +117,17 @@ def test_bedrock_session_assume_role():
             RoleSessionName="dashforge-bedrock",
             DurationSeconds=3600,
         )
-        # Second Session call should use temporary creds
-        assert mock_boto3.Session.call_count == 2
-        second_call_kwargs = mock_boto3.Session.call_args_list[1][1]
-        assert second_call_kwargs["aws_access_key_id"] == "ASIAEXAMPLE"
-        assert second_call_kwargs["aws_session_token"] == "tokenexample"
-        assert session == assumed_session
+        # RefreshableCredentials should have been created with a refresh callback
+        rc_cls = mock_botocore_creds_mod.RefreshableCredentials
+        rc_cls.create_from_metadata.assert_called_once()
+        call_kwargs = rc_cls.create_from_metadata.call_args[1]
+        assert call_kwargs["method"] == "sts-assume-role"
+        assert callable(call_kwargs["refresh_using"])
+        # Final session should be built via botocore_session (not static creds)
+        last_session_kwargs = mock_boto3.Session.call_args_list[-1][1]
+        assert "botocore_session" in last_session_kwargs, (
+            "Session should be built from a botocore_session with refreshable creds"
+        )
 
     print("[PASS] test_bedrock_session_assume_role")
 
@@ -793,6 +812,171 @@ def test_bedrock_resolve_model_id_unknown_model_returns_default():
 
     _resolve_cache.clear()
     print("[PASS] test_bedrock_resolve_model_id_unknown_model_returns_default")
+
+
+# ── Bug: STS credential refresh for long-running processes ─────────────────
+
+def test_bedrock_assume_role_uses_refreshable_credentials():
+    """When llm_bedrock_role_arn is set, _build_boto3_session must return a
+    session with auto-refreshable credentials, not static one-shot STS creds.
+    The refresh callback must be callable to re-assume before expiry."""
+    mock_boto3 = MagicMock()
+    base_session = MagicMock()
+    refreshed_session = MagicMock()
+
+    mock_sts = MagicMock()
+    from datetime import datetime, timezone, timedelta
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    mock_sts.assume_role.return_value = {
+        "Credentials": {
+            "AccessKeyId": "ASIAEXAMPLE",
+            "SecretAccessKey": "secret",
+            "SessionToken": "token",
+            "Expiration": future,
+        }
+    }
+    base_session.client.return_value = mock_sts
+    mock_boto3.Session.side_effect = [base_session, refreshed_session]
+
+    mock_botocore_session = MagicMock()
+    mock_refreshable = MagicMock()
+    mock_botocore_creds_mod = MagicMock()
+    mock_botocore_creds_mod.RefreshableCredentials.create_from_metadata.return_value = mock_refreshable
+    mock_botocore_sess_mod = MagicMock()
+    mock_botocore_sess_mod.get_session.return_value = mock_botocore_session
+
+    with patch.dict("sys.modules", {
+             "boto3": mock_boto3,
+             "botocore": MagicMock(),
+             "botocore.credentials": mock_botocore_creds_mod,
+             "botocore.session": mock_botocore_sess_mod,
+         }), \
+         patch("dashforge.agents.providers.bedrock.settings") as mock_settings:
+        mock_settings.llm_bedrock_region = "us-east-1"
+        mock_settings.llm_aws_access_key_id = ""
+        mock_settings.llm_aws_secret_access_key = ""
+        mock_settings.llm_bedrock_role_arn = "arn:aws:iam::123456789012:role/TestRole"
+
+        from dashforge.agents.providers.bedrock import _build_boto3_session
+        session = _build_boto3_session()
+
+        # The refresh_using callback must be set so creds auto-renew
+        rc_cls = mock_botocore_creds_mod.RefreshableCredentials
+        rc_cls.create_from_metadata.assert_called_once()
+        call_kwargs = rc_cls.create_from_metadata.call_args[1]
+        refresh_fn = call_kwargs["refresh_using"]
+        assert callable(refresh_fn), "refresh_using must be a callable"
+
+        # Calling it again should re-assume the role
+        result = refresh_fn()
+        assert result["access_key"] == "ASIAEXAMPLE"
+        assert result["token"] == "token"
+        assert mock_sts.assume_role.call_count == 2  # initial + refresh
+
+    print("[PASS] test_bedrock_assume_role_uses_refreshable_credentials")
+
+
+def test_bedrock_provider_prefixed_model_id_preserved():
+    """When llm_model is already a provider-prefixed Bedrock ID like
+    'meta.llama3-70b-instruct-v1:0', it should be used as-is even if
+    ListFoundationModels is unavailable — never silently replaced."""
+    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
+    _resolve_cache.clear()
+
+    mock_bedrock_client = MagicMock()
+    mock_bedrock_client.list_foundation_models.side_effect = Exception("AccessDenied")
+
+    # Provider-prefixed IDs must pass through without resolution
+    for model_id in [
+        "meta.llama3-70b-instruct-v1:0",
+        "amazon.titan-text-express-v1",
+        "cohere.command-r-plus-v1:0",
+        "mistral.mixtral-8x7b-instruct-v0:1",
+        "anthropic.claude-sonnet-4-20250514-v1:0",
+    ]:
+        _resolve_cache.clear()
+        result = _resolve_bedrock_model_id(model_id, mock_bedrock_client)
+        assert result == model_id, (
+            f"Provider-prefixed model ID {model_id!r} should be preserved as-is, "
+            f"got: {result!r}"
+        )
+        # Should NOT have called ListFoundationModels — passthrough is immediate
+        mock_bedrock_client.list_foundation_models.assert_not_called()
+
+    _resolve_cache.clear()
+    print("[PASS] test_bedrock_provider_prefixed_model_id_preserved")
+
+
+def test_bedrock_service_specific_exception_retried():
+    """Bedrock Runtime raises service-specific exceptions like ThrottlingException
+    whose type name is NOT 'ClientError'. These must still be caught as transient."""
+    from dashforge.agents.llm import call_llm, LLMTransientError
+    from pydantic import BaseModel
+    from tenacity import RetryError, wait_none
+
+    class Simple(BaseModel):
+        v: int
+
+    # Simulate Bedrock's service-specific ThrottlingException
+    # (NOT a ClientError subclass — different type hierarchy)
+    class ThrottlingException(Exception):
+        """Bedrock-specific throttling; __name__ is 'ThrottlingException'."""
+        def __init__(self, msg):
+            super().__init__(msg)
+            self.response = {"Error": {"Code": "ThrottlingException"}}
+
+    throttle = ThrottlingException("Rate exceeded")
+
+    mock_provider = MagicMock()
+    mock_provider.chat_json = AsyncMock(
+        side_effect=[throttle, '{"v": 42}']
+    )
+
+    original_wait = call_llm.retry.wait
+    call_llm.retry.wait = wait_none()
+
+    try:
+        with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+            result = asyncio.run(call_llm("sys", "user", Simple))
+            assert result.v == 42, f"Expected retry to succeed, got: {result}"
+            assert mock_provider.chat_json.call_count == 2, (
+                f"Expected 2 calls (1 throttle + 1 success), "
+                f"got {mock_provider.chat_json.call_count}"
+            )
+    finally:
+        call_llm.retry.wait = original_wait
+
+    print("[PASS] test_bedrock_service_specific_exception_retried")
+
+
+def test_pyproject_boto3_minimum_version_supports_converse():
+    """The bedrock optional extra must require boto3>=1.34.116 (when Converse
+    API was added), not an earlier version that would fail at runtime."""
+    from pathlib import Path
+    import tomllib
+    import re
+
+    toml_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    with open(toml_path, "rb") as f:
+        data = tomllib.load(f)
+
+    bedrock_deps = data["project"]["optional-dependencies"]["bedrock"]
+    boto3_dep = next(d for d in bedrock_deps if "boto3" in d)
+
+    # Extract version from spec like "boto3>=1.34.0"
+    match = re.search(r"(\d+\.\d+\.\d+)", boto3_dep)
+    assert match, f"Could not parse version from: {boto3_dep}"
+    parts = match.group(1).split(".")
+    major, minor, patch_v = int(parts[0]), int(parts[1]), int(parts[2])
+
+    # Must be >= 1.34.116
+    version_tuple = (major, minor, patch_v)
+    assert version_tuple >= (1, 34, 116), (
+        f"boto3 lower bound {match.group(1)} is too low — Converse API "
+        f"requires >=1.34.116. Older versions will AttributeError at runtime."
+    )
+
+    print("[PASS] test_pyproject_boto3_minimum_version_supports_converse")
 
 
 # ── Runner ─────────────────────────────────────────────────────────────────

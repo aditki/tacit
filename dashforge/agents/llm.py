@@ -54,15 +54,26 @@ async def call_llm(
             raise LLMTransientError(str(exc)) from exc
         raise  # 401, 403, 400 etc. are not retryable
     except Exception as exc:
-        # Catch botocore/boto3 transient errors (throttling, service unavailable)
+        # Catch botocore/boto3 transient errors (throttling, service unavailable).
+        # Bedrock Runtime raises service-specific exceptions whose type names
+        # match the error code directly (e.g. ThrottlingException, not ClientError).
         exc_name = type(exc).__name__
-        if exc_name in ("ClientError", "EndpointConnectionError", "ReadTimeoutError"):
+        _TRANSIENT_EXC_NAMES = {
+            "EndpointConnectionError", "ReadTimeoutError", "ConnectTimeoutError",
+            "ThrottlingException", "TooManyRequestsException",
+            "ServiceUnavailableException", "InternalServerException",
+            "ModelTimeoutException",
+        }
+        if exc_name in _TRANSIENT_EXC_NAMES:
+            logger.warning("llm_boto_transient_error", error=str(exc), exc_type=exc_name)
+            raise LLMTransientError(str(exc)) from exc
+        if exc_name == "ClientError":
             err_code = ""
             if hasattr(exc, "response"):
                 err_code = exc.response.get("Error", {}).get("Code", "")
             _RETRYABLE_CODES = {"ThrottlingException", "TooManyRequestsException",
                                 "ServiceUnavailableException", "InternalServerException"}
-            if err_code in _RETRYABLE_CODES or exc_name in ("EndpointConnectionError", "ReadTimeoutError"):
+            if err_code in _RETRYABLE_CODES:
                 logger.warning("llm_boto_transient_error", error=str(exc), code=err_code)
                 raise LLMTransientError(str(exc)) from exc
         raise

@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-bedrock = ["boto3>=1.34.0"]
+bedrock = ["boto3>=1.34.116"]
 
 [project.scripts]
 dashforge = "dashforge.cli:main"
