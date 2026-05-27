@@ -108,6 +108,15 @@ async def call_llm(
                 )
                 parsed = json.loads(repair_raw)
                 logger.info("llm_json_repaired", method="llm_reask")
+            except (httpx.TimeoutException, httpx.NetworkError, ConnectionError, OSError) as repair_exc:
+                logger.warning("llm_repair_transient_error", error=str(repair_exc))
+                raise LLMTransientError(str(repair_exc)) from repair_exc
+            except httpx.HTTPStatusError as repair_exc:
+                if repair_exc.response.status_code in {429, 500, 502, 503, 529}:
+                    logger.warning("llm_repair_rate_or_server_error", status=repair_exc.response.status_code)
+                    raise LLMTransientError(str(repair_exc)) from repair_exc
+                logger.error("llm_json_repair_failed", error=str(repair_exc), raw=raw[:300])
+                raise LLMParseError(f"LLM returned invalid JSON (repair failed): {repair_exc}") from repair_exc
             except (json.JSONDecodeError, Exception) as repair_exc:
                 logger.error("llm_json_repair_failed", error=str(repair_exc), raw=raw[:300])
                 raise LLMParseError(f"LLM returned invalid JSON (repair failed): {repair_exc}") from repair_exc

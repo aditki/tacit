@@ -3,6 +3,8 @@ import json
 import sys
 import os
 
+import httpx
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from dashforge.models.schemas import (
@@ -554,6 +556,98 @@ def test_cloudwatch_target_includes_region():
     print("[PASS] test_cloudwatch_target_includes_region")
 
 
+def test_json_repair_path_reraises_transient_errors():
+    """When the LLM repair call hits a transient error (timeout, 429),
+    it must raise LLMTransientError so tenacity retries, not LLMParseError."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from dashforge.agents.llm import call_llm, LLMTransientError
+    from pydantic import BaseModel
+
+    class Simple(BaseModel):
+        v: int
+
+    mock_provider = MagicMock()
+    # Each tenacity attempt: primary returns bad JSON, repair hits timeout.
+    # tenacity retries 3 times, so we need 3 × (primary + repair) = 6 calls.
+    mock_provider.chat_json = AsyncMock(
+        side_effect=[
+            '{broken json',                             # attempt 1: primary
+            httpx.TimeoutException("read timed out"),   # attempt 1: repair
+            '{broken json',                             # attempt 2: primary
+            httpx.TimeoutException("read timed out"),   # attempt 2: repair
+            '{broken json',                             # attempt 3: primary
+            httpx.TimeoutException("read timed out"),   # attempt 3: repair
+        ]
+    )
+
+    from tenacity import RetryError, wait_none
+    # Patch wait to zero so test doesn't sleep
+    original_wait = call_llm.retry.wait
+    call_llm.retry.wait = wait_none()
+
+    try:
+        with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+            try:
+                asyncio.run(call_llm("sys", "user", Simple))
+                assert False, "Should have raised"
+            except RetryError as re:
+                # tenacity wraps the last exception — it must be LLMTransientError
+                last = re.last_attempt.exception()
+                assert isinstance(last, LLMTransientError), (
+                    f"Expected LLMTransientError inside RetryError, "
+                    f"got {type(last).__name__}: {last}"
+                )
+            except LLMTransientError:
+                pass  # also acceptable
+            except Exception as exc:
+                assert False, (
+                    f"Expected LLMTransientError for transient repair failure, "
+                    f"got {type(exc).__name__}: {exc}"
+                )
+        # All 3 attempts should have been made (6 chat_json calls = 3 primary + 3 repair)
+        assert mock_provider.chat_json.call_count == 6, (
+            f"Expected 6 calls (3 attempts × 2), got {mock_provider.chat_json.call_count}"
+        )
+    finally:
+        call_llm.retry.wait = original_wait
+    print("[PASS] test_json_repair_path_reraises_transient_errors")
+
+
+def test_cloudwatch_region_defaults_to_datasource_default():
+    """When cloudwatch_region is empty, _build_panel_json should emit
+    region='default' so Grafana uses the datasource's defaultRegion,
+    rather than a potentially wrong LLM-guessed value."""
+    panel = PanelSpec(
+        title="5xx Errors",
+        queries=[PanelQuery(
+            expr="HTTPCode_ELB_5XX",
+            datasource_uid="cw-1",
+            datasource_type="cloudwatch",
+            cloudwatch_namespace="AWS/ApplicationELB",
+            cloudwatch_stat="Sum",
+            # cloudwatch_region intentionally NOT set — should use "default"
+        )],
+    )
+    result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    target = result["targets"][0]
+    assert target["region"] == "default", (
+        f"Empty cloudwatch_region should map to 'default', got {target.get('region')!r}"
+    )
+    print("[PASS] test_cloudwatch_region_defaults_to_datasource_default")
+
+
+def test_query_builder_prompt_does_not_instruct_region_guessing():
+    """The query builder prompt must NOT tell the LLM to set cloudwatch_region,
+    because the metric context doesn't include region info and the LLM would guess."""
+    from dashforge.agents.query_builder import SYSTEM_PROMPT
+    assert "cloudwatch_region" not in SYSTEM_PROMPT, (
+        "SYSTEM_PROMPT should not instruct LLM to set cloudwatch_region — "
+        "region should come from the datasource defaultRegion, not LLM guessing"
+    )
+    print("[PASS] test_query_builder_prompt_does_not_instruct_region_guessing")
+
+
 def test_prometheus_target_excludes_cloudwatch_fields():
     """Non-CloudWatch targets must NOT include region, namespace, etc."""
     panel = PanelSpec(
@@ -602,4 +696,7 @@ if __name__ == "__main__":
     test_cloudwatch_panel_query_region_field()
     test_cloudwatch_target_includes_region()
     test_prometheus_target_excludes_cloudwatch_fields()
+    test_json_repair_path_reraises_transient_errors()
+    test_cloudwatch_region_defaults_to_datasource_default()
+    test_query_builder_prompt_does_not_instruct_region_guessing()
     print("\n=== All tests passed ===")

@@ -39,7 +39,6 @@ Your job:
     "cloudwatch_namespace": "AWS/ApplicationELB"
     "cloudwatch_stat": "Sum" or "Average" or "p99" etc.
     "cloudwatch_dimensions": {"LoadBalancer": ["*"]}  (or specific values)
-    "cloudwatch_region": the AWS region from the metric context (e.g. "us-east-1")
   Example expr: "HTTPCode_ELB_5XX"
 
 - **logql** (datasource_type: loki):
