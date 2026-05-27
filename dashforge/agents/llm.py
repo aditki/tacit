@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Type, TypeVar
 
 import httpx
@@ -27,6 +28,36 @@ class LLMTransientError(Exception):
 
 class LLMParseError(Exception):
     """LLM returned unparseable or invalid output. Do NOT retry blindly."""
+
+
+def _attempt_json_repair(raw: str) -> str | None:
+    """Try lightweight programmatic fixes for common LLM JSON issues.
+
+    Returns repaired JSON string or None if repair failed.
+    """
+    text = raw.strip()
+
+    # Strip markdown code fences: ```json ... ``` or ``` ... ```
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+        text = text.strip()
+
+    # Remove trailing commas before } or ]
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+
+    # Try parsing the repaired text
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError:
+        return None
+
+
+_REPAIR_SYSTEM_PROMPT = """\
+You are a JSON repair tool. The following text was intended to be valid JSON \
+but has syntax errors. Fix the JSON and return ONLY the corrected JSON object. \
+Do not add commentary, markdown fences, or extra text. Preserve all data."""
 
 
 @retry(
@@ -56,11 +87,30 @@ async def call_llm(
 
     logger.debug("llm_raw_response", raw=raw[:500])
 
+    # ── Parse JSON (with repair fallback) ─────────────────────────────
+    parsed = None
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.error("llm_json_parse_error", raw=raw[:300])
-        raise LLMParseError(f"LLM returned invalid JSON: {exc}") from exc
+    except json.JSONDecodeError:
+        # Step 1: lightweight programmatic repair
+        repaired = _attempt_json_repair(raw)
+        if repaired is not None:
+            logger.info("llm_json_repaired", method="programmatic")
+            parsed = json.loads(repaired)
+        else:
+            # Step 2: one-shot LLM repair (strict token cap)
+            logger.warning("llm_json_repair_attempting", raw_preview=raw[:200])
+            try:
+                repair_raw = await provider.chat_json(
+                    _REPAIR_SYSTEM_PROMPT,
+                    raw[:4000],  # cap input to avoid cost blowout
+                    temperature=0.0,
+                )
+                parsed = json.loads(repair_raw)
+                logger.info("llm_json_repaired", method="llm_reask")
+            except (json.JSONDecodeError, Exception) as repair_exc:
+                logger.error("llm_json_repair_failed", error=str(repair_exc), raw=raw[:300])
+                raise LLMParseError(f"LLM returned invalid JSON (repair failed): {repair_exc}") from repair_exc
 
     try:
         return response_model.model_validate(parsed)

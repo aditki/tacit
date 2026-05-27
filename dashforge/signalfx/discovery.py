@@ -7,6 +7,7 @@ from typing import Any
 import structlog
 
 from dashforge.cache import make_cache_key, metric_cache
+from dashforge.config import settings
 from dashforge.grafana.adapters.signalfx import KEYWORD_METRIC_MAP
 from dashforge.models.schemas import MetricEntry
 from dashforge.signalfx.client import SignalFxClient
@@ -19,6 +20,23 @@ _MAX_DIMENSION_VALUES = 10
 # Internal SFx keys to exclude from dimension lists
 _INTERNAL_KEYS = {"sf_metric", "sf_originatingMetric", "sf_key", "sf_type",
                   "sf_isActive", "sf_createdOnMs", "sf_tags"}
+
+
+def _normalize_keywords(keywords: list[str]) -> list[str]:
+    """Normalize keywords for cache-key stability.
+
+    Lowercases, strips whitespace, deduplicates, and sorts so that
+    semantically equivalent keyword sets like ['cpu', 'high'] and
+    ['high', 'CPU'] produce the same cache key.
+    """
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for kw in keywords:
+        k = kw.lower().strip()
+        if k and k not in seen:
+            seen.add(k)
+            normalized.append(k)
+    return sorted(normalized)
 
 
 async def _fetch_dimensions(
@@ -64,7 +82,8 @@ async def discover_metrics(
     Returns normalized MetricEntry objects compatible with the rest of
     the DashForge pipeline.
     """
-    cache_key = make_cache_key("sfx_direct", ",".join(sorted(keywords)))
+    norm_kw = _normalize_keywords(keywords)
+    cache_key = make_cache_key("sfx_direct", ",".join(norm_kw))
     cached = metric_cache.get(cache_key)
     if cached is not None:
         logger.info("signalfx_direct_cache_hit", metrics=len(cached))
@@ -84,14 +103,20 @@ async def discover_metrics(
     if not search_queries:
         search_queries = {"*"}
 
-    # Execute searches concurrently
+    # Execute searches with bounded concurrency to avoid API burst
+    search_sem = asyncio.Semaphore(settings.adapter_max_concurrent)
+    search_errors = 0
+
     async def _search_one(query: str) -> list[dict[str, Any]]:
-        try:
-            data = await client.search_metrics(query=query, limit=100)
-            return data.get("results", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        except Exception:
-            logger.warning("signalfx_direct_search_failed", query=query)
-            return []
+        nonlocal search_errors
+        async with search_sem:
+            try:
+                data = await client.search_metrics(query=query, limit=100)
+                return data.get("results", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            except Exception:
+                search_errors += 1
+                logger.warning("signalfx_direct_search_failed", query=query)
+                return []
 
     tasks = [_search_one(q) for q in list(search_queries)[:10]]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -112,15 +137,28 @@ async def discover_metrics(
     unmatched = [n for n in metric_names if n not in set(matched)]
     metric_names = (matched + unmatched)[:_MAX_CATALOG_SIZE]
 
-    # Fetch dimensions for top metrics
+    # Fetch dimensions for top metrics with bounded concurrency
     to_sample = metric_names[:50]
-    dim_tasks = [_fetch_dimensions(client, name) for name in to_sample]
+    dim_sem = asyncio.Semaphore(settings.adapter_max_concurrent)
+    dim_errors = 0
+
+    async def _bounded_dims(name: str) -> tuple[str, list[str]]:
+        nonlocal dim_errors
+        async with dim_sem:
+            try:
+                dims = await _fetch_dimensions(client, name)
+                return name, dims
+            except Exception:
+                dim_errors += 1
+                return name, []
+
+    dim_tasks = [_bounded_dims(name) for name in to_sample]
     dim_results = await asyncio.gather(*dim_tasks, return_exceptions=True)
 
     catalog: dict[str, list[str]] = {name: [] for name in metric_names}
-    for name, result in zip(to_sample, dim_results):
-        if isinstance(result, list):
-            catalog[name] = result
+    for result in dim_results:
+        if isinstance(result, tuple):
+            catalog[result[0]] = result[1]
 
     # Build MetricEntry list — use "signalfx" type + "signalflow" language
     entries = [
@@ -137,5 +175,7 @@ async def discover_metrics(
 
     metric_cache.set(cache_key, entries)
     logger.info("signalfx_direct_discovered", total=len(entries),
-                sampled_dims=sum(1 for v in catalog.values() if v))
+                sampled_dims=sum(1 for v in catalog.values() if v),
+                search_errors=search_errors, dim_errors=dim_errors,
+                search_queries=len(search_queries))
     return entries
