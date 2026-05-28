@@ -304,13 +304,7 @@
   <!-- Signals tab -->
   <div class="tab-content" id="tab-signals">
     <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
-        <div class="result-label" style="margin:0">Signal Taxonomy</div>
-        <div id="signal-stats" style="font-size:0.75rem;color:#6b7280"></div>
-      </div>
-      <div id="signals-content"><div class="status">Loading...</div></div>
-
-      <div class="teach-form">
+      <div class="teach-form" style="border-top:none;padding-top:0;margin-top:0">
         <h3>Teach Signal Mapping</h3>
         <div class="form-row">
           <label>Signal</label>
@@ -333,6 +327,13 @@
           <span id="teach-status" style="font-size:0.8rem"></span>
         </div>
       </div>
+
+      <hr class="section-divider">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+        <div class="result-label" style="margin:0">Signal Taxonomy</div>
+        <div id="signal-stats" style="font-size:0.75rem;color:#6b7280"></div>
+      </div>
+      <div id="signals-content"><div class="status">Loading...</div></div>
     </div>
   </div>
 
@@ -418,8 +419,8 @@
         const data = await resp.json();
         lastDashboardUid = data.dashboard_uid;
         const dashUrl = data.dashboard_url ? data.dashboard_url.replace('http://localhost:3000', 'http://' + window.location.hostname + ':3000') : '';
-        const grafanaLink = dashUrl ? `<div class="result-url"><a href="${dashUrl}" target="_blank">${data.dashboard_uid} &mdash; Open in Grafana &rarr;</a></div>` : '';
-        const sfxLink = data.signalfx_url ? `<div class="result-url" style="margin-top:4px"><a href="${data.signalfx_url}" target="_blank">Open in SignalFx &rarr;</a></div>` : '';
+        const grafanaLink = dashUrl ? `<div class="result-url"><a href="${esc(dashUrl)}" target="_blank">${esc(data.dashboard_uid)} &mdash; Open in Grafana &rarr;</a></div>` : '';
+        const sfxLink = data.signalfx_url ? `<div class="result-url" style="margin-top:4px"><a href="${esc(data.signalfx_url)}" target="_blank">Open in SignalFx &rarr;</a></div>` : '';
 
         result.innerHTML = `
           <div class="result-card success">
@@ -428,7 +429,7 @@
             ${sfxLink}
             <div class="result-meta">
               <strong>${data.panel_count}</strong> panels<br>
-              ${data.summary.replace(/\n/g, '<br>')}
+              ${esc(data.summary).replace(/\n/g, '<br>')}
             </div>
             <div class="feedback-form" id="feedback-form">
               <h3>Rate this dashboard</h3>
@@ -452,7 +453,7 @@
         result.innerHTML = `
           <div class="result-card error">
             <div class="result-label">Error</div>
-            <div class="result-meta" style="color:#fca5a5">${e.message}</div>
+            <div class="result-meta" style="color:#fca5a5">${esc(e.message)}</div>
           </div>`;
       } finally {
         btn.disabled = false;
@@ -569,7 +570,7 @@
 
         el.innerHTML = html;
       } catch (e) {
-        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${e.message}</div>`;
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${esc(e.message)}</div>`;
       }
     }
 
@@ -582,17 +583,17 @@
         const data = await resp.json();
         let html = '';
         for (const a of data.archetypes) {
-          const tags = a.tags.map(t => `<span class="arch-tag">${t}</span>`).join('');
-          const panels = a.panels.map(p => `<li>${p}</li>`).join('');
+          const tags = a.tags.map(t => `<span class="arch-tag">${esc(t)}</span>`).join('');
+          const panels = a.panels.map(p => `<li>${esc(p)}</li>`).join('');
           html += `<div class="arch-card">
-            <h3>${a.name} <span style="font-size:0.75rem;color:#6b7280">(${a.id})</span></h3>
-            <div class="arch-desc">${a.description} ${tags}</div>
+            <h3>${esc(a.name)} <span style="font-size:0.75rem;color:#6b7280">(${esc(a.id)})</span></h3>
+            <div class="arch-desc">${esc(a.description)} ${tags}</div>
             <div class="arch-panels">${a.panel_count} panels: <ul style="margin:0.25rem 0 0 1.25rem;font-size:0.8rem">${panels}</ul></div>
           </div>`;
         }
         el.innerHTML = html || '<div class="status">No archetypes loaded</div>';
       } catch (e) {
-        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${e.message}</div>`;
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${esc(e.message)}</div>`;
       }
     }
 
@@ -636,7 +637,7 @@
         html += '</tbody></table>';
         el.innerHTML = html;
       } catch (e) {
-        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${e.message}</div>`;
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
       }
     }
 
@@ -648,9 +649,9 @@
         if (!resp.ok) throw new Error('Not found');
         const inv = await resp.json();
         const badge = statusBadge(inv.status);
-        const archs = (inv.archetypes || []).map(a => `${a.type} (${Math.round(a.confidence*100)}%)`).join(', ') || '—';
-        const metrics = (inv.metrics_selected || []).join(', ') || '—';
-        const dsTypes = (inv.datasource_types || []).join(', ') || '—';
+        const archs = (inv.archetypes || []).map(a => `${esc(a.type)} (${Math.round(a.confidence*100)}%)`).join(', ') || '—';
+        const metrics = (inv.metrics_selected || []).map(m => esc(m)).join(', ') || '—';
+        const dsTypes = (inv.datasource_types || []).map(d => esc(d)).join(', ') || '—';
 
         let queriesHtml = '';
         for (const q of (inv.generated_queries || []).slice(0, 15)) {
@@ -707,10 +708,10 @@
             <h4>Timings</h4>
             <div>${timingsHtml || '<span class="kv">—</span>'}</div>
 
-            ${inv.dashboard_url ? `<h4>Result</h4><div class="kv"><a href="${inv.dashboard_url}" target="_blank" style="color:#6366f1">${inv.dashboard_url} &rarr;</a></div>` : ''}
+            ${inv.dashboard_url ? `<h4>Result</h4><div class="kv"><a href="${esc(inv.dashboard_url)}" target="_blank" style="color:#6366f1">${esc(inv.dashboard_url)} &rarr;</a></div>` : ''}
           </div>`;
       } catch (e) {
-        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${e.message}</div>`;
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
       }
     }
 
@@ -737,7 +738,7 @@
             <div class="stat-card"><div class="stat-value">${s.archetype_path || 0} / ${s.freeform_path || 0}</div><div class="stat-label">Archetype / Freeform</div></div>
           </div>`;
       } catch (e) {
-        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${e.message}</div>`;
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
       }
     }
 
@@ -871,9 +872,9 @@
         const signals = await listResp.json();
         const stats = await statsResp.json();
 
-        statsEl.textContent = `${stats.signal_types || 0} signals, ${stats.total_mappings || 0} mappings`;
+        statsEl.textContent = `${stats.signal_types || 0} signals, ${stats.metric_mappings || 0} mappings`;
 
-        const signalList = signals.signals || [];
+        const signalList = signals.signal_types || [];
         const teachSelect = document.getElementById('teach-signal');
         teachSelect.innerHTML = signalList.map(s =>
           `<option value="${esc(s.signal_type)}">${esc(s.signal_type)} (${esc(s.category || '')})</option>`

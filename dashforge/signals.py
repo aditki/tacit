@@ -170,10 +170,15 @@ class SignalStore:
             )
 
     def list_signal_types(self) -> list[dict[str, Any]]:
-        """List all registered signal types."""
+        """List all registered signal types with mapping counts."""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM signal_types ORDER BY category, signal_type"
+                """SELECT st.*, COUNT(m.id) AS mapping_count
+                   FROM signal_types st
+                   LEFT JOIN signal_metric_mappings m
+                     ON st.signal_type = m.signal_type
+                   GROUP BY st.signal_type
+                   ORDER BY st.category, st.signal_type"""
             ).fetchall()
         return [dict(r) for r in rows]
 

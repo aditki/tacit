@@ -47,6 +47,8 @@ services:
     environment:
       GRAFANA_URL: http://grafana:3000
       SSL_CERT_FILE: ""
+    volumes:
+      - ./data:/app/data
     depends_on:
       - grafana
       - prometheus
