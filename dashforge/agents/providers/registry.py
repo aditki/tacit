@@ -23,9 +23,17 @@ def get_provider() -> LLMProvider:
         from dashforge.agents.providers.anthropic import AnthropicProvider
         _provider = AnthropicProvider()
 
-    elif name in ("openai", "azure"):
+    elif name == "openai":
         from dashforge.agents.providers.openai_provider import OpenAIProvider
         _provider = OpenAIProvider()
+
+    elif name == "azure":
+        from dashforge.agents.providers.openai_provider import AzureOpenAIProvider
+        _provider = AzureOpenAIProvider()
+
+    elif name == "bedrock":
+        from dashforge.agents.providers.bedrock import BedrockProvider
+        _provider = BedrockProvider()
 
     elif name == "ollama":
         from dashforge.agents.providers.ollama import OllamaProvider
@@ -34,7 +42,7 @@ def get_provider() -> LLMProvider:
     else:
         raise ValueError(
             f"Unknown LLM_PROVIDER={name!r}. "
-            f"Supported: anthropic, openai, azure, ollama"
+            f"Supported: anthropic, openai, azure, bedrock, ollama"
         )
 
     logger.info("llm_provider_init", provider=name, model=settings.llm_model)

@@ -17,7 +17,28 @@ import yaml
 # ── Constants ────────────────────────────────────────────────────────────────
 DASHFORGE_HOME = Path.home() / ".dashforge"
 CONFIG_FILE = DASHFORGE_HOME / "config.yaml"
-VERSION = "0.1.0"
+
+def _get_version() -> str:
+    """Derive version from package metadata to avoid drift with pyproject.toml."""
+    # 1. Try installed package metadata (works after pip install -e .)
+    try:
+        from importlib.metadata import version
+        return version("dashforge")
+    except Exception:
+        pass
+    # 2. Fallback: parse pyproject.toml directly (running from source)
+    try:
+        import re
+        toml_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        if toml_path.exists():
+            match = re.search(r'^version\s*=\s*"([^"]+)"', toml_path.read_text(), re.MULTILINE)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+    return "0.0.0-dev"
+
+VERSION = _get_version()
 
 # ── Rich helpers (graceful fallback) ─────────────────────────────────────────
 try:
@@ -161,13 +182,18 @@ def _interactive_setup() -> dict:
     # ── LLM ──
     console.print()
     _header("LLM Provider")
-    config["llm_provider"] = _prompt("Provider (anthropic/openai/azure/ollama)", "anthropic")
-    config["llm_api_key"] = _prompt("LLM API key", "")
+    config["llm_provider"] = _prompt("Provider (anthropic/openai/azure/bedrock/ollama)", "anthropic")
+
+    if config["llm_provider"] != "bedrock":
+        config["llm_api_key"] = _prompt("LLM API key", "")
+    else:
+        config["llm_api_key"] = ""  # Bedrock uses IAM, not API keys
 
     model_defaults = {
         "anthropic": "claude-sonnet-4-20250514",
         "openai": "gpt-4o",
         "azure": "gpt-4o",
+        "bedrock": "anthropic.claude-sonnet-4-20250514-v1:0",
         "ollama": "llama3",
     }
     default_model = model_defaults.get(config["llm_provider"], "claude-sonnet-4-20250514")
@@ -175,6 +201,13 @@ def _interactive_setup() -> dict:
 
     if config["llm_provider"] in ("azure", "ollama"):
         config["llm_api_base"] = _prompt("API base URL", "")
+    elif config["llm_provider"] == "bedrock":
+        config["llm_api_base"] = ""
+        config["llm_bedrock_region"] = _prompt("AWS region", "us-east-1")
+        config["llm_bedrock_role_arn"] = _prompt("IAM role ARN to assume (leave empty for default chain)", "")
+        if _confirm("Use explicit AWS access keys? (No = use IAM role/instance profile)", default=False):
+            config["llm_aws_access_key_id"] = _prompt("AWS Access Key ID", "")
+            config["llm_aws_secret_access_key"] = _prompt("AWS Secret Access Key", "")
     else:
         config["llm_api_base"] = ""
 
@@ -210,6 +243,8 @@ def _split_config(config: dict) -> tuple[dict, dict]:
         "slack_app_token": "SLACK_APP_TOKEN",
         "slack_signing_secret": "SLACK_SIGNING_SECRET",
         "signalfx_api_token": "SIGNALFX_API_TOKEN",
+        "llm_aws_access_key_id": "LLM_AWS_ACCESS_KEY_ID",
+        "llm_aws_secret_access_key": "LLM_AWS_SECRET_ACCESS_KEY",
     }
     yaml_config: dict = {}
     secrets: dict = {}
@@ -235,6 +270,15 @@ def _split_config(config: dict) -> tuple[dict, dict]:
     api_base = yaml_config.pop("llm_api_base", "")
     if api_base:
         structured["llm"]["api_base"] = api_base
+
+    # Bedrock config
+    bedrock_region = yaml_config.pop("llm_bedrock_region", "")
+    bedrock_role_arn = yaml_config.pop("llm_bedrock_role_arn", "")
+    if structured["llm"].get("provider") == "bedrock" or bedrock_region:
+        if bedrock_region:
+            structured["llm"]["bedrock_region"] = bedrock_region
+        if bedrock_role_arn:
+            structured["llm"]["bedrock_role_arn"] = bedrock_role_arn
 
     # SignalFx config
     sfx_enabled = yaml_config.pop("signalfx_enabled", False)
@@ -263,8 +307,13 @@ def doctor():
     _header("DashForge Doctor")
     _load_env()
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # ── Synchronous local checks (instant) ────────────────────────────
     checks_passed = 0
     checks_total = 0
+    fatal_failures: list[str] = []
+    warnings: list[str] = []
 
     # 1. Config file
     checks_total += 1
@@ -273,45 +322,17 @@ def doctor():
         checks_passed += 1
     else:
         _warn(f"No config at {CONFIG_FILE} — run `dashforge init`")
+        fatal_failures.append("config")
 
-    # 2. Grafana connectivity
-    checks_total += 1
-    grafana_ok = _check_grafana()
-    if grafana_ok:
-        checks_passed += 1
-
-    # 3. Datasource discovery
-    if grafana_ok:
-        checks_total += 1
-        ds_ok = _check_datasources()
-        if ds_ok:
-            checks_passed += 1
-
-    # 4. LLM connectivity
-    checks_total += 1
-    llm_ok = _check_llm()
-    if llm_ok:
-        checks_passed += 1
-
-    # 5. Archetypes
+    # 2. Archetypes (local file check, no network)
     checks_total += 1
     arch_ok = _check_archetypes()
     if arch_ok:
         checks_passed += 1
+    else:
+        warnings.append("archetypes")
 
-    # 6. SignalFx connectivity (if enabled)
-    _check_signalfx_result = None
-    try:
-        from dashforge.config import settings as _sfx_settings
-        if _sfx_settings.signalfx_enabled and _sfx_settings.signalfx_api_token:
-            checks_total += 1
-            _check_signalfx_result = _check_signalfx()
-            if _check_signalfx_result:
-                checks_passed += 1
-    except Exception:
-        pass
-
-    # 7. Cache dir
+    # 3. Cache dir
     checks_total += 1
     data_dir = Path("data")
     if data_dir.exists():
@@ -321,15 +342,66 @@ def doctor():
         _info("Data directory will be created on first run")
         checks_passed += 1  # Not a failure
 
-    # Summary
+    # ── Parallel network checks ───────────────────────────────────────
+    # Run Grafana, LLM, and SignalFx checks concurrently to reduce wall time
+    sfx_enabled = False
+    try:
+        from dashforge.config import settings as _sfx_settings
+        sfx_enabled = _sfx_settings.signalfx_enabled and bool(_sfx_settings.signalfx_api_token)
+    except Exception:
+        pass
+
+    network_checks: dict[str, callable] = {
+        "grafana": _check_grafana,
+        "llm": _check_llm,
+    }
+    if sfx_enabled:
+        network_checks["signalfx"] = _check_signalfx
+
+    network_results: dict[str, bool] = {}
+    with ThreadPoolExecutor(max_workers=len(network_checks)) as pool:
+        futures = {pool.submit(fn): name for name, fn in network_checks.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                network_results[name] = future.result()
+            except Exception:
+                network_results[name] = False
+
+    grafana_ok = network_results.get("grafana", False)
+    llm_ok = network_results.get("llm", False)
+
+    checks_total += len(network_checks)
+    for name, ok in network_results.items():
+        if ok:
+            checks_passed += 1
+        else:
+            fatal_failures.append(name)
+
+    # 4. Datasource discovery (depends on Grafana — sequential)
+    if grafana_ok:
+        checks_total += 1
+        ds_ok = _check_datasources()
+        if ds_ok:
+            checks_passed += 1
+        else:
+            warnings.append("datasources")
+
+    # ── Summary with classified failures ──────────────────────────────
     console.print()
     if checks_passed == checks_total:
         _success(f"All {checks_total} checks passed!")
     else:
         _warn(f"{checks_passed}/{checks_total} checks passed")
-        if not grafana_ok:
+        if fatal_failures:
+            _fail(f"Fatal: {', '.join(fatal_failures)}")
+        if warnings:
+            _warn(f"Warnings: {', '.join(warnings)}")
+        if "grafana" in fatal_failures:
             _info("Run `dashforge connect grafana` to fix Grafana connection")
-        if not llm_ok:
+        if "signalfx" in fatal_failures:
+            _info("Run `dashforge connect signalfx` to fix SignalFx connection")
+        if "llm" in fatal_failures:
             _info("Check your LLM_API_KEY in ~/.dashforge/.env")
 
 
@@ -400,7 +472,7 @@ def _check_llm() -> bool:
         api_key = settings.llm_api_key
         model = settings.llm_model
 
-        if not api_key and provider != "ollama":
+        if not api_key and provider not in ("ollama", "bedrock"):
             _warn(f"LLM: no API key for {provider}")
             return False
 
@@ -411,6 +483,41 @@ def _check_llm() -> bool:
         elif provider in ("openai", "azure") and api_key.startswith("sk-"):
             _success(f"LLM: {provider} / {model} (key looks valid)")
             return True
+        elif provider == "bedrock":
+            try:
+                import boto3
+                session_kwargs: dict = {"region_name": settings.llm_bedrock_region}
+                if settings.llm_aws_access_key_id:
+                    session_kwargs["aws_access_key_id"] = settings.llm_aws_access_key_id
+                    session_kwargs["aws_secret_access_key"] = settings.llm_aws_secret_access_key
+                session = boto3.Session(**session_kwargs)
+                # Mirror _build_boto3_session: assume role if configured
+                if settings.llm_bedrock_role_arn:
+                    sts = session.client("sts")
+                    assumed = sts.assume_role(
+                        RoleArn=settings.llm_bedrock_role_arn,
+                        RoleSessionName="dashforge-bedrock",
+                        DurationSeconds=3600,
+                    )
+                    creds = assumed["Credentials"]
+                    session = boto3.Session(
+                        aws_access_key_id=creds["AccessKeyId"],
+                        aws_secret_access_key=creds["SecretAccessKey"],
+                        aws_session_token=creds["SessionToken"],
+                        region_name=settings.llm_bedrock_region,
+                    )
+                sts = session.client("sts")
+                identity = sts.get_caller_identity()
+                account = identity.get("Account", "?")
+                model_id = settings.llm_bedrock_model_id or model
+                _success(f"LLM: bedrock / {model_id} (AWS account {account}, region {settings.llm_bedrock_region})")
+                return True
+            except ImportError:
+                _fail("LLM: bedrock requires boto3 — pip install 'dashforge[bedrock]'")
+                return False
+            except Exception as be:
+                _fail(f"LLM: bedrock AWS auth failed — {be}")
+                return False
         elif provider == "ollama":
             import httpx
             base = settings.llm_api_base or "http://localhost:11434"

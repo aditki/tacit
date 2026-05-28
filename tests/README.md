@@ -186,4 +186,15 @@ validate.py
 |------|-------------|
 | `validate.py` | Validation suite (run with `uv run python tests/validate.py`) |
 | `dashforge_validation_prompts.csv` | 100-prompt test dataset across 3 fake services |
-| `test_unit.py` | Unit tests (run with `uv run pytest`) |
+| `test_unit.py` | Core unit tests: schemas, LLM JSON repair, SignalFx cache |
+| `test_bedrock.py` | Bedrock provider: session auth, converse, model resolution, inference profile retry, Mistral |
+| `test_azure.py` | Azure OpenAI provider: init validation, deployment resolution |
+| `test_registry.py` | Provider registry: routing, error messages |
+| `test_providers.py` | CloudWatch schema/rendering, CLI doctor checks |
+| `test_backends.py` | Backend adapters: Grafana, SignalFx protocol implementations |
+| `test_signalfx_unit.py` | SignalFx discovery, validation, SignalFlow query handling |
+
+Run all tests with:
+```bash
+uv run pytest
+```

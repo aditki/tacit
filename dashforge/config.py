@@ -85,6 +85,15 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(default="", repr=False)
     llm_model: str = "claude-sonnet-4-20250514"
     llm_api_base: str = ""  # optional: custom endpoint (Azure, Ollama, vLLM, etc.)
+    # Azure OpenAI-specific (only used when llm_provider=azure)
+    llm_azure_api_version: str = "2024-06-01"  # Azure OpenAI API version
+    llm_azure_deployment: str = ""  # Azure deployment name (defaults to llm_model if empty)
+    # AWS Bedrock-specific (only used when llm_provider=bedrock)
+    llm_bedrock_region: str = "us-east-1"  # AWS region for Bedrock endpoint
+    llm_bedrock_model_id: str = ""  # Bedrock model ID (e.g. anthropic.claude-sonnet-4-20250514-v1:0); defaults to llm_model
+    llm_bedrock_role_arn: str = ""  # Optional IAM role ARN to assume (cross-account)
+    llm_aws_access_key_id: str = Field(default="", repr=False)  # Optional explicit AWS key
+    llm_aws_secret_access_key: str = Field(default="", repr=False)  # Optional explicit AWS secret
 
     # Grafana
     grafana_enabled: bool = True

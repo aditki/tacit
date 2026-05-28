@@ -30,6 +30,42 @@ class LLMParseError(Exception):
     """LLM returned unparseable or invalid output. Do NOT retry blindly."""
 
 
+def _strip_trailing_commas(text: str) -> str:
+    """Remove trailing commas before } or ] only when outside JSON string literals."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            # Consume the entire string literal (respecting escape sequences)
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                out.append(c)
+                i += 1
+                if c == '\\' and i < n:
+                    out.append(text[i])
+                    i += 1
+                elif c == '"':
+                    break
+        elif ch == ',':
+            # Look ahead: if next non-whitespace is } or ], skip this comma
+            j = i + 1
+            while j < n and text[j] in ' \t\n\r':
+                j += 1
+            if j < n and text[j] in ('}', ']'):
+                i += 1  # drop the comma
+            else:
+                out.append(ch)
+                i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return ''.join(out)
+
+
 def _attempt_json_repair(raw: str) -> str | None:
     """Try lightweight programmatic fixes for common LLM JSON issues.
 
@@ -43,8 +79,8 @@ def _attempt_json_repair(raw: str) -> str | None:
         text = re.sub(r"\n?```\s*$", "", text)
         text = text.strip()
 
-    # Remove trailing commas before } or ]
-    text = re.sub(r",\s*([}\]])", r"\1", text)
+    # Remove trailing commas before } or ] — only outside string literals
+    text = _strip_trailing_commas(text)
 
     # Try parsing the repaired text
     try:
@@ -84,6 +120,30 @@ async def call_llm(
             logger.warning("llm_rate_or_server_error", status=exc.response.status_code)
             raise LLMTransientError(str(exc)) from exc
         raise  # 401, 403, 400 etc. are not retryable
+    except Exception as exc:
+        # Catch botocore/boto3 transient errors (throttling, service unavailable).
+        # Bedrock Runtime raises service-specific exceptions whose type names
+        # match the error code directly (e.g. ThrottlingException, not ClientError).
+        exc_name = type(exc).__name__
+        _TRANSIENT_EXC_NAMES = {
+            "EndpointConnectionError", "ReadTimeoutError", "ConnectTimeoutError",
+            "ThrottlingException", "TooManyRequestsException",
+            "ServiceUnavailableException", "InternalServerException",
+            "ModelTimeoutException",
+        }
+        if exc_name in _TRANSIENT_EXC_NAMES:
+            logger.warning("llm_boto_transient_error", error=str(exc), exc_type=exc_name)
+            raise LLMTransientError(str(exc)) from exc
+        if exc_name == "ClientError":
+            err_code = ""
+            if hasattr(exc, "response"):
+                err_code = exc.response.get("Error", {}).get("Code", "")
+            _RETRYABLE_CODES = {"ThrottlingException", "TooManyRequestsException",
+                                "ServiceUnavailableException", "InternalServerException"}
+            if err_code in _RETRYABLE_CODES:
+                logger.warning("llm_boto_transient_error", error=str(exc), code=err_code)
+                raise LLMTransientError(str(exc)) from exc
+        raise
 
     logger.debug("llm_raw_response", raw=raw[:500])
 
