@@ -7,6 +7,7 @@ from urllib.parse import quote
 import structlog
 
 from dashforge.cache import make_cache_key, metric_cache
+from dashforge.config import settings
 from dashforge.grafana.adapters.base import DatasourceAdapter
 from dashforge.grafana.client import GrafanaClient
 from dashforge.models.schemas import DatasourceInfo, MetricEntry
@@ -92,24 +93,39 @@ class PrometheusAdapter(DatasourceAdapter):
         # Drop auto-generated noise metrics
         all_names = [n for n in all_names if not n.endswith(_NOISE_SUFFIXES)]
 
-        # Fetch per-metric labels (capped)
+        # Fetch per-metric labels with bounded concurrency to avoid
+        # overwhelming the Grafana proxy / Prometheus instance.
         to_sample = all_names[:_MAX_SAMPLE_METRICS]
-        label_tasks = [
-            self._fetch_metric_labels(client, datasource, name)
-            for name in to_sample
-        ]
-        label_results = await asyncio.gather(*label_tasks, return_exceptions=True)
+        sem = asyncio.Semaphore(settings.adapter_max_concurrent)
+        fetch_errors = 0
+        total_label_cardinality = 0
+
+        async def _bounded_fetch(name: str) -> tuple[str, list[str]]:
+            nonlocal fetch_errors, total_label_cardinality
+            async with sem:
+                try:
+                    dims = await self._fetch_metric_labels(client, datasource, name)
+                    total_label_cardinality += len(dims)
+                    return name, dims
+                except Exception:
+                    fetch_errors += 1
+                    return name, []
+
+        tasks = [_bounded_fetch(name) for name in to_sample]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
         catalog: dict[str, list[str]] = {}
         for name in all_names:
             catalog[name] = []  # default: no dims
-        for name, result in zip(to_sample, label_results):
-            if isinstance(result, list):
-                catalog[name] = result
+        for result in results:
+            if isinstance(result, tuple):
+                catalog[result[0]] = result[1]
 
         metric_cache.set(cache_key, catalog)
         logger.info("prometheus_catalog_cached", datasource=datasource.name,
-                    total=len(catalog), sampled_labels=sum(1 for v in catalog.values() if v))
+                    total=len(catalog), sampled_labels=sum(1 for v in catalog.values() if v),
+                    sample_count=len(to_sample), fetch_errors=fetch_errors,
+                    label_cardinality=total_label_cardinality)
         return catalog
 
     async def discover_metrics(

@@ -3,6 +3,8 @@ import json
 import sys
 import os
 
+import httpx
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from dashforge.models.schemas import (
@@ -18,7 +20,7 @@ from dashforge.models.schemas import (
     PanelSpec,
     SignalType,
 )
-from dashforge.grafana.dashboard import build_dashboard_json, TIMERANGE_MAP
+from dashforge.grafana.dashboard import build_dashboard_json, _build_panel_json, TIMERANGE_MAP
 from dashforge.grafana.datasource import (
     filter_datasources_by_signal,
     filter_searchable_datasources,
@@ -513,6 +515,371 @@ def test_config_concurrency_defaults():
     print("[PASS] test_config_concurrency_defaults")
 
 
+def test_cloudwatch_panel_query_region_field():
+    """PanelQuery must accept a cloudwatch_region field for CW targets."""
+    q = PanelQuery(
+        expr="HTTPCode_ELB_5XX",
+        datasource_uid="cw-1",
+        datasource_type="cloudwatch",
+        cloudwatch_namespace="AWS/ApplicationELB",
+        cloudwatch_stat="Sum",
+        cloudwatch_region="us-west-2",
+    )
+    assert q.cloudwatch_region == "us-west-2"
+    # Default should be empty when not supplied
+    q2 = PanelQuery(expr="up", datasource_uid="p1")
+    assert q2.cloudwatch_region == ""
+    print("[PASS] test_cloudwatch_panel_query_region_field")
+
+
+def test_cloudwatch_target_includes_region():
+    """Grafana CW target JSON must contain region when cloudwatch_namespace is set."""
+    panel = PanelSpec(
+        title="5xx Errors",
+        queries=[PanelQuery(
+            expr="HTTPCode_ELB_5XX",
+            datasource_uid="cw-1",
+            datasource_type="cloudwatch",
+            cloudwatch_namespace="AWS/ApplicationELB",
+            cloudwatch_stat="Sum",
+            cloudwatch_region="eu-west-1",
+            cloudwatch_dimensions={"LoadBalancer": "*"},
+        )],
+    )
+    result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    target = result["targets"][0]
+    assert target["region"] == "eu-west-1", f"Expected region 'eu-west-1', got {target.get('region')}"
+    assert target["namespace"] == "AWS/ApplicationELB"
+    assert target["metricName"] == "HTTPCode_ELB_5XX"
+    assert target["statistics"] == ["Sum"]
+    assert target["dimensions"] == {"LoadBalancer": "*"}
+    print("[PASS] test_cloudwatch_target_includes_region")
+
+
+def test_json_repair_path_reraises_transient_errors():
+    """When the LLM repair call hits a transient error (timeout, 429),
+    it must raise LLMTransientError so tenacity retries, not LLMParseError."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from dashforge.agents.llm import call_llm, LLMTransientError
+    from pydantic import BaseModel
+
+    class Simple(BaseModel):
+        v: int
+
+    mock_provider = MagicMock()
+    # Each tenacity attempt: primary returns bad JSON, repair hits timeout.
+    # tenacity retries 3 times, so we need 3 × (primary + repair) = 6 calls.
+    mock_provider.chat_json = AsyncMock(
+        side_effect=[
+            '{broken json',                             # attempt 1: primary
+            httpx.TimeoutException("read timed out"),   # attempt 1: repair
+            '{broken json',                             # attempt 2: primary
+            httpx.TimeoutException("read timed out"),   # attempt 2: repair
+            '{broken json',                             # attempt 3: primary
+            httpx.TimeoutException("read timed out"),   # attempt 3: repair
+        ]
+    )
+
+    from tenacity import RetryError, wait_none
+    # Patch wait to zero so test doesn't sleep
+    original_wait = call_llm.retry.wait
+    call_llm.retry.wait = wait_none()
+
+    try:
+        with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+            try:
+                asyncio.run(call_llm("sys", "user", Simple))
+                assert False, "Should have raised"
+            except RetryError as re:
+                # tenacity wraps the last exception — it must be LLMTransientError
+                last = re.last_attempt.exception()
+                assert isinstance(last, LLMTransientError), (
+                    f"Expected LLMTransientError inside RetryError, "
+                    f"got {type(last).__name__}: {last}"
+                )
+            except LLMTransientError:
+                pass  # also acceptable
+            except Exception as exc:
+                assert False, (
+                    f"Expected LLMTransientError for transient repair failure, "
+                    f"got {type(exc).__name__}: {exc}"
+                )
+        # All 3 attempts should have been made (6 chat_json calls = 3 primary + 3 repair)
+        assert mock_provider.chat_json.call_count == 6, (
+            f"Expected 6 calls (3 attempts × 2), got {mock_provider.chat_json.call_count}"
+        )
+    finally:
+        call_llm.retry.wait = original_wait
+    print("[PASS] test_json_repair_path_reraises_transient_errors")
+
+
+def test_cloudwatch_region_defaults_to_datasource_default():
+    """When cloudwatch_region is empty, _build_panel_json should emit
+    region='default' so Grafana uses the datasource's defaultRegion,
+    rather than a potentially wrong LLM-guessed value."""
+    panel = PanelSpec(
+        title="5xx Errors",
+        queries=[PanelQuery(
+            expr="HTTPCode_ELB_5XX",
+            datasource_uid="cw-1",
+            datasource_type="cloudwatch",
+            cloudwatch_namespace="AWS/ApplicationELB",
+            cloudwatch_stat="Sum",
+            # cloudwatch_region intentionally NOT set — should use "default"
+        )],
+    )
+    result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    target = result["targets"][0]
+    assert target["region"] == "default", (
+        f"Empty cloudwatch_region should map to 'default', got {target.get('region')!r}"
+    )
+    print("[PASS] test_cloudwatch_region_defaults_to_datasource_default")
+
+
+def test_query_builder_prompt_does_not_instruct_region_guessing():
+    """The query builder prompt must NOT tell the LLM to set cloudwatch_region,
+    because the metric context doesn't include region info and the LLM would guess."""
+    from dashforge.agents.query_builder import SYSTEM_PROMPT
+    assert "cloudwatch_region" not in SYSTEM_PROMPT, (
+        "SYSTEM_PROMPT should not instruct LLM to set cloudwatch_region — "
+        "region should come from the datasource defaultRegion, not LLM guessing"
+    )
+    print("[PASS] test_query_builder_prompt_does_not_instruct_region_guessing")
+
+
+def test_prometheus_target_excludes_cloudwatch_fields():
+    """Non-CloudWatch targets must NOT include region, namespace, etc."""
+    panel = PanelSpec(
+        title="Request Rate",
+        queries=[PanelQuery(
+            expr='rate(http_requests_total[5m])',
+            datasource_uid="prom-1",
+            datasource_type="prometheus",
+        )],
+    )
+    result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    target = result["targets"][0]
+    assert "region" not in target
+    assert "namespace" not in target
+    assert "metricName" not in target
+    assert "statistics" not in target
+    print("[PASS] test_prometheus_target_excludes_cloudwatch_fields")
+
+
+def test_cloudwatch_validation_is_skipped_for_prometheus_probe():
+    """CloudWatch panels should not be probed through Prometheus api/v1/query."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from dashforge.validation import validate_dashboard_queries
+
+    client = type("Client", (), {})()
+    client.datasource_proxy_get = AsyncMock(return_value={"data": {"result": []}})
+
+    spec = DashboardSpec(
+        title="cw",
+        panels=[PanelSpec(
+            title="ELB 5xx",
+            queries=[PanelQuery(
+                expr="HTTPCode_ELB_5XX",
+                datasource_uid="cw-1",
+                datasource_type="cloudwatch",
+                cloudwatch_namespace="AWS/ApplicationELB",
+            )],
+        )],
+    )
+
+    filtered, warnings = asyncio.run(validate_dashboard_queries(client, spec))
+
+    assert len(filtered.panels) == 1
+    assert warnings == []
+    client.datasource_proxy_get.assert_not_called()
+    print("[PASS] test_cloudwatch_validation_is_skipped_for_prometheus_probe")
+
+
+def test_prometheus_validation_still_uses_proxy_query():
+    """Prometheus panels should continue using api/v1/query validation."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from dashforge.validation import validate_dashboard_queries
+
+    client = type("Client", (), {})()
+    client.datasource_proxy_get = AsyncMock(return_value={"data": {"result": [{"metric": {}}]}})
+
+    spec = DashboardSpec(
+        title="prom",
+        panels=[PanelSpec(
+            title="Request Rate",
+            queries=[PanelQuery(
+                expr='rate(http_requests_total[5m])',
+                datasource_uid="prom-1",
+                datasource_type="prometheus",
+            )],
+        )],
+    )
+
+    filtered, warnings = asyncio.run(validate_dashboard_queries(client, spec))
+
+    assert len(filtered.panels) == 1
+    assert warnings == []
+    client.datasource_proxy_get.assert_called_once()
+    print("[PASS] test_prometheus_validation_still_uses_proxy_query")
+
+
+def test_provider_sdk_transient_error_in_repair_retried():
+    """When the LLM repair call raises a provider SDK exception (e.g.
+    OpenAI RateLimitError), it must be classified as LLMTransientError
+    so tenacity retries, not swallowed as LLMParseError."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from dashforge.agents.llm import call_llm, LLMTransientError
+    from pydantic import BaseModel
+    from tenacity import RetryError, wait_none
+
+    class Simple(BaseModel):
+        v: int
+
+    # Simulate a provider SDK rate-limit exception (not httpx, not ClientError)
+    class RateLimitError(Exception):
+        """Simulates openai.RateLimitError."""
+        def __init__(self):
+            super().__init__("Rate limit exceeded")
+            self.status_code = 429
+
+    mock_provider = MagicMock()
+    mock_provider.chat_json = AsyncMock(
+        side_effect=[
+            '{broken json',       # attempt 1: primary
+            RateLimitError(),     # attempt 1: repair → transient
+            '{broken json',       # attempt 2: primary
+            RateLimitError(),     # attempt 2: repair → transient
+            '{broken json',       # attempt 3: primary
+            RateLimitError(),     # attempt 3: repair → transient
+        ]
+    )
+
+    original_wait = call_llm.retry.wait
+    call_llm.retry.wait = wait_none()
+
+    try:
+        with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+            try:
+                asyncio.run(call_llm("sys", "user", Simple))
+                assert False, "Should have raised"
+            except RetryError as re:
+                last = re.last_attempt.exception()
+                assert isinstance(last, LLMTransientError), (
+                    f"Expected LLMTransientError (retryable), "
+                    f"got {type(last).__name__}: {last}"
+                )
+            except LLMTransientError:
+                pass  # also acceptable
+            except Exception as exc:
+                assert False, (
+                    f"Provider SDK rate-limit error should be LLMTransientError, "
+                    f"got {type(exc).__name__}: {exc}"
+                )
+        assert mock_provider.chat_json.call_count == 6, (
+            f"Expected 6 calls (3 attempts × 2), got {mock_provider.chat_json.call_count}"
+        )
+    finally:
+        call_llm.retry.wait = original_wait
+    print("[PASS] test_provider_sdk_transient_error_in_repair_retried")
+
+
+def test_cloudwatch_metric_name_strips_namespace_prefix():
+    """When expr contains the catalog-style 'Namespace/MetricName', _build_panel_json
+    must strip the namespace prefix so metricName is just 'MetricName'."""
+    panel = PanelSpec(
+        title="5xx Errors",
+        queries=[PanelQuery(
+            expr="AWS/ApplicationELB/HTTPCode_ELB_5XX",
+            datasource_uid="cw-1",
+            datasource_type="cloudwatch",
+            cloudwatch_namespace="AWS/ApplicationELB",
+            cloudwatch_stat="Sum",
+        )],
+    )
+    result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    target = result["targets"][0]
+    assert target["metricName"] == "HTTPCode_ELB_5XX", (
+        f"Expected stripped metricName 'HTTPCode_ELB_5XX', got {target['metricName']!r}"
+    )
+    # When expr is already bare, should pass through unchanged
+    panel2 = PanelSpec(
+        title="5xx Errors",
+        queries=[PanelQuery(
+            expr="HTTPCode_ELB_5XX",
+            datasource_uid="cw-1",
+            datasource_type="cloudwatch",
+            cloudwatch_namespace="AWS/ApplicationELB",
+            cloudwatch_stat="Sum",
+        )],
+    )
+    result2 = _build_panel_json(panel2, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    assert result2["targets"][0]["metricName"] == "HTTPCode_ELB_5XX"
+    print("[PASS] test_cloudwatch_metric_name_strips_namespace_prefix")
+
+
+def test_cloudwatch_dimensions_accept_str_and_list():
+    """CloudWatch dimensions accept both str and list[str] values.
+    Single-element lists should be normalized to strings by _build_panel_json.
+    Multi-value lists should pass through."""
+    q = PanelQuery(
+        expr="HTTPCode_ELB_5XX",
+        datasource_uid="cw-1",
+        datasource_type="cloudwatch",
+        cloudwatch_namespace="AWS/ApplicationELB",
+        cloudwatch_stat="Sum",
+        cloudwatch_dimensions={
+            "LoadBalancer": "*",
+            "AvailabilityZone": ["us-east-1a", "us-east-1b"],
+        },
+    )
+    assert q.cloudwatch_dimensions["LoadBalancer"] == "*"
+    assert q.cloudwatch_dimensions["AvailabilityZone"] == ["us-east-1a", "us-east-1b"]
+
+    # Verify _build_panel_json passes through correctly
+    panel = PanelSpec(title="Test", queries=[q])
+    result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    dims = result["targets"][0]["dimensions"]
+    assert dims["LoadBalancer"] == "*", "String values should pass through"
+    assert dims["AvailabilityZone"] == ["us-east-1a", "us-east-1b"], "Multi-value lists should pass through"
+
+    # Single-element lists should be normalized to strings
+    q2 = PanelQuery(
+        expr="HTTPCode_ELB_5XX",
+        datasource_uid="cw-1",
+        datasource_type="cloudwatch",
+        cloudwatch_namespace="AWS/ApplicationELB",
+        cloudwatch_stat="Sum",
+        cloudwatch_dimensions={"LoadBalancer": ["*"]},
+    )
+    panel2 = PanelSpec(title="Test", queries=[q2])
+    result2 = _build_panel_json(panel2, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    assert result2["targets"][0]["dimensions"]["LoadBalancer"] == "*", \
+        "Single-element list ['*'] should be normalized to '*'"
+    print("[PASS] test_cloudwatch_dimensions_accept_str_and_list")
+
+
+def test_signalfx_discovery_normalized_keywords_match_cache():
+    """SignalFx discovery must use normalized keywords for both the cache key
+    and the API search, so whitespace-containing keywords don't poison the cache."""
+    from dashforge.signalfx.discovery import _normalize_keywords
+
+    raw = [" CPU ", "High", "cpu"]
+    norm = _normalize_keywords(raw)
+    assert norm == ["cpu", "high"], f"Expected ['cpu', 'high'], got {norm}"
+
+    # Verify the same keywords in different order/case produce same result
+    raw2 = ["high", "CPU"]
+    norm2 = _normalize_keywords(raw2)
+    assert norm == norm2, f"Expected same normalization, got {norm} vs {norm2}"
+    print("[PASS] test_signalfx_discovery_normalized_keywords_match_cache")
+
+
 if __name__ == "__main__":
     test_intent_model()
     test_dashboard_spec_model()
@@ -539,4 +906,16 @@ if __name__ == "__main__":
     test_metrics_discovery_prompt_has_security()
     test_query_builder_prompt_has_security()
     test_config_concurrency_defaults()
+    test_cloudwatch_panel_query_region_field()
+    test_cloudwatch_target_includes_region()
+    test_prometheus_target_excludes_cloudwatch_fields()
+    test_json_repair_path_reraises_transient_errors()
+    test_cloudwatch_region_defaults_to_datasource_default()
+    test_query_builder_prompt_does_not_instruct_region_guessing()
+    test_cloudwatch_validation_is_skipped_for_prometheus_probe()
+    test_prometheus_validation_still_uses_proxy_query()
+    test_provider_sdk_transient_error_in_repair_retried()
+    test_cloudwatch_metric_name_strips_namespace_prefix()
+    test_cloudwatch_dimensions_accept_str_and_list()
+    test_signalfx_discovery_normalized_keywords_match_cache()
     print("\n=== All tests passed ===")
