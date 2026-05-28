@@ -1,7 +1,6 @@
 """DashForge CLI — single-command local startup for on-call engineers."""
 from __future__ import annotations
 
-import logging
 import os
 import shutil
 import subprocess
@@ -11,7 +10,6 @@ from pathlib import Path
 from typing import Optional
 
 import click
-import structlog
 import yaml
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -816,12 +814,8 @@ def serve(host: str, port: int, reload: bool, no_slack: bool):
     import uvicorn
     from dashforge.config import settings
 
-    log_level = settings.log_level.lower()
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(
-            getattr(logging, settings.log_level.upper(), logging.INFO)
-        ),
-    )
+    from dashforge.logging import configure_logging
+    configure_logging(settings.log_level)
 
     _info(f"LLM: {settings.llm_provider} / {settings.llm_model}")
     _info(f"Grafana: {settings.grafana_url}")
