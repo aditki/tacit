@@ -4,6 +4,7 @@ from __future__ import annotations
 import structlog
 
 from dashforge.agents.llm import call_llm
+from dashforge.agents.providers.base import TokenUsage
 from dashforge.models.schemas import (
     DashboardSpec,
     Intent,
@@ -171,16 +172,16 @@ async def build_dashboard(
     intent: Intent,
     discovery: MetricsDiscoveryResult,
     metric_catalog: list[MetricEntry] | None = None,
-) -> DashboardSpec:
+) -> tuple[DashboardSpec, TokenUsage]:
     user_prompt = _build_user_prompt(intent, discovery, metric_catalog)
 
     ds_types = list({m.datasource_type for m in discovery.metrics})
     logger.info("query_builder_start", metric_count=len(discovery.metrics), datasource_types=ds_types)
-    spec = await call_llm(
+    spec, usage = await call_llm(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=DashboardSpec,
         temperature=0.2,
     )
     logger.info("query_builder_done", panel_count=len(spec.panels))
-    return spec
+    return spec, usage

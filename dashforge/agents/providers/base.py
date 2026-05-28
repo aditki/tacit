@@ -2,6 +2,31 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+
+@dataclass
+class TokenUsage:
+    """Token usage from a single LLM call."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        return TokenUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+        )
+
+
+@dataclass
+class LLMResult:
+    """Raw LLM response text + token usage metadata."""
+
+    text: str
+    usage: TokenUsage = field(default_factory=TokenUsage)
 
 
 class LLMProvider(ABC):
@@ -13,7 +38,7 @@ class LLMProvider(ABC):
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.2,
-    ) -> str:
+    ) -> LLMResult:
         """Return a raw JSON string from the model.
 
         Implementations should instruct the model to respond with valid JSON
@@ -26,5 +51,5 @@ class LLMProvider(ABC):
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.3,
-    ) -> str:
+    ) -> LLMResult:
         """Return plain text from the model."""

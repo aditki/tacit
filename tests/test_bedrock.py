@@ -257,7 +257,7 @@ def test_bedrock_converse_call_structure():
     ]
     assert call_kwargs["inferenceConfig"]["temperature"] == 0.2
     assert call_kwargs["inferenceConfig"]["maxTokens"] == 4096
-    assert result == '{"result": "ok"}'
+    assert result.text == '{"result": "ok"}'
 
     print("[PASS] test_bedrock_converse_call_structure")
 
@@ -280,7 +280,7 @@ def test_bedrock_converse_multiple_content_blocks():
         mock_client, {"llm_bedrock_model_id": "test-model"},
     )
     result = provider._converse("sys", "user", 0.5)
-    assert result == "part1part2"
+    assert result.text == "part1part2"
 
     print("[PASS] test_bedrock_converse_multiple_content_blocks")
 
@@ -294,7 +294,7 @@ def test_bedrock_converse_empty_response():
         mock_client, {"llm_bedrock_model_id": "test-model"},
     )
     result = provider._converse("sys", "user", 0.5)
-    assert result == ""
+    assert result.text == ""
 
     print("[PASS] test_bedrock_converse_empty_response")
 
@@ -340,7 +340,8 @@ def test_bedrock_model_id_fallback_uses_bedrock_default():
 
 def test_bedrock_resolve_model_id_uses_list_foundation_models():
     """_resolve_bedrock_model_id should call ListFoundationModels API."""
-    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id
+    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
+    _resolve_cache.clear()
 
     mock_bedrock_client = MagicMock()
     mock_bedrock_client.list_foundation_models.return_value = {
@@ -354,6 +355,8 @@ def test_bedrock_resolve_model_id_uses_list_foundation_models():
     result = _resolve_bedrock_model_id("claude-sonnet-4-20250514", mock_bedrock_client)
     assert result == "anthropic.claude-sonnet-4-20250514-v1:0"
     mock_bedrock_client.list_foundation_models.assert_called_once()
+
+    _resolve_cache.clear()
     print("[PASS] test_bedrock_resolve_model_id_uses_list_foundation_models")
 
 
@@ -458,7 +461,7 @@ def test_bedrock_chat_json_appends_json_preamble():
 
     result = asyncio.run(provider.chat_json("system prompt", "user prompt", 0.2))
 
-    assert result == '{"ok": true}'
+    assert result.text == '{"ok": true}'
     call_kwargs = mock_client.converse.call_args[1]
     system_text = call_kwargs["system"][0]["text"]
     assert "system prompt" in system_text
@@ -480,7 +483,7 @@ def test_bedrock_chat_text_no_preamble():
 
     result = asyncio.run(provider.chat_text("system only", "user msg", 0.3))
 
-    assert result == "plain response"
+    assert result.text == "plain response"
     call_kwargs = mock_client.converse.call_args[1]
     system_text = call_kwargs["system"][0]["text"]
     assert system_text == "system only"
@@ -508,7 +511,7 @@ def test_converse_retries_with_inference_profile_on_validation_error():
 
     result = provider._converse("sys", "user", 0.2)
 
-    assert result == '{"ok": true}'
+    assert result.text == '{"ok": true}'
     assert mock_client.converse.call_count == 2
     assert provider._model_id.startswith("us.")
     assert provider._model_id == f"us.{bare_id}"
@@ -574,11 +577,11 @@ def test_converse_cached_profile_id_skips_retry():
     provider, _ = _make_bedrock_provider(mock_client)
 
     result1 = provider._converse("sys", "user", 0.2)
-    assert result1 == "first"
+    assert result1.text == "first"
     assert mock_client.converse.call_count == 2  # 1 fail + 1 retry
 
     result2 = provider._converse("sys", "user", 0.2)
-    assert result2 == "second"
+    assert result2.text == "second"
     assert mock_client.converse.call_count == 3  # +1 direct
 
     print("[PASS] test_converse_cached_profile_id_skips_retry")
@@ -600,7 +603,7 @@ def test_mistral_model_folds_system_into_user_message():
 
     result = provider._converse("system instructions", "user question", 0.3)
 
-    assert result == '{"v": 1}'
+    assert result.text == '{"v": 1}'
     call_kwargs = mock_client.converse.call_args[1]
     assert "system" not in call_kwargs
     user_text = call_kwargs["messages"][0]["content"][0]["text"]
@@ -685,15 +688,17 @@ def test_bedrock_converse_wraps_throttling_for_retry():
         {"Error": {"Code": "ThrottlingException"}},
     )
 
+    from dashforge.agents.providers.base import LLMResult
+
     mock_provider = MagicMock()
     mock_provider.chat_json = AsyncMock(
-        side_effect=[throttle_exc, '{"value": 99}']
+        side_effect=[throttle_exc, LLMResult(text='{"value": 99}')]
     )
 
     with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
         try:
-            result = asyncio.run(call_llm("sys", "user", SimpleModel))
-            assert result.value == 99
+            model, usage = asyncio.run(call_llm("sys", "user", SimpleModel))
+            assert model.value == 99
             assert mock_provider.chat_json.call_count == 2
         except Exception as exc:
             assert isinstance(exc, LLMTransientError), \
@@ -716,9 +721,11 @@ def test_bedrock_service_specific_exception_retried():
             super().__init__(msg)
             self.response = {"Error": {"Code": "ThrottlingException"}}
 
+    from dashforge.agents.providers.base import LLMResult
+
     mock_provider = MagicMock()
     mock_provider.chat_json = AsyncMock(
-        side_effect=[ThrottlingException("Rate exceeded"), '{"v": 42}']
+        side_effect=[ThrottlingException("Rate exceeded"), LLMResult(text='{"v": 42}')]
     )
 
     original_wait = call_llm.retry.wait
@@ -726,8 +733,8 @@ def test_bedrock_service_specific_exception_retried():
 
     try:
         with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
-            result = asyncio.run(call_llm("sys", "user", Simple))
-            assert result.v == 42
+            model, usage = asyncio.run(call_llm("sys", "user", Simple))
+            assert model.v == 42
             assert mock_provider.chat_json.call_count == 2
     finally:
         call_llm.retry.wait = original_wait

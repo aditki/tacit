@@ -13,7 +13,7 @@ import json
 
 import structlog
 
-from dashforge.agents.providers.base import LLMProvider
+from dashforge.agents.providers.base import LLMProvider, LLMResult, TokenUsage
 from dashforge.config import settings
 
 logger = structlog.get_logger()
@@ -243,12 +243,19 @@ class BedrockProvider(LLMProvider):
             "inferenceConfig": {"temperature": temperature, "maxTokens": 4096},
         }
 
+    @staticmethod
+    def _extract_usage(response: dict) -> TokenUsage:
+        usage = response.get("usage", {})
+        inp = usage.get("inputTokens", 0) or 0
+        out = usage.get("outputTokens", 0) or 0
+        return TokenUsage(prompt_tokens=inp, completion_tokens=out, total_tokens=inp + out)
+
     def _converse(
         self,
         system_prompt: str,
         user_prompt: str,
         temperature: float,
-    ) -> str:
+    ) -> LLMResult:
         """Call Bedrock Converse API (sync — wrapped async by callers).
 
         If the bare model ID fails with a ValidationException (common for
@@ -278,7 +285,7 @@ class BedrockProvider(LLMProvider):
         message = output.get("message", {})
         content_blocks = message.get("content", [])
         text_parts = [b["text"] for b in content_blocks if "text" in b]
-        return "".join(text_parts)
+        return LLMResult(text="".join(text_parts), usage=self._extract_usage(response))
 
     def _should_retry_with_profile(self, exc: Exception) -> bool:
         """Return True if the exception indicates the model needs an inference
@@ -295,28 +302,27 @@ class BedrockProvider(LLMProvider):
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.2,
-    ) -> str:
+    ) -> LLMResult:
         import asyncio
 
         system = (
             f"{system_prompt}\n\n"
             "Respond ONLY with a valid JSON object. No markdown, no explanation."
         )
-        raw = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             self._converse, system, user_prompt, temperature
         )
-        logger.debug("bedrock_raw", raw=raw[:500])
-        return raw
+        logger.debug("bedrock_raw", raw=result.text[:500])
+        return result
 
     async def chat_text(
         self,
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.3,
-    ) -> str:
+    ) -> LLMResult:
         import asyncio
 
-        raw = await asyncio.to_thread(
+        return await asyncio.to_thread(
             self._converse, system_prompt, user_prompt, temperature
         )
-        return raw

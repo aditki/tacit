@@ -22,6 +22,7 @@ import sys
 import time
 
 import httpx
+import pytest
 import structlog
 
 # Ensure dashforge is importable
@@ -34,6 +35,17 @@ from dashforge.signalfx.publisher import publish_dashboard
 from dashforge.models.schemas import DashboardSpec, PanelSpec, PanelQuery
 
 logger = structlog.get_logger()
+
+
+@pytest.fixture
+async def client():
+    """Provide a SignalFxClient for integration tests, skip if not configured."""
+    token = settings.signalfx_api_token
+    if not token:
+        pytest.skip("SIGNALFX_API_TOKEN not set — skipping SignalFx integration tests")
+    c = SignalFxClient()
+    yield c
+    await c.close()
 
 # ── Dummy metrics to ingest ──────────────────────────────────────────────────
 

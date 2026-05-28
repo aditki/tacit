@@ -4,7 +4,7 @@ from __future__ import annotations
 import httpx
 import structlog
 
-from dashforge.agents.providers.base import LLMProvider
+from dashforge.agents.providers.base import LLMProvider, LLMResult, TokenUsage
 from dashforge.config import settings
 
 logger = structlog.get_logger()
@@ -16,12 +16,18 @@ class OllamaProvider(LLMProvider):
         self._base_url = base.rstrip("/")
         self._client = httpx.AsyncClient(timeout=120.0)
 
+    @staticmethod
+    def _extract_usage(data: dict) -> TokenUsage:
+        inp = data.get("prompt_eval_count", 0) or 0
+        out = data.get("eval_count", 0) or 0
+        return TokenUsage(prompt_tokens=inp, completion_tokens=out, total_tokens=inp + out)
+
     async def chat_json(
         self,
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.2,
-    ) -> str:
+    ) -> LLMResult:
         payload = {
             "model": settings.llm_model,
             "messages": [
@@ -36,16 +42,17 @@ class OllamaProvider(LLMProvider):
             f"{self._base_url}/api/chat", json=payload
         )
         resp.raise_for_status()
-        raw = resp.json()["message"]["content"]
+        data = resp.json()
+        raw = data["message"]["content"]
         logger.debug("ollama_raw", raw=raw[:500])
-        return raw
+        return LLMResult(text=raw, usage=self._extract_usage(data))
 
     async def chat_text(
         self,
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.3,
-    ) -> str:
+    ) -> LLMResult:
         payload = {
             "model": settings.llm_model,
             "messages": [
@@ -59,4 +66,5 @@ class OllamaProvider(LLMProvider):
             f"{self._base_url}/api/chat", json=payload
         )
         resp.raise_for_status()
-        return resp.json()["message"]["content"]
+        data = resp.json()
+        return LLMResult(text=data["message"]["content"], usage=self._extract_usage(data))

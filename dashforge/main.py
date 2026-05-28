@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import secrets
 from contextlib import asynccontextmanager
 
@@ -392,10 +391,8 @@ async def get_investigation(investigation_id: str):
 
 
 def main():
-    log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(log_level),
-    )
+    from dashforge.logging import configure_logging
+    configure_logging(settings.log_level)
     uvicorn.run(
         "dashforge.main:app",
         host="0.0.0.0",
