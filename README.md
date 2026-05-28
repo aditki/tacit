@@ -1,3 +1,20 @@
+[!WARNING]
+
+Early Project Status
+
+DashForge is an experimental infrastructure engineering project.
+
+It is not production-ready and should currently be treated as a development/private-beta system only.
+
+The primary goals of this repository are:
+
+exploring LLM-assisted observability workflows
+experimenting with multi-agent infrastructure tooling
+demonstrating systems/infrastructure engineering ability
+learning from real-world operational tradeoffs
+
+APIs, configuration formats, internal architecture, and integrations may change significantly between versions.
+
 # DashForge
 
 **Natural language → observability dashboards.**
