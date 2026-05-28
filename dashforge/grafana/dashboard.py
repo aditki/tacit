@@ -35,13 +35,6 @@ def _build_panel_json(panel: PanelSpec, panel_id: int, grid_pos: dict) -> dict[s
             "legendFormat": q.legend_format,
             "datasource": {"uid": q.datasource_uid, "type": q.datasource_type},
         }
-        if q.cloudwatch_namespace:
-            target["namespace"] = q.cloudwatch_namespace
-            target["metricName"] = q.expr  # expr holds the CW metric name
-            target["region"] = q.cloudwatch_region or "default"
-            target["statistics"] = [q.cloudwatch_stat or "Average"]
-            if q.cloudwatch_dimensions:
-                target["dimensions"] = q.cloudwatch_dimensions
         # CloudWatch targets need additional Grafana-specific fields
         if q.cloudwatch_namespace:
             target["namespace"] = q.cloudwatch_namespace

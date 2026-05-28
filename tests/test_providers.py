@@ -265,7 +265,7 @@ def test_bedrock_converse_empty_response():
 
 def test_bedrock_model_id_fallback():
     """When llm_bedrock_model_id is empty and llm_model is not a known Anthropic
-    API name, should fall back to the Bedrock default model."""
+    API name, should fall back to the region-prefixed Bedrock default model."""
     mock_client = MagicMock()
     mock_client.converse.return_value = {
         "output": {"message": {"content": [{"text": "{}"}]}}
@@ -285,9 +285,12 @@ def test_bedrock_model_id_fallback():
         mock_settings.llm_bedrock_model_id = ""
         mock_settings.llm_model = "unknown-model-id"
 
-        from dashforge.agents.providers.bedrock import BedrockProvider, _BEDROCK_DEFAULT_MODEL
+        from dashforge.agents.providers.bedrock import BedrockProvider, _BEDROCK_DEFAULT_MODEL, _inference_profile_id
         provider = BedrockProvider()
-        assert provider._model_id == _BEDROCK_DEFAULT_MODEL
+        expected = _inference_profile_id(_BEDROCK_DEFAULT_MODEL, "us-east-1")
+        assert provider._model_id == expected, (
+            f"Expected region-prefixed default {expected!r}, got {provider._model_id!r}"
+        )
 
     print("[PASS] test_bedrock_model_id_fallback")
 
@@ -527,7 +530,7 @@ def test_dashboard_cloudwatch_target_rendering():
     assert target["namespace"] == "AWS/ApplicationELB"
     assert target["metricName"] == "HTTPCode_ELB_5XX"
     assert target["statistics"] == ["Sum"]
-    assert target["dimensions"] == {"LoadBalancer": ["app/my-lb/123"]}
+    assert target["dimensions"] == {"LoadBalancer": "app/my-lb/123"}  # single-element list normalized to str
     assert target["region"] == "eu-west-1"
     print("[PASS] test_dashboard_cloudwatch_target_rendering")
 
@@ -759,14 +762,24 @@ def test_bedrock_resolve_model_id_uses_list_foundation_models():
 
 def test_bedrock_resolve_model_id_api_failure_falls_back_to_static_map():
     """When ListFoundationModels fails, _resolve_bedrock_model_id should fall
-    back to the static _ANTHROPIC_TO_BEDROCK map."""
-    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _ANTHROPIC_TO_BEDROCK
+    back to the static _ANTHROPIC_TO_BEDROCK map with inference profile prefix."""
+    from dashforge.agents.providers.bedrock import (
+        _resolve_bedrock_model_id, _ANTHROPIC_TO_BEDROCK,
+        _inference_profile_id, _resolve_cache,
+    )
+    _resolve_cache.clear()
 
     mock_bedrock_client = MagicMock()
     mock_bedrock_client.list_foundation_models.side_effect = Exception("AccessDenied")
 
-    result = _resolve_bedrock_model_id("claude-sonnet-4-20250514", mock_bedrock_client)
-    assert result == _ANTHROPIC_TO_BEDROCK["claude-sonnet-4-20250514"]
+    with patch("dashforge.agents.providers.bedrock.settings") as mock_settings:
+        mock_settings.llm_bedrock_region = "us-east-1"
+        result = _resolve_bedrock_model_id("claude-sonnet-4-20250514", mock_bedrock_client)
+        bare = _ANTHROPIC_TO_BEDROCK["claude-sonnet-4-20250514"]
+        expected = _inference_profile_id(bare, "us-east-1")
+        assert result == expected, f"Expected {expected!r}, got {result!r}"
+
+    _resolve_cache.clear()
     print("[PASS] test_bedrock_resolve_model_id_api_failure_falls_back_to_static_map")
 
 
@@ -795,9 +808,12 @@ def test_bedrock_resolve_model_id_caches_result():
 
 
 def test_bedrock_resolve_model_id_unknown_model_returns_default():
-    """When the model is not found via API or static map, return the Bedrock default."""
-    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _BEDROCK_DEFAULT_MODEL, _resolve_cache
-
+    """When the model is not found via API or static map, return the
+    region-prefixed Bedrock default."""
+    from dashforge.agents.providers.bedrock import (
+        _resolve_bedrock_model_id, _BEDROCK_DEFAULT_MODEL,
+        _inference_profile_id, _resolve_cache,
+    )
     _resolve_cache.clear()
 
     mock_bedrock_client = MagicMock()
@@ -807,8 +823,11 @@ def test_bedrock_resolve_model_id_unknown_model_returns_default():
         ]
     }
 
-    result = _resolve_bedrock_model_id("totally-unknown-model", mock_bedrock_client)
-    assert result == _BEDROCK_DEFAULT_MODEL
+    with patch("dashforge.agents.providers.bedrock.settings") as mock_settings:
+        mock_settings.llm_bedrock_region = "eu-west-1"
+        result = _resolve_bedrock_model_id("totally-unknown-model", mock_bedrock_client)
+        expected = _inference_profile_id(_BEDROCK_DEFAULT_MODEL, "eu-west-1")
+        assert result == expected, f"Expected {expected!r}, got {result!r}"
 
     _resolve_cache.clear()
     print("[PASS] test_bedrock_resolve_model_id_unknown_model_returns_default")

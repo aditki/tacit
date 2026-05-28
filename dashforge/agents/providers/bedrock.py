@@ -37,10 +37,36 @@ _BEDROCK_DEFAULT_MODEL = "anthropic.claude-sonnet-4-20250514-v1:0"
 
 # Known Bedrock provider prefixes — if llm_model starts with one of these,
 # it's already a valid Bedrock model ID and should be used as-is.
+# Includes regional/global inference profile prefixes (us., eu., ap., etc.).
 _BEDROCK_PROVIDER_PREFIXES = (
     "anthropic.", "meta.", "mistral.", "amazon.", "cohere.",
-    "ai21.", "stability.", "us.", "eu.",
+    "ai21.", "stability.",
+    # Regional and cross-region inference profile prefixes
+    "us.", "eu.", "ap.", "sa.", "me.", "ca.", "af.", "global.",
 )
+
+# Map AWS region prefix to inference profile prefix.
+# Models that require inference profiles (e.g. Sonnet 4) need this prefix
+# prepended to the bare foundation model ID.
+_REGION_INFERENCE_PREFIX: dict[str, str] = {
+    "us": "us", "eu": "eu", "ap": "ap",
+    "sa": "sa", "me": "me", "ca": "ca", "af": "af",
+}
+
+
+def _inference_profile_id(bare_model_id: str, region: str) -> str:
+    """Prefix a bare model ID with the region's inference profile prefix.
+
+    Example: ('anthropic.claude-sonnet-4-20250514-v1:0', 'us-east-1')
+             -> 'us.anthropic.claude-sonnet-4-20250514-v1:0'
+
+    Returns the bare ID unchanged if the region prefix is unknown.
+    """
+    region_prefix = region.split("-")[0]  # "us-east-1" -> "us"
+    prefix = _REGION_INFERENCE_PREFIX.get(region_prefix)
+    if prefix:
+        return f"{prefix}.{bare_model_id}"
+    return bare_model_id
 
 # Cache for resolved model IDs — avoids repeated ListFoundationModels calls
 _resolve_cache: dict[str, str] = {}
@@ -78,8 +104,11 @@ def _resolve_bedrock_model_id(anthropic_model_name: str, bedrock_client) -> str:
     except Exception as exc:
         logger.debug("bedrock_list_models_failed", error=str(exc))
 
-    # Fall back to static map, then default
-    resolved = _ANTHROPIC_TO_BEDROCK.get(anthropic_model_name, _BEDROCK_DEFAULT_MODEL)
+    # Fall back to static map, then default.
+    # Apply inference profile prefix since bare IDs may not support
+    # on-demand invocation in all regions (e.g. Sonnet 4 in us-east-1).
+    bare = _ANTHROPIC_TO_BEDROCK.get(anthropic_model_name, _BEDROCK_DEFAULT_MODEL)
+    resolved = _inference_profile_id(bare, settings.llm_bedrock_region)
     _resolve_cache[anthropic_model_name] = resolved
     logger.info("bedrock_model_resolved", source="static_map",
                 input=anthropic_model_name, resolved=resolved)
@@ -164,8 +193,10 @@ class BedrockProvider(LLMProvider):
         if settings.llm_bedrock_model_id:
             self._model_id = settings.llm_bedrock_model_id
         else:
-            # Resolve Anthropic API model name to Bedrock model ID
-            # Uses ListFoundationModels API with fallback to static map
+            # Resolve Anthropic API model name to Bedrock model ID.
+            # Uses ListFoundationModels API with fallback to static map.
+            # Static-map fallback applies regional inference profile prefix
+            # so the default works on-demand in the configured region.
             bedrock_ctrl = session.client("bedrock")
             self._model_id = _resolve_bedrock_model_id(
                 settings.llm_model, bedrock_ctrl
@@ -182,7 +213,14 @@ class BedrockProvider(LLMProvider):
         user_prompt: str,
         temperature: float,
     ) -> str:
-        """Call Bedrock Converse API (sync — wrapped async by callers)."""
+        """Call Bedrock Converse API (sync — wrapped async by callers).
+
+        NOTE: The ``system`` parameter is not supported by all Bedrock model
+        families.  Mistral AI Instruct models accept Converse but reject the
+        system field (AWS model-feature table).  If Mistral support is needed
+        in the future, fold the system prompt into the first user message for
+        those model families instead of passing it as a separate field.
+        """
         response = self._client.converse(
             modelId=self._model_id,
             system=[{"text": system_prompt}],
