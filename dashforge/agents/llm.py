@@ -16,6 +16,7 @@ from tenacity import (
 )
 
 from dashforge.agents.providers import get_provider
+from dashforge.agents.providers.base import LLMResult, TokenUsage
 
 logger = structlog.get_logger()
 
@@ -106,12 +107,17 @@ async def call_llm(
     user_prompt: str,
     response_model: Type[T],
     temperature: float = 0.2,
-) -> T:
-    """Call the configured LLM provider and parse JSON into *response_model*."""
+) -> tuple[T, TokenUsage]:
+    """Call the configured LLM provider and parse JSON into *response_model*.
+
+    Returns a tuple of (parsed_model, token_usage) where token_usage
+    accumulates across the primary call and any repair calls.
+    """
     provider = get_provider()
+    total_usage = TokenUsage()
 
     try:
-        raw = await provider.chat_json(system_prompt, user_prompt, temperature)
+        result = await provider.chat_json(system_prompt, user_prompt, temperature)
     except (httpx.TimeoutException, httpx.NetworkError, ConnectionError, OSError) as exc:
         logger.warning("llm_transient_error", error=str(exc))
         raise LLMTransientError(str(exc)) from exc
@@ -145,9 +151,11 @@ async def call_llm(
                 raise LLMTransientError(str(exc)) from exc
         raise
 
+    raw = result.text
+    total_usage = total_usage + result.usage
     logger.debug("llm_raw_response", raw=raw[:500])
 
-    # ── Parse JSON (with repair fallback) ─────────────────────────────
+    # ── Parse JSON (with repair fallback) ───────────────────────────────
     parsed = None
     try:
         parsed = json.loads(raw)
@@ -161,12 +169,13 @@ async def call_llm(
             # Step 2: one-shot LLM repair (strict token cap)
             logger.warning("llm_json_repair_attempting", raw_preview=raw[:200])
             try:
-                repair_raw = await provider.chat_json(
+                repair_result = await provider.chat_json(
                     _REPAIR_SYSTEM_PROMPT,
                     raw[:4000],  # cap input to avoid cost blowout
                     temperature=0.0,
                 )
-                parsed = json.loads(repair_raw)
+                total_usage = total_usage + repair_result.usage
+                parsed = json.loads(repair_result.text)
                 logger.info("llm_json_repaired", method="llm_reask")
             except (httpx.TimeoutException, httpx.NetworkError, ConnectionError, OSError) as repair_exc:
                 logger.warning("llm_repair_transient_error", error=str(repair_exc))
@@ -212,7 +221,7 @@ async def call_llm(
                 raise LLMParseError(f"LLM returned invalid JSON (repair failed): {repair_exc}") from repair_exc
 
     try:
-        return response_model.model_validate(parsed)
+        return response_model.model_validate(parsed), total_usage
     except ValidationError as exc:
         logger.error("llm_validation_error", errors=exc.error_count())
         raise LLMParseError(f"LLM output failed validation: {exc}") from exc
@@ -222,7 +231,8 @@ async def call_llm_text(
     system_prompt: str,
     user_prompt: str,
     temperature: float = 0.3,
-) -> str:
+) -> tuple[str, TokenUsage]:
     """Return plain text from the LLM (no structured output)."""
     provider = get_provider()
-    return await provider.chat_text(system_prompt, user_prompt, temperature)
+    result = await provider.chat_text(system_prompt, user_prompt, temperature)
+    return result.text, result.usage

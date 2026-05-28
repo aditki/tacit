@@ -4,10 +4,19 @@ from __future__ import annotations
 import openai
 import structlog
 
-from dashforge.agents.providers.base import LLMProvider
+from dashforge.agents.providers.base import LLMProvider, LLMResult, TokenUsage
 from dashforge.config import settings
 
 logger = structlog.get_logger()
+
+
+def _extract_openai_usage(response) -> TokenUsage:
+    usage = getattr(response, "usage", None)
+    if usage:
+        inp = getattr(usage, "prompt_tokens", 0) or 0
+        out = getattr(usage, "completion_tokens", 0) or 0
+        return TokenUsage(prompt_tokens=inp, completion_tokens=out, total_tokens=inp + out)
+    return TokenUsage()
 
 
 class OpenAIProvider(LLMProvider):
@@ -22,7 +31,7 @@ class OpenAIProvider(LLMProvider):
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.2,
-    ) -> str:
+    ) -> LLMResult:
         response = await self._client.chat.completions.create(
             model=settings.llm_model,
             messages=[
@@ -34,14 +43,14 @@ class OpenAIProvider(LLMProvider):
         )
         raw = response.choices[0].message.content or "{}"
         logger.debug("openai_raw", raw=raw[:500])
-        return raw
+        return LLMResult(text=raw, usage=_extract_openai_usage(response))
 
     async def chat_text(
         self,
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.3,
-    ) -> str:
+    ) -> LLMResult:
         response = await self._client.chat.completions.create(
             model=settings.llm_model,
             messages=[
@@ -50,7 +59,7 @@ class OpenAIProvider(LLMProvider):
             ],
             temperature=temperature,
         )
-        return response.choices[0].message.content or ""
+        return LLMResult(text=response.choices[0].message.content or "", usage=_extract_openai_usage(response))
 
 
 class AzureOpenAIProvider(LLMProvider):
@@ -88,7 +97,7 @@ class AzureOpenAIProvider(LLMProvider):
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.2,
-    ) -> str:
+    ) -> LLMResult:
         response = await self._client.chat.completions.create(
             model=self._deployment,
             messages=[
@@ -100,14 +109,14 @@ class AzureOpenAIProvider(LLMProvider):
         )
         raw = response.choices[0].message.content or "{}"
         logger.debug("azure_openai_raw", raw=raw[:500])
-        return raw
+        return LLMResult(text=raw, usage=_extract_openai_usage(response))
 
     async def chat_text(
         self,
         system_prompt: str,
         user_prompt: str,
         temperature: float = 0.3,
-    ) -> str:
+    ) -> LLMResult:
         response = await self._client.chat.completions.create(
             model=self._deployment,
             messages=[
@@ -116,4 +125,4 @@ class AzureOpenAIProvider(LLMProvider):
             ],
             temperature=temperature,
         )
-        return response.choices[0].message.content or ""
+        return LLMResult(text=response.choices[0].message.content or "", usage=_extract_openai_usage(response))

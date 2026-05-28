@@ -4,6 +4,7 @@ from __future__ import annotations
 import structlog
 
 from dashforge.agents.llm import call_llm
+from dashforge.agents.providers.base import TokenUsage
 from dashforge.models.schemas import Intent
 
 logger = structlog.get_logger()
@@ -96,9 +97,9 @@ SECURITY RULES (never violate these):
 """
 
 
-async def classify_intent(prompt: str) -> Intent:
+async def classify_intent(prompt: str) -> tuple[Intent, TokenUsage]:
     logger.info("intent_agent_start", prompt=prompt[:120])
-    intent = await call_llm(
+    intent, usage = await call_llm(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=prompt,
         response_model=Intent,
@@ -120,4 +121,4 @@ async def classify_intent(prompt: str) -> Intent:
         services=intent.services,
         archetypes=[(a.type, a.confidence) for a in intent.archetypes],
     )
-    return intent
+    return intent, usage

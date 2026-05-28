@@ -567,16 +567,18 @@ def test_json_repair_path_reraises_transient_errors():
     class Simple(BaseModel):
         v: int
 
+    from dashforge.agents.providers.base import LLMResult
+
     mock_provider = MagicMock()
     # Each tenacity attempt: primary returns bad JSON, repair hits timeout.
     # tenacity retries 3 times, so we need 3 × (primary + repair) = 6 calls.
     mock_provider.chat_json = AsyncMock(
         side_effect=[
-            '{broken json',                             # attempt 1: primary
+            LLMResult(text='{broken json'),              # attempt 1: primary
             httpx.TimeoutException("read timed out"),   # attempt 1: repair
-            '{broken json',                             # attempt 2: primary
+            LLMResult(text='{broken json'),              # attempt 2: primary
             httpx.TimeoutException("read timed out"),   # attempt 2: repair
-            '{broken json',                             # attempt 3: primary
+            LLMResult(text='{broken json'),              # attempt 3: primary
             httpx.TimeoutException("read timed out"),   # attempt 3: repair
         ]
     )
@@ -748,15 +750,17 @@ def test_provider_sdk_transient_error_in_repair_retried():
             super().__init__("Rate limit exceeded")
             self.status_code = 429
 
+    from dashforge.agents.providers.base import LLMResult
+
     mock_provider = MagicMock()
     mock_provider.chat_json = AsyncMock(
         side_effect=[
-            '{broken json',       # attempt 1: primary
-            RateLimitError(),     # attempt 1: repair → transient
-            '{broken json',       # attempt 2: primary
-            RateLimitError(),     # attempt 2: repair → transient
-            '{broken json',       # attempt 3: primary
-            RateLimitError(),     # attempt 3: repair → transient
+            LLMResult(text='{broken json'),  # attempt 1: primary
+            RateLimitError(),                # attempt 1: repair → transient
+            LLMResult(text='{broken json'),  # attempt 2: primary
+            RateLimitError(),                # attempt 2: repair → transient
+            LLMResult(text='{broken json'),  # attempt 3: primary
+            RateLimitError(),                # attempt 3: repair → transient
         ]
     )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import structlog
 
 from dashforge.agents.llm import call_llm
+from dashforge.agents.providers.base import TokenUsage
 from dashforge.context.enrichment import format_context_for_prompt
 from dashforge.models.schemas import (
     ContextChunk,
@@ -134,7 +135,7 @@ async def discover_metrics(
     intent: Intent,
     metric_catalog: list[MetricEntry],
     context_chunks: list[ContextChunk] | None = None,
-) -> MetricsDiscoveryResult:
+) -> tuple[MetricsDiscoveryResult, TokenUsage]:
     user_prompt = _build_user_prompt(intent, metric_catalog)
 
     # Inject knowledge base context if available
@@ -150,11 +151,11 @@ async def discover_metrics(
         datasource_types=ds_types,
         context_chunks=len(context_chunks) if context_chunks else 0,
     )
-    result = await call_llm(
+    result, usage = await call_llm(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_model=MetricsDiscoveryResult,
         temperature=0.1,
     )
     logger.info("metrics_discovery_done", metric_count=len(result.metrics))
-    return result
+    return result, usage

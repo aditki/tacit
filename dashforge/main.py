@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import secrets
 from contextlib import asynccontextmanager
 
@@ -38,7 +37,10 @@ _slack_task: asyncio.Task | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start the Slack bot alongside the API server."""
+    """Configure logging and start the Slack bot alongside the API server."""
+    from dashforge.logging import configure_logging
+    configure_logging(settings.log_level)
+
     global _slack_task
     if settings.slack_bot_token and settings.slack_app_token:
         from dashforge.integrations.slack import start_slack_bot
@@ -392,10 +394,6 @@ async def get_investigation(investigation_id: str):
 
 
 def main():
-    log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(log_level),
-    )
     uvicorn.run(
         "dashforge.main:app",
         host="0.0.0.0",
