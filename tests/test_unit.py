@@ -823,26 +823,45 @@ def test_cloudwatch_metric_name_strips_namespace_prefix():
     print("[PASS] test_cloudwatch_metric_name_strips_namespace_prefix")
 
 
-def test_cloudwatch_dimensions_are_string_valued():
-    """CloudWatch dimensions must be dict[str, str], not dict[str, list[str]].
-    Grafana expects string values per dimension key."""
+def test_cloudwatch_dimensions_accept_str_and_list():
+    """CloudWatch dimensions accept both str and list[str] values.
+    Single-element lists should be normalized to strings by _build_panel_json.
+    Multi-value lists should pass through."""
     q = PanelQuery(
         expr="HTTPCode_ELB_5XX",
         datasource_uid="cw-1",
         datasource_type="cloudwatch",
         cloudwatch_namespace="AWS/ApplicationELB",
         cloudwatch_stat="Sum",
-        cloudwatch_dimensions={"LoadBalancer": "*", "AvailabilityZone": "us-east-1a"},
+        cloudwatch_dimensions={
+            "LoadBalancer": "*",
+            "AvailabilityZone": ["us-east-1a", "us-east-1b"],
+        },
     )
-    assert q.cloudwatch_dimensions == {"LoadBalancer": "*", "AvailabilityZone": "us-east-1a"}
+    assert q.cloudwatch_dimensions["LoadBalancer"] == "*"
+    assert q.cloudwatch_dimensions["AvailabilityZone"] == ["us-east-1a", "us-east-1b"]
 
-    # Verify _build_panel_json emits string values
+    # Verify _build_panel_json passes through correctly
     panel = PanelSpec(title="Test", queries=[q])
     result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
     dims = result["targets"][0]["dimensions"]
-    for k, v in dims.items():
-        assert isinstance(v, str), f"Dimension {k!r} should be str, got {type(v).__name__}: {v!r}"
-    print("[PASS] test_cloudwatch_dimensions_are_string_valued")
+    assert dims["LoadBalancer"] == "*", "String values should pass through"
+    assert dims["AvailabilityZone"] == ["us-east-1a", "us-east-1b"], "Multi-value lists should pass through"
+
+    # Single-element lists should be normalized to strings
+    q2 = PanelQuery(
+        expr="HTTPCode_ELB_5XX",
+        datasource_uid="cw-1",
+        datasource_type="cloudwatch",
+        cloudwatch_namespace="AWS/ApplicationELB",
+        cloudwatch_stat="Sum",
+        cloudwatch_dimensions={"LoadBalancer": ["*"]},
+    )
+    panel2 = PanelSpec(title="Test", queries=[q2])
+    result2 = _build_panel_json(panel2, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
+    assert result2["targets"][0]["dimensions"]["LoadBalancer"] == "*", \
+        "Single-element list ['*'] should be normalized to '*'"
+    print("[PASS] test_cloudwatch_dimensions_accept_str_and_list")
 
 
 def test_signalfx_discovery_normalized_keywords_match_cache():
@@ -897,6 +916,6 @@ if __name__ == "__main__":
     test_prometheus_validation_still_uses_proxy_query()
     test_provider_sdk_transient_error_in_repair_retried()
     test_cloudwatch_metric_name_strips_namespace_prefix()
-    test_cloudwatch_dimensions_are_string_valued()
+    test_cloudwatch_dimensions_accept_str_and_list()
     test_signalfx_discovery_normalized_keywords_match_cache()
     print("\n=== All tests passed ===")

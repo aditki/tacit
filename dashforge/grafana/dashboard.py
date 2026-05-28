@@ -48,9 +48,10 @@ def _build_panel_json(panel: PanelSpec, panel_id: int, grid_pos: dict) -> dict[s
             target["region"] = q.cloudwatch_region or "default"
             target["statistics"] = [q.cloudwatch_stat or "Average"]
             if q.cloudwatch_dimensions:
-                # Grafana expects string values; flatten any list leftovers
+                # Grafana accepts both str and list[str] dimension values.
+                # Normalize single-element lists to strings for cleanliness.
                 target["dimensions"] = {
-                    k: v[0] if isinstance(v, list) else v
+                    k: v[0] if isinstance(v, list) and len(v) == 1 else v
                     for k, v in q.cloudwatch_dimensions.items()
                 }
         targets.append(target)
