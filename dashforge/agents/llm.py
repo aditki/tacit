@@ -30,6 +30,42 @@ class LLMParseError(Exception):
     """LLM returned unparseable or invalid output. Do NOT retry blindly."""
 
 
+def _strip_trailing_commas(text: str) -> str:
+    """Remove trailing commas before } or ] only when outside JSON string literals."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            # Consume the entire string literal (respecting escape sequences)
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                out.append(c)
+                i += 1
+                if c == '\\' and i < n:
+                    out.append(text[i])
+                    i += 1
+                elif c == '"':
+                    break
+        elif ch == ',':
+            # Look ahead: if next non-whitespace is } or ], skip this comma
+            j = i + 1
+            while j < n and text[j] in ' \t\n\r':
+                j += 1
+            if j < n and text[j] in ('}', ']'):
+                i += 1  # drop the comma
+            else:
+                out.append(ch)
+                i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return ''.join(out)
+
+
 def _attempt_json_repair(raw: str) -> str | None:
     """Try lightweight programmatic fixes for common LLM JSON issues.
 
@@ -43,8 +79,8 @@ def _attempt_json_repair(raw: str) -> str | None:
         text = re.sub(r"\n?```\s*$", "", text)
         text = text.strip()
 
-    # Remove trailing commas before } or ]
-    text = re.sub(r",\s*([}\]])", r"\1", text)
+    # Remove trailing commas before } or ] — only outside string literals
+    text = _strip_trailing_commas(text)
 
     # Try parsing the repaired text
     try:

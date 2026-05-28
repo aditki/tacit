@@ -880,6 +880,37 @@ def test_signalfx_discovery_normalized_keywords_match_cache():
     print("[PASS] test_signalfx_discovery_normalized_keywords_match_cache")
 
 
+def test_strip_trailing_commas_preserves_string_content():
+    """Trailing-comma repair must not mutate commas inside JSON string values."""
+    from dashforge.agents.llm import _strip_trailing_commas
+
+    # Comma inside a string value followed by } — must NOT be stripped
+    raw = '{"desc": "Check errors,}", "v": 1,}'
+    fixed = _strip_trailing_commas(raw)
+    assert fixed == '{"desc": "Check errors,}", "v": 1}', f"Got: {fixed!r}"
+
+    # Comma inside string followed by ] — must NOT be stripped
+    raw2 = '{"arr": ["a,]", "b",]}'
+    fixed2 = _strip_trailing_commas(raw2)
+    assert fixed2 == '{"arr": ["a,]", "b"]}', f"Got: {fixed2!r}"
+
+    # Escaped quotes inside strings must not confuse the parser
+    raw3 = '{"q": "rate(x{\\"svc\\":\\"a\\"},})[5m]", "n": 1,}'
+    fixed3 = _strip_trailing_commas(raw3)
+    assert '"n": 1}' in fixed3, f"Trailing comma not removed: {fixed3!r}"
+    assert '\\"a\\"},})' in fixed3, f"String content mutated: {fixed3!r}"
+
+    # Plain trailing comma (no string involvement) — should still be removed
+    raw4 = '{"a": 1, "b": 2,}'
+    assert _strip_trailing_commas(raw4) == '{"a": 1, "b": 2}'
+
+    # No trailing comma — no change
+    raw5 = '{"a": 1}'
+    assert _strip_trailing_commas(raw5) == raw5
+
+    print("[PASS] test_strip_trailing_commas_preserves_string_content")
+
+
 if __name__ == "__main__":
     test_intent_model()
     test_dashboard_spec_model()
@@ -918,4 +949,5 @@ if __name__ == "__main__":
     test_cloudwatch_metric_name_strips_namespace_prefix()
     test_cloudwatch_dimensions_accept_str_and_list()
     test_signalfx_discovery_normalized_keywords_match_cache()
+    test_strip_trailing_commas_preserves_string_content()
     print("\n=== All tests passed ===")
