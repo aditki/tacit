@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import structlog
 
-from dashforge.backends.base import DashboardBackend, PublishResult
+from dashforge.backends.base import DashboardBackend, DashboardFeatures, PublishResult
 from dashforge.grafana.client import GrafanaClient
 from dashforge.grafana.datasource import (
     discover_all_metrics,
@@ -78,6 +78,30 @@ class GrafanaBackend:
     ) -> PublishResult:
         url, uid = await publish_dashboard_fn(self._client, spec)
         return PublishResult(url=url, uid=uid, backend_name="grafana")
+
+    # ── Ingestion ─────────────────────────────────────────────────────
+
+    async def ingest_dashboard(self, uid: str) -> DashboardFeatures:
+        from dashforge.dashboard_ingest import parse_dashboard_json
+        dashboard_json = await self._client._get(f"/api/dashboards/uid/{uid}")
+        extracted = parse_dashboard_json(dashboard_json)
+        return DashboardFeatures(
+            dashboard_uid=extracted["dashboard_uid"],
+            dashboard_title=extracted["dashboard_title"],
+            dashboard_tags=extracted["dashboard_tags"],
+            backend_name=self.name,
+            query_language=self.query_language,
+            metrics_found=extracted["metrics_found"],
+            panel_count=extracted["panel_count"],
+            panel_titles=extracted["panel_titles"],
+            row_groups=extracted["row_groups"],
+            metric_cooccurrence=extracted["metric_cooccurrence"],
+            aggregation_patterns=extracted["aggregation_patterns"],
+            query_transformations=extracted["query_transformations"],
+            alert_links=extracted["alert_links"],
+            drilldown_links=extracted["drilldown_links"],
+            panels=extracted["panels"],
+        )
 
     # ── Cleanup ───────────────────────────────────────────────────────
 

@@ -19,6 +19,35 @@ class PublishResult:
     backend_name: str = ""
 
 
+@dataclass
+class DashboardFeatures:
+    """Vendor-agnostic features extracted from an existing dashboard.
+
+    Every backend returns this common structure from ``ingest_dashboard()``.
+    The signal inference engine and archetype generator work against this
+    dataclass — zero vendor-specific logic downstream.
+    """
+    dashboard_uid: str = ""
+    dashboard_title: str = ""
+    dashboard_tags: list[str] = field(default_factory=list)
+    backend_name: str = ""                        # 'grafana', 'signalfx', etc.
+    query_language: str = ""                       # 'promql', 'signalflow', etc.
+
+    # Extracted features
+    metrics_found: list[str] = field(default_factory=list)
+    panel_count: int = 0
+    panel_titles: list[str] = field(default_factory=list)
+    row_groups: list[dict] = field(default_factory=list)        # [{"row": "Traffic", "panels": [...]}]
+    metric_cooccurrence: dict[str, list[str]] = field(default_factory=dict)
+    aggregation_patterns: list[dict] = field(default_factory=list)
+    query_transformations: list[str] = field(default_factory=list)
+    alert_links: list[str] = field(default_factory=list)
+    drilldown_links: list[str] = field(default_factory=list)
+
+    # Per-panel detail (for archetype generation)
+    panels: list[dict] = field(default_factory=list)
+
+
 @runtime_checkable
 class DashboardBackend(Protocol):
     """Common interface every dashboard vendor must implement."""
@@ -56,6 +85,15 @@ class DashboardBackend(Protocol):
         spec: DashboardSpec,
     ) -> PublishResult:
         """Create/update the dashboard on this backend."""
+        ...
+
+    async def ingest_dashboard(self, uid: str) -> DashboardFeatures:
+        """Fetch an existing dashboard and extract operational features.
+
+        Each backend implements its own fetch + parse logic, but returns
+        the same ``DashboardFeatures`` structure.  The signal inference
+        engine and archetype generator are fully vendor-agnostic.
+        """
         ...
 
     async def close(self) -> None:

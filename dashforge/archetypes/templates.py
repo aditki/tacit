@@ -393,6 +393,8 @@ def _load_archetypes_from_yaml(path: Path) -> list[InvestigationArchetype]:
             description=entry.get("description", ""),
             problem_types=entry.get("problem_types", []),
             required_metrics=entry.get("required_metrics", []),
+            required_signals=entry.get("required_signals", []),
+            signal_bindings=entry.get("signal_bindings", {}),
             panels=panels,
             tags=entry.get("tags", []),
             default_timerange=entry.get("default_timerange", "1h"),

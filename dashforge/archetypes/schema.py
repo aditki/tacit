@@ -52,6 +52,20 @@ class InvestigationArchetype(BaseModel):
         description="Metric name patterns this archetype needs (regex-style), "
         "e.g. ['http_requests_total', 'http_request_duration_seconds.*']"
     )
+    required_signals: list[str] = Field(
+        default_factory=list,
+        description="Semantic signal types this archetype needs, "
+        "e.g. ['request_latency', 'error_rate']. Resolved to actual "
+        "metrics at compile time via the signal mapping store."
+    )
+    signal_bindings: dict[str, str] = Field(
+        default_factory=dict,
+        description="Maps signal_type → default_metric_name used in query templates. "
+        "When the default metric is missing from the catalog, the signal "
+        "resolution engine finds the best alternative. "
+        "e.g. {'request_latency': 'http_request_duration_seconds', "
+        "'error_rate': 'http_requests_total'}"
+    )
     panels: list[PanelTemplate]
     tags: list[str] = Field(default_factory=list)
     default_timerange: str = "1h"

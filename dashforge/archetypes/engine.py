@@ -10,7 +10,7 @@ import re
 
 import structlog
 
-from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate
+from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from dashforge.models.schemas import (
     DashboardSpec,
     Intent,
@@ -327,6 +327,90 @@ def _find_top_level_slash(expr: str) -> int | None:
     return None
 
 
+def _apply_metric_substitutions(
+    archetype: InvestigationArchetype,
+    substitutions: dict[str, str],
+) -> InvestigationArchetype:
+    """Return a copy of the archetype with metric names substituted in queries.
+
+    Used when signal resolution finds that the default metric names in the
+    archetype templates don't exist in the environment, but equivalent
+    metrics do (e.g. auth_requests_total → sso_auth_requests_total).
+    """
+    if not substitutions:
+        return archetype
+
+    new_panels = []
+    for panel in archetype.panels:
+        new_queries = []
+        for qt in panel.queries:
+            expr = qt.expr
+            for old_metric, new_metric in substitutions.items():
+                expr = expr.replace(old_metric, new_metric)
+            new_queries.append(QueryTemplate(
+                expr=expr,
+                legend_format=qt.legend_format,
+                datasource_type=qt.datasource_type,
+            ))
+        new_panels.append(PanelTemplate(
+            title=panel.title,
+            description=panel.description,
+            panel_type=panel.panel_type,
+            row=panel.row,
+            queries=new_queries,
+            unit=panel.unit,
+        ))
+
+    return InvestigationArchetype(
+        id=archetype.id,
+        name=archetype.name,
+        description=archetype.description,
+        problem_types=archetype.problem_types,
+        required_metrics=archetype.required_metrics,
+        required_signals=archetype.required_signals,
+        signal_bindings=archetype.signal_bindings,
+        panels=new_panels,
+        tags=archetype.tags,
+        default_timerange=archetype.default_timerange,
+    )
+
+
+def _resolve_archetype_signals(
+    archetype: InvestigationArchetype,
+    catalog: list[MetricEntry],
+    intent: Intent,
+) -> InvestigationArchetype:
+    """Resolve signal bindings and substitute metrics if needed.
+
+    If the archetype has signal_bindings and any default metrics are missing
+    from the catalog, the signal store is consulted to find alternatives.
+    Returns the (possibly modified) archetype.
+    """
+    if not archetype.signal_bindings:
+        return archetype
+
+    try:
+        from dashforge.signals import get_signal_store
+        store = get_signal_store()
+        substitutions = store.resolve_signals_for_archetype(
+            signal_bindings=archetype.signal_bindings,
+            catalog=catalog,
+            context_service=intent.services[0] if intent.services else "",
+            context_archetype=archetype.id,
+        )
+        if substitutions:
+            logger.info(
+                "archetype_signals_resolved",
+                archetype=archetype.id,
+                substitutions=substitutions,
+            )
+            return _apply_metric_substitutions(archetype, substitutions)
+    except Exception:
+        logger.warning("signal_resolution_failed", archetype=archetype.id, exc_info=True)
+
+    return archetype
+
+
 def compile_archetype(
     archetype: InvestigationArchetype,
     intent: Intent,
@@ -339,8 +423,14 @@ def compile_archetype(
     Resolves {service_filter}, {container_filter}, {rate_interval}
     from the intent and catalog.
 
+    If the archetype has signal_bindings, metric names are resolved via the
+    signal store before template compilation.
+
     target_language: 'promql' (default) or 'signalflow'
     """
+    # Resolve signals → actual metrics before compiling templates
+    archetype = _resolve_archetype_signals(archetype, catalog, intent)
+
     rate_interval = _resolve_rate_interval(intent)
 
     if target_language == "signalflow":

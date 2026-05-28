@@ -98,6 +98,18 @@ app = FastAPI(
             "Archetypes are loaded from `archetypes.yaml` and can be hot-reloaded without restart.",
         },
         {
+            "name": "Signals",
+            "description": "Semantic signal taxonomy — maps canonical observability concepts "
+            "(e.g. 'request_latency', 'error_rate') to environment-specific metrics. "
+            "Signals decouple archetypes from raw metric names for portability.",
+        },
+        {
+            "name": "Learning",
+            "description": "Learn operational patterns from existing Grafana dashboards. "
+            "Ingests dashboards, extracts metric co-occurrence, panel groupings, "
+            "and aggregation patterns, then infers signal mappings.",
+        },
+        {
             "name": "System",
             "description": "Health checks and system status.",
         },
@@ -391,6 +403,257 @@ async def get_investigation(investigation_id: str):
     if inv is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
     return inv
+
+
+# ── Signal taxonomy endpoints ─────────────────────────────────────────────
+
+@app.get(
+    "/api/v1/signals",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Signals"],
+    summary="List all signal types",
+    response_description="All registered semantic signal types with categories",
+)
+async def list_signals():
+    """List all registered semantic signal types.
+
+    Signal types are canonical observability concepts (e.g. 'request_latency',
+    'error_rate') that are independent of specific metric names. They bridge
+    archetypes to environment-specific metrics."""
+    from dashforge.signals import get_signal_store
+    store = get_signal_store()
+    return {"signal_types": store.list_signal_types()}
+
+
+@app.get(
+    "/api/v1/signals/stats",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Signals"],
+    summary="Signal store statistics",
+    response_description="Summary stats: signal types, mappings, ingested dashboards",
+)
+async def signal_stats():
+    """Summary statistics for the signal mapping store."""
+    from dashforge.signals import get_signal_store
+    store = get_signal_store()
+    return store.stats()
+
+
+@app.get(
+    "/api/v1/signals/{signal_type}",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Signals"],
+    summary="Get signal type details",
+    response_description="Signal type with all metric mappings, confidence scores, and provenance",
+)
+async def get_signal(signal_type: str):
+    """Get a signal type with all its metric mappings.
+
+    Each mapping includes: metric pattern, confidence, context filters,
+    provenance (source type + references), and trust metrics."""
+    from dashforge.signals import get_signal_store
+    store = get_signal_store()
+    result = store.get_signal_type(signal_type)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Signal type '{signal_type}' not found")
+    return result
+
+
+@app.post(
+    "/api/v1/signals/teach",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Signals"],
+    summary="Teach DashForge a signal mapping",
+    response_description="Confirmation of the created mapping",
+)
+async def teach_signal(request: Request):
+    """Teach DashForge an organization-specific signal mapping.
+
+    Example: tell the system that for your org, 'queue_depth' means
+    'kafka_consumer_lag' and 'inflight_messages'.
+
+    Request body:
+    ```json
+    {
+        "signal_type": "queue_depth",
+        "metric_patterns": [
+            {"pattern": "kafka_consumer_lag", "confidence": 0.9},
+            {"pattern": "inflight_messages", "confidence": 0.8}
+        ],
+        "description": "Queue pressure metrics for our Kafka setup",
+        "services": ["payment-service"],
+        "category": "saturation"
+    }
+    ```"""
+    body = await request.json()
+    signal_type = body.get("signal_type", "").strip()
+    if not signal_type:
+        raise HTTPException(status_code=400, detail="signal_type is required")
+
+    from dashforge.signals import get_signal_store
+    store = get_signal_store()
+
+    # Register or update the signal type
+    store.register_signal_type(
+        signal_type=signal_type,
+        description=body.get("description", ""),
+        category=body.get("category", ""),
+        unit=body.get("unit", ""),
+    )
+
+    # Add metric mappings
+    mappings_created = 0
+    for mp in body.get("metric_patterns", []):
+        pattern = mp.get("pattern", "").strip()
+        if not pattern:
+            continue
+        store.add_mapping(
+            signal_type=signal_type,
+            metric_pattern=pattern,
+            confidence=mp.get("confidence", 0.7),
+            context_services=body.get("services", []),
+            context_datasource_types=body.get("datasource_types", []),
+            context_environments=body.get("environments", []),
+            source_type="teach",
+            source_refs=[f"manual:{body.get('taught_by', 'api')}"],
+        )
+        mappings_created += 1
+
+    return {
+        "signal_type": signal_type,
+        "mappings_created": mappings_created,
+        "message": f"Signal '{signal_type}' updated with {mappings_created} mapping(s)",
+    }
+
+
+# ── Dashboard learning endpoints ─────────────────────────────────────────
+
+@app.post(
+    "/api/v1/learn/dashboard",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Learning"],
+    summary="Learn from an existing Grafana dashboard",
+    response_description="Extracted features, inferred signals, and generated archetype YAML",
+)
+async def learn_from_dashboard(request: Request):
+    """Ingest an existing Grafana dashboard to learn operational patterns.
+
+    Extracts metric co-occurrence, panel groupings, aggregation patterns,
+    query transformations, and infers semantic signal mappings.
+
+    Optionally auto-generates an archetype YAML snippet for review.
+
+    Request body:
+    ```json
+    {
+        "dashboard_uid": "abc123",
+        "backend": "grafana",
+        "auto_approve": false
+    }
+    ```
+
+    The ``backend`` field selects which backend to fetch from: ``"grafana"``
+    (default) or ``"signalfx"``. If omitted, uses the first active backend.
+
+    When `auto_approve` is false (default), the ingested dashboard is stored
+    as 'pending' for human review before signal mappings are activated."""
+    body = await request.json()
+    dashboard_uid = body.get("dashboard_uid", "").strip()
+    if not dashboard_uid:
+        raise HTTPException(status_code=400, detail="dashboard_uid is required")
+
+    auto_approve = body.get("auto_approve", False)
+    backend_name = body.get("backend", "")
+
+    from dashforge.dashboard_ingest import ingest_dashboard
+    try:
+        result = await ingest_dashboard(
+            dashboard_uid=dashboard_uid,
+            backend_name=backend_name,
+            auto_approve=auto_approve,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("dashboard_ingest_failed", uid=dashboard_uid, backend=backend_name)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to ingest dashboard '{dashboard_uid}'. "
+            "Check that the UID exists and the backend is accessible.",
+        )
+
+
+@app.get(
+    "/api/v1/learn/dashboards",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Learning"],
+    summary="List ingested dashboards",
+    response_description="Ingested dashboards with extracted features and status",
+)
+async def list_ingested_dashboards(
+    status: str | None = None,
+    limit: int = 50,
+):
+    """List dashboards that have been ingested for learning.
+
+    Filter by status: 'pending', 'approved', or 'rejected'."""
+    from dashforge.signals import get_signal_store
+    store = get_signal_store()
+    dashboards = store.list_ingested_dashboards(status=status, limit=limit)
+    return {"count": len(dashboards), "dashboards": dashboards}
+
+
+@app.post(
+    "/api/v1/learn/dashboards/{dashboard_uid}/approve",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Learning"],
+    summary="Approve an ingested dashboard",
+    response_description="Approval status and signal mappings created",
+)
+async def approve_ingested_dashboard(dashboard_uid: str):
+    """Approve a pending ingested dashboard, activating its signal mappings.
+
+    This creates signal-to-metric mappings from the inferred signals with
+    provenance tracking back to the source dashboard."""
+    from dashforge.signals import get_signal_store
+    store = get_signal_store()
+
+    ingested = store.get_ingested_dashboard(dashboard_uid)
+    if ingested is None:
+        raise HTTPException(status_code=404, detail="Ingested dashboard not found")
+
+    if ingested["status"] != "pending":
+        return {"message": f"Dashboard already {ingested['status']}"}
+
+    # Create signal mappings from inferred signals
+    mappings_created = 0
+    for signal_type in ingested.get("signals_inferred", []):
+        # Find matching metrics for this signal
+        for metric in ingested.get("metrics_found", []):
+            from dashforge.signals import _metric_matches_pattern
+            signal_data = store.get_signal_type(signal_type)
+            if signal_data:
+                for mapping in signal_data.get("mappings", []):
+                    if _metric_matches_pattern(metric, mapping["metric_pattern"]):
+                        store.add_mapping(
+                            signal_type=signal_type,
+                            metric_pattern=metric,
+                            confidence=mapping.get("confidence", 0.6),
+                            source_type="dashboard_ingest",
+                            source_refs=[dashboard_uid],
+                        )
+                        mappings_created += 1
+                        break
+
+    store.approve_ingested_dashboard(dashboard_uid)
+
+    return {
+        "dashboard_uid": dashboard_uid,
+        "status": "approved",
+        "mappings_created": mappings_created,
+        "message": f"Dashboard approved, {mappings_created} signal mapping(s) created",
+    }
 
 
 def main():

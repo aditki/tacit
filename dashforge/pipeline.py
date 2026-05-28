@@ -184,6 +184,10 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             primary_arch, primary_conf = ranked_archetypes[0]
             # ── ARCHETYPE PATH: deterministic, no LLM needed ──────────
 
+            # Signal resolution happens inside compile_archetype/blend_archetypes
+            # via _resolve_archetype_signals — substitutes missing metrics
+            # with signal-resolved alternatives from the live catalog.
+
             if len(ranked_archetypes) > 1:
                 dashboard_spec = blend_archetypes(
                     ranked_archetypes, intent, metric_catalog,
@@ -202,6 +206,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 archetypes_matched=len(ranked_archetypes),
                 panels_generated=len(dashboard_spec.panels),
                 target_language=target_language,
+                signal_bindings_count=len(primary_arch.signal_bindings),
             )
         else:
             # ── FREEFORM PATH: LLM-driven discovery + query generation ─

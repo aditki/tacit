@@ -1,0 +1,459 @@
+{
+    "uid": "dashforge-signal-coverage",
+    "title": "DashForge Signal Coverage",
+    "tags": ["dashforge", "signals", "coverage"],
+    "timezone": "browser",
+    "refresh": "30s",
+    "time": { "from": "now-1h", "to": "now" },
+    "links": [
+      {
+        "title": "Service Overview",
+        "url": "/d/service-overview/service-overview",
+        "type": "link"
+      },
+      {
+        "title": "Alerting Rules",
+        "url": "/alerting/list",
+        "type": "link"
+      }
+    ],
+    "panels": [
+      {
+        "id": 100,
+        "type": "row",
+        "title": "Latency",
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+        "panels": []
+      },
+      {
+        "id": 1,
+        "type": "timeseries",
+        "title": "Request Latency (p50 / p95 / p99)",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.5, sum(rate(http_request_duration_seconds_bucket{service=~\"$service\"}[5m])) by (le))",
+            "legendFormat": "p50",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service=~\"$service\"}[5m])) by (le))",
+            "legendFormat": "p95",
+            "refId": "B"
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service=~\"$service\"}[5m])) by (le))",
+            "legendFormat": "p99",
+            "refId": "C"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "s" }
+        }
+      },
+      {
+        "id": 2,
+        "type": "timeseries",
+        "title": "DB Query Latency by Operation",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(db_query_duration_seconds_bucket{service=~\"$service\"}[5m])) by (le, operation))",
+            "legendFormat": "p95 - {{operation}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "s" }
+        }
+      },
+      {
+        "id": 101,
+        "type": "row",
+        "title": "Throughput",
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+        "panels": []
+      },
+      {
+        "id": 3,
+        "type": "timeseries",
+        "title": "Request Rate by Service",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total{service=~\"$service\"}[5m])) by (service)",
+            "legendFormat": "{{service}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "reqps" }
+        }
+      },
+      {
+        "id": 4,
+        "type": "stat",
+        "title": "Total Request Rate",
+        "gridPos": { "h": 4, "w": 6, "x": 12, "y": 10 },
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total[5m]))",
+            "legendFormat": "",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "reqps" }
+        }
+      },
+      {
+        "id": 102,
+        "type": "row",
+        "title": "Errors",
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+        "panels": []
+      },
+      {
+        "id": 5,
+        "type": "timeseries",
+        "title": "Error Rate (5xx)",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total{status=~\"5..\", service=~\"$service\"}[5m])) / sum(rate(http_requests_total{service=~\"$service\"}[5m]))",
+            "legendFormat": "5xx rate",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "percentunit" }
+        }
+      },
+      {
+        "id": 103,
+        "type": "row",
+        "title": "Saturation",
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+        "panels": []
+      },
+      {
+        "id": 6,
+        "type": "timeseries",
+        "title": "Container CPU Usage",
+        "gridPos": { "h": 8, "w": 8, "x": 0, "y": 28 },
+        "targets": [
+          {
+            "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"production\"}[5m])) by (pod)",
+            "legendFormat": "{{pod}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "s" }
+        }
+      },
+      {
+        "id": 7,
+        "type": "timeseries",
+        "title": "Container Memory Working Set",
+        "gridPos": { "h": 8, "w": 8, "x": 8, "y": 28 },
+        "targets": [
+          {
+            "expr": "container_memory_working_set_bytes{namespace=\"production\"}",
+            "legendFormat": "{{pod}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "bytes" }
+        }
+      },
+      {
+        "id": 8,
+        "type": "gauge",
+        "title": "In-Flight Requests",
+        "gridPos": { "h": 8, "w": 8, "x": 16, "y": 28 },
+        "targets": [
+          {
+            "expr": "http_requests_in_flight{service=~\"$service\"}",
+            "legendFormat": "{{service}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "short" }
+        }
+      },
+      {
+        "id": 9,
+        "type": "timeseries",
+        "title": "Queue Depth",
+        "gridPos": { "h": 8, "w": 8, "x": 0, "y": 36 },
+        "targets": [
+          {
+            "expr": "message_queue_depth{service=~\"$service\"}",
+            "legendFormat": "{{service}} - {{queue}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "short" }
+        }
+      },
+      {
+        "id": 10,
+        "type": "gauge",
+        "title": "DB Connection Pool Active",
+        "gridPos": { "h": 8, "w": 8, "x": 8, "y": 36 },
+        "targets": [
+          {
+            "expr": "db_connections_active{service=~\"$service\"}",
+            "legendFormat": "{{service}} - {{database}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "short" }
+        }
+      },
+      {
+        "id": 104,
+        "type": "row",
+        "title": "Stability",
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 },
+        "panels": []
+      },
+      {
+        "id": 11,
+        "type": "timeseries",
+        "title": "Pod Restarts",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 45 },
+        "targets": [
+          {
+            "expr": "increase(kube_pod_container_restarts_total{namespace=\"production\"}[1h])",
+            "legendFormat": "{{pod}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "short" }
+        }
+      },
+      {
+        "id": 105,
+        "type": "row",
+        "title": "Caching",
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 53 },
+        "panels": []
+      },
+      {
+        "id": 12,
+        "type": "timeseries",
+        "title": "Cache Hit Ratio",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 54 },
+        "targets": [
+          {
+            "expr": "sum(rate(cache_hit_total{service=~\"$service\"}[5m])) / (sum(rate(cache_hit_total{service=~\"$service\"}[5m])) + sum(rate(cache_miss_total{service=~\"$service\"}[5m])))",
+            "legendFormat": "hit ratio",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "percentunit" }
+        }
+      },
+      {
+        "id": 106,
+        "type": "row",
+        "title": "Network",
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 62 },
+        "panels": []
+      },
+      {
+        "id": 13,
+        "type": "timeseries",
+        "title": "Network Traffic",
+        "gridPos": { "h": 8, "w": 8, "x": 0, "y": 63 },
+        "targets": [
+          {
+            "expr": "sum(rate(network_bytes_received_total{service=~\"$service\"}[5m])) by (service)",
+            "legendFormat": "{{service}} rx",
+            "refId": "A"
+          },
+          {
+            "expr": "sum(rate(network_bytes_transmitted_total{service=~\"$service\"}[5m])) by (service)",
+            "legendFormat": "{{service}} tx",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "Bps" }
+        }
+      },
+      {
+        "id": 14,
+        "type": "timeseries",
+        "title": "DNS Failures",
+        "gridPos": { "h": 8, "w": 8, "x": 8, "y": 63 },
+        "targets": [
+          {
+            "expr": "sum(rate(dns_failures_total[5m])) by (service)",
+            "legendFormat": "{{service}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "short" }
+        }
+      },
+      {
+        "id": 15,
+        "type": "timeseries",
+        "title": "TLS Handshake Failures",
+        "gridPos": { "h": 8, "w": 8, "x": 16, "y": 63 },
+        "targets": [
+          {
+            "expr": "sum(rate(tls_handshake_failures_total[5m])) by (service)",
+            "legendFormat": "{{service}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "short" }
+        }
+      },
+      {
+        "id": 107,
+        "type": "row",
+        "title": "Messaging",
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 71 },
+        "panels": []
+      },
+      {
+        "id": 16,
+        "type": "timeseries",
+        "title": "Kafka Consumer Lag",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 72 },
+        "targets": [
+          {
+            "expr": "kafka_consumer_lag{consumer_group=~\"$consumer_group\"}",
+            "legendFormat": "{{consumer_group}} / {{topic}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "short" }
+        }
+      },
+      {
+        "id": 108,
+        "type": "row",
+        "title": "Database",
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 80 },
+        "panels": []
+      },
+      {
+        "id": 17,
+        "type": "timeseries",
+        "title": "DB Query Duration (p95)",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 81 },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(db_query_duration_seconds_bucket[5m])) by (le, service, database))",
+            "legendFormat": "{{service}} / {{database}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "s" }
+        }
+      },
+      {
+        "id": 109,
+        "type": "row",
+        "title": "Storage & IO",
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 89 },
+        "panels": []
+      },
+      {
+        "id": 18,
+        "type": "timeseries",
+        "title": "Disk Usage",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 90 },
+        "targets": [
+          {
+            "expr": "1 - (node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"})",
+            "legendFormat": "{{instance}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "percentunit" }
+        }
+      },
+      {
+        "id": 110,
+        "type": "row",
+        "title": "Rate Limiting",
+        "collapsed": false,
+        "gridPos": { "h": 1, "w": 24, "x": 0, "y": 98 },
+        "panels": []
+      },
+      {
+        "id": 19,
+        "type": "timeseries",
+        "title": "Rate Limit Rejections",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 99 },
+        "targets": [
+          {
+            "expr": "sum(rate(rate_limit_hits_total{service=~\"$service\"}[5m])) by (service)",
+            "legendFormat": "{{service}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "short" }
+        }
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "service",
+          "type": "query",
+          "query": "label_values(http_requests_total, service)",
+          "multi": true,
+          "includeAll": true,
+          "current": { "text": "All", "value": "$__all" }
+        },
+        {
+          "name": "consumer_group",
+          "type": "query",
+          "query": "label_values(kafka_consumer_lag, consumer_group)",
+          "multi": true,
+          "includeAll": true,
+          "current": { "text": "All", "value": "$__all" }
+        }
+      ]
+    },
+    "annotations": {
+      "list": [
+        {
+          "name": "Alerts",
+          "datasource": "-- Grafana --",
+          "enable": true,
+          "type": "alert"
+        }
+      ]
+    }
+}

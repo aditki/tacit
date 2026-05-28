@@ -46,6 +46,7 @@ services:
       - .env
     environment:
       GRAFANA_URL: http://grafana:3000
+      SSL_CERT_FILE: ""
     depends_on:
       - grafana
       - prometheus
