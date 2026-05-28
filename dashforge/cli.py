@@ -835,7 +835,7 @@ def serve(host: str, port: int, reload: bool, no_slack: bool):
         host=host,
         port=port,
         reload=reload,
-        log_level=log_level,
+        log_level=settings.log_level.lower(),
     )
 
 
