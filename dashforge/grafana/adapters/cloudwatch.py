@@ -77,7 +77,13 @@ KEYWORD_NAMESPACE_MAP: dict[str, list[str]] = {
 
 
 def _select_namespaces(keywords: list[str], available: list[str]) -> list[str]:
-    """Pick CloudWatch namespaces relevant to the intent keywords."""
+    """Pick CloudWatch namespaces relevant to the intent keywords.
+
+    Strategy (narrow → broad):
+    1. Match keywords against KEYWORD_NAMESPACE_MAP → intersect with available.
+    2. If nothing matched, use only the top 5 priority namespaces (not 8+).
+    3. If still empty, return whatever priority namespaces exist.
+    """
     matched: set[str] = set()
     kw_lower = [k.lower() for k in keywords]
 
@@ -86,18 +92,22 @@ def _select_namespaces(keywords: list[str], available: list[str]) -> list[str]:
             if pattern in kw or kw in pattern:
                 matched.update(namespaces)
 
-    # Always include priority namespaces if they exist in this account
-    if not matched:
-        matched = set(PRIORITY_NAMESPACES[:8])
-
-    # Intersect with what's actually available
     available_set = set(available)
-    result = [ns for ns in matched if ns in available_set]
 
-    # If intersection is empty, fall back to all priority namespaces that exist
-    if not result:
-        result = [ns for ns in PRIORITY_NAMESPACES if ns in available_set]
+    if matched:
+        result = [ns for ns in matched if ns in available_set]
+        if result:
+            return result[:10]
 
+    # Narrow fallback: only top-5 priority namespaces to limit noise
+    result = [ns for ns in PRIORITY_NAMESPACES[:5] if ns in available_set]
+    if result:
+        logger.info("cloudwatch_namespace_fallback", reason="no_keyword_match",
+                    namespaces=result)
+        return result
+
+    # Last resort: any priority namespace that exists
+    result = [ns for ns in PRIORITY_NAMESPACES if ns in available_set]
     return result[:10]
 
 
@@ -121,13 +131,17 @@ class CloudWatchAdapter(DatasourceAdapter):
         entries: list[MetricEntry] = []
 
         # 1. List available namespaces
+        ns_fetch_failed = False
         try:
             ns_resp = await client.datasource_resource(
                 datasource.uid, "namespaces", {"region": default_region}
             )
             available_ns: list[str] = ns_resp if isinstance(ns_resp, list) else list(ns_resp.keys()) if isinstance(ns_resp, dict) else []
         except Exception:
-            logger.warning("cloudwatch_namespace_list_failed", datasource=datasource.name)
+            ns_fetch_failed = True
+            logger.warning("cloudwatch_namespace_list_hard_failure",
+                           datasource=datasource.name,
+                           fallback="static_priority_namespaces")
             available_ns = PRIORITY_NAMESPACES
 
         # 2. Select namespaces relevant to the intent

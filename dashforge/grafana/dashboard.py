@@ -42,6 +42,25 @@ def _build_panel_json(panel: PanelSpec, panel_id: int, grid_pos: dict) -> dict[s
             target["statistics"] = [q.cloudwatch_stat or "Average"]
             if q.cloudwatch_dimensions:
                 target["dimensions"] = q.cloudwatch_dimensions
+        # CloudWatch targets need additional Grafana-specific fields
+        if q.cloudwatch_namespace:
+            target["namespace"] = q.cloudwatch_namespace
+            # The catalog may emit names like "AWS/ApplicationELB/HTTPCode_ELB_5XX";
+            # CloudWatch expects just the metric part after the namespace prefix.
+            metric_name = q.expr
+            ns_prefix = q.cloudwatch_namespace + "/"
+            if metric_name.startswith(ns_prefix):
+                metric_name = metric_name[len(ns_prefix):]
+            target["metricName"] = metric_name
+            target["region"] = q.cloudwatch_region or "default"
+            target["statistics"] = [q.cloudwatch_stat or "Average"]
+            if q.cloudwatch_dimensions:
+                # Grafana accepts both str and list[str] dimension values.
+                # Normalize single-element lists to strings for cleanliness.
+                target["dimensions"] = {
+                    k: v[0] if isinstance(v, list) and len(v) == 1 else v
+                    for k, v in q.cloudwatch_dimensions.items()
+                }
         targets.append(target)
 
     panel_json: dict[str, Any] = {

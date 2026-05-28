@@ -116,6 +116,7 @@ class PanelQuery(BaseModel):
     cloudwatch_namespace: str = Field(default="", description="AWS CloudWatch namespace, e.g. 'AWS/ApplicationELB'")
     cloudwatch_stat: str = Field(default="", description="CloudWatch statistic: Sum, Average, p99, etc.")
     cloudwatch_dimensions: dict[str, list[str]] = Field(default_factory=dict, description="CloudWatch dimensions, e.g. {'LoadBalancer': ['*']}")
+    cloudwatch_dimensions: dict[str, str | list[str]] = Field(default_factory=dict, description="CloudWatch dimensions, e.g. {'LoadBalancer': '*'} or {'AvailabilityZone': ['us-east-1a', 'us-east-1b']}")
     cloudwatch_region: str = Field(default="", description="AWS region for this CloudWatch query, e.g. 'us-east-1'")
 
 

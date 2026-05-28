@@ -22,9 +22,15 @@ _SFX_DATA_RE = re.compile(r"data\(\s*['\"]([^'\"]+)['\"]\s*[),]")
 async def _check_query(
     client: GrafanaClient,
     datasource_uid: str,
+    datasource_type: str,
     expr: str,
 ) -> bool:
-    """Check if a PromQL expression returns any data."""
+    """Check if a query returns data for datasources we can validate via Prometheus API."""
+    normalized_type = (datasource_type or "").lower()
+    if normalized_type in {"cloudwatch"}:
+        logger.debug("query_check_skipped", datasource_type=normalized_type, reason="unsupported_datasource_validation")
+        return True
+
     try:
         encoded = quote(expr, safe="")
         data = await client.datasource_proxy_get(
@@ -32,10 +38,10 @@ async def _check_query(
         )
         result = data.get("data", {}).get("result", []) if isinstance(data, dict) else []
         has_data = len(result) > 0
-        logger.debug("query_check", expr=expr[:80], has_data=has_data, result_count=len(result))
+        logger.debug("query_check", expr=expr[:80], datasource_type=normalized_type, has_data=has_data, result_count=len(result))
         return has_data
     except Exception as e:
-        logger.warning("query_check_error", expr=expr[:80], error=str(e))
+        logger.warning("query_check_error", expr=expr[:80], datasource_type=normalized_type, error=str(e))
         return False
 
 
@@ -52,19 +58,19 @@ async def validate_dashboard_queries(
     valid_panels: list[PanelSpec] = []
     warnings: list[str] = []
 
-    # Collect all (panel_idx, query_idx, datasource_uid, expr) to check
-    checks: list[tuple[int, str, str]] = []
+    # Collect all (panel_idx, datasource_uid, datasource_type, expr) to check
+    checks: list[tuple[int, str, str, str]] = []
     for panel_idx, panel in enumerate(spec.panels):
         for query in panel.queries:
-            checks.append((panel_idx, query.datasource_uid, query.expr))
+            checks.append((panel_idx, query.datasource_uid, query.datasource_type, query.expr))
 
     if not checks:
         return spec, ["No queries to validate"]
 
     # Run all checks concurrently
     tasks = [
-        _check_query(client, ds_uid, expr)
-        for _, ds_uid, expr in checks
+        _check_query(client, ds_uid, ds_type, expr)
+        for _, ds_uid, ds_type, expr in checks
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 

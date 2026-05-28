@@ -263,6 +263,33 @@ and a native SignalFx dashboard with SignalFlow charts.
 When enabled, the API response includes `signalfx_url` and `signalfx_dashboard_id`
 alongside the standard Grafana fields.
 
+## AWS Bedrock (LLM Provider)
+
+DashForge supports **AWS Bedrock** as an LLM provider for organizations that require
+all AI calls to stay within their AWS account.
+
+### Setup
+
+1. Install the optional dependency:
+   ```bash
+   pip install 'dashforge[bedrock]'
+   ```
+2. Configure via `dashforge init` or manually in `~/.dashforge/config.yaml`:
+   ```yaml
+   llm:
+     provider: bedrock
+     model: anthropic.claude-sonnet-4-20250514-v1:0
+     bedrock_region: us-east-1
+     # bedrock_role_arn: arn:aws:iam::123456789012:role/DashForgeBedrock  # optional cross-account
+   ```
+3. Authentication (resolved in order):
+   - **Explicit keys** — set `LLM_AWS_ACCESS_KEY_ID` + `LLM_AWS_SECRET_ACCESS_KEY` in `~/.dashforge/.env`
+   - **Assume-role** — set `llm.bedrock_role_arn` in config (uses STS)
+   - **Default boto3 chain** — env vars, `~/.aws/credentials`, EC2 instance profile, ECS task role
+4. Run `dashforge doctor` to verify (calls `sts:GetCallerIdentity`)
+
+No API key is needed — Bedrock uses IAM authentication.
+
 ## Architecture
 
 | Component | Description |
@@ -282,7 +309,7 @@ alongside the standard Grafana fields.
 | **Web UI** | Simple browser interface at `/` for testing prompts |
 
 All agents use structured JSON output with Pydantic validation. The LLM layer is
-provider-agnostic — set `LLM_PROVIDER` to `anthropic`, `openai`, `azure`, or `ollama`.
+provider-agnostic — set `LLM_PROVIDER` to `anthropic`, `openai`, `azure`, `bedrock`, or `ollama`.
 
 ### Key design decisions
 
@@ -356,8 +383,9 @@ dashforge/
 │   │   ├── query_builder.py # Multi-language query generation
 │   │   └── providers/       # LLM backends
 │   │       ├── base.py      #   Abstract interface
-│   │       ├── anthropic.py #   Claude
-│   │       ├── openai_provider.py  # GPT-4o / Azure
+│   │       ├── anthropic.py #   Claude (direct API)
+│   │       ├── openai_provider.py  # GPT-4o / Azure OpenAI
+│   │       ├── bedrock.py   #   AWS Bedrock (IAM auth, assume-role, Converse API)
 │   │       ├── ollama.py    #   Local models
 │   │       └── registry.py  #   Provider factory
 │   ├── archetypes/          # Investigation archetypes (deterministic path)
@@ -438,6 +466,7 @@ dashforge/
 - [x] Input validation & SQL injection hardening — parameterized queries, UID regex validation, path parameter constraints
 - [x] CLI (`dashforge init/doctor/connect grafana/connect signalfx/test/serve`) — Click + Rich, interactive setup wizard, connection validation, single-command startup
 - [x] Backend adapter pattern — `DashboardBackend` protocol with pluggable adapters (Grafana, SignalFx). Pipeline iterates over enabled backends for discovery, validation, and publishing — zero vendor-specific branching
+- [x] AWS Bedrock LLM provider — IAM auth (explicit keys, assume-role, default boto3 chain), Converse API for unified model access (Claude, Llama, Mistral on Bedrock)
 - [x] Config discovery (`~/.dashforge/config.yaml` + `~/.dashforge/.env`) — secrets isolated at 0600 permissions
 - [x] Single-binary distribution — PyInstaller spec for macOS/Linux/Windows, `./scripts/build.sh`
 - [x] 41 investigation archetypes with 176 panels covering latency, errors, golden signals, Kubernetes, Kafka (5 archetypes), Redis, SQS, Lambda, DDoS, mTLS, capacity planning, and more
