@@ -46,27 +46,31 @@ _BEDROCK_PROVIDER_PREFIXES = (
 )
 
 # Map AWS region prefix to inference profile prefix.
-# Models that require inference profiles (e.g. Sonnet 4) need this prefix
-# prepended to the bare foundation model ID.
+# Only us. and eu. have documented geo-specific inference profiles;
+# all other regions (ap, sa, me, ca, af) use the global. profile.
 _REGION_INFERENCE_PREFIX: dict[str, str] = {
-    "us": "us", "eu": "eu", "ap": "ap",
-    "sa": "sa", "me": "me", "ca": "ca", "af": "af",
+    "us": "us", "eu": "eu",
 }
+
+# Prefixes that indicate a model ID is already an inference profile
+_INFERENCE_PROFILE_PREFIXES = ("us.", "eu.", "ap.", "sa.", "me.", "ca.", "af.", "global.")
 
 
 def _inference_profile_id(bare_model_id: str, region: str) -> str:
     """Prefix a bare model ID with the region's inference profile prefix.
 
+    Uses ``us.`` / ``eu.`` for those geo regions and ``global.`` for
+    everything else (ap-*, sa-*, me-*, etc.), matching AWS's documented
+    inference profile availability.
+
     Example: ('anthropic.claude-sonnet-4-20250514-v1:0', 'us-east-1')
              -> 'us.anthropic.claude-sonnet-4-20250514-v1:0'
-
-    Returns the bare ID unchanged if the region prefix is unknown.
+    Example: ('anthropic.claude-sonnet-4-20250514-v1:0', 'ap-northeast-1')
+             -> 'global.anthropic.claude-sonnet-4-20250514-v1:0'
     """
     region_prefix = region.split("-")[0]  # "us-east-1" -> "us"
-    prefix = _REGION_INFERENCE_PREFIX.get(region_prefix)
-    if prefix:
-        return f"{prefix}.{bare_model_id}"
-    return bare_model_id
+    prefix = _REGION_INFERENCE_PREFIX.get(region_prefix, "global")
+    return f"{prefix}.{bare_model_id}"
 
 # Cache for resolved model IDs — avoids repeated ListFoundationModels calls
 _resolve_cache: dict[str, str] = {}
@@ -105,10 +109,9 @@ def _resolve_bedrock_model_id(anthropic_model_name: str, bedrock_client) -> str:
         logger.debug("bedrock_list_models_failed", error=str(exc))
 
     # Fall back to static map, then default.
-    # Apply inference profile prefix since bare IDs may not support
-    # on-demand invocation in all regions (e.g. Sonnet 4 in us-east-1).
-    bare = _ANTHROPIC_TO_BEDROCK.get(anthropic_model_name, _BEDROCK_DEFAULT_MODEL)
-    resolved = _inference_profile_id(bare, settings.llm_bedrock_region)
+    # Returns the bare foundation model ID; _converse() will auto-retry
+    # with an inference profile prefix if invocation fails.
+    resolved = _ANTHROPIC_TO_BEDROCK.get(anthropic_model_name, _BEDROCK_DEFAULT_MODEL)
     _resolve_cache[anthropic_model_name] = resolved
     logger.info("bedrock_model_resolved", source="static_map",
                 input=anthropic_model_name, resolved=resolved)
@@ -194,9 +197,8 @@ class BedrockProvider(LLMProvider):
             self._model_id = settings.llm_bedrock_model_id
         else:
             # Resolve Anthropic API model name to Bedrock model ID.
-            # Uses ListFoundationModels API with fallback to static map.
-            # Static-map fallback applies regional inference profile prefix
-            # so the default works on-demand in the configured region.
+            # Returns a bare foundation model ID; _converse() auto-retries
+            # with an inference profile prefix if on-demand invocation fails.
             bedrock_ctrl = session.client("bedrock")
             self._model_id = _resolve_bedrock_model_id(
                 settings.llm_model, bedrock_ctrl
@@ -207,6 +209,40 @@ class BedrockProvider(LLMProvider):
             region=settings.llm_bedrock_region,
         )
 
+    # Model families that do NOT support the Converse ``system`` parameter.
+    # For these, we fold the system prompt into the first user message.
+    _NO_SYSTEM_PREFIXES = ("mistral.",)
+
+    def _build_converse_kwargs(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+    ) -> dict:
+        """Build kwargs for client.converse(), handling model-family quirks.
+
+        Mistral AI Instruct models accept Converse but reject the ``system``
+        field (AWS model-feature table), so the system prompt is folded into
+        the user message for those families.
+        """
+        model_id = self._model_id
+
+        # Mistral (and any future no-system families): fold system into user msg
+        if model_id.startswith(self._NO_SYSTEM_PREFIXES):
+            merged_user = f"{system_prompt}\n\n{user_prompt}"
+            return {
+                "modelId": model_id,
+                "messages": [{"role": "user", "content": [{"text": merged_user}]}],
+                "inferenceConfig": {"temperature": temperature, "maxTokens": 4096},
+            }
+
+        return {
+            "modelId": model_id,
+            "system": [{"text": system_prompt}],
+            "messages": [{"role": "user", "content": [{"text": user_prompt}]}],
+            "inferenceConfig": {"temperature": temperature, "maxTokens": 4096},
+        }
+
     def _converse(
         self,
         system_prompt: str,
@@ -215,29 +251,44 @@ class BedrockProvider(LLMProvider):
     ) -> str:
         """Call Bedrock Converse API (sync — wrapped async by callers).
 
-        NOTE: The ``system`` parameter is not supported by all Bedrock model
-        families.  Mistral AI Instruct models accept Converse but reject the
-        system field (AWS model-feature table).  If Mistral support is needed
-        in the future, fold the system prompt into the first user message for
-        those model families instead of passing it as a separate field.
+        If the bare model ID fails with a ValidationException (common for
+        models that require inference profiles, e.g. Sonnet 4 in us-east-1),
+        automatically retries with a region-appropriate inference profile ID
+        and caches the working ID for subsequent calls.
         """
-        response = self._client.converse(
-            modelId=self._model_id,
-            system=[{"text": system_prompt}],
-            messages=[
-                {"role": "user", "content": [{"text": user_prompt}]},
-            ],
-            inferenceConfig={
-                "temperature": temperature,
-                "maxTokens": 4096,
-            },
-        )
+        kwargs = self._build_converse_kwargs(system_prompt, user_prompt, temperature)
+
+        try:
+            response = self._client.converse(**kwargs)
+        except Exception as exc:
+            if not self._should_retry_with_profile(exc):
+                raise
+            # Retry with inference profile
+            profile_id = _inference_profile_id(self._model_id, settings.llm_bedrock_region)
+            logger.warning("bedrock_model_retry_with_profile",
+                          bare=self._model_id, profile=profile_id)
+            kwargs["modelId"] = profile_id
+            response = self._client.converse(**kwargs)
+            # Success — cache the working profile ID for future calls
+            self._model_id = profile_id
+            logger.info("bedrock_model_updated", model_id=profile_id)
+
         # Extract text from the response
         output = response.get("output", {})
         message = output.get("message", {})
         content_blocks = message.get("content", [])
         text_parts = [b["text"] for b in content_blocks if "text" in b]
         return "".join(text_parts)
+
+    def _should_retry_with_profile(self, exc: Exception) -> bool:
+        """Return True if the exception indicates the model needs an inference
+        profile and the current model ID is a bare (non-prefixed) ID."""
+        if type(exc).__name__ != "ValidationException":
+            return False
+        # Already an inference profile ID — don't double-prefix
+        if self._model_id.startswith(_INFERENCE_PROFILE_PREFIXES):
+            return False
+        return True
 
     async def chat_json(
         self,
