@@ -37,13 +37,13 @@ def _get_semaphore() -> asyncio.Semaphore:
 
 async def run_pipeline(request: DashRequest) -> DashResponse:
     """End-to-end: natural language → Grafana dashboard URL."""
-    rid = bind_request_id()
+    bind_request_id()
     sem = _get_semaphore()
     try:
         async with sem:
             try:
                 return await asyncio.wait_for(
-                    _run_pipeline_inner(request, rid),
+                    _run_pipeline_inner(request),
                     timeout=settings.pipeline_timeout_seconds,
                 )
             except asyncio.TimeoutError:
@@ -65,7 +65,7 @@ async def run_pipeline(request: DashRequest) -> DashResponse:
         unbind_request_id()
 
 
-async def _run_pipeline_inner(request: DashRequest, request_id: str = "") -> DashResponse:
+async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
     """Inner pipeline logic (wrapped with timeout + semaphore above).
 
     Uses the backend adapter pattern: each enabled vendor (Grafana, SignalFx,
@@ -222,11 +222,11 @@ async def _run_pipeline_inner(request: DashRequest, request_id: str = "") -> Das
             )
             cached_discovery = llm_cache.get(discovery_cache_key)
             discovery_usage = TokenUsage()
+            t_disc = time.monotonic()
             if cached_discovery is not None:
                 discovery = cached_discovery
                 discovery_cached = True
             else:
-                t_disc = time.monotonic()
                 discovery, discovery_usage = await discover_metrics(intent, ranked_catalog, context_chunks)
                 cumulative_tokens = cumulative_tokens + discovery_usage
                 if discovery.metrics:
@@ -234,7 +234,7 @@ async def _run_pipeline_inner(request: DashRequest, request_id: str = "") -> Das
                 discovery_cached = False
 
             stage_log(
-                "metrics_discovery", (time.monotonic() - t0) * 1000,
+                "metrics_discovery", (time.monotonic() - t_disc) * 1000,
                 token_usage=discovery_usage if not discovery_cached else None,
                 catalog_size=len(ranked_catalog),
                 metrics_selected=len(discovery.metrics),

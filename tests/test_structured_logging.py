@@ -243,6 +243,3 @@ def test_classify_intent_returns_usage():
 
     assert intent.domain == "general"
     assert usage.total_tokens == 600
-
-
-print("[INFO] test_structured_logging module loaded")

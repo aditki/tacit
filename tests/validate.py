@@ -223,7 +223,7 @@ async def run_archetype_validation(cases: list[TestCase]) -> list[ArchetypeResul
         t0 = time.monotonic()
         all_archetypes: list[dict] = []
         try:
-            intent = await classify_intent(case.prompt)
+            intent, _usage = await classify_intent(case.prompt)
             actual = intent.problem_type
             all_archetypes = [
                 {"type": a.type, "confidence": a.confidence}
