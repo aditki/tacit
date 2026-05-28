@@ -40,6 +40,7 @@ _DEFAULT_DB_PATH = Path("data/dashforge_signals.db")
 _DECAY_HALF_LIFE_DAYS = 90  # confidence halves every 90 days without use
 _MIN_CONFIDENCE = 0.05      # floor — never fully forget
 _TRUST_THRESHOLD = 0.15     # below this, mapping is excluded from resolution
+_CONTEXT_MISSING_PENALTY = 0.7  # lower rank when mapping has context caller lacks
 
 
 def _db_path() -> Path:
@@ -305,8 +306,15 @@ class SignalStore:
                                     context_archetype, context_environment):
                 continue
 
-            # Compute effective confidence with decay + feedback
-            effective = _effective_confidence(m, now)
+            # Compute effective confidence with decay + feedback + context ranking
+            effective = _effective_confidence(
+                m,
+                now,
+                context_service=context_service,
+                context_datasource_type=context_datasource_type,
+                context_archetype=context_archetype,
+                context_environment=context_environment,
+            )
             if not include_decayed and effective < _TRUST_THRESHOLD:
                 continue
 
@@ -627,7 +635,10 @@ def _context_matches(
 ) -> bool:
     """Check if a mapping's context filters match the given context.
 
-    Empty context list in the mapping = matches everything.
+    Empty context list in the mapping = matches everything. If the caller omits
+    a context dimension that the mapping constrains, keep the mapping eligible
+    so ingestion-time signal inference can still find it; confidence ranking
+    applies a missing-context penalty separately.
     """
     if service and mapping.get("context_services"):
         if service.lower() not in [s.lower() for s in mapping["context_services"]]:
@@ -644,18 +655,58 @@ def _context_matches(
     return True
 
 
-def _effective_confidence(mapping: dict[str, Any], now: float) -> float:
-    """Compute effective confidence with time decay and feedback adjustment.
+def _missing_context_multiplier(
+    mapping: dict[str, Any],
+    service: str = "",
+    datasource_type: str = "",
+    archetype: str = "",
+    environment: str = "",
+) -> float:
+    """Return a ranking penalty when constrained mapping context is absent.
+
+    Context-specific mappings are intentionally not filtered when the caller
+    has no context (notably ingestion-time inference). Penalizing them preserves
+    recall while keeping global mappings ahead when there is no evidence that
+    the service/datasource/archetype/environment constraint applies.
+    """
+    missing_context = (
+        (not service and bool(mapping.get("context_services")))
+        or (not datasource_type and bool(mapping.get("context_datasource_types")))
+        or (not archetype and bool(mapping.get("context_archetypes")))
+        or (not environment and bool(mapping.get("context_environments")))
+    )
+    return _CONTEXT_MISSING_PENALTY if missing_context else 1.0
+
+
+def _effective_confidence(
+    mapping: dict[str, Any],
+    now: float,
+    *,
+    context_service: str = "",
+    context_datasource_type: str = "",
+    context_archetype: str = "",
+    context_environment: str = "",
+) -> float:
+    """Compute effective confidence with time decay, feedback, and context adjustment.
 
     - Confidence decays with a half-life based on time since last_seen.
     - Positive feedback boosts, negative feedback penalizes.
+    - Context-specific mappings get a ranking penalty when caller context is missing.
     - Bootstrap mappings don't decay (they're canonical starting points).
     """
     base = mapping["confidence"]
 
-    # Bootstrap mappings don't decay
+    context_multiplier = _missing_context_multiplier(
+        mapping,
+        context_service,
+        context_datasource_type,
+        context_archetype,
+        context_environment,
+    )
+
+    # Bootstrap mappings don't decay, but still receive context ranking penalties.
     if mapping.get("source_type") == "bootstrap":
-        return base
+        return max(base * context_multiplier, _MIN_CONFIDENCE)
 
     # Time decay
     last_seen = mapping.get("last_seen", now)
@@ -674,6 +725,8 @@ def _effective_confidence(mapping: dict[str, Any], now: float) -> float:
         # Scale: 0.7x at all-negative, 1.3x at all-positive, 1.0x at balanced
         fb_multiplier = 0.7 + 0.6 * fb_ratio
         base *= fb_multiplier
+
+    base *= context_multiplier
 
     return max(base, _MIN_CONFIDENCE)
 

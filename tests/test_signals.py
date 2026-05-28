@@ -10,23 +10,22 @@ from pathlib import Path
 
 import pytest
 
+from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from dashforge.backends.base import DashboardFeatures
+from dashforge.dashboard_ingest import (
+    extract_aggregation_patterns,
+    extract_metrics_from_promql,
+    generate_archetype_yaml,
+    infer_signals_from_metrics,
+    parse_dashboard_json,
+)
+from dashforge.models.schemas import MetricEntry
 from dashforge.signals import (
     SignalStore,
+    _context_matches,
     _effective_confidence,
     _metric_matches_pattern,
-    _context_matches,
-    _TRUST_THRESHOLD,
 )
-from dashforge.dashboard_ingest import (
-    extract_metrics_from_promql,
-    extract_aggregation_patterns,
-    parse_dashboard_json,
-    infer_signals_from_metrics,
-    generate_archetype_yaml,
-)
-from dashforge.backends.base import DashboardFeatures
-from dashforge.models.schemas import MetricEntry
-from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -250,6 +249,45 @@ class TestContextFiltering:
         )
         assert len(mappings) == 1
         assert mappings[0]["metric_pattern"] == "generic_latency"
+
+    def test_context_specific_mapping_penalized_without_context(self, signal_store):
+        signal_store.add_mapping(
+            "request_latency", "checkout_specific_latency",
+            confidence=0.9,
+            context_services=["checkout"],
+        )
+        signal_store.add_mapping(
+            "request_latency", "generic_latency",
+            confidence=0.8,
+        )
+
+        mappings = signal_store.get_mappings_for_signal("request_latency")
+
+        assert [m["metric_pattern"] for m in mappings] == [
+            "generic_latency",
+            "checkout_specific_latency",
+        ]
+        assert mappings[1]["effective_confidence"] == pytest.approx(0.63, abs=0.001)
+
+    def test_context_specific_mapping_not_penalized_with_matching_context(
+        self, signal_store
+    ):
+        signal_store.add_mapping(
+            "request_latency", "checkout_specific_latency",
+            confidence=0.9,
+            context_services=["checkout"],
+        )
+        signal_store.add_mapping(
+            "request_latency", "generic_latency",
+            confidence=0.8,
+        )
+
+        mappings = signal_store.get_mappings_for_signal(
+            "request_latency", context_service="checkout"
+        )
+
+        assert mappings[0]["metric_pattern"] == "checkout_specific_latency"
+        assert mappings[0]["effective_confidence"] == pytest.approx(0.9, abs=0.001)
 
 
 # ── Confidence decay ─────────────────────────────────────────────────────────
@@ -659,7 +697,6 @@ class TestSignalInference:
         ]
         signals = infer_signals_from_metrics(metrics)
 
-        signal_types = {s["signal_type"] for s in signals}
         # Should infer auth-related signals
         assert len(signals) > 0
         # At least one auth signal should be inferred
@@ -958,7 +995,7 @@ class TestDashboardFeatures:
         sfx_metrics = ["cpu.utilization", "memory.usage"]
         grafana_metrics = ["container_cpu_usage_seconds_total", "process_resident_memory_bytes"]
 
-        sfx_signals = infer_signals_from_metrics(sfx_metrics)
+        infer_signals_from_metrics(sfx_metrics)
         grafana_signals = infer_signals_from_metrics(grafana_metrics)
 
         # Grafana standard metrics should match known signals
@@ -1144,8 +1181,6 @@ class TestSignalCoverageDashboard:
 
     def test_signal_categories_coverage(self, inferred_signals):
         """Verify we hit at least 8 of the 12 signal categories."""
-        from dashforge.signals import SignalStore
-        store = SignalStore.__new__(SignalStore)
         # Collect categories from inferred signals by looking up
         # the signal_type in the bootstrap yaml
         import yaml
@@ -1171,3 +1206,152 @@ class TestSignalCoverageDashboard:
         assert "required_signals:" in yaml_str
         assert "signal_bindings:" in yaml_str
         assert "panels:" in yaml_str
+
+
+# ── Bug 3: Literal braces in generated archetype YAML ────────────────────
+
+class TestArchetypeYamlBraceEscaping:
+    """Queries with label selectors like {service=\"api\"} must not break
+    str.format() when the generated archetype is later compiled."""
+
+    def test_braces_are_escaped_in_generated_yaml(self):
+        """Concrete query braces must be escaped as {{ / }} so
+        compile_archetype()'s str.format(**params) does not interpret them
+        as Python format placeholders."""
+        import yaml
+
+        extracted = {
+            "dashboard_title": "Test Dashboard",
+            "dashboard_tags": [],
+            "metrics_found": ["http_requests_total"],
+            "panels": [
+                {
+                    "title": "RPS",
+                    "queries": ['rate(http_requests_total{service="api"}[5m])'],
+                    "row": "",
+                    "unit": "",
+                    "description": "",
+                },
+            ],
+        }
+        signals = [
+            {"signal_type": "request_rate", "metric": "http_requests_total", "confidence": 0.8},
+        ]
+        yaml_str = generate_archetype_yaml(extracted, signals)
+        parsed = yaml.safe_load(yaml_str)
+        expr = parsed["archetypes"][0]["panels"][0]["queries"][0]["expr"]
+
+        # The expression must survive str.format() with no matching keys
+        # If braces are NOT escaped, this raises KeyError('service="api"')
+        result = expr.format(service_filter="", container_filter="", rate_interval="5m")
+        # Verify the original brace content is preserved after formatting
+        assert '{service="api"}' in result
+
+    def test_template_placeholders_preserved(self):
+        """Legitimate {service_filter} placeholders must NOT be double-escaped."""
+        extracted = {
+            "dashboard_title": "Template Dashboard",
+            "dashboard_tags": [],
+            "metrics_found": ["http_requests_total"],
+            "panels": [
+                {
+                    "title": "RPS",
+                    "queries": ['rate(http_requests_total{{{service_filter}}}[5m])'],
+                    "row": "",
+                    "unit": "",
+                    "description": "",
+                },
+            ],
+        }
+        signals = []
+        yaml_str = generate_archetype_yaml(extracted, signals)
+        import yaml
+        parsed = yaml.safe_load(yaml_str)
+        expr = parsed["archetypes"][0]["panels"][0]["queries"][0]["expr"]
+        # Template placeholder must still resolve
+        result = expr.format(service_filter='job="api"', container_filter="", rate_interval="5m")
+        assert 'job="api"' in result
+
+
+# ── Bug 5: Suffix-aware metric substitution ──────────────────────────────
+
+class TestSuffixAwareMetricSubstitution:
+    """_apply_metric_substitutions must not double-suffix when the base
+    binding name is a prefix of a suffixed variant in the query template."""
+
+    def _make_archetype(self, expr: str, binding_default: str) -> InvestigationArchetype:
+        return InvestigationArchetype(
+            id="test",
+            name="Test",
+            problem_types=["test"],
+            signal_bindings={"request_latency": binding_default},
+            panels=[
+                PanelTemplate(
+                    title="P1",
+                    queries=[QueryTemplate(expr=expr)],
+                ),
+            ],
+        )
+
+    def test_base_metric_replaced(self):
+        """Simple base metric replacement still works."""
+        from dashforge.archetypes.engine import _apply_metric_substitutions
+
+        arch = self._make_archetype(
+            expr="rate(http_request_duration_seconds[5m])",
+            binding_default="http_request_duration_seconds",
+        )
+        result = _apply_metric_substitutions(arch, {
+            "http_request_duration_seconds": "custom_request_duration_seconds",
+        })
+        assert result.panels[0].queries[0].expr == "rate(custom_request_duration_seconds[5m])"
+
+    def test_suffixed_variant_no_double_suffix(self):
+        """Replacing base metric when the template uses _bucket suffix.
+        The resolved metric is the base form, so the suffix should survive."""
+        from dashforge.archetypes.engine import _apply_metric_substitutions
+
+        arch = self._make_archetype(
+            expr="histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))",
+            binding_default="http_request_duration_seconds",
+        )
+        result = _apply_metric_substitutions(arch, {
+            "http_request_duration_seconds": "custom_request_duration_seconds",
+        })
+        assert "custom_request_duration_seconds_bucket" in result.panels[0].queries[0].expr
+        assert "_bucket_bucket" not in result.panels[0].queries[0].expr
+
+    def test_resolved_metric_already_suffixed(self):
+        """When the catalog match is already a suffixed form (e.g. _bucket),
+        replacing the base binding should NOT produce double suffix."""
+        from dashforge.archetypes.engine import _apply_metric_substitutions
+
+        arch = self._make_archetype(
+            expr="histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))",
+            binding_default="http_request_duration_seconds",
+        )
+        # The substitution map says base → already-suffixed resolved metric
+        result = _apply_metric_substitutions(arch, {
+            "http_request_duration_seconds": "custom_request_duration_seconds_bucket",
+        })
+        # Must NOT become custom_request_duration_seconds_bucket_bucket
+        assert "_bucket_bucket" not in result.panels[0].queries[0].expr
+        # The _bucket variant should appear exactly once
+        assert "custom_request_duration_seconds_bucket" in result.panels[0].queries[0].expr
+
+    def test_multiple_suffixes_in_one_expression(self):
+        """An expression referencing both _bucket and _count of the same base."""
+        from dashforge.archetypes.engine import _apply_metric_substitutions
+
+        arch = self._make_archetype(
+            expr="histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) / rate(http_request_duration_seconds_count[5m])",
+            binding_default="http_request_duration_seconds",
+        )
+        result = _apply_metric_substitutions(arch, {
+            "http_request_duration_seconds": "custom_latency",
+        })
+        expr = result.panels[0].queries[0].expr
+        assert "custom_latency_bucket" in expr
+        assert "custom_latency_count" in expr
+        assert "_bucket_bucket" not in expr
+        assert "_count_count" not in expr

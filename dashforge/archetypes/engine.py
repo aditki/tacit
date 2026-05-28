@@ -327,6 +327,47 @@ def _find_top_level_slash(expr: str) -> int | None:
     return None
 
 
+_HISTOGRAM_SUFFIXES = ("_bucket", "_count", "_sum", "_total", "_created", "_info")
+
+
+def _suffix_aware_replace(expr: str, old_metric: str, new_metric: str) -> str:
+    """Replace *old_metric* with *new_metric* in *expr*, handling suffixes.
+
+    When *old_metric* is ``http_request_duration_seconds`` and the expression
+    contains ``http_request_duration_seconds_bucket``, a naive ``.replace()``
+    with a *new_metric* of ``custom_duration_seconds_bucket`` would produce
+    ``custom_duration_seconds_bucket_bucket``.
+
+    This function:
+    1. Replaces suffixed variants first (longest match first) — if the new
+       metric already ends with that suffix, only the base portion is used
+       for substitution so the suffix is not doubled.
+    2. Replaces the bare base metric last.
+    """
+    # Sort suffixes longest-first to avoid partial matches
+    suffixes = sorted(_HISTOGRAM_SUFFIXES, key=len, reverse=True)
+
+    # Replace suffixed variants first
+    for suffix in suffixes:
+        old_suffixed = old_metric + suffix
+        if old_suffixed not in expr:
+            continue
+        if new_metric.endswith(suffix):
+            # new_metric already has this suffix — use it as-is
+            new_suffixed = new_metric
+        else:
+            new_suffixed = new_metric + suffix
+        expr = expr.replace(old_suffixed, new_suffixed)
+
+    # Replace remaining bare base metric occurrences
+    # (only hits instances that are NOT part of a suffixed variant, since
+    # those were already replaced above)
+    if old_metric in expr:
+        expr = expr.replace(old_metric, new_metric)
+
+    return expr
+
+
 def _apply_metric_substitutions(
     archetype: InvestigationArchetype,
     substitutions: dict[str, str],
@@ -336,6 +377,12 @@ def _apply_metric_substitutions(
     Used when signal resolution finds that the default metric names in the
     archetype templates don't exist in the environment, but equivalent
     metrics do (e.g. auth_requests_total → sso_auth_requests_total).
+
+    Suffix-aware: if the template references ``base_metric_bucket`` and the
+    substitution maps ``base_metric`` → ``new_metric``, the result is
+    ``new_metric_bucket`` (not ``new_metric_bucket`` from a naive replace
+    that could also cause ``new_metric_bucket_bucket`` when the resolved
+    metric is already suffixed).
     """
     if not substitutions:
         return archetype
@@ -346,7 +393,7 @@ def _apply_metric_substitutions(
         for qt in panel.queries:
             expr = qt.expr
             for old_metric, new_metric in substitutions.items():
-                expr = expr.replace(old_metric, new_metric)
+                expr = _suffix_aware_replace(expr, old_metric, new_metric)
             new_queries.append(QueryTemplate(
                 expr=expr,
                 legend_format=qt.legend_format,

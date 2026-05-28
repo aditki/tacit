@@ -898,7 +898,7 @@
                 <div class="signal-desc">${esc(s.description || '')} &middot; <code>${esc(s.unit || '')}</code></div>
                 <div class="signal-patterns">
                   <span style="font-size:0.72rem;color:#6b7280">${s.mapping_count || 0} mappings</span>
-                  <span class="hist-back" style="margin-left:0.5rem" onclick="showSignalDetail('${esc(s.signal_type)}')">View mappings</span>
+                  <span class="hist-back signal-detail-btn" style="margin-left:0.5rem" data-signal="${esc(s.signal_type)}">View mappings</span>
                 </div>
               </div>`;
           }
@@ -960,7 +960,10 @@
       try {
         statusEl.textContent = 'Teaching...';
         statusEl.style.color = '#9ca3af';
-        const body = { signal_type: signalType, metric_pattern: metric, confidence };
+        const body = {
+          signal_type: signalType,
+          metric_patterns: [{ pattern: metric, confidence }],
+        };
         if (service) body.services = [service];
         const resp = await fetch(`${BASE}/api/v1/signals/teach`, {
           method: 'POST',
@@ -980,6 +983,12 @@
         statusEl.style.color = '#ef4444';
       }
     }
+
+    // Delegate signal detail clicks (avoids inline onclick + quote escaping issues)
+    document.getElementById('signals-content').addEventListener('click', (e) => {
+      const btn = e.target.closest('.signal-detail-btn');
+      if (btn && btn.dataset.signal) showSignalDetail(btn.dataset.signal);
+    });
 
     // Submit on Ctrl+Enter
     document.getElementById('prompt').addEventListener('keydown', (e) => {

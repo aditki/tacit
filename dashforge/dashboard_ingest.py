@@ -315,6 +315,28 @@ def infer_signals_from_metrics(
 
 # ── Archetype generation ─────────────────────────────────────────────────────
 
+_TEMPLATE_PLACEHOLDERS = re.compile(
+    r"\{(service_filter|container_filter|rate_interval)\}"
+)
+
+
+def _escape_literal_braces(expr: str) -> str:
+    """Escape literal ``{``/``}`` in a concrete query so that
+    ``str.format()`` in ``compile_archetype()`` treats them as text.
+
+    Known template placeholders (``{service_filter}``, etc.) are preserved.
+    """
+    # First, escape ALL braces
+    escaped = expr.replace("{", "{{").replace("}", "}}")
+    # Then un-escape known template placeholders (they became doubled)
+    escaped = re.sub(
+        r"\{\{(service_filter|container_filter|rate_interval)\}\}",
+        r"{\1}",
+        escaped,
+    )
+    return escaped
+
+
 def generate_archetype_yaml(
     extracted: dict[str, Any],
     signals: list[dict[str, Any]],
@@ -353,7 +375,7 @@ def generate_archetype_yaml(
         queries = []
         for q in p.get("queries", []):
             queries.append({
-                "expr": q,
+                "expr": _escape_literal_braces(q),
                 "legend_format": "",
             })
         if queries:
