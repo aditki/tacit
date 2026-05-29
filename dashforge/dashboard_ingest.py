@@ -32,10 +32,11 @@ from dashforge.signals import get_signal_store
 logger = structlog.get_logger()
 
 # ── PromQL metric name extraction ────────────────────────────────────────────
-# Matches metric names in PromQL: word chars before { or [ or (
-# Also handles rate(metric_name{...}[5m]), histogram_quantile, etc.
+# Matches metric names in PromQL: word chars that look like identifiers.
+# A metric name starts with [a-zA-Z_:] and continues with [a-zA-Z0-9_:].
+# It can appear before {, [, ), whitespace, operators, comparisons, or EOL.
 _PROMQL_METRIC_RE = re.compile(
-    r'(?:^|(?<=[\s(,]))([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?:\{|\[|$)',
+    r'(?:^|(?<=[\s(,]))([a-zA-Z_:][a-zA-Z0-9_:]*)(?=\s*[{\[)\/\*\+\-><=!,]|\s|$)',
     re.MULTILINE,
 )
 
@@ -315,25 +316,39 @@ def infer_signals_from_metrics(
 
 # ── Archetype generation ─────────────────────────────────────────────────────
 
-_TEMPLATE_PLACEHOLDERS = re.compile(
-    r"\{(service_filter|container_filter|rate_interval)\}"
-)
+_TEMPLATE_PLACEHOLDER_NAMES = ("service_filter", "container_filter", "rate_interval")
 
 
 def _escape_literal_braces(expr: str) -> str:
-    """Escape literal ``{``/``}`` in a concrete query so that
-    ``str.format()`` in ``compile_archetype()`` treats them as text.
+    """Escape literal ``{``/``}`` in a concrete query for later ``str.format``.
 
-    Known template placeholders (``{service_filter}``, etc.) are preserved.
+    Generated archetype YAML can contain two different kinds of braces:
+
+    * concrete query label selectors, e.g. ``{service="api"}``, which must be
+      escaped so ``str.format(**params)`` treats them as literal braces; and
+    * DashForge template placeholders, e.g. ``{service_filter}`` and the
+      PromQL label-selector form ``{{{service_filter}}}``, which must remain
+      format placeholders.
     """
-    # First, escape ALL braces
+    protected: dict[str, str] = {}
+
+    def protect(value: str) -> str:
+        token = f"__DASHFORGE_FMT_TOKEN_{len(protected)}__"
+        protected[token] = value
+        return token
+
+    # Protect the triple-brace label-selector placeholders first so the inner
+    # ``{service_filter}`` match below cannot partially consume them.
+    for name in _TEMPLATE_PLACEHOLDER_NAMES:
+        expr = expr.replace(f"{{{{{{{name}}}}}}}", protect(f"{{{{{{{name}}}}}}}"))
+
+    # Protect simple placeholders such as ``{rate_interval}``.
+    for name in _TEMPLATE_PLACEHOLDER_NAMES:
+        expr = expr.replace(f"{{{name}}}", protect(f"{{{name}}}"))
+
     escaped = expr.replace("{", "{{").replace("}", "}}")
-    # Then un-escape known template placeholders (they became doubled)
-    escaped = re.sub(
-        r"\{\{(service_filter|container_filter|rate_interval)\}\}",
-        r"{\1}",
-        escaped,
-    )
+    for token, value in protected.items():
+        escaped = escaped.replace(token, value)
     return escaped
 
 
@@ -369,15 +384,25 @@ def generate_archetype_yaml(
             signal_bindings[sig["signal_type"]] = sig["metric"]
             required_signals.append(sig["signal_type"])
 
+    # Determine datasource_type from source query language
+    query_language = extracted.get("query_language", "promql")
+    is_signalflow = query_language == "signalflow"
+
     # Build panels from extracted panel data
     panels = []
     for p in extracted.get("panels", [])[:12]:  # cap at 12 panels
         queries = []
         for q in p.get("queries", []):
-            queries.append({
-                "expr": _escape_literal_braces(q),
+            query_def: dict[str, Any] = {
+                # SignalFlow expressions must not be brace-escaped (no
+                # str.format placeholders); PromQL expressions need escaping
+                # to protect literal label selectors from format().
+                "expr": q if is_signalflow else _escape_literal_braces(q),
                 "legend_format": "",
-            })
+            }
+            if is_signalflow:
+                query_def["datasource_type"] = "signalfx"
+            queries.append(query_def)
         if queries:
             panel_def: dict[str, Any] = {
                 "title": p["title"],
@@ -456,23 +481,27 @@ async def ingest_dashboard(
     from dashforge.backends import get_active_backends
     from dashforge.backends.base import DashboardFeatures
 
+    all_backends: list[Any] = []
     own_backends = False
     if backend is None:
-        backends = get_active_backends()
+        all_backends = get_active_backends()
         own_backends = True
-        if not backends:
+        if not all_backends:
             raise RuntimeError("No active backends configured for dashboard ingestion")
 
         if backend_name:
-            matched = [b for b in backends if b.name == backend_name]
+            matched = [b for b in all_backends if b.name == backend_name]
             if not matched:
-                available = [b.name for b in backends]
+                available = [b.name for b in all_backends]
+                # Close all backends before raising
+                for b in all_backends:
+                    await b.close()
                 raise ValueError(
                     f"Backend '{backend_name}' not found. Available: {available}"
                 )
             backend = matched[0]
         else:
-            backend = backends[0]
+            backend = all_backends[0]
 
     try:
         # Delegate fetch + parse to the backend (vendor-specific)
@@ -507,7 +536,7 @@ async def ingest_dashboard(
             panel_titles=features.panel_titles,
             alert_links=features.alert_links,
             drilldown_links=features.drilldown_links,
-            signals_inferred=[s["signal_type"] for s in signals],
+            signals_inferred=signals,
             status=status,
         )
 
@@ -561,4 +590,5 @@ async def ingest_dashboard(
 
     finally:
         if own_backends:
-            await backend.close()
+            for b in all_backends:
+                await b.close()

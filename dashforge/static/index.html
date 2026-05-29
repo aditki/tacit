@@ -748,6 +748,9 @@
     }
 
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    function escAttr(s) {
+      return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
 
     /* ── Learning tab ─────────────────────────────────────────── */
     let autoApprove = false;
@@ -898,7 +901,7 @@
                 <div class="signal-desc">${esc(s.description || '')} &middot; <code>${esc(s.unit || '')}</code></div>
                 <div class="signal-patterns">
                   <span style="font-size:0.72rem;color:#6b7280">${s.mapping_count || 0} mappings</span>
-                  <span class="hist-back signal-detail-btn" style="margin-left:0.5rem" data-signal="${esc(s.signal_type)}">View mappings</span>
+                  <span class="hist-back signal-detail-btn" style="margin-left:0.5rem" data-signal="${escAttr(s.signal_type)}">View mappings</span>
                 </div>
               </div>`;
           }
@@ -913,7 +916,7 @@
       const el = document.getElementById('signals-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const resp = await fetch(`${BASE}/api/v1/signals/${signalType}`);
+        const resp = await fetch(`${BASE}/api/v1/signals/${encodeURIComponent(signalType)}`);
         if (!resp.ok) throw new Error('Not found');
         const data = await resp.json();
         const mappings = data.mappings || [];
@@ -947,7 +950,8 @@
     async function teachSignal() {
       const signalType = document.getElementById('teach-signal').value;
       const metric = document.getElementById('teach-metric').value.trim();
-      const confidence = parseFloat(document.getElementById('teach-confidence').value) || 0.8;
+      const confidenceInput = parseFloat(document.getElementById('teach-confidence').value);
+      const confidence = Number.isFinite(confidenceInput) ? confidenceInput : 0.8;
       const service = document.getElementById('teach-service').value.trim();
       const statusEl = document.getElementById('teach-status');
 

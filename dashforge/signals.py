@@ -242,6 +242,11 @@ class SignalStore:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(signal_type, metric_pattern) DO UPDATE SET
                        confidence = MAX(excluded.confidence, signal_metric_mappings.confidence),
+                       context_services = excluded.context_services,
+                       context_datasource_types = excluded.context_datasource_types,
+                       context_environments = excluded.context_environments,
+                       context_archetypes = excluded.context_archetypes,
+                       source_type = excluded.source_type,
                        source_refs = excluded.source_refs,
                        last_seen = excluded.last_seen,
                        use_count = signal_metric_mappings.use_count + 1""",
@@ -315,7 +320,16 @@ class SignalStore:
                 context_archetype=context_archetype,
                 context_environment=context_environment,
             )
-            if not include_decayed and effective < _TRUST_THRESHOLD:
+            trust_effective = _effective_confidence(
+                m,
+                now,
+                context_service=context_service,
+                context_datasource_type=context_datasource_type,
+                context_archetype=context_archetype,
+                context_environment=context_environment,
+                apply_context_penalty=False,
+            )
+            if not include_decayed and trust_effective < _TRUST_THRESHOLD:
                 continue
 
             m["effective_confidence"] = round(effective, 4)
@@ -492,7 +506,7 @@ class SignalStore:
         panel_titles: list[str] | None = None,
         alert_links: list[str] | None = None,
         drilldown_links: list[str] | None = None,
-        signals_inferred: list[str] | None = None,
+        signals_inferred: list[str] | list[dict] | None = None,
         archetype_generated: str = "",
         status: str = "pending",
     ) -> None:
@@ -686,6 +700,7 @@ def _effective_confidence(
     context_datasource_type: str = "",
     context_archetype: str = "",
     context_environment: str = "",
+    apply_context_penalty: bool = True,
 ) -> float:
     """Compute effective confidence with time decay, feedback, and context adjustment.
 
@@ -696,12 +711,16 @@ def _effective_confidence(
     """
     base = mapping["confidence"]
 
-    context_multiplier = _missing_context_multiplier(
-        mapping,
-        context_service,
-        context_datasource_type,
-        context_archetype,
-        context_environment,
+    context_multiplier = (
+        _missing_context_multiplier(
+            mapping,
+            context_service,
+            context_datasource_type,
+            context_archetype,
+            context_environment,
+        )
+        if apply_context_penalty
+        else 1.0
     )
 
     # Bootstrap mappings don't decay, but still receive context ranking penalties.

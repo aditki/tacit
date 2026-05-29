@@ -330,41 +330,70 @@ def _find_top_level_slash(expr: str) -> int | None:
 _HISTOGRAM_SUFFIXES = ("_bucket", "_count", "_sum", "_total", "_created", "_info")
 
 
+_METRIC_TOKEN_CHARS = r"A-Za-z0-9_:."
+
+
+def _metric_name_pattern(metric_name: str) -> re.Pattern[str]:
+    """Match a metric name as a complete metric token, not a substring."""
+    return re.compile(
+        rf"(?<![{_METRIC_TOKEN_CHARS}]){re.escape(metric_name)}(?![{_METRIC_TOKEN_CHARS}])"
+    )
+
+
+def _strip_known_metric_suffix(metric_name: str) -> tuple[str, str]:
+    """Return (base, suffix) if *metric_name* ends in a known metric suffix."""
+    for suffix in sorted(_HISTOGRAM_SUFFIXES, key=len, reverse=True):
+        if metric_name.endswith(suffix):
+            return metric_name[: -len(suffix)], suffix
+    return metric_name, ""
+
+
 def _suffix_aware_replace(expr: str, old_metric: str, new_metric: str) -> str:
     """Replace *old_metric* with *new_metric* in *expr*, handling suffixes.
 
-    When *old_metric* is ``http_request_duration_seconds`` and the expression
-    contains ``http_request_duration_seconds_bucket``, a naive ``.replace()``
-    with a *new_metric* of ``custom_duration_seconds_bucket`` would produce
-    ``custom_duration_seconds_bucket_bucket``.
+    The replacement is token-aware and suffix-aware:
 
-    This function:
-    1. Replaces suffixed variants first (longest match first) — if the new
-       metric already ends with that suffix, only the base portion is used
-       for substitution so the suffix is not doubled.
-    2. Replaces the bare base metric last.
+    * ``old_metric_bucket`` becomes ``new_metric_bucket``;
+    * if ``new_metric`` already has that same suffix, the suffix is not doubled;
+    * if ``new_metric`` has a different known suffix, that suffix is stripped
+      before appending the suffix from the expression; and
+    * bare replacements are bounded to metric-token characters so similarly
+      named metrics and already-replaced text are not rewritten accidentally.
     """
-    # Sort suffixes longest-first to avoid partial matches
-    suffixes = sorted(_HISTOGRAM_SUFFIXES, key=len, reverse=True)
+    if not old_metric or old_metric == new_metric:
+        return expr
 
-    # Replace suffixed variants first
-    for suffix in suffixes:
+    protected: dict[str, str] = {}
+
+    def protect(value: str) -> str:
+        token = f"__DASHFORGE_METRIC_TOKEN_{len(protected)}__"
+        protected[token] = value
+        return token
+
+    new_base, new_suffix = _strip_known_metric_suffix(new_metric)
+
+    # Replace suffixed variants first and protect replacements so the later bare
+    # pass cannot rewrite inside a new metric that happens to contain old_metric.
+    for suffix in sorted(_HISTOGRAM_SUFFIXES, key=len, reverse=True):
         old_suffixed = old_metric + suffix
-        if old_suffixed not in expr:
-            continue
         if new_metric.endswith(suffix):
-            # new_metric already has this suffix — use it as-is
             new_suffixed = new_metric
+        elif new_suffix:
+            new_suffixed = new_base + suffix
         else:
             new_suffixed = new_metric + suffix
-        expr = expr.replace(old_suffixed, new_suffixed)
+        expr = _metric_name_pattern(old_suffixed).sub(
+            lambda _m, replacement=new_suffixed: protect(replacement),
+            expr,
+        )
 
-    # Replace remaining bare base metric occurrences
-    # (only hits instances that are NOT part of a suffixed variant, since
-    # those were already replaced above)
-    if old_metric in expr:
-        expr = expr.replace(old_metric, new_metric)
+    expr = _metric_name_pattern(old_metric).sub(
+        lambda _m: protect(new_metric),
+        expr,
+    )
 
+    for token, value in protected.items():
+        expr = expr.replace(token, value)
     return expr
 
 
@@ -491,9 +520,6 @@ def compile_archetype(
         datasource_uid = _get_datasource_uid(catalog)
         datasource_type = "prometheus"
 
-    # Available metric names for validation
-    available_metrics = {e.name for e in catalog}
-
     params = {
         "service_filter": service_filter,
         "container_filter": container_filter,
@@ -564,7 +590,7 @@ def compile_archetype(
 
 
 def blend_archetypes(
-    ranked_archetypes: list[tuple["InvestigationArchetype", float]],
+    ranked_archetypes: list[tuple[InvestigationArchetype, float]],
     intent: Intent,
     catalog: list[MetricEntry],
     secondary_min_confidence: float = 0.4,

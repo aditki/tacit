@@ -424,6 +424,50 @@ def test_signalfx_backend_discover_error():
     print("[PASS] test_signalfx_backend_discover_error")
 
 
+# ── Bug 8: ingest_dashboard must close all backends ────────────────────
+
+def test_ingest_dashboard_closes_all_backends():
+    """When get_active_backends() returns multiple backends and one is
+    selected by name, ALL backends must be closed — not just the selected
+    one.  Otherwise, unused HTTP clients leak."""
+    from dashforge.backends.base import DashboardFeatures
+
+    grafana_backend = AsyncMock()
+    grafana_backend.name = "grafana"
+    grafana_backend.ingest_dashboard = AsyncMock(
+        return_value=DashboardFeatures(
+            dashboard_uid="test-uid",
+            dashboard_title="Test",
+            backend_name="grafana",
+            query_language="promql",
+            metrics_found=["up"],
+            panel_count=1,
+            panels=[],
+        )
+    )
+
+    signalfx_backend = AsyncMock()
+    signalfx_backend.name = "signalfx"
+
+    with patch(
+        "dashforge.backends.get_active_backends",
+        return_value=[grafana_backend, signalfx_backend],
+    ):
+        from dashforge.dashboard_ingest import ingest_dashboard
+
+        asyncio.run(ingest_dashboard(
+            dashboard_uid="test-uid",
+            backend_name="grafana",
+            auto_approve=False,
+        ))
+
+    # Both backends must have close() called
+    grafana_backend.close.assert_awaited_once()
+    signalfx_backend.close.assert_awaited_once()
+
+print("[PASS] test_ingest_dashboard_closes_all_backends")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════════════════

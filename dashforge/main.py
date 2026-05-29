@@ -628,23 +628,40 @@ async def approve_ingested_dashboard(dashboard_uid: str):
 
     # Create signal mappings from inferred signals
     mappings_created = 0
-    for signal_type in ingested.get("signals_inferred", []):
-        # Find matching metrics for this signal
-        for metric in ingested.get("metrics_found", []):
-            from dashforge.signals import _metric_matches_pattern
-            signal_data = store.get_signal_type(signal_type)
-            if signal_data:
-                for mapping in signal_data.get("mappings", []):
-                    if _metric_matches_pattern(metric, mapping["metric_pattern"]):
-                        store.add_mapping(
-                            signal_type=signal_type,
-                            metric_pattern=metric,
-                            confidence=mapping.get("confidence", 0.6),
-                            source_type="dashboard_ingest",
-                            source_refs=[dashboard_uid],
-                        )
-                        mappings_created += 1
-                        break
+    for sig in ingested.get("signals_inferred", []):
+        # Support both old format (plain signal type string) and new format
+        # (dict with signal_type, metric, confidence)
+        if isinstance(sig, dict):
+            signal_type = sig["signal_type"]
+            metric = sig.get("metric", "")
+            confidence = sig.get("confidence", 0.6)
+            if metric and confidence >= 0.5:
+                store.add_mapping(
+                    signal_type=signal_type,
+                    metric_pattern=metric,
+                    confidence=confidence,
+                    source_type="dashboard_ingest",
+                    source_refs=[dashboard_uid],
+                )
+                mappings_created += 1
+        else:
+            # Legacy: plain string signal type — fall back to pattern matching
+            signal_type = sig
+            for metric in ingested.get("metrics_found", []):
+                from dashforge.signals import _metric_matches_pattern
+                signal_data = store.get_signal_type(signal_type)
+                if signal_data:
+                    for mapping in signal_data.get("mappings", []):
+                        if _metric_matches_pattern(metric, mapping["metric_pattern"]):
+                            store.add_mapping(
+                                signal_type=signal_type,
+                                metric_pattern=metric,
+                                confidence=mapping.get("confidence", 0.6),
+                                source_type="dashboard_ingest",
+                                source_refs=[dashboard_uid],
+                            )
+                            mappings_created += 1
+                            break
 
     store.approve_ingested_dashboard(dashboard_uid)
 
