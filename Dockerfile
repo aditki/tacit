@@ -12,4 +12,4 @@ RUN uv sync --frozen --no-dev
 
 EXPOSE 8000
 
-CMD ["uv", "run", "dashforge"]
+CMD ["uv", "run", "dashforge", "serve"]
