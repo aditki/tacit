@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # ── Grafana (local dev) ──────────────────────────────────────────────
   grafana:
@@ -49,6 +47,9 @@ services:
     depends_on:
       - grafana
       - prometheus
+    # Uncomment below if using something like ollama on the host and want to access it from the container
+    # extra_hosts:
+    #  - "host.docker.internal:host-gateway" # use "http://host.docker.internal:11434" in .env for LLM_API_BASE
 
 volumes:
   grafana_data:
