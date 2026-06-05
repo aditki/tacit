@@ -414,7 +414,7 @@
         });
         if (!resp.ok) {
           const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-          throw new Error(err.detail || `HTTP ${resp.status}`);
+          throw new Error(errMsg(err, `HTTP ${resp.status}`));
         }
         const data = await resp.json();
         lastDashboardUid = data.dashboard_uid;
@@ -519,7 +519,7 @@
           document.getElementById('feedback-form').querySelectorAll('button,textarea').forEach(el => el.disabled = true);
         } else {
           const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-          statusEl.textContent = `Error: ${err.detail || resp.statusText}`;
+          statusEl.textContent = `Error: ${errMsg(err, resp.statusText)}`;
           statusEl.style.color = '#ef4444';
         }
       } catch(e) {
@@ -751,6 +751,20 @@
     function escAttr(s) {
       return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
+    // Normalize an error response body into a readable string. FastAPI returns
+    // a plain string `detail` for HTTPExceptions but an array of
+    // {loc, msg, type} objects for 422 validation errors.
+    function errMsg(body, fallback) {
+      const d = body && body.detail;
+      if (typeof d === 'string') return d;
+      if (Array.isArray(d)) {
+        return d.map(e => {
+          const field = Array.isArray(e.loc) ? e.loc.filter(p => p !== 'body').join('.') : '';
+          return field ? `${field}: ${e.msg}` : e.msg;
+        }).join('; ');
+      }
+      return fallback;
+    }
 
     /* ── Learning tab ─────────────────────────────────────────── */
     let autoApprove = false;
@@ -780,7 +794,7 @@
         });
         if (!resp.ok) {
           const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-          throw new Error(err.detail || `HTTP ${resp.status}`);
+          throw new Error(errMsg(err, `HTTP ${resp.status}`));
         }
         const data = await resp.json();
         const signals = (data.signals_inferred || []);
@@ -894,7 +908,7 @@
         const signalList = signals.signal_types || [];
         const teachSelect = document.getElementById('teach-signal');
         teachSelect.innerHTML = signalList.map(s =>
-          `<option value="${esc(s.signal_type)}">${esc(s.signal_type)} (${esc(s.category || '')})</option>`
+          `<option value="${escAttr(s.signal_type)}">${esc(s.signal_type)} (${esc(s.category || '')})</option>`
         ).join('');
 
         // Group by category
@@ -990,7 +1004,7 @@
         });
         if (!resp.ok) {
           const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-          throw new Error(err.detail || `HTTP ${resp.status}`);
+          throw new Error(errMsg(err, `HTTP ${resp.status}`));
         }
         statusEl.textContent = 'Mapping taught!';
         statusEl.style.color = '#34d399';

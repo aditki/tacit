@@ -280,7 +280,14 @@ class SignalStore:
         source_type: str = "bootstrap",
         source_refs: list[str] | None = None,
     ) -> int:
-        """Add or update a signal-to-metric mapping. Returns mapping ID."""
+        """Add or update a signal-to-metric mapping. Returns mapping ID.
+
+        ``confidence`` is a 0.0–1.0 score; out-of-range values (e.g. ``90``
+        instead of ``0.9``) are rejected here so a single bad write cannot
+        dominate resolution / effective-confidence sorting.
+        """
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError(f"confidence must be within [0.0, 1.0], got {confidence!r}")
         now = time.time()
         with self._conn() as conn:
             # Ensure signal type exists

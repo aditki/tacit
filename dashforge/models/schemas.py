@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ── Intent ───────────────────────────────────────────────────────────────────
 
@@ -297,3 +297,125 @@ class ArchetypeReloadResponse(BaseModel):
     message: str = Field(description="Status message")
     count: int = Field(description="Number of archetypes loaded")
     archetypes: list[dict[str, Any]] = Field(description="Summary of each loaded archetype")
+
+
+# ── Signals / Learning ───────────────────────────────────────────────────────
+
+
+class MetricPattern(BaseModel):
+    """A single signal→metric mapping taught via the API."""
+
+    model_config = {"extra": "forbid"}
+
+    pattern: str = Field(description="Metric name or pattern this signal maps to")
+    confidence: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score (0.0–1.0). Values like 90 (meant 0.9) are rejected.",
+    )
+
+    @field_validator("pattern")
+    @classmethod
+    def _strip_pattern(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("pattern must not be empty")
+        return v
+
+
+class TeachSignalRequest(BaseModel):
+    """Request body for ``POST /api/v1/signals/teach``.
+
+    Strictly validated: confidence bounds, non-empty identifiers, and unknown
+    fields are all enforced here rather than in the endpoint body.
+    """
+
+    model_config = {
+        "extra": "forbid",
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "signal_type": "queue_depth",
+                    "metric_patterns": [
+                        {"pattern": "kafka_consumer_lag", "confidence": 0.9},
+                        {"pattern": "inflight_messages", "confidence": 0.8},
+                    ],
+                    "description": "Queue pressure metrics for our Kafka setup",
+                    "category": "saturation",
+                    "services": ["payment-service"],
+                }
+            ]
+        },
+    }
+
+    signal_type: str = Field(description="Organization-specific signal name, e.g. 'queue_depth'")
+    metric_patterns: list[MetricPattern] = Field(
+        default_factory=list, description="Metric patterns this signal maps to"
+    )
+    description: str = Field(default="", description="Human-readable description of the signal")
+    category: str = Field(default="", description="Signal category, e.g. 'saturation'")
+    unit: str = Field(default="", description="Unit hint for the signal")
+    services: list[str] = Field(default_factory=list, description="Context: services this mapping applies to")
+    datasource_types: list[str] = Field(
+        default_factory=list, description="Context: datasource types this mapping applies to"
+    )
+    environments: list[str] = Field(default_factory=list, description="Context: environments this mapping applies to")
+    taught_by: str = Field(default="api", description="Provenance: who taught this mapping")
+
+    @field_validator("signal_type")
+    @classmethod
+    def _strip_signal_type(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("signal_type must not be empty")
+        return v
+
+
+class TeachSignalResponse(BaseModel):
+    """Result of teaching a signal mapping."""
+
+    signal_type: str
+    mappings_created: int
+    message: str
+
+
+class LearnDashboardRequest(BaseModel):
+    """Request body for ``POST /api/v1/learn/dashboard``."""
+
+    model_config = {
+        "extra": "forbid",
+        "json_schema_extra": {
+            "examples": [{"dashboard_uid": "abc123", "backend": "grafana", "auto_approve": False}]
+        },
+    }
+
+    dashboard_uid: str = Field(description="Dashboard UID/ID to ingest (interpretation is backend-specific)")
+    backend: str = Field(
+        default="", description="Backend to fetch from: 'grafana' or 'signalfx' (default: first active)"
+    )
+    auto_approve: bool = Field(
+        default=False,
+        description="If true, approve and create signal mappings immediately; otherwise store as 'pending'.",
+    )
+
+    @field_validator("dashboard_uid")
+    @classmethod
+    def _strip_uid(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("dashboard_uid must not be empty")
+        return v
+
+    @field_validator("auto_approve", mode="before")
+    @classmethod
+    def _parse_auto_approve(cls, v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            normalized = v.strip().lower()
+            if normalized == "true":
+                return True
+            if normalized == "false":
+                return False
+        raise ValueError("auto_approve must be a boolean or the string 'true'/'false'")

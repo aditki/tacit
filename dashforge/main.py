@@ -9,7 +9,7 @@ from pathlib import Path
 
 import structlog
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -26,6 +26,9 @@ from dashforge.models.schemas import (
     FeedbackResponse,
     FeedbackStatsResponse,
     HealthResponse,
+    LearnDashboardRequest,
+    TeachSignalRequest,
+    TeachSignalResponse,
 )
 from dashforge.pipeline import run_pipeline
 
@@ -481,67 +484,51 @@ async def get_signal(signal_type: str):
     dependencies=[Depends(verify_api_key)],
     tags=["Signals"],
     summary="Teach DashForge a signal mapping",
+    response_model=TeachSignalResponse,
     response_description="Confirmation of the created mapping",
 )
-async def teach_signal(request: Request):
+async def teach_signal(request: TeachSignalRequest) -> TeachSignalResponse:
     """Teach DashForge an organization-specific signal mapping.
 
     Example: tell the system that for your org, 'queue_depth' means
     'kafka_consumer_lag' and 'inflight_messages'.
 
-    Request body:
-    ```json
-    {
-        "signal_type": "queue_depth",
-        "metric_patterns": [
-            {"pattern": "kafka_consumer_lag", "confidence": 0.9},
-            {"pattern": "inflight_messages", "confidence": 0.8}
-        ],
-        "description": "Queue pressure metrics for our Kafka setup",
-        "services": ["payment-service"],
-        "category": "saturation"
-    }
-    ```"""
-    body = await request.json()
-    signal_type = body.get("signal_type", "").strip()
-    if not signal_type:
-        raise HTTPException(status_code=400, detail="signal_type is required")
-
+    The request body is validated against ``TeachSignalRequest`` — confidence
+    bounds, non-empty identifiers, and unknown fields are all enforced before
+    this handler runs (invalid input → 422).
+    """
     from dashforge.signals import get_signal_store
 
     store = get_signal_store()
 
     # Register or update the signal type
     store.register_signal_type(
-        signal_type=signal_type,
-        description=body.get("description", ""),
-        category=body.get("category", ""),
-        unit=body.get("unit", ""),
+        signal_type=request.signal_type,
+        description=request.description,
+        category=request.category,
+        unit=request.unit,
     )
 
-    # Add metric mappings
+    # Add metric mappings (each already validated: non-empty pattern, 0–1 confidence)
     mappings_created = 0
-    for mp in body.get("metric_patterns", []):
-        pattern = mp.get("pattern", "").strip()
-        if not pattern:
-            continue
+    for mp in request.metric_patterns:
         store.add_mapping(
-            signal_type=signal_type,
-            metric_pattern=pattern,
-            confidence=mp.get("confidence", 0.7),
-            context_services=body.get("services", []),
-            context_datasource_types=body.get("datasource_types", []),
-            context_environments=body.get("environments", []),
+            signal_type=request.signal_type,
+            metric_pattern=mp.pattern,
+            confidence=mp.confidence,
+            context_services=request.services,
+            context_datasource_types=request.datasource_types,
+            context_environments=request.environments,
             source_type="teach",
-            source_refs=[f"manual:{body.get('taught_by', 'api')}"],
+            source_refs=[f"manual:{request.taught_by}"],
         )
         mappings_created += 1
 
-    return {
-        "signal_type": signal_type,
-        "mappings_created": mappings_created,
-        "message": f"Signal '{signal_type}' updated with {mappings_created} mapping(s)",
-    }
+    return TeachSignalResponse(
+        signal_type=request.signal_type,
+        mappings_created=mappings_created,
+        message=f"Signal '{request.signal_type}' updated with {mappings_created} mapping(s)",
+    )
 
 
 # ── Dashboard learning endpoints ─────────────────────────────────────────
@@ -554,7 +541,7 @@ async def teach_signal(request: Request):
     summary="Learn from an existing Grafana dashboard",
     response_description="Extracted features, inferred signals, and generated archetype YAML",
 )
-async def learn_from_dashboard(request: Request):
+async def learn_from_dashboard(request: LearnDashboardRequest):
     """Ingest an existing Grafana dashboard to learn operational patterns.
 
     Extracts metric co-occurrence, panel groupings, aggregation patterns,
@@ -562,44 +549,32 @@ async def learn_from_dashboard(request: Request):
 
     Optionally auto-generates an archetype YAML snippet for review.
 
-    Request body:
-    ```json
-    {
-        "dashboard_uid": "abc123",
-        "backend": "grafana",
-        "auto_approve": false
-    }
-    ```
+    The request body is validated against ``LearnDashboardRequest``;
+    ``auto_approve`` is a strict boolean, so a JSON serialization mistake like
+    the string ``"false"`` is read correctly rather than treated as truthy
+    (invalid input → 422).
 
     The ``backend`` field selects which backend to fetch from: ``"grafana"``
     (default) or ``"signalfx"``. If omitted, uses the first active backend.
 
     When `auto_approve` is false (default), the ingested dashboard is stored
     as 'pending' for human review before signal mappings are activated."""
-    body = await request.json()
-    dashboard_uid = body.get("dashboard_uid", "").strip()
-    if not dashboard_uid:
-        raise HTTPException(status_code=400, detail="dashboard_uid is required")
-
-    auto_approve = body.get("auto_approve", False)
-    backend_name = body.get("backend", "")
-
     from dashforge.dashboard_ingest import ingest_dashboard
 
     try:
         result = await ingest_dashboard(
-            dashboard_uid=dashboard_uid,
-            backend_name=backend_name,
-            auto_approve=auto_approve,
+            dashboard_uid=request.dashboard_uid,
+            backend_name=request.backend,
+            auto_approve=request.auto_approve,
         )
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
-        logger.exception("dashboard_ingest_failed", uid=dashboard_uid, backend=backend_name)
+        logger.exception("dashboard_ingest_failed", uid=request.dashboard_uid, backend=request.backend)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to ingest dashboard '{dashboard_uid}'. "
+            detail=f"Failed to ingest dashboard '{request.dashboard_uid}'. "
             "Check that the UID exists and the backend is accessible.",
         )
 

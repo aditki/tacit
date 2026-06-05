@@ -274,6 +274,14 @@ def _extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(panel_ds, dict) and not datasource_type:
         datasource_type = panel_ds.get("type", "")
 
+    # Per-panel drilldown links (panel.links). These attach navigation paths
+    # at the panel level and are distinct from dashboard-level links.
+    panel_links = []
+    for link in panel.get("links", []):
+        if not isinstance(link, dict):
+            continue
+        panel_links.append({"title": link.get("title", ""), "url": link.get("url", "")})
+
     return {
         "title": title,
         "description": panel.get("description", ""),
@@ -283,6 +291,7 @@ def _extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
         "aggregation_patterns": agg_patterns,
         "datasource_type": datasource_type,
         "unit": panel.get("fieldConfig", {}).get("defaults", {}).get("unit", ""),
+        "links": panel_links,
     }
 
 
@@ -369,6 +378,14 @@ def parse_dashboard_json(dashboard_json: dict[str, Any]) -> dict[str, Any]:
             drilldown_links.extend(link.get("tags", []))
         elif link.get("type") == "link":
             drilldown_links.append(link.get("url", ""))
+
+    # Per-panel drilldown links (panel.links) captured in _extract_panel_data.
+    # Fold them into the aggregate so navigation paths aren't discarded.
+    for p in all_panels:
+        for link in p.get("links", []):
+            target = link.get("url") or link.get("title")
+            if target and target not in drilldown_links:
+                drilldown_links.append(target)
 
     return {
         "dashboard_uid": uid,

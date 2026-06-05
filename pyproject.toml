@@ -41,6 +41,7 @@ dev = [
     "pyinstaller>=6.0.0",
     "black>=26.5.1",
     "mypy>=2.1.0",
+    "types-PyYAML>=6.0",
 ]
 
 [tool.pytest.ini_options]
