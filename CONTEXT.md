@@ -598,9 +598,19 @@ python tests/validate.py --mode pipeline --api-url http://localhost:8000 --revie
 - No Prometheus `/metrics` endpoint for self-observability
 
 ### Roadmap (see README.md for full list)
+- **Product boundary**: DashForge should consume organizational knowledge, not custody it.
+  Enterprise runbooks, service catalogs, ownership data, postmortems, and policy knowledge
+  should come through customer-owned RAG/A2A/MCP systems. DashForge owns observability
+  outcomes: investigation history, dashboard provenance, feedback-derived metric quality,
+  archetype gaps, and what worked in prior incidents.
 - **Near term**: Ephemeral dashboard TTL, Loki/Tempo support, conversational refinement,
   alert context ingestion, dashboard versioning
+- **Personal/demo memory**: Optional local memory mode using SQLite FTS over DashForge
+  history/feedback, with Qdrant as an optional Docker-backed semantic demo backend.
+  This is a convenience path, not the enterprise knowledge strategy.
 - **Highest-leverage**: Grafana App Plugin — native "Investigate with DashForge" side panel
   inside Grafana. Shifts from external service to native workflow. Zero context switch.
-- **Enterprise**: Metadata indexing, semantic retrieval, AST query compiler,
-  Observability IR, query cost planner, RBAC, circuit breakers, self-observability
+- **Enterprise**: Hardened context provider contract for RAG/A2A/MCP, DashForge-native
+  observability memory, metadata indexing, semantic metric retrieval, Observability IR,
+  deterministic query compiler, query cost planner, RBAC, circuit breakers,
+  self-observability
