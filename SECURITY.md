@@ -36,7 +36,9 @@ If you discover a security issue, please avoid opening a public GitHub issue.
 Instead:
 
 * open a private GitHub security advisory if available
-* or contact the maintainer directly
+* or, if private advisories are not enabled, open a public issue titled
+  `Security disclosure channel request` with no vulnerability details so the
+  maintainer can provide a private response channel before details are shared
 
 Please include:
 

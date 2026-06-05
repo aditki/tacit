@@ -56,20 +56,20 @@ cd dashforge
 uv sync
 cp .env.example .env
 
-python -m dashforge.cli init
-python -m dashforge.cli doctor
+uv run -m dashforge.cli init
+uv run -m dashforge.cli doctor
 ```
 
 Run the API locally:
 
 ```bash
-python -m dashforge.main
+uv run -m dashforge.main
 ```
 
 Run tests:
 
 ```bash
-pytest
+uv run pytest
 ```
 
 ## Contribution Style
