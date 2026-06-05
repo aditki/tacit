@@ -22,6 +22,10 @@ class QueryTemplate(BaseModel):
     legend_format: str = ""
     query_language: str = "promql"
     datasource_type: str = "prometheus"
+    cloudwatch_namespace: str = ""
+    cloudwatch_stat: str = ""
+    cloudwatch_dimensions: dict[str, str | list[str]] = Field(default_factory=dict)
+    cloudwatch_region: str = ""
 
 
 class PanelTemplate(BaseModel):

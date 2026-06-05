@@ -105,6 +105,28 @@ class MetricEntry(BaseModel):
     dimensions: list[str] = Field(default_factory=list, description="Available dimensions / label names")
 
 
+class QueryTarget(BaseModel):
+    """Resolved datasource identity for a query.
+
+    Keep datasource UID, datasource type, and query language together so code
+    paths cannot accidentally update one without the others.
+    """
+
+    datasource_uid: str
+    datasource_type: str
+    query_language: str
+    datasource_name: str = ""
+
+    @classmethod
+    def from_metric(cls, metric: MetricEntry) -> QueryTarget:
+        return cls(
+            datasource_uid=metric.datasource_uid,
+            datasource_type=metric.datasource_type,
+            query_language=metric.query_language,
+            datasource_name=metric.datasource_name,
+        )
+
+
 class DiscoveredMetric(BaseModel):
     metric_name: str
     datasource_uid: str
@@ -131,6 +153,7 @@ class PanelQuery(BaseModel):
     legend_format: str = Field(default="{{instance}}", description="Legend template")
     datasource_uid: str
     datasource_type: str = "prometheus"
+    query_language: str = ""
     # CloudWatch-specific fields (only set when datasource_type='cloudwatch')
     cloudwatch_namespace: str = Field(default="", description="AWS CloudWatch namespace, e.g. 'AWS/ApplicationELB'")
     cloudwatch_stat: str = Field(default="", description="CloudWatch statistic: Sum, Average, p99, etc.")

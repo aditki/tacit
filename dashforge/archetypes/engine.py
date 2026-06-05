@@ -18,6 +18,7 @@ from dashforge.models.schemas import (
     MetricEntry,
     PanelQuery,
     PanelSpec,
+    QueryTarget,
 )
 
 logger = structlog.get_logger()
@@ -102,11 +103,66 @@ def _resolve_container_filter(
     return f'container=~".*{_re2_escape(target)}.*"'
 
 
-def _get_datasource_uid(catalog: list[MetricEntry]) -> str:
-    """Get the datasource UID from the catalog (first entry)."""
+_PROMETHEUS_DATASOURCE_TYPES = {"prometheus", "mimir", "cortex", "thanos"}
+_SIGNALFX_DATASOURCE_TYPES = {"signalfx", "grafana-signalfx-datasource"}
+
+
+def _datasource_type_matches(candidate: str, requested: str) -> bool:
+    candidate = candidate.lower()
+    requested = requested.lower()
+    if not requested:
+        return True
+    if candidate == requested:
+        return True
+    if candidate in _PROMETHEUS_DATASOURCE_TYPES and requested in _PROMETHEUS_DATASOURCE_TYPES:
+        return True
+    if candidate in _SIGNALFX_DATASOURCE_TYPES and requested in _SIGNALFX_DATASOURCE_TYPES:
+        return True
+    return False
+
+
+def _datasource_type_for_language(query_language: str, fallback: str = "prometheus") -> str:
+    return {
+        "signalflow": "signalfx",
+        "logql": "loki",
+        "cloudwatch": "cloudwatch",
+        "lucene": "elasticsearch",
+        "graphite": "graphite",
+        "influxql": "influxdb",
+    }.get(query_language.lower(), fallback)
+
+
+def _resolve_query_target(
+    catalog: list[MetricEntry],
+    datasource_type: str = "",
+    query_language: str = "",
+    fallback_uid: str = "",
+) -> QueryTarget:
+    """Resolve datasource identity as one object, preferring matching catalog entries."""
+    query_language = query_language.lower()
+    datasource_type = datasource_type.lower()
+    for entry in catalog:
+        if datasource_type and not _datasource_type_matches(entry.datasource_type, datasource_type):
+            continue
+        if query_language and (entry.query_language or "").lower() != query_language:
+            continue
+        return QueryTarget.from_metric(entry)
+    for entry in catalog:
+        if datasource_type and _datasource_type_matches(entry.datasource_type, datasource_type):
+            return QueryTarget.from_metric(entry)
+    if datasource_type or query_language:
+        return QueryTarget(
+            datasource_uid=fallback_uid,
+            datasource_type=datasource_type or _datasource_type_for_language(query_language, ""),
+            query_language=query_language,
+        )
     if catalog:
-        return catalog[0].datasource_uid
-    return ""
+        return QueryTarget.from_metric(catalog[0])
+    return QueryTarget(
+        datasource_uid=fallback_uid,
+        datasource_type=datasource_type,
+        query_language=query_language,
+    )
 
 
 def _resolve_rate_interval(intent: Intent) -> str:
@@ -433,6 +489,10 @@ def _apply_metric_substitutions(
                     legend_format=qt.legend_format,
                     query_language=qt.query_language,
                     datasource_type=qt.datasource_type,
+                    cloudwatch_namespace=qt.cloudwatch_namespace,
+                    cloudwatch_stat=qt.cloudwatch_stat,
+                    cloudwatch_dimensions=qt.cloudwatch_dimensions,
+                    cloudwatch_region=qt.cloudwatch_region,
                 )
             )
         new_panels.append(
@@ -485,6 +545,7 @@ def _resolve_archetype_signals(
             signal_bindings=archetype.signal_bindings,
             catalog=catalog,
             context_service=intent.services[0] if intent.services else "",
+            context_datasource_type=_datasource_type_for_language(target_language),
             context_archetype=archetype.id,
             target_query_language=target_language,
         )
@@ -526,13 +587,16 @@ def compile_archetype(
     if target_language == "signalflow":
         service_filter = _resolve_sfx_service_filter(intent, catalog)
         container_filter = _resolve_sfx_container_filter(intent, catalog)
-        datasource_uid = "signalfx-direct"
-        datasource_type = "signalfx"
+        default_target = _resolve_query_target(
+            catalog,
+            "signalfx",
+            "signalflow",
+            fallback_uid="signalfx-direct",
+        )
     else:
         service_filter = _resolve_service_filter(intent, catalog)
         container_filter = _resolve_container_filter(intent, catalog)
-        datasource_uid = _get_datasource_uid(catalog)
-        datasource_type = "prometheus"
+        default_target = _resolve_query_target(catalog, "prometheus", "promql")
 
     params = {
         "service_filter": service_filter,
@@ -565,29 +629,32 @@ def compile_archetype(
                     # Compile the resolved PromQL template directly to SignalFlow.
                     legend = qt.legend_format or pt.title
                     expr = _promql_template_to_signalflow(expr, service_filter, container_filter, legend)
-                query_datasource_type = datasource_type
+                query_target = default_target
             else:
                 # Non-PromQL queries are honored verbatim — no PromQL
                 # format/escaping or PromQL→SignalFlow conversion.
                 expr = qt.expr
                 if not qt.datasource_type or qt.datasource_type == "prometheus":
-                    query_datasource_type = {
-                        "signalflow": "signalfx",
-                        "logql": "loki",
-                        "cloudwatch": "cloudwatch",
-                        "lucene": "elasticsearch",
-                        "graphite": "graphite",
-                        "influxql": "influxdb",
-                    }.get(qt_language, datasource_type)
+                    query_datasource_type = _datasource_type_for_language(qt_language, default_target.datasource_type)
                 else:
                     query_datasource_type = qt.datasource_type
+                query_target = _resolve_query_target(
+                    catalog,
+                    query_datasource_type,
+                    qt_language,
+                )
 
             panel_queries.append(
                 PanelQuery(
                     expr=expr,
                     legend_format=qt.legend_format,
-                    datasource_uid=datasource_uid,
-                    datasource_type=query_datasource_type,
+                    datasource_uid=query_target.datasource_uid,
+                    datasource_type=query_target.datasource_type,
+                    query_language=query_target.query_language,
+                    cloudwatch_namespace=qt.cloudwatch_namespace,
+                    cloudwatch_stat=qt.cloudwatch_stat,
+                    cloudwatch_dimensions=qt.cloudwatch_dimensions,
+                    cloudwatch_region=qt.cloudwatch_region,
                 )
             )
 

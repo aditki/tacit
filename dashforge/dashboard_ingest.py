@@ -635,13 +635,13 @@ def generate_archetype_yaml(
             for ct in cloudwatch_targets:
                 queries.append(
                     {
+                        "expr": ct.get("metric_name", ""),
                         "query_language": "cloudwatch",
                         "datasource_type": "cloudwatch",
-                        "namespace": ct.get("namespace", ""),
-                        "metric_name": ct.get("metric_name", ""),
-                        "stat": ct.get("stat", ""),
-                        "region": ct.get("region", ""),
-                        "dimensions": ct.get("dimensions", {}),
+                        "cloudwatch_namespace": ct.get("namespace", ""),
+                        "cloudwatch_stat": ct.get("stat", ""),
+                        "cloudwatch_region": ct.get("region", ""),
+                        "cloudwatch_dimensions": ct.get("dimensions", {}),
                         "legend_format": "",
                     }
                 )

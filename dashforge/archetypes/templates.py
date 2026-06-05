@@ -429,10 +429,14 @@ def _load_archetypes_from_yaml(path: Path) -> list[InvestigationArchetype]:
         for p in entry.get("panels", []):
             queries = [
                 QueryTemplate(
-                    expr=q["expr"],
+                    expr=q.get("expr") or q.get("metric_name", ""),
                     legend_format=q.get("legend_format", ""),
                     query_language=q.get("query_language", "promql"),
                     datasource_type=q.get("datasource_type", "prometheus"),
+                    cloudwatch_namespace=q.get("cloudwatch_namespace", q.get("namespace", "")),
+                    cloudwatch_stat=q.get("cloudwatch_stat", q.get("stat", "")),
+                    cloudwatch_dimensions=q.get("cloudwatch_dimensions", q.get("dimensions", {})),
+                    cloudwatch_region=q.get("cloudwatch_region", q.get("region", "")),
                 )
                 for q in p.get("queries", [])
             ]

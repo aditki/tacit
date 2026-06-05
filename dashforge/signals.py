@@ -619,7 +619,7 @@ class SignalStore:
                     signal_type=sig_type,
                     metric_pattern=mp["pattern"],
                     confidence=mp.get("confidence", 0.5),
-                    context_datasource_types=mp.get("datasource_types", []),
+                    context_datasource_types=mp["datasource_types"] if "datasource_types" in mp else None,
                     source_type="bootstrap",
                 )
                 count += 1
