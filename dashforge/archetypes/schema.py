@@ -5,6 +5,7 @@ with pre-defined panel templates and deterministic query patterns.
 The LLM classifies the problem → archetype, then fills parameters —
 it does NOT invent the dashboard structure.
 """
+
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
@@ -51,13 +52,13 @@ class InvestigationArchetype(BaseModel):
     required_metrics: list[str] = Field(
         default_factory=list,
         description="Metric name patterns this archetype needs (regex-style), "
-        "e.g. ['http_requests_total', 'http_request_duration_seconds.*']"
+        "e.g. ['http_requests_total', 'http_request_duration_seconds.*']",
     )
     required_signals: list[str] = Field(
         default_factory=list,
         description="Semantic signal types this archetype needs, "
         "e.g. ['request_latency', 'error_rate']. Resolved to actual "
-        "metrics at compile time via the signal mapping store."
+        "metrics at compile time via the signal mapping store.",
     )
     signal_bindings: dict[str, str] = Field(
         default_factory=dict,
@@ -65,7 +66,7 @@ class InvestigationArchetype(BaseModel):
         "When the default metric is missing from the catalog, the signal "
         "resolution engine finds the best alternative. "
         "e.g. {'request_latency': 'http_request_duration_seconds', "
-        "'error_rate': 'http_requests_total'}"
+        "'error_rate': 'http_requests_total'}",
     )
     panels: list[PanelTemplate]
     tags: list[str] = Field(default_factory=list)

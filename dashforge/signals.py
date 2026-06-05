@@ -16,6 +16,7 @@ Many-to-many relationship: one metric can imply multiple signals (e.g.
 ``queue_depth`` → saturation, throughput_mismatch, downstream_outage);
 one signal can map to many metrics across environments.
 """
+
 from __future__ import annotations
 
 import fnmatch
@@ -38,8 +39,8 @@ _DEFAULT_DB_PATH = Path("data/dashforge_signals.db")
 # ── Confidence decay ────────────────────────────────────────────────────────
 # Mappings decay in confidence over time if not reinforced.
 _DECAY_HALF_LIFE_DAYS = 90  # confidence halves every 90 days without use
-_MIN_CONFIDENCE = 0.05      # floor — never fully forget
-_TRUST_THRESHOLD = 0.15     # below this, mapping is excluded from resolution
+_MIN_CONFIDENCE = 0.05  # floor — never fully forget
+_TRUST_THRESHOLD = 0.15  # below this, mapping is excluded from resolution
 _CONTEXT_MISSING_PENALTY = 0.7  # lower rank when mapping has context caller lacks
 
 
@@ -91,7 +92,8 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
 
 CREATE TABLE IF NOT EXISTS ingested_dashboards (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    dashboard_uid       TEXT NOT NULL UNIQUE,
+    dashboard_uid       TEXT NOT NULL,
+    backend_name        TEXT NOT NULL DEFAULT '',
     dashboard_title     TEXT NOT NULL DEFAULT '',
     dashboard_tags      TEXT NOT NULL DEFAULT '[]',
 
@@ -112,12 +114,12 @@ CREATE TABLE IF NOT EXISTS ingested_dashboards (
     archetype_generated TEXT NOT NULL DEFAULT '',
 
     created_at          REAL NOT NULL,
-    reviewed_at         REAL
+    reviewed_at         REAL,
+    UNIQUE(dashboard_uid, backend_name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_smm_signal ON signal_metric_mappings(signal_type);
 CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern);
-CREATE INDEX IF NOT EXISTS idx_ingested_uid ON ingested_dashboards(dashboard_uid);
 """
 
 
@@ -145,7 +147,69 @@ class SignalStore:
     def _ensure_schema(self):
         with self._conn() as conn:
             conn.executescript(_SCHEMA_SQL)
+            self._ensure_ingested_dashboard_backend_scope(conn)
         logger.info("signal_store_init", db_path=str(self._db_path))
+
+    def _ensure_ingested_dashboard_backend_scope(self, conn: sqlite3.Connection) -> None:
+        columns = [row["name"] for row in conn.execute("PRAGMA table_info(ingested_dashboards)").fetchall()]
+        if "backend_name" not in columns:
+            conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN backend_name TEXT NOT NULL DEFAULT ''")
+            columns.append("backend_name")
+
+        for index in conn.execute("PRAGMA index_list(ingested_dashboards)").fetchall():
+            if not index["unique"]:
+                continue
+            indexed_cols = [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
+            if indexed_cols == ["dashboard_uid"]:
+                self._rebuild_ingested_dashboards_table(conn)
+                return
+
+        conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_uid_backend
+               ON ingested_dashboards(dashboard_uid, backend_name)""")
+
+    def _rebuild_ingested_dashboards_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute("ALTER TABLE ingested_dashboards RENAME TO ingested_dashboards_old")
+        conn.executescript("""
+            CREATE TABLE ingested_dashboards (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                dashboard_uid       TEXT NOT NULL,
+                backend_name        TEXT NOT NULL DEFAULT '',
+                dashboard_title     TEXT NOT NULL DEFAULT '',
+                dashboard_tags      TEXT NOT NULL DEFAULT '[]',
+                metrics_found       TEXT NOT NULL DEFAULT '[]',
+                panel_count         INTEGER NOT NULL DEFAULT 0,
+                row_groups          TEXT NOT NULL DEFAULT '[]',
+                metric_cooccurrence TEXT NOT NULL DEFAULT '{}',
+                aggregation_patterns TEXT NOT NULL DEFAULT '[]',
+                query_transformations TEXT NOT NULL DEFAULT '[]',
+                panel_titles        TEXT NOT NULL DEFAULT '[]',
+                alert_links         TEXT NOT NULL DEFAULT '[]',
+                drilldown_links     TEXT NOT NULL DEFAULT '[]',
+                status              TEXT NOT NULL DEFAULT 'pending',
+                signals_inferred    TEXT NOT NULL DEFAULT '[]',
+                archetype_generated TEXT NOT NULL DEFAULT '',
+                created_at          REAL NOT NULL,
+                reviewed_at         REAL,
+                UNIQUE(dashboard_uid, backend_name)
+            );
+        """)
+        conn.execute("""INSERT INTO ingested_dashboards
+               (id, dashboard_uid, backend_name, dashboard_title, dashboard_tags,
+                metrics_found, panel_count, row_groups, metric_cooccurrence,
+                aggregation_patterns, query_transformations, panel_titles,
+                alert_links, drilldown_links, status, signals_inferred,
+                archetype_generated, created_at, reviewed_at)
+               SELECT id, dashboard_uid, COALESCE(backend_name, ''), dashboard_title, dashboard_tags,
+                      metrics_found, panel_count, row_groups, metric_cooccurrence,
+                      aggregation_patterns, query_transformations, panel_titles,
+                      alert_links, drilldown_links, status, signals_inferred,
+                      archetype_generated, created_at, reviewed_at
+               FROM ingested_dashboards_old""")
+        conn.execute("DROP TABLE ingested_dashboards_old")
+        conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_uid_backend
+               ON ingested_dashboards(dashboard_uid, backend_name)""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_uid_backend
+               ON ingested_dashboards(dashboard_uid, backend_name)""")
 
     # ── Signal type CRUD ─────────────────────────────────────────────────
 
@@ -173,14 +237,12 @@ class SignalStore:
     def list_signal_types(self) -> list[dict[str, Any]]:
         """List all registered signal types with mapping counts."""
         with self._conn() as conn:
-            rows = conn.execute(
-                """SELECT st.*, COUNT(m.id) AS mapping_count
+            rows = conn.execute("""SELECT st.*, COUNT(m.id) AS mapping_count
                    FROM signal_types st
                    LEFT JOIN signal_metric_mappings m
                      ON st.signal_type = m.signal_type
                    GROUP BY st.signal_type
-                   ORDER BY st.category, st.signal_type"""
-            ).fetchall()
+                   ORDER BY st.category, st.signal_type""").fetchall()
         return [dict(r) for r in rows]
 
     def get_signal_type(self, signal_type: str) -> dict[str, Any] | None:
@@ -242,12 +304,42 @@ class SignalStore:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(signal_type, metric_pattern) DO UPDATE SET
                        confidence = MAX(excluded.confidence, signal_metric_mappings.confidence),
-                       context_services = excluded.context_services,
-                       context_datasource_types = excluded.context_datasource_types,
-                       context_environments = excluded.context_environments,
-                       context_archetypes = excluded.context_archetypes,
-                       source_type = excluded.source_type,
-                       source_refs = excluded.source_refs,
+                       context_services = CASE
+                           WHEN excluded.source_type = 'bootstrap'
+                                AND signal_metric_mappings.source_type <> 'bootstrap'
+                           THEN signal_metric_mappings.context_services
+                           ELSE excluded.context_services
+                       END,
+                       context_datasource_types = CASE
+                           WHEN excluded.source_type = 'bootstrap'
+                                AND signal_metric_mappings.source_type <> 'bootstrap'
+                           THEN signal_metric_mappings.context_datasource_types
+                           ELSE excluded.context_datasource_types
+                       END,
+                       context_environments = CASE
+                           WHEN excluded.source_type = 'bootstrap'
+                                AND signal_metric_mappings.source_type <> 'bootstrap'
+                           THEN signal_metric_mappings.context_environments
+                           ELSE excluded.context_environments
+                       END,
+                       context_archetypes = CASE
+                           WHEN excluded.source_type = 'bootstrap'
+                                AND signal_metric_mappings.source_type <> 'bootstrap'
+                           THEN signal_metric_mappings.context_archetypes
+                           ELSE excluded.context_archetypes
+                       END,
+                       source_type = CASE
+                           WHEN excluded.source_type = 'bootstrap'
+                                AND signal_metric_mappings.source_type <> 'bootstrap'
+                           THEN signal_metric_mappings.source_type
+                           ELSE excluded.source_type
+                       END,
+                       source_refs = CASE
+                           WHEN excluded.source_type = 'bootstrap'
+                                AND signal_metric_mappings.source_type <> 'bootstrap'
+                           THEN signal_metric_mappings.source_refs
+                           ELSE excluded.source_refs
+                       END,
                        last_seen = excluded.last_seen,
                        use_count = signal_metric_mappings.use_count + 1""",
                 (
@@ -266,9 +358,7 @@ class SignalStore:
             )
             return cursor.lastrowid or 0
 
-    def record_feedback(
-        self, signal_type: str, metric_pattern: str, positive: bool
-    ) -> None:
+    def record_feedback(self, signal_type: str, metric_pattern: str, positive: bool) -> None:
         """Record positive/negative feedback for a mapping (anti-drift)."""
         col = "positive_feedback" if positive else "negative_feedback"
         with self._conn() as conn:
@@ -307,8 +397,9 @@ class SignalStore:
             m = _deserialize_mapping(row)
 
             # Context filtering
-            if not _context_matches(m, context_service, context_datasource_type,
-                                    context_archetype, context_environment):
+            if not _context_matches(
+                m, context_service, context_datasource_type, context_archetype, context_environment
+            ):
                 continue
 
             # Compute effective confidence with decay + feedback + context ranking
@@ -495,6 +586,7 @@ class SignalStore:
         self,
         dashboard_uid: str,
         *,
+        backend_name: str = "",
         dashboard_title: str = "",
         dashboard_tags: list[str] | None = None,
         metrics_found: list[str] | None = None,
@@ -515,15 +607,16 @@ class SignalStore:
         with self._conn() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO ingested_dashboards
-                   (dashboard_uid, dashboard_title, dashboard_tags,
+                   (dashboard_uid, backend_name, dashboard_title, dashboard_tags,
                     metrics_found, panel_count, row_groups,
                     metric_cooccurrence, aggregation_patterns,
                     query_transformations, panel_titles,
                     alert_links, drilldown_links,
                     status, signals_inferred, archetype_generated, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     dashboard_uid,
+                    backend_name,
                     dashboard_title,
                     json.dumps(dashboard_tags or []),
                     json.dumps(metrics_found or []),
@@ -542,20 +635,30 @@ class SignalStore:
                 ),
             )
 
-    def get_ingested_dashboard(self, dashboard_uid: str) -> dict[str, Any] | None:
+    def get_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> dict[str, Any] | None:
         """Get ingested dashboard record."""
         with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM ingested_dashboards WHERE dashboard_uid = ?",
-                (dashboard_uid,),
-            ).fetchone()
+            if backend_name is None:
+                rows = conn.execute(
+                    """SELECT * FROM ingested_dashboards
+                       WHERE dashboard_uid = ?
+                       ORDER BY created_at DESC LIMIT 2""",
+                    (dashboard_uid,),
+                ).fetchall()
+                if len(rows) != 1:
+                    return None
+                row = rows[0]
+            else:
+                row = conn.execute(
+                    """SELECT * FROM ingested_dashboards
+                       WHERE dashboard_uid = ? AND backend_name = ?""",
+                    (dashboard_uid, backend_name),
+                ).fetchone()
         if row is None:
             return None
         return _deserialize_ingested(row)
 
-    def list_ingested_dashboards(
-        self, status: str | None = None, limit: int = 50
-    ) -> list[dict[str, Any]]:
+    def list_ingested_dashboards(self, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         """List ingested dashboards, optionally filtered by status."""
         with self._conn() as conn:
             if status:
@@ -572,13 +675,17 @@ class SignalStore:
                 ).fetchall()
         return [_deserialize_ingested(r) for r in rows]
 
-    def approve_ingested_dashboard(self, dashboard_uid: str) -> bool:
+    def approve_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> bool:
         """Approve a pending ingested dashboard (activates its signal mappings)."""
+        ingested = self.get_ingested_dashboard(dashboard_uid, backend_name)
+        if ingested is None:
+            return False
+
         with self._conn() as conn:
             cursor = conn.execute(
                 """UPDATE ingested_dashboards SET status = 'approved', reviewed_at = ?
-                   WHERE dashboard_uid = ? AND status = 'pending'""",
-                (time.time(), dashboard_uid),
+                   WHERE id = ? AND status = 'pending'""",
+                (time.time(), ingested["id"]),
             )
             return cursor.rowcount > 0
 
@@ -587,25 +694,15 @@ class SignalStore:
     def stats(self) -> dict[str, Any]:
         """Summary statistics for the signal store."""
         with self._conn() as conn:
-            signal_count = conn.execute(
-                "SELECT COUNT(*) FROM signal_types"
-            ).fetchone()[0]
-            mapping_count = conn.execute(
-                "SELECT COUNT(*) FROM signal_metric_mappings"
-            ).fetchone()[0]
-            ingested_count = conn.execute(
-                "SELECT COUNT(*) FROM ingested_dashboards"
-            ).fetchone()[0]
+            signal_count = conn.execute("SELECT COUNT(*) FROM signal_types").fetchone()[0]
+            mapping_count = conn.execute("SELECT COUNT(*) FROM signal_metric_mappings").fetchone()[0]
+            ingested_count = conn.execute("SELECT COUNT(*) FROM ingested_dashboards").fetchone()[0]
 
-            by_source = conn.execute(
-                """SELECT source_type, COUNT(*) as n
-                   FROM signal_metric_mappings GROUP BY source_type"""
-            ).fetchall()
+            by_source = conn.execute("""SELECT source_type, COUNT(*) as n
+                   FROM signal_metric_mappings GROUP BY source_type""").fetchall()
 
-            by_category = conn.execute(
-                """SELECT category, COUNT(*) as n
-                   FROM signal_types GROUP BY category"""
-            ).fetchall()
+            by_category = conn.execute("""SELECT category, COUNT(*) as n
+                   FROM signal_types GROUP BY category""").fetchall()
 
         return {
             "signal_types": signal_count,
@@ -618,11 +715,17 @@ class SignalStore:
 
 # ── Helper functions ─────────────────────────────────────────────────────────
 
+
 def _deserialize_mapping(row: sqlite3.Row) -> dict[str, Any]:
     """Convert a DB row to a dict with deserialized JSON fields."""
     d = dict(row)
-    for field in ("context_services", "context_datasource_types",
-                  "context_environments", "context_archetypes", "source_refs"):
+    for field in (
+        "context_services",
+        "context_datasource_types",
+        "context_environments",
+        "context_archetypes",
+        "source_refs",
+    ):
         if field in d and isinstance(d[field], str):
             d[field] = json.loads(d[field])
     return d
@@ -631,10 +734,18 @@ def _deserialize_mapping(row: sqlite3.Row) -> dict[str, Any]:
 def _deserialize_ingested(row: sqlite3.Row) -> dict[str, Any]:
     """Convert an ingested dashboard DB row to a dict."""
     d = dict(row)
-    for field in ("dashboard_tags", "metrics_found", "row_groups",
-                  "metric_cooccurrence", "aggregation_patterns",
-                  "query_transformations", "panel_titles",
-                  "alert_links", "drilldown_links", "signals_inferred"):
+    for field in (
+        "dashboard_tags",
+        "metrics_found",
+        "row_groups",
+        "metric_cooccurrence",
+        "aggregation_patterns",
+        "query_transformations",
+        "panel_titles",
+        "alert_links",
+        "drilldown_links",
+        "signals_inferred",
+    ):
         if field in d and isinstance(d[field], str):
             d[field] = json.loads(d[field])
     return d
@@ -732,6 +843,7 @@ def _effective_confidence(
     age_days = (now - last_seen) / 86400.0
     if age_days > 0:
         import math
+
         decay = math.pow(0.5, age_days / _DECAY_HALF_LIFE_DAYS)
         base *= decay
 

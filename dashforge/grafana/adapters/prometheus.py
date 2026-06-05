@@ -1,4 +1,5 @@
 """Adapter for Prometheus-compatible datasources (Prometheus, Mimir, Cortex, Thanos)."""
+
 from __future__ import annotations
 
 import asyncio
@@ -76,16 +77,18 @@ class PrometheusAdapter(DatasourceAdapter):
         cache_key = make_cache_key("prom_catalog", datasource.uid)
         cached = metric_cache.get(cache_key)
         if cached is not None:
-            logger.info("prometheus_catalog_cache_hit", datasource=datasource.name,
-                        metrics=len(cached))
+            logger.info("prometheus_catalog_cache_hit", datasource=datasource.name, metrics=len(cached))
             return cached
 
         # Fetch metric names
         try:
-            data = await client.datasource_proxy_get(
-                datasource.uid, "api/v1/label/__name__/values"
-            )
-            all_names: list[str] = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            data = await client.datasource_proxy_get(datasource.uid, "api/v1/label/__name__/values")
+            if isinstance(data, dict):
+                all_names: list[str] = data.get("data", [])
+            elif isinstance(data, list):
+                all_names = data
+            else:
+                all_names = []
         except Exception:
             logger.warning("prometheus_metric_list_failed", datasource=datasource.name)
             return {}
@@ -122,10 +125,15 @@ class PrometheusAdapter(DatasourceAdapter):
                 catalog[result[0]] = result[1]
 
         metric_cache.set(cache_key, catalog)
-        logger.info("prometheus_catalog_cached", datasource=datasource.name,
-                    total=len(catalog), sampled_labels=sum(1 for v in catalog.values() if v),
-                    sample_count=len(to_sample), fetch_errors=fetch_errors,
-                    label_cardinality=total_label_cardinality)
+        logger.info(
+            "prometheus_catalog_cached",
+            datasource=datasource.name,
+            total=len(catalog),
+            sampled_labels=sum(1 for v in catalog.values() if v),
+            sample_count=len(to_sample),
+            fetch_errors=fetch_errors,
+            label_cardinality=total_label_cardinality,
+        )
         return catalog
 
     async def discover_metrics(

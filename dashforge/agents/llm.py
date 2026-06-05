@@ -1,9 +1,9 @@
 """Shared LLM helpers used by all agents."""
+
 from __future__ import annotations
 
 import json
 import re
-from typing import Type, TypeVar
 
 import httpx
 import structlog
@@ -16,11 +16,9 @@ from tenacity import (
 )
 
 from dashforge.agents.providers import get_provider
-from dashforge.agents.providers.base import LLMResult, TokenUsage
+from dashforge.agents.providers.base import TokenUsage
 
 logger = structlog.get_logger()
-
-T = TypeVar("T", bound=BaseModel)
 
 
 class LLMTransientError(Exception):
@@ -46,17 +44,17 @@ def _strip_trailing_commas(text: str) -> str:
                 c = text[i]
                 out.append(c)
                 i += 1
-                if c == '\\' and i < n:
+                if c == "\\" and i < n:
                     out.append(text[i])
                     i += 1
                 elif c == '"':
                     break
-        elif ch == ',':
+        elif ch == ",":
             # Look ahead: if next non-whitespace is } or ], skip this comma
             j = i + 1
-            while j < n and text[j] in ' \t\n\r':
+            while j < n and text[j] in " \t\n\r":
                 j += 1
-            if j < n and text[j] in ('}', ']'):
+            if j < n and text[j] in ("}", "]"):
                 i += 1  # drop the comma
             else:
                 out.append(ch)
@@ -64,7 +62,7 @@ def _strip_trailing_commas(text: str) -> str:
         else:
             out.append(ch)
             i += 1
-    return ''.join(out)
+    return "".join(out)
 
 
 def _attempt_json_repair(raw: str) -> str | None:
@@ -102,10 +100,10 @@ Do not add commentary, markdown fences, or extra text. Preserve all data."""
     stop=stop_after_attempt(3),
     wait=wait_exponential(min=1, max=10),
 )
-async def call_llm(
+async def call_llm[T: BaseModel](
     system_prompt: str,
     user_prompt: str,
-    response_model: Type[T],
+    response_model: type[T],
     temperature: float = 0.2,
 ) -> tuple[T, TokenUsage]:
     """Call the configured LLM provider and parse JSON into *response_model*.
@@ -132,9 +130,13 @@ async def call_llm(
         # match the error code directly (e.g. ThrottlingException, not ClientError).
         exc_name = type(exc).__name__
         _TRANSIENT_EXC_NAMES = {
-            "EndpointConnectionError", "ReadTimeoutError", "ConnectTimeoutError",
-            "ThrottlingException", "TooManyRequestsException",
-            "ServiceUnavailableException", "InternalServerException",
+            "EndpointConnectionError",
+            "ReadTimeoutError",
+            "ConnectTimeoutError",
+            "ThrottlingException",
+            "TooManyRequestsException",
+            "ServiceUnavailableException",
+            "InternalServerException",
             "ModelTimeoutException",
         }
         if exc_name in _TRANSIENT_EXC_NAMES:
@@ -144,8 +146,12 @@ async def call_llm(
             err_code = ""
             if hasattr(exc, "response"):
                 err_code = exc.response.get("Error", {}).get("Code", "")
-            _RETRYABLE_CODES = {"ThrottlingException", "TooManyRequestsException",
-                                "ServiceUnavailableException", "InternalServerException"}
+            _RETRYABLE_CODES = {
+                "ThrottlingException",
+                "TooManyRequestsException",
+                "ServiceUnavailableException",
+                "InternalServerException",
+            }
             if err_code in _RETRYABLE_CODES:
                 logger.warning("llm_boto_transient_error", error=str(exc), code=err_code)
                 raise LLMTransientError(str(exc)) from exc
@@ -194,11 +200,17 @@ async def call_llm(
                 # rate limits, botocore throttling, etc.) that aren't httpx types.
                 # Check if the exception looks transient before giving up.
                 _TRANSIENT_EXC_NAMES = {
-                    "APIConnectionError", "APITimeoutError", "RateLimitError",
-                    "InternalServerError", "ServiceUnavailableError",
-                    "ThrottlingException", "TooManyRequestsException",
-                    "ServiceUnavailableException", "ModelTimeoutException",
-                    "EndpointConnectionError", "ReadTimeoutError",
+                    "APIConnectionError",
+                    "APITimeoutError",
+                    "RateLimitError",
+                    "InternalServerError",
+                    "ServiceUnavailableError",
+                    "ThrottlingException",
+                    "TooManyRequestsException",
+                    "ServiceUnavailableException",
+                    "ModelTimeoutException",
+                    "EndpointConnectionError",
+                    "ReadTimeoutError",
                     "ConnectTimeoutError",
                 }
                 exc_name = type(repair_exc).__name__
@@ -208,8 +220,12 @@ async def call_llm(
                 # Check for response-based error codes (botocore ClientError)
                 if hasattr(repair_exc, "response") and isinstance(repair_exc.response, dict):
                     err_code = repair_exc.response.get("Error", {}).get("Code", "")
-                    if err_code in {"ThrottlingException", "TooManyRequestsException",
-                                    "ServiceUnavailableException", "InternalServerException"}:
+                    if err_code in {
+                        "ThrottlingException",
+                        "TooManyRequestsException",
+                        "ServiceUnavailableException",
+                        "InternalServerException",
+                    }:
                         logger.warning("llm_repair_transient_error", error=str(repair_exc), code=err_code)
                         raise LLMTransientError(str(repair_exc)) from repair_exc
                 # Check for status_code attribute (common in provider SDKs)

@@ -1,14 +1,17 @@
 """Quick test: verify query validation works via Grafana proxy."""
+
 import asyncio
 import os
 import sys
-import httpx
 from urllib.parse import quote
+
+import httpx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(os.path.join(os.path.dirname(__file__), ".."))
 
-from dashforge.config import settings
+from dashforge.config import settings  # noqa: E402
+
 
 async def main():
     c = httpx.AsyncClient(
@@ -33,5 +36,6 @@ async def main():
         print(f"  {label}: {count} series (status={r.status_code})")
 
     await c.aclose()
+
 
 asyncio.run(main())

@@ -8,6 +8,7 @@ Full request persistence for every pipeline run:
 SQLite-backed. Complements the feedback store (which tracks post-hoc human ratings)
 by capturing the full investigation lifecycle for debugging and audit.
 """
+
 from __future__ import annotations
 
 import json
@@ -271,9 +272,7 @@ class InvestigationStore:
     def get(self, inv_id: str) -> dict[str, Any] | None:
         """Get a single investigation by ID."""
         with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM investigations WHERE id=?", (inv_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM investigations WHERE id=?", (inv_id,)).fetchone()
             return self._row_to_dict(row) if row else None
 
     def get_by_dashboard(self, dashboard_uid: str) -> dict[str, Any] | None:
@@ -336,9 +335,15 @@ class InvestigationStore:
         """Convert a Row to dict, parsing JSON fields."""
         d = dict(row)
         for key in (
-            "intent_services", "intent_keywords", "intent_signals",
-            "archetypes", "datasource_types", "metrics_selected",
-            "generated_queries", "validation_warnings", "timings",
+            "intent_services",
+            "intent_keywords",
+            "intent_signals",
+            "archetypes",
+            "datasource_types",
+            "metrics_selected",
+            "generated_queries",
+            "validation_warnings",
+            "timings",
         ):
             if key in d and isinstance(d[key], str):
                 try:

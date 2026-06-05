@@ -1,4 +1,5 @@
 """Abstract base for context providers (knowledge base integrations)."""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod

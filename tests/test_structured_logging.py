@@ -1,17 +1,17 @@
 """Tests for structured logging: TokenUsage, LLMResult, stage_log, request_id binding."""
+
 from __future__ import annotations
 
-import json
-import io
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import structlog
 
 from dashforge.agents.providers.base import LLMResult, TokenUsage
 
-
 # ── TokenUsage ────────────────────────────────────────────────────────────────
+
 
 def test_token_usage_defaults():
     u = TokenUsage()
@@ -39,6 +39,7 @@ def test_token_usage_addition_preserves_originals():
 
 # ── LLMResult ─────────────────────────────────────────────────────────────────
 
+
 def test_llm_result_defaults():
     r = LLMResult(text="hello")
     assert r.text == "hello"
@@ -54,8 +55,10 @@ def test_llm_result_with_usage():
 
 # ── request_id binding ────────────────────────────────────────────────────────
 
+
 def test_bind_request_id_generates_id():
     from dashforge.logging import bind_request_id, unbind_request_id
+
     rid = bind_request_id()
     assert len(rid) == 12
     unbind_request_id()
@@ -63,15 +66,18 @@ def test_bind_request_id_generates_id():
 
 def test_bind_request_id_uses_provided():
     from dashforge.logging import bind_request_id, unbind_request_id
+
     rid = bind_request_id("custom-id-123")
     assert rid == "custom-id-123"
     unbind_request_id()
 
 
 def test_bind_unbind_cycle():
-    from dashforge.logging import bind_request_id, unbind_request_id
     from structlog.contextvars import get_contextvars
-    rid = bind_request_id("test-rid")
+
+    from dashforge.logging import bind_request_id, unbind_request_id
+
+    bind_request_id("test-rid")
     ctx = get_contextvars()
     assert ctx.get("request_id") == "test-rid"
     unbind_request_id()
@@ -81,8 +87,9 @@ def test_bind_unbind_cycle():
 
 # ── stage_log ─────────────────────────────────────────────────────────────────
 
+
 def test_stage_log_emits_event():
-    from dashforge.logging import stage_log, bind_request_id, unbind_request_id
+    from dashforge.logging import bind_request_id, stage_log, unbind_request_id
 
     captured = {}
 
@@ -102,10 +109,11 @@ def test_stage_log_emits_event():
     )
 
     try:
-        rid = bind_request_id("test-stage-rid")
+        bind_request_id("test-stage-rid")
         usage = TokenUsage(prompt_tokens=500, completion_tokens=200, total_tokens=700)
         stage_log(
-            "intent", 142.5,
+            "intent",
+            142.5,
             token_usage=usage,
             metrics_considered=284,
             metrics_selected=18,
@@ -160,9 +168,11 @@ def test_stage_log_without_token_usage():
 
 # ── call_llm returns (model, usage) ──────────────────────────────────────────
 
+
 def test_call_llm_returns_tuple():
-    from dashforge.agents.llm import call_llm
     from pydantic import BaseModel
+
+    from dashforge.agents.llm import call_llm
 
     class Simple(BaseModel):
         v: int
@@ -185,8 +195,9 @@ def test_call_llm_returns_tuple():
 
 def test_call_llm_accumulates_repair_tokens():
     """When JSON repair is needed, tokens from both calls are accumulated."""
-    from dashforge.agents.llm import call_llm
     from pydantic import BaseModel
+
+    from dashforge.agents.llm import call_llm
 
     class Simple(BaseModel):
         v: int
@@ -195,7 +206,7 @@ def test_call_llm_accumulates_repair_tokens():
     mock_provider.chat_json = AsyncMock(
         side_effect=[
             LLMResult(
-                text='{broken json',
+                text="{broken json",
                 usage=TokenUsage(prompt_tokens=100, completion_tokens=50, total_tokens=150),
             ),
             LLMResult(
@@ -215,20 +226,22 @@ def test_call_llm_accumulates_repair_tokens():
 
 # ── Agent functions return (result, usage) ────────────────────────────────────
 
+
 def test_classify_intent_returns_usage():
     from dashforge.agents.intent import classify_intent
-    from dashforge.agents.llm import call_llm
 
-    intent_json = json.dumps({
-        "summary": "test",
-        "domain": "general",
-        "services": [],
-        "signals": ["metrics"],
-        "keywords": ["cpu"],
-        "timerange": "1h",
-        "problem_type": "general",
-        "archetypes": [{"type": "general", "confidence": 0.9}],
-    })
+    intent_json = json.dumps(
+        {
+            "summary": "test",
+            "domain": "general",
+            "services": [],
+            "signals": ["metrics"],
+            "keywords": ["cpu"],
+            "timerange": "1h",
+            "problem_type": "general",
+            "archetypes": [{"type": "general", "confidence": 0.9}],
+        }
+    )
 
     mock_provider = MagicMock()
     mock_provider.chat_json = AsyncMock(

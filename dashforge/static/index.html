@@ -842,7 +842,7 @@
             ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Generated archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(d.archetype_generated)}</pre></details>`
             : '';
           const approveBtn = d.status === 'pending'
-            ? `<button class="btn-sm btn-success" onclick="approveDashboard('${esc(d.dashboard_uid)}')">Approve</button>`
+            ? `<button class="btn-sm btn-success approve-dashboard-btn" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Approve</button>`
             : '';
           html += `
             <div class="ingest-card">
@@ -852,6 +852,7 @@
               </div>
               <div class="ingest-meta">
                 UID: <code>${esc(d.dashboard_uid)}</code> &middot;
+                ${d.backend_name ? `Backend: <code>${esc(d.backend_name)}</code> &middot; ` : ''}
                 ${d.panel_count || 0} panels &middot;
                 ${(d.metrics_found || []).length} metrics
               </div>
@@ -865,9 +866,10 @@
       }
     }
 
-    async function approveDashboard(uid) {
+    async function approveDashboard(uid, backend = '') {
       try {
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboards/${uid}/approve`, { method: 'POST' });
+        const backendQuery = backend ? `?backend=${encodeURIComponent(backend)}` : '';
+        const resp = await fetch(`${BASE}/api/v1/learn/dashboards/${encodeURIComponent(uid)}/approve${backendQuery}`, { method: 'POST' });
         if (!resp.ok) throw new Error('Approval failed');
         loadIngestedDashboards();
       } catch (e) { alert('Approve failed: ' + e.message); }
@@ -1004,6 +1006,14 @@
     document.getElementById('signals-content').addEventListener('click', (e) => {
       const btn = e.target.closest('.signal-detail-btn');
       if (btn && btn.dataset.signal) showSignalDetail(btn.dataset.signal);
+    });
+
+    // Delegate dashboard approval clicks so UIDs are never embedded in JS strings.
+    document.getElementById('ingested-list').addEventListener('click', (e) => {
+      const btn = e.target.closest('.approve-dashboard-btn');
+      if (btn && btn.dataset.dashboardUid) {
+        approveDashboard(btn.dataset.dashboardUid, btn.dataset.dashboardBackend || '');
+      }
     });
 
     // Submit on Ctrl+Enter

@@ -6,6 +6,7 @@ Lightweight SQLite-backed persistence for:
 
 In production, swap for Postgres via SQLAlchemy or similar.
 """
+
 from __future__ import annotations
 
 import json
@@ -28,6 +29,7 @@ def _sanitize_uid(uid: str) -> str:
     if not _UID_PATTERN.match(uid):
         raise ValueError(f"Invalid dashboard_uid: must be 1-128 alphanumeric/hyphen/underscore chars, got {uid!r:.40}")
     return uid
+
 
 logger = structlog.get_logger()
 
@@ -231,9 +233,7 @@ class FeedbackStore:
                 "avg_noise_level": round(row["avg_noise"] or 0, 2),
                 "avg_investigation_speed": round(row["avg_speed"] or 0, 2),
                 "useful_rate": round(row["useful_rate"] or 0, 3),
-                "total_dashboards": conn.execute(
-                    "SELECT COUNT(DISTINCT dashboard_uid) FROM feedback"
-                ).fetchone()[0],
+                "total_dashboards": conn.execute("SELECT COUNT(DISTINCT dashboard_uid) FROM feedback").fetchone()[0],
             }
 
     # ── Feedback Analysis (closes the loop) ───────────────────────────
@@ -365,17 +365,21 @@ class FeedbackStore:
                     bucket[m] = bucket.get(m, 0) + 1
 
             all_metrics = set(good_metrics) | set(bad_metrics)
-            metric_scores = []
+            metric_scores: list[dict[str, Any]] = []
             for m in all_metrics:
                 good = good_metrics.get(m, 0)
-                bad = bad_metrics.get(m, 0)
-                total_m = good + bad
+                bad_count = bad_metrics.get(m, 0)
+                total_m = good + bad_count
                 score = good / total_m if total_m > 0 else 0.5
-                metric_scores.append({
-                    "metric": m, "good": good, "bad": bad,
-                    "quality_score": round(score, 3),
-                })
-            metric_scores.sort(key=lambda x: x["quality_score"])
+                metric_scores.append(
+                    {
+                        "metric": m,
+                        "good": good,
+                        "bad": bad_count,
+                        "quality_score": round(score, 3),
+                    }
+                )
+            metric_scores.sort(key=lambda x: float(x["quality_score"]))
             report["metric_quality"] = metric_scores
 
             # ── Confidence calibration ────────────────────────────────
@@ -388,18 +392,21 @@ class FeedbackStore:
                 WHERE f.overall_useful IS NOT NULL
             """).fetchall()
 
-            high_conf, low_conf = [], []
+            high_conf: list[dict[str, Any]] = []
+            low_conf: list[dict[str, Any]] = []
             for r in rows:
                 archetypes = json.loads(r["archetypes"])
                 top_conf = archetypes[0]["confidence"] if archetypes else 0
-                bucket = high_conf if top_conf >= 0.8 else low_conf
-                bucket.append({
-                    "useful": r["overall_useful"],
-                    "symptom": r["symptom_visibility"],
-                    "noise": r["noise_level"],
-                })
+                confidence_bucket = high_conf if top_conf >= 0.8 else low_conf
+                confidence_bucket.append(
+                    {
+                        "useful": r["overall_useful"],
+                        "symptom": r["symptom_visibility"],
+                        "noise": r["noise_level"],
+                    }
+                )
 
-            def _avg(items, key):
+            def _avg(items: list[dict[str, Any]], key: str) -> float | None:
                 vals = [i[key] for i in items if i[key] is not None]
                 return round(sum(vals) / len(vals), 2) if vals else None
 
@@ -446,20 +453,21 @@ class FeedbackStore:
                 )
 
             # Low-quality metrics
-            bad = [m for m in metric_scores if m["quality_score"] < 0.3 and m["bad"] >= 2]
-            if bad:
-                names = ", ".join(m["metric"] for m in bad[:5])
-                recommendations.append(
-                    f"DEPRIORITIZE METRICS: {names} — appear mostly in poorly-rated dashboards"
-                )
+            bad_metric_scores = [m for m in metric_scores if m["quality_score"] < 0.3 and m["bad"] >= 2]
+            if bad_metric_scores:
+                names = ", ".join(m["metric"] for m in bad_metric_scores[:5])
+                recommendations.append(f"DEPRIORITIZE METRICS: {names} — appear mostly in poorly-rated dashboards")
 
             # Confidence miscalibration
             cal = report["confidence_calibration"]
             hi = cal["high_confidence_ge_0.8"]
             lo = cal["low_confidence_lt_0.8"]
-            if (hi["useful_rate"] is not None and lo["useful_rate"] is not None
-                    and lo["useful_rate"] > hi["useful_rate"] + 0.1
-                    and lo["count"] >= 3):
+            if (
+                hi["useful_rate"] is not None
+                and lo["useful_rate"] is not None
+                and lo["useful_rate"] > hi["useful_rate"] + 0.1
+                and lo["count"] >= 3
+            ):
                 recommendations.append(
                     f"RECALIBRATE: low-confidence archetypes ({lo['useful_rate']:.0%} useful) "
                     f"outperform high-confidence ({hi['useful_rate']:.0%}) — "

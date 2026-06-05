@@ -1,4 +1,5 @@
 """Adapter for Elasticsearch / OpenSearch datasource."""
+
 from __future__ import annotations
 
 import structlog
@@ -31,9 +32,7 @@ class ElasticsearchAdapter(DatasourceAdapter):
 
         # Fetch field mappings from the index
         try:
-            data = await client.datasource_proxy_get(
-                datasource.uid, f"{index_name}/_mapping"
-            )
+            data = await client.datasource_proxy_get(datasource.uid, f"{index_name}/_mapping")
         except Exception:
             logger.warning("elasticsearch_mapping_failed", datasource=datasource.name)
             return []

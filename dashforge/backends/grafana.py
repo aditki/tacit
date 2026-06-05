@@ -1,17 +1,20 @@
 """Grafana backend adapter — wraps existing Grafana client and helpers."""
+
 from __future__ import annotations
+
+from typing import Any, cast
 
 import structlog
 
-from dashforge.backends.base import DashboardBackend, DashboardFeatures, PublishResult
+from dashforge.backends.base import DashboardFeatures, PublishResult
 from dashforge.grafana.client import GrafanaClient
+from dashforge.grafana.dashboard import publish_dashboard as publish_dashboard_fn
 from dashforge.grafana.datasource import (
     discover_all_metrics,
     filter_datasources_by_signal,
     filter_searchable_datasources,
     list_datasources,
 )
-from dashforge.grafana.dashboard import publish_dashboard as publish_dashboard_fn
 from dashforge.models.schemas import DashboardSpec, Intent, MetricEntry
 from dashforge.validation import validate_dashboard_queries
 
@@ -83,7 +86,8 @@ class GrafanaBackend:
 
     async def ingest_dashboard(self, uid: str) -> DashboardFeatures:
         from dashforge.dashboard_ingest import parse_dashboard_json
-        dashboard_json = await self._client._get(f"/api/dashboards/uid/{uid}")
+
+        dashboard_json = cast(dict[str, Any], await self._client._get(f"/api/dashboards/uid/{uid}"))
         extracted = parse_dashboard_json(dashboard_json)
         return DashboardFeatures(
             dashboard_uid=extracted["dashboard_uid"],

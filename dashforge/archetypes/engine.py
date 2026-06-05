@@ -4,6 +4,7 @@ Given an archetype + intent + discovered label values, deterministically
 compiles query templates into real PromQL or SignalFlow depending on the
 target backend. No LLM needed for query generation.
 """
+
 from __future__ import annotations
 
 import re
@@ -120,6 +121,7 @@ def _resolve_rate_interval(intent: Intent) -> str:
 
 # ── SignalFlow filter resolvers ──────────────────────────────────────────────
 
+
 def _resolve_sfx_service_filter(intent: Intent, catalog: list[MetricEntry]) -> str:
     """Build a SignalFlow filter() expression for the target service."""
     result = _find_best_label(intent, catalog)
@@ -187,11 +189,11 @@ def _promql_template_to_signalflow(
         depth = 0
         current = ""
         for ch in label_block:
-            if ch == '(':
+            if ch == "(":
                 depth += 1
-            elif ch == ')':
+            elif ch == ")":
                 depth -= 1
-            if ch == ',' and depth == 0:
+            if ch == "," and depth == 0:
                 current = current.strip()
                 if current:
                     parts.append(current)
@@ -222,7 +224,7 @@ def _promql_template_to_signalflow(
     slash_pos = _find_top_level_slash(expr)
     if slash_pos is not None:
         left = _promql_template_to_signalflow(expr[:slash_pos].strip(), service_filter, container_filter, "_num")
-        right = _promql_template_to_signalflow(expr[slash_pos + 1:].strip(), service_filter, container_filter, "_den")
+        right = _promql_template_to_signalflow(expr[slash_pos + 1 :].strip(), service_filter, container_filter, "_den")
         # Strip .publish() from sub-expressions
         left = re.sub(r"\.publish\([^)]*\)$", "", left)
         right = re.sub(r"\.publish\([^)]*\)$", "", right)
@@ -230,8 +232,8 @@ def _promql_template_to_signalflow(
 
     # ── histogram_quantile ──
     hq = re.match(
-        r'histogram_quantile\(([\d.]+),\s*sum\(rate\((\w+?)_bucket\{(.*?)\}\[.*?\]\)\)\s*by\s*\(le(?:,\s*(\w+))?\)\)',
-        expr
+        r"histogram_quantile\(([\d.]+),\s*sum\(rate\((\w+?)_bucket\{(.*?)\}\[.*?\]\)\)\s*by\s*\(le(?:,\s*(\w+))?\)\)",
+        expr,
     )
     if hq:
         pct = int(float(hq.group(1)) * 100)
@@ -247,7 +249,7 @@ def _promql_template_to_signalflow(
         return f"{base}.percentile(pct={pct}).publish(label='{legend}')"
 
     # ── topk ──
-    topk = re.match(r'topk\((\d+),\s*(.+)\)$', expr, re.DOTALL)
+    topk = re.match(r"topk\((\d+),\s*(.+)\)$", expr, re.DOTALL)
     if topk:
         k = topk.group(1)
         inner = _promql_template_to_signalflow(topk.group(2), service_filter, container_filter, legend)
@@ -255,10 +257,7 @@ def _promql_template_to_signalflow(
         return f"{inner}.top(count={k}).publish(label='{legend}')"
 
     # ── agg(rate/increase(metric{labels}[interval])) by (dims) ──
-    agg = re.match(
-        r'(sum|avg|count|min|max)\((rate|increase)\((\w+)\{(.*?)\}\[.*?\]\)\)(?:\s*by\s*\(([^)]+)\))?',
-        expr
-    )
+    agg = re.match(r"(sum|avg|count|min|max)\((rate|increase)\((\w+)\{(.*?)\}\[.*?\]\)\)(?:\s*by\s*\(([^)]+)\))?", expr)
     if agg:
         agg_fn = agg.group(1)
         func = agg.group(2)
@@ -281,7 +280,7 @@ def _promql_template_to_signalflow(
         return f"{base}.publish(label='{legend}')"
 
     # ── bare rate/increase ──
-    rate = re.match(r'(rate|increase)\((\w+)\{(.*?)\}\[.*?\]\)', expr)
+    rate = re.match(r"(rate|increase)\((\w+)\{(.*?)\}\[.*?\]\)", expr)
     if rate:
         func = rate.group(1)
         metric = rate.group(2)
@@ -294,7 +293,7 @@ def _promql_template_to_signalflow(
         return f"{base}.publish(label='{legend}')"
 
     # ── simple metric{labels} ──
-    simple = re.match(r'(\w+)\{(.*?)\}$', expr)
+    simple = re.match(r"(\w+)\{(.*?)\}$", expr)
     if simple:
         metric = simple.group(1)
         filt = _build_sfx_filter(simple.group(2))
@@ -305,7 +304,7 @@ def _promql_template_to_signalflow(
         return f"{base}.publish(label='{legend}')"
 
     # ── bare metric name ──
-    bare = re.match(r'^(\w+)$', expr)
+    bare = re.match(r"^(\w+)$", expr)
     if bare:
         return f"data('{bare.group(1)}').publish(label='{legend}')"
 
@@ -318,11 +317,11 @@ def _find_top_level_slash(expr: str) -> int | None:
     """Find position of top-level '/' operator (not inside parens)."""
     depth = 0
     for i, ch in enumerate(expr):
-        if ch == '(':
+        if ch == "(":
             depth += 1
-        elif ch == ')':
+        elif ch == ")":
             depth -= 1
-        elif ch == '/' and depth == 0 and i > 0:
+        elif ch == "/" and depth == 0 and i > 0:
             return i
     return None
 
@@ -335,9 +334,7 @@ _METRIC_TOKEN_CHARS = r"A-Za-z0-9_:."
 
 def _metric_name_pattern(metric_name: str) -> re.Pattern[str]:
     """Match a metric name as a complete metric token, not a substring."""
-    return re.compile(
-        rf"(?<![{_METRIC_TOKEN_CHARS}]){re.escape(metric_name)}(?![{_METRIC_TOKEN_CHARS}])"
-    )
+    return re.compile(rf"(?<![{_METRIC_TOKEN_CHARS}]){re.escape(metric_name)}(?![{_METRIC_TOKEN_CHARS}])")
 
 
 def _strip_known_metric_suffix(metric_name: str) -> tuple[str, str]:
@@ -382,8 +379,12 @@ def _suffix_aware_replace(expr: str, old_metric: str, new_metric: str) -> str:
             new_suffixed = new_base + suffix
         else:
             new_suffixed = new_metric + suffix
+
+        def replace_suffixed(_match: re.Match[str], replacement: str = new_suffixed) -> str:
+            return protect(replacement)
+
         expr = _metric_name_pattern(old_suffixed).sub(
-            lambda _m, replacement=new_suffixed: protect(replacement),
+            replace_suffixed,
             expr,
         )
 
@@ -423,20 +424,24 @@ def _apply_metric_substitutions(
             expr = qt.expr
             for old_metric, new_metric in substitutions.items():
                 expr = _suffix_aware_replace(expr, old_metric, new_metric)
-            new_queries.append(QueryTemplate(
-                expr=expr,
-                legend_format=qt.legend_format,
-                query_language=qt.query_language,
-                datasource_type=qt.datasource_type,
-            ))
-        new_panels.append(PanelTemplate(
-            title=panel.title,
-            description=panel.description,
-            panel_type=panel.panel_type,
-            row=panel.row,
-            queries=new_queries,
-            unit=panel.unit,
-        ))
+            new_queries.append(
+                QueryTemplate(
+                    expr=expr,
+                    legend_format=qt.legend_format,
+                    query_language=qt.query_language,
+                    datasource_type=qt.datasource_type,
+                )
+            )
+        new_panels.append(
+            PanelTemplate(
+                title=panel.title,
+                description=panel.description,
+                panel_type=panel.panel_type,
+                row=panel.row,
+                queries=new_queries,
+                unit=panel.unit,
+            )
+        )
 
     return InvestigationArchetype(
         id=archetype.id,
@@ -468,6 +473,7 @@ def _resolve_archetype_signals(
 
     try:
         from dashforge.signals import get_signal_store
+
         store = get_signal_store()
         substitutions = store.resolve_signals_for_archetype(
             signal_bindings=archetype.signal_bindings,
@@ -546,29 +552,31 @@ def compile_archetype(
             if target_language == "signalflow" and not raw_signalflow_query:
                 # Compile the resolved PromQL template directly to SignalFlow
                 legend = qt.legend_format or pt.title
-                expr = _promql_template_to_signalflow(
-                    expr, service_filter, container_filter, legend
-                )
+                expr = _promql_template_to_signalflow(expr, service_filter, container_filter, legend)
 
-            panel_queries.append(PanelQuery(
-                expr=expr,
-                legend_format=qt.legend_format,
-                datasource_uid=datasource_uid,
-                datasource_type=datasource_type,
-            ))
+            panel_queries.append(
+                PanelQuery(
+                    expr=expr,
+                    legend_format=qt.legend_format,
+                    datasource_uid=datasource_uid,
+                    datasource_type=datasource_type,
+                )
+            )
 
         if not panel_queries:
             skipped += 1
             continue
 
-        panels.append(PanelSpec(
-            title=pt.title,
-            description=pt.description,
-            panel_type=pt.panel_type,
-            row=pt.row,
-            queries=panel_queries,
-            unit=pt.unit,
-        ))
+        panels.append(
+            PanelSpec(
+                title=pt.title,
+                description=pt.description,
+                panel_type=pt.panel_type,
+                row=pt.row,
+                queries=panel_queries,
+                unit=pt.unit,
+            )
+        )
 
     # Build title from archetype name + service
     service_name = intent.services[0] if intent.services else "Service"
@@ -640,9 +648,7 @@ def blend_archetypes(
         for panel in secondary_spec.panels:
             if panel.title.lower() not in existing_titles:
                 # Tag panel with its source archetype for traceability
-                panel_with_row = panel.model_copy(
-                    update={"row": panel.row or arch.name}
-                )
+                panel_with_row = panel.model_copy(update={"row": panel.row or arch.name})
                 blended_panels.append(panel_with_row)
                 existing_titles.add(panel.title.lower())
                 added += 1
@@ -658,9 +664,7 @@ def blend_archetypes(
 
     # Build final title
     service_name = intent.services[0] if intent.services else "Service"
-    arch_names = " + ".join(
-        a.name for a, c in ranked_archetypes[:3] if c >= secondary_min_confidence
-    )
+    arch_names = " + ".join(a.name for a, c in ranked_archetypes[:3] if c >= secondary_min_confidence)
     title = f"{service_name.title()} — {arch_names}"
 
     spec = DashboardSpec(

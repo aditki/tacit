@@ -8,6 +8,7 @@ Archetypes are loaded from ``archetypes.yaml`` if it exists (project root or
 below are used as the default.  This lets engineers edit templates without
 touching Python code — just edit the YAML and restart.
 """
+
 from __future__ import annotations
 
 import os
@@ -38,20 +39,25 @@ LATENCY_INVESTIGATION = InvestigationArchetype(
             title="Request Rate",
             description="HTTP request throughput by status code",
             row="Traffic",
-            queries=[QueryTemplate(
-                expr='sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}])) by (status)',
-                legend_format="{{status}}",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}])) by (status)",
+                    legend_format="{{status}}",
+                )
+            ],
             unit="reqps",
         ),
         PanelTemplate(
             title="Error Rate (5xx)",
             description="Rate of server errors",
             row="Errors",
-            queries=[QueryTemplate(
-                expr='sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}])) / sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))',
-                legend_format="error ratio",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr='sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}]))'
+                    " / sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))",
+                    legend_format="error ratio",
+                )
+            ],
             unit="percentunit",
         ),
         PanelTemplate(
@@ -60,15 +66,18 @@ LATENCY_INVESTIGATION = InvestigationArchetype(
             row="Latency",
             queries=[
                 QueryTemplate(
-                    expr='histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))',
+                    expr="histogram_quantile(0.50, sum(rate("
+                    "http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))",
                     legend_format="p50",
                 ),
                 QueryTemplate(
-                    expr='histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))',
+                    expr="histogram_quantile(0.95, sum(rate("
+                    "http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))",
                     legend_format="p95",
                 ),
                 QueryTemplate(
-                    expr='histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))',
+                    expr="histogram_quantile(0.99, sum(rate("
+                    "http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))",
                     legend_format="p99",
                 ),
             ],
@@ -78,29 +87,35 @@ LATENCY_INVESTIGATION = InvestigationArchetype(
             title="In-Flight Requests",
             description="Current request concurrency (saturation signal)",
             row="Saturation",
-            queries=[QueryTemplate(
-                expr='http_requests_in_flight{{{service_filter}}}',
-                legend_format="in-flight",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="http_requests_in_flight{{{service_filter}}}",
+                    legend_format="in-flight",
+                )
+            ],
         ),
         PanelTemplate(
             title="CPU Usage",
             description="Container CPU consumption",
             row="Resources",
-            queries=[QueryTemplate(
-                expr='rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])',
-                legend_format="cpu",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])",
+                    legend_format="cpu",
+                )
+            ],
             unit="s",
         ),
         PanelTemplate(
             title="Memory Usage",
             description="Container memory working set",
             row="Resources",
-            queries=[QueryTemplate(
-                expr='container_memory_working_set_bytes{{{container_filter}}}',
-                legend_format="memory",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="container_memory_working_set_bytes{{{container_filter}}}",
+                    legend_format="memory",
+                )
+            ],
             unit="bytes",
         ),
     ],
@@ -127,7 +142,7 @@ ERROR_SPIKE = InvestigationArchetype(
                     legend_format="5xx rate",
                 ),
                 QueryTemplate(
-                    expr='sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))',
+                    expr="sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))",
                     legend_format="total rate",
                 ),
             ],
@@ -138,50 +153,63 @@ ERROR_SPIKE = InvestigationArchetype(
             description="Percentage of requests returning 5xx",
             row="Errors",
             panel_type="stat",
-            queries=[QueryTemplate(
-                expr='sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}])) / sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))',
-                legend_format="error ratio",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr='sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}]))'
+                    " / sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))",
+                    legend_format="error ratio",
+                )
+            ],
             unit="percentunit",
         ),
         PanelTemplate(
             title="Errors by Status Code",
             description="Breakdown of error responses by HTTP status",
             row="Errors",
-            queries=[QueryTemplate(
-                expr='sum(rate(http_requests_total{{{service_filter}, status=~"[45].."}}[{rate_interval}])) by (status)',
-                legend_format="{{status}}",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr='sum(rate(http_requests_total{{{service_filter}, status=~"[45].."}}'
+                    "[{rate_interval}])) by (status)",
+                    legend_format="{{status}}",
+                )
+            ],
             unit="reqps",
         ),
         PanelTemplate(
             title="Errors by Path",
             description="Which endpoints are failing",
             row="Breakdown",
-            queries=[QueryTemplate(
-                expr='sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}])) by (path)',
-                legend_format="{{path}}",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr='sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}])) by (path)',
+                    legend_format="{{path}}",
+                )
+            ],
             unit="reqps",
         ),
         PanelTemplate(
             title="Request Latency During Errors",
             description="p95 latency — often spikes correlate with errors",
             row="Latency",
-            queries=[QueryTemplate(
-                expr='histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))',
-                legend_format="p95",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="histogram_quantile(0.95, sum(rate("
+                    "http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))",
+                    legend_format="p95",
+                )
+            ],
             unit="s",
         ),
         PanelTemplate(
             title="Pod Restarts",
             description="Container restarts may indicate crash loops causing errors",
             row="Resources",
-            queries=[QueryTemplate(
-                expr='increase(kube_pod_container_restarts_total{{{container_filter}}}[{rate_interval}])',
-                legend_format="restarts",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="increase(kube_pod_container_restarts_total{{{container_filter}}}[{rate_interval}])",
+                    legend_format="restarts",
+                )
+            ],
         ),
     ],
 )
@@ -201,10 +229,12 @@ GOLDEN_SIGNALS = InvestigationArchetype(
             title="Request Throughput",
             description="Total request rate — traffic signal",
             row="Traffic",
-            queries=[QueryTemplate(
-                expr='sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}])) by (method)',
-                legend_format="{{method}}",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}])) by (method)",
+                    legend_format="{{method}}",
+                )
+            ],
             unit="reqps",
         ),
         PanelTemplate(
@@ -213,15 +243,18 @@ GOLDEN_SIGNALS = InvestigationArchetype(
             row="Latency",
             queries=[
                 QueryTemplate(
-                    expr='histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))',
+                    expr="histogram_quantile(0.50, sum(rate("
+                    "http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))",
                     legend_format="p50",
                 ),
                 QueryTemplate(
-                    expr='histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))',
+                    expr="histogram_quantile(0.95, sum(rate("
+                    "http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))",
                     legend_format="p95",
                 ),
                 QueryTemplate(
-                    expr='histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))',
+                    expr="histogram_quantile(0.99, sum(rate("
+                    "http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le))",
                     legend_format="p99",
                 ),
             ],
@@ -233,7 +266,8 @@ GOLDEN_SIGNALS = InvestigationArchetype(
             row="Errors",
             queries=[
                 QueryTemplate(
-                    expr='sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}])) / sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))',
+                    expr='sum(rate(http_requests_total{{{service_filter}, status=~"5.."}}[{rate_interval}]))'
+                    " / sum(rate(http_requests_total{{{service_filter}}}[{rate_interval}]))",
                     legend_format="error ratio",
                 ),
             ],
@@ -243,39 +277,48 @@ GOLDEN_SIGNALS = InvestigationArchetype(
             title="Errors by Status",
             description="Error breakdown by HTTP status code",
             row="Errors",
-            queries=[QueryTemplate(
-                expr='sum(rate(http_requests_total{{{service_filter}, status=~"[45].."}}[{rate_interval}])) by (status)',
-                legend_format="{{status}}",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr='sum(rate(http_requests_total{{{service_filter}, status=~"[45].."}}'
+                    "[{rate_interval}])) by (status)",
+                    legend_format="{{status}}",
+                )
+            ],
             unit="reqps",
         ),
         PanelTemplate(
             title="In-Flight Requests",
             description="Concurrent request count — saturation signal",
             row="Saturation",
-            queries=[QueryTemplate(
-                expr='http_requests_in_flight{{{service_filter}}}',
-                legend_format="in-flight",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="http_requests_in_flight{{{service_filter}}}",
+                    legend_format="in-flight",
+                )
+            ],
         ),
         PanelTemplate(
             title="CPU Usage",
             description="Container CPU — resource saturation",
             row="Saturation",
-            queries=[QueryTemplate(
-                expr='rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])',
-                legend_format="cpu",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])",
+                    legend_format="cpu",
+                )
+            ],
             unit="s",
         ),
         PanelTemplate(
             title="Memory Usage",
             description="Container memory — resource saturation",
             row="Saturation",
-            queries=[QueryTemplate(
-                expr='container_memory_working_set_bytes{{{container_filter}}}',
-                legend_format="memory",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="container_memory_working_set_bytes{{{container_filter}}}",
+                    legend_format="memory",
+                )
+            ],
             unit="bytes",
         ),
     ],
@@ -296,58 +339,71 @@ RESOURCE_SATURATION = InvestigationArchetype(
             title="CPU Usage",
             description="Container CPU consumption rate",
             row="CPU",
-            queries=[QueryTemplate(
-                expr='rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])',
-                legend_format="{{container}}",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="rate(container_cpu_usage_seconds_total{{{container_filter}}}[{rate_interval}])",
+                    legend_format="{{container}}",
+                )
+            ],
             unit="s",
         ),
         PanelTemplate(
             title="Memory Working Set",
             description="Active memory usage",
             row="Memory",
-            queries=[QueryTemplate(
-                expr='container_memory_working_set_bytes{{{container_filter}}}',
-                legend_format="{{container}}",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="container_memory_working_set_bytes{{{container_filter}}}",
+                    legend_format="{{container}}",
+                )
+            ],
             unit="bytes",
         ),
         PanelTemplate(
             title="Database Connections",
             description="Active database connection pool usage",
             row="Connections",
-            queries=[QueryTemplate(
-                expr='db_connections_active{{{service_filter}}}',
-                legend_format="active",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="db_connections_active{{{service_filter}}}",
+                    legend_format="active",
+                )
+            ],
         ),
         PanelTemplate(
             title="DB Query Latency",
             description="Average database query duration",
             row="Connections",
-            queries=[QueryTemplate(
-                expr='rate(db_query_duration_seconds_sum{{{service_filter}}}[{rate_interval}]) / rate(db_query_duration_seconds_count{{{service_filter}}}[{rate_interval}])',
-                legend_format="avg query time",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="rate(db_query_duration_seconds_sum{{{service_filter}}}[{rate_interval}])"
+                    " / rate(db_query_duration_seconds_count{{{service_filter}}}[{rate_interval}])",
+                    legend_format="avg query time",
+                )
+            ],
             unit="s",
         ),
         PanelTemplate(
             title="In-Flight Requests",
             description="Concurrency pressure",
             row="Saturation",
-            queries=[QueryTemplate(
-                expr='http_requests_in_flight{{{service_filter}}}',
-                legend_format="in-flight",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="http_requests_in_flight{{{service_filter}}}",
+                    legend_format="in-flight",
+                )
+            ],
         ),
         PanelTemplate(
             title="Pod Restarts",
             description="OOM kills and crash loops",
             row="Stability",
-            queries=[QueryTemplate(
-                expr='increase(kube_pod_container_restarts_total{{{container_filter}}}[{rate_interval}])',
-                legend_format="restarts",
-            )],
+            queries=[
+                QueryTemplate(
+                    expr="increase(kube_pod_container_restarts_total{{{container_filter}}}[{rate_interval}])",
+                    legend_format="restarts",
+                )
+            ],
         ),
     ],
 )
@@ -364,7 +420,7 @@ def _load_archetypes_from_yaml(path: Path) -> list[InvestigationArchetype]:
     """Parse archetypes.yaml into InvestigationArchetype objects."""
     import yaml
 
-    with open(path, "r") as f:
+    with open(path) as f:
         data = yaml.safe_load(f)
 
     archetypes = []
@@ -379,26 +435,30 @@ def _load_archetypes_from_yaml(path: Path) -> list[InvestigationArchetype]:
                 )
                 for q in p.get("queries", [])
             ]
-            panels.append(PanelTemplate(
-                title=p["title"],
-                description=p.get("description", ""),
-                panel_type=p.get("panel_type", "timeseries"),
-                row=p.get("row", ""),
-                queries=queries,
-                unit=p.get("unit", ""),
-            ))
-        archetypes.append(InvestigationArchetype(
-            id=entry["id"],
-            name=entry["name"],
-            description=entry.get("description", ""),
-            problem_types=entry.get("problem_types", []),
-            required_metrics=entry.get("required_metrics", []),
-            required_signals=entry.get("required_signals", []),
-            signal_bindings=entry.get("signal_bindings", {}),
-            panels=panels,
-            tags=entry.get("tags", []),
-            default_timerange=entry.get("default_timerange", "1h"),
-        ))
+            panels.append(
+                PanelTemplate(
+                    title=p["title"],
+                    description=p.get("description", ""),
+                    panel_type=p.get("panel_type", "timeseries"),
+                    row=p.get("row", ""),
+                    queries=queries,
+                    unit=p.get("unit", ""),
+                )
+            )
+        archetypes.append(
+            InvestigationArchetype(
+                id=entry["id"],
+                name=entry["name"],
+                description=entry.get("description", ""),
+                problem_types=entry.get("problem_types", []),
+                required_metrics=entry.get("required_metrics", []),
+                required_signals=entry.get("required_signals", []),
+                signal_bindings=entry.get("signal_bindings", {}),
+                panels=panels,
+                tags=entry.get("tags", []),
+                default_timerange=entry.get("default_timerange", "1h"),
+            )
+        )
     return archetypes
 
 

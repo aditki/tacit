@@ -1,4 +1,5 @@
 """Orchestration pipeline: Prompt → Intent → Discover → Build → Publish."""
+
 from __future__ import annotations
 
 import asyncio
@@ -17,9 +18,9 @@ from dashforge.backends.base import PublishResult
 from dashforge.cache import llm_cache, make_cache_key
 from dashforge.config import settings
 from dashforge.context.enrichment import enrich_context
+from dashforge.history import get_investigation_store
 from dashforge.logging import bind_request_id, stage_log, unbind_request_id
 from dashforge.models.schemas import DashRequest, DashResponse
-from dashforge.history import get_investigation_store
 from dashforge.ranking import prerank_metrics
 
 logger = structlog.get_logger()
@@ -46,12 +47,16 @@ async def run_pipeline(request: DashRequest) -> DashResponse:
                     _run_pipeline_inner(request),
                     timeout=settings.pipeline_timeout_seconds,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.error("pipeline_timeout", user=request.user_id, timeout=settings.pipeline_timeout_seconds)
                 try:
                     store = get_investigation_store()
                     inv_id = store.start(request.prompt, request.user_id, request.channel_id)
-                    store.finish(inv_id, status="timeout", error=f"Timed out after {settings.pipeline_timeout_seconds}s")
+                    store.finish(
+                        inv_id,
+                        status="timeout",
+                        error=f"Timed out after {settings.pipeline_timeout_seconds}s",
+                    )
                 except Exception:
                     pass
                 return DashResponse(
@@ -75,9 +80,10 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
     backends = get_active_backends()
     if not backends:
         return DashResponse(
-            dashboard_url="", dashboard_uid="", panel_count=0,
-            summary="No dashboard backends are enabled. "
-            "Enable at least one of: grafana, signalfx.",
+            dashboard_url="",
+            dashboard_uid="",
+            panel_count=0,
+            summary="No dashboard backends are enabled. " "Enable at least one of: grafana, signalfx.",
         )
 
     primary = backends[0]  # determines query language for compilation
@@ -96,7 +102,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         timings["intent"] = time.monotonic() - t0
         cumulative_tokens = cumulative_tokens + intent_usage
         stage_log(
-            "intent", (time.monotonic() - t0) * 1000,
+            "intent",
+            (time.monotonic() - t0) * 1000,
             token_usage=intent_usage,
             prompt=request.prompt[:100],
             user_id=request.user_id,
@@ -124,7 +131,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         context_chunks = await enrich_context(intent)
         timings["context"] = time.monotonic() - t0
         stage_log(
-            "context_enrichment", (time.monotonic() - t0) * 1000,
+            "context_enrichment",
+            (time.monotonic() - t0) * 1000,
             chunks_returned=len(context_chunks),
         )
 
@@ -139,7 +147,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 ds_types.append(backend.name)
         timings["metrics_fetch"] = time.monotonic() - t0
         stage_log(
-            "metrics_fetch", (time.monotonic() - t0) * 1000,
+            "metrics_fetch",
+            (time.monotonic() - t0) * 1000,
             backends_queried=len(backends),
             datasource_types=ds_types,
             metrics_found=len(metric_catalog),
@@ -156,8 +165,13 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             logger.warning("history_record_discovery_failed", exc_info=True)
 
         if not metric_catalog:
-            history.finish(inv_id, status="failed", error="No metrics found",
-                           timings=timings, total_time=time.monotonic() - t_start)
+            history.finish(
+                inv_id,
+                status="failed",
+                error="No metrics found",
+                timings=timings,
+                total_time=time.monotonic() - t_start,
+            )
             return DashResponse(
                 dashboard_url="",
                 dashboard_uid="",
@@ -168,9 +182,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
 
         # ── 4. Multi-label archetype matching ────────────────────
         t0 = time.monotonic()
-        ranked_archetypes = get_archetypes_by_confidence(
-            intent.archetypes, min_confidence=0.3
-        )
+        ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
         # Fallback: try legacy single-label lookup
         if not ranked_archetypes:
             legacy = get_archetype(intent.problem_type)
@@ -190,17 +202,22 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
 
             if len(ranked_archetypes) > 1:
                 dashboard_spec = blend_archetypes(
-                    ranked_archetypes, intent, metric_catalog,
+                    ranked_archetypes,
+                    intent,
+                    metric_catalog,
                     target_language=target_language,
                 )
             else:
                 dashboard_spec = compile_archetype(
-                    primary_arch, intent, metric_catalog,
+                    primary_arch,
+                    intent,
+                    metric_catalog,
                     target_language=target_language,
                 )
             timings["archetype_compile"] = time.monotonic() - t0
             stage_log(
-                "archetype_compile", (time.monotonic() - t0) * 1000,
+                "archetype_compile",
+                (time.monotonic() - t0) * 1000,
                 primary_archetype=primary_arch.id,
                 primary_confidence=primary_conf,
                 archetypes_matched=len(ranked_archetypes),
@@ -215,14 +232,17 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             t_prerank = time.monotonic()
             ranked_catalog = prerank_metrics(intent, metric_catalog)
             stage_log(
-                "metric_ranking", (time.monotonic() - t_prerank) * 1000,
+                "metric_ranking",
+                (time.monotonic() - t_prerank) * 1000,
                 metrics_considered=len(metric_catalog),
                 metrics_selected=len(ranked_catalog),
             )
 
             # Metrics Discovery LLM (cached)
             discovery_cache_key = make_cache_key(
-                "discovery", intent.summary, ",".join(intent.keywords),
+                "discovery",
+                intent.summary,
+                ",".join(intent.keywords),
                 ",".join(e.name for e in ranked_catalog[:20]),
             )
             cached_discovery = llm_cache.get(discovery_cache_key)
@@ -239,7 +259,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 discovery_cached = False
 
             stage_log(
-                "metrics_discovery", (time.monotonic() - t_disc) * 1000,
+                "metrics_discovery",
+                (time.monotonic() - t_disc) * 1000,
                 token_usage=discovery_usage if not discovery_cached else None,
                 catalog_size=len(ranked_catalog),
                 metrics_selected=len(discovery.metrics),
@@ -247,8 +268,13 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             )
 
             if not discovery.metrics:
-                history.finish(inv_id, status="failed", error="No relevant metrics found by LLM",
-                               timings=timings, total_time=time.monotonic() - t_start)
+                history.finish(
+                    inv_id,
+                    status="failed",
+                    error="No relevant metrics found by LLM",
+                    timings=timings,
+                    total_time=time.monotonic() - t_start,
+                )
                 return DashResponse(
                     dashboard_url="",
                     dashboard_uid="",
@@ -260,23 +286,24 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             # Post-validate LLM output
             valid_uids = {e.datasource_uid for e in metric_catalog}
             original_count = len(discovery.metrics)
-            discovery.metrics = [
-                m for m in discovery.metrics
-                if m.datasource_uid in valid_uids
-            ]
+            discovery.metrics = [m for m in discovery.metrics if m.datasource_uid in valid_uids]
             dropped = original_count - len(discovery.metrics)
             if dropped:
                 logger.warning("llm_hallucinated_uids_dropped", dropped=dropped)
 
             if not discovery.metrics:
-                history.finish(inv_id, status="failed", error="All LLM-selected metrics had invalid datasource UIDs",
-                               timings=timings, total_time=time.monotonic() - t_start)
+                history.finish(
+                    inv_id,
+                    status="failed",
+                    error="All LLM-selected metrics had invalid datasource UIDs",
+                    timings=timings,
+                    total_time=time.monotonic() - t_start,
+                )
                 return DashResponse(
                     dashboard_url="",
                     dashboard_uid="",
                     panel_count=0,
-                    summary="LLM selected metrics with invalid datasource references. "
-                    "Try rephrasing your query.",
+                    summary="LLM selected metrics with invalid datasource references. " "Try rephrasing your query.",
                 )
 
             # Query Builder Agent
@@ -285,7 +312,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             timings["query_builder"] = time.monotonic() - t0
             cumulative_tokens = cumulative_tokens + qb_usage
             stage_log(
-                "query_builder", (time.monotonic() - t0) * 1000,
+                "query_builder",
+                (time.monotonic() - t0) * 1000,
                 token_usage=qb_usage,
                 metrics_input=len(discovery.metrics),
                 panels_generated=len(dashboard_spec.panels),
@@ -297,7 +325,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         dashboard_spec, validation_warnings = await primary.validate_queries(dashboard_spec)
         timings["query_validation"] = time.monotonic() - t0
         stage_log(
-            "query_validation", (time.monotonic() - t0) * 1000,
+            "query_validation",
+            (time.monotonic() - t0) * 1000,
             backend=primary.name,
             panels_before=panels_before,
             panels_after=len(dashboard_spec.panels),
@@ -307,13 +336,16 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         # Record queries after validation
         try:
             queries_for_history = [
-                {"expr": q.expr, "panel_title": p.title}
-                for p in dashboard_spec.panels for q in p.queries if q.expr
+                {"expr": q.expr, "panel_title": p.title} for p in dashboard_spec.panels for q in p.queries if q.expr
             ]
-            metrics_for_history = list({
-                q.expr.split("{")[0].split("(")[-1].strip()
-                for p in dashboard_spec.panels for q in p.queries if q.expr
-            })
+            metrics_for_history = list(
+                {
+                    q.expr.split("{")[0].split("(")[-1].strip()
+                    for p in dashboard_spec.panels
+                    for q in p.queries
+                    if q.expr
+                }
+            )
             history.record_queries(
                 inv_id,
                 metrics_selected=metrics_for_history,
@@ -325,16 +357,20 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             logger.warning("history_record_queries_failed", exc_info=True)
 
         if not dashboard_spec.panels:
-            history.finish(inv_id, status="failed", error="All panels empty after validation",
-                           timings=timings, total_time=time.monotonic() - t_start)
+            history.finish(
+                inv_id,
+                status="failed",
+                error="All panels empty after validation",
+                timings=timings,
+                total_time=time.monotonic() - t_start,
+            )
             return DashResponse(
                 dashboard_url="",
                 dashboard_uid="",
                 panel_count=0,
                 summary="No panels returned data for your query. "
                 "The service or metrics you asked about may not exist "
-                "in the connected datasources.\n"
-                + "\n".join(validation_warnings),
+                "in the connected datasources.\n" + "\n".join(validation_warnings),
             )
 
         # ── 6. Publish — each backend publishes independently ────────
@@ -348,7 +384,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 logger.warning("publish_failed", backend=backend.name, exc_info=True)
             timings[f"{backend.name}_publish"] = time.monotonic() - t0
             stage_log(
-                "publish", (time.monotonic() - t0) * 1000,
+                "publish",
+                (time.monotonic() - t0) * 1000,
                 backend=backend.name,
                 success=backend.name in publish_results,
             )
@@ -366,8 +403,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             else ", ".join({m.datasource_name for m in discovery.metrics})
         )
         summary_parts = [
-            f"Created dashboard **{dashboard_spec.title}** with "
-            f"{len(dashboard_spec.panels)} panels.",
+            f"Created dashboard **{dashboard_spec.title}** with " f"{len(dashboard_spec.panels)} panels.",
             f"Timerange: last {dashboard_spec.timerange}",
             f"Datasources used: {ds_info}",
             f"Path: {path_used}",
@@ -394,7 +430,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             logger.warning("history_record_validation_failed", exc_info=True)
 
         stage_log(
-            "pipeline_complete", total_s * 1000,
+            "pipeline_complete",
+            total_s * 1000,
             token_usage=cumulative_tokens,
             user_id=request.user_id,
             channel_id=request.channel_id,
@@ -420,21 +457,21 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         # ── 7. Record provenance for feedback system ──────────────────
         try:
             from dashforge.feedback import get_feedback_store
+
             store = get_feedback_store()
-            metrics_used = list({
-                q.expr.split("{")[0].split("(")[-1].strip()
-                for p in dashboard_spec.panels
-                for q in p.queries
-                if q.expr
-            })
+            metrics_used = list(
+                {
+                    q.expr.split("{")[0].split("(")[-1].strip()
+                    for p in dashboard_spec.panels
+                    for q in p.queries
+                    if q.expr
+                }
+            )
             store.record_provenance(
                 dashboard_uid=effective_uid,
                 prompt=request.prompt,
                 problem_type=intent.problem_type,
-                archetypes=[
-                    {"type": a.type, "confidence": a.confidence}
-                    for a in intent.archetypes
-                ],
+                archetypes=[{"type": a.type, "confidence": a.confidence} for a in intent.archetypes],
                 metrics_used=metrics_used,
                 panel_count=len(dashboard_spec.panels),
                 path_used=path_used,

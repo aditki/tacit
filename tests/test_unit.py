@@ -1,13 +1,24 @@
 """Unit tests for DashForge core modules."""
-import json
-import sys
+
 import os
+import sys
 
 import httpx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from dashforge.agents.metrics_discovery import _keyword_filter as md_keyword_filter
+from dashforge.context.enrichment import enrich_context, format_context_for_prompt
+from dashforge.context.registry import get_context_provider
+from dashforge.grafana.adapters.cloudwatch import _select_namespaces
+from dashforge.grafana.adapters.registry import get_adapter, get_adapter_for_type, supported_datasource_types
+from dashforge.grafana.dashboard import TIMERANGE_MAP, _build_panel_json, build_dashboard_json
+from dashforge.grafana.datasource import (
+    filter_datasources_by_signal,
+    filter_searchable_datasources,
+)
 from dashforge.models.schemas import (
+    ContextChunk,
     DashboardSpec,
     DashRequest,
     DashResponse,
@@ -15,22 +26,10 @@ from dashforge.models.schemas import (
     DiscoveredMetric,
     Intent,
     MetricEntry,
-    MetricsDiscoveryResult,
     PanelQuery,
     PanelSpec,
     SignalType,
 )
-from dashforge.grafana.dashboard import build_dashboard_json, _build_panel_json, TIMERANGE_MAP
-from dashforge.grafana.datasource import (
-    filter_datasources_by_signal,
-    filter_searchable_datasources,
-)
-from dashforge.grafana.adapters.registry import get_adapter, get_adapter_for_type, supported_datasource_types
-from dashforge.grafana.adapters.cloudwatch import _select_namespaces
-from dashforge.agents.metrics_discovery import _keyword_filter as md_keyword_filter
-from dashforge.context.enrichment import format_context_for_prompt, enrich_context
-from dashforge.context.registry import get_context_provider
-from dashforge.models.schemas import ContextChunk
 
 
 def test_intent_model():
@@ -324,8 +323,13 @@ def test_filter_searchable_datasources():
 
 def test_cloudwatch_namespace_selection():
     available = [
-        "AWS/EC2", "AWS/ApplicationELB", "AWS/RDS", "AWS/Lambda",
-        "AWS/SQS", "AWS/DynamoDB", "AWS/S3",
+        "AWS/EC2",
+        "AWS/ApplicationELB",
+        "AWS/RDS",
+        "AWS/Lambda",
+        "AWS/SQS",
+        "AWS/DynamoDB",
+        "AWS/S3",
     ]
 
     # 5xx keyword should match ALB namespaces
@@ -405,6 +409,7 @@ def test_context_provider_disabled_by_default():
 
 def test_enrich_context_noop_when_disabled():
     import asyncio
+
     intent = Intent(
         summary="High CPU",
         domain="infrastructure",
@@ -416,7 +421,7 @@ def test_enrich_context_noop_when_disabled():
 
 
 def test_prompt_sanitization():
-    from dashforge.main import _sanitize_prompt, MAX_PROMPT_LENGTH
+    from dashforge.main import MAX_PROMPT_LENGTH, _sanitize_prompt
 
     # Normal prompt passes through
     assert _sanitize_prompt("high latency on checkout") == "high latency on checkout"
@@ -440,6 +445,7 @@ def test_prompt_sanitization():
 
 def test_secrets_not_in_repr():
     from dashforge.config import Settings
+
     s = Settings(
         llm_api_key="sk-secret-key-123",
         grafana_api_key="glsa_secret",
@@ -457,7 +463,7 @@ def test_secrets_not_in_repr():
 
 
 def test_llm_error_classes():
-    from dashforge.agents.llm import LLMTransientError, LLMParseError
+    from dashforge.agents.llm import LLMParseError, LLMTransientError
 
     # LLMTransientError is retryable
     try:
@@ -484,6 +490,7 @@ def test_llm_error_classes():
 
 def test_intent_prompt_has_security_rules():
     from dashforge.agents.intent import SYSTEM_PROMPT
+
     assert "SECURITY RULES" in SYSTEM_PROMPT
     assert "UNTRUSTED DATA" in SYSTEM_PROMPT
     assert "NEVER" in SYSTEM_PROMPT
@@ -492,6 +499,7 @@ def test_intent_prompt_has_security_rules():
 
 def test_metrics_discovery_prompt_has_security():
     from dashforge.agents.metrics_discovery import SYSTEM_PROMPT
+
     assert "SECURITY" in SYSTEM_PROMPT
     assert "never invent metric names" in SYSTEM_PROMPT.lower() or "never invent" in SYSTEM_PROMPT.lower()
     print("[PASS] test_metrics_discovery_prompt_has_security")
@@ -499,6 +507,7 @@ def test_metrics_discovery_prompt_has_security():
 
 def test_query_builder_prompt_has_security():
     from dashforge.agents.query_builder import SYSTEM_PROMPT
+
     assert "SECURITY" in SYSTEM_PROMPT
     assert "Never invent UIDs" in SYSTEM_PROMPT
     print("[PASS] test_query_builder_prompt_has_security")
@@ -506,6 +515,7 @@ def test_query_builder_prompt_has_security():
 
 def test_config_concurrency_defaults():
     from dashforge.config import settings
+
     assert settings.pipeline_max_concurrent >= 1
     assert settings.pipeline_timeout_seconds >= 30
     assert settings.adapter_max_concurrent >= 1
@@ -536,15 +546,17 @@ def test_cloudwatch_target_includes_region():
     """Grafana CW target JSON must contain region when cloudwatch_namespace is set."""
     panel = PanelSpec(
         title="5xx Errors",
-        queries=[PanelQuery(
-            expr="HTTPCode_ELB_5XX",
-            datasource_uid="cw-1",
-            datasource_type="cloudwatch",
-            cloudwatch_namespace="AWS/ApplicationELB",
-            cloudwatch_stat="Sum",
-            cloudwatch_region="eu-west-1",
-            cloudwatch_dimensions={"LoadBalancer": "*"},
-        )],
+        queries=[
+            PanelQuery(
+                expr="HTTPCode_ELB_5XX",
+                datasource_uid="cw-1",
+                datasource_type="cloudwatch",
+                cloudwatch_namespace="AWS/ApplicationELB",
+                cloudwatch_stat="Sum",
+                cloudwatch_region="eu-west-1",
+                cloudwatch_dimensions={"LoadBalancer": "*"},
+            )
+        ],
     )
     result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
     target = result["targets"][0]
@@ -561,8 +573,10 @@ def test_json_repair_path_reraises_transient_errors():
     it must raise LLMTransientError so tenacity retries, not LLMParseError."""
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
-    from dashforge.agents.llm import call_llm, LLMTransientError
+
     from pydantic import BaseModel
+
+    from dashforge.agents.llm import LLMTransientError, call_llm
 
     class Simple(BaseModel):
         v: int
@@ -574,16 +588,17 @@ def test_json_repair_path_reraises_transient_errors():
     # tenacity retries 3 times, so we need 3 × (primary + repair) = 6 calls.
     mock_provider.chat_json = AsyncMock(
         side_effect=[
-            LLMResult(text='{broken json'),              # attempt 1: primary
-            httpx.TimeoutException("read timed out"),   # attempt 1: repair
-            LLMResult(text='{broken json'),              # attempt 2: primary
-            httpx.TimeoutException("read timed out"),   # attempt 2: repair
-            LLMResult(text='{broken json'),              # attempt 3: primary
-            httpx.TimeoutException("read timed out"),   # attempt 3: repair
+            LLMResult(text="{broken json"),  # attempt 1: primary
+            httpx.TimeoutException("read timed out"),  # attempt 1: repair
+            LLMResult(text="{broken json"),  # attempt 2: primary
+            httpx.TimeoutException("read timed out"),  # attempt 2: repair
+            LLMResult(text="{broken json"),  # attempt 3: primary
+            httpx.TimeoutException("read timed out"),  # attempt 3: repair
         ]
     )
 
     from tenacity import RetryError, wait_none
+
     # Patch wait to zero so test doesn't sleep
     original_wait = call_llm.retry.wait
     call_llm.retry.wait = wait_none()
@@ -597,20 +612,18 @@ def test_json_repair_path_reraises_transient_errors():
                 # tenacity wraps the last exception — it must be LLMTransientError
                 last = re.last_attempt.exception()
                 assert isinstance(last, LLMTransientError), (
-                    f"Expected LLMTransientError inside RetryError, "
-                    f"got {type(last).__name__}: {last}"
+                    f"Expected LLMTransientError inside RetryError, " f"got {type(last).__name__}: {last}"
                 )
             except LLMTransientError:
                 pass  # also acceptable
             except Exception as exc:
                 assert False, (
-                    f"Expected LLMTransientError for transient repair failure, "
-                    f"got {type(exc).__name__}: {exc}"
+                    f"Expected LLMTransientError for transient repair failure, " f"got {type(exc).__name__}: {exc}"
                 )
         # All 3 attempts should have been made (6 chat_json calls = 3 primary + 3 repair)
-        assert mock_provider.chat_json.call_count == 6, (
-            f"Expected 6 calls (3 attempts × 2), got {mock_provider.chat_json.call_count}"
-        )
+        assert (
+            mock_provider.chat_json.call_count == 6
+        ), f"Expected 6 calls (3 attempts × 2), got {mock_provider.chat_json.call_count}"
     finally:
         call_llm.retry.wait = original_wait
     print("[PASS] test_json_repair_path_reraises_transient_errors")
@@ -622,20 +635,22 @@ def test_cloudwatch_region_defaults_to_datasource_default():
     rather than a potentially wrong LLM-guessed value."""
     panel = PanelSpec(
         title="5xx Errors",
-        queries=[PanelQuery(
-            expr="HTTPCode_ELB_5XX",
-            datasource_uid="cw-1",
-            datasource_type="cloudwatch",
-            cloudwatch_namespace="AWS/ApplicationELB",
-            cloudwatch_stat="Sum",
-            # cloudwatch_region intentionally NOT set — should use "default"
-        )],
+        queries=[
+            PanelQuery(
+                expr="HTTPCode_ELB_5XX",
+                datasource_uid="cw-1",
+                datasource_type="cloudwatch",
+                cloudwatch_namespace="AWS/ApplicationELB",
+                cloudwatch_stat="Sum",
+                # cloudwatch_region intentionally NOT set — should use "default"
+            )
+        ],
     )
     result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
     target = result["targets"][0]
-    assert target["region"] == "default", (
-        f"Empty cloudwatch_region should map to 'default', got {target.get('region')!r}"
-    )
+    assert (
+        target["region"] == "default"
+    ), f"Empty cloudwatch_region should map to 'default', got {target.get('region')!r}"
     print("[PASS] test_cloudwatch_region_defaults_to_datasource_default")
 
 
@@ -643,6 +658,7 @@ def test_query_builder_prompt_does_not_instruct_region_guessing():
     """The query builder prompt must NOT tell the LLM to set cloudwatch_region,
     because the metric context doesn't include region info and the LLM would guess."""
     from dashforge.agents.query_builder import SYSTEM_PROMPT
+
     assert "cloudwatch_region" not in SYSTEM_PROMPT, (
         "SYSTEM_PROMPT should not instruct LLM to set cloudwatch_region — "
         "region should come from the datasource defaultRegion, not LLM guessing"
@@ -654,11 +670,13 @@ def test_prometheus_target_excludes_cloudwatch_fields():
     """Non-CloudWatch targets must NOT include region, namespace, etc."""
     panel = PanelSpec(
         title="Request Rate",
-        queries=[PanelQuery(
-            expr='rate(http_requests_total[5m])',
-            datasource_uid="prom-1",
-            datasource_type="prometheus",
-        )],
+        queries=[
+            PanelQuery(
+                expr="rate(http_requests_total[5m])",
+                datasource_uid="prom-1",
+                datasource_type="prometheus",
+            )
+        ],
     )
     result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
     target = result["targets"][0]
@@ -681,15 +699,19 @@ def test_cloudwatch_validation_is_skipped_for_prometheus_probe():
 
     spec = DashboardSpec(
         title="cw",
-        panels=[PanelSpec(
-            title="ELB 5xx",
-            queries=[PanelQuery(
-                expr="HTTPCode_ELB_5XX",
-                datasource_uid="cw-1",
-                datasource_type="cloudwatch",
-                cloudwatch_namespace="AWS/ApplicationELB",
-            )],
-        )],
+        panels=[
+            PanelSpec(
+                title="ELB 5xx",
+                queries=[
+                    PanelQuery(
+                        expr="HTTPCode_ELB_5XX",
+                        datasource_uid="cw-1",
+                        datasource_type="cloudwatch",
+                        cloudwatch_namespace="AWS/ApplicationELB",
+                    )
+                ],
+            )
+        ],
     )
 
     filtered, warnings = asyncio.run(validate_dashboard_queries(client, spec))
@@ -712,14 +734,18 @@ def test_prometheus_validation_still_uses_proxy_query():
 
     spec = DashboardSpec(
         title="prom",
-        panels=[PanelSpec(
-            title="Request Rate",
-            queries=[PanelQuery(
-                expr='rate(http_requests_total[5m])',
-                datasource_uid="prom-1",
-                datasource_type="prometheus",
-            )],
-        )],
+        panels=[
+            PanelSpec(
+                title="Request Rate",
+                queries=[
+                    PanelQuery(
+                        expr="rate(http_requests_total[5m])",
+                        datasource_uid="prom-1",
+                        datasource_type="prometheus",
+                    )
+                ],
+            )
+        ],
     )
 
     filtered, warnings = asyncio.run(validate_dashboard_queries(client, spec))
@@ -736,9 +762,11 @@ def test_provider_sdk_transient_error_in_repair_retried():
     so tenacity retries, not swallowed as LLMParseError."""
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
-    from dashforge.agents.llm import call_llm, LLMTransientError
+
     from pydantic import BaseModel
     from tenacity import RetryError, wait_none
+
+    from dashforge.agents.llm import LLMTransientError, call_llm
 
     class Simple(BaseModel):
         v: int
@@ -746,6 +774,7 @@ def test_provider_sdk_transient_error_in_repair_retried():
     # Simulate a provider SDK rate-limit exception (not httpx, not ClientError)
     class RateLimitError(Exception):
         """Simulates openai.RateLimitError."""
+
         def __init__(self):
             super().__init__("Rate limit exceeded")
             self.status_code = 429
@@ -755,12 +784,12 @@ def test_provider_sdk_transient_error_in_repair_retried():
     mock_provider = MagicMock()
     mock_provider.chat_json = AsyncMock(
         side_effect=[
-            LLMResult(text='{broken json'),  # attempt 1: primary
-            RateLimitError(),                # attempt 1: repair → transient
-            LLMResult(text='{broken json'),  # attempt 2: primary
-            RateLimitError(),                # attempt 2: repair → transient
-            LLMResult(text='{broken json'),  # attempt 3: primary
-            RateLimitError(),                # attempt 3: repair → transient
+            LLMResult(text="{broken json"),  # attempt 1: primary
+            RateLimitError(),  # attempt 1: repair → transient
+            LLMResult(text="{broken json"),  # attempt 2: primary
+            RateLimitError(),  # attempt 2: repair → transient
+            LLMResult(text="{broken json"),  # attempt 3: primary
+            RateLimitError(),  # attempt 3: repair → transient
         ]
     )
 
@@ -775,19 +804,17 @@ def test_provider_sdk_transient_error_in_repair_retried():
             except RetryError as re:
                 last = re.last_attempt.exception()
                 assert isinstance(last, LLMTransientError), (
-                    f"Expected LLMTransientError (retryable), "
-                    f"got {type(last).__name__}: {last}"
+                    f"Expected LLMTransientError (retryable), " f"got {type(last).__name__}: {last}"
                 )
             except LLMTransientError:
                 pass  # also acceptable
             except Exception as exc:
                 assert False, (
-                    f"Provider SDK rate-limit error should be LLMTransientError, "
-                    f"got {type(exc).__name__}: {exc}"
+                    f"Provider SDK rate-limit error should be LLMTransientError, " f"got {type(exc).__name__}: {exc}"
                 )
-        assert mock_provider.chat_json.call_count == 6, (
-            f"Expected 6 calls (3 attempts × 2), got {mock_provider.chat_json.call_count}"
-        )
+        assert (
+            mock_provider.chat_json.call_count == 6
+        ), f"Expected 6 calls (3 attempts × 2), got {mock_provider.chat_json.call_count}"
     finally:
         call_llm.retry.wait = original_wait
     print("[PASS] test_provider_sdk_transient_error_in_repair_retried")
@@ -798,29 +825,33 @@ def test_cloudwatch_metric_name_strips_namespace_prefix():
     must strip the namespace prefix so metricName is just 'MetricName'."""
     panel = PanelSpec(
         title="5xx Errors",
-        queries=[PanelQuery(
-            expr="AWS/ApplicationELB/HTTPCode_ELB_5XX",
-            datasource_uid="cw-1",
-            datasource_type="cloudwatch",
-            cloudwatch_namespace="AWS/ApplicationELB",
-            cloudwatch_stat="Sum",
-        )],
+        queries=[
+            PanelQuery(
+                expr="AWS/ApplicationELB/HTTPCode_ELB_5XX",
+                datasource_uid="cw-1",
+                datasource_type="cloudwatch",
+                cloudwatch_namespace="AWS/ApplicationELB",
+                cloudwatch_stat="Sum",
+            )
+        ],
     )
     result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
     target = result["targets"][0]
-    assert target["metricName"] == "HTTPCode_ELB_5XX", (
-        f"Expected stripped metricName 'HTTPCode_ELB_5XX', got {target['metricName']!r}"
-    )
+    assert (
+        target["metricName"] == "HTTPCode_ELB_5XX"
+    ), f"Expected stripped metricName 'HTTPCode_ELB_5XX', got {target['metricName']!r}"
     # When expr is already bare, should pass through unchanged
     panel2 = PanelSpec(
         title="5xx Errors",
-        queries=[PanelQuery(
-            expr="HTTPCode_ELB_5XX",
-            datasource_uid="cw-1",
-            datasource_type="cloudwatch",
-            cloudwatch_namespace="AWS/ApplicationELB",
-            cloudwatch_stat="Sum",
-        )],
+        queries=[
+            PanelQuery(
+                expr="HTTPCode_ELB_5XX",
+                datasource_uid="cw-1",
+                datasource_type="cloudwatch",
+                cloudwatch_namespace="AWS/ApplicationELB",
+                cloudwatch_stat="Sum",
+            )
+        ],
     )
     result2 = _build_panel_json(panel2, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
     assert result2["targets"][0]["metricName"] == "HTTPCode_ELB_5XX"
@@ -863,8 +894,9 @@ def test_cloudwatch_dimensions_accept_str_and_list():
     )
     panel2 = PanelSpec(title="Test", queries=[q2])
     result2 = _build_panel_json(panel2, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
-    assert result2["targets"][0]["dimensions"]["LoadBalancer"] == "*", \
-        "Single-element list ['*'] should be normalized to '*'"
+    assert (
+        result2["targets"][0]["dimensions"]["LoadBalancer"] == "*"
+    ), "Single-element list ['*'] should be normalized to '*'"
     print("[PASS] test_cloudwatch_dimensions_accept_str_and_list")
 
 

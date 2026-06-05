@@ -1,4 +1,5 @@
 """Query Builder Agent — generates queries in any language and panel specs from discovered metrics."""
+
 from __future__ import annotations
 
 import structlog
@@ -65,7 +66,10 @@ Your job:
   Use filter() for dimension filtering, not curly braces.
   Example: data('cpu.utilization', filter=filter('host', 'web-*')).mean().publish(label='CPU')
   Example: data('service.request.count', filter=filter('sf_environment', 'production')).sum().publish(label='Requests')
-  Example: (data('service.request.count', filter=filter('sf_error', 'true')) / data('service.request.count')).scale(100).publish(label='Error Rate %')
+  Example: (
+    data('service.request.count', filter=filter('sf_error', 'true'))
+    / data('service.request.count')
+  ).scale(100).publish(label='Error Rate %')
   For rollups use: data('metric.name', rollup='rate').publish()
   For percentiles: data('service.request.duration').percentile(pct=99).publish(label='P99')
 

@@ -39,6 +39,8 @@ dev = [
     "prometheus-client>=0.20.0",
     "ruff>=0.5.0",
     "pyinstaller>=6.0.0",
+    "black>=26.5.1",
+    "mypy>=2.1.0",
 ]
 
 [tool.pytest.ini_options]
@@ -51,6 +53,18 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.black]
+line-length = 120
+target-version = ["py312"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["dashforge"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
 
 [build-system]
 requires = ["hatchling"]

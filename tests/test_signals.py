@@ -2,8 +2,10 @@
 
 Covers both PromQL (Grafana) and SignalFlow (SignalFx) extraction.
 """
+
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import time
 from pathlib import Path
@@ -28,6 +30,7 @@ from dashforge.signals import (
 )
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture
 def signal_store(tmp_path):
@@ -96,15 +99,14 @@ def sample_catalog():
 
 # ── Signal Store basics ──────────────────────────────────────────────────────
 
+
 class TestSignalStoreBasics:
 
     def test_register_and_list_signal_types(self, signal_store):
         signal_store.register_signal_type(
             "request_latency", description="Request latency", category="latency", unit="s"
         )
-        signal_store.register_signal_type(
-            "error_rate", description="Error rate", category="errors", unit="percentunit"
-        )
+        signal_store.register_signal_type("error_rate", description="Error rate", category="errors", unit="percentunit")
 
         types = signal_store.list_signal_types()
         assert len(types) == 2
@@ -130,12 +132,15 @@ class TestSignalStoreBasics:
 
 # ── Signal ↔ metric mappings ────────────────────────────────────────────────
 
+
 class TestSignalMappings:
 
     def test_add_and_retrieve_mapping(self, signal_store):
         signal_store.register_signal_type("request_latency")
         signal_store.add_mapping(
-            "request_latency", "http_request_duration_seconds", confidence=0.95,
+            "request_latency",
+            "http_request_duration_seconds",
+            confidence=0.95,
             source_type="bootstrap",
         )
 
@@ -183,7 +188,8 @@ class TestSignalMappings:
 
     def test_provenance_tracking(self, signal_store):
         signal_store.add_mapping(
-            "auth_latency", "sso_auth_latency_seconds",
+            "auth_latency",
+            "sso_auth_latency_seconds",
             confidence=0.8,
             source_type="dashboard_ingest",
             source_refs=["dashboard-uid-123"],
@@ -206,57 +212,70 @@ class TestSignalMappings:
 
 # ── Context filtering ────────────────────────────────────────────────────────
 
+
 class TestContextFiltering:
 
     def test_empty_context_matches_all(self):
-        mapping = {"context_services": [], "context_datasource_types": [],
-                    "context_archetypes": [], "context_environments": []}
+        mapping = {
+            "context_services": [],
+            "context_datasource_types": [],
+            "context_archetypes": [],
+            "context_environments": [],
+        }
         assert _context_matches(mapping, "any-svc", "prometheus", "latency", "prod")
 
     def test_service_context_filter(self):
-        mapping = {"context_services": ["sso-gateway"], "context_datasource_types": [],
-                    "context_archetypes": [], "context_environments": []}
+        mapping = {
+            "context_services": ["sso-gateway"],
+            "context_datasource_types": [],
+            "context_archetypes": [],
+            "context_environments": [],
+        }
         assert _context_matches(mapping, "sso-gateway", "", "", "")
         assert not _context_matches(mapping, "payment-service", "", "", "")
 
     def test_datasource_type_context_filter(self):
-        mapping = {"context_services": [], "context_datasource_types": ["prometheus"],
-                    "context_archetypes": [], "context_environments": []}
+        mapping = {
+            "context_services": [],
+            "context_datasource_types": ["prometheus"],
+            "context_archetypes": [],
+            "context_environments": [],
+        }
         assert _context_matches(mapping, "", "prometheus", "", "")
         assert not _context_matches(mapping, "", "cloudwatch", "", "")
 
     def test_context_filter_with_signal_store(self, signal_store):
         signal_store.add_mapping(
-            "request_latency", "sso_specific_latency",
+            "request_latency",
+            "sso_specific_latency",
             confidence=0.9,
             context_services=["sso-gateway"],
         )
         signal_store.add_mapping(
-            "request_latency", "generic_latency",
+            "request_latency",
+            "generic_latency",
             confidence=0.8,
         )
 
         # With SSO context — both match
-        mappings = signal_store.get_mappings_for_signal(
-            "request_latency", context_service="sso-gateway"
-        )
+        mappings = signal_store.get_mappings_for_signal("request_latency", context_service="sso-gateway")
         assert len(mappings) == 2
 
         # With different service — only generic matches
-        mappings = signal_store.get_mappings_for_signal(
-            "request_latency", context_service="payment-service"
-        )
+        mappings = signal_store.get_mappings_for_signal("request_latency", context_service="payment-service")
         assert len(mappings) == 1
         assert mappings[0]["metric_pattern"] == "generic_latency"
 
     def test_context_specific_mapping_penalized_without_context(self, signal_store):
         signal_store.add_mapping(
-            "request_latency", "checkout_specific_latency",
+            "request_latency",
+            "checkout_specific_latency",
             confidence=0.9,
             context_services=["checkout"],
         )
         signal_store.add_mapping(
-            "request_latency", "generic_latency",
+            "request_latency",
+            "generic_latency",
             confidence=0.8,
         )
 
@@ -268,29 +287,28 @@ class TestContextFiltering:
         ]
         assert mappings[1]["effective_confidence"] == pytest.approx(0.63, abs=0.001)
 
-    def test_context_specific_mapping_not_penalized_with_matching_context(
-        self, signal_store
-    ):
+    def test_context_specific_mapping_not_penalized_with_matching_context(self, signal_store):
         signal_store.add_mapping(
-            "request_latency", "checkout_specific_latency",
+            "request_latency",
+            "checkout_specific_latency",
             confidence=0.9,
             context_services=["checkout"],
         )
         signal_store.add_mapping(
-            "request_latency", "generic_latency",
+            "request_latency",
+            "generic_latency",
             confidence=0.8,
         )
 
-        mappings = signal_store.get_mappings_for_signal(
-            "request_latency", context_service="checkout"
-        )
+        mappings = signal_store.get_mappings_for_signal("request_latency", context_service="checkout")
 
         assert mappings[0]["metric_pattern"] == "checkout_specific_latency"
         assert mappings[0]["effective_confidence"] == pytest.approx(0.9, abs=0.001)
 
     def test_context_penalty_does_not_make_trusted_mapping_disappear(self, signal_store):
         signal_store.add_mapping(
-            "request_latency", "low_confidence_checkout_latency",
+            "request_latency",
+            "low_confidence_checkout_latency",
             confidence=0.2,
             context_services=["checkout"],
         )
@@ -319,13 +337,16 @@ class TestContextFiltering:
 
 # ── Confidence decay ─────────────────────────────────────────────────────────
 
+
 class TestConfidenceDecay:
 
     def test_bootstrap_no_decay(self):
         mapping = {
-            "confidence": 0.9, "source_type": "bootstrap",
+            "confidence": 0.9,
+            "source_type": "bootstrap",
             "last_seen": time.time() - 365 * 86400,  # 1 year ago
-            "positive_feedback": 0, "negative_feedback": 0,
+            "positive_feedback": 0,
+            "negative_feedback": 0,
         }
         eff = _effective_confidence(mapping, time.time())
         assert eff == 0.9  # no decay for bootstrap
@@ -333,9 +354,11 @@ class TestConfidenceDecay:
     def test_learned_mapping_decays(self):
         now = time.time()
         mapping = {
-            "confidence": 0.9, "source_type": "dashboard_ingest",
+            "confidence": 0.9,
+            "source_type": "dashboard_ingest",
             "last_seen": now - 90 * 86400,  # 90 days ago = 1 half-life
-            "positive_feedback": 0, "negative_feedback": 0,
+            "positive_feedback": 0,
+            "negative_feedback": 0,
         }
         eff = _effective_confidence(mapping, now)
         assert 0.4 < eff < 0.5  # ~0.45 after one half-life
@@ -343,9 +366,11 @@ class TestConfidenceDecay:
     def test_positive_feedback_boosts(self):
         now = time.time()
         mapping = {
-            "confidence": 0.5, "source_type": "teach",
+            "confidence": 0.5,
+            "source_type": "teach",
             "last_seen": now,  # fresh
-            "positive_feedback": 10, "negative_feedback": 0,
+            "positive_feedback": 10,
+            "negative_feedback": 0,
         }
         eff = _effective_confidence(mapping, now)
         assert eff > 0.5  # boosted by all-positive feedback
@@ -354,9 +379,11 @@ class TestConfidenceDecay:
     def test_negative_feedback_penalizes(self):
         now = time.time()
         mapping = {
-            "confidence": 0.5, "source_type": "teach",
+            "confidence": 0.5,
+            "source_type": "teach",
             "last_seen": now,
-            "positive_feedback": 0, "negative_feedback": 10,
+            "positive_feedback": 0,
+            "negative_feedback": 10,
         }
         eff = _effective_confidence(mapping, now)
         assert eff < 0.5  # penalized
@@ -365,15 +392,18 @@ class TestConfidenceDecay:
     def test_min_confidence_floor(self):
         now = time.time()
         mapping = {
-            "confidence": 0.01, "source_type": "dashboard_ingest",
+            "confidence": 0.01,
+            "source_type": "dashboard_ingest",
             "last_seen": now - 365 * 86400,
-            "positive_feedback": 0, "negative_feedback": 100,
+            "positive_feedback": 0,
+            "negative_feedback": 100,
         }
         eff = _effective_confidence(mapping, now)
         assert eff >= 0.05  # never drops below MIN_CONFIDENCE
 
 
 # ── Metric pattern matching ──────────────────────────────────────────────────
+
 
 class TestMetricPatternMatching:
 
@@ -384,8 +414,7 @@ class TestMetricPatternMatching:
         assert _metric_matches_pattern("sso_auth_failures_total", "*auth*fail*")
 
     def test_glob_wildcard_suffix(self):
-        assert _metric_matches_pattern("http_request_duration_seconds_bucket",
-                                       "*_duration_seconds*")
+        assert _metric_matches_pattern("http_request_duration_seconds_bucket", "*_duration_seconds*")
 
     def test_glob_no_match(self):
         assert not _metric_matches_pattern("cpu_usage_total", "*auth*")
@@ -399,45 +428,39 @@ class TestMetricPatternMatching:
 
 # ── Signal resolution ────────────────────────────────────────────────────────
 
+
 class TestSignalResolution:
 
     def test_resolve_signal_exact_match(self, signal_store, sample_catalog):
-        signal_store.add_mapping("request_rate", "http_requests_total", 0.95,
-                                 source_type="bootstrap")
+        signal_store.add_mapping("request_rate", "http_requests_total", 0.95, source_type="bootstrap")
         resolved = signal_store.resolve_signal("request_rate", sample_catalog)
         assert len(resolved) == 1
         assert resolved[0][0].name == "http_requests_total"
         assert resolved[0][1] == 0.95
 
     def test_resolve_signal_pattern_match(self, signal_store, sample_catalog):
-        signal_store.add_mapping("auth_failure_count", "*auth*fail*", 0.85,
-                                 source_type="bootstrap")
+        signal_store.add_mapping("auth_failure_count", "*auth*fail*", 0.85, source_type="bootstrap")
         resolved = signal_store.resolve_signal("auth_failure_count", sample_catalog)
         assert len(resolved) == 1
         assert resolved[0][0].name == "sso_auth_failures_total"
 
     def test_resolve_signal_multiple_matches(self, signal_store, sample_catalog):
-        signal_store.add_mapping("auth_request_rate", "*auth*requests*", 0.8,
-                                 source_type="bootstrap")
+        signal_store.add_mapping("auth_request_rate", "*auth*requests*", 0.8, source_type="bootstrap")
         resolved = signal_store.resolve_signal("auth_request_rate", sample_catalog)
         assert len(resolved) >= 1
         names = {r[0].name for r in resolved}
         assert "sso_auth_requests_total" in names
 
     def test_resolve_signal_no_match(self, signal_store, sample_catalog):
-        signal_store.add_mapping("kafka_lag", "kafka_consumer_lag", 0.9,
-                                 source_type="bootstrap")
+        signal_store.add_mapping("kafka_lag", "kafka_consumer_lag", 0.9, source_type="bootstrap")
         resolved = signal_store.resolve_signal("kafka_lag", sample_catalog)
         assert len(resolved) == 0
 
     def test_resolve_signals_for_archetype(self, signal_store, sample_catalog):
         """Core SSO use case: archetype says auth_requests_total but env has sso_auth_requests_total."""
-        signal_store.add_mapping("auth_request_rate", "*auth*requests*total", 0.85,
-                                 source_type="bootstrap")
-        signal_store.add_mapping("auth_failure_count", "*auth*fail*total", 0.85,
-                                 source_type="bootstrap")
-        signal_store.add_mapping("auth_latency", "*auth*latency*", 0.8,
-                                 source_type="bootstrap")
+        signal_store.add_mapping("auth_request_rate", "*auth*requests*total", 0.85, source_type="bootstrap")
+        signal_store.add_mapping("auth_failure_count", "*auth*fail*total", 0.85, source_type="bootstrap")
+        signal_store.add_mapping("auth_latency", "*auth*latency*", 0.8, source_type="bootstrap")
 
         signal_bindings = {
             "auth_request_rate": "auth_requests_total",
@@ -460,8 +483,7 @@ class TestSignalResolution:
 
     def test_resolve_skips_existing_metrics(self, signal_store, sample_catalog):
         """If the default metric exists in catalog, no substitution needed."""
-        signal_store.add_mapping("request_rate", "*requests*total", 0.9,
-                                 source_type="bootstrap")
+        signal_store.add_mapping("request_rate", "*requests*total", 0.9, source_type="bootstrap")
 
         subs = signal_store.resolve_signals_for_archetype(
             signal_bindings={"request_rate": "http_requests_total"},
@@ -473,6 +495,7 @@ class TestSignalResolution:
 
 
 # ── Metric substitution in archetypes ────────────────────────────────────────
+
 
 class TestArchetypeMetricSubstitution:
 
@@ -486,15 +509,19 @@ class TestArchetypeMetricSubstitution:
             panels=[
                 PanelTemplate(
                     title="Auth Rate",
-                    queries=[QueryTemplate(
-                        expr='sum(rate(auth_requests_total{{{service_filter}}}[{rate_interval}]))',
-                    )],
+                    queries=[
+                        QueryTemplate(
+                            expr="sum(rate(auth_requests_total{{{service_filter}}}[{rate_interval}]))",
+                        )
+                    ],
                 ),
                 PanelTemplate(
                     title="Auth Failures",
-                    queries=[QueryTemplate(
-                        expr='sum(increase(failed_login_attempts_total{{{service_filter}}}[{rate_interval}]))',
-                    )],
+                    queries=[
+                        QueryTemplate(
+                            expr="sum(increase(failed_login_attempts_total{{{service_filter}}}[{rate_interval}]))",
+                        )
+                    ],
                 ),
             ],
         )
@@ -508,9 +535,7 @@ class TestArchetypeMetricSubstitution:
 
         assert "sso_auth_requests_total" in result.panels[0].queries[0].expr
         # The old metric name should be replaced — check the expr starts with the new one
-        assert result.panels[0].queries[0].expr.startswith(
-            "sum(rate(sso_auth_requests_total"
-        )
+        assert result.panels[0].queries[0].expr.startswith("sum(rate(sso_auth_requests_total")
         assert "sso_auth_failures_total" in result.panels[1].queries[0].expr
 
     def test_no_substitution_returns_same(self):
@@ -520,10 +545,12 @@ class TestArchetypeMetricSubstitution:
             id="test",
             name="Test",
             problem_types=["test"],
-            panels=[PanelTemplate(
-                title="T",
-                queries=[QueryTemplate(expr='metric{filter}')],
-            )],
+            panels=[
+                PanelTemplate(
+                    title="T",
+                    queries=[QueryTemplate(expr="metric{filter}")],
+                )
+            ],
         )
 
         result = _apply_metric_substitutions(archetype, {})
@@ -532,6 +559,7 @@ class TestArchetypeMetricSubstitution:
 
 # ── PromQL metric extraction ────────────────────────────────────────────────
 
+
 class TestPromQLExtraction:
 
     def test_simple_metric(self):
@@ -539,9 +567,7 @@ class TestPromQLExtraction:
         assert "http_requests_total" in metrics
 
     def test_rate_wrapped(self):
-        metrics = extract_metrics_from_promql(
-            'sum(rate(http_requests_total{service="checkout"}[5m])) by (status)'
-        )
+        metrics = extract_metrics_from_promql('sum(rate(http_requests_total{service="checkout"}[5m])) by (status)')
         assert "http_requests_total" in metrics
         assert "sum" not in metrics
         assert "rate" not in metrics
@@ -555,17 +581,12 @@ class TestPromQLExtraction:
         assert "histogram_quantile" not in metrics
 
     def test_multiple_metrics(self):
-        expr = (
-            'sum(rate(http_requests_total{status=~"5.."}[5m])) / '
-            'sum(rate(http_requests_total[5m]))'
-        )
+        expr = 'sum(rate(http_requests_total{status=~"5.."}[5m])) / ' "sum(rate(http_requests_total[5m]))"
         metrics = extract_metrics_from_promql(expr)
         assert "http_requests_total" in metrics
 
     def test_excludes_promql_keywords(self):
-        metrics = extract_metrics_from_promql(
-            'topk(5, sum(rate(my_metric[5m])) by (instance))'
-        )
+        metrics = extract_metrics_from_promql("topk(5, sum(rate(my_metric[5m])) by (instance))")
         assert "my_metric" in metrics
         assert "topk" not in metrics
         assert "sum" not in metrics
@@ -580,26 +601,20 @@ class TestPromQLExtraction:
         assert "reason" not in metrics
 
     def test_without_grouping_labels_are_not_metrics(self):
-        metrics = extract_metrics_from_promql(
-            'sum without(instance, pod) (http_requests_total)'
-        )
+        metrics = extract_metrics_from_promql("sum without(instance, pod) (http_requests_total)")
         assert "http_requests_total" in metrics
         assert "instance" not in metrics
         assert "pod" not in metrics
 
     def test_vector_matching_labels_are_not_metrics(self):
-        metrics = extract_metrics_from_promql(
-            'http_requests_total / ignoring(instance) group_left(job) target_info'
-        )
+        metrics = extract_metrics_from_promql("http_requests_total / ignoring(instance) group_left(job) target_info")
         assert "http_requests_total" in metrics
         assert "target_info" in metrics
         assert "instance" not in metrics
         assert "job" not in metrics
 
     def test_falls_back_to_regex_for_templated_queries(self):
-        metrics = extract_metrics_from_promql(
-            'sum(rate(http_requests_total[$__rate_interval])) by (status)'
-        )
+        metrics = extract_metrics_from_promql("sum(rate(http_requests_total[$__rate_interval])) by (status)")
         assert "http_requests_total" in metrics
         assert "status" not in metrics
 
@@ -607,26 +622,20 @@ class TestPromQLExtraction:
 class TestAggregationExtraction:
 
     def test_sum_rate(self):
-        patterns = extract_aggregation_patterns(
-            'sum(rate(http_requests_total[5m])) by (status)'
-        )
-        assert any(p["aggregation"] == "sum" and p.get("inner_function") == "rate"
-                    for p in patterns)
+        patterns = extract_aggregation_patterns("sum(rate(http_requests_total[5m])) by (status)")
+        assert any(p["aggregation"] == "sum" and p.get("inner_function") == "rate" for p in patterns)
 
     def test_histogram_quantile(self):
-        patterns = extract_aggregation_patterns(
-            'histogram_quantile(0.99, sum(rate(metric_bucket[5m])) by (le))'
-        )
+        patterns = extract_aggregation_patterns("histogram_quantile(0.99, sum(rate(metric_bucket[5m])) by (le))")
         assert any(p["aggregation"] == "histogram_quantile" for p in patterns)
 
     def test_bare_rate(self):
-        patterns = extract_aggregation_patterns(
-            'rate(container_cpu_usage_seconds_total[5m])'
-        )
+        patterns = extract_aggregation_patterns("rate(container_cpu_usage_seconds_total[5m])")
         assert any(p["aggregation"] == "rate" for p in patterns)
 
 
 # ── Dashboard JSON parsing ───────────────────────────────────────────────────
+
 
 class TestDashboardParsing:
 
@@ -640,22 +649,18 @@ class TestDashboardParsing:
                     {
                         "type": "timeseries",
                         "title": "Auth Request Rate",
-                        "targets": [
-                            {"expr": 'sum(rate(sso_auth_requests_total[5m])) by (result)'}
-                        ],
+                        "targets": [{"expr": "sum(rate(sso_auth_requests_total[5m])) by (result)"}],
                     },
                     {
                         "type": "timeseries",
                         "title": "Auth Failures",
-                        "targets": [
-                            {"expr": 'sum(increase(sso_auth_failures_total[5m])) by (reason)'}
-                        ],
+                        "targets": [{"expr": "sum(increase(sso_auth_failures_total[5m])) by (reason)"}],
                     },
                     {
                         "type": "stat",
                         "title": "Auth Latency p95",
                         "targets": [
-                            {"expr": 'histogram_quantile(0.95, sum(rate(sso_auth_latency_seconds_bucket[5m])) by (le))'}
+                            {"expr": "histogram_quantile(0.95, sum(rate(sso_auth_latency_seconds_bucket[5m])) by (le))"}
                         ],
                         "fieldConfig": {"defaults": {"unit": "s"}},
                     },
@@ -726,8 +731,7 @@ class TestDashboardParsing:
                 "tags": [],
                 "panels": [
                     {"type": "text", "title": "Instructions", "targets": []},
-                    {"type": "timeseries", "title": "Real Panel",
-                     "targets": [{"expr": "up"}]},
+                    {"type": "timeseries", "title": "Real Panel", "targets": [{"expr": "up"}]},
                 ],
                 "links": [],
                 "annotations": {"list": []},
@@ -740,6 +744,7 @@ class TestDashboardParsing:
 
 
 # ── Signal inference from metrics ────────────────────────────────────────────
+
 
 class TestSignalInference:
 
@@ -771,6 +776,7 @@ class TestSignalInference:
 
 # ── Archetype YAML generation ───────────────────────────────────────────────
 
+
 class TestArchetypeGeneration:
 
     def test_generate_archetype_yaml(self, signal_store_with_bootstrap):
@@ -784,13 +790,13 @@ class TestArchetypeGeneration:
             "panels": [
                 {
                     "title": "Auth Rate",
-                    "queries": ['sum(rate(sso_auth_requests_total[5m]))'],
+                    "queries": ["sum(rate(sso_auth_requests_total[5m]))"],
                     "row": "Auth",
                     "unit": "reqps",
                 },
                 {
                     "title": "Auth Failures",
-                    "queries": ['sum(increase(sso_auth_failures_total[5m]))'],
+                    "queries": ["sum(increase(sso_auth_failures_total[5m]))"],
                     "row": "Auth",
                     "unit": "short",
                 },
@@ -804,6 +810,7 @@ class TestArchetypeGeneration:
         assert "sso_auth_requests_total" in yaml_str
         assert "auto-generated" in yaml_str
         import yaml
+
         parsed = yaml.safe_load(yaml_str)
         query = parsed["archetypes"][0]["panels"][0]["queries"][0]
         assert query["query_language"] == "promql"
@@ -811,11 +818,13 @@ class TestArchetypeGeneration:
 
 # ── Ingested dashboard records ───────────────────────────────────────────────
 
+
 class TestIngestedDashboards:
 
     def test_record_and_retrieve(self, signal_store):
         signal_store.record_ingested_dashboard(
             "dash-1",
+            backend_name="grafana",
             dashboard_title="Test Dashboard",
             metrics_found=["metric_a", "metric_b"],
             panel_count=3,
@@ -824,6 +833,7 @@ class TestIngestedDashboards:
 
         result = signal_store.get_ingested_dashboard("dash-1")
         assert result is not None
+        assert result["backend_name"] == "grafana"
         assert result["dashboard_title"] == "Test Dashboard"
         assert result["metrics_found"] == ["metric_a", "metric_b"]
         assert result["panel_count"] == 3
@@ -864,8 +874,80 @@ class TestIngestedDashboards:
 
         stored = signal_store.get_ingested_dashboard("cpu-dash")
         assert stored is not None
+        assert stored["backend_name"] == "signalfx"
         assert stored["archetype_generated"] == result["archetype_yaml"]
         assert "archetypes:" in stored["archetype_generated"]
+
+    def test_dashboard_uid_is_scoped_by_backend(self, signal_store):
+        signal_store.record_ingested_dashboard(
+            "shared-dash",
+            backend_name="grafana",
+            dashboard_title="Grafana Dashboard",
+            status="pending",
+        )
+        signal_store.record_ingested_dashboard(
+            "shared-dash",
+            backend_name="signalfx",
+            dashboard_title="SignalFx Dashboard",
+            status="pending",
+        )
+
+        grafana = signal_store.get_ingested_dashboard("shared-dash", backend_name="grafana")
+        signalfx = signal_store.get_ingested_dashboard("shared-dash", backend_name="signalfx")
+        ambiguous = signal_store.get_ingested_dashboard("shared-dash")
+
+        assert grafana is not None
+        assert signalfx is not None
+        assert grafana["dashboard_title"] == "Grafana Dashboard"
+        assert signalfx["dashboard_title"] == "SignalFx Dashboard"
+        assert ambiguous is None
+
+        assert signal_store.approve_ingested_dashboard("shared-dash", backend_name="grafana")
+        assert signal_store.get_ingested_dashboard("shared-dash", backend_name="grafana")["status"] == "approved"
+        assert signal_store.get_ingested_dashboard("shared-dash", backend_name="signalfx")["status"] == "pending"
+
+    def test_existing_uid_unique_table_migrates_to_backend_scope(self, tmp_path):
+        db_path = tmp_path / "legacy_signals.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript("""
+                CREATE TABLE ingested_dashboards (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dashboard_uid       TEXT NOT NULL UNIQUE,
+                    dashboard_title     TEXT NOT NULL DEFAULT '',
+                    dashboard_tags      TEXT NOT NULL DEFAULT '[]',
+                    metrics_found       TEXT NOT NULL DEFAULT '[]',
+                    panel_count         INTEGER NOT NULL DEFAULT 0,
+                    row_groups          TEXT NOT NULL DEFAULT '[]',
+                    metric_cooccurrence TEXT NOT NULL DEFAULT '{}',
+                    aggregation_patterns TEXT NOT NULL DEFAULT '[]',
+                    query_transformations TEXT NOT NULL DEFAULT '[]',
+                    panel_titles        TEXT NOT NULL DEFAULT '[]',
+                    alert_links         TEXT NOT NULL DEFAULT '[]',
+                    drilldown_links     TEXT NOT NULL DEFAULT '[]',
+                    status              TEXT NOT NULL DEFAULT 'pending',
+                    signals_inferred    TEXT NOT NULL DEFAULT '[]',
+                    archetype_generated TEXT NOT NULL DEFAULT '',
+                    created_at          REAL NOT NULL,
+                    reviewed_at         REAL
+                );
+                INSERT INTO ingested_dashboards (dashboard_uid, dashboard_title, created_at)
+                VALUES ('shared-dash', 'Legacy Grafana', 1.0);
+            """)
+
+        store = SignalStore(db_path=db_path)
+        store.record_ingested_dashboard(
+            "shared-dash",
+            backend_name="signalfx",
+            dashboard_title="SignalFx Dashboard",
+        )
+
+        legacy = store.get_ingested_dashboard("shared-dash", backend_name="")
+        signalfx = store.get_ingested_dashboard("shared-dash", backend_name="signalfx")
+
+        assert legacy is not None
+        assert signalfx is not None
+        assert legacy["dashboard_title"] == "Legacy Grafana"
+        assert signalfx["dashboard_title"] == "SignalFx Dashboard"
 
     def test_list_by_status(self, signal_store):
         signal_store.record_ingested_dashboard("d1", status="pending")
@@ -891,6 +973,7 @@ class TestIngestedDashboards:
 
 
 # ── YAML loading ─────────────────────────────────────────────────────────────
+
 
 class TestYAMLLoading:
 
@@ -950,6 +1033,7 @@ signals:
 
 # ── End-to-end: SSO custom metrics scenario ──────────────────────────────────
 
+
 class TestEndToEndSSO:
     """The original motivating use case: SSO service with custom metrics."""
 
@@ -984,18 +1068,19 @@ class TestEndToEndSSO:
 
 # ── SignalFlow metric extraction ───────────────────────────────────────────
 
+
 class TestSignalFlowExtraction:
     """Test SignalFlow metric name and pattern extraction."""
 
     def test_simple_data_call(self):
         from dashforge.backends.signalfx import _extract_metrics_from_signalflow
-        metrics = _extract_metrics_from_signalflow(
-            "data('cpu.utilization').publish()"
-        )
+
+        metrics = _extract_metrics_from_signalflow("data('cpu.utilization').publish()")
         assert metrics == ["cpu.utilization"]
 
     def test_multiple_data_calls(self):
         from dashforge.backends.signalfx import _extract_metrics_from_signalflow
+
         program = """
         A = data('requests.count', filter=filter('service', 'api')).publish()
         B = data('errors.count', filter=filter('service', 'api')).publish()
@@ -1007,13 +1092,13 @@ class TestSignalFlowExtraction:
 
     def test_data_with_double_quotes(self):
         from dashforge.backends.signalfx import _extract_metrics_from_signalflow
-        metrics = _extract_metrics_from_signalflow(
-            'data("memory.usage").publish()'
-        )
+
+        metrics = _extract_metrics_from_signalflow('data("memory.usage").publish()')
         assert metrics == ["memory.usage"]
 
     def test_analytics_patterns(self):
         from dashforge.backends.signalfx import _extract_signalflow_patterns
+
         program = "data('cpu.utilization').mean().percentile(pct=95).publish()"
         patterns = _extract_signalflow_patterns(program)
         agg_names = [p["aggregation"] for p in patterns]
@@ -1022,6 +1107,7 @@ class TestSignalFlowExtraction:
 
     def test_rate_and_sum(self):
         from dashforge.backends.signalfx import _extract_signalflow_patterns
+
         program = "data('requests.count').sum().rate().publish()"
         patterns = _extract_signalflow_patterns(program)
         agg_names = [p["aggregation"] for p in patterns]
@@ -1030,11 +1116,13 @@ class TestSignalFlowExtraction:
 
     def test_no_metrics(self):
         from dashforge.backends.signalfx import _extract_metrics_from_signalflow
+
         assert _extract_metrics_from_signalflow("") == []
         assert _extract_metrics_from_signalflow("publish()") == []
 
 
 # ── DashboardFeatures dataclass ──────────────────────────────────────────
+
 
 class TestDashboardFeatures:
     """Verify the vendor-agnostic DashboardFeatures dataclass."""
@@ -1073,6 +1161,7 @@ class TestDashboardFeatures:
 
     def test_features_to_dict(self):
         from dashforge.dashboard_ingest import _features_to_dict
+
         f = DashboardFeatures(
             dashboard_uid="test",
             dashboard_title="Test",
@@ -1102,6 +1191,7 @@ class TestDashboardFeatures:
 
 # ── Signal coverage dashboard ingestion tests ───────────────────────────
 
+
 class TestSignalCoverageDashboard:
     """Tests for the provisioned Grafana dashboard that exercises every signal category.
 
@@ -1112,10 +1202,9 @@ class TestSignalCoverageDashboard:
     def dashboard_json(self):
         """Load the signal coverage dashboard JSON fixture."""
         import json
+
         fixture_path = (
-            Path(__file__).parent.parent
-            / "dev" / "grafana" / "provisioning" / "dashboards"
-            / "signal_coverage.json"
+            Path(__file__).parent.parent / "dev" / "grafana" / "provisioning" / "dashboards" / "signal_coverage.json"
         )
         with open(fixture_path) as f:
             return json.load(f)
@@ -1142,8 +1231,7 @@ class TestSignalCoverageDashboard:
 
     def test_contains_latency_metrics(self, extracted):
         metrics = set(extracted["metrics_found"])
-        assert "http_request_duration_seconds" in metrics or \
-               "http_request_duration_seconds_bucket" in metrics
+        assert "http_request_duration_seconds" in metrics or "http_request_duration_seconds_bucket" in metrics
 
     def test_contains_throughput_metrics(self, extracted):
         metrics = set(extracted["metrics_found"])
@@ -1151,10 +1239,12 @@ class TestSignalCoverageDashboard:
 
     def test_contains_saturation_metrics(self, extracted):
         metrics = set(extracted["metrics_found"])
-        saturation = {"container_cpu_usage_seconds_total",
-                      "container_memory_working_set_bytes",
-                      "http_requests_in_flight",
-                      "db_connections_active"}
+        saturation = {
+            "container_cpu_usage_seconds_total",
+            "container_memory_working_set_bytes",
+            "http_requests_in_flight",
+            "db_connections_active",
+        }
         assert saturation & metrics, f"No saturation metrics found in {metrics}"
 
     def test_contains_stability_metrics(self, extracted):
@@ -1177,8 +1267,12 @@ class TestSignalCoverageDashboard:
 
     def test_contains_network_metrics(self, extracted):
         metrics = set(extracted["metrics_found"])
-        net = {"network_bytes_received_total", "network_bytes_transmitted_total",
-               "dns_failures_total", "tls_handshake_failures_total"}
+        net = {
+            "network_bytes_received_total",
+            "network_bytes_transmitted_total",
+            "dns_failures_total",
+            "tls_handshake_failures_total",
+        }
         assert net & metrics, f"No network metrics found in {metrics}"
 
     def test_contains_queue_metrics(self, extracted):
@@ -1251,8 +1345,7 @@ class TestSignalCoverageDashboard:
 
     def test_covers_saturation_signals(self, inferred_signals):
         types = {s["signal_type"] for s in inferred_signals}
-        saturation = {"cpu_usage", "memory_usage", "in_flight_requests",
-                      "queue_depth", "db_connection_pool"}
+        saturation = {"cpu_usage", "memory_usage", "in_flight_requests", "queue_depth", "db_connection_pool"}
         assert types & saturation, f"No saturation signals in {types}"
 
     def test_covers_cache_signal(self, inferred_signals):
@@ -1281,6 +1374,7 @@ class TestSignalCoverageDashboard:
         # Collect categories from inferred signals by looking up
         # the signal_type in the bootstrap yaml
         import yaml
+
         yaml_path = Path(__file__).parent.parent / "signals.yaml"
         with open(yaml_path) as f:
             data = yaml.safe_load(f)
@@ -1292,8 +1386,7 @@ class TestSignalCoverageDashboard:
             cat = sig_def.get("category", "")
             if cat:
                 categories.add(cat)
-        assert len(categories) >= 8, \
-            f"Expected >=8 categories, got {len(categories)}: {categories}"
+        assert len(categories) >= 8, f"Expected >=8 categories, got {len(categories)}: {categories}"
 
     # ── Archetype generation ───────────────────────────────────────────
 
@@ -1306,6 +1399,7 @@ class TestSignalCoverageDashboard:
 
 
 # ── Bug 3: Literal braces in generated archetype YAML ────────────────────
+
 
 class TestArchetypeYamlBraceEscaping:
     """Queries with label selectors like {service=\"api\"} must not break
@@ -1353,7 +1447,7 @@ class TestArchetypeYamlBraceEscaping:
             "panels": [
                 {
                     "title": "RPS",
-                    "queries": ['rate(http_requests_total{{{service_filter}}}[5m])'],
+                    "queries": ["rate(http_requests_total{{{service_filter}}}[5m])"],
                     "row": "",
                     "unit": "",
                     "description": "",
@@ -1363,6 +1457,7 @@ class TestArchetypeYamlBraceEscaping:
         signals = []
         yaml_str = generate_archetype_yaml(extracted, signals)
         import yaml
+
         parsed = yaml.safe_load(yaml_str)
         expr = parsed["archetypes"][0]["panels"][0]["queries"][0]["expr"]
         # Template placeholder must still resolve as a PromQL label selector.
@@ -1378,7 +1473,7 @@ class TestArchetypeYamlBraceEscaping:
             "panels": [
                 {
                     "title": "RPS",
-                    "queries": ['rate(http_requests_total[ {rate_interval} ])'],
+                    "queries": ["rate(http_requests_total[ {rate_interval} ])"],
                     "row": "",
                     "unit": "",
                     "description": "",
@@ -1387,6 +1482,7 @@ class TestArchetypeYamlBraceEscaping:
         }
         yaml_str = generate_archetype_yaml(extracted, [])
         import yaml
+
         parsed = yaml.safe_load(yaml_str)
         expr = parsed["archetypes"][0]["panels"][0]["queries"][0]["expr"]
 
@@ -1428,13 +1524,15 @@ class TestSignalFlowCompileCompatibility:
         spec = compile_archetype(
             archetype,
             intent,
-            [MetricEntry(
-                name="cpu.utilization",
-                datasource_uid="x",
-                datasource_name="SignalFx",
-                datasource_type="signalfx",
-                query_language="signalflow",
-            )],
+            [
+                MetricEntry(
+                    name="cpu.utilization",
+                    datasource_uid="x",
+                    datasource_name="SignalFx",
+                    datasource_type="signalfx",
+                    query_language="signalflow",
+                )
+            ],
             target_language="signalflow",
         )
 
@@ -1473,13 +1571,15 @@ class TestSignalFlowCompileCompatibility:
         spec = compile_archetype(
             archetype,
             intent,
-            [MetricEntry(
-                name="cpu.utilization",
-                datasource_uid="x",
-                datasource_name="SignalFx",
-                datasource_type="signalfx",
-                query_language="signalflow",
-            )],
+            [
+                MetricEntry(
+                    name="cpu.utilization",
+                    datasource_uid="x",
+                    datasource_name="SignalFx",
+                    datasource_type="signalfx",
+                    query_language="signalflow",
+                )
+            ],
             target_language="signalflow",
         )
 
@@ -1488,6 +1588,7 @@ class TestSignalFlowCompileCompatibility:
 
 
 # ── Bug 5: Suffix-aware metric substitution ──────────────────────────────
+
 
 class TestSuffixAwareMetricSubstitution:
     """_apply_metric_substitutions must not double-suffix when the base
@@ -1515,9 +1616,12 @@ class TestSuffixAwareMetricSubstitution:
             expr="rate(http_request_duration_seconds[5m])",
             binding_default="http_request_duration_seconds",
         )
-        result = _apply_metric_substitutions(arch, {
-            "http_request_duration_seconds": "custom_request_duration_seconds",
-        })
+        result = _apply_metric_substitutions(
+            arch,
+            {
+                "http_request_duration_seconds": "custom_request_duration_seconds",
+            },
+        )
         assert result.panels[0].queries[0].expr == "rate(custom_request_duration_seconds[5m])"
 
     def test_suffixed_variant_no_double_suffix(self):
@@ -1529,9 +1633,12 @@ class TestSuffixAwareMetricSubstitution:
             expr="histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))",
             binding_default="http_request_duration_seconds",
         )
-        result = _apply_metric_substitutions(arch, {
-            "http_request_duration_seconds": "custom_request_duration_seconds",
-        })
+        result = _apply_metric_substitutions(
+            arch,
+            {
+                "http_request_duration_seconds": "custom_request_duration_seconds",
+            },
+        )
         assert "custom_request_duration_seconds_bucket" in result.panels[0].queries[0].expr
         assert "_bucket_bucket" not in result.panels[0].queries[0].expr
 
@@ -1545,9 +1652,12 @@ class TestSuffixAwareMetricSubstitution:
             binding_default="http_request_duration_seconds",
         )
         # The substitution map says base → already-suffixed resolved metric
-        result = _apply_metric_substitutions(arch, {
-            "http_request_duration_seconds": "custom_request_duration_seconds_bucket",
-        })
+        result = _apply_metric_substitutions(
+            arch,
+            {
+                "http_request_duration_seconds": "custom_request_duration_seconds_bucket",
+            },
+        )
         # Must NOT become custom_request_duration_seconds_bucket_bucket
         assert "_bucket_bucket" not in result.panels[0].queries[0].expr
         # The _bucket variant should appear exactly once
@@ -1564,9 +1674,12 @@ class TestSuffixAwareMetricSubstitution:
             ),
             binding_default="http_request_duration_seconds",
         )
-        result = _apply_metric_substitutions(arch, {
-            "http_request_duration_seconds": "custom_latency",
-        })
+        result = _apply_metric_substitutions(
+            arch,
+            {
+                "http_request_duration_seconds": "custom_latency",
+            },
+        )
         expr = result.panels[0].queries[0].expr
         assert "custom_latency_bucket" in expr
         assert "custom_latency_count" in expr
@@ -1580,9 +1693,12 @@ class TestSuffixAwareMetricSubstitution:
             expr="rate(request_duration_seconds_bucket[5m])",
             binding_default="request_duration_seconds",
         )
-        result = _apply_metric_substitutions(arch, {
-            "request_duration_seconds": "custom_request_duration_seconds",
-        })
+        result = _apply_metric_substitutions(
+            arch,
+            {
+                "request_duration_seconds": "custom_request_duration_seconds",
+            },
+        )
 
         assert result.panels[0].queries[0].expr == "rate(custom_request_duration_seconds_bucket[5m])"
 
@@ -1593,9 +1709,12 @@ class TestSuffixAwareMetricSubstitution:
             expr="rate(foo_request_duration_seconds[5m]) + rate(request_duration_seconds[5m])",
             binding_default="request_duration_seconds",
         )
-        result = _apply_metric_substitutions(arch, {
-            "request_duration_seconds": "custom_request_duration_seconds",
-        })
+        result = _apply_metric_substitutions(
+            arch,
+            {
+                "request_duration_seconds": "custom_request_duration_seconds",
+            },
+        )
         expr = result.panels[0].queries[0].expr
 
         assert "foo_request_duration_seconds" in expr
@@ -1609,9 +1728,12 @@ class TestSuffixAwareMetricSubstitution:
             expr="rate(http_request_duration_seconds_count[5m])",
             binding_default="http_request_duration_seconds",
         )
-        result = _apply_metric_substitutions(arch, {
-            "http_request_duration_seconds": "custom_request_duration_seconds_bucket",
-        })
+        result = _apply_metric_substitutions(
+            arch,
+            {
+                "http_request_duration_seconds": "custom_request_duration_seconds_bucket",
+            },
+        )
 
         assert result.panels[0].queries[0].expr == "rate(custom_request_duration_seconds_count[5m])"
 
@@ -1630,15 +1752,19 @@ class TestSuffixAwareMetricSubstitution:
             expr="histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))",
             binding_default="http_request_duration_seconds",
         )
-        result = _apply_metric_substitutions(arch, {
-            "http_request_duration_seconds": "http_request_duration_seconds_bucket",
-        })
+        result = _apply_metric_substitutions(
+            arch,
+            {
+                "http_request_duration_seconds": "http_request_duration_seconds_bucket",
+            },
+        )
         expr = result.panels[0].queries[0].expr
         assert "_bucket_bucket" not in expr
         assert "http_request_duration_seconds_bucket" in expr
 
 
 # ── Bug 7: PromQL metric extraction regex coverage ──────────────────────
+
 
 class TestPromQLExtractionBug7:
     """The regex must capture metrics in positions not followed by { or [,
@@ -1653,9 +1779,7 @@ class TestPromQLExtractionBug7:
         assert "up" in metrics
 
     def test_metric_in_binary_expression(self):
-        metrics = extract_metrics_from_promql(
-            "node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes"
-        )
+        metrics = extract_metrics_from_promql("node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes")
         assert "node_memory_MemAvailable_bytes" in metrics
         assert "node_memory_MemTotal_bytes" in metrics
 
@@ -1670,6 +1794,7 @@ class TestPromQLExtractionBug7:
 
 # ── Bug 9: teach upsert must merge context fields ───────────────────────
 
+
 class TestTeachUpsertContext:
     """When a mapping for (signal_type, metric_pattern) already exists,
     re-teaching with new context_services must update the context —
@@ -1677,13 +1802,15 @@ class TestTeachUpsertContext:
 
     def test_upsert_updates_context_services(self, signal_store):
         signal_store.add_mapping(
-            "request_latency", "checkout_latency_seconds",
+            "request_latency",
+            "checkout_latency_seconds",
             confidence=0.9,
             source_type="bootstrap",
         )
         # Re-teach with a service scope
         signal_store.add_mapping(
-            "request_latency", "checkout_latency_seconds",
+            "request_latency",
+            "checkout_latency_seconds",
             confidence=0.9,
             context_services=["checkout"],
             source_type="teach",
@@ -1695,12 +1822,14 @@ class TestTeachUpsertContext:
 
     def test_upsert_updates_source_type(self, signal_store):
         signal_store.add_mapping(
-            "request_latency", "latency_metric",
+            "request_latency",
+            "latency_metric",
             confidence=0.8,
             source_type="bootstrap",
         )
         signal_store.add_mapping(
-            "request_latency", "latency_metric",
+            "request_latency",
+            "latency_metric",
             confidence=0.8,
             source_type="teach",
         )
@@ -1709,8 +1838,31 @@ class TestTeachUpsertContext:
         assert len(mappings) == 1
         assert mappings[0]["source_type"] == "teach"
 
+    def test_bootstrap_reload_preserves_learned_provenance(self, signal_store):
+        signal_store.add_mapping(
+            "request_latency",
+            "http_requests_total",
+            confidence=0.8,
+            context_services=["checkout"],
+            source_type="dashboard_ingest",
+            source_refs=["grafana:checkout-dash"],
+        )
+        signal_store.add_mapping(
+            "request_latency",
+            "http_requests_total",
+            confidence=0.9,
+            source_type="bootstrap",
+        )
+
+        mappings = signal_store.get_mappings_for_signal("request_latency")
+        assert len(mappings) == 1
+        assert mappings[0]["source_type"] == "dashboard_ingest"
+        assert mappings[0]["source_refs"] == ["grafana:checkout-dash"]
+        assert mappings[0]["context_services"] == ["checkout"]
+
 
 # ── Bug 10: pending ingestion must store full signal records ─────────────
+
 
 class TestPendingIngestionSignalRecords:
     """signals_inferred stored in ingested_dashboards should include the
@@ -1738,6 +1890,7 @@ class TestPendingIngestionSignalRecords:
 
 # ── Bug 11: SignalFlow queries should not be written as PromQL templates ─
 
+
 class TestSignalFlowArchetypeGeneration:
     """When the ingested dashboard is from SignalFx, generate_archetype_yaml
     should tag query templates with a datasource_type so compile_archetype
@@ -1761,6 +1914,7 @@ class TestSignalFlowArchetypeGeneration:
         }
         signals = []
         import yaml
+
         yaml_str = generate_archetype_yaml(extracted, signals)
         parsed = yaml.safe_load(yaml_str)
         query = parsed["archetypes"][0]["panels"][0]["queries"][0]
@@ -1774,16 +1928,28 @@ class TestSignalFlowArchetypeGeneration:
 
 class TestLearningTabRendering:
 
-    def test_ingested_dashboard_signal_chips_render_fields_not_object_repr(self):
+    def _learning_load_section(self) -> str:
         html = (Path(__file__).parent.parent / "dashforge" / "static" / "index.html").read_text()
-        load_section = html.split("async function loadIngestedDashboards()", 1)[1].split("async function approveDashboard", 1)[0]
+        return html.split("async function loadIngestedDashboards()", 1)[1].split("async function approveDashboard", 1)[
+            0
+        ]
+
+    def test_ingested_dashboard_signal_chips_render_fields_not_object_repr(self):
+        load_section = self._learning_load_section()
         assert "d.signals_inferred" in load_section
         assert "s.signal_type" in load_section
         assert "s.metric" in load_section
         assert "s.confidence" in load_section
 
     def test_ingested_dashboard_list_renders_persisted_archetype_yaml(self):
-        html = (Path(__file__).parent.parent / "dashforge" / "static" / "index.html").read_text()
-        load_section = html.split("async function loadIngestedDashboards()", 1)[1].split("async function approveDashboard", 1)[0]
+        load_section = self._learning_load_section()
         assert "d.archetype_generated" in load_section
         assert "Generated archetype YAML" in load_section
+
+    def test_ingested_dashboard_approval_uses_data_attributes_not_inline_js(self):
+        html = (Path(__file__).parent.parent / "dashforge" / "static" / "index.html").read_text()
+        load_section = self._learning_load_section()
+        assert 'onclick="approveDashboard' not in load_section
+        assert "data-dashboard-uid" in load_section
+        assert "data-dashboard-backend" in load_section
+        assert "encodeURIComponent(uid)" in html

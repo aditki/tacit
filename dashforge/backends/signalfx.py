@@ -1,12 +1,13 @@
 """SignalFx backend adapter — wraps existing SignalFx client and helpers."""
+
 from __future__ import annotations
+
+import re
+from typing import Any, cast
 
 import structlog
 
-import re
-from collections import defaultdict
-
-from dashforge.backends.base import DashboardBackend, DashboardFeatures, PublishResult
+from dashforge.backends.base import DashboardFeatures, PublishResult
 from dashforge.models.schemas import DashboardSpec, Intent, MetricEntry
 from dashforge.signalfx.client import SignalFxClient
 from dashforge.signalfx.discovery import discover_metrics as sfx_discover
@@ -65,7 +66,7 @@ class SignalFxBackend:
     # ── Ingestion ─────────────────────────────────────────────────────
 
     async def ingest_dashboard(self, uid: str) -> DashboardFeatures:
-        dashboard_json = await self._client._get(f"/v2/dashboard/{uid}")
+        dashboard_json = cast(dict[str, Any], await self._client._get(f"/v2/dashboard/{uid}"))
         return await self._parse_sfx_dashboard(dashboard_json)
 
     async def _parse_sfx_dashboard(self, dashboard_json: dict) -> DashboardFeatures:
@@ -89,7 +90,7 @@ class SignalFxBackend:
             if not chart_id:
                 continue
             try:
-                chart = await self._client._get(f"/v2/chart/{chart_id}")
+                chart = cast(dict[str, Any], await self._client._get(f"/v2/chart/{chart_id}"))
                 charts.append(chart)
             except Exception:
                 logger.warning("sfx_chart_fetch_failed", chart_id=chart_id)
@@ -124,19 +125,21 @@ class SignalFxBackend:
                 all_agg_patterns.extend(agg)
 
             if chart_name or program_text:
-                panels.append({
-                    "title": chart_name,
-                    "description": chart.get("description", ""),
-                    "panel_type": chart.get("options", {}).get("type", "TimeSeriesChart"),
-                    "metrics": list(dict.fromkeys(
-                        _extract_metrics_from_signalflow(program_text) if program_text else []
-                    )),
-                    "queries": [program_text] if program_text else [],
-                    "aggregation_patterns": agg if program_text else [],
-                    "datasource_type": "signalfx",
-                    "unit": options.get("unitPrefix", ""),
-                    "row": "",
-                })
+                panels.append(
+                    {
+                        "title": chart_name,
+                        "description": chart.get("description", ""),
+                        "panel_type": chart.get("options", {}).get("type", "TimeSeriesChart"),
+                        "metrics": list(
+                            dict.fromkeys(_extract_metrics_from_signalflow(program_text) if program_text else [])
+                        ),
+                        "queries": [program_text] if program_text else [],
+                        "aggregation_patterns": agg if program_text else [],
+                        "datasource_type": "signalfx",
+                        "unit": options.get("unitPrefix", ""),
+                        "row": "",
+                    }
+                )
 
         unique_metrics = list(dict.fromkeys(all_metrics))
 

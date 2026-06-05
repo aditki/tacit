@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 import httpx
 import structlog
 
@@ -45,7 +47,7 @@ class GrafanaClient:
     # ── Datasources ──────────────────────────────────────────────────────
 
     async def list_datasources(self) -> list[dict]:
-        return await self._get("/api/datasources")
+        return cast(list[dict], await self._get("/api/datasources"))
 
     async def datasource_proxy_get(self, datasource_uid: str, path: str) -> dict | list:
         """Proxy a GET request through the Grafana datasource proxy (by UID)."""
@@ -55,7 +57,12 @@ class GrafanaClient:
         """Proxy a POST request through the Grafana datasource proxy (by UID)."""
         return await self._post(f"/api/datasources/proxy/uid/{datasource_uid}/{path}", json=json)
 
-    async def datasource_resource(self, datasource_uid: str, resource_path: str, body: dict | None = None) -> dict | list:
+    async def datasource_resource(
+        self,
+        datasource_uid: str,
+        resource_path: str,
+        body: dict | None = None,
+    ) -> dict | list:
         """Call a Grafana datasource plugin resource endpoint (POST).
 
         Used by CloudWatch, Azure Monitor, etc. that expose custom resource APIs.
@@ -66,7 +73,12 @@ class GrafanaClient:
                 json=body or {},
             )
         except httpx.HTTPStatusError as exc:
-            logger.warning("datasource_resource_failed", uid=datasource_uid, path=resource_path, status=exc.response.status_code)
+            logger.warning(
+                "datasource_resource_failed",
+                uid=datasource_uid,
+                path=resource_path,
+                status=exc.response.status_code,
+            )
             return {}
 
     # ── Dashboards ───────────────────────────────────────────────────────

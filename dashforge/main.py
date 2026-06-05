@@ -1,34 +1,35 @@
 """DashForge – FastAPI entrypoint + Slack bot startup."""
+
 from __future__ import annotations
 
 import asyncio
 import secrets
 from contextlib import asynccontextmanager
-
 from pathlib import Path
 
 import structlog
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Path as PathParam, Request, Security
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
 
 from dashforge.config import settings
-
-_STATIC_DIR = Path(__file__).parent / "static"
+from dashforge.feedback import get_feedback_store
 from dashforge.models.schemas import (
+    ArchetypeListResponse,
+    ArchetypeReloadResponse,
     DashRequest,
     DashResponse,
     FeedbackRequest,
     FeedbackResponse,
     FeedbackStatsResponse,
     HealthResponse,
-    ArchetypeListResponse,
-    ArchetypeReloadResponse,
 )
-from dashforge.feedback import get_feedback_store
 from dashforge.pipeline import run_pipeline
+
+_STATIC_DIR = Path(__file__).parent / "static"
 
 logger = structlog.get_logger()
 
@@ -39,6 +40,7 @@ _slack_task: asyncio.Task | None = None
 async def lifespan(app: FastAPI):
     """Configure logging and start the Slack bot alongside the API server."""
     from dashforge.logging import configure_logging
+
     configure_logging(settings.log_level)
 
     global _slack_task
@@ -196,6 +198,7 @@ async def create_chart(request: DashRequest):
 
 # ── Feedback endpoints ───────────────────────────────────────────────────
 
+
 @app.post(
     "/api/v1/feedback",
     response_model=FeedbackResponse,
@@ -235,7 +238,9 @@ async def submit_feedback(req: FeedbackRequest):
     tags=["Insights"],
     summary="Feedback statistics",
     response_model=FeedbackStatsResponse,
-    response_description="Aggregate stats: total feedback, dashboards reviewed, useful rate, average dimensional scores",
+    response_description=(
+        "Aggregate stats: total feedback, dashboards reviewed, useful rate, average dimensional scores"
+    ),
 )
 async def get_feedback_stats():
     """Aggregate feedback statistics across all reviewed dashboards.
@@ -291,6 +296,7 @@ async def get_feedback(
 
 # ── Archetype management ─────────────────────────────────────────────────
 
+
 @app.post(
     "/api/v1/archetypes/reload",
     dependencies=[Depends(verify_api_key)],
@@ -304,9 +310,11 @@ async def reload_archetypes_endpoint():
 
     Workflow: edit `archetypes.yaml` → call this endpoint → changes take effect immediately.
     If the YAML file is missing or invalid, falls back to built-in Python definitions."""
-    from dashforge.archetypes.templates import reload_archetypes, ALL_ARCHETYPES
+    from dashforge.archetypes.templates import reload_archetypes
+
     reload_archetypes()
     from dashforge.archetypes.templates import ALL_ARCHETYPES as reloaded
+
     return {
         "message": "Archetypes reloaded",
         "count": len(reloaded),
@@ -329,6 +337,7 @@ async def list_archetypes():
     error spike) with pre-defined panel templates and query patterns. Archetypes are
     loaded from `archetypes.yaml` if available, otherwise from built-in Python definitions."""
     from dashforge.archetypes.templates import ALL_ARCHETYPES
+
     return {
         "count": len(ALL_ARCHETYPES),
         "archetypes": [
@@ -348,6 +357,7 @@ async def list_archetypes():
 
 # ── Investigation history ─────────────────────────────────────────────────
 
+
 @app.get(
     "/api/v1/investigations",
     dependencies=[Depends(verify_api_key)],
@@ -366,6 +376,7 @@ async def list_investigations(
     Includes full pipeline telemetry: intent classification, datasource discovery,
     metric selection, generated queries, validation warnings, timings, and results."""
     from dashforge.history import get_investigation_store
+
     store = get_investigation_store()
     investigations = store.list_recent(limit=limit, offset=offset, status=status, user_id=user_id)
     return {"count": len(investigations), "investigations": investigations}
@@ -381,6 +392,7 @@ async def list_investigations(
 async def investigation_stats():
     """Aggregate stats: success/failure rates, avg timings, path distribution."""
     from dashforge.history import get_investigation_store
+
     store = get_investigation_store()
     return store.stats()
 
@@ -398,6 +410,7 @@ async def get_investigation(investigation_id: str):
     Returns the complete pipeline trace: prompt, intent, archetypes,
     datasources, metrics, queries, validation, timings, and result."""
     from dashforge.history import get_investigation_store
+
     store = get_investigation_store()
     inv = store.get(investigation_id)
     if inv is None:
@@ -406,6 +419,7 @@ async def get_investigation(investigation_id: str):
 
 
 # ── Signal taxonomy endpoints ─────────────────────────────────────────────
+
 
 @app.get(
     "/api/v1/signals",
@@ -421,6 +435,7 @@ async def list_signals():
     'error_rate') that are independent of specific metric names. They bridge
     archetypes to environment-specific metrics."""
     from dashforge.signals import get_signal_store
+
     store = get_signal_store()
     return {"signal_types": store.list_signal_types()}
 
@@ -435,6 +450,7 @@ async def list_signals():
 async def signal_stats():
     """Summary statistics for the signal mapping store."""
     from dashforge.signals import get_signal_store
+
     store = get_signal_store()
     return store.stats()
 
@@ -452,6 +468,7 @@ async def get_signal(signal_type: str):
     Each mapping includes: metric pattern, confidence, context filters,
     provenance (source type + references), and trust metrics."""
     from dashforge.signals import get_signal_store
+
     store = get_signal_store()
     result = store.get_signal_type(signal_type)
     if result is None:
@@ -491,6 +508,7 @@ async def teach_signal(request: Request):
         raise HTTPException(status_code=400, detail="signal_type is required")
 
     from dashforge.signals import get_signal_store
+
     store = get_signal_store()
 
     # Register or update the signal type
@@ -527,6 +545,7 @@ async def teach_signal(request: Request):
 
 
 # ── Dashboard learning endpoints ─────────────────────────────────────────
+
 
 @app.post(
     "/api/v1/learn/dashboard",
@@ -566,6 +585,7 @@ async def learn_from_dashboard(request: Request):
     backend_name = body.get("backend", "")
 
     from dashforge.dashboard_ingest import ingest_dashboard
+
     try:
         result = await ingest_dashboard(
             dashboard_uid=dashboard_uid,
@@ -599,6 +619,7 @@ async def list_ingested_dashboards(
 
     Filter by status: 'pending', 'approved', or 'rejected'."""
     from dashforge.signals import get_signal_store
+
     store = get_signal_store()
     dashboards = store.list_ingested_dashboards(status=status, limit=limit)
     return {"count": len(dashboards), "dashboards": dashboards}
@@ -611,15 +632,17 @@ async def list_ingested_dashboards(
     summary="Approve an ingested dashboard",
     response_description="Approval status and signal mappings created",
 )
-async def approve_ingested_dashboard(dashboard_uid: str):
+async def approve_ingested_dashboard(dashboard_uid: str, backend: str | None = None):
     """Approve a pending ingested dashboard, activating its signal mappings.
 
     This creates signal-to-metric mappings from the inferred signals with
     provenance tracking back to the source dashboard."""
     from dashforge.signals import get_signal_store
-    store = get_signal_store()
 
-    ingested = store.get_ingested_dashboard(dashboard_uid)
+    store = get_signal_store()
+    backend_name = backend
+
+    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend_name)
     if ingested is None:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")
 
@@ -628,6 +651,7 @@ async def approve_ingested_dashboard(dashboard_uid: str):
 
     # Create signal mappings from inferred signals
     mappings_created = 0
+    source_ref = f"{ingested['backend_name']}:{dashboard_uid}" if ingested.get("backend_name") else dashboard_uid
     for sig in ingested.get("signals_inferred", []):
         # Support both old format (plain signal type string) and new format
         # (dict with signal_type, metric, confidence)
@@ -641,7 +665,7 @@ async def approve_ingested_dashboard(dashboard_uid: str):
                     metric_pattern=metric,
                     confidence=confidence,
                     source_type="dashboard_ingest",
-                    source_refs=[dashboard_uid],
+                    source_refs=[source_ref],
                 )
                 mappings_created += 1
         else:
@@ -649,6 +673,7 @@ async def approve_ingested_dashboard(dashboard_uid: str):
             signal_type = sig
             for metric in ingested.get("metrics_found", []):
                 from dashforge.signals import _metric_matches_pattern
+
                 signal_data = store.get_signal_type(signal_type)
                 if signal_data:
                     for mapping in signal_data.get("mappings", []):
@@ -658,15 +683,16 @@ async def approve_ingested_dashboard(dashboard_uid: str):
                                 metric_pattern=metric,
                                 confidence=mapping.get("confidence", 0.6),
                                 source_type="dashboard_ingest",
-                                source_refs=[dashboard_uid],
+                                source_refs=[source_ref],
                             )
                             mappings_created += 1
                             break
 
-    store.approve_ingested_dashboard(dashboard_uid)
+    store.approve_ingested_dashboard(dashboard_uid, backend_name=backend_name)
 
     return {
         "dashboard_uid": dashboard_uid,
+        "backend_name": ingested.get("backend_name", ""),
         "status": "approved",
         "mappings_created": mappings_created,
         "message": f"Dashboard approved, {mappings_created} signal mapping(s) created",

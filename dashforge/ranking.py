@@ -8,10 +8,10 @@ from human reviews are used to boost/penalize metrics during ranking.
 Metrics that consistently appear in well-rated dashboards get promoted;
 metrics that correlate with poorly-rated dashboards get demoted.
 """
+
 from __future__ import annotations
 
 import time
-from typing import Any
 
 import structlog
 
@@ -47,12 +47,11 @@ def _load_metric_quality() -> dict[str, float]:
 
     try:
         from dashforge.feedback import get_feedback_store
+
         store = get_feedback_store()
         report = store.analyze()
         quality_list = report.get("metric_quality", [])
-        _metric_quality_cache = {
-            m["metric"]: m["quality_score"] for m in quality_list
-        }
+        _metric_quality_cache = {m["metric"]: m["quality_score"] for m in quality_list}
         _metric_quality_expires = now + _QUALITY_CACHE_TTL
         if _metric_quality_cache:
             logger.debug("metric_quality_loaded", count=len(_metric_quality_cache))
@@ -101,9 +100,21 @@ def _score_metric(
 
     # Boost common observability metrics
     observability_signals = [
-        "request", "latency", "duration", "error", "total",
-        "bytes", "cpu", "memory", "connections", "in_flight",
-        "queue", "restarts", "health", "up", "status",
+        "request",
+        "latency",
+        "duration",
+        "error",
+        "total",
+        "bytes",
+        "cpu",
+        "memory",
+        "connections",
+        "in_flight",
+        "queue",
+        "restarts",
+        "health",
+        "up",
+        "status",
     ]
     for sig in observability_signals:
         if sig in name_lower:
@@ -138,8 +149,7 @@ def prerank_metrics(
     feedback_scores = _load_metric_quality()
 
     scored = [
-        (entry, _score_metric(entry.name, intent.keywords, intent.services, feedback_scores))
-        for entry in catalog
+        (entry, _score_metric(entry.name, intent.keywords, intent.services, feedback_scores)) for entry in catalog
     ]
     # Sort by score descending, stable (preserves original order for ties)
     scored.sort(key=lambda x: x[1], reverse=True)

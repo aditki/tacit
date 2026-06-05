@@ -3,6 +3,7 @@
 Every vendor (Grafana, SignalFx, etc.) implements `DashboardBackend`.
 The pipeline calls the same interface regardless of vendor.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ from dashforge.models.schemas import DashboardSpec, Intent, MetricEntry
 @dataclass
 class PublishResult:
     """Outcome of publishing a dashboard to a backend."""
+
     url: str = ""
     uid: str = ""
     backend_name: str = ""
@@ -27,17 +29,18 @@ class DashboardFeatures:
     The signal inference engine and archetype generator work against this
     dataclass — zero vendor-specific logic downstream.
     """
+
     dashboard_uid: str = ""
     dashboard_title: str = ""
     dashboard_tags: list[str] = field(default_factory=list)
-    backend_name: str = ""                        # 'grafana', 'signalfx', etc.
-    query_language: str = ""                       # 'promql', 'signalflow', etc.
+    backend_name: str = ""  # 'grafana', 'signalfx', etc.
+    query_language: str = ""  # 'promql', 'signalflow', etc.
 
     # Extracted features
     metrics_found: list[str] = field(default_factory=list)
     panel_count: int = 0
     panel_titles: list[str] = field(default_factory=list)
-    row_groups: list[dict] = field(default_factory=list)        # [{"row": "Traffic", "panels": [...]}]
+    row_groups: list[dict] = field(default_factory=list)  # [{"row": "Traffic", "panels": [...]}]
     metric_cooccurrence: dict[str, list[str]] = field(default_factory=dict)
     aggregation_patterns: list[dict] = field(default_factory=list)
     query_transformations: list[str] = field(default_factory=list)

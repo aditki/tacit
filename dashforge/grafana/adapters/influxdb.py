@@ -1,4 +1,5 @@
 """Adapter for InfluxDB datasource (InfluxQL and Flux)."""
+
 from __future__ import annotations
 
 import structlog

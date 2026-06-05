@@ -19,6 +19,7 @@ Per-backend parsers extract:
 Then infers signal types by matching extracted metrics against the signal
 store's taxonomy, and optionally auto-generates an archetype YAML snippet.
 """
+
 from __future__ import annotations
 
 import re
@@ -37,41 +38,93 @@ logger = structlog.get_logger()
 # A metric name starts with [a-zA-Z_:] and continues with [a-zA-Z0-9_:].
 # It can appear before {, [, ), whitespace, operators, comparisons, or EOL.
 _PROMQL_METRIC_RE = re.compile(
-    r'(?:^|(?<=[\s(,]))([a-zA-Z_:][a-zA-Z0-9_:]*)(?=\s*[{\[)\/\*\+\-><=!,]|\s|$)',
+    r"(?:^|(?<=[\s(,]))([a-zA-Z_:][a-zA-Z0-9_:]*)(?=\s*[{\[)\/\*\+\-><=!,]|\s|$)",
     re.MULTILINE,
 )
 
 # PromQL functions/keywords to exclude from metric extraction
-_PROMQL_FUNCS = frozenset({
-    "sum", "avg", "min", "max", "count", "count_values", "bottomk", "topk",
-    "quantile", "stddev", "stdvar", "group",
-    "rate", "irate", "increase", "delta", "idelta", "deriv", "predict_linear",
-    "histogram_quantile", "histogram_count", "histogram_sum",
-    "absent", "absent_over_time", "changes", "resets",
-    "ceil", "floor", "round", "clamp", "clamp_min", "clamp_max",
-    "label_replace", "label_join", "sort", "sort_desc",
-    "time", "timestamp", "vector", "scalar",
-    "year", "month", "day_of_month", "day_of_week", "hour", "minute",
-    "days_in_month",
-    "exp", "ln", "log2", "log10", "sqrt", "sgn", "abs",
-    "on", "ignoring", "by", "without", "bool", "offset",
-    "and", "or", "unless",
-    "le", "inf", "nan",
-})
+_PROMQL_FUNCS = frozenset(
+    {
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "count",
+        "count_values",
+        "bottomk",
+        "topk",
+        "quantile",
+        "stddev",
+        "stdvar",
+        "group",
+        "rate",
+        "irate",
+        "increase",
+        "delta",
+        "idelta",
+        "deriv",
+        "predict_linear",
+        "histogram_quantile",
+        "histogram_count",
+        "histogram_sum",
+        "absent",
+        "absent_over_time",
+        "changes",
+        "resets",
+        "ceil",
+        "floor",
+        "round",
+        "clamp",
+        "clamp_min",
+        "clamp_max",
+        "label_replace",
+        "label_join",
+        "sort",
+        "sort_desc",
+        "time",
+        "timestamp",
+        "vector",
+        "scalar",
+        "year",
+        "month",
+        "day_of_month",
+        "day_of_week",
+        "hour",
+        "minute",
+        "days_in_month",
+        "exp",
+        "ln",
+        "log2",
+        "log10",
+        "sqrt",
+        "sgn",
+        "abs",
+        "on",
+        "ignoring",
+        "by",
+        "without",
+        "bool",
+        "offset",
+        "and",
+        "or",
+        "unless",
+        "le",
+        "inf",
+        "nan",
+    }
+)
 
 # Aggregation function patterns
 _AGG_PATTERN = re.compile(
-    r'(sum|avg|min|max|count|topk|bottomk|quantile)\s*\(\s*'
-    r'(?:(\d+(?:\.\d+)?)\s*,\s*)?'
-    r'(rate|irate|increase|delta|histogram_quantile)?\s*\('
+    r"(sum|avg|min|max|count|topk|bottomk|quantile)\s*\(\s*"
+    r"(?:(\d+(?:\.\d+)?)\s*,\s*)?"
+    r"(rate|irate|increase|delta|histogram_quantile)?\s*\("
 )
 
 # histogram_quantile pattern
-_HISTOGRAM_PATTERN = re.compile(
-    r'histogram_quantile\(\s*([\d.]+)'
-)
+_HISTOGRAM_PATTERN = re.compile(r"histogram_quantile\(\s*([\d.]+)")
 
-_PROMQL_LABEL_LIST_RE = re.compile(r'\b(by|without|on|ignoring|group_left|group_right)\s*\(([^)]*)\)')
+_PROMQL_LABEL_LIST_RE = re.compile(r"\b(by|without|on|ignoring|group_left|group_right)\s*\(([^)]*)\)")
 
 
 def _strip_promql_label_lists(expr: str) -> str:
@@ -148,30 +201,33 @@ def extract_aggregation_patterns(expr: str) -> list[dict[str, str]]:
     for match in _AGG_PATTERN.finditer(expr):
         agg_func = match.group(1)
         inner_func = match.group(3) or ""
-        patterns.append({
-            "aggregation": agg_func,
-            "inner_function": inner_func,
-        })
+        patterns.append(
+            {
+                "aggregation": agg_func,
+                "inner_function": inner_func,
+            }
+        )
 
     # histogram_quantile
     for match in _HISTOGRAM_PATTERN.finditer(expr):
-        patterns.append({
-            "aggregation": "histogram_quantile",
-            "quantile": match.group(1),
-        })
+        patterns.append(
+            {
+                "aggregation": "histogram_quantile",
+                "quantile": match.group(1),
+            }
+        )
 
     # Also emit rate/increase/etc. as their own pattern entries
     # (even when wrapped inside sum/avg — both are useful features)
     for func in ("rate", "irate", "increase", "delta"):
-        if f"{func}(" in expr and not any(
-            p.get("aggregation") == func for p in patterns
-        ):
+        if f"{func}(" in expr and not any(p.get("aggregation") == func for p in patterns):
             patterns.append({"aggregation": func})
 
     return patterns
 
 
 # ── Dashboard JSON parsing ───────────────────────────────────────────────────
+
 
 def _extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
     """Extract relevant data from a single Grafana panel JSON."""
@@ -271,10 +327,7 @@ def parse_dashboard_json(dashboard_json: dict[str, Any]) -> dict[str, Any]:
     for p in all_panels:
         row = p.get("row", "") or "ungrouped"
         row_groups[row].append(p["title"])
-    row_groups_list = [
-        {"row": row, "panels": panels}
-        for row, panels in row_groups.items()
-    ]
+    row_groups_list = [{"row": row, "panels": panels} for row, panels in row_groups.items()]
 
     # Metric co-occurrence: for each metric, which other metrics appear in the same dashboard
     cooccurrence: dict[str, list[str]] = {}
@@ -336,6 +389,7 @@ def parse_dashboard_json(dashboard_json: dict[str, Any]) -> dict[str, Any]:
 
 # ── Signal inference ─────────────────────────────────────────────────────────
 
+
 def infer_signals_from_metrics(
     metrics: list[str],
     panel_data: list[dict[str, Any]] | None = None,
@@ -356,17 +410,19 @@ def infer_signals_from_metrics(
             mappings = store.get_mappings_for_signal(signal_type)
             for mapping in mappings:
                 from dashforge.signals import _metric_matches_pattern
+
                 if _metric_matches_pattern(metric, mapping["metric_pattern"]):
                     key = (signal_type, metric)
                     if key not in seen:
                         seen.add(key)
-                        inferred.append({
-                            "signal_type": signal_type,
-                            "metric": metric,
-                            "confidence": mapping.get("effective_confidence",
-                                                       mapping["confidence"]),
-                            "reason": f"matches pattern '{mapping['metric_pattern']}'",
-                        })
+                        inferred.append(
+                            {
+                                "signal_type": signal_type,
+                                "metric": metric,
+                                "confidence": mapping.get("effective_confidence", mapping["confidence"]),
+                                "reason": f"matches pattern '{mapping['metric_pattern']}'",
+                            }
+                        )
 
     inferred.sort(key=lambda x: x["confidence"], reverse=True)
     return inferred
@@ -425,12 +481,12 @@ def generate_archetype_yaml(
     title = extracted["dashboard_title"]
     if not archetype_id:
         # Generate ID from title
-        archetype_id = re.sub(r'[^a-z0-9]+', '_', title.lower()).strip('_')
+        archetype_id = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
 
     # Derive problem_types from tags + title
     problem_types = [archetype_id]
     for tag in extracted.get("dashboard_tags", []):
-        clean = re.sub(r'[^a-z0-9]+', '_', tag.lower()).strip('_')
+        clean = re.sub(r"[^a-z0-9]+", "_", tag.lower()).strip("_")
         if clean and clean != archetype_id:
             problem_types.append(clean)
 
@@ -498,9 +554,11 @@ def generate_archetype_yaml(
 
 # ── Full ingestion pipeline ─────────────────────────────────────────────────
 
+
 def _features_to_dict(features) -> dict[str, Any]:
     """Convert a DashboardFeatures dataclass to a plain dict."""
     from dataclasses import asdict
+
     return asdict(features)
 
 
@@ -555,9 +613,7 @@ async def ingest_dashboard(
                 # Close all backends before raising
                 for b in all_backends:
                     await b.close()
-                raise ValueError(
-                    f"Backend '{backend_name}' not found. Available: {available}"
-                )
+                raise ValueError(f"Backend '{backend_name}' not found. Available: {available}")
             backend = matched[0]
         else:
             backend = all_backends[0]
@@ -584,6 +640,7 @@ async def ingest_dashboard(
 
         store.record_ingested_dashboard(
             dashboard_uid=dashboard_uid,
+            backend_name=features.backend_name,
             dashboard_title=features.dashboard_title,
             dashboard_tags=features.dashboard_tags,
             metrics_found=features.metrics_found,
@@ -603,6 +660,7 @@ async def ingest_dashboard(
         # If auto-approved, create signal mappings from inferred signals
         if auto_approve:
             mappings_created = 0
+            source_ref = f"{features.backend_name}:{dashboard_uid}" if features.backend_name else dashboard_uid
             for sig in signals:
                 if sig["confidence"] >= 0.5:  # only confident mappings
                     store.add_mapping(
@@ -610,7 +668,7 @@ async def ingest_dashboard(
                         metric_pattern=sig["metric"],
                         confidence=sig["confidence"],
                         source_type="dashboard_ingest",
-                        source_refs=[dashboard_uid],
+                        source_refs=[source_ref],
                     )
                     mappings_created += 1
             logger.info(

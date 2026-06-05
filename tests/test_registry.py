@@ -4,6 +4,7 @@ Covers:
 - Provider routing for 'bedrock'
 - Unknown provider error message
 """
+
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -14,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 def test_registry_routes_bedrock():
     """Registry should route 'bedrock' to BedrockProvider."""
     import dashforge.agents.providers.registry as reg
+
     reg._provider = None  # reset singleton
 
     mock_boto3 = MagicMock()
@@ -22,8 +24,7 @@ def test_registry_routes_bedrock():
     mock_session.client.return_value = mock_client
     mock_boto3.Session.return_value = mock_session
 
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), \
-         patch.object(reg, "settings") as mock_settings:
+    with patch.dict("sys.modules", {"boto3": mock_boto3}), patch.object(reg, "settings") as mock_settings:
         mock_settings.llm_provider = "bedrock"
         mock_settings.llm_bedrock_region = "us-east-1"
         mock_settings.llm_aws_access_key_id = ""
@@ -35,6 +36,7 @@ def test_registry_routes_bedrock():
         provider = reg.get_provider()
 
         from dashforge.agents.providers.bedrock import BedrockProvider
+
         assert isinstance(provider, BedrockProvider)
 
     reg._provider = None  # cleanup
@@ -45,6 +47,7 @@ def test_registry_routes_bedrock():
 def test_registry_unknown_provider_includes_bedrock_in_error():
     """Unknown provider error message should list 'bedrock' as an option."""
     import dashforge.agents.providers.registry as reg
+
     reg._provider = None
 
     with patch.object(reg, "settings") as mock_settings:
@@ -74,6 +77,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[FAIL] {test_fn.__name__}: {e}")
             import traceback
+
             traceback.print_exc()
             failed += 1
 

@@ -10,6 +10,7 @@ Expected API contract:
   Body: {"query": "...", "max_results": 10, "filters": {...}}
   Response: {"results": [{"content": "...", "source": "...", "score": 0.9, "metadata": {...}}]}
 """
+
 from __future__ import annotations
 
 import httpx
