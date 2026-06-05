@@ -446,6 +446,12 @@ dashforge/
 
 ## Roadmap
 
+### Roadmap Principles
+
+- DashForge should **consume organizational knowledge, not custody it**. Enterprise runbooks, service catalogs, ownership data, postmortems, and policy knowledge should come through pluggable RAG / A2A / MCP integrations owned by the organization.
+- DashForge should own **observability outcomes**: investigation history, dashboard provenance, feedback-derived metric quality, archetype gaps, and what worked in prior incidents.
+- Local vector memory should stay optional: valuable for personal use, demos, offline workflows, and small teams without existing RAG infrastructure — not a required enterprise dependency.
+
 ### Done
 
 - [x] Knowledge base integration (RAG / A2A / MCP) — pluggable context enrichment
@@ -487,13 +493,16 @@ dashforge/
 - [ ] Conversational refinement — refine dashboards via follow-up messages (zoom, pivot, drill-down)
 - [ ] Alert context ingestion — auto-read alert payload as prompt
 - [ ] Dashboard versioning / history
+- [ ] **Optional local memory demo mode** — package a lightweight local knowledge setup for personal use and demos. Start with SQLite FTS over DashForge investigation history/feedback; optionally add Qdrant via Docker Compose for semantic search over local runbooks and past investigations. This is a convenience backend, not the enterprise knowledge strategy.
 
 ### Enterprise — Architecture Evolution
 
-- [ ] **Metadata indexing layer** — background indexer → vector/relational metadata store, replacing live datasource introspection per request. Store metric names, label keys, common values, descriptions, usage frequency, service ownership, embeddings. Moves system from O(all metrics) to O(relevant metrics).
-- [ ] **Semantic retrieval before reasoning** — BM25 + embedding hybrid search to narrow 50k+ metrics → top 50 candidates before LLM. Mandatory for cost/latency/quality at scale. (Current pre-ranking uses keyword/service relevance; embeddings would improve recall.)
-- [ ] **Deterministic query compiler** — extend archetype engine to full AST-based compilation for freeform path. LLM emits semantic intent AST, deterministic code generates validated PromQL/LogQL.
+- [ ] **Enterprise context provider contract** — harden the existing RAG / A2A / MCP context layer for production org knowledge: typed context chunks, source attribution, freshness, confidence, RBAC hints, trust labels, and failure behavior. DashForge retrieves from customer-owned systems instead of storing their knowledge base.
+- [ ] **DashForge-native memory** — persist and retrieve observability-specific learning: similar investigations, dashboard provenance, feedback-derived metric quality, panel usefulness, noisy archetypes, and successful prior dashboard patterns.
+- [ ] **Metadata indexing layer** — background indexer → relational/search metadata store, replacing live datasource introspection per request. Store metric names, label keys, common values, descriptions, usage frequency, service ownership references, and retrieval metadata. Moves system from O(all metrics) to O(relevant metrics).
+- [ ] **Semantic metric retrieval before reasoning** — BM25 + embedding hybrid search to narrow 50k+ metrics → top 50 candidates before LLM. Mandatory for cost/latency/quality at scale. This is for observability metadata and prior DashForge outcomes, not for owning the organization's general knowledge base.
 - [ ] **Canonical Observability IR** — intermediate representation (`signal_type`, `resource_type`, `aggregation`, `scope`) that each datasource adapter maps to native queries. Scales portability without accumulating datasource-specific prompt hacks.
+- [ ] **Deterministic query compiler** — extend archetype engine to full AST-based compilation for freeform path. LLM emits semantic intent AST, deterministic code generates validated PromQL/LogQL.
 - [ ] **Query cost planner** — cardinality estimation, time-range scoring, query complexity analysis, datasource load awareness. Like a database optimizer for observability queries.
 
 ### Enterprise — Security & Compliance
