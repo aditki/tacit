@@ -319,7 +319,7 @@ class TestContextFiltering:
         assert mappings[0]["metric_pattern"] == "low_confidence_checkout_latency"
         assert mappings[0]["effective_confidence"] == pytest.approx(0.14, abs=0.001)
 
-    def test_conflict_updates_mapping_context(self, signal_store):
+    def test_conflict_preserves_global_mapping_context(self, signal_store):
         signal_store.add_mapping("request_latency", "latency_seconds", confidence=0.5)
         signal_store.add_mapping(
             "request_latency",
@@ -331,7 +331,7 @@ class TestContextFiltering:
 
         mappings = signal_store.get_mappings_for_signal("request_latency", include_decayed=True)
 
-        assert mappings[0]["context_services"] == ["checkout"]
+        assert mappings[0]["context_services"] == []
         assert mappings[0]["source_type"] == "teach"
 
 
@@ -493,6 +493,40 @@ class TestSignalResolution:
         # http_requests_total IS in catalog → no substitution
         assert "http_requests_total" not in subs
 
+    def test_default_presence_is_scoped_to_target_language_and_datasource(self, signal_store):
+        signal_store.add_mapping(
+            "request_rate",
+            "prom_http_requests_total",
+            confidence=0.9,
+            context_datasource_types=["prometheus"],
+            source_type="teach",
+        )
+        catalog = [
+            MetricEntry(
+                name="http_requests_total",
+                datasource_uid="sfx-1",
+                datasource_name="SignalFx",
+                datasource_type="signalfx",
+                query_language="signalflow",
+            ),
+            MetricEntry(
+                name="prom_http_requests_total",
+                datasource_uid="prom-1",
+                datasource_name="Prometheus",
+                datasource_type="prometheus",
+                query_language="promql",
+            ),
+        ]
+
+        subs = signal_store.resolve_signals_for_archetype(
+            signal_bindings={"request_rate": "http_requests_total"},
+            catalog=catalog,
+            context_datasource_type="prometheus",
+            target_query_language="promql",
+        )
+
+        assert subs == {"http_requests_total": "prom_http_requests_total"}
+
 
 # ── Metric substitution in archetypes ────────────────────────────────────────
 
@@ -617,6 +651,10 @@ class TestPromQLExtraction:
         metrics = extract_metrics_from_promql("sum(rate(http_requests_total[$__rate_interval])) by (status)")
         assert "http_requests_total" in metrics
         assert "status" not in metrics
+
+    def test_range_selector_walks_matrix_vs(self):
+        metrics = extract_metrics_from_promql("rate(http_requests_total[5m])")
+        assert metrics == ["http_requests_total"]
 
 
 class TestAggregationExtraction:
@@ -1792,15 +1830,13 @@ class TestPromQLExtractionBug7:
         assert "process_resident_memory_bytes" in metrics
 
 
-# ── Bug 9: teach upsert must merge context fields ───────────────────────
+# ── Bug 9: teach upsert must preserve global context fields ─────────────
 
 
 class TestTeachUpsertContext:
-    """When a mapping for (signal_type, metric_pattern) already exists,
-    re-teaching with new context_services must update the context —
-    not silently discard it."""
+    """Mappings keep global scope unless an existing scoped mapping is updated."""
 
-    def test_upsert_updates_context_services(self, signal_store):
+    def test_upsert_preserves_global_context_services(self, signal_store):
         signal_store.add_mapping(
             "request_latency",
             "checkout_latency_seconds",
@@ -1818,7 +1854,27 @@ class TestTeachUpsertContext:
 
         mappings = signal_store.get_mappings_for_signal("request_latency")
         assert len(mappings) == 1
-        assert "checkout" in mappings[0]["context_services"]
+        assert mappings[0]["context_services"] == []
+
+    def test_upsert_unions_existing_scoped_context_services(self, signal_store):
+        signal_store.add_mapping(
+            "request_latency",
+            "checkout_latency_seconds",
+            confidence=0.9,
+            context_services=["checkout"],
+            source_type="teach",
+        )
+        signal_store.add_mapping(
+            "request_latency",
+            "checkout_latency_seconds",
+            confidence=0.9,
+            context_services=["payments"],
+            source_type="teach",
+        )
+
+        mappings = signal_store.get_mappings_for_signal("request_latency")
+        assert len(mappings) == 1
+        assert set(mappings[0]["context_services"]) == {"checkout", "payments"}
 
     def test_upsert_updates_source_type(self, signal_store):
         signal_store.add_mapping(

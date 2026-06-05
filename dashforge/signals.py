@@ -328,6 +328,8 @@ class SignalStore:
                     return existing_list
                 if not provided:  # explicit empty list clears the scope
                     return []
+                if prior is not None and not existing_list:
+                    return []
                 merged = list(existing_list)
                 for value in provided:
                     if value not in merged:
@@ -494,6 +496,7 @@ class SignalStore:
             return []
 
         target_lang = target_query_language.lower()
+        target_ds = context_datasource_type.lower()
         matched: list[tuple[MetricEntry, float]] = []
         seen_metrics: set[str] = set()
 
@@ -507,6 +510,8 @@ class SignalStore:
                 # Restrict to the target backend's query language so we never
                 # substitute a cross-backend metric into the wrong template.
                 if target_lang and (entry.query_language or "").lower() != target_lang:
+                    continue
+                if target_ds and not _datasource_type_matches(entry.datasource_type, target_ds):
                     continue
                 if _metric_matches_pattern(entry.name, pattern):
                     matched.append((entry, eff_conf))
@@ -544,11 +549,19 @@ class SignalStore:
             Only contains entries where the default metric was NOT found in
             the catalog and a signal-based resolution succeeded.
         """
-        catalog_names = {e.name for e in catalog}
+        target_lang = target_query_language.lower()
+        target_ds = context_datasource_type.lower()
+        catalog_names = {
+            e.name
+            for e in catalog
+            if (not target_lang or (e.query_language or "").lower() == target_lang)
+            and (not target_ds or _datasource_type_matches(e.datasource_type, target_ds))
+        }
+
         substitutions: dict[str, str] = {}
 
         for signal_type, default_metric in signal_bindings.items():
-            # If the default metric exists in the catalog, no substitution needed
+            # If the default metric exists in the catalog (filtered by target language), no substitution needed
             if default_metric in catalog_names:
                 continue
 
@@ -825,6 +838,24 @@ def _context_matches(
         if environment.lower() not in [e.lower() for e in mapping["context_environments"]]:
             return False
     return True
+
+
+_PROMETHEUS_DATASOURCE_TYPES = {"prometheus", "mimir", "cortex", "thanos"}
+_SIGNALFX_DATASOURCE_TYPES = {"signalfx", "grafana-signalfx-datasource"}
+
+
+def _datasource_type_matches(candidate: str, requested: str) -> bool:
+    candidate = (candidate or "").lower()
+    requested = (requested or "").lower()
+    if not requested:
+        return True
+    if candidate == requested:
+        return True
+    if candidate in _PROMETHEUS_DATASOURCE_TYPES and requested in _PROMETHEUS_DATASOURCE_TYPES:
+        return True
+    if candidate in _SIGNALFX_DATASOURCE_TYPES and requested in _SIGNALFX_DATASOURCE_TYPES:
+        return True
+    return False
 
 
 def _missing_context_multiplier(

@@ -155,7 +155,7 @@ def _walk_promql_ast(node: Any, metrics: list[str]) -> None:
         return
 
     if node_type == "MatrixSelector":
-        _walk_promql_ast(getattr(node, "vector_selector", None), metrics)
+        _walk_promql_ast(getattr(node, "vs", None) or getattr(node, "vector_selector", None), metrics)
         return
 
     if node_type in {"AggregateExpr", "UnaryExpr", "ParenExpr", "SubqueryExpr", "StepInvariantExpr"}:
@@ -172,7 +172,7 @@ def _walk_promql_ast(node: Any, metrics: list[str]) -> None:
             _walk_promql_ast(arg, metrics)
         return
 
-    for attr in ("expr", "lhs", "rhs", "vector_selector"):
+    for attr in ("expr", "lhs", "rhs", "vs", "vector_selector"):
         child = getattr(node, attr, None)
         if child is not None:
             _walk_promql_ast(child, metrics)
