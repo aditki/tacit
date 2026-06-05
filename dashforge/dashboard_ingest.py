@@ -229,8 +229,67 @@ def extract_aggregation_patterns(expr: str) -> list[dict[str, str]]:
 # ── Dashboard JSON parsing ───────────────────────────────────────────────────
 
 
+def _datasource_type_to_language(ds_type: str) -> str:
+    """Map a Grafana datasource type to its query language.
+
+    Defaults to ``promql`` when the type is unknown or empty, but recognizes the
+    common non-Prometheus backends so ingestion can preserve their queries
+    verbatim instead of mis-parsing them as PromQL.
+    """
+    t = (ds_type or "").lower()
+    if not t:
+        return "promql"
+    exact = {
+        "prometheus": "promql",
+        "mimir": "promql",
+        "cortex": "promql",
+        "thanos": "promql",
+        "loki": "logql",
+        "cloudwatch": "cloudwatch",
+        "signalfx": "signalflow",
+        "elasticsearch": "lucene",
+        "opensearch": "lucene",
+        "graphite": "graphite",
+        "influxdb": "influxql",
+    }
+    if t in exact:
+        return exact[t]
+    for needle, lang in (
+        ("prometheus", "promql"),
+        ("signalfx", "signalflow"),
+        ("loki", "logql"),
+        ("cloudwatch", "cloudwatch"),
+        ("elasticsearch", "lucene"),
+        ("opensearch", "lucene"),
+        ("graphite", "graphite"),
+        ("influx", "influxql"),
+    ):
+        if needle in t:
+            return lang
+    return "promql"
+
+
+def _language_to_datasource_type(language: str) -> str:
+    """Best-effort inverse of :func:`_datasource_type_to_language` for tagging."""
+    return {
+        "promql": "prometheus",
+        "logql": "loki",
+        "cloudwatch": "cloudwatch",
+        "signalflow": "signalfx",
+        "lucene": "elasticsearch",
+        "graphite": "graphite",
+        "influxql": "influxdb",
+    }.get(language, "prometheus")
+
+
 def _extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
-    """Extract relevant data from a single Grafana panel JSON."""
+    """Extract relevant data from a single Grafana panel JSON.
+
+    Per-language aware: PromQL metric extraction and aggregation parsing only run
+    on Prometheus-family targets. Non-PromQL queries (LogQL, SignalFlow, etc.)
+    are preserved verbatim, and CloudWatch targets are captured as structured
+    templates (namespace / metric / stat / region / dimensions).
+    """
     panel_type = panel.get("type", "")
     title = panel.get("title", "")
 
@@ -238,49 +297,81 @@ def _extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
     if panel_type in ("row", "text", "news", "dashlist", ""):
         return None
 
+    panel_ds = panel.get("datasource", {})
+    panel_ds_type = panel_ds.get("type", "") if isinstance(panel_ds, dict) else ""
+
     queries = []
     metrics = []
     agg_patterns = []
+    cloudwatch_targets: list[dict[str, Any]] = []
     datasource_type = ""
 
     # Extract from targets (query definitions)
     for target in panel.get("targets", []):
+        t_ds = target.get("datasource", {})
+        t_ds_type = t_ds.get("type", "") if isinstance(t_ds, dict) else ""
+        eff_ds = t_ds_type or panel_ds_type
+        language = _datasource_type_to_language(eff_ds)
+
         expr = target.get("expr", "") or target.get("query", "") or ""
-        if not expr:
-            # CloudWatch uses different fields
+        if expr:
+            queries.append(expr)
+            if language == "promql":
+                metrics.extend(extract_metrics_from_promql(expr))
+                agg_patterns.extend(extract_aggregation_patterns(expr))
+            elif language == "signalflow":
+                # SignalFlow has its own metric grammar; reuse the SignalFx
+                # extractor rather than the PromQL one.
+                try:
+                    from dashforge.backends.signalfx import _extract_metrics_from_signalflow
+
+                    metrics.extend(_extract_metrics_from_signalflow(expr))
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            # Other languages (LogQL, etc.): preserve the query, no PromQL parse.
+            if eff_ds:
+                datasource_type = eff_ds
+        else:
+            # CloudWatch-style structured target (no expr/query string).
             cw_metric = target.get("metricName", "")
-            cw_ns = target.get("namespace", "")
             if cw_metric:
+                cw_ns = target.get("namespace", "")
+                stat = target.get("statistic", "") or (target.get("statistics") or [""])[0] or ""
+                region = target.get("region", "")
+                dimensions = target.get("dimensions", {}) or {}
                 metric_name = f"{cw_ns}/{cw_metric}" if cw_ns else cw_metric
                 metrics.append(metric_name)
-                datasource_type = "cloudwatch"
-            continue
+                cloudwatch_targets.append(
+                    {
+                        "namespace": cw_ns,
+                        "metric_name": cw_metric,
+                        "stat": stat,
+                        "region": region,
+                        "dimensions": dimensions,
+                    }
+                )
+                datasource_type = eff_ds or "cloudwatch"
 
-        queries.append(expr)
-        extracted = extract_metrics_from_promql(expr)
-        metrics.extend(extracted)
-        agg_patterns.extend(extract_aggregation_patterns(expr))
-
-        # Detect datasource type from target
-        ds = target.get("datasource", {})
-        if isinstance(ds, dict):
-            datasource_type = ds.get("type", datasource_type)
-
-    if not metrics and not queries:
+    if not metrics and not queries and not cloudwatch_targets:
         return None
 
-    # Detect datasource from panel level
-    panel_ds = panel.get("datasource", {})
-    if isinstance(panel_ds, dict) and not datasource_type:
-        datasource_type = panel_ds.get("type", "")
+    if not datasource_type:
+        datasource_type = panel_ds_type
+    query_language = _datasource_type_to_language(datasource_type)
 
     # Per-panel drilldown links (panel.links). These attach navigation paths
     # at the panel level and are distinct from dashboard-level links.
     panel_links = []
-    for link in panel.get("links", []):
+    links = panel.get("links", [])
+    if not isinstance(links, list):
+        links = []
+    for link in links:
         if not isinstance(link, dict):
             continue
-        panel_links.append({"title": link.get("title", ""), "url": link.get("url", "")})
+        link_title = link.get("title", "")
+        link_url = link.get("url", "")
+        if link_title or link_url:
+            panel_links.append({"title": link_title, "url": link_url})
 
     return {
         "title": title,
@@ -290,6 +381,8 @@ def _extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
         "queries": queries,
         "aggregation_patterns": agg_patterns,
         "datasource_type": datasource_type,
+        "query_language": query_language,
+        "cloudwatch_targets": cloudwatch_targets,
         "unit": panel.get("fieldConfig", {}).get("defaults", {}).get("unit", ""),
         "links": panel_links,
     }
@@ -373,11 +466,18 @@ def parse_dashboard_json(dashboard_json: dict[str, Any]) -> dict[str, Any]:
 
     # Drilldown links — look for panel links and dashboard links
     drilldown_links = []
-    for link in dashboard.get("links", []):
+    dashboard_links = dashboard.get("links", [])
+    if not isinstance(dashboard_links, list):
+        dashboard_links = []
+    for link in dashboard_links:
+        if not isinstance(link, dict):
+            continue
         if link.get("type") == "dashboards":
             drilldown_links.extend(link.get("tags", []))
         elif link.get("type") == "link":
-            drilldown_links.append(link.get("url", ""))
+            url = link.get("url", "")
+            if url:
+                drilldown_links.append(url)
 
     # Per-panel drilldown links (panel.links) captured in _extract_panel_data.
     # Fold them into the aggregate so navigation paths aren't discarded.
@@ -515,26 +615,49 @@ def generate_archetype_yaml(
             signal_bindings[sig["signal_type"]] = sig["metric"]
             required_signals.append(sig["signal_type"])
 
-    # Determine datasource_type from source query language
-    query_language = extracted.get("query_language", "promql")
-    is_signalflow = query_language == "signalflow"
+    # Dashboard-level language is only a fallback for panels that don't carry
+    # their own (e.g. SignalFx-direct ingestion where every panel is signalflow).
+    dashboard_language = extracted.get("query_language", "promql")
 
     # Build panels from extracted panel data
     panels = []
     for p in extracted.get("panels", [])[:12]:  # cap at 12 panels
+        # Per-panel language: panel tag → datasource-type mapping → dashboard default.
+        panel_language = p.get("query_language")
+        if not panel_language:
+            ds_type = p.get("datasource_type", "")
+            panel_language = _datasource_type_to_language(ds_type) if ds_type else dashboard_language
+
         queries = []
-        for q in p.get("queries", []):
-            query_def: dict[str, Any] = {
-                # SignalFlow expressions must not be brace-escaped (no
-                # str.format placeholders); PromQL expressions need escaping
-                # to protect literal label selectors from format().
-                "expr": q if is_signalflow else _escape_literal_braces(q),
-                "legend_format": "",
-                "query_language": query_language,
-            }
-            if is_signalflow:
-                query_def["datasource_type"] = "signalfx"
-            queries.append(query_def)
+        cloudwatch_targets = p.get("cloudwatch_targets") or []
+        if panel_language == "cloudwatch" and cloudwatch_targets:
+            # Preserve the structured CloudWatch query so the panel isn't dropped.
+            for ct in cloudwatch_targets:
+                queries.append(
+                    {
+                        "query_language": "cloudwatch",
+                        "datasource_type": "cloudwatch",
+                        "namespace": ct.get("namespace", ""),
+                        "metric_name": ct.get("metric_name", ""),
+                        "stat": ct.get("stat", ""),
+                        "region": ct.get("region", ""),
+                        "dimensions": ct.get("dimensions", {}),
+                        "legend_format": "",
+                    }
+                )
+        else:
+            for q in p.get("queries", []):
+                # Only PromQL needs brace-escaping (literal label selectors must
+                # survive str.format at compile time). Non-PromQL queries
+                # (SignalFlow, LogQL, …) are preserved verbatim.
+                query_def: dict[str, Any] = {
+                    "expr": _escape_literal_braces(q) if panel_language == "promql" else q,
+                    "legend_format": "",
+                    "query_language": panel_language,
+                }
+                if panel_language != "promql":
+                    query_def["datasource_type"] = _language_to_datasource_type(panel_language)
+                queries.append(query_def)
         if queries:
             panel_def: dict[str, Any] = {
                 "title": p["title"],

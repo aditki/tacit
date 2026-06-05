@@ -431,6 +431,7 @@ def _load_archetypes_from_yaml(path: Path) -> list[InvestigationArchetype]:
                 QueryTemplate(
                     expr=q["expr"],
                     legend_format=q.get("legend_format", ""),
+                    query_language=q.get("query_language", "promql"),
                     datasource_type=q.get("datasource_type", "prometheus"),
                 )
                 for q in p.get("queries", [])

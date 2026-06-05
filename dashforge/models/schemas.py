@@ -356,11 +356,16 @@ class TeachSignalRequest(BaseModel):
     description: str = Field(default="", description="Human-readable description of the signal")
     category: str = Field(default="", description="Signal category, e.g. 'saturation'")
     unit: str = Field(default="", description="Unit hint for the signal")
-    services: list[str] = Field(default_factory=list, description="Context: services this mapping applies to")
-    datasource_types: list[str] = Field(
-        default_factory=list, description="Context: datasource types this mapping applies to"
+    # Scope fields use None (omitted) vs [] (explicit clear) vs [..] (union):
+    # omitting a field leaves existing scope unchanged on re-teach; an empty
+    # list clears it (makes the mapping global); values union with existing.
+    services: list[str] | None = Field(default=None, description="Context: services this mapping applies to")
+    datasource_types: list[str] | None = Field(
+        default=None, description="Context: datasource types this mapping applies to"
     )
-    environments: list[str] = Field(default_factory=list, description="Context: environments this mapping applies to")
+    environments: list[str] | None = Field(
+        default=None, description="Context: environments this mapping applies to"
+    )
     taught_by: str = Field(default="api", description="Provenance: who taught this mapping")
 
     @field_validator("signal_type")

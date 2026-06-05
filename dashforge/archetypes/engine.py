@@ -232,7 +232,7 @@ def _promql_template_to_signalflow(
 
     # ── histogram_quantile ──
     hq = re.match(
-        r"histogram_quantile\(([\d.]+),\s*sum\(rate\((\w+?)_bucket\{(.*?)\}\[.*?\]\)\)\s*by\s*\(le(?:,\s*(\w+))?\)\)",
+        r"histogram_quantile\(([\d.]+),\s*sum\(rate\(([\w.:]+?)_bucket\{(.*?)\}\[.*?\]\)\)\s*by\s*\(le(?:,\s*(\w+))?\)\)",
         expr,
     )
     if hq:
@@ -257,7 +257,10 @@ def _promql_template_to_signalflow(
         return f"{inner}.top(count={k}).publish(label='{legend}')"
 
     # ── agg(rate/increase(metric{labels}[interval])) by (dims) ──
-    agg = re.match(r"(sum|avg|count|min|max)\((rate|increase)\((\w+)\{(.*?)\}\[.*?\]\)\)(?:\s*by\s*\(([^)]+)\))?", expr)
+    agg = re.match(
+        r"(sum|avg|count|min|max)\((rate|increase)\(([\w.:]+)\{(.*?)\}\[.*?\]\)\)(?:\s*by\s*\(([^)]+)\))?",
+        expr,
+    )
     if agg:
         agg_fn = agg.group(1)
         func = agg.group(2)
@@ -280,7 +283,7 @@ def _promql_template_to_signalflow(
         return f"{base}.publish(label='{legend}')"
 
     # ── bare rate/increase ──
-    rate = re.match(r"(rate|increase)\((\w+)\{(.*?)\}\[.*?\]\)", expr)
+    rate = re.match(r"(rate|increase)\(([\w.:]+)\{(.*?)\}\[.*?\]\)", expr)
     if rate:
         func = rate.group(1)
         metric = rate.group(2)
@@ -293,7 +296,7 @@ def _promql_template_to_signalflow(
         return f"{base}.publish(label='{legend}')"
 
     # ── simple metric{labels} ──
-    simple = re.match(r"(\w+)\{(.*?)\}$", expr)
+    simple = re.match(r"([\w.:]+)\{(.*?)\}$", expr)
     if simple:
         metric = simple.group(1)
         filt = _build_sfx_filter(simple.group(2))
@@ -304,7 +307,7 @@ def _promql_template_to_signalflow(
         return f"{base}.publish(label='{legend}')"
 
     # ── bare metric name ──
-    bare = re.match(r"^(\w+)$", expr)
+    bare = re.match(r"^([\w.:]+)$", expr)
     if bare:
         return f"data('{bare.group(1)}').publish(label='{legend}')"
 
@@ -461,11 +464,14 @@ def _resolve_archetype_signals(
     archetype: InvestigationArchetype,
     catalog: list[MetricEntry],
     intent: Intent,
+    target_language: str = "promql",
 ) -> InvestigationArchetype:
     """Resolve signal bindings and substitute metrics if needed.
 
     If the archetype has signal_bindings and any default metrics are missing
     from the catalog, the signal store is consulted to find alternatives.
+    ``target_language`` keeps substitutions within the backend being compiled
+    for (e.g. don't pull a SignalFx metric into a PromQL dashboard).
     Returns the (possibly modified) archetype.
     """
     if not archetype.signal_bindings:
@@ -480,6 +486,7 @@ def _resolve_archetype_signals(
             catalog=catalog,
             context_service=intent.services[0] if intent.services else "",
             context_archetype=archetype.id,
+            target_query_language=target_language,
         )
         if substitutions:
             logger.info(
@@ -512,7 +519,7 @@ def compile_archetype(
     target_language: 'promql' (default) or 'signalflow'
     """
     # Resolve signals → actual metrics before compiling templates
-    archetype = _resolve_archetype_signals(archetype, catalog, intent)
+    archetype = _resolve_archetype_signals(archetype, catalog, intent, target_language)
 
     rate_interval = _resolve_rate_interval(intent)
 
@@ -539,27 +546,48 @@ def compile_archetype(
     for pt in archetype.panels:
         panel_queries: list[PanelQuery] = []
         for qt in pt.queries:
-            try:
-                expr = qt.expr.format(**params)
-            except KeyError as e:
-                logger.warning("archetype_placeholder_missing", panel=pt.title, key=str(e))
-                continue
+            # Determine whether this query is PromQL. An explicit non-PromQL
+            # query_language (signalflow/logql/cloudwatch/…) — or a SignalFx
+            # datasource tag — marks it as a native query to honor verbatim.
+            qt_language = (qt.query_language or "promql").lower()
+            if qt_language in ("", "promql") and "signalfx" in (qt.datasource_type or "").lower():
+                qt_language = "signalflow"
+            is_promql_query = qt_language in ("", "promql")
 
-            raw_signalflow_query = target_language == "signalflow" and (
-                qt.query_language == "signalflow" or qt.datasource_type == "signalfx"
-            )
-
-            if target_language == "signalflow" and not raw_signalflow_query:
-                # Compile the resolved PromQL template directly to SignalFlow
-                legend = qt.legend_format or pt.title
-                expr = _promql_template_to_signalflow(expr, service_filter, container_filter, legend)
+            if is_promql_query:
+                # PromQL templates use {service_filter} etc. and need str.format.
+                try:
+                    expr = qt.expr.format(**params)
+                except KeyError as e:
+                    logger.warning("archetype_placeholder_missing", panel=pt.title, key=str(e))
+                    continue
+                if target_language == "signalflow":
+                    # Compile the resolved PromQL template directly to SignalFlow.
+                    legend = qt.legend_format or pt.title
+                    expr = _promql_template_to_signalflow(expr, service_filter, container_filter, legend)
+                query_datasource_type = datasource_type
+            else:
+                # Non-PromQL queries are honored verbatim — no PromQL
+                # format/escaping or PromQL→SignalFlow conversion.
+                expr = qt.expr
+                if not qt.datasource_type or qt.datasource_type == "prometheus":
+                    query_datasource_type = {
+                        "signalflow": "signalfx",
+                        "logql": "loki",
+                        "cloudwatch": "cloudwatch",
+                        "lucene": "elasticsearch",
+                        "graphite": "graphite",
+                        "influxql": "influxdb",
+                    }.get(qt_language, datasource_type)
+                else:
+                    query_datasource_type = qt.datasource_type
 
             panel_queries.append(
                 PanelQuery(
                     expr=expr,
                     legend_format=qt.legend_format,
                     datasource_uid=datasource_uid,
-                    datasource_type=datasource_type,
+                    datasource_type=query_datasource_type,
                 )
             )
 

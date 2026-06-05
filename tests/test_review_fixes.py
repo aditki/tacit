@@ -98,6 +98,25 @@ class TestPanelDrilldownLinks:
         parsed = parse_dashboard_json(self._dashboard(panel_links=[]))
         assert parsed["drilldown_links"] == []
 
+    def test_non_list_panel_links_are_ignored(self):
+        parsed = parse_dashboard_json(self._dashboard(panel_links={"title": "bad"}))
+        assert parsed["panels"][0].get("links") == []
+        assert parsed["drilldown_links"] == []
+
+    def test_non_dict_dashboard_links_are_ignored(self):
+        parsed = parse_dashboard_json(
+            self._dashboard(
+                panel_links=[],
+                dashboard_links=["not-a-link", {"type": "link", "url": "/d/ok"}],
+            )
+        )
+        assert parsed["drilldown_links"] == ["/d/ok"]
+
+    def test_empty_panel_links_are_not_persisted(self):
+        parsed = parse_dashboard_json(self._dashboard(panel_links=[{}, {"title": "", "url": ""}]))
+        assert parsed["panels"][0].get("links") == []
+        assert parsed["drilldown_links"] == []
+
 
 # ── #4 / strict request models ───────────────────────────────────────────────
 

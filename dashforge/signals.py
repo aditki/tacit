@@ -227,9 +227,15 @@ class SignalStore:
                 """INSERT INTO signal_types (signal_type, description, category, unit, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(signal_type) DO UPDATE SET
-                       description = excluded.description,
-                       category = excluded.category,
-                       unit = excluded.unit,
+                       -- Only overwrite metadata when a non-empty value is
+                       -- supplied, so a teach call with blank fields doesn't
+                       -- wipe bootstrap taxonomy (description/category/unit).
+                       description = CASE WHEN excluded.description != '' THEN excluded.description
+                                         ELSE signal_types.description END,
+                       category = CASE WHEN excluded.category != '' THEN excluded.category
+                                       ELSE signal_types.category END,
+                       unit = CASE WHEN excluded.unit != '' THEN excluded.unit
+                                   ELSE signal_types.unit END,
                        updated_at = excluded.updated_at""",
                 (signal_type, description, category, unit, now, now),
             )
@@ -302,6 +308,37 @@ class SignalStore:
                     (signal_type, now, now),
                 )
 
+            # Merge context scopes with any existing mapping so re-teaching the
+            # same signal/metric for a second service unions rather than
+            # replaces. Semantics per dimension:
+            #   None  → leave existing unchanged
+            #   []    → explicitly clear (make global)
+            #   [...] → union with existing
+            prior = conn.execute(
+                """SELECT context_services, context_datasource_types,
+                          context_environments, context_archetypes
+                     FROM signal_metric_mappings
+                    WHERE signal_type = ? AND metric_pattern = ?""",
+                (signal_type, metric_pattern),
+            ).fetchone()
+
+            def _merge(provided: list[str] | None, existing_json: str | None) -> list[str]:
+                existing_list = json.loads(existing_json) if existing_json else []
+                if provided is None:
+                    return existing_list
+                if not provided:  # explicit empty list clears the scope
+                    return []
+                merged = list(existing_list)
+                for value in provided:
+                    if value not in merged:
+                        merged.append(value)
+                return merged
+
+            services = _merge(context_services, prior["context_services"] if prior else None)
+            ds_types = _merge(context_datasource_types, prior["context_datasource_types"] if prior else None)
+            environments = _merge(context_environments, prior["context_environments"] if prior else None)
+            archetypes = _merge(context_archetypes, prior["context_archetypes"] if prior else None)
+
             cursor = conn.execute(
                 """INSERT INTO signal_metric_mappings
                    (signal_type, metric_pattern, confidence,
@@ -311,30 +348,11 @@ class SignalStore:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(signal_type, metric_pattern) DO UPDATE SET
                        confidence = MAX(excluded.confidence, signal_metric_mappings.confidence),
-                       context_services = CASE
-                           WHEN excluded.source_type = 'bootstrap'
-                                AND signal_metric_mappings.source_type <> 'bootstrap'
-                           THEN signal_metric_mappings.context_services
-                           ELSE excluded.context_services
-                       END,
-                       context_datasource_types = CASE
-                           WHEN excluded.source_type = 'bootstrap'
-                                AND signal_metric_mappings.source_type <> 'bootstrap'
-                           THEN signal_metric_mappings.context_datasource_types
-                           ELSE excluded.context_datasource_types
-                       END,
-                       context_environments = CASE
-                           WHEN excluded.source_type = 'bootstrap'
-                                AND signal_metric_mappings.source_type <> 'bootstrap'
-                           THEN signal_metric_mappings.context_environments
-                           ELSE excluded.context_environments
-                       END,
-                       context_archetypes = CASE
-                           WHEN excluded.source_type = 'bootstrap'
-                                AND signal_metric_mappings.source_type <> 'bootstrap'
-                           THEN signal_metric_mappings.context_archetypes
-                           ELSE excluded.context_archetypes
-                       END,
+                       -- excluded.context_* already holds the merged scopes.
+                       context_services = excluded.context_services,
+                       context_datasource_types = excluded.context_datasource_types,
+                       context_environments = excluded.context_environments,
+                       context_archetypes = excluded.context_archetypes,
                        source_type = CASE
                            WHEN excluded.source_type = 'bootstrap'
                                 AND signal_metric_mappings.source_type <> 'bootstrap'
@@ -353,10 +371,10 @@ class SignalStore:
                     signal_type,
                     metric_pattern,
                     confidence,
-                    json.dumps(context_services or []),
-                    json.dumps(context_datasource_types or []),
-                    json.dumps(context_environments or []),
-                    json.dumps(context_archetypes or []),
+                    json.dumps(services),
+                    json.dumps(ds_types),
+                    json.dumps(environments),
+                    json.dumps(archetypes),
                     source_type,
                     json.dumps(source_refs or []),
                     now,
@@ -447,6 +465,7 @@ class SignalStore:
         context_datasource_type: str = "",
         context_archetype: str = "",
         context_environment: str = "",
+        target_query_language: str = "",
     ) -> list[tuple[MetricEntry, float]]:
         """Resolve a semantic signal to actual metrics from the live catalog.
 
@@ -455,6 +474,11 @@ class SignalStore:
         - Pattern matching against catalog metric names
         - Context filters (service, datasource, archetype, environment)
         - Confidence decay and feedback adjustment
+
+        ``target_query_language`` restricts matching to catalog entries of that
+        query language (e.g. ``promql``). This prevents a learned SignalFx metric
+        from being substituted into a PromQL template (or vice versa) when the
+        catalog spans multiple backends.
 
         This is the core algorithm that bridges semantic signals to real metrics.
         """
@@ -469,6 +493,7 @@ class SignalStore:
         if not mappings:
             return []
 
+        target_lang = target_query_language.lower()
         matched: list[tuple[MetricEntry, float]] = []
         seen_metrics: set[str] = set()
 
@@ -478,6 +503,10 @@ class SignalStore:
 
             for entry in catalog:
                 if entry.name in seen_metrics:
+                    continue
+                # Restrict to the target backend's query language so we never
+                # substitute a cross-backend metric into the wrong template.
+                if target_lang and (entry.query_language or "").lower() != target_lang:
                     continue
                 if _metric_matches_pattern(entry.name, pattern):
                     matched.append((entry, eff_conf))
@@ -494,6 +523,7 @@ class SignalStore:
         context_service: str = "",
         context_datasource_type: str = "",
         context_archetype: str = "",
+        target_query_language: str = "",
     ) -> dict[str, str]:
         """Resolve signal bindings to metric substitutions for archetype compile.
 
@@ -503,6 +533,9 @@ class SignalStore:
             Maps signal_type → default_metric_name (from archetype YAML).
         catalog : list[MetricEntry]
             Live metric catalog from datasource discovery.
+        target_query_language : str
+            When set, only catalog metrics of this query language are eligible,
+            so substitutions stay within the backend being compiled for.
 
         Returns
         -------
@@ -526,6 +559,7 @@ class SignalStore:
                 context_service=context_service,
                 context_datasource_type=context_datasource_type,
                 context_archetype=context_archetype,
+                target_query_language=target_query_language,
             )
 
             if resolved:
@@ -552,7 +586,13 @@ class SignalStore:
 
         if path is None:
             candidates = [
+                # Source checkout: signals.yaml at the project root.
                 Path(__file__).resolve().parent.parent / "signals.yaml",
+                # Installed wheel: packaged copy shipped inside the package
+                # (see force-include in pyproject.toml) so a CLI run from any
+                # directory still bootstraps the signal taxonomy.
+                Path(__file__).resolve().parent / "signals.yaml",
+                # Explicit per-invocation override in the working directory.
                 Path("signals.yaml"),
             ]
             for p in candidates:

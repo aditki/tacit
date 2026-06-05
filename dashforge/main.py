@@ -550,9 +550,9 @@ async def learn_from_dashboard(request: LearnDashboardRequest):
     Optionally auto-generates an archetype YAML snippet for review.
 
     The request body is validated against ``LearnDashboardRequest``;
-    ``auto_approve`` is a strict boolean, so a JSON serialization mistake like
-    the string ``"false"`` is read correctly rather than treated as truthy
-    (invalid input → 422).
+    ``auto_approve`` accepts real JSON booleans plus the explicit strings
+    ``"true"`` / ``"false"``. Other truthy/falsy values are rejected (422)
+    so accidental strings like ``"yes"`` cannot approve unreviewed mappings.
 
     The ``backend`` field selects which backend to fetch from: ``"grafana"``
     (default) or ``"signalfx"``. If omitted, uses the first active backend.
