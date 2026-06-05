@@ -1,4 +1,5 @@
 """Direct SignalFx metric discovery — reuses keyword mapping from the Grafana adapter."""
+
 from __future__ import annotations
 
 import asyncio
@@ -18,8 +19,7 @@ _MAX_CATALOG_SIZE = 300
 _MAX_DIMENSION_KEYS = 15
 _MAX_DIMENSION_VALUES = 10
 # Internal SFx keys to exclude from dimension lists
-_INTERNAL_KEYS = {"sf_metric", "sf_originatingMetric", "sf_key", "sf_type",
-                  "sf_isActive", "sf_createdOnMs", "sf_tags"}
+_INTERNAL_KEYS = {"sf_metric", "sf_originatingMetric", "sf_key", "sf_type", "sf_isActive", "sf_createdOnMs", "sf_tags"}
 
 
 def _normalize_keywords(keywords: list[str]) -> list[str]:
@@ -45,9 +45,7 @@ async def _fetch_dimensions(
 ) -> list[str]:
     """Fetch dimension keys + sample values for a metric via MTS search."""
     try:
-        data = await client.search_metric_timeseries(
-            query=f"sf_metric:{metric_name}", limit=20
-        )
+        data = await client.search_metric_timeseries(query=f"sf_metric:{metric_name}", limit=20)
         results = data.get("results", []) if isinstance(data, dict) else data
         if not results:
             return []
@@ -156,9 +154,9 @@ async def discover_metrics(
     dim_results = await asyncio.gather(*dim_tasks, return_exceptions=True)
 
     catalog: dict[str, list[str]] = {name: [] for name in metric_names}
-    for result in dim_results:
-        if isinstance(result, tuple):
-            catalog[result[0]] = result[1]
+    for dim_result in dim_results:
+        if isinstance(dim_result, tuple):
+            catalog[dim_result[0]] = dim_result[1]
 
     # Build MetricEntry list — use "signalfx" type + "signalflow" language
     entries = [
@@ -174,8 +172,12 @@ async def discover_metrics(
     ]
 
     metric_cache.set(cache_key, entries)
-    logger.info("signalfx_direct_discovered", total=len(entries),
-                sampled_dims=sum(1 for v in catalog.values() if v),
-                search_errors=search_errors, dim_errors=dim_errors,
-                search_queries=len(search_queries))
+    logger.info(
+        "signalfx_direct_discovered",
+        total=len(entries),
+        sampled_dims=sum(1 for v in catalog.values() if v),
+        search_errors=search_errors,
+        dim_errors=dim_errors,
+        search_queries=len(search_queries),
+    )
     return entries

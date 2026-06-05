@@ -4,7 +4,7 @@
 > decisions, pivots, tradeoffs, bugs encountered, and current state. It is intended to
 > onboard a new AI assistant or developer on a different machine.
 >
-> Last updated: 2026-05-26
+> Last updated: 2026-05-28
 
 ---
 
@@ -243,6 +243,13 @@ dashboard_uid values.
 | `GET` | `/api/v1/investigations` | History | List recent investigations (filter by status, user) |
 | `GET` | `/api/v1/investigations/stats` | History | Aggregate investigation stats |
 | `GET` | `/api/v1/investigations/{id}` | History | Full investigation detail |
+| `GET` | `/api/v1/signals` | Signals | List all semantic signal types |
+| `GET` | `/api/v1/signals/stats` | Signals | Signal store statistics |
+| `GET` | `/api/v1/signals/{signal_type}` | Signals | Signal details + all metric mappings |
+| `POST` | `/api/v1/signals/teach` | Signals | Teach org-specific signal mapping |
+| `POST` | `/api/v1/learn/dashboard` | Learning | Ingest existing Grafana dashboard |
+| `GET` | `/api/v1/learn/dashboards` | Learning | List ingested dashboards |
+| `POST` | `/api/v1/learn/dashboards/{uid}/approve` | Learning | Approve ingested dashboard |
 
 **Auth**: Optional `X-API-Key` header (when `API_AUTH_ENABLED=true`).
 
@@ -277,9 +284,19 @@ dashboard_uid values.
 ### Archetype Schema (dashforge/archetypes/schema.py)
 
 - **`InvestigationArchetype`** — id, name, description, problem_types, required_metrics,
-  panels, tags, default_timerange
+  required_signals, signal_bindings, panels, tags, default_timerange
 - **`PanelTemplate`** — title, description, panel_type, row, queries, unit
 - **`QueryTemplate`** — expr (with placeholders), legend_format, datasource_type
+
+### Signal Schema (dashforge/signals.py)
+
+- **`signal_types` table** — signal_type (PK), description, category, unit, timestamps
+- **`signal_metric_mappings` table** — many-to-many signal ↔ metric with context filters
+  (services, datasource_types, environments, archetypes), provenance (source_type,
+  source_refs), trust metrics (use_count, positive/negative_feedback), confidence decay
+- **`ingested_dashboards` table** — dashboard features extracted during learning:
+  metrics_found, row_groups, metric_cooccurrence, aggregation_patterns, panel_titles,
+  alert_links, drilldown_links, inferred signals, approval status
 
 ---
 
@@ -442,6 +459,8 @@ dashforge/
 │   ├── ranking.py           # Pre-ranking + feedback-driven quality scoring
 │   ├── feedback.py          # SQLite feedback store + analysis engine
 │   ├── history.py           # SQLite investigation history (full pipeline telemetry)
+│   ├── signals.py           # Semantic signal store + resolution engine (SQLite)
+│   ├── dashboard_ingest.py  # Dashboard ingestion: extract → infer → learn
 │   ├── signalfx/            # Direct Splunk SignalFx integration
 │   │   ├── client.py        # Async SignalFx v2 REST API client
 │   │   ├── discovery.py     # Direct metric discovery (reuses adapter keyword map)
@@ -474,6 +493,7 @@ dashforge/
 │   └── README.md            # Validation documentation
 ├── dev/                     # Docker dev environment (Grafana, Prometheus, fake app)
 ├── archetypes.yaml          # Editable investigation templates (41 archetypes)
+├── signals.yaml             # Bootstrap signal taxonomy (semantic signals → metric patterns)
 ├── dashforge.yaml.example   # Reference config
 ├── dashforge.spec           # PyInstaller spec for single-binary builds
 ├── scripts/
@@ -571,6 +591,14 @@ python tests/validate.py --mode pipeline --api-url http://localhost:8000 --revie
 ### What Works
 - Full pipeline: prompt → intent → metrics → query → dashboard → Grafana
 - Multi-label archetype blending (41 archetypes, 176 panels, 153 problem types)
+- **Semantic signal layer** — decouples archetypes from raw metric names via signal
+  taxonomy. Archetypes declare `required_signals` + `signal_bindings`; resolution engine
+  maps signals to actual metrics at compile time. Many-to-many signal ↔ metric with
+  context-aware resolution (service, datasource, archetype, environment), confidence
+  decay, feedback adjustment, and full provenance tracking.
+- **Dashboard learning** — ingest existing Grafana dashboards to extract metric
+  co-occurrence, row groupings, aggregation patterns, panel ordering, and auto-infer
+  signal mappings. Human approval workflow for anti-drift protection.
 - Pre-ranking with feedback-driven quality scoring
 - Feedback collection, analysis, and recommendations
 - YAML archetype templates with hot-reload

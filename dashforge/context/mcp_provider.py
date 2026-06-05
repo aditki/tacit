@@ -6,6 +6,7 @@ needs the server URL and an optional auth token.
 
 MCP spec: https://modelcontextprotocol.io
 """
+
 from __future__ import annotations
 
 import httpx

@@ -1,13 +1,12 @@
 """DashForge CLI — single-command local startup for on-call engineers."""
+
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
-import sys
 import webbrowser
+from collections.abc import Callable
+from concurrent.futures import Future
 from pathlib import Path
-from typing import Optional
 
 import click
 import yaml
@@ -16,17 +15,20 @@ import yaml
 DASHFORGE_HOME = Path.home() / ".dashforge"
 CONFIG_FILE = DASHFORGE_HOME / "config.yaml"
 
+
 def _get_version() -> str:
     """Derive version from package metadata to avoid drift with pyproject.toml."""
     # 1. Try installed package metadata (works after pip install -e .)
     try:
         from importlib.metadata import version
+
         return version("dashforge")
     except Exception:
         pass
     # 2. Fallback: parse pyproject.toml directly (running from source)
     try:
         import re
+
         toml_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
         if toml_path.exists():
             match = re.search(r'^version\s*=\s*"([^"]+)"', toml_path.read_text(), re.MULTILINE)
@@ -36,14 +38,15 @@ def _get_version() -> str:
         pass
     return "0.0.0-dev"
 
+
 VERSION = _get_version()
 
 # ── Rich helpers (graceful fallback) ─────────────────────────────────────────
 try:
     from rich.console import Console
     from rich.panel import Panel
+    from rich.prompt import Confirm, Prompt
     from rich.table import Table
-    from rich.prompt import Prompt, Confirm
 
     console = Console()
 
@@ -345,11 +348,12 @@ def doctor():
     sfx_enabled = False
     try:
         from dashforge.config import settings as _sfx_settings
+
         sfx_enabled = _sfx_settings.signalfx_enabled and bool(_sfx_settings.signalfx_api_token)
     except Exception:
         pass
 
-    network_checks: dict[str, callable] = {
+    network_checks: dict[str, Callable[[], bool]] = {
         "grafana": _check_grafana,
         "llm": _check_llm,
     }
@@ -358,7 +362,7 @@ def doctor():
 
     network_results: dict[str, bool] = {}
     with ThreadPoolExecutor(max_workers=len(network_checks)) as pool:
-        futures = {pool.submit(fn): name for name, fn in network_checks.items()}
+        futures: dict[Future[bool], str] = {pool.submit(fn): name for name, fn in network_checks.items()}
         for future in as_completed(futures):
             name = futures[future]
             try:
@@ -367,7 +371,6 @@ def doctor():
                 network_results[name] = False
 
     grafana_ok = network_results.get("grafana", False)
-    llm_ok = network_results.get("llm", False)
 
     checks_total += len(network_checks)
     for name, ok in network_results.items():
@@ -408,6 +411,7 @@ def _load_env():
     env_file = DASHFORGE_HOME / ".env"
     if env_file.exists():
         from dotenv import load_dotenv
+
         load_dotenv(env_file)
 
     if CONFIG_FILE.exists() and not os.environ.get("DASHFORGE_CONFIG"):
@@ -417,7 +421,9 @@ def _load_env():
 def _check_grafana() -> bool:
     try:
         import httpx
+
         from dashforge.config import settings
+
         url = settings.grafana_url.rstrip("/")
         api_key = settings.grafana_api_key
 
@@ -442,13 +448,15 @@ def _check_grafana() -> bool:
 def _check_datasources() -> bool:
     try:
         import httpx
+
         from dashforge.config import settings
+
         url = settings.grafana_url.rstrip("/")
         headers = {"Authorization": f"Bearer {settings.grafana_api_key}"}
         resp = httpx.get(f"{url}/api/datasources", headers=headers, timeout=10)
         if resp.status_code == 200:
             ds_list = resp.json()
-            types = {}
+            types: dict[str, int] = {}
             for ds in ds_list:
                 t = ds.get("type", "unknown")
                 types[t] = types.get(t, 0) + 1
@@ -466,6 +474,7 @@ def _check_datasources() -> bool:
 def _check_llm() -> bool:
     try:
         from dashforge.config import settings
+
         provider = settings.llm_provider
         api_key = settings.llm_api_key
         model = settings.llm_model
@@ -484,6 +493,7 @@ def _check_llm() -> bool:
         elif provider == "bedrock":
             try:
                 import boto3
+
                 session_kwargs: dict = {"region_name": settings.llm_bedrock_region}
                 if settings.llm_aws_access_key_id:
                     session_kwargs["aws_access_key_id"] = settings.llm_aws_access_key_id
@@ -518,6 +528,7 @@ def _check_llm() -> bool:
                 return False
         elif provider == "ollama":
             import httpx
+
             base = settings.llm_api_base or "http://localhost:11434"
             try:
                 resp = httpx.get(f"{base}/api/tags", timeout=5)
@@ -539,6 +550,7 @@ def _check_llm() -> bool:
 def _check_archetypes() -> bool:
     try:
         from dashforge.archetypes.templates import _load_archetypes_from_yaml
+
         archetypes_path = Path("archetypes.yaml")
         if not archetypes_path.exists():
             # Try relative to package
@@ -561,7 +573,9 @@ def _check_archetypes() -> bool:
 def _check_signalfx() -> bool:
     try:
         import httpx
+
         from dashforge.config import settings
+
         realm = settings.signalfx_realm
         token = settings.signalfx_api_token
         if not token:
@@ -580,7 +594,7 @@ def _check_signalfx() -> bool:
             _success(f"SignalFx: connected to realm {realm} ({count} metrics)")
             return True
         elif resp.status_code == 401:
-            _fail(f"SignalFx: authentication failed (HTTP 401) — check API token")
+            _fail("SignalFx: authentication failed (HTTP 401) — check API token")
             return False
         else:
             _fail(f"SignalFx: HTTP {resp.status_code} from api.{realm}.signalfx.com")
@@ -600,7 +614,7 @@ def connect():
 @connect.command("grafana")
 @click.option("--url", default=None, help="Grafana URL")
 @click.option("--api-key", default=None, help="Grafana service account token")
-def connect_grafana(url: Optional[str], api_key: Optional[str]):
+def connect_grafana(url: str | None, api_key: str | None):
     """Test and persist Grafana connection."""
     _header("Connect to Grafana")
     _load_env()
@@ -616,6 +630,7 @@ def connect_grafana(url: Optional[str], api_key: Optional[str]):
 
     # Test connection
     import httpx
+
     try:
         headers = {"Authorization": f"Bearer {api_key}"}
         resp = httpx.get(f"{url.rstrip('/')}/api/org", headers=headers, timeout=10)
@@ -651,7 +666,7 @@ def connect_grafana(url: Optional[str], api_key: Optional[str]):
 @connect.command("signalfx")
 @click.option("--token", default=None, help="SignalFx API access token")
 @click.option("--realm", default=None, help="SignalFx realm (us0, us1, us2, eu0, jp0, au0)")
-def connect_signalfx(token: Optional[str], realm: Optional[str]):
+def connect_signalfx(token: str | None, realm: str | None):
     """Test and persist Splunk SignalFx connection."""
     _header("Connect to Splunk SignalFx")
     _load_env()
@@ -667,6 +682,7 @@ def connect_signalfx(token: Optional[str], realm: Optional[str]):
 
     # Test connection
     import httpx
+
     try:
         resp = httpx.get(
             f"https://api.{realm}.signalfx.com/v2/metric",
@@ -746,22 +762,21 @@ def _update_env(updates: dict):
 @cli.command("test")
 @click.option("--prompt", "-p", default=None, help="Custom test prompt")
 @click.option("--open-browser/--no-open-browser", default=True, help="Open dashboard in browser")
-def test_run(prompt: Optional[str], open_browser: bool):
+def test_run(prompt: str | None, open_browser: bool):
     """Run a sample investigation and open the resulting dashboard."""
     _header("DashForge Test Run")
     _load_env()
 
     if prompt is None:
         prompt = "High latency on the checkout service in the last hour"
-    _info(f"Prompt: \"{prompt}\"")
+    _info(f'Prompt: "{prompt}"')
     console.print()
 
     import asyncio
 
     async def _run():
-        from dashforge.config import settings
-        from dashforge.pipeline import run_pipeline
         from dashforge.models.schemas import DashRequest
+        from dashforge.pipeline import run_pipeline
 
         req = DashRequest(prompt=prompt)
         _info("Running pipeline...")
@@ -777,9 +792,7 @@ def test_run(prompt: Optional[str], open_browser: bool):
             _info(f"  Panels: {result.panel_count}")
             _info(f"  Path: {result.path_used}")
             if result.archetypes:
-                arch_str = ", ".join(
-                    f"{a.type} ({a.confidence:.0%})" for a in result.archetypes
-                )
+                arch_str = ", ".join(f"{a.type} ({a.confidence:.0%})" for a in result.archetypes)
                 _info(f"  Archetypes: {arch_str}")
 
             if open_browser and result.dashboard_url:
@@ -812,9 +825,10 @@ def serve(host: str, port: int, reload: bool, no_slack: bool):
     _header(f"DashForge Server — {host}:{port}")
 
     import uvicorn
-    from dashforge.config import settings
 
+    from dashforge.config import settings
     from dashforge.logging import configure_logging
+
     configure_logging(settings.log_level)
 
     _info(f"LLM: {settings.llm_provider} / {settings.llm_model}")
@@ -850,10 +864,11 @@ def history():
 @click.option("--limit", "-n", default=20, type=int, help="Number of records")
 @click.option("--status", type=click.Choice(["success", "failed", "timeout"]), default=None)
 @click.option("--user", default=None, help="Filter by user ID")
-def history_list(limit: int, status: Optional[str], user: Optional[str]):
+def history_list(limit: int, status: str | None, user: str | None):
     """List recent investigations."""
     _load_env()
     from dashforge.history import get_investigation_store
+
     store = get_investigation_store()
     investigations = store.list_recent(limit=limit, status=status, user_id=user)
 
@@ -879,9 +894,7 @@ def history_list(limit: int, status: Optional[str], user: Optional[str]):
             }.get(inv["status"], inv["status"])
 
             archetypes = inv.get("archetypes", [])
-            arch_str = ", ".join(
-                f"{a['type']}({a['confidence']:.0%})" for a in archetypes[:2]
-            ) if archetypes else "—"
+            arch_str = ", ".join(f"{a['type']}({a['confidence']:.0%})" for a in archetypes[:2]) if archetypes else "—"
 
             table.add_row(
                 inv["id"],
@@ -904,6 +917,7 @@ def history_show(investigation_id: str):
     """Show full details of a single investigation."""
     _load_env()
     from dashforge.history import get_investigation_store
+
     store = get_investigation_store()
     inv = store.get(investigation_id)
 
@@ -987,6 +1001,7 @@ def history_stats():
     """Show aggregate investigation statistics."""
     _load_env()
     from dashforge.history import get_investigation_store
+
     store = get_investigation_store()
     s = store.stats()
 

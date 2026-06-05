@@ -3,12 +3,13 @@
 Returns the list of active backends based on config. The pipeline iterates
 over these instead of using vendor-specific if/else branches.
 """
+
 from __future__ import annotations
 
-from dashforge.backends.base import DashboardBackend, PublishResult
+from dashforge.backends.base import DashboardBackend, DashboardFeatures, PublishResult
 from dashforge.config import settings
 
-__all__ = ["DashboardBackend", "PublishResult", "get_active_backends"]
+__all__ = ["DashboardBackend", "DashboardFeatures", "PublishResult", "get_active_backends"]
 
 
 def get_active_backends() -> list[DashboardBackend]:
@@ -23,10 +24,12 @@ def get_active_backends() -> list[DashboardBackend]:
 
     if settings.grafana_enabled:
         from dashforge.backends.grafana import GrafanaBackend
+
         backends.append(GrafanaBackend())
 
     if settings.signalfx_enabled and settings.signalfx_api_token:
         from dashforge.backends.signalfx import SignalFxBackend
+
         backends.append(SignalFxBackend())
 
     return backends

@@ -1,4 +1,5 @@
 """Adapter for Graphite datasource."""
+
 from __future__ import annotations
 
 import structlog
@@ -35,9 +36,7 @@ class GraphiteAdapter(DatasourceAdapter):
 
         for pattern in search_patterns[:5]:
             try:
-                data = await client.datasource_proxy_get(
-                    datasource.uid, f"metrics/find?query={pattern}"
-                )
+                data = await client.datasource_proxy_get(datasource.uid, f"metrics/find?query={pattern}")
                 results: list[dict] = data if isinstance(data, list) else []
             except Exception:
                 logger.warning("graphite_find_failed", datasource=datasource.name, pattern=pattern)

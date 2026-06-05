@@ -1,4 +1,5 @@
 """Anthropic (Claude) provider."""
+
 from __future__ import annotations
 
 import anthropic
@@ -10,6 +11,14 @@ from dashforge.config import settings
 logger = structlog.get_logger()
 
 JSON_PREAMBLE = "Respond ONLY with a valid JSON object. No markdown, no explanation."
+
+
+def _response_text(response) -> str:
+    for block in response.content:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            return text
+    return ""
 
 
 class AnthropicProvider(LLMProvider):
@@ -38,7 +47,7 @@ class AnthropicProvider(LLMProvider):
             system=system,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        raw = response.content[0].text
+        raw = _response_text(response)
         logger.debug("anthropic_raw", raw=raw[:500])
         return LLMResult(text=raw, usage=self._extract_usage(response))
 
@@ -55,4 +64,4 @@ class AnthropicProvider(LLMProvider):
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        return LLMResult(text=response.content[0].text, usage=self._extract_usage(response))
+        return LLMResult(text=_response_text(response), usage=self._extract_usage(response))

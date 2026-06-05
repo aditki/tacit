@@ -5,9 +5,10 @@ Auth: X-SF-TOKEN header
 
 Docs: https://dev.splunk.com/observability/reference
 """
+
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import structlog
@@ -48,16 +49,14 @@ class SignalFxClient:
     async def _post(self, path: str, json: dict | list | None = None) -> dict:
         resp = await self._client.post(path, json=json)
         if resp.status_code >= 400:
-            logger.error("signalfx_api_error", method="POST", path=path,
-                         status=resp.status_code, body=resp.text[:500])
+            logger.error("signalfx_api_error", method="POST", path=path, status=resp.status_code, body=resp.text[:500])
         resp.raise_for_status()
         return resp.json()
 
     async def _put(self, path: str, json: dict | None = None) -> dict:
         resp = await self._client.put(path, json=json)
         if resp.status_code >= 400:
-            logger.error("signalfx_api_error", method="PUT", path=path,
-                         status=resp.status_code, body=resp.text[:500])
+            logger.error("signalfx_api_error", method="PUT", path=path, status=resp.status_code, body=resp.text[:500])
         resp.raise_for_status()
         return resp.json()
 
@@ -74,15 +73,21 @@ class SignalFxClient:
         offset: int = 0,
     ) -> dict[str, Any]:
         """Search metrics. Returns {count, results: [{name, description, type, ...}]}."""
-        return await self._get("/v2/metric", params={
-            "query": query,
-            "limit": limit,
-            "offset": offset,
-        })
+        return cast(
+            dict[str, Any],
+            await self._get(
+                "/v2/metric",
+                params={
+                    "query": query,
+                    "limit": limit,
+                    "offset": offset,
+                },
+            ),
+        )
 
     async def get_metric(self, metric_name: str) -> dict[str, Any]:
         """Get metadata for a single metric."""
-        return await self._get(f"/v2/metric/{metric_name}")
+        return cast(dict[str, Any], await self._get(f"/v2/metric/{metric_name}"))
 
     async def search_metric_timeseries(
         self,
@@ -90,10 +95,16 @@ class SignalFxClient:
         limit: int = 50,
     ) -> dict[str, Any]:
         """Search metric time series (MTS) for dimension discovery."""
-        return await self._get("/v2/metrictimeseries", params={
-            "query": query,
-            "limit": limit,
-        })
+        return cast(
+            dict[str, Any],
+            await self._get(
+                "/v2/metrictimeseries",
+                params={
+                    "query": query,
+                    "limit": limit,
+                },
+            ),
+        )
 
     async def get_dimensions(
         self,
@@ -101,20 +112,26 @@ class SignalFxClient:
         limit: int = 100,
     ) -> dict[str, Any]:
         """Search dimensions."""
-        return await self._get("/v2/dimension", params={
-            "query": query,
-            "limit": limit,
-        })
+        return cast(
+            dict[str, Any],
+            await self._get(
+                "/v2/dimension",
+                params={
+                    "query": query,
+                    "limit": limit,
+                },
+            ),
+        )
 
     # ── Charts ───────────────────────────────────────────────────────────
 
     async def create_chart(self, chart_json: dict[str, Any]) -> dict[str, Any]:
         """Create a chart. Returns the chart object with id."""
-        return await self._post("/v2/chart", json=chart_json)
+        return cast(dict[str, Any], await self._post("/v2/chart", json=chart_json))
 
     async def update_chart(self, chart_id: str, chart_json: dict[str, Any]) -> dict[str, Any]:
         """Update an existing chart."""
-        return await self._put(f"/v2/chart/{chart_id}", json=chart_json)
+        return cast(dict[str, Any], await self._put(f"/v2/chart/{chart_id}", json=chart_json))
 
     async def delete_chart(self, chart_id: str) -> None:
         """Delete a chart."""
@@ -124,21 +141,21 @@ class SignalFxClient:
 
     async def create_dashboard(self, dashboard_json: dict[str, Any]) -> dict[str, Any]:
         """Create a dashboard. Returns the dashboard object with id."""
-        return await self._post("/v2/dashboard", json=dashboard_json)
+        return cast(dict[str, Any], await self._post("/v2/dashboard", json=dashboard_json))
 
     async def update_dashboard(self, dashboard_id: str, dashboard_json: dict[str, Any]) -> dict[str, Any]:
         """Update an existing dashboard."""
-        return await self._put(f"/v2/dashboard/{dashboard_id}", json=dashboard_json)
+        return cast(dict[str, Any], await self._put(f"/v2/dashboard/{dashboard_id}", json=dashboard_json))
 
     # ── Dashboard Groups ─────────────────────────────────────────────────
 
     async def list_dashboard_groups(self, limit: int = 100) -> dict[str, Any]:
         """List dashboard groups."""
-        return await self._get("/v2/dashboardgroup", params={"limit": limit})
+        return cast(dict[str, Any], await self._get("/v2/dashboardgroup", params={"limit": limit}))
 
     async def create_dashboard_group(self, group_json: dict[str, Any]) -> dict[str, Any]:
         """Create a dashboard group."""
-        return await self._post("/v2/dashboardgroup", json=group_json)
+        return cast(dict[str, Any], await self._post("/v2/dashboardgroup", json=group_json))
 
     async def get_or_create_dashboard_group(self, name: str) -> dict[str, Any]:
         """Find existing dashboard group by name, or create one."""
@@ -147,10 +164,12 @@ class SignalFxClient:
         for group in results:
             if group.get("name") == name:
                 return group
-        return await self.create_dashboard_group({
-            "name": name,
-            "description": "Auto-generated by DashForge",
-        })
+        return await self.create_dashboard_group(
+            {
+                "name": name,
+                "description": "Auto-generated by DashForge",
+            }
+        )
 
     # ── Health ───────────────────────────────────────────────────────────
 

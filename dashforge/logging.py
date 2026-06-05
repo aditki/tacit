@@ -10,13 +10,14 @@ stage-specific metadata.  This module provides:
 - ``stage_log()``         — emits the canonical ``stage_complete`` event.
 - ``configure_logging()`` — one-call structlog configuration for prod use.
 """
+
 from __future__ import annotations
 
 import logging
 import uuid
 
 import structlog
-from structlog.contextvars import bind_contextvars, clear_contextvars, unbind_contextvars
+from structlog.contextvars import bind_contextvars, unbind_contextvars
 
 from dashforge.agents.providers.base import TokenUsage
 

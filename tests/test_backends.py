@@ -3,9 +3,10 @@
 Tests written BEFORE implementation. These define the contract that
 GrafanaBackend, SignalFxBackend, and the registry must satisfy.
 """
+
 import asyncio
-import sys
 import os
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -20,8 +21,8 @@ from dashforge.models.schemas import (
     SignalType,
 )
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────
+
 
 def _make_intent(**overrides) -> Intent:
     defaults = dict(
@@ -48,8 +49,11 @@ def _make_spec(query_lang="promql", ds_type="prometheus") -> DashboardSpec:
                 panel_type="timeseries",
                 queries=[
                     PanelQuery(
-                        expr="data('http.requests').publish(label='A')" if query_lang == "signalflow"
-                        else "rate(http_requests_total[5m])",
+                        expr=(
+                            "data('http.requests').publish(label='A')"
+                            if query_lang == "signalflow"
+                            else "rate(http_requests_total[5m])"
+                        ),
                         legend_format="rps",
                         datasource_uid="ds1",
                         datasource_type=ds_type,
@@ -64,8 +68,10 @@ def _make_spec(query_lang="promql", ds_type="prometheus") -> DashboardSpec:
 # 1. base.py — PublishResult dataclass
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_publish_result_defaults():
     from dashforge.backends.base import PublishResult
+
     r = PublishResult()
     assert r.url == ""
     assert r.uid == ""
@@ -75,6 +81,7 @@ def test_publish_result_defaults():
 
 def test_publish_result_with_values():
     from dashforge.backends.base import PublishResult
+
     r = PublishResult(url="http://grafana/d/abc", uid="abc", backend_name="grafana")
     assert r.url == "http://grafana/d/abc"
     assert r.uid == "abc"
@@ -86,9 +93,12 @@ def test_publish_result_with_values():
 # 2. base.py — DashboardBackend Protocol shape
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_backend_protocol_attributes():
-    from dashforge.backends.base import DashboardBackend
     import inspect
+
+    from dashforge.backends.base import DashboardBackend
+
     # Protocol should define these methods
     members = {name for name, _ in inspect.getmembers(DashboardBackend)}
     assert "discover_metrics" in members
@@ -102,8 +112,10 @@ def test_backend_protocol_attributes():
 # 3. GrafanaBackend — properties
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_grafana_backend_properties():
     from dashforge.backends.grafana import GrafanaBackend
+
     backend = GrafanaBackend.__new__(GrafanaBackend)
     assert backend.name == "grafana"
     assert backend.query_language == "promql"
@@ -114,6 +126,7 @@ def test_grafana_backend_properties():
 # 4. GrafanaBackend — discover_metrics delegates to existing code
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_grafana_backend_discover_metrics():
     from dashforge.backends.grafana import GrafanaBackend
 
@@ -121,15 +134,21 @@ def test_grafana_backend_discover_metrics():
     backend = GrafanaBackend(client=mock_client)
 
     fake_entries = [
-        MetricEntry(name="http_requests_total", datasource_uid="prom1",
-                    datasource_name="Prom", datasource_type="prometheus",
-                    query_language="promql"),
+        MetricEntry(
+            name="http_requests_total",
+            datasource_uid="prom1",
+            datasource_name="Prom",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
     ]
 
-    with patch("dashforge.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list, \
-         patch("dashforge.backends.grafana.filter_datasources_by_signal") as mock_filter, \
-         patch("dashforge.backends.grafana.filter_searchable_datasources") as mock_searchable, \
-         patch("dashforge.backends.grafana.discover_all_metrics", new_callable=AsyncMock) as mock_discover:
+    with (
+        patch("dashforge.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list,
+        patch("dashforge.backends.grafana.filter_datasources_by_signal") as mock_filter,
+        patch("dashforge.backends.grafana.filter_searchable_datasources") as mock_searchable,
+        patch("dashforge.backends.grafana.discover_all_metrics", new_callable=AsyncMock) as mock_discover,
+    ):
 
         mock_list.return_value = [MagicMock(type="prometheus")]
         mock_filter.return_value = [MagicMock(type="prometheus")]
@@ -149,6 +168,7 @@ def test_grafana_backend_discover_metrics():
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. GrafanaBackend — validate_queries delegates to existing code
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def test_grafana_backend_validate_queries():
     from dashforge.backends.grafana import GrafanaBackend
@@ -172,9 +192,10 @@ def test_grafana_backend_validate_queries():
 # 6. GrafanaBackend — publish delegates to existing code
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_grafana_backend_publish():
-    from dashforge.backends.grafana import GrafanaBackend
     from dashforge.backends.base import PublishResult
+    from dashforge.backends.grafana import GrafanaBackend
 
     mock_client = AsyncMock()
     backend = GrafanaBackend(client=mock_client)
@@ -196,8 +217,10 @@ def test_grafana_backend_publish():
 # 7. SignalFxBackend — properties
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_signalfx_backend_properties():
     from dashforge.backends.signalfx import SignalFxBackend
+
     backend = SignalFxBackend.__new__(SignalFxBackend)
     assert backend.name == "signalfx"
     assert backend.query_language == "signalflow"
@@ -208,6 +231,7 @@ def test_signalfx_backend_properties():
 # 8. SignalFxBackend — discover_metrics delegates to signalfx.discovery
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_signalfx_backend_discover_metrics():
     from dashforge.backends.signalfx import SignalFxBackend
 
@@ -215,9 +239,13 @@ def test_signalfx_backend_discover_metrics():
     backend = SignalFxBackend(client=mock_client)
 
     fake_entries = [
-        MetricEntry(name="http.server.request.count", datasource_uid="signalfx-direct",
-                    datasource_name="SignalFx Direct", datasource_type="signalfx",
-                    query_language="signalflow"),
+        MetricEntry(
+            name="http.server.request.count",
+            datasource_uid="signalfx-direct",
+            datasource_name="SignalFx Direct",
+            datasource_type="signalfx",
+            query_language="signalflow",
+        ),
     ]
 
     with patch("dashforge.backends.signalfx.sfx_discover", new_callable=AsyncMock) as mock_disc:
@@ -234,6 +262,7 @@ def test_signalfx_backend_discover_metrics():
 # ═══════════════════════════════════════════════════════════════════════════
 # 9. SignalFxBackend — validate_queries delegates to validate_signalflow_queries
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def test_signalfx_backend_validate_queries():
     from dashforge.backends.signalfx import SignalFxBackend
@@ -257,9 +286,10 @@ def test_signalfx_backend_validate_queries():
 # 10. SignalFxBackend — publish delegates to signalfx.publisher
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_signalfx_backend_publish():
-    from dashforge.backends.signalfx import SignalFxBackend
     from dashforge.backends.base import PublishResult
+    from dashforge.backends.signalfx import SignalFxBackend
 
     mock_client = AsyncMock()
     backend = SignalFxBackend(client=mock_client)
@@ -280,6 +310,7 @@ def test_signalfx_backend_publish():
 # ═══════════════════════════════════════════════════════════════════════════
 # 11. Registry — get_active_backends reads config
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def test_registry_grafana_only():
     from dashforge.backends import get_active_backends
@@ -341,6 +372,7 @@ def test_registry_none_enabled():
 # 12. Registry — primary backend is first in list
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_registry_primary_is_first():
     """When both enabled, the primary backend (first) determines query language."""
     from dashforge.backends import get_active_backends
@@ -362,8 +394,10 @@ def test_registry_primary_is_first():
 # 13. Close — backends clean up resources
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_grafana_backend_close():
     from dashforge.backends.grafana import GrafanaBackend
+
     mock_client = AsyncMock()
     backend = GrafanaBackend(client=mock_client)
     asyncio.run(backend.close())
@@ -373,6 +407,7 @@ def test_grafana_backend_close():
 
 def test_signalfx_backend_close():
     from dashforge.backends.signalfx import SignalFxBackend
+
     mock_client = AsyncMock()
     backend = SignalFxBackend(client=mock_client)
     asyncio.run(backend.close())
@@ -384,15 +419,18 @@ def test_signalfx_backend_close():
 # 14. GrafanaBackend — discover returns empty when no searchable datasources
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_grafana_backend_discover_no_datasources():
     from dashforge.backends.grafana import GrafanaBackend
 
     mock_client = AsyncMock()
     backend = GrafanaBackend(client=mock_client)
 
-    with patch("dashforge.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list, \
-         patch("dashforge.backends.grafana.filter_datasources_by_signal") as mock_filter, \
-         patch("dashforge.backends.grafana.filter_searchable_datasources") as mock_searchable:
+    with (
+        patch("dashforge.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list,
+        patch("dashforge.backends.grafana.filter_datasources_by_signal") as mock_filter,
+        patch("dashforge.backends.grafana.filter_searchable_datasources") as mock_searchable,
+    ):
 
         mock_list.return_value = []
         mock_filter.return_value = []
@@ -409,6 +447,7 @@ def test_grafana_backend_discover_no_datasources():
 # 15. SignalFxBackend — discover handles errors gracefully
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_signalfx_backend_discover_error():
     from dashforge.backends.signalfx import SignalFxBackend
 
@@ -422,6 +461,54 @@ def test_signalfx_backend_discover_error():
         assert result == []
 
     print("[PASS] test_signalfx_backend_discover_error")
+
+
+# ── Bug 8: ingest_dashboard must close all backends ────────────────────
+
+
+def test_ingest_dashboard_closes_all_backends():
+    """When get_active_backends() returns multiple backends and one is
+    selected by name, ALL backends must be closed — not just the selected
+    one.  Otherwise, unused HTTP clients leak."""
+    from dashforge.backends.base import DashboardFeatures
+
+    grafana_backend = AsyncMock()
+    grafana_backend.name = "grafana"
+    grafana_backend.ingest_dashboard = AsyncMock(
+        return_value=DashboardFeatures(
+            dashboard_uid="test-uid",
+            dashboard_title="Test",
+            backend_name="grafana",
+            query_language="promql",
+            metrics_found=["up"],
+            panel_count=1,
+            panels=[],
+        )
+    )
+
+    signalfx_backend = AsyncMock()
+    signalfx_backend.name = "signalfx"
+
+    with patch(
+        "dashforge.backends.get_active_backends",
+        return_value=[grafana_backend, signalfx_backend],
+    ):
+        from dashforge.dashboard_ingest import ingest_dashboard
+
+        asyncio.run(
+            ingest_dashboard(
+                dashboard_uid="test-uid",
+                backend_name="grafana",
+                auto_approve=False,
+            )
+        )
+
+    # Both backends must have close() called
+    grafana_backend.close.assert_awaited_once()
+    signalfx_backend.close.assert_awaited_once()
+
+
+print("[PASS] test_ingest_dashboard_closes_all_backends")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

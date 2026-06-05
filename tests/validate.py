@@ -16,6 +16,7 @@ Usage:
   python tests/validate.py tests/dashforge_validation_prompts.csv --mode archetype --limit 10
   python tests/validate.py tests/dashforge_validation_prompts.csv --mode all --output results.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -36,6 +37,7 @@ os.chdir(_PROJECT_ROOT)
 
 
 # ── Data classes ────────────────────────────────────────────────────────────
+
 
 @dataclass
 class TestCase:
@@ -119,13 +121,21 @@ def normalize_archetype(problem_type: str) -> str:
 
 # ── CSV loader ──────────────────────────────────────────────────────────────
 
+
 def load_test_cases(csv_path: str) -> list[TestCase]:
     """Load test cases from a CSV file. Supports any CSV with the required columns."""
     cases: list[TestCase] = []
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
-        required = {"prompt_id", "prompt", "expected_archetype", "expected_metrics",
-                     "expected_datasources", "difficulty", "validation_goal"}
+        required = {
+            "prompt_id",
+            "prompt",
+            "expected_archetype",
+            "expected_metrics",
+            "expected_datasources",
+            "difficulty",
+            "validation_goal",
+        }
         if not required.issubset(set(reader.fieldnames or [])):
             missing = required - set(reader.fieldnames or [])
             raise ValueError(f"CSV missing columns: {missing}")
@@ -138,36 +148,99 @@ def load_test_cases(csv_path: str) -> list[TestCase]:
             critical = []
             if has_critical and row.get("critical_metrics"):
                 critical = [m.strip() for m in row["critical_metrics"].split(";") if m.strip()]
-            cases.append(TestCase(
-                prompt_id=row["prompt_id"].strip(),
-                prompt=row["prompt"].strip(),
-                expected_archetype=row["expected_archetype"].strip(),
-                expected_metrics=metrics,
-                expected_datasources=datasources,
-                difficulty=row["difficulty"].strip(),
-                validation_goal=row["validation_goal"].strip(),
-                critical_metrics=critical,
-            ))
+            cases.append(
+                TestCase(
+                    prompt_id=row["prompt_id"].strip(),
+                    prompt=row["prompt"].strip(),
+                    expected_archetype=row["expected_archetype"].strip(),
+                    expected_metrics=metrics,
+                    expected_datasources=datasources,
+                    difficulty=row["difficulty"].strip(),
+                    validation_goal=row["validation_goal"].strip(),
+                    critical_metrics=critical,
+                )
+            )
     return cases
 
 
 # ── PromQL metric extraction ───────────────────────────────────────────────
 
-_PROMQL_FUNCTIONS = frozenset({
-    "abs", "absent", "absent_over_time", "avg", "avg_over_time", "bottomk",
-    "ceil", "changes", "clamp", "clamp_max", "clamp_min", "count",
-    "count_over_time", "count_values", "day_of_month", "day_of_week",
-    "days_in_month", "delta", "deriv", "exp", "floor", "group",
-    "histogram_quantile", "holt_winters", "hour", "idelta", "increase",
-    "irate", "label_join", "label_replace", "last_over_time", "ln", "log2",
-    "log10", "max", "max_over_time", "min", "min_over_time", "minute",
-    "month", "predict_linear", "quantile", "quantile_over_time", "rate",
-    "resets", "round", "scalar", "sgn", "sort", "sort_desc", "sqrt",
-    "stddev", "stddev_over_time", "stdvar", "stdvar_over_time", "sum",
-    "sum_over_time", "time", "timestamp", "topk", "vector", "year",
-    "by", "without", "on", "ignoring", "group_left", "group_right", "bool",
-    "offset", "le", "inf",
-})
+_PROMQL_FUNCTIONS = frozenset(
+    {
+        "abs",
+        "absent",
+        "absent_over_time",
+        "avg",
+        "avg_over_time",
+        "bottomk",
+        "ceil",
+        "changes",
+        "clamp",
+        "clamp_max",
+        "clamp_min",
+        "count",
+        "count_over_time",
+        "count_values",
+        "day_of_month",
+        "day_of_week",
+        "days_in_month",
+        "delta",
+        "deriv",
+        "exp",
+        "floor",
+        "group",
+        "histogram_quantile",
+        "holt_winters",
+        "hour",
+        "idelta",
+        "increase",
+        "irate",
+        "label_join",
+        "label_replace",
+        "last_over_time",
+        "ln",
+        "log2",
+        "log10",
+        "max",
+        "max_over_time",
+        "min",
+        "min_over_time",
+        "minute",
+        "month",
+        "predict_linear",
+        "quantile",
+        "quantile_over_time",
+        "rate",
+        "resets",
+        "round",
+        "scalar",
+        "sgn",
+        "sort",
+        "sort_desc",
+        "sqrt",
+        "stddev",
+        "stddev_over_time",
+        "stdvar",
+        "stdvar_over_time",
+        "sum",
+        "sum_over_time",
+        "time",
+        "timestamp",
+        "topk",
+        "vector",
+        "year",
+        "by",
+        "without",
+        "on",
+        "ignoring",
+        "group_left",
+        "group_right",
+        "bool",
+        "offset",
+        "le",
+        "inf",
+    }
+)
 
 
 def extract_metrics_from_expr(expr: str) -> set[str]:
@@ -178,13 +251,13 @@ def extract_metrics_from_expr(expr: str) -> set[str]:
     """
     metrics: set[str] = set()
     # Primary: identifiers immediately before { or [
-    for match in re.finditer(r'([a-zA-Z_:][a-zA-Z0-9_:]*)\s*[{\[]', expr):
+    for match in re.finditer(r"([a-zA-Z_:][a-zA-Z0-9_:]*)\s*[{\[]", expr):
         name = match.group(1)
         if name.lower() not in _PROMQL_FUNCTIONS:
             metrics.add(name)
     # Secondary: identifiers used as function arguments — strip brace content first
-    stripped = re.sub(r'\{[^}]*\}', '{}', expr)
-    for match in re.finditer(r'(?<=[(,])\s*([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?=[{\[(])', stripped):
+    stripped = re.sub(r"\{[^}]*\}", "{}", expr)
+    for match in re.finditer(r"(?<=[(,])\s*([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?=[{\[(])", stripped):
         name = match.group(1)
         if name.lower() not in _PROMQL_FUNCTIONS:
             metrics.add(name)
@@ -208,6 +281,7 @@ def fuzzy_metric_match(expected: set[str], found: set[str]) -> set[str]:
 
 # ── Archetype validation ───────────────────────────────────────────────────
 
+
 async def run_archetype_validation(cases: list[TestCase]) -> list[ArchetypeResult]:
     """Test intent agent problem_type classification accuracy.
 
@@ -225,10 +299,7 @@ async def run_archetype_validation(cases: list[TestCase]) -> list[ArchetypeResul
         try:
             intent, _usage = await classify_intent(case.prompt)
             actual = intent.problem_type
-            all_archetypes = [
-                {"type": a.type, "confidence": a.confidence}
-                for a in intent.archetypes
-            ]
+            all_archetypes = [{"type": a.type, "confidence": a.confidence} for a in intent.archetypes]
         except Exception as e:
             actual = f"ERROR:{e}"
         elapsed = (time.monotonic() - t0) * 1000
@@ -247,29 +318,34 @@ async def run_archetype_validation(cases: list[TestCase]) -> list[ArchetypeResul
                     any_match = True
                     break
 
-        results.append(ArchetypeResult(
-            prompt_id=case.prompt_id,
-            expected=case.expected_archetype,
-            actual=actual,
-            passed=passed,
-            latency_ms=elapsed,
-            all_archetypes=all_archetypes,
-            any_match=any_match,
-            top_confidence=top_confidence,
-        ))
+        results.append(
+            ArchetypeResult(
+                prompt_id=case.prompt_id,
+                expected=case.expected_archetype,
+                actual=actual,
+                passed=passed,
+                latency_ms=elapsed,
+                all_archetypes=all_archetypes,
+                any_match=any_match,
+                top_confidence=top_confidence,
+            )
+        )
 
         # Show multi-label info in output
-        arch_str = " ".join(
-            f"{a['type']}({a['confidence']:.2f})" for a in all_archetypes[:3]
-        ) if all_archetypes else actual
+        arch_str = (
+            " ".join(f"{a['type']}({a['confidence']:.2f})" for a in all_archetypes[:3]) if all_archetypes else actual
+        )
         icon = "\u2713" if passed else ("\u25b3" if any_match else "\u2717")
-        print(f"  [{i:3d}/{total}] {icon} {case.prompt_id}: "
-              f"expected={case.expected_archetype:25s} top={actual:25s} [{arch_str}] ({elapsed:.0f}ms)")
+        print(
+            f"  [{i:3d}/{total}] {icon} {case.prompt_id}: "
+            f"expected={case.expected_archetype:25s} top={actual:25s} [{arch_str}] ({elapsed:.0f}ms)"
+        )
 
     return results
 
 
 # ── Pipeline validation ────────────────────────────────────────────────────
+
 
 async def run_pipeline_validation(
     cases: list[TestCase],
@@ -278,6 +354,7 @@ async def run_pipeline_validation(
 ) -> list[PipelineResult]:
     """Test full pipeline: metric selection + archetype via the running API."""
     import httpx
+
     from dashforge.config import settings
 
     results: list[PipelineResult] = []
@@ -299,20 +376,24 @@ async def run_pipeline_validation(
                 elapsed = (time.monotonic() - t0) * 1000
 
                 if resp.status_code != 200:
-                    results.append(PipelineResult(
-                        prompt_id=case.prompt_id,
-                        expected_metrics=case.expected_metrics,
-                        found_metrics=[],
-                        missing_metrics=case.expected_metrics,
-                        extra_metrics=[],
-                        metric_recall=0.0,
-                        dashboard_url="",
-                        panel_count=0,
-                        latency_ms=elapsed,
-                        error=f"HTTP {resp.status_code}: {resp.text[:200]}",
-                    ))
-                    print(f"  [{i:3d}/{total}] \u2717 {case.prompt_id}: "
-                          f"API error {resp.status_code} ({elapsed:.0f}ms)")
+                    results.append(
+                        PipelineResult(
+                            prompt_id=case.prompt_id,
+                            expected_metrics=case.expected_metrics,
+                            found_metrics=[],
+                            missing_metrics=case.expected_metrics,
+                            extra_metrics=[],
+                            metric_recall=0.0,
+                            dashboard_url="",
+                            panel_count=0,
+                            latency_ms=elapsed,
+                            error=f"HTTP {resp.status_code}: {resp.text[:200]}",
+                        )
+                    )
+                    print(
+                        f"  [{i:3d}/{total}] \u2717 {case.prompt_id}: "
+                        f"API error {resp.status_code} ({elapsed:.0f}ms)"
+                    )
                     continue
 
                 data = resp.json()
@@ -321,20 +402,21 @@ async def run_pipeline_validation(
                 panel_count = data.get("panel_count", 0)
 
                 if not dashboard_uid:
-                    results.append(PipelineResult(
-                        prompt_id=case.prompt_id,
-                        expected_metrics=case.expected_metrics,
-                        found_metrics=[],
-                        missing_metrics=case.expected_metrics,
-                        extra_metrics=[],
-                        metric_recall=0.0,
-                        dashboard_url="",
-                        panel_count=0,
-                        latency_ms=elapsed,
-                        error="No dashboard created",
-                    ))
-                    print(f"  [{i:3d}/{total}] \u25cb {case.prompt_id}: "
-                          f"No dashboard ({elapsed:.0f}ms)")
+                    results.append(
+                        PipelineResult(
+                            prompt_id=case.prompt_id,
+                            expected_metrics=case.expected_metrics,
+                            found_metrics=[],
+                            missing_metrics=case.expected_metrics,
+                            extra_metrics=[],
+                            metric_recall=0.0,
+                            dashboard_url="",
+                            panel_count=0,
+                            latency_ms=elapsed,
+                            error="No dashboard created",
+                        )
+                    )
+                    print(f"  [{i:3d}/{total}] \u25cb {case.prompt_id}: " f"No dashboard ({elapsed:.0f}ms)")
                     continue
 
                 # Fetch dashboard JSON from Grafana to inspect panel queries
@@ -349,15 +431,11 @@ async def run_pipeline_validation(
                         panels = dash_json.get("dashboard", {}).get("panels", [])
                         for panel in panels:
                             for target in panel.get("targets", []):
-                                found_metrics.update(
-                                    extract_metrics_from_expr(target.get("expr", ""))
-                                )
+                                found_metrics.update(extract_metrics_from_expr(target.get("expr", "")))
                             # Panels nested inside row panels
                             for nested in panel.get("panels", []):
                                 for target in nested.get("targets", []):
-                                    found_metrics.update(
-                                        extract_metrics_from_expr(target.get("expr", ""))
-                                    )
+                                    found_metrics.update(extract_metrics_from_expr(target.get("expr", "")))
                 except Exception:
                     pass  # grafana fetch failure — metrics stay empty
 
@@ -372,8 +450,7 @@ async def run_pipeline_validation(
                 critical_matched = fuzzy_metric_match(critical_set, found_metrics) if critical_set else set()
                 critical_missing = sorted(critical_set - critical_matched) if critical_set else []
                 critical_recall = (
-                    len(critical_matched) / len(critical_set)
-                    if critical_set else recall  # fall back to overall recall
+                    len(critical_matched) / len(critical_set) if critical_set else recall  # fall back to overall recall
                 )
 
                 # Weighted recall: critical=1.0, supporting=0.4
@@ -392,23 +469,25 @@ async def run_pipeline_validation(
                 total_found = len(found_metrics)
                 snr = relevant_count / total_found if total_found > 0 else 0.0
 
-                results.append(PipelineResult(
-                    prompt_id=case.prompt_id,
-                    expected_metrics=case.expected_metrics,
-                    found_metrics=sorted(found_metrics),
-                    missing_metrics=missing,
-                    extra_metrics=extra,
-                    metric_recall=recall,
-                    dashboard_url=dashboard_url,
-                    panel_count=panel_count,
-                    latency_ms=elapsed,
-                    critical_metrics_expected=case.critical_metrics,
-                    critical_metrics_found=sorted(critical_matched),
-                    critical_metrics_missing=critical_missing,
-                    critical_recall=critical_recall,
-                    weighted_recall=weighted_recall,
-                    signal_to_noise=snr,
-                ))
+                results.append(
+                    PipelineResult(
+                        prompt_id=case.prompt_id,
+                        expected_metrics=case.expected_metrics,
+                        found_metrics=sorted(found_metrics),
+                        missing_metrics=missing,
+                        extra_metrics=extra,
+                        metric_recall=recall,
+                        dashboard_url=dashboard_url,
+                        panel_count=panel_count,
+                        latency_ms=elapsed,
+                        critical_metrics_expected=case.critical_metrics,
+                        critical_metrics_found=sorted(critical_matched),
+                        critical_metrics_missing=critical_missing,
+                        critical_recall=critical_recall,
+                        weighted_recall=weighted_recall,
+                        signal_to_noise=snr,
+                    )
+                )
 
                 if recall >= 0.5:
                     icon = "\u2713"
@@ -416,30 +495,35 @@ async def run_pipeline_validation(
                     icon = "\u25b3"
                 else:
                     icon = "\u2717"
-                print(f"  [{i:3d}/{total}] {icon} {case.prompt_id}: "
-                      f"recall={recall:.0%} found={len(matched)}/{len(expected_set)} "
-                      f"panels={panel_count} ({elapsed:.0f}ms)")
+                print(
+                    f"  [{i:3d}/{total}] {icon} {case.prompt_id}: "
+                    f"recall={recall:.0%} found={len(matched)}/{len(expected_set)} "
+                    f"panels={panel_count} ({elapsed:.0f}ms)"
+                )
 
             except Exception as e:
                 elapsed = (time.monotonic() - t0) * 1000
-                results.append(PipelineResult(
-                    prompt_id=case.prompt_id,
-                    expected_metrics=case.expected_metrics,
-                    found_metrics=[],
-                    missing_metrics=case.expected_metrics,
-                    extra_metrics=[],
-                    metric_recall=0.0,
-                    dashboard_url="",
-                    panel_count=0,
-                    latency_ms=elapsed,
-                    error=str(e),
-                ))
+                results.append(
+                    PipelineResult(
+                        prompt_id=case.prompt_id,
+                        expected_metrics=case.expected_metrics,
+                        found_metrics=[],
+                        missing_metrics=case.expected_metrics,
+                        extra_metrics=[],
+                        metric_recall=0.0,
+                        dashboard_url="",
+                        panel_count=0,
+                        latency_ms=elapsed,
+                        error=str(e),
+                    )
+                )
                 print(f"  [{i:3d}/{total}] \u2717 {case.prompt_id}: {e} ({elapsed:.0f}ms)")
 
     return results
 
 
 # ── Reporting ──────────────────────────────────────────────────────────────
+
 
 def print_archetype_report(
     results: list[ArchetypeResult],
@@ -452,9 +536,8 @@ def print_archetype_report(
     accuracy = passed / total if total else 0.0
     soft_accuracy = soft_passed / total if total else 0.0
     avg_latency = sum(r.latency_ms for r in results) / total if total else 0.0
-    avg_confidence = (
-        sum(r.top_confidence for r in results if r.top_confidence > 0)
-        / max(1, sum(1 for r in results if r.top_confidence > 0))
+    avg_confidence = sum(r.top_confidence for r in results if r.top_confidence > 0) / max(
+        1, sum(1 for r in results if r.top_confidence > 0)
     )
 
     print(f"\n{'=' * 72}")
@@ -470,15 +553,14 @@ def print_archetype_report(
     for r in results:
         by_archetype.setdefault(r.expected, []).append(r)
 
-    print(f"\n  Per-archetype breakdown (strict / soft):")
+    print("\n  Per-archetype breakdown (strict / soft):")
     for arch in sorted(by_archetype):
         arch_results = by_archetype[arch]
         arch_passed = sum(1 for r in arch_results if r.passed)
         arch_soft = sum(1 for r in arch_results if r.any_match)
         arch_total = len(arch_results)
         bar = _bar(arch_soft, arch_total, width=20)
-        print(f"    {arch:28s} {arch_passed:2d}/{arch_total:2d} strict  "
-              f"{arch_soft:2d}/{arch_total:2d} soft  {bar}")
+        print(f"    {arch:28s} {arch_passed:2d}/{arch_total:2d} strict  " f"{arch_soft:2d}/{arch_total:2d} soft  {bar}")
 
     # Per-difficulty breakdown
     case_map = {c.prompt_id: c for c in cases}
@@ -487,15 +569,14 @@ def print_archetype_report(
         diff = case_map.get(r.prompt_id, cases[0]).difficulty
         by_diff.setdefault(diff, []).append(r)
 
-    print(f"\n  Per-difficulty breakdown:")
+    print("\n  Per-difficulty breakdown:")
     for diff in ["easy", "medium", "hard"]:
         if diff in by_diff:
             d_results = by_diff[diff]
             d_passed = sum(1 for r in d_results if r.passed)
             d_soft = sum(1 for r in d_results if r.any_match)
             d_total = len(d_results)
-            print(f"    {diff:10s} {d_passed:2d}/{d_total:2d} strict  "
-                  f"{d_soft:2d}/{d_total:2d} soft")
+            print(f"    {diff:10s} {d_passed:2d}/{d_total:2d} strict  " f"{d_soft:2d}/{d_total:2d} soft")
 
     # Strict failures
     failures = [r for r in results if not r.passed]
@@ -536,7 +617,7 @@ def print_pipeline_report(
     print(f"{'=' * 72}")
 
     # ── Tier 1: Retrieval Accuracy ─────────────────────────────────────
-    print(f"\n  ── Tier 1: Retrieval Accuracy ──")
+    print("\n  ── Tier 1: Retrieval Accuracy ──")
     print(f"  Avg metric recall    : {avg_recall:.1%}")
     if has_critical:
         print(f"  Avg critical recall  : {avg_critical:.1%}")
@@ -548,7 +629,7 @@ def print_pipeline_report(
 
     # ── Tier 2: Operational Utility ────────────────────────────────────
     avg_panels = sum(r.panel_count for r in valid) / len(valid) if valid else 0.0
-    print(f"\n  ── Tier 2: Operational Utility ──")
+    print("\n  ── Tier 2: Operational Utility ──")
     print(f"  Total prompts        : {total}")
     print(f"  Succeeded            : {len(valid)}")
     print(f"  Errors               : {len(errored)}")
@@ -562,7 +643,7 @@ def print_pipeline_report(
         arch = case_map.get(r.prompt_id, cases[0]).expected_archetype
         by_archetype.setdefault(arch, []).append(r)
 
-    print(f"\n  Per-archetype breakdown:")
+    print("\n  Per-archetype breakdown:")
     header = f"    {'archetype':28s} {'recall':>7s}"
     if has_critical:
         header += f"  {'critical':>8s}  {'weighted':>8s}"
@@ -609,6 +690,7 @@ def _bar(filled: int, total: int, width: int = 20) -> str:
 
 # ── Human review ──────────────────────────────────────────────────────────
 
+
 def _prompt_rating(prompt_text: str, min_val: int = 1, max_val: int = 5) -> int | None:
     """Prompt reviewer for a rating. Returns None on skip (empty input)."""
     while True:
@@ -621,7 +703,7 @@ def _prompt_rating(prompt_text: str, min_val: int = 1, max_val: int = 5) -> int 
                 return val
             print(f"      Please enter {min_val}-{max_val}")
         except ValueError:
-            print(f"      Please enter a number or press Enter to skip")
+            print("      Please enter a number or press Enter to skip")
 
 
 def _prompt_bool(prompt_text: str) -> bool | None:
@@ -665,7 +747,7 @@ def collect_human_reviews(
         print(f"  Panels : {r.panel_count}  |  Recall: {r.metric_recall:.0%}  |  SNR: {r.signal_to_noise:.0%}")
         if r.missing_metrics:
             print(f"  Missing: {', '.join(r.missing_metrics[:5])}")
-        print(f"  → Open the dashboard in Grafana, then rate it:\n")
+        print("  → Open the dashboard in Grafana, then rate it:\n")
 
         try:
             symptom = _prompt_rating("Symptom visibility")
@@ -738,6 +820,7 @@ def print_review_report(reviews: list[dict]) -> None:
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
+
 async def main() -> None:
     parser = argparse.ArgumentParser(
         description="DashForge Validation Suite — test archetype and metric accuracy",
@@ -788,7 +871,7 @@ async def main() -> None:
     if args.limit > 0:
         cases = cases[: args.limit]
 
-    print(f"\nDashForge Validation Suite")
+    print("\nDashForge Validation Suite")
     print(f"Dataset  : {args.csv}")
     print(f"Prompts  : {len(cases)}")
     print(f"Mode     : {args.mode}")
@@ -798,7 +881,7 @@ async def main() -> None:
     # ── Archetype validation ────────────────────────────────────────────
     if args.mode in ("archetype", "all"):
         print(f"\n{'─' * 72}")
-        print(f"  Running archetype classification validation ...")
+        print("  Running archetype classification validation ...")
         print(f"{'─' * 72}")
         arch_results = await run_archetype_validation(cases)
         arch_accuracy = print_archetype_report(arch_results, cases)
@@ -810,12 +893,8 @@ async def main() -> None:
             "strict_passed": sum(1 for r in arch_results if r.passed),
             "soft_passed": soft_passed,
             "failed": sum(1 for r in arch_results if not r.passed),
-            "avg_latency_ms": round(
-                sum(r.latency_ms for r in arch_results) / len(arch_results), 1
-            ),
-            "avg_top_confidence": round(
-                sum(r.top_confidence for r in arch_results) / max(1, len(arch_results)), 3
-            ),
+            "avg_latency_ms": round(sum(r.latency_ms for r in arch_results) / len(arch_results), 1),
+            "avg_top_confidence": round(sum(r.top_confidence for r in arch_results) / max(1, len(arch_results)), 3),
             "details": [
                 {
                     "prompt_id": r.prompt_id,
@@ -834,30 +913,28 @@ async def main() -> None:
     # ── Pipeline validation ─────────────────────────────────────────────
     if args.mode in ("pipeline", "all"):
         print(f"\n{'─' * 72}")
-        print(f"  Running pipeline metric selection validation ...")
+        print("  Running pipeline metric selection validation ...")
         print(f"{'─' * 72}")
         pipe_results = await run_pipeline_validation(cases, args.api_url, args.grafana_url)
         pipe_recall = print_pipeline_report(pipe_results, cases)
         pipe_valid = [r for r in pipe_results if not r.error]
         output["pipeline"] = {
             "avg_metric_recall": round(pipe_recall, 4),
-            "avg_critical_recall": round(
-                sum(r.critical_recall for r in pipe_valid) / len(pipe_valid), 4
-            ) if pipe_valid else 0,
-            "avg_weighted_recall": round(
-                sum(r.weighted_recall for r in pipe_valid) / len(pipe_valid), 4
-            ) if pipe_valid else 0,
-            "avg_signal_to_noise": round(
-                sum(r.signal_to_noise for r in pipe_valid) / len(pipe_valid), 4
-            ) if pipe_valid else 0,
+            "avg_critical_recall": (
+                round(sum(r.critical_recall for r in pipe_valid) / len(pipe_valid), 4) if pipe_valid else 0
+            ),
+            "avg_weighted_recall": (
+                round(sum(r.weighted_recall for r in pipe_valid) / len(pipe_valid), 4) if pipe_valid else 0
+            ),
+            "avg_signal_to_noise": (
+                round(sum(r.signal_to_noise for r in pipe_valid) / len(pipe_valid), 4) if pipe_valid else 0
+            ),
             "total": len(pipe_results),
             "succeeded": len(pipe_valid),
             "errors": sum(1 for r in pipe_results if r.error),
-            "avg_latency_ms": round(
-                sum(r.latency_ms for r in pipe_results) / len(pipe_results), 1
-            )
-            if pipe_results
-            else 0,
+            "avg_latency_ms": (
+                round(sum(r.latency_ms for r in pipe_results) / len(pipe_results), 1) if pipe_results else 0
+            ),
             "details": [
                 {
                     "prompt_id": r.prompt_id,
@@ -904,8 +981,10 @@ async def main() -> None:
         print(f"  Avg confidence     : {a['avg_top_confidence']:.2f}")
     if "pipeline" in output:
         p = output["pipeline"]
-        print(f"  Metric recall      : {p['avg_metric_recall']:.1%}  "
-              f"({p['succeeded']} succeeded, {p['errors']} errors)")
+        print(
+            f"  Metric recall      : {p['avg_metric_recall']:.1%}  "
+            f"({p['succeeded']} succeeded, {p['errors']} errors)"
+        )
         if p.get("avg_critical_recall"):
             print(f"  Critical recall    : {p['avg_critical_recall']:.1%}")
             print(f"  Weighted recall    : {p['avg_weighted_recall']:.1%}")

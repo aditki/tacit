@@ -1,4 +1,5 @@
 """Abstract base for datasource adapters."""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod

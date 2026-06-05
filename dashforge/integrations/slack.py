@@ -1,4 +1,5 @@
 """Slack Bot integration using Slack Bolt (Socket Mode)."""
+
 from __future__ import annotations
 
 import re
@@ -35,11 +36,13 @@ def _build_action_buttons(response) -> list[dict]:
         }
     ]
     if response.signalfx_url:
-        buttons.append({
-            "type": "button",
-            "text": {"type": "plain_text", "text": "Open in SignalFx"},
-            "url": response.signalfx_url,
-        })
+        buttons.append(
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Open in SignalFx"},
+                "url": response.signalfx_url,
+            }
+        )
     return buttons
 
 

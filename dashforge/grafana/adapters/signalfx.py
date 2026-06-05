@@ -10,6 +10,7 @@ Grafana datasource proxy paths used:
   GET /api/datasources/proxy/uid/{uid}/v2/metrictimeseries?query=<filter>&limit=<n>
   GET /api/datasources/proxy/uid/{uid}/v2/metric/<name>
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -78,8 +79,7 @@ class SignalFxAdapter(DatasourceAdapter):
                 return data.get("results", [])
             return data if isinstance(data, list) else []
         except Exception:
-            logger.warning("signalfx_metric_search_failed",
-                           datasource=datasource.name, query=query)
+            logger.warning("signalfx_metric_search_failed", datasource=datasource.name, query=query)
             return []
 
     async def _get_metric_metadata(
@@ -120,9 +120,15 @@ class SignalFxAdapter(DatasourceAdapter):
 
             # Collect unique dimension keys and values across MTS
             dim_values: dict[str, set[str]] = {}
-            internal_keys = {"sf_metric", "sf_originatingMetric",
-                             "sf_key", "sf_type", "sf_isActive",
-                             "sf_createdOnMs", "sf_tags"}
+            internal_keys = {
+                "sf_metric",
+                "sf_originatingMetric",
+                "sf_key",
+                "sf_type",
+                "sf_isActive",
+                "sf_createdOnMs",
+                "sf_tags",
+            }
             for mts in results[:20]:
                 for k, v in mts.items():
                     if k.startswith("sf_") or k in internal_keys:
@@ -146,12 +152,10 @@ class SignalFxAdapter(DatasourceAdapter):
         keywords: list[str],
     ) -> dict[str, list[str]]:
         """Return {metric_name: [dim_strings]} from cache or live fetch."""
-        cache_key = make_cache_key("sfx_catalog", datasource.uid,
-                                    ",".join(sorted(keywords)))
+        cache_key = make_cache_key("sfx_catalog", datasource.uid, ",".join(sorted(keywords)))
         cached = metric_cache.get(cache_key)
         if cached is not None:
-            logger.info("signalfx_catalog_cache_hit", datasource=datasource.name,
-                        metrics=len(cached))
+            logger.info("signalfx_catalog_cache_hit", datasource=datasource.name, metrics=len(cached))
             return cached
 
         # Build search queries from keywords
@@ -187,23 +191,23 @@ class SignalFxAdapter(DatasourceAdapter):
 
         # Fetch dimensions for top metrics
         to_sample = metric_names[:50]
-        dim_tasks = [
-            self._search_dimensions(client, datasource, name)
-            for name in to_sample
-        ]
+        dim_tasks = [self._search_dimensions(client, datasource, name) for name in to_sample]
         dim_results = await asyncio.gather(*dim_tasks, return_exceptions=True)
 
         catalog: dict[str, list[str]] = {}
         for name in metric_names:
             catalog[name] = []
-        for name, result in zip(to_sample, dim_results):
-            if isinstance(result, list):
-                catalog[name] = result
+        for name, dim_result in zip(to_sample, dim_results):
+            if isinstance(dim_result, list):
+                catalog[name] = dim_result
 
         metric_cache.set(cache_key, catalog)
-        logger.info("signalfx_catalog_cached", datasource=datasource.name,
-                    total=len(catalog),
-                    sampled_dims=sum(1 for v in catalog.values() if v))
+        logger.info(
+            "signalfx_catalog_cached",
+            datasource=datasource.name,
+            total=len(catalog),
+            sampled_dims=sum(1 for v in catalog.values() if v),
+        )
         return catalog
 
     async def discover_metrics(

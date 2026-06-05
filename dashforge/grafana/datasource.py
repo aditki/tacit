@@ -15,10 +15,17 @@ logger = structlog.get_logger()
 # could carry the signal, not just the obvious ones).
 SIGNAL_TYPE_MAP: dict[str, set[str]] = {
     "metrics": {
-        "prometheus", "mimir", "cortex", "thanos",
-        "cloudwatch", "graphite", "influxdb",
-        "elasticsearch", "opensearch",
-        "grafana-signalfx-datasource", "signalfx",
+        "prometheus",
+        "mimir",
+        "cortex",
+        "thanos",
+        "cloudwatch",
+        "graphite",
+        "influxdb",
+        "elasticsearch",
+        "opensearch",
+        "grafana-signalfx-datasource",
+        "signalfx",
     },
     "logs": {"loki", "elasticsearch", "opensearch"},
     "traces": {"tempo", "jaeger", "zipkin"},
@@ -87,7 +94,7 @@ async def discover_all_metrics(
                     adapter.discover_metrics(client, ds, keywords),
                     timeout=timeout,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("adapter_timeout", datasource=ds.name, type=ds.type, timeout=timeout)
                 return []
             except Exception:

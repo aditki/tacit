@@ -5,13 +5,13 @@ When a context provider is configured, it queries the company's knowledge
 base and returns relevant context chunks.  When not configured, it's a
 no-op — the pipeline works exactly as before.
 """
+
 from __future__ import annotations
 
 import asyncio
 
 import structlog
 
-from dashforge.config import settings
 from dashforge.context.registry import get_context_provider
 from dashforge.models.schemas import ContextChunk, Intent
 
@@ -56,7 +56,7 @@ async def enrich_context(
         )
         return chunks
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("context_enrichment_timeout", provider=provider.name, timeout=CONTEXT_TIMEOUT)
         return []
 

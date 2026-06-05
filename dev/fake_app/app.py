@@ -3,15 +3,15 @@
 Simulates a checkout-service, payment-api, and inventory-db with realistic
 Prometheus metrics: request rates, error rates, latencies, resource usage.
 """
+
 import random
 import time
-import threading
+
 from prometheus_client import (
     Counter,
     Gauge,
     Histogram,
     start_http_server,
-    REGISTRY,
 )
 
 # ── Checkout Service ─────────────────────────────────────────────────────────
@@ -108,9 +108,7 @@ def simulate_traffic():
             for i in range(2):  # 2 replicas per service
                 pod = f"{svc}-{i}"
                 ns = "production"
-                container_cpu.labels(pod=pod, namespace=ns, container=svc).set(
-                    cpu_base + random.uniform(-0.02, 0.1)
-                )
+                container_cpu.labels(pod=pod, namespace=ns, container=svc).set(cpu_base + random.uniform(-0.02, 0.1))
                 container_memory.labels(pod=pod, namespace=ns, container=svc).set(
                     mem_base + random.uniform(-10e6, 30e6)
                 )
@@ -124,12 +122,12 @@ def simulate_traffic():
         db_connections_active.labels(service="inventory-db", database="inventory_db").set(random.randint(3, 20))
 
         for op in ["SELECT", "INSERT", "UPDATE"]:
-            db_query_duration.labels(
-                service="checkout-service", database="orders_db", operation=op
-            ).observe(random.uniform(0.001, 0.05))
-            db_query_duration.labels(
-                service="inventory-db", database="inventory_db", operation=op
-            ).observe(random.uniform(0.002, 0.1))
+            db_query_duration.labels(service="checkout-service", database="orders_db", operation=op).observe(
+                random.uniform(0.001, 0.05)
+            )
+            db_query_duration.labels(service="inventory-db", database="inventory_db", operation=op).observe(
+                random.uniform(0.002, 0.1)
+            )
 
         time.sleep(1)  # tick every second
 

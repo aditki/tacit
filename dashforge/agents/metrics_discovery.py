@@ -1,4 +1,5 @@
 """Metrics Discovery Agent — finds the most relevant metrics across ALL datasources."""
+
 from __future__ import annotations
 
 import structlog
@@ -111,10 +112,7 @@ def _build_user_prompt(
     for ds_label, entries in by_ds.items():
         capped = entries[:MAX_ENTRIES_PER_DS]
         first = capped[0]
-        parts.append(
-            f"### {ds_label}  [uid={first.datasource_uid}, "
-            f"query_language={first.query_language}]"
-        )
+        parts.append(f"### {ds_label}  [uid={first.datasource_uid}, " f"query_language={first.query_language}]")
         parts.append(f"Metrics: {len(capped)} (of {len(entries)} total)")
         for e in capped:
             ns_part = f"  ns={e.namespace}" if e.namespace else ""

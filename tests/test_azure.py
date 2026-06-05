@@ -3,6 +3,7 @@
 Covers:
 - AzureOpenAIProvider: api_base required, deployment resolution
 """
+
 import os
 import sys
 from unittest.mock import patch
@@ -20,6 +21,7 @@ def test_azure_provider_requires_api_base():
 
         try:
             from dashforge.agents.providers.openai_provider import AzureOpenAIProvider
+
             AzureOpenAIProvider()
             assert False, "Should have raised ValueError"
         except ValueError as exc:
@@ -30,8 +32,10 @@ def test_azure_provider_requires_api_base():
 
 def test_azure_deployment_fallback_to_model():
     """When llm_azure_deployment is empty, should use llm_model."""
-    with patch("dashforge.agents.providers.openai_provider.settings") as mock_settings, \
-         patch("dashforge.agents.providers.openai_provider.openai") as mock_openai:
+    with (
+        patch("dashforge.agents.providers.openai_provider.settings") as mock_settings,
+        patch("dashforge.agents.providers.openai_provider.openai"),
+    ):
         mock_settings.llm_api_base = "https://test.openai.azure.com"
         mock_settings.llm_api_key = "test-key"
         mock_settings.llm_azure_deployment = ""
@@ -39,6 +43,7 @@ def test_azure_deployment_fallback_to_model():
         mock_settings.llm_azure_api_version = "2024-06-01"
 
         from dashforge.agents.providers.openai_provider import AzureOpenAIProvider
+
         provider = AzureOpenAIProvider()
         assert provider._deployment == "gpt-4o"
 
@@ -47,8 +52,10 @@ def test_azure_deployment_fallback_to_model():
 
 def test_azure_deployment_explicit():
     """When llm_azure_deployment is set, should use it over llm_model."""
-    with patch("dashforge.agents.providers.openai_provider.settings") as mock_settings, \
-         patch("dashforge.agents.providers.openai_provider.openai") as mock_openai:
+    with (
+        patch("dashforge.agents.providers.openai_provider.settings") as mock_settings,
+        patch("dashforge.agents.providers.openai_provider.openai"),
+    ):
         mock_settings.llm_api_base = "https://test.openai.azure.com"
         mock_settings.llm_api_key = "test-key"
         mock_settings.llm_azure_deployment = "my-custom-deployment"
@@ -56,6 +63,7 @@ def test_azure_deployment_explicit():
         mock_settings.llm_azure_api_version = "2024-06-01"
 
         from dashforge.agents.providers.openai_provider import AzureOpenAIProvider
+
         provider = AzureOpenAIProvider()
         assert provider._deployment == "my-custom-deployment"
 
@@ -75,6 +83,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[FAIL] {test_fn.__name__}: {e}")
             import traceback
+
             traceback.print_exc()
             failed += 1
 

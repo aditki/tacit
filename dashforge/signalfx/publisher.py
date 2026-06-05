@@ -7,6 +7,7 @@ SignalFx dashboard model:
 
 Flow: DashboardSpec → create charts → create dashboard → link charts → return URL
 """
+
 from __future__ import annotations
 
 import re
@@ -66,7 +67,7 @@ _TIMERANGE_MS = {
 # Regex to parse PromQL label matchers: {key="val", key=~"regex", ...}
 _LABEL_RE = re.compile(r'(\w+)\s*(=~|!=|=)\s*"([^"]*?)"')
 # Regex to detect PromQL patterns (curly-brace selectors, rate(), sum(), etc.)
-_PROMQL_INDICATORS = re.compile(r'\b(rate|sum|increase|histogram_quantile|count|avg|topk|bottomk)\s*\(')
+_PROMQL_INDICATORS = re.compile(r"\b(rate|sum|increase|histogram_quantile|count|avg|topk|bottomk)\s*\(")
 
 
 def _is_promql(expr: str) -> bool:
@@ -77,7 +78,7 @@ def _is_promql(expr: str) -> bool:
     if _PROMQL_INDICATORS.search(expr):
         return True
     # Bare metric with label selectors: metric_name{key="val"}
-    if re.search(r'\w+\{.*?\}', expr) and "filter(" not in expr:
+    if re.search(r"\w+\{.*?\}", expr) and "filter(" not in expr:
         return True
     return False
 
@@ -121,8 +122,8 @@ def _promql_to_signalflow(expr: str, label: str = "A") -> str:
 
     # ── histogram_quantile → percentile ──
     hq_match = re.match(
-        r'histogram_quantile\(([\d.]+),\s*sum\(rate\((\w+?)_bucket\{(.*?)\}\[(\w+)\]\)\)\s*by\s*\(le(?:,\s*(\w+))?\)\)',
-        expr
+        r"histogram_quantile\(([\d.]+),\s*sum\(rate\((\w+?)_bucket\{(.*?)\}\[(\w+)\]\)\)\s*by\s*\(le(?:,\s*(\w+))?\)\)",
+        expr,
     )
     if hq_match:
         pct = int(float(hq_match.group(1)) * 100)
@@ -140,7 +141,7 @@ def _promql_to_signalflow(expr: str, label: str = "A") -> str:
         return f"{chain}.publish(label='{label}')"
 
     # ── topk → top ──
-    topk_match = re.match(r'topk\((\d+),\s*(.+)\)$', expr, re.DOTALL)
+    topk_match = re.match(r"topk\((\d+),\s*(.+)\)$", expr, re.DOTALL)
     if topk_match:
         k = topk_match.group(1)
         inner = _promql_to_signalflow(topk_match.group(2), label)
@@ -150,8 +151,7 @@ def _promql_to_signalflow(expr: str, label: str = "A") -> str:
 
     # ── sum/avg/count/min/max wrapping rate/increase ──
     agg_rate_match = re.match(
-        r'(sum|avg|count|min|max)\((rate|increase)\((\w+)\{(.*?)\}\[(\w+)\]\)\)(?:\s*by\s*\(([^)]+)\))?',
-        expr
+        r"(sum|avg|count|min|max)\((rate|increase)\((\w+)\{(.*?)\}\[(\w+)\]\)\)(?:\s*by\s*\(([^)]+)\))?", expr
     )
     if agg_rate_match:
         agg = agg_rate_match.group(1)
@@ -177,8 +177,7 @@ def _promql_to_signalflow(expr: str, label: str = "A") -> str:
 
     # ── sum/avg of two aggregated expressions (ratio) ──
     ratio_match = re.match(
-        r'(sum|avg)\(rate\((\w+)\{(.*?)\}\[(\w+)\]\)\)\s*/\s*(sum|avg)\(rate\((\w+)\{(.*?)\}\[(\w+)\]\)\)',
-        expr
+        r"(sum|avg)\(rate\((\w+)\{(.*?)\}\[(\w+)\]\)\)\s*/\s*(sum|avg)\(rate\((\w+)\{(.*?)\}\[(\w+)\]\)\)", expr
     )
     if ratio_match:
         m1 = ratio_match.group(2)
@@ -198,7 +197,7 @@ def _promql_to_signalflow(expr: str, label: str = "A") -> str:
         return f"({num} / {den}).publish(label='{label}')"
 
     # ── bare rate/increase ──
-    rate_match = re.match(r'(rate|increase)\((\w+)\{(.*?)\}\[(\w+)\]\)', expr)
+    rate_match = re.match(r"(rate|increase)\((\w+)\{(.*?)\}\[(\w+)\]\)", expr)
     if rate_match:
         func = rate_match.group(1)
         metric = rate_match.group(2)
@@ -212,7 +211,7 @@ def _promql_to_signalflow(expr: str, label: str = "A") -> str:
         return f"{base}.publish(label='{label}')"
 
     # ── simple metric{labels} ──
-    simple_match = re.match(r'(\w+)\{(.*?)\}$', expr)
+    simple_match = re.match(r"(\w+)\{(.*?)\}$", expr)
     if simple_match:
         metric = simple_match.group(1)
         labels = _parse_labels(simple_match.group(2))
@@ -224,7 +223,7 @@ def _promql_to_signalflow(expr: str, label: str = "A") -> str:
         return f"{base}.publish(label='{label}')"
 
     # ── bare metric name ──
-    bare_match = re.match(r'^(\w+)$', expr)
+    bare_match = re.match(r"^(\w+)$", expr)
     if bare_match:
         return f"data('{bare_match.group(1)}').publish(label='{label}')"
 
@@ -282,10 +281,12 @@ def _build_chart_json(panel: PanelSpec) -> dict[str, Any]:
         color_scale = []
         for t in panel.thresholds:
             if "value" in t:
-                color_scale.append({
-                    "gt": t["value"],
-                    "color": t.get("color", ""),
-                })
+                color_scale.append(
+                    {
+                        "gt": t["value"],
+                        "color": t.get("color", ""),
+                    }
+                )
         if color_scale:
             chart["options"]["colorScale2"] = color_scale
 
@@ -321,13 +322,15 @@ def _build_dashboard_json(
             col = 0
             for _ in row_panels:
                 if chart_idx < len(chart_ids):
-                    charts.append({
-                        "chartId": chart_ids[chart_idx],
-                        "column": col,
-                        "row": row,
-                        "height": chart_height,
-                        "width": chart_width,
-                    })
+                    charts.append(
+                        {
+                            "chartId": chart_ids[chart_idx],
+                            "column": col,
+                            "row": row,
+                            "height": chart_height,
+                            "width": chart_width,
+                        }
+                    )
                     chart_idx += 1
                     col += chart_width
                     if col >= 12:
@@ -338,19 +341,19 @@ def _build_dashboard_json(
                 col = 0
     else:
         for idx, chart_id in enumerate(chart_ids):
-            charts.append({
-                "chartId": chart_id,
-                "column": col,
-                "row": row,
-                "height": chart_height,
-                "width": chart_width,
-            })
+            charts.append(
+                {
+                    "chartId": chart_id,
+                    "column": col,
+                    "row": row,
+                    "height": chart_height,
+                    "width": chart_width,
+                }
+            )
             col += chart_width
             if col >= 12:
                 col = 0
                 row += chart_height
-
-    time_ms = _TIMERANGE_MS.get(spec.timerange, 3_600_000)
 
     dashboard: dict[str, Any] = {
         "name": spec.title,
@@ -380,7 +383,7 @@ async def publish_dashboard(
     Creates charts, then a dashboard linking them.
     Returns (dashboard_url, dashboard_id).
     """
-    group_name = group_name or getattr(settings, "signalfx_dashboard_group", "DashForge")
+    group_name = group_name or str(getattr(settings, "signalfx_dashboard_group", "DashForge"))
 
     # 1. Get or create dashboard group
     group = await client.get_or_create_dashboard_group(group_name)

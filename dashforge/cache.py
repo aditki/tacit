@@ -3,6 +3,7 @@
 Eliminates redundant datasource API calls and LLM invocations.
 In production, swap for Redis/Memcached via the same interface.
 """
+
 from __future__ import annotations
 
 import hashlib

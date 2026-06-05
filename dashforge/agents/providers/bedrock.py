@@ -7,9 +7,8 @@ Supports three authentication strategies (resolved in order):
 
 Requires `boto3` to be installed (optional dependency).
 """
-from __future__ import annotations
 
-import json
+from __future__ import annotations
 
 import structlog
 
@@ -39,17 +38,30 @@ _BEDROCK_DEFAULT_MODEL = "anthropic.claude-sonnet-4-20250514-v1:0"
 # it's already a valid Bedrock model ID and should be used as-is.
 # Includes regional/global inference profile prefixes (us., eu., ap., etc.).
 _BEDROCK_PROVIDER_PREFIXES = (
-    "anthropic.", "meta.", "mistral.", "amazon.", "cohere.",
-    "ai21.", "stability.",
+    "anthropic.",
+    "meta.",
+    "mistral.",
+    "amazon.",
+    "cohere.",
+    "ai21.",
+    "stability.",
     # Regional and cross-region inference profile prefixes
-    "us.", "eu.", "ap.", "sa.", "me.", "ca.", "af.", "global.",
+    "us.",
+    "eu.",
+    "ap.",
+    "sa.",
+    "me.",
+    "ca.",
+    "af.",
+    "global.",
 )
 
 # Map AWS region prefix to inference profile prefix.
 # Only us. and eu. have documented geo-specific inference profiles;
 # all other regions (ap, sa, me, ca, af) use the global. profile.
 _REGION_INFERENCE_PREFIX: dict[str, str] = {
-    "us": "us", "eu": "eu",
+    "us": "us",
+    "eu": "eu",
 }
 
 # Prefixes that indicate a model ID is already an inference profile
@@ -72,6 +84,7 @@ def _inference_profile_id(bare_model_id: str, region: str) -> str:
     prefix = _REGION_INFERENCE_PREFIX.get(region_prefix, "global")
     return f"{prefix}.{bare_model_id}"
 
+
 # Cache for resolved model IDs — avoids repeated ListFoundationModels calls
 _resolve_cache: dict[str, str] = {}
 
@@ -88,8 +101,9 @@ def _resolve_bedrock_model_id(anthropic_model_name: str, bedrock_client) -> str:
     """
     # Already a valid Bedrock model ID — pass through
     if anthropic_model_name.startswith(_BEDROCK_PROVIDER_PREFIXES):
-        logger.info("bedrock_model_resolved", source="passthrough",
-                    input=anthropic_model_name, resolved=anthropic_model_name)
+        logger.info(
+            "bedrock_model_resolved", source="passthrough", input=anthropic_model_name, resolved=anthropic_model_name
+        )
         return anthropic_model_name
 
     if anthropic_model_name in _resolve_cache:
@@ -102,8 +116,7 @@ def _resolve_bedrock_model_id(anthropic_model_name: str, bedrock_client) -> str:
             model_id = model.get("modelId", "")
             if anthropic_model_name in model_id:
                 _resolve_cache[anthropic_model_name] = model_id
-                logger.info("bedrock_model_resolved", source="api",
-                            input=anthropic_model_name, resolved=model_id)
+                logger.info("bedrock_model_resolved", source="api", input=anthropic_model_name, resolved=model_id)
                 return model_id
     except Exception as exc:
         logger.debug("bedrock_list_models_failed", error=str(exc))
@@ -113,8 +126,7 @@ def _resolve_bedrock_model_id(anthropic_model_name: str, bedrock_client) -> str:
     # with an inference profile prefix if invocation fails.
     resolved = _ANTHROPIC_TO_BEDROCK.get(anthropic_model_name, _BEDROCK_DEFAULT_MODEL)
     _resolve_cache[anthropic_model_name] = resolved
-    logger.info("bedrock_model_resolved", source="static_map",
-                input=anthropic_model_name, resolved=resolved)
+    logger.info("bedrock_model_resolved", source="static_map", input=anthropic_model_name, resolved=resolved)
     return resolved
 
 
@@ -123,10 +135,7 @@ def _build_boto3_session():
     try:
         import boto3
     except ImportError as exc:
-        raise ImportError(
-            "AWS Bedrock provider requires boto3. "
-            "Install it with: pip install boto3"
-        ) from exc
+        raise ImportError("AWS Bedrock provider requires boto3. " "Install it with: pip install boto3") from exc
 
     session_kwargs: dict = {
         "region_name": settings.llm_bedrock_region,
@@ -147,8 +156,8 @@ def _build_boto3_session():
     # Uses botocore RefreshableCredentials so the singleton provider
     # doesn't expire after DurationSeconds in long-running processes.
     if settings.llm_bedrock_role_arn:
-        from botocore.credentials import RefreshableCredentials
         import botocore.session
+        from botocore.credentials import RefreshableCredentials
 
         sts = session.client("sts")
 
@@ -177,8 +186,7 @@ def _build_boto3_session():
         botocore_sess.set_config_variable("region", settings.llm_bedrock_region)
         session = boto3.Session(botocore_session=botocore_sess)
 
-        logger.info("bedrock_auth", method="assume_role_refreshable",
-                     role_arn=settings.llm_bedrock_role_arn)
+        logger.info("bedrock_auth", method="assume_role_refreshable", role_arn=settings.llm_bedrock_role_arn)
 
     return session
 
@@ -200,9 +208,7 @@ class BedrockProvider(LLMProvider):
             # Returns a bare foundation model ID; _converse() auto-retries
             # with an inference profile prefix if on-demand invocation fails.
             bedrock_ctrl = session.client("bedrock")
-            self._model_id = _resolve_bedrock_model_id(
-                settings.llm_model, bedrock_ctrl
-            )
+            self._model_id = _resolve_bedrock_model_id(settings.llm_model, bedrock_ctrl)
         logger.info(
             "bedrock_init",
             model_id=self._model_id,
@@ -272,8 +278,7 @@ class BedrockProvider(LLMProvider):
                 raise
             # Retry with inference profile
             profile_id = _inference_profile_id(self._model_id, settings.llm_bedrock_region)
-            logger.warning("bedrock_model_retry_with_profile",
-                          bare=self._model_id, profile=profile_id)
+            logger.warning("bedrock_model_retry_with_profile", bare=self._model_id, profile=profile_id)
             kwargs["modelId"] = profile_id
             response = self._client.converse(**kwargs)
             # Success — cache the working profile ID for future calls
@@ -305,13 +310,8 @@ class BedrockProvider(LLMProvider):
     ) -> LLMResult:
         import asyncio
 
-        system = (
-            f"{system_prompt}\n\n"
-            "Respond ONLY with a valid JSON object. No markdown, no explanation."
-        )
-        result = await asyncio.to_thread(
-            self._converse, system, user_prompt, temperature
-        )
+        system = f"{system_prompt}\n\n" "Respond ONLY with a valid JSON object. No markdown, no explanation."
+        result = await asyncio.to_thread(self._converse, system, user_prompt, temperature)
         logger.debug("bedrock_raw", raw=result.text[:500])
         return result
 
@@ -323,6 +323,4 @@ class BedrockProvider(LLMProvider):
     ) -> LLMResult:
         import asyncio
 
-        return await asyncio.to_thread(
-            self._converse, system_prompt, user_prompt, temperature
-        )
+        return await asyncio.to_thread(self._converse, system_prompt, user_prompt, temperature)

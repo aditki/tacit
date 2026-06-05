@@ -10,15 +10,18 @@ Covers:
 - Transient error retry: ThrottlingException, service-specific exceptions
 - pyproject.toml: bedrock optional extra, boto3 minimum version
 """
+
 import asyncio
 import os
 import sys
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 # ── Helper ─────────────────────────────────────────────────────────────────
+
 
 def _make_bedrock_provider(mock_client, mock_settings_overrides=None):
     """Helper to construct a BedrockProvider with a mocked client."""
@@ -27,8 +30,10 @@ def _make_bedrock_provider(mock_client, mock_settings_overrides=None):
     mock_session.client.return_value = mock_client
     mock_boto3.Session.return_value = mock_session
 
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), \
-         patch("dashforge.agents.providers.bedrock.settings") as mock_settings:
+    with (
+        patch.dict("sys.modules", {"boto3": mock_boto3}),
+        patch("dashforge.agents.providers.bedrock.settings") as mock_settings,
+    ):
         mock_settings.llm_bedrock_region = "us-east-1"
         mock_settings.llm_aws_access_key_id = ""
         mock_settings.llm_aws_secret_access_key = ""
@@ -39,10 +44,12 @@ def _make_bedrock_provider(mock_client, mock_settings_overrides=None):
             for k, v in mock_settings_overrides.items():
                 setattr(mock_settings, k, v)
         from dashforge.agents.providers.bedrock import BedrockProvider
+
         return BedrockProvider(), mock_settings
 
 
 # ── _build_boto3_session tests ─────────────────────────────────────────────
+
 
 def test_bedrock_session_explicit_keys():
     """Strategy 1: explicit access key + secret should be passed to Session."""
@@ -50,14 +57,17 @@ def test_bedrock_session_explicit_keys():
     mock_session = MagicMock()
     mock_boto3.Session.return_value = mock_session
 
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), \
-         patch("dashforge.agents.providers.bedrock.settings") as mock_settings:
+    with (
+        patch.dict("sys.modules", {"boto3": mock_boto3}),
+        patch("dashforge.agents.providers.bedrock.settings") as mock_settings,
+    ):
         mock_settings.llm_bedrock_region = "us-west-2"
         mock_settings.llm_aws_access_key_id = "AKIAIOSFODNN7EXAMPLE"
         mock_settings.llm_aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
         mock_settings.llm_bedrock_role_arn = ""
 
         from dashforge.agents.providers.bedrock import _build_boto3_session
+
         session = _build_boto3_session()
 
         mock_boto3.Session.assert_called_once_with(
@@ -76,14 +86,17 @@ def test_bedrock_session_default_chain():
     mock_session = MagicMock()
     mock_boto3.Session.return_value = mock_session
 
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), \
-         patch("dashforge.agents.providers.bedrock.settings") as mock_settings:
+    with (
+        patch.dict("sys.modules", {"boto3": mock_boto3}),
+        patch("dashforge.agents.providers.bedrock.settings") as mock_settings,
+    ):
         mock_settings.llm_bedrock_region = "eu-west-1"
         mock_settings.llm_aws_access_key_id = ""
         mock_settings.llm_aws_secret_access_key = ""
         mock_settings.llm_bedrock_role_arn = ""
 
         from dashforge.agents.providers.bedrock import _build_boto3_session
+
         session = _build_boto3_session()
 
         mock_boto3.Session.assert_called_once_with(region_name="eu-west-1")
@@ -99,8 +112,9 @@ def test_bedrock_session_assume_role():
     refreshed_session = MagicMock()
 
     mock_sts_client = MagicMock()
-    from datetime import datetime, timezone, timedelta
-    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    from datetime import datetime, timedelta
+
+    future = datetime.now(UTC) + timedelta(hours=1)
     mock_sts_client.assume_role.return_value = {
         "Credentials": {
             "AccessKeyId": "ASIAEXAMPLE",
@@ -120,20 +134,26 @@ def test_bedrock_session_assume_role():
     mock_botocore_sess_mod = MagicMock()
     mock_botocore_sess_mod.get_session.return_value = mock_botocore_session
 
-    with patch.dict("sys.modules", {
-             "boto3": mock_boto3,
-             "botocore": MagicMock(),
-             "botocore.credentials": mock_botocore_creds_mod,
-             "botocore.session": mock_botocore_sess_mod,
-         }), \
-         patch("dashforge.agents.providers.bedrock.settings") as mock_settings:
+    with (
+        patch.dict(
+            "sys.modules",
+            {
+                "boto3": mock_boto3,
+                "botocore": MagicMock(),
+                "botocore.credentials": mock_botocore_creds_mod,
+                "botocore.session": mock_botocore_sess_mod,
+            },
+        ),
+        patch("dashforge.agents.providers.bedrock.settings") as mock_settings,
+    ):
         mock_settings.llm_bedrock_region = "us-east-1"
         mock_settings.llm_aws_access_key_id = ""
         mock_settings.llm_aws_secret_access_key = ""
         mock_settings.llm_bedrock_role_arn = "arn:aws:iam::123456789012:role/TestRole"
 
         from dashforge.agents.providers.bedrock import _build_boto3_session
-        session = _build_boto3_session()
+
+        _build_boto3_session()
 
         mock_sts_client.assume_role.assert_called_once_with(
             RoleArn="arn:aws:iam::123456789012:role/TestRole",
@@ -179,8 +199,9 @@ def test_bedrock_assume_role_uses_refreshable_credentials():
     refreshed_session = MagicMock()
 
     mock_sts = MagicMock()
-    from datetime import datetime, timezone, timedelta
-    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    from datetime import datetime, timedelta
+
+    future = datetime.now(UTC) + timedelta(hours=1)
     mock_sts.assume_role.return_value = {
         "Credentials": {
             "AccessKeyId": "ASIAEXAMPLE",
@@ -199,20 +220,26 @@ def test_bedrock_assume_role_uses_refreshable_credentials():
     mock_botocore_sess_mod = MagicMock()
     mock_botocore_sess_mod.get_session.return_value = mock_botocore_session
 
-    with patch.dict("sys.modules", {
-             "boto3": mock_boto3,
-             "botocore": MagicMock(),
-             "botocore.credentials": mock_botocore_creds_mod,
-             "botocore.session": mock_botocore_sess_mod,
-         }), \
-         patch("dashforge.agents.providers.bedrock.settings") as mock_settings:
+    with (
+        patch.dict(
+            "sys.modules",
+            {
+                "boto3": mock_boto3,
+                "botocore": MagicMock(),
+                "botocore.credentials": mock_botocore_creds_mod,
+                "botocore.session": mock_botocore_sess_mod,
+            },
+        ),
+        patch("dashforge.agents.providers.bedrock.settings") as mock_settings,
+    ):
         mock_settings.llm_bedrock_region = "us-east-1"
         mock_settings.llm_aws_access_key_id = ""
         mock_settings.llm_aws_secret_access_key = ""
         mock_settings.llm_bedrock_role_arn = "arn:aws:iam::123456789012:role/TestRole"
 
         from dashforge.agents.providers.bedrock import _build_boto3_session
-        session = _build_boto3_session()
+
+        _build_boto3_session()
 
         rc_cls = mock_botocore_creds_mod.RefreshableCredentials
         rc_cls.create_from_metadata.assert_called_once()
@@ -230,16 +257,11 @@ def test_bedrock_assume_role_uses_refreshable_credentials():
 
 # ── BedrockProvider._converse tests ────────────────────────────────────────
 
+
 def test_bedrock_converse_call_structure():
     """_converse should call client.converse with correct Bedrock API shape."""
     mock_client = MagicMock()
-    mock_client.converse.return_value = {
-        "output": {
-            "message": {
-                "content": [{"text": '{"result": "ok"}'}]
-            }
-        }
-    }
+    mock_client.converse.return_value = {"output": {"message": {"content": [{"text": '{"result": "ok"}'}]}}}
 
     provider, _ = _make_bedrock_provider(
         mock_client,
@@ -252,9 +274,7 @@ def test_bedrock_converse_call_structure():
     call_kwargs = mock_client.converse.call_args[1]
     assert call_kwargs["modelId"] == "anthropic.claude-sonnet-4-20250514-v1:0"
     assert call_kwargs["system"] == [{"text": "system text"}]
-    assert call_kwargs["messages"] == [
-        {"role": "user", "content": [{"text": "user text"}]}
-    ]
+    assert call_kwargs["messages"] == [{"role": "user", "content": [{"text": "user text"}]}]
     assert call_kwargs["inferenceConfig"]["temperature"] == 0.2
     assert call_kwargs["inferenceConfig"]["maxTokens"] == 4096
     assert result.text == '{"result": "ok"}'
@@ -277,7 +297,8 @@ def test_bedrock_converse_multiple_content_blocks():
     }
 
     provider, _ = _make_bedrock_provider(
-        mock_client, {"llm_bedrock_model_id": "test-model"},
+        mock_client,
+        {"llm_bedrock_model_id": "test-model"},
     )
     result = provider._converse("sys", "user", 0.5)
     assert result.text == "part1part2"
@@ -291,7 +312,8 @@ def test_bedrock_converse_empty_response():
     mock_client.converse.return_value = {"output": {"message": {"content": []}}}
 
     provider, _ = _make_bedrock_provider(
-        mock_client, {"llm_bedrock_model_id": "test-model"},
+        mock_client,
+        {"llm_bedrock_model_id": "test-model"},
     )
     result = provider._converse("sys", "user", 0.5)
     assert result.text == ""
@@ -301,20 +323,21 @@ def test_bedrock_converse_empty_response():
 
 # ── Model ID resolution ───────────────────────────────────────────────────
 
+
 def test_bedrock_model_id_fallback():
     """When llm_bedrock_model_id is empty and llm_model is not a known Anthropic
     API name, should fall back to the bare Bedrock default model.
     _converse() handles inference-profile retry at invocation time."""
     mock_client = MagicMock()
-    mock_client.converse.return_value = {
-        "output": {"message": {"content": [{"text": "{}"}]}}
-    }
+    mock_client.converse.return_value = {"output": {"message": {"content": [{"text": "{}"}]}}}
 
     provider, _ = _make_bedrock_provider(
-        mock_client, {"llm_model": "unknown-model-id"},
+        mock_client,
+        {"llm_model": "unknown-model-id"},
     )
 
     from dashforge.agents.providers.bedrock import _BEDROCK_DEFAULT_MODEL
+
     assert provider._model_id == _BEDROCK_DEFAULT_MODEL
 
     print("[PASS] test_bedrock_model_id_fallback")
@@ -324,16 +347,14 @@ def test_bedrock_model_id_fallback_uses_bedrock_default():
     """When llm_model is the Anthropic API default, should resolve to a
     valid Bedrock model ID, not the bare Anthropic API name."""
     mock_client = MagicMock()
-    mock_client.converse.return_value = {
-        "output": {"message": {"content": [{"text": "{}"}]}}
-    }
+    mock_client.converse.return_value = {"output": {"message": {"content": [{"text": "{}"}]}}}
 
     provider, _ = _make_bedrock_provider(mock_client)
 
-    assert provider._model_id != "claude-sonnet-4-20250514", \
-        f"Model ID should be a Bedrock ID, not Anthropic API name: {provider._model_id}"
-    assert "anthropic." in provider._model_id, \
-        f"Expected Bedrock model ID format, got: {provider._model_id}"
+    assert (
+        provider._model_id != "claude-sonnet-4-20250514"
+    ), f"Model ID should be a Bedrock ID, not Anthropic API name: {provider._model_id}"
+    assert "anthropic." in provider._model_id, f"Expected Bedrock model ID format, got: {provider._model_id}"
 
     print("[PASS] test_bedrock_model_id_fallback_uses_bedrock_default")
 
@@ -341,6 +362,7 @@ def test_bedrock_model_id_fallback_uses_bedrock_default():
 def test_bedrock_resolve_model_id_uses_list_foundation_models():
     """_resolve_bedrock_model_id should call ListFoundationModels API."""
     from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
+
     _resolve_cache.clear()
 
     mock_bedrock_client = MagicMock()
@@ -363,8 +385,11 @@ def test_bedrock_resolve_model_id_uses_list_foundation_models():
 def test_bedrock_resolve_model_id_api_failure_falls_back_to_static_map():
     """When ListFoundationModels fails, should fall back to bare static map entry."""
     from dashforge.agents.providers.bedrock import (
-        _resolve_bedrock_model_id, _ANTHROPIC_TO_BEDROCK, _resolve_cache,
+        _ANTHROPIC_TO_BEDROCK,
+        _resolve_bedrock_model_id,
+        _resolve_cache,
     )
+
     _resolve_cache.clear()
 
     mock_bedrock_client = MagicMock()
@@ -381,6 +406,7 @@ def test_bedrock_resolve_model_id_api_failure_falls_back_to_static_map():
 def test_bedrock_resolve_model_id_caches_result():
     """Repeated calls should not repeat the API call."""
     from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
+
     _resolve_cache.clear()
 
     mock_bedrock_client = MagicMock()
@@ -402,8 +428,11 @@ def test_bedrock_resolve_model_id_caches_result():
 def test_bedrock_resolve_model_id_unknown_model_returns_default():
     """Unknown model falls back to bare Bedrock default."""
     from dashforge.agents.providers.bedrock import (
-        _resolve_bedrock_model_id, _BEDROCK_DEFAULT_MODEL, _resolve_cache,
+        _BEDROCK_DEFAULT_MODEL,
+        _resolve_bedrock_model_id,
+        _resolve_cache,
     )
+
     _resolve_cache.clear()
 
     mock_bedrock_client = MagicMock()
@@ -423,6 +452,7 @@ def test_bedrock_resolve_model_id_unknown_model_returns_default():
 def test_bedrock_provider_prefixed_model_id_preserved():
     """Provider-prefixed IDs should pass through without resolution."""
     from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
+
     _resolve_cache.clear()
 
     mock_bedrock_client = MagicMock()
@@ -437,9 +467,7 @@ def test_bedrock_provider_prefixed_model_id_preserved():
     ]:
         _resolve_cache.clear()
         result = _resolve_bedrock_model_id(model_id, mock_bedrock_client)
-        assert result == model_id, (
-            f"Provider-prefixed {model_id!r} should be preserved, got: {result!r}"
-        )
+        assert result == model_id, f"Provider-prefixed {model_id!r} should be preserved, got: {result!r}"
         mock_bedrock_client.list_foundation_models.assert_not_called()
 
     _resolve_cache.clear()
@@ -448,15 +476,15 @@ def test_bedrock_provider_prefixed_model_id_preserved():
 
 # ── Async methods ──────────────────────────────────────────────────────────
 
+
 def test_bedrock_chat_json_appends_json_preamble():
     """chat_json should append JSON preamble to system prompt."""
     mock_client = MagicMock()
-    mock_client.converse.return_value = {
-        "output": {"message": {"content": [{"text": '{"ok": true}'}]}}
-    }
+    mock_client.converse.return_value = {"output": {"message": {"content": [{"text": '{"ok": true}'}]}}}
 
     provider, _ = _make_bedrock_provider(
-        mock_client, {"llm_bedrock_model_id": "test-model"},
+        mock_client,
+        {"llm_bedrock_model_id": "test-model"},
     )
 
     result = asyncio.run(provider.chat_json("system prompt", "user prompt", 0.2))
@@ -473,12 +501,11 @@ def test_bedrock_chat_json_appends_json_preamble():
 def test_bedrock_chat_text_no_preamble():
     """chat_text should pass system prompt without JSON preamble."""
     mock_client = MagicMock()
-    mock_client.converse.return_value = {
-        "output": {"message": {"content": [{"text": "plain response"}]}}
-    }
+    mock_client.converse.return_value = {"output": {"message": {"content": [{"text": "plain response"}]}}}
 
     provider, _ = _make_bedrock_provider(
-        mock_client, {"llm_bedrock_model_id": "test-model"},
+        mock_client,
+        {"llm_bedrock_model_id": "test-model"},
     )
 
     result = asyncio.run(provider.chat_text("system only", "user msg", 0.3))
@@ -494,8 +521,10 @@ def test_bedrock_chat_text_no_preamble():
 
 # ── Converse inference-profile retry ───────────────────────────────────────
 
+
 def test_converse_retries_with_inference_profile_on_validation_error():
     """Bare model ID + ValidationException → retry with regional profile → cache."""
+
     class ValidationException(Exception):
         pass
 
@@ -521,6 +550,7 @@ def test_converse_retries_with_inference_profile_on_validation_error():
 
 def test_converse_no_retry_if_already_prefixed():
     """Already-prefixed model ID should not retry on ValidationException."""
+
     class ValidationException(Exception):
         pass
 
@@ -544,6 +574,7 @@ def test_converse_no_retry_if_already_prefixed():
 
 def test_converse_no_retry_on_non_validation_error():
     """Non-ValidationException should not trigger profile retry."""
+
     class ThrottlingException(Exception):
         pass
 
@@ -564,6 +595,7 @@ def test_converse_no_retry_on_non_validation_error():
 
 def test_converse_cached_profile_id_skips_retry():
     """After successful retry, subsequent calls go direct (no retry)."""
+
     class ValidationException(Exception):
         pass
 
@@ -589,12 +621,11 @@ def test_converse_cached_profile_id_skips_retry():
 
 # ── Mistral system prompt folding ──────────────────────────────────────────
 
+
 def test_mistral_model_folds_system_into_user_message():
     """Mistral models: system prompt folded into user message, no system field."""
     mock_client = MagicMock()
-    mock_client.converse.return_value = {
-        "output": {"message": {"content": [{"text": '{"v": 1}'}]}}
-    }
+    mock_client.converse.return_value = {"output": {"message": {"content": [{"text": '{"v": 1}'}]}}}
 
     provider, _ = _make_bedrock_provider(
         mock_client,
@@ -616,9 +647,7 @@ def test_mistral_model_folds_system_into_user_message():
 def test_non_mistral_model_uses_system_field():
     """Non-Mistral models should use the standard system field."""
     mock_client = MagicMock()
-    mock_client.converse.return_value = {
-        "output": {"message": {"content": [{"text": "ok"}]}}
-    }
+    mock_client.converse.return_value = {"output": {"message": {"content": [{"text": "ok"}]}}}
 
     provider, _ = _make_bedrock_provider(
         mock_client,
@@ -637,8 +666,10 @@ def test_non_mistral_model_uses_system_field():
 
 # ── _inference_profile_id unit tests ───────────────────────────────────────
 
+
 def test_inference_profile_id_us_region():
     from dashforge.agents.providers.bedrock import _inference_profile_id
+
     result = _inference_profile_id("anthropic.claude-sonnet-4-20250514-v1:0", "us-east-1")
     assert result == "us.anthropic.claude-sonnet-4-20250514-v1:0"
     print("[PASS] test_inference_profile_id_us_region")
@@ -646,6 +677,7 @@ def test_inference_profile_id_us_region():
 
 def test_inference_profile_id_eu_region():
     from dashforge.agents.providers.bedrock import _inference_profile_id
+
     result = _inference_profile_id("anthropic.claude-sonnet-4-20250514-v1:0", "eu-west-1")
     assert result == "eu.anthropic.claude-sonnet-4-20250514-v1:0"
     print("[PASS] test_inference_profile_id_eu_region")
@@ -654,6 +686,7 @@ def test_inference_profile_id_eu_region():
 def test_inference_profile_id_apac_uses_global():
     """APAC regions should use global. prefix, not ap."""
     from dashforge.agents.providers.bedrock import _inference_profile_id
+
     result = _inference_profile_id("anthropic.claude-sonnet-4-20250514-v1:0", "ap-northeast-1")
     assert result == "global.anthropic.claude-sonnet-4-20250514-v1:0"
     print("[PASS] test_inference_profile_id_apac_uses_global")
@@ -662,6 +695,7 @@ def test_inference_profile_id_apac_uses_global():
 def test_inference_profile_id_other_regions_use_global():
     """sa-*, me-*, ca-*, af-* regions should all use global. prefix."""
     from dashforge.agents.providers.bedrock import _inference_profile_id
+
     for region in ["sa-east-1", "me-south-1", "ca-central-1", "af-south-1"]:
         result = _inference_profile_id("anthropic.claude-sonnet-4-20250514-v1:0", region)
         assert result.startswith("global."), f"Region {region}: expected global., got {result!r}"
@@ -670,10 +704,12 @@ def test_inference_profile_id_other_regions_use_global():
 
 # ── Transient error retry ─────────────────────────────────────────────────
 
+
 def test_bedrock_converse_wraps_throttling_for_retry():
     """Bedrock ThrottlingException → LLMTransientError so tenacity retries."""
-    from dashforge.agents.llm import call_llm, LLMTransientError
     from pydantic import BaseModel
+
+    from dashforge.agents.llm import LLMTransientError, call_llm
 
     class SimpleModel(BaseModel):
         value: int
@@ -691,9 +727,7 @@ def test_bedrock_converse_wraps_throttling_for_retry():
     from dashforge.agents.providers.base import LLMResult
 
     mock_provider = MagicMock()
-    mock_provider.chat_json = AsyncMock(
-        side_effect=[throttle_exc, LLMResult(text='{"value": 99}')]
-    )
+    mock_provider.chat_json = AsyncMock(side_effect=[throttle_exc, LLMResult(text='{"value": 99}')])
 
     with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
         try:
@@ -701,17 +735,17 @@ def test_bedrock_converse_wraps_throttling_for_retry():
             assert model.value == 99
             assert mock_provider.chat_json.call_count == 2
         except Exception as exc:
-            assert isinstance(exc, LLMTransientError), \
-                f"Expected LLMTransientError, got {type(exc).__name__}: {exc}"
+            assert isinstance(exc, LLMTransientError), f"Expected LLMTransientError, got {type(exc).__name__}: {exc}"
 
     print("[PASS] test_bedrock_converse_wraps_throttling_for_retry")
 
 
 def test_bedrock_service_specific_exception_retried():
     """Bedrock service-specific ThrottlingException (not ClientError) → retried."""
-    from dashforge.agents.llm import call_llm, LLMTransientError
     from pydantic import BaseModel
     from tenacity import wait_none
+
+    from dashforge.agents.llm import call_llm
 
     class Simple(BaseModel):
         v: int
@@ -724,9 +758,7 @@ def test_bedrock_service_specific_exception_retried():
     from dashforge.agents.providers.base import LLMResult
 
     mock_provider = MagicMock()
-    mock_provider.chat_json = AsyncMock(
-        side_effect=[ThrottlingException("Rate exceeded"), LLMResult(text='{"v": 42}')]
-    )
+    mock_provider.chat_json = AsyncMock(side_effect=[ThrottlingException("Rate exceeded"), LLMResult(text='{"v": 42}')])
 
     original_wait = call_llm.retry.wait
     call_llm.retry.wait = wait_none()
@@ -744,10 +776,11 @@ def test_bedrock_service_specific_exception_retried():
 
 # ── pyproject.toml ─────────────────────────────────────────────────────────
 
+
 def test_pyproject_has_bedrock_optional_extra():
     """pyproject.toml must define bedrock extra with boto3."""
-    from pathlib import Path
     import tomllib
+    from pathlib import Path
 
     toml_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
     with open(toml_path, "rb") as f:
@@ -761,9 +794,9 @@ def test_pyproject_has_bedrock_optional_extra():
 
 def test_pyproject_boto3_minimum_version_supports_converse():
     """bedrock extra must require boto3>=1.34.116 (Converse API)."""
-    from pathlib import Path
-    import tomllib
     import re
+    import tomllib
+    from pathlib import Path
 
     toml_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
     with open(toml_path, "rb") as f:
@@ -775,9 +808,11 @@ def test_pyproject_boto3_minimum_version_supports_converse():
     match = re.search(r"(\d+\.\d+\.\d+)", boto3_dep)
     assert match, f"Could not parse version from: {boto3_dep}"
     parts = [int(x) for x in match.group(1).split(".")]
-    assert tuple(parts) >= (1, 34, 116), (
-        f"boto3 lower bound {match.group(1)} too low — Converse API requires >=1.34.116"
-    )
+    assert tuple(parts) >= (
+        1,
+        34,
+        116,
+    ), f"boto3 lower bound {match.group(1)} too low — Converse API requires >=1.34.116"
 
     print("[PASS] test_pyproject_boto3_minimum_version_supports_converse")
 
@@ -795,6 +830,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[FAIL] {test_fn.__name__}: {e}")
             import traceback
+
             traceback.print_exc()
             failed += 1
 

@@ -5,6 +5,7 @@ with pre-defined panel templates and deterministic query patterns.
 The LLM classifies the problem → archetype, then fills parameters —
 it does NOT invent the dashboard structure.
 """
+
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
@@ -19,7 +20,12 @@ class QueryTemplate(BaseModel):
 
     expr: str = Field(description="Query template with {placeholders}")
     legend_format: str = ""
+    query_language: str = "promql"
     datasource_type: str = "prometheus"
+    cloudwatch_namespace: str = ""
+    cloudwatch_stat: str = ""
+    cloudwatch_dimensions: dict[str, str | list[str]] = Field(default_factory=dict)
+    cloudwatch_region: str = ""
 
 
 class PanelTemplate(BaseModel):
@@ -50,7 +56,21 @@ class InvestigationArchetype(BaseModel):
     required_metrics: list[str] = Field(
         default_factory=list,
         description="Metric name patterns this archetype needs (regex-style), "
-        "e.g. ['http_requests_total', 'http_request_duration_seconds.*']"
+        "e.g. ['http_requests_total', 'http_request_duration_seconds.*']",
+    )
+    required_signals: list[str] = Field(
+        default_factory=list,
+        description="Semantic signal types this archetype needs, "
+        "e.g. ['request_latency', 'error_rate']. Resolved to actual "
+        "metrics at compile time via the signal mapping store.",
+    )
+    signal_bindings: dict[str, str] = Field(
+        default_factory=dict,
+        description="Maps signal_type → default_metric_name used in query templates. "
+        "When the default metric is missing from the catalog, the signal "
+        "resolution engine finds the best alternative. "
+        "e.g. {'request_latency': 'http_request_duration_seconds', "
+        "'error_rate': 'http_requests_total'}",
     )
     panels: list[PanelTemplate]
     tags: list[str] = Field(default_factory=list)

@@ -13,10 +13,10 @@ Steps:
 4. Test publishing (chart + dashboard creation)
 5. Clean up created resources
 """
+
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 import time
@@ -29,10 +29,10 @@ import structlog
 sys.path.insert(0, ".")
 
 from dashforge.config import settings
+from dashforge.models.schemas import DashboardSpec, PanelQuery, PanelSpec
 from dashforge.signalfx.client import SignalFxClient
 from dashforge.signalfx.discovery import discover_metrics
 from dashforge.signalfx.publisher import publish_dashboard
-from dashforge.models.schemas import DashboardSpec, PanelSpec, PanelQuery
 
 logger = structlog.get_logger()
 
@@ -46,6 +46,7 @@ async def client():
     c = SignalFxClient()
     yield c
     await c.close()
+
 
 # ── Dummy metrics to ingest ──────────────────────────────────────────────────
 
@@ -103,6 +104,7 @@ def _header(msg: str) -> None:
 
 # ── Step 1: Ingest dummy metrics ─────────────────────────────────────────────
 
+
 def ingest_dummy_metrics(realm: str, token: str) -> bool:
     """Send dummy datapoints to the SignalFx ingest endpoint."""
     ingest_url = f"https://ingest.{realm}.signalfx.com/v2/datapoint"
@@ -144,6 +146,7 @@ def ingest_dummy_metrics(realm: str, token: str) -> bool:
 
 # ── Step 2: Wait for indexing ────────────────────────────────────────────────
 
+
 def wait_for_indexing(realm: str, token: str, max_wait: int = 60) -> bool:
     """Poll the metric API until our test metrics are discoverable."""
     api_url = f"https://api.{realm}.signalfx.com/v2/metric"
@@ -174,6 +177,7 @@ def wait_for_indexing(realm: str, token: str, max_wait: int = 60) -> bool:
 
 # ── Step 3: Test discovery ───────────────────────────────────────────────────
 
+
 async def test_discovery(client: SignalFxClient) -> list:
     """Test direct metric discovery using our test keywords."""
     keywords = ["http", "cpu", "error", "queue", "dashforge.test"]
@@ -194,6 +198,7 @@ async def test_discovery(client: SignalFxClient) -> list:
 
 # ── Step 4: Test publishing ──────────────────────────────────────────────────
 
+
 async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
     """Test chart + dashboard creation with a real DashboardSpec."""
     spec = DashboardSpec(
@@ -207,12 +212,15 @@ async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
                 description="HTTP request latency",
                 panel_type="timeseries",
                 unit="s",
-                queries=[PanelQuery(
-                    expr="data('dashforge.test.http_request_duration_seconds', filter=filter('service', 'checkout')).percentile(pct=99).publish(label='P99')",
-                    legend_format="P99",
-                    datasource_uid="signalfx-direct",
-                    datasource_type="signalfx",
-                )],
+                queries=[
+                    PanelQuery(
+                        expr="data('dashforge.test.http_request_duration_seconds', "
+                        "filter=filter('service', 'checkout')).percentile(pct=99).publish(label='P99')",
+                        legend_format="P99",
+                        datasource_uid="signalfx-direct",
+                        datasource_type="signalfx",
+                    )
+                ],
                 row="Latency",
             ),
             PanelSpec(
@@ -220,12 +228,15 @@ async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
                 description="HTTP requests per second",
                 panel_type="timeseries",
                 unit="reqps",
-                queries=[PanelQuery(
-                    expr="data('dashforge.test.http_requests_total', filter=filter('service', 'checkout')).sum().publish(label='RPS')",
-                    legend_format="RPS",
-                    datasource_uid="signalfx-direct",
-                    datasource_type="signalfx",
-                )],
+                queries=[
+                    PanelQuery(
+                        expr="data('dashforge.test.http_requests_total', "
+                        "filter=filter('service', 'checkout')).sum().publish(label='RPS')",
+                        legend_format="RPS",
+                        datasource_uid="signalfx-direct",
+                        datasource_type="signalfx",
+                    )
+                ],
                 row="Latency",
             ),
             PanelSpec(
@@ -233,12 +244,14 @@ async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
                 description="Host CPU usage percentage",
                 panel_type="timeseries",
                 unit="percent",
-                queries=[PanelQuery(
-                    expr="data('dashforge.test.cpu_utilization_percent').mean().publish(label='CPU %')",
-                    legend_format="CPU %",
-                    datasource_uid="signalfx-direct",
-                    datasource_type="signalfx",
-                )],
+                queries=[
+                    PanelQuery(
+                        expr="data('dashforge.test.cpu_utilization_percent').mean().publish(label='CPU %')",
+                        legend_format="CPU %",
+                        datasource_uid="signalfx-direct",
+                        datasource_type="signalfx",
+                    )
+                ],
                 row="Resources",
             ),
             PanelSpec(
@@ -246,12 +259,15 @@ async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
                 description="Error rate by service",
                 panel_type="stat",
                 unit="percentunit",
-                queries=[PanelQuery(
-                    expr="data('dashforge.test.error_rate', filter=filter('service', 'checkout')).mean().publish(label='Error Rate')",
-                    legend_format="Error Rate",
-                    datasource_uid="signalfx-direct",
-                    datasource_type="signalfx",
-                )],
+                queries=[
+                    PanelQuery(
+                        expr="data('dashforge.test.error_rate', "
+                        "filter=filter('service', 'checkout')).mean().publish(label='Error Rate')",
+                        legend_format="Error Rate",
+                        datasource_uid="signalfx-direct",
+                        datasource_type="signalfx",
+                    )
+                ],
                 row="Resources",
             ),
         ],
@@ -270,6 +286,7 @@ async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
 
 # ── Step 5: Cleanup ──────────────────────────────────────────────────────────
 
+
 async def cleanup(client: SignalFxClient, dashboard_id: str) -> None:
     """Delete the test dashboard (charts remain for inspection)."""
     if not dashboard_id:
@@ -286,6 +303,7 @@ async def cleanup(client: SignalFxClient, dashboard_id: str) -> None:
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
+
 
 async def main():
     api_token = settings.signalfx_api_token

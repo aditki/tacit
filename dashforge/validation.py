@@ -2,16 +2,21 @@
 
 Prevents publishing empty dashboards that waste engineer time.
 """
+
 from __future__ import annotations
 
 import asyncio
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 import structlog
 
 from dashforge.grafana.client import GrafanaClient
 from dashforge.models.schemas import DashboardSpec, PanelSpec
+
+if TYPE_CHECKING:
+    from dashforge.signalfx.client import SignalFxClient
 
 logger = structlog.get_logger()
 
@@ -33,12 +38,16 @@ async def _check_query(
 
     try:
         encoded = quote(expr, safe="")
-        data = await client.datasource_proxy_get(
-            datasource_uid, f"api/v1/query?query={encoded}"
-        )
+        data = await client.datasource_proxy_get(datasource_uid, f"api/v1/query?query={encoded}")
         result = data.get("data", {}).get("result", []) if isinstance(data, dict) else []
         has_data = len(result) > 0
-        logger.debug("query_check", expr=expr[:80], datasource_type=normalized_type, has_data=has_data, result_count=len(result))
+        logger.debug(
+            "query_check",
+            expr=expr[:80],
+            datasource_type=normalized_type,
+            has_data=has_data,
+            result_count=len(result),
+        )
         return has_data
     except Exception as e:
         logger.warning("query_check_error", expr=expr[:80], datasource_type=normalized_type, error=str(e))
@@ -68,10 +77,7 @@ async def validate_dashboard_queries(
         return spec, ["No queries to validate"]
 
     # Run all checks concurrently
-    tasks = [
-        _check_query(client, ds_uid, ds_type, expr)
-        for _, ds_uid, ds_type, expr in checks
-    ]
+    tasks = [_check_query(client, ds_uid, ds_type, expr) for _, ds_uid, ds_type, expr in checks]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Group results by panel
@@ -92,17 +98,18 @@ async def validate_dashboard_queries(
             valid_panels.append(panel)
         else:
             warnings.append(f'Panel "{panel.title}" dropped — no matching series')
-            logger.warning("panel_no_data", panel=panel.title,
-                           queries=[q.expr[:80] for q in panel.queries])
+            logger.warning("panel_no_data", panel=panel.title, queries=[q.expr[:80] for q in panel.queries])
 
     spec = spec.model_copy(update={"panels": valid_panels})
     if not valid_panels:
         warnings.append("ALL panels returned no data — dashboard not created")
 
-    logger.info("query_validation_complete",
-                total_panels=len(spec.panels) + len(warnings),
-                valid_panels=len(valid_panels),
-                dropped=len(warnings))
+    logger.info(
+        "query_validation_complete",
+        total_panels=len(spec.panels) + len(warnings),
+        valid_panels=len(valid_panels),
+        dropped=len(warnings),
+    )
 
     return spec, warnings
 
@@ -116,7 +123,7 @@ def _extract_signalflow_metrics(expr: str) -> list[str]:
 
 
 async def _check_metric_exists(
-    sfx_client: "SignalFxClient",
+    sfx_client: SignalFxClient,
     metric_name: str,
     _cache: dict[str, bool] | None = None,
 ) -> bool:
@@ -136,7 +143,7 @@ async def _check_metric_exists(
 
 
 async def validate_signalflow_queries(
-    sfx_client: "SignalFxClient",
+    sfx_client: SignalFxClient,
     spec: DashboardSpec,
 ) -> tuple[DashboardSpec, list[str]]:
     """Validate SignalFlow panels by checking that referenced metrics exist.
@@ -145,7 +152,6 @@ async def validate_signalflow_queries(
     they exist in SignalFx. Drops panels where ALL referenced metrics are missing.
     Returns (filtered_spec, warnings).
     """
-    from dashforge.signalfx.client import SignalFxClient  # noqa: F811
 
     valid_panels: list[PanelSpec] = []
     warnings: list[str] = []
@@ -161,8 +167,7 @@ async def validate_signalflow_queries(
         all_metrics.update(metrics)
 
     if not all_metrics:
-        logger.warning("sfx_validation_no_metrics",
-                        reason="no data() calls found in any panel")
+        logger.warning("sfx_validation_no_metrics", reason="no data() calls found in any panel")
         return spec, ["No SignalFlow data() calls found to validate"]
 
     # Check all unique metrics concurrently with a shared cache
@@ -183,21 +188,21 @@ async def validate_signalflow_queries(
             valid_panels.append(panel)
         else:
             warnings.append(
-                f'Panel "{panel.title}" dropped — metrics not found in SignalFx: '
-                f'{", ".join(metrics[:5])}'
+                f'Panel "{panel.title}" dropped — metrics not found in SignalFx: ' f'{", ".join(metrics[:5])}'
             )
-            logger.warning("sfx_panel_no_data", panel=panel.title,
-                           missing_metrics=metrics[:5])
+            logger.warning("sfx_panel_no_data", panel=panel.title, missing_metrics=metrics[:5])
 
     spec = spec.model_copy(update={"panels": valid_panels})
     if not valid_panels:
         warnings.append("ALL panels returned no data — dashboard not created")
 
-    logger.info("sfx_query_validation_complete",
-                total_panels=len(valid_panels) + len(warnings),
-                valid_panels=len(valid_panels),
-                dropped=len(warnings),
-                metrics_checked=len(all_metrics),
-                metrics_found=sum(1 for v in cache.values() if v))
+    logger.info(
+        "sfx_query_validation_complete",
+        total_panels=len(valid_panels) + len(warnings),
+        valid_panels=len(valid_panels),
+        dropped=len(warnings),
+        metrics_checked=len(all_metrics),
+        metrics_found=sum(1 for v in cache.values() if v),
+    )
 
     return spec, warnings
