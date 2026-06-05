@@ -113,6 +113,30 @@ DashForge closes this gap by turning a problem statement into a ready-made inves
  Dashboard URLs → Slack / Web UI / API response
 ```
 
+### Dashboard Learning Loop
+
+```
+ Existing Grafana / SignalFx dashboards
+     │
+     ▼
+┌──────────────────────────┐
+│ Dashboard Ingestion      │  Vendor-agnostic: backend.ingest_dashboard(uid)
+│ (PromQL / SignalFlow)    │  Extracts metrics, panels, rows, aggregation patterns
+└──────┬───────────────────┘
+       ▼
+┌──────────────────────────┐
+│ Signal Inference Engine  │  Matches metrics → signal taxonomy (signals.yaml)
+│                          │  12 categories, pattern-based with confidence scores
+└──────┬───────────────────┘
+       ▼
+┌──────────────────────────┐
+│ Signal Store (SQLite)    │  Persists metric→signal mappings, confidence decay,
+│                          │  feedback adjustment, context-aware resolution
+└──────┬───────────────────┘
+       ▼
+ Signal taxonomy feeds archetype engine + metric ranking
+```
+
 The pipeline is **vendor-agnostic**. Each backend (Grafana, SignalFx) implements
 the same `DashboardBackend` protocol — `discover_metrics()`, `validate_queries()`,
 `publish()`, `close()`. The pipeline iterates over enabled backends with zero
@@ -287,6 +311,70 @@ and a native SignalFx dashboard with SignalFlow charts.
 When enabled, the API response includes `signalfx_url` and `signalfx_dashboard_id`
 alongside the standard Grafana fields.
 
+## Dashboard Learning & Signals
+
+DashForge can **learn from existing dashboards** — ingest a Grafana or SignalFx dashboard
+and automatically infer which observability signals (latency, error rate, saturation, etc.)
+its metrics represent. Learned mappings feed back into the pipeline to improve metric
+ranking and archetype selection.
+
+### Ingest a Dashboard
+
+Via the **Web UI** — go to the **Learning** tab, enter a dashboard UID, select the backend, and click "Ingest Dashboard".
+
+Via the **API**:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/learn/dashboard \
+  -H "Content-Type: application/json" \
+  -d '{"dashboard_uid": "my-service-overview", "backend": "grafana", "auto_approve": true}'
+```
+
+### Teach a Signal Mapping
+
+Manually teach DashForge that a custom metric maps to a signal:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/signals/teach \
+  -H "Content-Type: application/json" \
+  -d '{
+    "signal_type": "request_latency",
+    "metric_patterns": [{"pattern": "my_custom_latency_seconds", "confidence": 0.9}],
+    "services": ["checkout"]
+  }'
+```
+
+### Signal Taxonomy
+
+The signal taxonomy (`signals.yaml`) defines 12 categories with metric patterns:
+
+| Category | Signals |
+|---|---|
+| **Latency** | request_latency, db_query_latency, dns_latency |
+| **Throughput** | request_rate, message_throughput |
+| **Errors** | error_rate, tls_handshake_failures, dns_failures |
+| **Saturation** | cpu_usage, memory_usage, disk_usage, db_connection_pool, in_flight_requests |
+| **Stability** | pod_restarts |
+| **Auth** | auth_failure_count, rate_limit_hits, tls_handshake_failures |
+| **Caching** | cache_hit_ratio |
+| **Network** | network_bytes, dns_failures, tls_handshake_failures |
+| **Messaging** | consumer_lag, queue_depth |
+| **Storage** | disk_usage, db_connection_pool |
+| **Serverless** | cold_start_duration, concurrent_executions |
+| **Traffic Management** | rate_limit_hits |
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/learn/dashboard` | Ingest a dashboard (requires `dashboard_uid`, optional `backend`, `auto_approve`) |
+| `GET` | `/api/v1/learn/dashboards` | List ingested dashboards |
+| `POST` | `/api/v1/learn/dashboards/{uid}/approve` | Approve a pending ingested dashboard |
+| `GET` | `/api/v1/signals` | List all signal types with mapping counts |
+| `GET` | `/api/v1/signals/{signal_type}` | Get signal detail with all metric mappings |
+| `GET` | `/api/v1/signals/stats` | Signal store statistics |
+| `POST` | `/api/v1/signals/teach` | Teach a new metric→signal mapping |
+
 ## AWS Bedrock (LLM Provider)
 
 DashForge supports **AWS Bedrock** as an LLM provider for organizations that require
@@ -316,21 +404,23 @@ No API key is needed — Bedrock uses IAM authentication.
 
 ## Architecture
 
-| Component                 | Description                                                                                                                                                                                                                      |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Prompt Sanitizer**      | Length caps, control-char removal, prompt injection guardrails                                                                                                                                                                   |
-| **Intent Agent**          | LLM classifies domain, services, keywords, signal types, timerange, and multi-label archetypes with confidence scores                                                                                                            |
-| **Context Enrichment**    | Pluggable knowledge base lookup (MCP, A2A, RAG API) — disabled by default                                                                                                                                                        |
-| **Backend Adapters**      | Pluggable `DashboardBackend` protocol (Grafana, SignalFx). Each backend discovers metrics, validates queries, and publishes dashboards independently. Pipeline iterates over enabled backends — zero vendor-specific branching   |
-| **Datasource Discovery**  | Grafana: auto-discovers all datasources, filters by signal type. SignalFx: keyword search via v2 metadata API                                                                                                                    |
-| **Metric Catalog Fetch**  | Per-datasource adapters query metric names + per-metric label names/values                                                                                                                                                       |
-| **Archetype Engine**      | Deterministic dashboard compilation for known investigation patterns. Multi-label: blends panels from multiple archetypes based on confidence (e.g. latency primary + saturation secondary). Skips LLM query generation entirely |
-| **Metrics Discovery LLM** | *(freeform fallback)* Selects the most relevant metrics from the full catalog                                                                                                                                                    |
-| **Post-Validation**       | Drops hallucinated datasource UIDs, verifies metrics exist in catalog                                                                                                                                                            |
-| **Query Builder LLM**     | *(freeform fallback)* Generates PromQL/LogQL with accurate label selectors                                                                                                                                                       |
-| **Query Validation**      | Primary backend verifies all panel queries return real data (PromQL via datasource proxy, SignalFlow via metric existence check); drops empty panels, blocks empty dashboards                                                    |
-| **Dashboard Publisher**   | Each enabled backend publishes independently — Grafana JSON via API, SignalFx charts via v2 REST API, or both                                                                                                                    |
-| **Web UI**                | Simple browser interface at `/` for testing prompts                                                                                                                                                                              |
+| Component | Description |
+|---|---|
+| **Prompt Sanitizer** | Length caps, control-char removal, prompt injection guardrails |
+| **Intent Agent** | LLM classifies domain, services, keywords, signal types, timerange, and multi-label archetypes with confidence scores |
+| **Context Enrichment** | Pluggable knowledge base lookup (MCP, A2A, RAG API) — disabled by default |
+| **Backend Adapters** | Pluggable `DashboardBackend` protocol (Grafana, SignalFx). Each backend discovers metrics, validates queries, and publishes dashboards independently. Pipeline iterates over enabled backends — zero vendor-specific branching |
+| **Datasource Discovery** | Grafana: auto-discovers all datasources, filters by signal type. SignalFx: keyword search via v2 metadata API |
+| **Metric Catalog Fetch** | Per-datasource adapters query metric names + per-metric label names/values |
+| **Archetype Engine** | Deterministic dashboard compilation for known investigation patterns. Multi-label: blends panels from multiple archetypes based on confidence (e.g. latency primary + saturation secondary). Skips LLM query generation entirely |
+| **Metrics Discovery LLM** | *(freeform fallback)* Selects the most relevant metrics from the full catalog |
+| **Post-Validation** | Drops hallucinated datasource UIDs, verifies metrics exist in catalog |
+| **Query Builder LLM** | *(freeform fallback)* Generates PromQL/LogQL with accurate label selectors |
+| **Query Validation** | Primary backend verifies all panel queries return real data (PromQL via datasource proxy, SignalFlow via metric existence check); drops empty panels, blocks empty dashboards |
+| **Dashboard Publisher** | Each enabled backend publishes independently — Grafana JSON via API, SignalFx charts via v2 REST API, or both |
+| **Dashboard Ingestion** | Vendor-agnostic learning: ingests existing Grafana/SignalFx dashboards, extracts metrics & query patterns, infers signal mappings. `DashboardFeatures` dataclass normalizes across backends |
+| **Signal Store** | SQLite-backed signal taxonomy: 12 categories, metric→signal mappings with confidence decay (90-day half-life), feedback adjustment (±30%), context-aware resolution (service, datasource, environment), trust threshold (0.15) |
+| **Web UI** | Browser interface at `/` with tabs: Generate, Learning (dashboard ingestion), Signals (taxonomy & teach), Insights (feedback), Archetypes, History |
 
 All agents use structured JSON output with Pydantic validation. The LLM layer is
 provider-agnostic — set `LLM_PROVIDER` to `anthropic`, `openai`, `azure`, `bedrock`, or `ollama`.
@@ -389,10 +479,13 @@ dashforge/
 │   ├── pipeline.py          # Orchestration: prompt → dashboard (vendor-agnostic)
 │   ├── validation.py        # Pre-publish query validation (PromQL + SignalFlow)
 │   ├── backends/            # Backend adapter pattern
-│   │   ├── base.py          # DashboardBackend Protocol + PublishResult
-│   │   ├── grafana.py       # GrafanaBackend adapter
-│   │   ├── signalfx.py      # SignalFxBackend adapter
+│   │   ├── base.py          # DashboardBackend Protocol + PublishResult + DashboardFeatures
+│   │   ├── grafana.py       # GrafanaBackend adapter (incl. ingest_dashboard)
+│   │   ├── signalfx.py      # SignalFxBackend adapter (incl. ingest_dashboard)
 │   │   └── __init__.py      # Registry: get_active_backends()
+│   ├── signals.py           # Signal store: taxonomy, metric mappings, confidence (SQLite)
+│   ├── dashboard_ingest.py  # Vendor-agnostic dashboard learning pipeline
+│   ├── signals.yaml         # Signal taxonomy: 12 categories, metric patterns
 │   ├── cache.py             # TTL-based metadata & LLM response cache
 │   ├── ranking.py           # Pre-ranking: narrows metric catalog before LLM
 │   ├── history.py           # Investigation history store (SQLite)
@@ -441,16 +534,17 @@ dashforge/
 │   ├── models/
 │   │   └── schemas.py       # Pydantic models (Intent, ArchetypeMatch, DashboardSpec)
 │   └── static/
-│       └── index.html       # Web UI for testing
+│       └── index.html       # Web UI (Generate, Learning, Signals, Insights, Archetypes, History)
 ├── tests/                   # Validation & testing
 │   ├── validate.py          # Validation suite (archetype + pipeline accuracy)
 │   ├── dashforge_validation_prompts.csv  # 100-prompt test dataset
 │   ├── test_unit.py         # Unit tests
+│   ├── test_signals.py      # Signal store, inference, SignalFlow extraction tests
 │   └── README.md            # Validation documentation
 ├── dev/                     # Local dev environment
 │   ├── fake_app/           # Fake metrics exporter (checkout, payment, inventory)
 │   ├── prometheus/         # Prometheus config
-│   └── grafana/            # Grafana provisioning
+│   └── grafana/            # Grafana provisioning (incl. signal_coverage dashboard)
 ├── docker-compose.yml
 ├── Dockerfile
 ├── pyproject.toml           # Project metadata & deps (uv)
@@ -462,6 +556,12 @@ dashforge/
 ```
 
 ## Roadmap
+
+### Roadmap Principles
+
+- DashForge should **consume organizational knowledge, not custody it**. Enterprise runbooks, service catalogs, ownership data, postmortems, and policy knowledge should come through pluggable RAG / A2A / MCP integrations owned by the organization.
+- DashForge should own **observability outcomes**: investigation history, dashboard provenance, feedback-derived metric quality, archetype gaps, and what worked in prior incidents.
+- Local vector memory should stay optional: valuable for personal use, demos, offline workflows, and small teams without existing RAG infrastructure — not a required enterprise dependency.
 
 ### Done
 
@@ -495,6 +595,13 @@ dashforge/
 - [x] Single-binary distribution — PyInstaller spec for macOS/Linux/Windows, `./scripts/build.sh`
 - [x] 41 investigation archetypes with 176 panels covering latency, errors, golden signals, Kubernetes, Kafka (5 archetypes), Redis, SQS, Lambda, DDoS, mTLS, capacity planning, and more
 - [x] Investigation history — full pipeline telemetry persisted in SQLite: prompt, intent, archetypes, datasources, metrics, queries, validation, per-step timings, failures, dashboard URLs. API + CLI (`dashforge history list/show/stats`)
+- [x] Structured logging — every pipeline stage emits `stage_complete` events with `request_id`, `stage`, `latency_ms`, token counts, and stage-specific fields via structlog
+- [x] Vendor-agnostic dashboard learning — ingest existing Grafana/SignalFx dashboards, extract metrics & query patterns (PromQL + SignalFlow), infer signal mappings via pattern matching. `DashboardFeatures` dataclass normalizes across backends
+- [x] Signal taxonomy & store — 12 signal categories (latency, throughput, errors, saturation, stability, auth, caching, network, messaging, storage, serverless, traffic management), SQLite-backed metric→signal mappings with confidence decay, feedback adjustment, context-aware resolution
+- [x] Web UI: Learning tab — dashboard ingestion form (backend selector, UID, auto-approve toggle), ingested dashboard history with approval workflow
+- [x] Web UI: Signals tab — signal taxonomy browser (grouped by category, mapping counts, drill-down), teach signal mapping form for manual metric→signal associations
+- [x] XSS hardening — all server data escaped via `esc()` before `innerHTML` injection across all UI tabs
+- [x] Data persistence — SQLite databases mounted via Docker volume (`./data:/app/data`) for signals, feedback, and history
 
 ### Personal Use — Near Term
 
@@ -504,13 +611,16 @@ dashforge/
 - [ ] Conversational refinement — refine dashboards via follow-up messages (zoom, pivot, drill-down)
 - [ ] Alert context ingestion — auto-read alert payload as prompt
 - [ ] Dashboard versioning / history
+- [ ] **Optional local memory demo mode** — package a lightweight local knowledge setup for personal use and demos. Start with SQLite FTS over DashForge investigation history/feedback; optionally add Qdrant via Docker Compose for semantic search over local runbooks and past investigations. This is a convenience backend, not the enterprise knowledge strategy.
 
 ### Enterprise — Architecture Evolution
 
-- [ ] **Metadata indexing layer** — background indexer → vector/relational metadata store, replacing live datasource introspection per request. Store metric names, label keys, common values, descriptions, usage frequency, service ownership, embeddings. Moves system from O(all metrics) to O(relevant metrics).
-- [ ] **Semantic retrieval before reasoning** — BM25 + embedding hybrid search to narrow 50k+ metrics → top 50 candidates before LLM. Mandatory for cost/latency/quality at scale. (Current pre-ranking uses keyword/service relevance; embeddings would improve recall.)
-- [ ] **Deterministic query compiler** — extend archetype engine to full AST-based compilation for freeform path. LLM emits semantic intent AST, deterministic code generates validated PromQL/LogQL.
+- [ ] **Enterprise context provider contract** — harden the existing RAG / A2A / MCP context layer for production org knowledge: typed context chunks, source attribution, freshness, confidence, RBAC hints, trust labels, and failure behavior. DashForge retrieves from customer-owned systems instead of storing their knowledge base.
+- [ ] **DashForge-native memory** — persist and retrieve observability-specific learning: similar investigations, dashboard provenance, feedback-derived metric quality, panel usefulness, noisy archetypes, and successful prior dashboard patterns.
+- [ ] **Metadata indexing layer** — background indexer → relational/search metadata store, replacing live datasource introspection per request. Store metric names, label keys, common values, descriptions, usage frequency, service ownership references, and retrieval metadata. Moves system from O(all metrics) to O(relevant metrics).
+- [ ] **Semantic metric retrieval before reasoning** — BM25 + embedding hybrid search to narrow 50k+ metrics → top 50 candidates before LLM. Mandatory for cost/latency/quality at scale. This is for observability metadata and prior DashForge outcomes, not for owning the organization's general knowledge base.
 - [ ] **Canonical Observability IR** — intermediate representation (`signal_type`, `resource_type`, `aggregation`, `scope`) that each datasource adapter maps to native queries. Scales portability without accumulating datasource-specific prompt hacks.
+- [ ] **Deterministic query compiler** — extend archetype engine to full AST-based compilation for freeform path. LLM emits semantic intent AST, deterministic code generates validated PromQL/LogQL.
 - [ ] **Query cost planner** — cardinality estimation, time-range scoring, query complexity analysis, datasource load awareness. Like a database optimizer for observability queries.
 
 ### Enterprise — Security & Compliance

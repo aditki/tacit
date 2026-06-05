@@ -1,4 +1,5 @@
 """Ollama provider — local models via the Ollama HTTP API."""
+
 from __future__ import annotations
 
 import httpx
@@ -38,9 +39,7 @@ class OllamaProvider(LLMProvider):
             "format": "json",
             "options": {"temperature": temperature},
         }
-        resp = await self._client.post(
-            f"{self._base_url}/api/chat", json=payload
-        )
+        resp = await self._client.post(f"{self._base_url}/api/chat", json=payload)
         resp.raise_for_status()
         data = resp.json()
         raw = data["message"]["content"]
@@ -62,9 +61,7 @@ class OllamaProvider(LLMProvider):
             "stream": False,
             "options": {"temperature": temperature},
         }
-        resp = await self._client.post(
-            f"{self._base_url}/api/chat", json=payload
-        )
+        resp = await self._client.post(f"{self._base_url}/api/chat", json=payload)
         resp.raise_for_status()
         data = resp.json()
         return LLMResult(text=data["message"]["content"], usage=self._extract_usage(data))

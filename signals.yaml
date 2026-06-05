@@ -1,0 +1,417 @@
+# DashForge Semantic Signal Definitions
+#
+# This file bootstraps the signal taxonomy — canonical observability concepts
+# that are independent of specific metric names or vendors.
+#
+# Signals are the bridge between investigation archetypes and environment-specific
+# metrics.  Instead of hardcoding "http_request_duration_seconds" in an archetype,
+# we reference the signal "request_latency" and let the resolution engine find
+# the actual metric in each environment.
+#
+# Many-to-many: one metric can map to multiple signals depending on context.
+# For example, "queue_depth" might indicate saturation, throughput mismatch,
+# or a downstream outage depending on the investigation.
+#
+# Patterns support exact names and glob wildcards (* and ?).
+
+signals:
+
+  # ── Latency ────────────────────────────────────────────────────────────
+
+  request_latency:
+    description: Time to process an HTTP/gRPC request
+    category: latency
+    unit: s
+    metric_patterns:
+      - pattern: "http_request_duration_seconds"
+        confidence: 0.95
+      - pattern: "http_request_duration_seconds_bucket"
+        confidence: 0.95
+      - pattern: "*_request_duration_*"
+        confidence: 0.7
+      - pattern: "*_latency_seconds*"
+        confidence: 0.7
+      - pattern: "*_response_time*"
+        confidence: 0.6
+      - pattern: "*_latency_ms*"
+        confidence: 0.55
+      - pattern: "*_duration_seconds*"
+        confidence: 0.5
+
+  api_latency:
+    description: API endpoint response time
+    category: latency
+    unit: s
+    metric_patterns:
+      - pattern: "*api*latency*"
+        confidence: 0.8
+      - pattern: "*api*duration*"
+        confidence: 0.7
+      - pattern: "*api*response_time*"
+        confidence: 0.7
+      - pattern: "*endpoint*latency*"
+        confidence: 0.6
+
+  db_query_latency:
+    description: Database query execution time
+    category: latency
+    unit: s
+    metric_patterns:
+      - pattern: "db_query_duration_seconds*"
+        confidence: 0.9
+      - pattern: "*sql*duration*"
+        confidence: 0.7
+      - pattern: "*db*latency*"
+        confidence: 0.7
+      - pattern: "*query*duration*"
+        confidence: 0.6
+      - pattern: "*database*latency*"
+        confidence: 0.5
+
+  # ── Traffic / throughput ───────────────────────────────────────────────
+
+  request_rate:
+    description: HTTP/gRPC request throughput
+    category: throughput
+    unit: reqps
+    metric_patterns:
+      - pattern: "http_requests_total"
+        confidence: 0.95
+      - pattern: "*_requests_total"
+        confidence: 0.8
+      - pattern: "*_request_count*"
+        confidence: 0.7
+      - pattern: "*_req_total"
+        confidence: 0.7
+      - pattern: "*_rpc_*_total"
+        confidence: 0.6
+
+  message_throughput:
+    description: Message processing rate
+    category: throughput
+    unit: reqps
+    metric_patterns:
+      - pattern: "*messages_sent_total"
+        confidence: 0.8
+      - pattern: "*messages_received_total"
+        confidence: 0.8
+      - pattern: "*_produced_total"
+        confidence: 0.7
+      - pattern: "*_consumed_total"
+        confidence: 0.7
+
+  # ── Errors ─────────────────────────────────────────────────────────────
+
+  error_rate:
+    description: Rate of errors or failed requests
+    category: errors
+    unit: percentunit
+    metric_patterns:
+      - pattern: "http_requests_total"
+        confidence: 0.85
+      - pattern: "*_errors_total"
+        confidence: 0.9
+      - pattern: "*_failures_total"
+        confidence: 0.85
+      - pattern: "*_failed_total"
+        confidence: 0.8
+      - pattern: "*error_count*"
+        confidence: 0.7
+      - pattern: "*_5xx_*"
+        confidence: 0.75
+
+  # ── Saturation ─────────────────────────────────────────────────────────
+
+  cpu_usage:
+    description: CPU utilization
+    category: saturation
+    unit: s
+    metric_patterns:
+      - pattern: "container_cpu_usage_seconds_total"
+        confidence: 0.95
+      - pattern: "process_cpu_seconds_total"
+        confidence: 0.9
+      - pattern: "node_cpu_seconds_total"
+        confidence: 0.85
+      - pattern: "*cpu*usage*"
+        confidence: 0.6
+      - pattern: "*cpu*utilization*"
+        confidence: 0.6
+
+  memory_usage:
+    description: Memory utilization
+    category: saturation
+    unit: bytes
+    metric_patterns:
+      - pattern: "container_memory_working_set_bytes"
+        confidence: 0.95
+      - pattern: "process_resident_memory_bytes"
+        confidence: 0.9
+      - pattern: "node_memory_MemAvailable_bytes"
+        confidence: 0.85
+      - pattern: "*memory*working_set*"
+        confidence: 0.7
+      - pattern: "*memory*usage*bytes"
+        confidence: 0.6
+      - pattern: "*_mem_*bytes"
+        confidence: 0.5
+
+  in_flight_requests:
+    description: Concurrent request count (saturation signal)
+    category: saturation
+    unit: short
+    metric_patterns:
+      - pattern: "http_requests_in_flight"
+        confidence: 0.95
+      - pattern: "*_in_flight"
+        confidence: 0.8
+      - pattern: "*_active_requests"
+        confidence: 0.7
+      - pattern: "*_concurrent_*"
+        confidence: 0.6
+
+  queue_depth:
+    description: Queue backlog size
+    category: saturation
+    unit: short
+    metric_patterns:
+      - pattern: "*queue*depth*"
+        confidence: 0.9
+      - pattern: "*queue*size*"
+        confidence: 0.85
+      - pattern: "*queue*length*"
+        confidence: 0.85
+      - pattern: "*_backlog*"
+        confidence: 0.7
+      - pattern: "*_pending_*"
+        confidence: 0.5
+
+  db_connection_pool:
+    description: Database connection pool usage
+    category: saturation
+    unit: short
+    metric_patterns:
+      - pattern: "db_connections_active"
+        confidence: 0.9
+      - pattern: "*connection*pool*active*"
+        confidence: 0.8
+      - pattern: "*db*connections*"
+        confidence: 0.7
+      - pattern: "*pool*size*"
+        confidence: 0.5
+
+  # ── Stability ──────────────────────────────────────────────────────────
+
+  pod_restarts:
+    description: Container/pod restart count
+    category: stability
+    unit: short
+    metric_patterns:
+      - pattern: "kube_pod_container_status_restarts_total"
+        confidence: 0.95
+      - pattern: "kube_pod_container_restarts_total"
+        confidence: 0.9
+      - pattern: "*restarts_total"
+        confidence: 0.7
+      - pattern: "*restart_count*"
+        confidence: 0.6
+
+  # ── Authentication & identity ──────────────────────────────────────────
+
+  auth_request_rate:
+    description: Authentication request throughput
+    category: auth
+    unit: reqps
+    metric_patterns:
+      - pattern: "auth_requests_total"
+        confidence: 0.9
+      - pattern: "*auth*requests*total"
+        confidence: 0.8
+      - pattern: "*authentication*total"
+        confidence: 0.7
+      - pattern: "*login*total"
+        confidence: 0.65
+      - pattern: "*sso*requests*"
+        confidence: 0.6
+      - pattern: "*oauth*requests*"
+        confidence: 0.6
+
+  auth_failure_count:
+    description: Failed authentication attempts
+    category: auth
+    unit: short
+    metric_patterns:
+      - pattern: "failed_login_attempts_total"
+        confidence: 0.9
+      - pattern: "*auth*fail*total"
+        confidence: 0.85
+      - pattern: "*login*fail*"
+        confidence: 0.8
+      - pattern: "*authentication*error*"
+        confidence: 0.75
+      - pattern: "*auth*denied*"
+        confidence: 0.7
+      - pattern: "*sso*fail*"
+        confidence: 0.65
+      - pattern: "*oauth*error*"
+        confidence: 0.6
+
+  auth_latency:
+    description: Authentication request latency
+    category: auth
+    unit: s
+    metric_patterns:
+      - pattern: "auth_latency_seconds*"
+        confidence: 0.9
+      - pattern: "*auth*duration*"
+        confidence: 0.75
+      - pattern: "*auth*latency*"
+        confidence: 0.75
+      - pattern: "*token*validation*duration*"
+        confidence: 0.7
+      - pattern: "*login*latency*"
+        confidence: 0.65
+
+  # ── Caching ────────────────────────────────────────────────────────────
+
+  cache_hit_ratio:
+    description: Cache hit/miss ratio
+    category: caching
+    unit: percentunit
+    metric_patterns:
+      - pattern: "*cache*hit*"
+        confidence: 0.85
+      - pattern: "*cache*miss*"
+        confidence: 0.8
+      - pattern: "*cache*ratio*"
+        confidence: 0.75
+
+  # ── Networking ─────────────────────────────────────────────────────────
+
+  network_bytes:
+    description: Network traffic volume
+    category: network
+    unit: bytes
+    metric_patterns:
+      - pattern: "*bytes_received*"
+        confidence: 0.8
+      - pattern: "*bytes_transmitted*"
+        confidence: 0.8
+      - pattern: "*network*bytes*"
+        confidence: 0.7
+      - pattern: "*rx_bytes*"
+        confidence: 0.7
+      - pattern: "*tx_bytes*"
+        confidence: 0.7
+
+  dns_failures:
+    description: DNS lookup failures
+    category: network
+    unit: short
+    metric_patterns:
+      - pattern: "*dns*fail*"
+        confidence: 0.85
+      - pattern: "*dns*error*"
+        confidence: 0.8
+      - pattern: "*resolve*fail*"
+        confidence: 0.7
+
+  tls_handshake_failures:
+    description: TLS/SSL handshake failures
+    category: network
+    unit: short
+    metric_patterns:
+      - pattern: "*tls*handshake*fail*"
+        confidence: 0.9
+      - pattern: "*ssl*error*"
+        confidence: 0.8
+      - pattern: "*certificate*error*"
+        confidence: 0.75
+      - pattern: "*mtls*reject*"
+        confidence: 0.8
+
+  # ── Messaging / queues ─────────────────────────────────────────────────
+
+  consumer_lag:
+    description: Message consumer lag
+    category: messaging
+    unit: short
+    metric_patterns:
+      - pattern: "*consumer*lag*"
+        confidence: 0.9
+      - pattern: "*consumer*offset*"
+        confidence: 0.75
+      - pattern: "*kafka*lag*"
+        confidence: 0.85
+      - pattern: "*sqs*age*"
+        confidence: 0.7
+
+  # ── Storage ────────────────────────────────────────────────────────────
+
+  disk_usage:
+    description: Disk space utilization
+    category: storage
+    unit: bytes
+    metric_patterns:
+      - pattern: "node_filesystem_avail_bytes"
+        confidence: 0.9
+      - pattern: "node_filesystem_size_bytes"
+        confidence: 0.85
+      - pattern: "*disk*usage*"
+        confidence: 0.7
+      - pattern: "*filesystem*"
+        confidence: 0.6
+
+  io_wait:
+    description: I/O wait time
+    category: storage
+    unit: s
+    metric_patterns:
+      - pattern: "*iowait*"
+        confidence: 0.85
+      - pattern: "*io*wait*"
+        confidence: 0.8
+      - pattern: "*disk*latency*"
+        confidence: 0.7
+
+  # ── Serverless ─────────────────────────────────────────────────────────
+
+  cold_start_duration:
+    description: Serverless cold start latency
+    category: serverless
+    unit: s
+    metric_patterns:
+      - pattern: "*cold_start*duration*"
+        confidence: 0.9
+      - pattern: "*init_duration*"
+        confidence: 0.8
+      - pattern: "*lambda*cold*"
+        confidence: 0.7
+
+  invocation_errors:
+    description: Serverless invocation failures
+    category: serverless
+    unit: short
+    metric_patterns:
+      - pattern: "*invocation*error*"
+        confidence: 0.85
+      - pattern: "*lambda*error*"
+        confidence: 0.8
+      - pattern: "*function*error*"
+        confidence: 0.7
+
+  # ── Rate limiting ──────────────────────────────────────────────────────
+
+  rate_limit_hits:
+    description: Requests rejected by rate limiting
+    category: traffic_management
+    unit: short
+    metric_patterns:
+      - pattern: "*rate_limit*"
+        confidence: 0.9
+      - pattern: "*throttle*"
+        confidence: 0.8
+      - pattern: "*429*"
+        confidence: 0.7
+      - pattern: "*blocked*requests*"
+        confidence: 0.6

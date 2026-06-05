@@ -6,6 +6,7 @@ Grafana exposes these via its datasource resource API:
   POST /api/datasources/uid/{uid}/resources/metrics   {namespace, region}
   POST /api/datasources/uid/{uid}/resources/dimension-keys  {namespace, region, metricName}
 """
+
 from __future__ import annotations
 
 import structlog
@@ -102,8 +103,7 @@ def _select_namespaces(keywords: list[str], available: list[str]) -> list[str]:
     # Narrow fallback: only top-5 priority namespaces to limit noise
     result = [ns for ns in PRIORITY_NAMESPACES[:5] if ns in available_set]
     if result:
-        logger.info("cloudwatch_namespace_fallback", reason="no_keyword_match",
-                    namespaces=result)
+        logger.info("cloudwatch_namespace_fallback", reason="no_keyword_match", namespaces=result)
         return result
 
     # Last resort: any priority namespace that exists
@@ -131,17 +131,20 @@ class CloudWatchAdapter(DatasourceAdapter):
         entries: list[MetricEntry] = []
 
         # 1. List available namespaces
-        ns_fetch_failed = False
         try:
-            ns_resp = await client.datasource_resource(
-                datasource.uid, "namespaces", {"region": default_region}
-            )
-            available_ns: list[str] = ns_resp if isinstance(ns_resp, list) else list(ns_resp.keys()) if isinstance(ns_resp, dict) else []
+            ns_resp = await client.datasource_resource(datasource.uid, "namespaces", {"region": default_region})
+            if isinstance(ns_resp, list):
+                available_ns: list[str] = ns_resp
+            elif isinstance(ns_resp, dict):
+                available_ns = list(ns_resp.keys())
+            else:
+                available_ns = []
         except Exception:
-            ns_fetch_failed = True
-            logger.warning("cloudwatch_namespace_list_hard_failure",
-                           datasource=datasource.name,
-                           fallback="static_priority_namespaces")
+            logger.warning(
+                "cloudwatch_namespace_list_hard_failure",
+                datasource=datasource.name,
+                fallback="static_priority_namespaces",
+            )
             available_ns = PRIORITY_NAMESPACES
 
         # 2. Select namespaces relevant to the intent
@@ -156,7 +159,12 @@ class CloudWatchAdapter(DatasourceAdapter):
                     "metrics",
                     {"region": default_region, "namespace": ns},
                 )
-                metric_names: list[str] = metrics_resp if isinstance(metrics_resp, list) else list(metrics_resp.keys()) if isinstance(metrics_resp, dict) else []
+                if isinstance(metrics_resp, list):
+                    metric_names: list[str] = metrics_resp
+                elif isinstance(metrics_resp, dict):
+                    metric_names = list(metrics_resp.keys())
+                else:
+                    metric_names = []
             except Exception:
                 logger.warning("cloudwatch_metrics_failed", datasource=datasource.name, namespace=ns)
                 continue

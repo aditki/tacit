@@ -1,25 +1,22 @@
 """End-to-end test: sends a prompt through the full pipeline and prints the dashboard URL."""
+
 import asyncio
-import sys
 import os
+import sys
 
 # Ensure we load .env from the project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(os.path.join(os.path.dirname(__file__), ".."))
 
-from dashforge.models.schemas import DashRequest
-from dashforge.pipeline import run_pipeline
+from dashforge.models.schemas import DashRequest  # noqa: E402
+from dashforge.pipeline import run_pipeline  # noqa: E402
 
-
-PROMPT = (
-    "High 5xx error rate on the checkout service in the last 30 minutes. "
-    "Users are reporting failed payments."
-)
+PROMPT = "High 5xx error rate on the checkout service in the last 30 minutes. " "Users are reporting failed payments."
 
 
 async def main():
     print(f"\n{'='*70}")
-    print(f"DashForge E2E Test")
+    print("DashForge E2E Test")
     print(f"{'='*70}")
     print(f"Prompt: {PROMPT}\n")
 
@@ -33,7 +30,7 @@ async def main():
     response = await run_pipeline(request)
 
     print(f"\n{'='*70}")
-    print(f"Result:")
+    print("Result:")
     print(f"  Dashboard URL:  {response.dashboard_url}")
     print(f"  Dashboard UID:  {response.dashboard_uid}")
     print(f"  Panel count:    {response.panel_count}")

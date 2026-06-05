@@ -6,6 +6,7 @@ from typing import Any
 
 try:
     import truststore
+
     truststore.inject_into_ssl()
 except ImportError:
     pass  # truststore not installed; fall back to default SSL
@@ -90,7 +91,8 @@ class Settings(BaseSettings):
     llm_azure_deployment: str = ""  # Azure deployment name (defaults to llm_model if empty)
     # AWS Bedrock-specific (only used when llm_provider=bedrock)
     llm_bedrock_region: str = "us-east-1"  # AWS region for Bedrock endpoint
-    llm_bedrock_model_id: str = ""  # Bedrock model ID (e.g. anthropic.claude-sonnet-4-20250514-v1:0); defaults to llm_model
+    # Bedrock model ID; defaults to llm_model.
+    llm_bedrock_model_id: str = ""
     llm_bedrock_role_arn: str = ""  # Optional IAM role ARN to assume (cross-account)
     llm_aws_access_key_id: str = Field(default="", repr=False)  # Optional explicit AWS key
     llm_aws_secret_access_key: str = Field(default="", repr=False)  # Optional explicit AWS secret
@@ -152,6 +154,7 @@ def _load_settings() -> Settings:
     config_path = _find_config_file()
     if config_path:
         import structlog
+
         structlog.get_logger().info("config_loaded", source=str(config_path))
     return Settings()
 

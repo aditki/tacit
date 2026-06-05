@@ -11,6 +11,7 @@ Usage:
 Requires SIGNALFX_API_TOKEN in config for realm lookup, and
 SIGNALFX_INGEST_TOKEN env var for ingestion.
 """
+
 from __future__ import annotations
 
 import math
@@ -30,19 +31,24 @@ from dashforge.grafana.adapters.signalfx import KEYWORD_METRIC_MAP
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+
 def _ok(msg: str) -> None:
     print(f"  \033[92m✔\033[0m {msg}")
+
 
 def _fail(msg: str) -> None:
     print(f"  \033[91m✘\033[0m {msg}")
 
+
 def _info(msg: str) -> None:
     print(f"  \033[90m→\033[0m {msg}")
+
 
 def _header(msg: str) -> None:
     print(f"\n\033[1;34m{'─' * 60}\033[0m")
     print(f"\033[1;34m  {msg}\033[0m")
     print(f"\033[1;34m{'─' * 60}\033[0m")
+
 
 # ── Extract metric names from archetypes ─────────────────────────────────────
 
@@ -56,12 +62,46 @@ _PROMQL_METRIC_RE = re.compile(
 
 # PromQL functions/keywords to exclude from metric extraction
 _PROMQL_FUNCS = {
-    "sum", "rate", "increase", "histogram_quantile", "count", "avg", "min",
-    "max", "topk", "bottomk", "by", "without", "offset", "on", "ignoring",
-    "group_left", "group_right", "le", "time", "job", "status", "method",
-    "path", "container", "pod", "namespace", "reason", "phase", "type",
-    "condition", "node", "rcode", "state", "resource", "cpu", "fstype",
-    "mountpoint", "gpu", "device", "common_name",
+    "sum",
+    "rate",
+    "increase",
+    "histogram_quantile",
+    "count",
+    "avg",
+    "min",
+    "max",
+    "topk",
+    "bottomk",
+    "by",
+    "without",
+    "offset",
+    "on",
+    "ignoring",
+    "group_left",
+    "group_right",
+    "le",
+    "time",
+    "job",
+    "status",
+    "method",
+    "path",
+    "container",
+    "pod",
+    "namespace",
+    "reason",
+    "phase",
+    "type",
+    "condition",
+    "node",
+    "rcode",
+    "state",
+    "resource",
+    "cpu",
+    "fstype",
+    "mountpoint",
+    "gpu",
+    "device",
+    "common_name",
 }
 
 
@@ -99,6 +139,7 @@ def extract_metrics_from_keyword_map() -> set[str]:
                 metrics.add(name)
     return metrics
 
+
 # ── Dimension + value templates for realistic data ───────────────────────────
 
 SERVICES = ["checkout", "payment", "catalog", "gateway", "auth", "user-service"]
@@ -111,6 +152,7 @@ ENDPOINTS = ["/api/orders", "/api/payments", "/api/products", "/api/auth", "/hea
 QUEUES = ["order-processing", "payment-events", "email-notifications"]
 DEVICES = ["sda", "sdb", "nvme0n1"]
 GPUS = ["gpu-0", "gpu-1"]
+
 
 def _dims_for_metric(metric: str) -> list[dict[str, str]]:
     """Generate 2-4 dimension combos for a metric based on its name."""
@@ -195,6 +237,7 @@ def _value_for_metric(metric: str, t_offset: int) -> float:
 
 # ── Ingest ───────────────────────────────────────────────────────────────────
 
+
 def build_payload(metrics: set[str], num_points: int = 20) -> dict:
     """Build a SignalFx ingest payload with gauge datapoints for all metrics."""
     gauges = []
@@ -205,12 +248,14 @@ def build_payload(metrics: set[str], num_points: int = 20) -> dict:
         for dims in dim_combos:
             for i in range(num_points):
                 ts = now_ms - (num_points - i) * 10_000  # 10s apart
-                gauges.append({
-                    "metric": metric,
-                    "value": _value_for_metric(metric, i),
-                    "dimensions": dims,
-                    "timestamp": ts,
-                })
+                gauges.append(
+                    {
+                        "metric": metric,
+                        "value": _value_for_metric(metric, i),
+                        "dimensions": dims,
+                        "timestamp": ts,
+                    }
+                )
 
     return {"gauge": gauges}
 
@@ -230,6 +275,7 @@ def ingest_batch(realm: str, token: str, payload: dict, batch_label: str) -> boo
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
+
 
 def main():
     realm = settings.signalfx_realm
@@ -271,7 +317,7 @@ def main():
     _header("Step 3: Ingest")
     gauges = full_payload["gauge"]
     batch_size = 10_000
-    batches = [gauges[i:i + batch_size] for i in range(0, len(gauges), batch_size)]
+    batches = [gauges[i : i + batch_size] for i in range(0, len(gauges), batch_size)]
 
     success_count = 0
     for idx, batch in enumerate(batches):

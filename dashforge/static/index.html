@@ -174,6 +174,68 @@
     }
     .hist-back { cursor: pointer; color: #6366f1; font-size: 0.82rem; }
     .hist-back:hover { text-decoration: underline; }
+
+    /* Learning / Signals */
+    .form-row { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; align-items: center; }
+    .form-row label { font-size: 0.82rem; color: #9ca3af; min-width: 80px; }
+    .form-row input, .form-row select {
+      flex: 1; background: #0f1117; border: 1px solid #3b3f54; border-radius: 6px;
+      color: #e4e6eb; padding: 0.4rem 0.6rem; font-size: 0.85rem;
+    }
+    .form-row input:focus, .form-row select:focus { outline: none; border-color: #6366f1; }
+    .toggle-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+    .toggle-label { font-size: 0.82rem; color: #9ca3af; }
+    .toggle {
+      width: 36px; height: 20px; background: #3b3f54; border-radius: 10px;
+      cursor: pointer; position: relative; transition: background 0.2s;
+    }
+    .toggle.on { background: #6366f1; }
+    .toggle::after {
+      content: ''; position: absolute; width: 16px; height: 16px;
+      background: #fff; border-radius: 50%; top: 2px; left: 2px; transition: left 0.2s;
+    }
+    .toggle.on::after { left: 18px; }
+    .ingest-card {
+      background: #0f1117; border: 1px solid #2d3040; border-radius: 8px;
+      padding: 1rem; margin-bottom: 0.75rem;
+    }
+    .ingest-card .ingest-title { font-size: 0.9rem; color: #c7d2fe; font-weight: 600; }
+    .ingest-card .ingest-meta { font-size: 0.8rem; color: #6b7280; margin-top: 0.25rem; }
+    .ingest-card .ingest-metrics { font-size: 0.78rem; color: #9ca3af; margin-top: 0.5rem; }
+    .ingest-card .ingest-signals { margin-top: 0.5rem; }
+    .signal-chip {
+      display: inline-block; background: #1e1b4b; border: 1px solid #3730a3;
+      border-radius: 12px; padding: 0.15rem 0.5rem; font-size: 0.7rem;
+      color: #a5b4fc; margin: 0.1rem; cursor: default;
+    }
+    .signal-chip.cat-latency { background: #1e1b4b; border-color: #4338ca; }
+    .signal-chip.cat-errors { background: #450a0a; border-color: #991b1b; color: #fca5a5; }
+    .signal-chip.cat-saturation { background: #451a03; border-color: #92400e; color: #fbbf24; }
+    .signal-chip.cat-throughput { background: #064e3b; border-color: #065f46; color: #34d399; }
+    .signal-card {
+      background: #0f1117; border: 1px solid #2d3040; border-radius: 8px;
+      padding: 1rem; margin-bottom: 0.75rem;
+    }
+    .signal-card h3 { font-size: 0.9rem; color: #c7d2fe; margin-bottom: 0.15rem; }
+    .signal-card .signal-desc { font-size: 0.8rem; color: #6b7280; margin-bottom: 0.5rem; }
+    .signal-card .signal-patterns { font-size: 0.78rem; color: #9ca3af; }
+    .signal-pattern {
+      background: #1a1d27; border-radius: 4px; padding: 0.2rem 0.5rem;
+      margin: 0.15rem 0; font-family: 'SF Mono', monospace; font-size: 0.75rem;
+      color: #a5b4fc; display: inline-block;
+    }
+    .confidence-bar {
+      display: inline-block; height: 6px; border-radius: 3px;
+      background: #3b3f54; width: 60px; margin-left: 0.5rem; vertical-align: middle;
+    }
+    .confidence-fill {
+      height: 100%; border-radius: 3px; background: #6366f1;
+    }
+    .section-divider {
+      border: none; border-top: 1px solid #2d3040; margin: 1rem 0;
+    }
+    .teach-form { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #2d3040; }
+    .teach-form h3 { font-size: 0.85rem; color: #9ca3af; margin-bottom: 0.75rem; }
   </style>
 </head>
 <body>
@@ -182,6 +244,8 @@
 
   <div class="tabs">
     <div class="tab active" onclick="switchTab('generate')">Generate</div>
+    <div class="tab" onclick="switchTab('learning')">Learning</div>
+    <div class="tab" onclick="switchTab('signals')">Signals</div>
     <div class="tab" onclick="switchTab('insights')">Insights</div>
     <div class="tab" onclick="switchTab('archetypes')">Archetypes</div>
     <div class="tab" onclick="switchTab('history')">History</div>
@@ -203,6 +267,74 @@
       </div>
     </div>
     <div class="result" id="result"></div>
+  </div>
+
+  <!-- Learning tab -->
+  <div class="tab-content" id="tab-learning">
+    <div class="card">
+      <div class="result-label">Ingest Dashboard</div>
+      <p style="font-size:0.8rem;color:#6b7280;margin-bottom:1rem">Learn signal mappings from an existing dashboard. Extracts metrics, co-occurrence, aggregation patterns, and infers semantic signals.</p>
+      <div class="form-row">
+        <label>Backend</label>
+        <select id="ingest-backend">
+          <option value="">Auto (first active)</option>
+          <option value="grafana">Grafana</option>
+          <option value="signalfx">SignalFx</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Dashboard</label>
+        <input type="text" id="ingest-uid" placeholder="Dashboard UID (e.g. dashforge-signal-coverage)">
+      </div>
+      <div class="toggle-row">
+        <div class="toggle" id="auto-approve-toggle" onclick="toggleAutoApprove()"></div>
+        <span class="toggle-label">Auto-approve signal mappings</span>
+      </div>
+      <div class="actions">
+        <button class="btn-primary" id="ingest-btn" onclick="ingestDashboard()">Ingest Dashboard</button>
+      </div>
+      <div id="ingest-result"></div>
+
+      <hr class="section-divider">
+      <div class="result-label">Ingested Dashboards</div>
+      <div id="ingested-list"><div class="status">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Signals tab -->
+  <div class="tab-content" id="tab-signals">
+    <div class="card">
+      <div class="teach-form" style="border-top:none;padding-top:0;margin-top:0">
+        <h3>Teach Signal Mapping</h3>
+        <div class="form-row">
+          <label>Signal</label>
+          <select id="teach-signal"></select>
+        </div>
+        <div class="form-row">
+          <label>Metric</label>
+          <input type="text" id="teach-metric" placeholder="e.g. my_custom_latency_seconds">
+        </div>
+        <div class="form-row">
+          <label>Confidence</label>
+          <input type="number" id="teach-confidence" value="0.8" min="0" max="1" step="0.05" style="max-width:100px">
+        </div>
+        <div class="form-row">
+          <label>Service</label>
+          <input type="text" id="teach-service" placeholder="Optional: limit to specific service">
+        </div>
+        <div class="actions">
+          <button class="btn-primary btn-sm" onclick="teachSignal()">Teach Mapping</button>
+          <span id="teach-status" style="font-size:0.8rem"></span>
+        </div>
+      </div>
+
+      <hr class="section-divider">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+        <div class="result-label" style="margin:0">Signal Taxonomy</div>
+        <div id="signal-stats" style="font-size:0.75rem;color:#6b7280"></div>
+      </div>
+      <div id="signals-content"><div class="status">Loading...</div></div>
+    </div>
   </div>
 
   <!-- Insights tab -->
@@ -247,15 +379,19 @@
     const BASE = window.location.origin;
     let lastDashboardUid = null;
 
+    const TAB_ORDER = ['generate','learning','signals','insights','archetypes','history'];
+
     /* ── Tabs ──────────────────────────────────────────────────── */
     function switchTab(name) {
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
       document.querySelector(`#tab-${name}`).classList.add('active');
-      document.querySelectorAll('.tab')[['generate','insights','archetypes','history'].indexOf(name)].classList.add('active');
+      document.querySelectorAll('.tab')[TAB_ORDER.indexOf(name)].classList.add('active');
       if (name === 'insights') loadInsights();
       if (name === 'archetypes') loadArchetypes();
       if (name === 'history') loadHistory();
+      if (name === 'learning') loadIngestedDashboards();
+      if (name === 'signals') loadSignals();
     }
 
     function fill(el) { document.getElementById('prompt').value = el.textContent; }
@@ -278,13 +414,13 @@
         });
         if (!resp.ok) {
           const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-          throw new Error(err.detail || `HTTP ${resp.status}`);
+          throw new Error(errMsg(err, `HTTP ${resp.status}`));
         }
         const data = await resp.json();
         lastDashboardUid = data.dashboard_uid;
         const dashUrl = data.dashboard_url ? data.dashboard_url.replace('http://localhost:3000', 'http://' + window.location.hostname + ':3000') : '';
-        const grafanaLink = dashUrl ? `<div class="result-url"><a href="${dashUrl}" target="_blank">${data.dashboard_uid} &mdash; Open in Grafana &rarr;</a></div>` : '';
-        const sfxLink = data.signalfx_url ? `<div class="result-url" style="margin-top:4px"><a href="${data.signalfx_url}" target="_blank">Open in SignalFx &rarr;</a></div>` : '';
+        const grafanaLink = dashUrl ? `<div class="result-url"><a href="${esc(dashUrl)}" target="_blank">${esc(data.dashboard_uid)} &mdash; Open in Grafana &rarr;</a></div>` : '';
+        const sfxLink = data.signalfx_url ? `<div class="result-url" style="margin-top:4px"><a href="${esc(data.signalfx_url)}" target="_blank">Open in SignalFx &rarr;</a></div>` : '';
 
         result.innerHTML = `
           <div class="result-card success">
@@ -293,7 +429,7 @@
             ${sfxLink}
             <div class="result-meta">
               <strong>${data.panel_count}</strong> panels<br>
-              ${data.summary.replace(/\n/g, '<br>')}
+              ${esc(data.summary).replace(/\n/g, '<br>')}
             </div>
             <div class="feedback-form" id="feedback-form">
               <h3>Rate this dashboard</h3>
@@ -317,7 +453,7 @@
         result.innerHTML = `
           <div class="result-card error">
             <div class="result-label">Error</div>
-            <div class="result-meta" style="color:#fca5a5">${e.message}</div>
+            <div class="result-meta" style="color:#fca5a5">${esc(e.message)}</div>
           </div>`;
       } finally {
         btn.disabled = false;
@@ -383,7 +519,7 @@
           document.getElementById('feedback-form').querySelectorAll('button,textarea').forEach(el => el.disabled = true);
         } else {
           const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-          statusEl.textContent = `Error: ${err.detail || resp.statusText}`;
+          statusEl.textContent = `Error: ${errMsg(err, resp.statusText)}`;
           statusEl.style.color = '#ef4444';
         }
       } catch(e) {
@@ -434,7 +570,7 @@
 
         el.innerHTML = html;
       } catch (e) {
-        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${e.message}</div>`;
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${esc(e.message)}</div>`;
       }
     }
 
@@ -447,17 +583,17 @@
         const data = await resp.json();
         let html = '';
         for (const a of data.archetypes) {
-          const tags = a.tags.map(t => `<span class="arch-tag">${t}</span>`).join('');
-          const panels = a.panels.map(p => `<li>${p}</li>`).join('');
+          const tags = a.tags.map(t => `<span class="arch-tag">${esc(t)}</span>`).join('');
+          const panels = a.panels.map(p => `<li>${esc(p)}</li>`).join('');
           html += `<div class="arch-card">
-            <h3>${a.name} <span style="font-size:0.75rem;color:#6b7280">(${a.id})</span></h3>
-            <div class="arch-desc">${a.description} ${tags}</div>
+            <h3>${esc(a.name)} <span style="font-size:0.75rem;color:#6b7280">(${esc(a.id)})</span></h3>
+            <div class="arch-desc">${esc(a.description)} ${tags}</div>
             <div class="arch-panels">${a.panel_count} panels: <ul style="margin:0.25rem 0 0 1.25rem;font-size:0.8rem">${panels}</ul></div>
           </div>`;
         }
         el.innerHTML = html || '<div class="status">No archetypes loaded</div>';
       } catch (e) {
-        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${e.message}</div>`;
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${esc(e.message)}</div>`;
       }
     }
 
@@ -501,7 +637,7 @@
         html += '</tbody></table>';
         el.innerHTML = html;
       } catch (e) {
-        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${e.message}</div>`;
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
       }
     }
 
@@ -513,9 +649,9 @@
         if (!resp.ok) throw new Error('Not found');
         const inv = await resp.json();
         const badge = statusBadge(inv.status);
-        const archs = (inv.archetypes || []).map(a => `${a.type} (${Math.round(a.confidence*100)}%)`).join(', ') || '—';
-        const metrics = (inv.metrics_selected || []).join(', ') || '—';
-        const dsTypes = (inv.datasource_types || []).join(', ') || '—';
+        const archs = (inv.archetypes || []).map(a => `${esc(a.type)} (${Math.round(a.confidence*100)}%)`).join(', ') || '—';
+        const metrics = (inv.metrics_selected || []).map(m => esc(m)).join(', ') || '—';
+        const dsTypes = (inv.datasource_types || []).map(d => esc(d)).join(', ') || '—';
 
         let queriesHtml = '';
         for (const q of (inv.generated_queries || []).slice(0, 15)) {
@@ -572,10 +708,10 @@
             <h4>Timings</h4>
             <div>${timingsHtml || '<span class="kv">—</span>'}</div>
 
-            ${inv.dashboard_url ? `<h4>Result</h4><div class="kv"><a href="${inv.dashboard_url}" target="_blank" style="color:#6366f1">${inv.dashboard_url} &rarr;</a></div>` : ''}
+            ${inv.dashboard_url ? `<h4>Result</h4><div class="kv"><a href="${esc(inv.dashboard_url)}" target="_blank" style="color:#6366f1">${esc(inv.dashboard_url)} &rarr;</a></div>` : ''}
           </div>`;
       } catch (e) {
-        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${e.message}</div>`;
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
       }
     }
 
@@ -602,7 +738,7 @@
             <div class="stat-card"><div class="stat-value">${s.archetype_path || 0} / ${s.freeform_path || 0}</div><div class="stat-label">Archetype / Freeform</div></div>
           </div>`;
       } catch (e) {
-        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${e.message}</div>`;
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
       }
     }
 
@@ -612,6 +748,287 @@
     }
 
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    function escAttr(s) {
+      return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    // Normalize an error response body into a readable string. FastAPI returns
+    // a plain string `detail` for HTTPExceptions but an array of
+    // {loc, msg, type} objects for 422 validation errors.
+    function errMsg(body, fallback) {
+      const d = body && body.detail;
+      if (typeof d === 'string') return d;
+      if (Array.isArray(d)) {
+        return d.map(e => {
+          const field = Array.isArray(e.loc) ? e.loc.filter(p => p !== 'body').join('.') : '';
+          return field ? `${field}: ${e.msg}` : e.msg;
+        }).join('; ');
+      }
+      return fallback;
+    }
+
+    /* ── Learning tab ─────────────────────────────────────────── */
+    let autoApprove = false;
+
+    function toggleAutoApprove() {
+      autoApprove = !autoApprove;
+      document.getElementById('auto-approve-toggle').classList.toggle('on', autoApprove);
+    }
+
+    async function ingestDashboard() {
+      const uid = document.getElementById('ingest-uid').value.trim();
+      if (!uid) { alert('Enter a dashboard UID'); return; }
+      const backend = document.getElementById('ingest-backend').value;
+      const btn = document.getElementById('ingest-btn');
+      const resultEl = document.getElementById('ingest-result');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>Ingesting...';
+      resultEl.innerHTML = '<div class="status"><span class="spinner"></span>Fetching and parsing dashboard...</div>';
+
+      try {
+        const body = { dashboard_uid: uid, auto_approve: autoApprove };
+        if (backend) body.backend = backend;
+        const resp = await fetch(`${BASE}/api/v1/learn/dashboard`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+          throw new Error(errMsg(err, `HTTP ${resp.status}`));
+        }
+        const data = await resp.json();
+        const signals = (data.signals_inferred || []);
+        const signalChips = signals.slice(0, 20).map(s =>
+          `<span class="signal-chip">${esc(s.signal_type)} <span style="opacity:0.6">${Math.round((s.confidence||0)*100)}%</span></span>`
+        ).join('');
+
+        resultEl.innerHTML = `
+          <div class="result-card success" style="margin-top:1rem">
+            <div class="result-label">Ingestion ${esc(data.status)}</div>
+            <div class="ingest-title">${esc(data.dashboard_title || uid)}</div>
+            <div class="ingest-meta">
+              ${data.backend ? `<strong>Backend:</strong> ${esc(data.backend)} &middot; ` : ''}
+              <strong>${data.panel_count || 0}</strong> panels &middot;
+              <strong>${(data.metrics_found || []).length}</strong> metrics &middot;
+              <strong>${signals.length}</strong> signals inferred
+            </div>
+            <div class="ingest-metrics"><strong>Metrics:</strong> ${(data.metrics_found || []).map(m => `<code>${esc(m)}</code>`).join(', ')}</div>
+            ${signalChips ? `<div class="ingest-signals">${signalChips}</div>` : ''}
+            ${data.archetype_yaml ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Generated archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(data.archetype_yaml)}</pre></details>` : ''}
+          </div>`;
+        loadIngestedDashboards();
+      } catch (e) {
+        resultEl.innerHTML = `<div class="result-card error" style="margin-top:1rem"><div class="result-label">Error</div><div class="result-meta" style="color:#fca5a5">${esc(e.message)}</div></div>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Ingest Dashboard';
+      }
+    }
+
+    async function loadIngestedDashboards() {
+      const el = document.getElementById('ingested-list');
+      el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      try {
+        const resp = await fetch(`${BASE}/api/v1/learn/dashboards`);
+        const data = await resp.json();
+        const dashboards = data.dashboards || [];
+        if (!dashboards.length) {
+          el.innerHTML = '<div class="status">No dashboards ingested yet. Paste a UID above to get started.</div>';
+          return;
+        }
+        let html = '';
+        for (const d of dashboards) {
+          const badge = d.status === 'approved'
+            ? '<span class="badge badge-success">approved</span>'
+            : '<span class="badge badge-running">pending</span>';
+          const signals = (d.signals_inferred || []).slice(0, 8).map(s => {
+            if (typeof s === 'string') {
+              return `<span class="signal-chip">${esc(s)}</span>`;
+            }
+            const signalType = esc(s.signal_type || 'unknown');
+            const metric = s.metric ? ` &rarr; <code>${esc(s.metric)}</code>` : '';
+            const confidence = Number.isFinite(s.confidence)
+              ? ` (${Math.round(s.confidence * 100)}%)`
+              : '';
+            return `<span class="signal-chip">${signalType}${metric}${confidence}</span>`;
+          }).join('');
+          const archetypeYaml = d.archetype_generated
+            ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Generated archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(d.archetype_generated)}</pre></details>`
+            : '';
+          const approveBtn = d.status === 'pending'
+            ? `<button class="btn-sm btn-success approve-dashboard-btn" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Approve</button>`
+            : '';
+          html += `
+            <div class="ingest-card">
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <span class="ingest-title">${esc(d.dashboard_title || d.dashboard_uid)}</span>
+                <span>${badge} ${approveBtn}</span>
+              </div>
+              <div class="ingest-meta">
+                UID: <code>${esc(d.dashboard_uid)}</code> &middot;
+                ${d.backend_name ? `Backend: <code>${esc(d.backend_name)}</code> &middot; ` : ''}
+                ${d.panel_count || 0} panels &middot;
+                ${(d.metrics_found || []).length} metrics
+              </div>
+              ${signals ? `<div class="ingest-signals">${signals}</div>` : ''}
+              ${archetypeYaml}
+            </div>`;
+        }
+        el.innerHTML = html;
+      } catch (e) {
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
+      }
+    }
+
+    async function approveDashboard(uid, backend = '') {
+      try {
+        const backendQuery = backend ? `?backend=${encodeURIComponent(backend)}` : '';
+        const resp = await fetch(`${BASE}/api/v1/learn/dashboards/${encodeURIComponent(uid)}/approve${backendQuery}`, { method: 'POST' });
+        if (!resp.ok) throw new Error('Approval failed');
+        loadIngestedDashboards();
+      } catch (e) { alert('Approve failed: ' + e.message); }
+    }
+
+    /* ── Signals tab ──────────────────────────────────────────── */
+    async function loadSignals() {
+      const el = document.getElementById('signals-content');
+      const statsEl = document.getElementById('signal-stats');
+      el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+
+      try {
+        const [listResp, statsResp] = await Promise.all([
+          fetch(`${BASE}/api/v1/signals`),
+          fetch(`${BASE}/api/v1/signals/stats`),
+        ]);
+        const signals = await listResp.json();
+        const stats = await statsResp.json();
+
+        statsEl.textContent = `${stats.signal_types || 0} signals, ${stats.metric_mappings || 0} mappings`;
+
+        const signalList = signals.signal_types || [];
+        const teachSelect = document.getElementById('teach-signal');
+        teachSelect.innerHTML = signalList.map(s =>
+          `<option value="${escAttr(s.signal_type)}">${esc(s.signal_type)} (${esc(s.category || '')})</option>`
+        ).join('');
+
+        // Group by category
+        const byCategory = {};
+        for (const s of signalList) {
+          const cat = s.category || 'other';
+          if (!byCategory[cat]) byCategory[cat] = [];
+          byCategory[cat].push(s);
+        }
+
+        let html = '';
+        for (const [cat, sigs] of Object.entries(byCategory)) {
+          html += `<div class="result-label" style="margin-top:1rem;text-transform:capitalize">${esc(cat)}</div>`;
+          for (const s of sigs) {
+            html += `
+              <div class="signal-card">
+                <h3>${esc(s.signal_type)}</h3>
+                <div class="signal-desc">${esc(s.description || '')} &middot; <code>${esc(s.unit || '')}</code></div>
+                <div class="signal-patterns">
+                  <span style="font-size:0.72rem;color:#6b7280">${s.mapping_count || 0} mappings</span>
+                  <span class="hist-back signal-detail-btn" style="margin-left:0.5rem" data-signal="${escAttr(s.signal_type)}">View mappings</span>
+                </div>
+              </div>`;
+          }
+        }
+        el.innerHTML = html || '<div class="status">No signals registered</div>';
+      } catch (e) {
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
+      }
+    }
+
+    async function showSignalDetail(signalType) {
+      const el = document.getElementById('signals-content');
+      el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      try {
+        const resp = await fetch(`${BASE}/api/v1/signals/${encodeURIComponent(signalType)}`);
+        if (!resp.ok) throw new Error('Not found');
+        const data = await resp.json();
+        const mappings = data.mappings || [];
+
+        let mappingsHtml = '';
+        for (const m of mappings) {
+          const conf = Math.round((m.effective_confidence || m.confidence || 0) * 100);
+          const confWidth = Math.min(conf, 100);
+          mappingsHtml += `
+            <div style="margin:0.3rem 0;display:flex;align-items:center;gap:0.5rem">
+              <span class="signal-pattern">${esc(m.metric_pattern)}</span>
+              <span class="confidence-bar"><span class="confidence-fill" style="width:${confWidth}%"></span></span>
+              <span style="font-size:0.72rem;color:#6b7280">${conf}%</span>
+              <span style="font-size:0.68rem;color:#4b5563">${esc(m.source_type || '')}</span>
+            </div>`;
+        }
+
+        el.innerHTML = `
+          <span class="hist-back" onclick="loadSignals()">&larr; Back to taxonomy</span>
+          <div class="signal-card" style="margin-top:0.75rem">
+            <h3>${esc(data.signal_type)}</h3>
+            <div class="signal-desc">${esc(data.description || '')} &middot; <code>${esc(data.unit || '')}</code> &middot; Category: ${esc(data.category || '')}</div>
+            <div class="result-label" style="margin-top:1rem">Metric Mappings (${mappings.length})</div>
+            ${mappingsHtml || '<div class="status">No mappings</div>'}
+          </div>`;
+      } catch (e) {
+        el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
+      }
+    }
+
+    async function teachSignal() {
+      const signalType = document.getElementById('teach-signal').value;
+      const metric = document.getElementById('teach-metric').value.trim();
+      const confidenceInput = parseFloat(document.getElementById('teach-confidence').value);
+      const confidence = Number.isFinite(confidenceInput) ? confidenceInput : 0.8;
+      const service = document.getElementById('teach-service').value.trim();
+      const statusEl = document.getElementById('teach-status');
+
+      if (!signalType || !metric) {
+        statusEl.textContent = 'Signal and metric are required';
+        statusEl.style.color = '#ef4444';
+        return;
+      }
+
+      try {
+        statusEl.textContent = 'Teaching...';
+        statusEl.style.color = '#9ca3af';
+        const body = {
+          signal_type: signalType,
+          metric_patterns: [{ pattern: metric, confidence }],
+        };
+        if (service) body.services = [service];
+        const resp = await fetch(`${BASE}/api/v1/signals/teach`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+          throw new Error(errMsg(err, `HTTP ${resp.status}`));
+        }
+        statusEl.textContent = 'Mapping taught!';
+        statusEl.style.color = '#34d399';
+        document.getElementById('teach-metric').value = '';
+        loadSignals();
+      } catch (e) {
+        statusEl.textContent = 'Error: ' + e.message;
+        statusEl.style.color = '#ef4444';
+      }
+    }
+
+    // Delegate signal detail clicks (avoids inline onclick + quote escaping issues)
+    document.getElementById('signals-content').addEventListener('click', (e) => {
+      const btn = e.target.closest('.signal-detail-btn');
+      if (btn && btn.dataset.signal) showSignalDetail(btn.dataset.signal);
+    });
+
+    // Delegate dashboard approval clicks so UIDs are never embedded in JS strings.
+    document.getElementById('ingested-list').addEventListener('click', (e) => {
+      const btn = e.target.closest('.approve-dashboard-btn');
+      if (btn && btn.dataset.dashboardUid) {
+        approveDashboard(btn.dataset.dashboardUid, btn.dataset.dashboardBackend || '');
+      }
+    });
 
     // Submit on Ctrl+Enter
     document.getElementById('prompt').addEventListener('keydown', (e) => {

@@ -6,6 +6,7 @@ about services, runbooks, architecture, and past incidents.
 
 A2A spec: https://google.github.io/A2A/
 """
+
 from __future__ import annotations
 
 import uuid

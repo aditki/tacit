@@ -1,4 +1,5 @@
 """Adapter for Loki datasource (log-derived metrics via LogQL)."""
+
 from __future__ import annotations
 
 import structlog
@@ -31,10 +32,13 @@ class LokiAdapter(DatasourceAdapter):
         # Loki exposes labels, not metric names.
         # Discover available label names → these become log stream selectors.
         try:
-            data = await client.datasource_proxy_get(
-                datasource.uid, "loki/api/v1/labels"
-            )
-            labels: list[str] = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            data = await client.datasource_proxy_get(datasource.uid, "loki/api/v1/labels")
+            if isinstance(data, dict):
+                labels: list[str] = data.get("data", [])
+            elif isinstance(data, list):
+                labels = data
+            else:
+                labels = []
         except Exception:
             logger.warning("loki_labels_failed", datasource=datasource.name)
             return []
@@ -42,17 +46,28 @@ class LokiAdapter(DatasourceAdapter):
         # For each interesting label, fetch its values (capped)
         # Focus on labels that look like service/app/namespace identifiers
         interesting_labels = [
-            l for l in labels
-            if l in {"app", "service", "namespace", "job", "container", "pod",
-                      "component", "host", "level", "severity", "status_code"}
+            label
+            for label in labels
+            if label
+            in {
+                "app",
+                "service",
+                "namespace",
+                "job",
+                "container",
+                "pod",
+                "component",
+                "host",
+                "level",
+                "severity",
+                "status_code",
+            }
         ]
 
         label_values_map: dict[str, list[str]] = {}
         for label in interesting_labels[:6]:
             try:
-                val_data = await client.datasource_proxy_get(
-                    datasource.uid, f"loki/api/v1/label/{label}/values"
-                )
+                val_data = await client.datasource_proxy_get(datasource.uid, f"loki/api/v1/label/{label}/values")
                 vals: list[str] = val_data.get("data", []) if isinstance(val_data, dict) else []
                 label_values_map[label] = vals[:50]
             except Exception:

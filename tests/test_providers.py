@@ -5,6 +5,7 @@ Covers:
 - Dashboard rendering: CW target JSON with region, namespace stripping, dimension normalization
 - CLI _check_llm: Bedrock assume-role mirroring
 """
+
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -14,9 +15,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # ── CloudWatch PanelQuery schema tests ─────────────────────────────────────
 
+
 def test_panel_query_cloudwatch_fields():
     """PanelQuery should accept CloudWatch-specific fields including region."""
     from dashforge.models.schemas import PanelQuery
+
     q = PanelQuery(
         expr="HTTPCode_ELB_5XX",
         datasource_uid="cw1",
@@ -36,6 +39,7 @@ def test_panel_query_cloudwatch_fields():
 def test_panel_query_cloudwatch_fields_default_empty():
     """CloudWatch fields should default to empty when not provided."""
     from dashforge.models.schemas import PanelQuery
+
     q = PanelQuery(expr="up", datasource_uid="prom1")
     assert q.cloudwatch_namespace == ""
     assert q.cloudwatch_stat == ""
@@ -46,22 +50,25 @@ def test_panel_query_cloudwatch_fields_default_empty():
 
 # ── Grafana dashboard CloudWatch target rendering ──────────────────────────
 
+
 def test_dashboard_cloudwatch_target_rendering():
     """CloudWatch panels should include namespace, metricName, statistics, dimensions, region."""
-    from dashforge.models.schemas import PanelSpec, PanelQuery
     from dashforge.grafana.dashboard import _build_panel_json
+    from dashforge.models.schemas import PanelQuery, PanelSpec
 
     panel = PanelSpec(
         title="5xx Errors",
-        queries=[PanelQuery(
-            expr="HTTPCode_ELB_5XX",
-            datasource_uid="cw1",
-            datasource_type="cloudwatch",
-            cloudwatch_namespace="AWS/ApplicationELB",
-            cloudwatch_stat="Sum",
-            cloudwatch_dimensions={"LoadBalancer": ["app/my-lb/123"]},
-            cloudwatch_region="eu-west-1",
-        )],
+        queries=[
+            PanelQuery(
+                expr="HTTPCode_ELB_5XX",
+                datasource_uid="cw1",
+                datasource_type="cloudwatch",
+                cloudwatch_namespace="AWS/ApplicationELB",
+                cloudwatch_stat="Sum",
+                cloudwatch_dimensions={"LoadBalancer": ["app/my-lb/123"]},
+                cloudwatch_region="eu-west-1",
+            )
+        ],
     )
     result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
     target = result["targets"][0]
@@ -75,16 +82,18 @@ def test_dashboard_cloudwatch_target_rendering():
 
 def test_dashboard_prometheus_target_no_cloudwatch_fields():
     """Prometheus panels should NOT include CloudWatch-specific fields."""
-    from dashforge.models.schemas import PanelSpec, PanelQuery
     from dashforge.grafana.dashboard import _build_panel_json
+    from dashforge.models.schemas import PanelQuery, PanelSpec
 
     panel = PanelSpec(
         title="Request Rate",
-        queries=[PanelQuery(
-            expr='rate(http_requests_total[5m])',
-            datasource_uid="prom1",
-            datasource_type="prometheus",
-        )],
+        queries=[
+            PanelQuery(
+                expr="rate(http_requests_total[5m])",
+                datasource_uid="prom1",
+                datasource_type="prometheus",
+            )
+        ],
     )
     result = _build_panel_json(panel, 1, {"x": 0, "y": 0, "w": 12, "h": 8})
     target = result["targets"][0]
@@ -96,6 +105,7 @@ def test_dashboard_prometheus_target_no_cloudwatch_fields():
 
 
 # ── CLI _check_llm bedrock assume-role tests ───────────────────────────────
+
 
 def test_check_llm_bedrock_with_role_arn_calls_assume_role():
     """When llm_bedrock_role_arn is set, _check_llm must call sts.assume_role
@@ -120,8 +130,7 @@ def test_check_llm_bedrock_with_role_arn_calls_assume_role():
 
     mock_boto3.Session.side_effect = [base_session, assumed_session]
 
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), \
-         patch("dashforge.config.settings") as mock_settings:
+    with patch.dict("sys.modules", {"boto3": mock_boto3}), patch("dashforge.config.settings") as mock_settings:
         mock_settings.llm_provider = "bedrock"
         mock_settings.llm_api_key = ""
         mock_settings.llm_model = "claude-sonnet-4-20250514"
@@ -132,6 +141,7 @@ def test_check_llm_bedrock_with_role_arn_calls_assume_role():
         mock_settings.llm_bedrock_model_id = ""
 
         from dashforge.cli import _check_llm
+
         result = _check_llm()
 
         # Must have called assume_role on the base session's STS client
@@ -160,8 +170,7 @@ def test_check_llm_bedrock_bad_role_arn_returns_false():
 
     mock_boto3.Session.return_value = base_session
 
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), \
-         patch("dashforge.config.settings") as mock_settings:
+    with patch.dict("sys.modules", {"boto3": mock_boto3}), patch("dashforge.config.settings") as mock_settings:
         mock_settings.llm_provider = "bedrock"
         mock_settings.llm_api_key = ""
         mock_settings.llm_model = "claude-sonnet-4-20250514"
@@ -172,6 +181,7 @@ def test_check_llm_bedrock_bad_role_arn_returns_false():
         mock_settings.llm_bedrock_model_id = ""
 
         from dashforge.cli import _check_llm
+
         result = _check_llm()
 
         assert result is False
@@ -192,6 +202,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[FAIL] {test_fn.__name__}: {e}")
             import traceback
+
             traceback.print_exc()
             failed += 1
 

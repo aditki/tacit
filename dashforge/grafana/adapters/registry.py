@@ -1,4 +1,5 @@
 """Registry that maps Grafana datasource types to adapters."""
+
 from __future__ import annotations
 
 import structlog

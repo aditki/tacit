@@ -1,4 +1,5 @@
 """Registry that resolves CONTEXT_PROVIDER config to a concrete implementation."""
+
 from __future__ import annotations
 
 import structlog
@@ -31,14 +32,17 @@ def get_context_provider() -> ContextProvider | None:
 
     if name == "mcp":
         from dashforge.context.mcp_provider import MCPProvider
+
         _provider = MCPProvider()
 
     elif name == "a2a":
         from dashforge.context.a2a_provider import A2AProvider
+
         _provider = A2AProvider()
 
     elif name == "rag_api":
         from dashforge.context.rag_api_provider import RAGAPIProvider
+
         _provider = RAGAPIProvider()
 
     else:

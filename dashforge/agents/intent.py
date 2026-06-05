@@ -1,4 +1,5 @@
 """Intent Agent — classifies user prompt into structured observability intent."""
+
 from __future__ import annotations
 
 import structlog
@@ -112,6 +113,7 @@ async def classify_intent(prompt: str) -> tuple[Intent, TokenUsage]:
     elif intent.problem_type and not intent.archetypes:
         # LLM returned old-style single label — wrap it
         from dashforge.models.schemas import ArchetypeMatch
+
         intent.archetypes = [ArchetypeMatch(type=intent.problem_type, confidence=0.9)]
 
     logger.info(
