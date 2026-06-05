@@ -19,6 +19,7 @@ class QueryTemplate(BaseModel):
 
     expr: str = Field(description="Query template with {placeholders}")
     legend_format: str = ""
+    query_language: str = "promql"
     datasource_type: str = "prometheus"
 
 

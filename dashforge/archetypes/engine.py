@@ -426,6 +426,7 @@ def _apply_metric_substitutions(
             new_queries.append(QueryTemplate(
                 expr=expr,
                 legend_format=qt.legend_format,
+                query_language=qt.query_language,
                 datasource_type=qt.datasource_type,
             ))
         new_panels.append(PanelTemplate(
@@ -538,7 +539,11 @@ def compile_archetype(
                 logger.warning("archetype_placeholder_missing", panel=pt.title, key=str(e))
                 continue
 
-            if target_language == "signalflow":
+            raw_signalflow_query = target_language == "signalflow" and (
+                qt.query_language == "signalflow" or qt.datasource_type == "signalfx"
+            )
+
+            if target_language == "signalflow" and not raw_signalflow_query:
                 # Compile the resolved PromQL template directly to SignalFlow
                 legend = qt.legend_format or pt.title
                 expr = _promql_template_to_signalflow(

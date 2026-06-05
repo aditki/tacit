@@ -827,9 +827,20 @@
           const badge = d.status === 'approved'
             ? '<span class="badge badge-success">approved</span>'
             : '<span class="badge badge-running">pending</span>';
-          const signals = (d.signals_inferred || []).slice(0, 8).map(s =>
-            `<span class="signal-chip">${esc(s)}</span>`
-          ).join('');
+          const signals = (d.signals_inferred || []).slice(0, 8).map(s => {
+            if (typeof s === 'string') {
+              return `<span class="signal-chip">${esc(s)}</span>`;
+            }
+            const signalType = esc(s.signal_type || 'unknown');
+            const metric = s.metric ? ` &rarr; <code>${esc(s.metric)}</code>` : '';
+            const confidence = Number.isFinite(s.confidence)
+              ? ` (${Math.round(s.confidence * 100)}%)`
+              : '';
+            return `<span class="signal-chip">${signalType}${metric}${confidence}</span>`;
+          }).join('');
+          const archetypeYaml = d.archetype_generated
+            ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Generated archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(d.archetype_generated)}</pre></details>`
+            : '';
           const approveBtn = d.status === 'pending'
             ? `<button class="btn-sm btn-success" onclick="approveDashboard('${esc(d.dashboard_uid)}')">Approve</button>`
             : '';
@@ -845,6 +856,7 @@
                 ${(d.metrics_found || []).length} metrics
               </div>
               ${signals ? `<div class="ingest-signals">${signals}</div>` : ''}
+              ${archetypeYaml}
             </div>`;
         }
         el.innerHTML = html;

@@ -25,6 +25,7 @@ import re
 from collections import defaultdict
 from typing import Any
 
+import promql_parser
 import structlog
 
 from dashforge.signals import get_signal_store
@@ -70,16 +71,73 @@ _HISTOGRAM_PATTERN = re.compile(
     r'histogram_quantile\(\s*([\d.]+)'
 )
 
+_PROMQL_LABEL_LIST_RE = re.compile(r'\b(by|without|on|ignoring|group_left|group_right)\s*\(([^)]*)\)')
 
-def extract_metrics_from_promql(expr: str) -> list[str]:
-    """Extract metric names from a PromQL expression."""
-    candidates = _PROMQL_METRIC_RE.findall(expr)
+
+def _strip_promql_label_lists(expr: str) -> str:
+    """Remove bare label lists so they are not mistaken for metrics."""
+    return _PROMQL_LABEL_LIST_RE.sub(lambda m: f"{m.group(1)} ()", expr)
+
+
+def _extract_metrics_from_promql_regex(expr: str) -> list[str]:
+    candidates = _PROMQL_METRIC_RE.findall(_strip_promql_label_lists(expr))
     metrics = []
     for name in candidates:
         name_lower = name.lower()
         if name_lower not in _PROMQL_FUNCS and not name.startswith("__"):
             metrics.append(name)
-    return list(dict.fromkeys(metrics))  # dedupe preserving order
+    return list(dict.fromkeys(metrics))
+
+
+def _walk_promql_ast(node: Any, metrics: list[str]) -> None:
+    if node is None:
+        return
+
+    node_type = type(node).__name__
+
+    if node_type == "VectorSelector":
+        name = getattr(node, "name", None)
+        if isinstance(name, str) and name and name.lower() not in _PROMQL_FUNCS and not name.startswith("__"):
+            metrics.append(name)
+        return
+
+    if node_type == "MatrixSelector":
+        _walk_promql_ast(getattr(node, "vector_selector", None), metrics)
+        return
+
+    if node_type in {"AggregateExpr", "UnaryExpr", "ParenExpr", "SubqueryExpr", "StepInvariantExpr"}:
+        _walk_promql_ast(getattr(node, "expr", None), metrics)
+        return
+
+    if node_type == "BinaryExpr":
+        _walk_promql_ast(getattr(node, "lhs", None), metrics)
+        _walk_promql_ast(getattr(node, "rhs", None), metrics)
+        return
+
+    if node_type == "Call":
+        for arg in getattr(node, "args", []) or []:
+            _walk_promql_ast(arg, metrics)
+        return
+
+    for attr in ("expr", "lhs", "rhs", "vector_selector"):
+        child = getattr(node, attr, None)
+        if child is not None:
+            _walk_promql_ast(child, metrics)
+
+    for child in getattr(node, "args", []) or []:
+        _walk_promql_ast(child, metrics)
+
+
+def extract_metrics_from_promql(expr: str) -> list[str]:
+    """Extract metric names from a PromQL expression."""
+    try:
+        ast = promql_parser.parse(expr)
+    except Exception:
+        return _extract_metrics_from_promql_regex(expr)
+
+    metrics: list[str] = []
+    _walk_promql_ast(ast, metrics)
+    return list(dict.fromkeys(metrics))
 
 
 def extract_aggregation_patterns(expr: str) -> list[dict[str, str]]:
@@ -399,6 +457,7 @@ def generate_archetype_yaml(
                 # to protect literal label selectors from format().
                 "expr": q if is_signalflow else _escape_literal_braces(q),
                 "legend_format": "",
+                "query_language": query_language,
             }
             if is_signalflow:
                 query_def["datasource_type"] = "signalfx"
@@ -537,6 +596,7 @@ async def ingest_dashboard(
             alert_links=features.alert_links,
             drilldown_links=features.drilldown_links,
             signals_inferred=signals,
+            archetype_generated=archetype_yaml,
             status=status,
         )
 

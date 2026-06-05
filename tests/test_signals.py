@@ -545,6 +545,7 @@ class TestPromQLExtraction:
         assert "http_requests_total" in metrics
         assert "sum" not in metrics
         assert "rate" not in metrics
+        assert "status" not in metrics
 
     def test_histogram_quantile(self):
         metrics = extract_metrics_from_promql(
@@ -569,12 +570,38 @@ class TestPromQLExtraction:
         assert "topk" not in metrics
         assert "sum" not in metrics
         assert "by" not in metrics
+        assert "instance" not in metrics
 
     def test_custom_sso_metrics(self):
         metrics = extract_metrics_from_promql(
             'sum(rate(sso_auth_failures_total{service="sso-gateway"}[5m])) by (reason)'
         )
         assert "sso_auth_failures_total" in metrics
+        assert "reason" not in metrics
+
+    def test_without_grouping_labels_are_not_metrics(self):
+        metrics = extract_metrics_from_promql(
+            'sum without(instance, pod) (http_requests_total)'
+        )
+        assert "http_requests_total" in metrics
+        assert "instance" not in metrics
+        assert "pod" not in metrics
+
+    def test_vector_matching_labels_are_not_metrics(self):
+        metrics = extract_metrics_from_promql(
+            'http_requests_total / ignoring(instance) group_left(job) target_info'
+        )
+        assert "http_requests_total" in metrics
+        assert "target_info" in metrics
+        assert "instance" not in metrics
+        assert "job" not in metrics
+
+    def test_falls_back_to_regex_for_templated_queries(self):
+        metrics = extract_metrics_from_promql(
+            'sum(rate(http_requests_total[$__rate_interval])) by (status)'
+        )
+        assert "http_requests_total" in metrics
+        assert "status" not in metrics
 
 
 class TestAggregationExtraction:
@@ -751,6 +778,7 @@ class TestArchetypeGeneration:
             "dashboard_uid": "sso-health",
             "dashboard_title": "SSO Service Health",
             "dashboard_tags": ["sso", "auth"],
+            "query_language": "promql",
             "metrics_found": ["sso_auth_requests_total", "sso_auth_failures_total"],
             "panel_count": 2,
             "panels": [
@@ -775,6 +803,10 @@ class TestArchetypeGeneration:
         assert "SSO Service Health" in yaml_str
         assert "sso_auth_requests_total" in yaml_str
         assert "auto-generated" in yaml_str
+        import yaml
+        parsed = yaml.safe_load(yaml_str)
+        query = parsed["archetypes"][0]["panels"][0]["queries"][0]
+        assert query["query_language"] == "promql"
 
 
 # ── Ingested dashboard records ───────────────────────────────────────────────
@@ -796,6 +828,44 @@ class TestIngestedDashboards:
         assert result["metrics_found"] == ["metric_a", "metric_b"]
         assert result["panel_count"] == 3
         assert result["status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_ingest_dashboard_persists_generated_archetype(self, signal_store, monkeypatch):
+        from dashforge import dashboard_ingest as di
+
+        class FakeBackend:
+            async def ingest_dashboard(self, uid):
+                return DashboardFeatures(
+                    dashboard_uid=uid,
+                    dashboard_title="CPU Dashboard",
+                    dashboard_tags=[],
+                    backend_name="signalfx",
+                    query_language="signalflow",
+                    metrics_found=["cpu.utilization"],
+                    panel_count=1,
+                    panel_titles=["CPU"],
+                    panels=[
+                        {
+                            "title": "CPU",
+                            "queries": ["data('cpu.utilization').publish()"],
+                            "row": "",
+                            "unit": "",
+                            "description": "",
+                        }
+                    ],
+                )
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
+
+        result = await di.ingest_dashboard("cpu-dash", backend=FakeBackend(), auto_approve=False)
+
+        stored = signal_store.get_ingested_dashboard("cpu-dash")
+        assert stored is not None
+        assert stored["archetype_generated"] == result["archetype_yaml"]
+        assert "archetypes:" in stored["archetype_generated"]
 
     def test_list_by_status(self, signal_store):
         signal_store.record_ingested_dashboard("d1", status="pending")
@@ -1323,6 +1393,100 @@ class TestArchetypeYamlBraceEscaping:
         assert "[ 1m ]" in expr.format(service_filter="", container_filter="", rate_interval="1m")
 
 
+class TestSignalFlowCompileCompatibility:
+
+    def test_raw_signalfx_query_is_not_recompiled_as_promql(self):
+        from dashforge.archetypes.engine import compile_archetype
+        from dashforge.models.schemas import ArchetypeMatch, Intent
+
+        archetype = InvestigationArchetype(
+            id="sfx_cpu",
+            name="SFX CPU",
+            problem_types=["cpu"],
+            panels=[
+                PanelTemplate(
+                    title="CPU",
+                    queries=[
+                        QueryTemplate(
+                            expr="data('cpu.utilization').publish()",
+                            datasource_type="signalfx",
+                        )
+                    ],
+                )
+            ],
+        )
+        intent = Intent(
+            summary="cpu",
+            domain="infra",
+            services=["api"],
+            signals=[],
+            keywords=[],
+            timerange="1h",
+            problem_type="cpu",
+            archetypes=[ArchetypeMatch(type="cpu", confidence=1.0)],
+        )
+        spec = compile_archetype(
+            archetype,
+            intent,
+            [MetricEntry(
+                name="cpu.utilization",
+                datasource_uid="x",
+                datasource_name="SignalFx",
+                datasource_type="signalfx",
+                query_language="signalflow",
+            )],
+            target_language="signalflow",
+        )
+
+        assert spec.panels[0].queries[0].expr == "data('cpu.utilization').publish()"
+
+    def test_explicit_query_language_marks_raw_signalflow(self):
+        from dashforge.archetypes.engine import compile_archetype
+        from dashforge.models.schemas import ArchetypeMatch, Intent
+
+        archetype = InvestigationArchetype(
+            id="sfx_cpu_language",
+            name="SFX CPU Language",
+            problem_types=["cpu"],
+            panels=[
+                PanelTemplate(
+                    title="CPU",
+                    queries=[
+                        QueryTemplate(
+                            expr="data('cpu.utilization').publish()",
+                            query_language="signalflow",
+                        )
+                    ],
+                )
+            ],
+        )
+        intent = Intent(
+            summary="cpu",
+            domain="infra",
+            services=["api"],
+            signals=[],
+            keywords=[],
+            timerange="1h",
+            problem_type="cpu",
+            archetypes=[ArchetypeMatch(type="cpu", confidence=1.0)],
+        )
+        spec = compile_archetype(
+            archetype,
+            intent,
+            [MetricEntry(
+                name="cpu.utilization",
+                datasource_uid="x",
+                datasource_name="SignalFx",
+                datasource_type="signalfx",
+                query_language="signalflow",
+            )],
+            target_language="signalflow",
+        )
+
+        assert spec.panels[0].queries[0].expr == "data('cpu.utilization').publish()"
+        assert spec.panels[0].queries[0].datasource_type == "signalfx"
+
+
 # ── Bug 5: Suffix-aware metric substitution ──────────────────────────────
 
 class TestSuffixAwareMetricSubstitution:
@@ -1602,6 +1766,24 @@ class TestSignalFlowArchetypeGeneration:
         query = parsed["archetypes"][0]["panels"][0]["queries"][0]
         # Must indicate this is already SignalFlow, not PromQL
         assert query.get("datasource_type") == "signalfx"
+        assert query.get("query_language") == "signalflow"
         # Expression must be preserved as-is (no brace escaping
         # that would break SignalFlow syntax)
         assert "data('cpu.utilization').publish()" in query["expr"]
+
+
+class TestLearningTabRendering:
+
+    def test_ingested_dashboard_signal_chips_render_fields_not_object_repr(self):
+        html = (Path(__file__).parent.parent / "dashforge" / "static" / "index.html").read_text()
+        load_section = html.split("async function loadIngestedDashboards()", 1)[1].split("async function approveDashboard", 1)[0]
+        assert "d.signals_inferred" in load_section
+        assert "s.signal_type" in load_section
+        assert "s.metric" in load_section
+        assert "s.confidence" in load_section
+
+    def test_ingested_dashboard_list_renders_persisted_archetype_yaml(self):
+        html = (Path(__file__).parent.parent / "dashforge" / "static" / "index.html").read_text()
+        load_section = html.split("async function loadIngestedDashboards()", 1)[1].split("async function approveDashboard", 1)[0]
+        assert "d.archetype_generated" in load_section
+        assert "Generated archetype YAML" in load_section
