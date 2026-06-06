@@ -8,6 +8,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import time
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
@@ -45,10 +46,7 @@ def signal_store_with_bootstrap(tmp_path):
     """SignalStore loaded with bootstrap signals.yaml."""
     db_path = tmp_path / "test_signals.db"
     store = SignalStore(db_path=db_path)
-    # Load from project root signals.yaml
-    yaml_path = Path(__file__).parent.parent.parent / "signals.yaml"
-    if yaml_path.is_file():
-        store.load_from_yaml(yaml_path)
+    store.load_from_yaml()
     return store
 
 
@@ -1051,14 +1049,10 @@ signals:
 
     def test_load_project_signals_yaml(self):
         """Verify the actual project signals.yaml loads without errors."""
-        yaml_path = Path(__file__).parent.parent.parent / "signals.yaml"
-        if not yaml_path.is_file():
-            pytest.skip("signals.yaml not found")
-
         db_path = Path(tempfile.mktemp(suffix=".db"))
         try:
             store = SignalStore(db_path=db_path)
-            count = store.load_from_yaml(yaml_path)
+            count = store.load_from_yaml()
             assert count > 20  # should have many bootstrap mappings
             types = store.list_signal_types()
             assert len(types) > 10
@@ -1411,8 +1405,8 @@ class TestSignalCoverageDashboard:
         # the signal_type in the bootstrap yaml
         import yaml
 
-        yaml_path = Path(__file__).parent.parent.parent / "signals.yaml"
-        with open(yaml_path) as f:
+        resource = files("dashforge.data").joinpath("signals.yaml")
+        with resource.open() as f:
             data = yaml.safe_load(f)
         sig_defs = data.get("signals", {})
 

@@ -559,22 +559,11 @@ def _check_llm() -> bool:
 
 def _check_archetypes() -> bool:
     try:
-        from dashforge.archetypes.templates import _load_archetypes_from_yaml
+        from dashforge.archetypes.templates import ALL_ARCHETYPES
 
-        archetypes_path = Path("archetypes.yaml")
-        if not archetypes_path.exists():
-            # Try relative to package
-            pkg_dir = Path(__file__).parent.parent
-            archetypes_path = pkg_dir / "archetypes.yaml"
-
-        if archetypes_path.exists():
-            loaded = _load_archetypes_from_yaml(archetypes_path)
-            total_panels = sum(len(a.panels) for a in loaded)
-            _success(f"Archetypes: {len(loaded)} loaded, {total_panels} panels")
-            return True
-        else:
-            _warn("Archetypes: archetypes.yaml not found")
-            return False
+        total_panels = sum(len(a.panels) for a in ALL_ARCHETYPES)
+        _success(f"Archetypes: {len(ALL_ARCHETYPES)} loaded, {total_panels} panels")
+        return True
     except Exception as e:
         _fail(f"Archetypes: {e}")
         return False

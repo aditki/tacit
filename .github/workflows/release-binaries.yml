@@ -19,12 +19,15 @@ jobs:
           - os: ubuntu-latest
             artifact: dashforge-linux-x86_64
             binary: dist/dashforge
+            package: dashforge-linux-x86_64.tar.gz
           - os: macos-latest
             artifact: dashforge-macos-arm64
             binary: dist/dashforge
+            package: dashforge-macos-arm64.tar.gz
           - os: windows-latest
-            artifact: dashforge-windows-x86_64.exe
+            artifact: dashforge-windows-x86_64
             binary: dist/dashforge.exe
+            package: dashforge-windows-x86_64.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -34,13 +37,22 @@ jobs:
       - run: uv sync --all-extras --dev
       - name: Build binary
         run: uv run pyinstaller dashforge.spec --clean --noconfirm
-      - name: Rename artifact
+      - name: Package artifact
         shell: bash
-        run: mv "${{ matrix.binary }}" "${{ matrix.artifact }}"
+        run: |
+          set -euo pipefail
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "${{ matrix.binary }}" dashforge.exe
+            7z a "${{ matrix.package }}" dashforge.exe
+          else
+            cp "${{ matrix.binary }}" dashforge
+            chmod 755 dashforge
+            tar -czf "${{ matrix.package }}" dashforge
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: ${{ matrix.package }}
 
   publish:
     needs: build

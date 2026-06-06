@@ -101,7 +101,8 @@ app = FastAPI(
         {
             "name": "Archetypes",
             "description": "View and manage investigation archetype templates. "
-            "Archetypes are loaded from `archetypes.yaml` and can be hot-reloaded without restart.",
+            "Archetypes are loaded from packaged data or `DASHFORGE_ARCHETYPES_PATH` "
+            "and can be hot-reloaded without restart.",
         },
         {
             "name": "Signals",
@@ -310,9 +311,9 @@ async def get_feedback(
     response_description="Confirmation with count and summary of loaded archetypes",
 )
 async def reload_archetypes_endpoint():
-    """Hot-reload archetype templates from `archetypes.yaml` without server restart.
+    """Hot-reload archetype templates without server restart.
 
-    Workflow: edit `archetypes.yaml` → call this endpoint → changes take effect immediately.
+    Workflow: set `DASHFORGE_ARCHETYPES_PATH`, edit that YAML, then call this endpoint.
     If the YAML file is missing or invalid, falls back to built-in Python definitions."""
     from dashforge.archetypes.templates import reload_archetypes
 
@@ -339,7 +340,7 @@ async def list_archetypes():
 
     Each archetype defines a known investigation pattern (e.g. latency investigation,
     error spike) with pre-defined panel templates and query patterns. Archetypes are
-    loaded from `archetypes.yaml` if available, otherwise from built-in Python definitions."""
+    loaded from packaged data or `DASHFORGE_ARCHETYPES_PATH`, otherwise from built-in Python definitions."""
     from dashforge.archetypes.templates import ALL_ARCHETYPES
 
     return {

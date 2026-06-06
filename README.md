@@ -127,7 +127,7 @@ DashForge closes this gap by turning a problem statement into a ready-made inves
 └──────┬───────────────────┘
        ▼
 ┌──────────────────────────┐
-│ Signal Inference Engine  │  Matches metrics → signal taxonomy (signals.yaml)
+│ Signal Inference Engine  │  Matches metrics → signal taxonomy (dashforge/data/signals.yaml)
 │                          │  12 categories, pattern-based with confidence scores
 └──────┬───────────────────┘
        ▼
@@ -364,7 +364,7 @@ curl -X POST http://localhost:8000/api/v1/signals/teach \
 
 ### Signal Taxonomy
 
-The signal taxonomy (`signals.yaml`) defines 12 categories with metric patterns:
+The packaged signal taxonomy (`dashforge/data/signals.yaml`) defines 12 categories with metric patterns:
 
 | Category | Signals |
 |---|---|
@@ -517,7 +517,9 @@ dashforge/
 │   │   └── __init__.py      # Registry: get_active_backends()
 │   ├── signals.py           # Signal store: taxonomy, metric mappings, confidence (SQLite)
 │   ├── dashboard_ingest.py  # Vendor-agnostic dashboard learning pipeline
-│   ├── signals.yaml         # Signal taxonomy: 12 categories, metric patterns
+│   ├── data/                # Packaged runtime YAML resources
+│   │   ├── archetypes.yaml  # Investigation templates
+│   │   └── signals.yaml     # Signal taxonomy: 12 categories, metric patterns
 │   ├── cache.py             # TTL-based metadata & LLM response cache
 │   ├── ranking.py           # Pre-ranking: narrows metric catalog before LLM
 │   ├── history.py           # Investigation history store (SQLite)
@@ -620,7 +622,7 @@ See also:
 - [x] Production feedback system — dimensional SRE ratings (symptom visibility, root cause support, noise level, investigation speed, overall usefulness), SQLite-backed provenance tracking, aggregate stats
 - [x] Closed-loop metric ranking — feedback-driven quality scores automatically boost/penalize metrics in pre-ranking. No model retraining needed
 - [x] Feedback analysis & recommendations — per-archetype quality, noisy dashboard detection, archetype gap identification, metric quality scoring, confidence calibration, actionable recommendations (PRUNE, ADD SIGNAL, NEW ARCHETYPE, DEPRIORITIZE, RECALIBRATE)
-- [x] YAML archetype templates — editable `archetypes.yaml` with hot-reload API endpoint. Engineers update investigation templates without touching Python code
+- [x] YAML archetype templates — packaged `dashforge/data/archetypes.yaml` with `DASHFORGE_ARCHETYPES_PATH` override and hot-reload API endpoint. Engineers update investigation templates without touching Python code
 - [x] Interactive API documentation — Swagger UI (`/docs`) and ReDoc (`/redoc`) with grouped endpoints, response schemas, and examples
 - [x] Input validation & SQL injection hardening — parameterized queries, UID regex validation, path parameter constraints
 - [x] CLI (`dashforge init/doctor/connect grafana/connect signalfx/test/serve`) — Click + Rich, interactive setup wizard, connection validation, single-command startup

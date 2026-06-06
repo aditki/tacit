@@ -20,6 +20,7 @@ import random
 import re
 import sys
 import time
+from importlib.resources import files
 
 import httpx
 import yaml
@@ -105,10 +106,11 @@ _PROMQL_FUNCS = {
 }
 
 
-def extract_metrics_from_archetypes(path: str) -> set[str]:
+def extract_metrics_from_archetypes() -> set[str]:
     """Parse archetypes.yaml and extract all metric names from PromQL expressions."""
-    with open(path) as f:
-        data = yaml.safe_load(f)
+    resource = files("dashforge.data").joinpath("archetypes.yaml")
+    with resource.open() as f:
+        data = yaml.safe_load(f) or {}
 
     metrics: set[str] = set()
     for arch in data.get("archetypes", []):
@@ -293,8 +295,7 @@ def main():
     # 1. Extract metrics
     _header("Step 1: Extract Metrics")
 
-    archetype_path = os.path.join(os.path.dirname(__file__), "..", "archetypes.yaml")
-    arch_metrics = extract_metrics_from_archetypes(archetype_path)
+    arch_metrics = extract_metrics_from_archetypes()
     _ok(f"Archetypes: {len(arch_metrics)} unique metrics")
 
     kw_metrics = extract_metrics_from_keyword_map()
