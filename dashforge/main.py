@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import APIKeyHeader
 
+from dashforge import __version__
 from dashforge.config import settings
 from dashforge.feedback import get_feedback_store
 from dashforge.models.schemas import (
@@ -79,7 +80,7 @@ app = FastAPI(
         "- **ReDoc** — alternative view at [`/redoc`](/redoc)\n"
         "- **Web UI** — interactive dashboard generator at [`/`](/)\n"
     ),
-    version="0.2.0",
+    version=__version__,
     lifespan=lifespan,
     openapi_tags=[
         {

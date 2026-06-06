@@ -447,16 +447,16 @@ def test_secrets_not_in_repr():
     from dashforge.config import Settings
 
     s = Settings(
-        llm_api_key="sk-secret-key-123",
-        grafana_api_key="glsa_secret",
-        slack_bot_token="xoxb-secret",
+        llm_api_key="sentinel-llm-secret",
+        grafana_api_key="sentinel-grafana-secret",
+        slack_bot_token="sentinel-slack-secret",
         context_api_key="ctx-secret",
         api_auth_key="auth-secret",
     )
     r = repr(s)
-    assert "sk-secret-key-123" not in r
-    assert "glsa_secret" not in r
-    assert "xoxb-secret" not in r
+    assert "sentinel-llm-secret" not in r
+    assert "sentinel-grafana-secret" not in r
+    assert "sentinel-slack-secret" not in r
     assert "ctx-secret" not in r
     assert "auth-secret" not in r
     print("[PASS] test_secrets_not_in_repr")

@@ -1,99 +1,52 @@
-# CONTRIBUTING.md
+# Contributing
 
-# Contributing to DashForge
+Thanks for taking a look at DashForge. This repository is in public beta, so the
+bar for contributions is practical: keep changes small, testable, and honest
+about what is supported versus experimental.
 
-Thanks for your interest in DashForge.
-
-This repository is currently an early-stage infrastructure/LLM tooling project focused on experimentation, architecture exploration, and learning.
-
-## Project Goals
-
-DashForge exists primarily to explore:
-
-* LLM-assisted observability workflows
-* Grafana dashboard automation
-* Multi-agent orchestration patterns
-* Infrastructure developer tooling
-* Metrics/query generation systems
-* Human-in-the-loop feedback pipelines
-
-The project is also intended as a public engineering portfolio project.
-
-## Current Status
-
-DashForge is **not production-ready**.
-
-Expect:
-
-* breaking changes
-* incomplete integrations
-* evolving APIs
-* changing configuration formats
-* rough edges in UX and operational reliability
-
-Contributions are welcome, but stability guarantees do not yet exist.
-
-## Ways to Contribute
-
-Helpful contributions include:
-
-* bug reports
-* datasource integration improvements
-* documentation fixes
-* CLI usability improvements
-* testing and validation
-* query validation improvements
-* architecture discussions
-* performance profiling
-* security hardening ideas
-
-## Development Setup
+## Setup
 
 ```bash
-git clone https://github.com/aditki/dashforge.git
-cd dashforge
+uv sync --all-extras --dev
+uv run dashforge --version
+```
 
-uv sync
+For local demos:
+
+```bash
 cp .env.example .env
-
-uv run -m dashforge.cli init
-uv run -m dashforge.cli doctor
+docker compose -f docker-compose.dev.yml up -d
 ```
 
-Run the API locally:
+The dev Compose stack is local-only and intentionally uses unsafe Grafana demo
+defaults.
+
+## Checks
+
+Run these before opening a PR:
 
 ```bash
-uv run -m dashforge.main
+uv run ruff check .
+uv run black --check .
+uv run mypy dashforge
+uv run pytest -q
+docker build -t dashforge:local .
 ```
 
-Run tests:
-
-```bash
-uv run pytest
-```
-
-## Contribution Style
-
-Please try to:
-
-* keep changes focused and well-scoped
-* include clear commit messages
-* avoid unrelated refactors in feature PRs
-* add/update tests where practical
-* document new configuration fields
+Live vendor scripts under `tests/live/` are not part of the hermetic test suite.
+Run them only against accounts and dashboards you are allowed to mutate.
 
 ## Security
 
-If you discover a security issue, please avoid filing a public issue.
+- Do not commit API keys, tokens, `.env` files, or generated credentials.
+- Do not weaken API auth or Docker hardening without calling it out in the PR.
+- Keep production guidance separate from local-demo shortcuts.
+- For vulnerability reporting, see `SECURITY.md`.
 
-See `SECURITY.md` for disclosure guidance.
+## Pull Requests
 
-## Philosophy
-
-The repository intentionally prioritizes:
-
-* clarity over abstraction
-* experimentation over perfection
-* fast iteration over long-term API stability
-
-Over time, parts of the project may stabilize into more production-oriented patterns.
+- Prefer focused PRs over broad rewrites.
+- Include tests for behavior changes.
+- Label new vendor features as supported beta or experimental in docs.
+- If a change touches generated dashboards, include the user-visible behavior in
+  the PR description.

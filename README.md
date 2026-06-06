@@ -21,6 +21,8 @@ APIs, configuration formats, internal architecture, and integrations may change 
 
 DashForge is an AI-powered observability navigation layer that lets on-call engineers describe a problem in plain English (via Slack or HTTP API) and instantly get a purpose-built dashboard populated with the most relevant metrics. It publishes to **Grafana**, **Splunk Observability Cloud (SignalFx)**, or both simultaneously — with a pluggable backend adapter pattern that makes adding new vendors straightforward. No more hunting through static dashboards during an incident.
 
+> **Public beta / early alpha:** DashForge is demoable and useful for controlled trials, but it is not production-ready software. Expect rough edges, incomplete vendor coverage, and breaking changes. Do not expose it to the public internet or production observability systems without enabling API auth, reviewing generated queries, and applying your own deployment controls.
+
 > *"High latency on the checkout service in the last hour"*
 > → a dashboard with request rate, error rate, p99 latency, CPU, memory, and pod restarts — all wired up and ready.
 
@@ -191,12 +193,18 @@ cp .env.example .env
 
 docker compose up -d
 
-# Go to localhost:8000 for Dashforge
-# generate a dashboard
-# go to localhost:3000 for Grafana to see dashboard
+# Go to localhost:8000 for DashForge
 ```
 
-This starts Grafana (`:3000`), Prometheus (`:9090`), a fake metrics app (`:9091`), and DashForge (`:8000`). Grafana is auto-provisioned with a Prometheus datasource and three simulated services.
+This starts only DashForge. Point `GRAFANA_URL` and `GRAFANA_API_KEY` at a Grafana instance you control.
+
+For the full local demo stack with Grafana, Prometheus, and fake metrics:
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+```
+
+The dev stack is local-only. It intentionally uses `admin/admin` and anonymous Grafana Editor access so demos work without setup friction. Do not expose it outside your machine.
 
 ### Single Binary (no Python required)
 
@@ -220,9 +228,19 @@ dashforge serve
 
 ### Try the HTTP API
 
+For local demos, API auth is disabled by default. For public/private-beta deployments, set:
+
+```bash
+API_AUTH_ENABLED=true
+API_AUTH_KEY=<strong random token>
+```
+
+Then pass the key on every request:
+
 ```bash
 curl -X POST http://localhost:8000/api/v1/chart \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_AUTH_KEY" \
   -d '{"prompt": "high CPU usage on prometheus server in the last 30 minutes"}'
 ```
 
@@ -248,7 +266,7 @@ curl -X POST http://localhost:8000/api/v1/chart \
 ### Setup
 
 1. Create a Slack App at [api.slack.com/apps](https://api.slack.com/apps)
-2. Enable **Socket Mode** and generate an App-Level Token (`xapp-...`)
+2. Enable **Socket Mode** and generate an App-Level Token
 3. Add Bot Token Scopes: `app_mentions:read`, `chat:write`, `commands`
 4. Install the app to your workspace
 5. (Optional) Create a `/dashforge` slash command
@@ -258,9 +276,9 @@ curl -X POST http://localhost:8000/api/v1/chart \
 
    **Option B: Manual** — add to `~/.dashforge/.env` or your project `.env`:
    ```
-   SLACK_BOT_TOKEN=xoxb-...
-   SLACK_APP_TOKEN=xapp-...
-   SLACK_SIGNING_SECRET=...
+   SLACK_BOT_TOKEN=<slack-bot-token>
+   SLACK_APP_TOKEN=<slack-app-token>
+   SLACK_SIGNING_SECRET=<slack-signing-secret>
    ```
 
 7. Start the server:
@@ -268,7 +286,7 @@ curl -X POST http://localhost:8000/api/v1/chart \
    dashforge serve              # Slack enabled by default
    dashforge serve --no-slack   # disable Slack integration
    ```
-   Or with Docker: `docker compose restart dashforge`
+   Or with the local demo stack: `docker compose -f docker-compose.dev.yml restart dashforge`
 
 ### Usage
 
@@ -435,6 +453,20 @@ provider-agnostic — set `LLM_PROVIDER` to `anthropic`, `openai`, `azure`, `bed
 - **Concurrency & timeout guards** — pipeline runs are bounded by a semaphore and a configurable timeout to prevent runaway LLM calls.
 - **Security hardening** — all three agent system prompts include injection guardrails; API key auth is optional but built-in.
 
+## Public Beta Support Matrix
+
+| Area | Status | Notes |
+|---|---|---|
+| Grafana publishing | Supported beta | Best demo path; requires a Grafana service-account token |
+| Prometheus datasource discovery | Supported beta | Best-covered datasource path |
+| Web UI + HTTP API | Supported beta | Enable `API_AUTH_ENABLED=true` outside local demos |
+| CLI setup/doctor/test/serve | Supported beta | Good for demos and local trials |
+| SignalFx publishing | Experimental | Works in controlled tests; use with non-production dashboards first |
+| CloudWatch/Loki/Elasticsearch/Graphite/Influx discovery | Experimental | Adapters exist, contract coverage is still growing |
+| Dashboard learning/signals | Experimental | Useful, but mappings should be reviewed before relying on them |
+| Slack integration | Experimental | Not yet hardened for production workspace controls |
+| Docker Compose demo stack | Dev-only | Uses unsafe Grafana defaults by design |
+
 ## Supported Backends & Datasources
 
 DashForge publishes to multiple backends simultaneously. Each backend discovers
@@ -535,18 +567,18 @@ dashforge/
 │   │   └── schemas.py       # Pydantic models (Intent, ArchetypeMatch, DashboardSpec)
 │   └── static/
 │       └── index.html       # Web UI (Generate, Learning, Signals, Insights, Archetypes, History)
-├── tests/                   # Validation & testing
+├── tests/                   # Hermetic unit/contract tests plus live scripts
 │   ├── validate.py          # Validation suite (archetype + pipeline accuracy)
 │   ├── dashforge_validation_prompts.csv  # 100-prompt test dataset
-│   ├── test_unit.py         # Unit tests
-│   ├── test_signals.py      # Signal store, inference, SignalFlow extraction tests
-│   └── README.md            # Validation documentation
+│   ├── test_*.py            # Hermetic pytest suite
+│   └── live/                # Opt-in scripts that can mutate real vendor accounts
 ├── dev/                     # Local dev environment
 │   ├── fake_app/           # Fake metrics exporter (checkout, payment, inventory)
 │   ├── prometheus/         # Prometheus config
 │   └── grafana/            # Grafana provisioning (incl. signal_coverage dashboard)
-├── docker-compose.yml
-├── Dockerfile
+├── docker-compose.yml       # App-only compose file
+├── docker-compose.dev.yml   # Local demo stack with unsafe Grafana dev defaults
+├── Dockerfile               # Hardened non-root runtime image
 ├── pyproject.toml           # Project metadata & deps (uv)
 ├── dashforge.yaml.example   # Reference YAML config (schema-validated)
 ├── dashforge.spec           # PyInstaller spec for single-binary builds
@@ -557,13 +589,16 @@ dashforge/
 
 ## Roadmap
 
-### Roadmap Principles
+See also:
+
+- [Operational Cognition design doc](docs/operational-cognition.md)
+- [Evaluation results](docs/evaluation.md)
+
+### Completed
 
 - DashForge should **consume organizational knowledge, not custody it**. Enterprise runbooks, service catalogs, ownership data, postmortems, and policy knowledge should come through pluggable RAG / A2A / MCP integrations owned by the organization.
 - DashForge should own **observability outcomes**: investigation history, dashboard provenance, feedback-derived metric quality, archetype gaps, and what worked in prior incidents.
 - Local vector memory should stay optional: valuable for personal use, demos, offline workflows, and small teams without existing RAG infrastructure — not a required enterprise dependency.
-
-### Done
 
 - [x] Knowledge base integration (RAG / A2A / MCP) — pluggable context enrichment
 - [x] Prompt injection guardrails & security hardening
@@ -602,18 +637,29 @@ dashforge/
 - [x] Web UI: Signals tab — signal taxonomy browser (grouped by category, mapping counts, drill-down), teach signal mapping form for manual metric→signal associations
 - [x] XSS hardening — all server data escaped via `esc()` before `innerHTML` injection across all UI tabs
 - [x] Data persistence — SQLite databases mounted via Docker volume (`./data:/app/data`) for signals, feedback, and history
+- [x] Public-beta CI baseline — lint, tests, integration contracts, Docker build, secret scan, fresh-install smoke
+- [x] Hardened Dockerfile — pinned uv image, non-root runtime user, healthcheck, `.dockerignore`
+- [x] Dev-only Compose split — app-only compose file plus explicit local demo stack
+- [x] Public beta documentation — API auth guidance, security policy, contributing guide, supported/experimental labels
+- [x] Binary release workflow — cross-platform PyInstaller builds for tagged releases
 
-### Personal Use — Near Term
+### Current Focus
 
 - [ ] Ephemeral dashboard garbage collection (TTL-based cleanup)
-- [ ] Loki (log panel) support
+- [ ] Functional demo hardening — fresh-clone install tests, Docker Compose smoke tests, and end-to-end local demo validation
+- [ ] Public evaluation expansion — publish repeatable benchmark runs, dashboard snapshots, and failure examples
+- [ ] Datasource contract depth — broaden hermetic request/response coverage for CloudWatch, Loki, Elasticsearch/OpenSearch, Graphite, InfluxDB, and SignalFx
+- [ ] Loki log panel support
 - [ ] Tempo (trace) support
 - [ ] Conversational refinement — refine dashboards via follow-up messages (zoom, pivot, drill-down)
 - [ ] Alert context ingestion — auto-read alert payload as prompt
 - [ ] Dashboard versioning / history
+- [ ] Vendor API contract generation — scheduled CI job pulls official vendor OpenAPI / JSON Schema specs for Grafana, OpenSearch, and other supported observability backends, then regenerates hermetic Pydantic v2 contract models with `datamodel-code-generator`
+- [ ] Self-observability endpoint — Prometheus metrics for prompt latency, query success rate, hallucination rate, dashboard usefulness, token cost, and cache hit rate
+- [ ] Slack hardening — per-user/channel/workspace rate limits, approval workflows for production datasources, query cost estimation before execution
 - [ ] **Optional local memory demo mode** — package a lightweight local knowledge setup for personal use and demos. Start with SQLite FTS over DashForge investigation history/feedback; optionally add Qdrant via Docker Compose for semantic search over local runbooks and past investigations. This is a convenience backend, not the enterprise knowledge strategy.
 
-### Enterprise — Architecture Evolution
+### Research Directions
 
 - [ ] **Enterprise context provider contract** — harden the existing RAG / A2A / MCP context layer for production org knowledge: typed context chunks, source attribution, freshness, confidence, RBAC hints, trust labels, and failure behavior. DashForge retrieves from customer-owned systems instead of storing their knowledge base.
 - [ ] **DashForge-native memory** — persist and retrieve observability-specific learning: similar investigations, dashboard provenance, feedback-derived metric quality, panel usefulness, noisy archetypes, and successful prior dashboard patterns.
@@ -622,28 +668,13 @@ dashforge/
 - [ ] **Canonical Observability IR** — intermediate representation (`signal_type`, `resource_type`, `aggregation`, `scope`) that each datasource adapter maps to native queries. Scales portability without accumulating datasource-specific prompt hacks.
 - [ ] **Deterministic query compiler** — extend archetype engine to full AST-based compilation for freeform path. LLM emits semantic intent AST, deterministic code generates validated PromQL/LogQL.
 - [ ] **Query cost planner** — cardinality estimation, time-range scoring, query complexity analysis, datasource load awareness. Like a database optimizer for observability queries.
-
-### Enterprise — Security & Compliance
-
 - [ ] **Structured trust boundaries** — all untrusted input (logs, labels, RAG, Slack) tagged with `trusted: false` in structured prompts. LLM aware of trust levels.
 - [ ] **Query allowlists** — allowed metric families, labels, aggregations, functions. Compile from AST templates, not raw text.
 - [ ] **Multi-tenant RBAC** — RBAC-aware retrieval filtering by user/team/org/datasource permissions at every step, not just dashboard publishing.
-- [ ] **Slack hardening** — per-user/channel/workspace rate limits, approval workflows for production datasources, query cost estimation before execution.
 - [ ] **Audit logging & compliance** — PII exposure controls, data residency, LLM vendor routing. (Dashboard provenance and prompt audit trail already implemented via feedback store.)
-
-### Enterprise — Reliability & Cost
-
 - [ ] **Circuit breakers & degradation** — retries with jitter, partial degradation, fallbacks, cancellation propagation for Grafana/Prometheus/CloudWatch/LLM failures.
 - [ ] **LLM cost optimization** — classifier models + local embeddings for intent/ranking, reserve large LLMs only for layout reasoning. (Pre-ranking and LLM response caching already reduce token cost; next step is smaller models for classification.)
-- [ ] **Self-observability** — DashForge exposes Prometheus metrics: prompt latency, query success rate, hallucination rate, dashboard usefulness, token cost, cache hit rate. (Per-step pipeline telemetry already logged; next step is Prometheus `/metrics` endpoint.)
 - [ ] **Correctness validation** — heuristics for SRE best practices (counter vs gauge, correct aggregation, valid RED/USE metrics), golden dashboard templates, domain-specific validation rules.
-
-### Enterprise — CI/CD & Contracts
-
-- [ ] **Vendor API contract generation** — scheduled CI job pulls official vendor OpenAPI / JSON Schema specs for Grafana, OpenSearch, and other supported observability backends, then regenerates hermetic Pydantic v2 contract models with `datamodel-code-generator` (for example: `datamodel-code-generator --input openapi.json --output tests/contracts/grafana_models.py --output-model-type pydantic_v2.BaseModel`). Run monthly and cache or commit generated test contracts so datasource adapters and dashboard publishers do not drift as vendors update APIs.
-
-### Enterprise — Integrations
-
 - [ ] **Grafana App Plugin** *(highest-leverage UX move)* — native "Investigate with DashForge" side panel inside Grafana. Shifts DashForge from external AI service to native Grafana workflow. Engineers trust tools inside Grafana far more than external systems. Plugin surfaces a prompt input in Grafana's sidebar, calls DashForge API, and opens the generated dashboard in-place — zero context switch.
 - [ ] Webex / Zoom integrations
 - [ ] Vendor-specific dashboards (Datadog, New Relic)

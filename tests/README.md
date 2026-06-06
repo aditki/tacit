@@ -58,7 +58,7 @@ If the expected archetype is `resource_saturation`, the strict check fails (top-
 
 Tests the complete pipeline: prompt → API → dashboard → metric extraction from Grafana.
 
-**Requires:** Running DashForge API + Grafana + Prometheus (via `docker compose up`)
+**Requires:** Running DashForge API + Grafana + Prometheus (via `docker compose -f docker-compose.dev.yml up -d`)
 
 **Metrics reported:**
 

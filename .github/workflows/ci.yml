@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -21,8 +24,7 @@ jobs:
       - name: Mypy
         run: uv run mypy dashforge
 
-  # Fast, hermetic, no network. Gates the rest.
-  unit:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,20 +32,19 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --all-extras --dev
-      - name: Unit tests
-        run: uv run pytest tests/unit -q
+      - name: Hermetic test suite
+        run: uv run pytest -q
 
-  # Vendor contract tests (mocked HTTP). Run only after unit passes.
   integration:
     runs-on: ubuntu-latest
-    needs: unit
+    needs: test
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
       - run: uv sync --all-extras --dev
-      - name: Integration (contract) tests
+      - name: Hermetic vendor contract tests
         run: uv run pytest tests/integration -m integration -q
       - name: Generated vendor contract smoke test
         shell: bash
@@ -56,3 +57,40 @@ jobs:
           else
             uv run python -m tests.contracts.vendor_specs.validate --allow-empty
           fi
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t dashforge:ci .
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --no-git --redact --verbose
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  fresh-install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install package in clean environment
+        run: |
+          uv venv .fresh-venv
+          uv pip install --python .fresh-venv/bin/python .
+          .fresh-venv/bin/dashforge --version
