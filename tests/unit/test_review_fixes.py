@@ -30,10 +30,7 @@ class TestConfidenceBounds:
         # Boundaries (0.0 and 1.0) and a mid value are all valid and persisted.
         for pattern, conf in [("metric_lo", 0.0), ("metric_hi", 1.0), ("metric_mid", 0.5)]:
             assert isinstance(signal_store.add_mapping("sig", pattern, confidence=conf), int)
-        patterns = {
-            m["metric_pattern"]
-            for m in signal_store.get_mappings_for_signal("sig", include_decayed=True)
-        }
+        patterns = {m["metric_pattern"] for m in signal_store.get_mappings_for_signal("sig", include_decayed=True)}
         assert {"metric_lo", "metric_hi", "metric_mid"} <= patterns
 
     def test_above_one_is_rejected(self, signal_store):
@@ -73,15 +70,11 @@ class TestPanelDrilldownLinks:
         }
 
     def test_panel_link_url_is_captured(self):
-        parsed = parse_dashboard_json(
-            self._dashboard([{"title": "Drill", "url": "/d/xyz/other"}])
-        )
+        parsed = parse_dashboard_json(self._dashboard([{"title": "Drill", "url": "/d/xyz/other"}]))
         assert "/d/xyz/other" in parsed["drilldown_links"]
 
     def test_panel_link_attached_to_panel(self):
-        parsed = parse_dashboard_json(
-            self._dashboard([{"title": "Drill", "url": "/d/xyz/other"}])
-        )
+        parsed = parse_dashboard_json(self._dashboard([{"title": "Drill", "url": "/d/xyz/other"}]))
         panel = parsed["panels"][0]
         assert panel.get("links") == [{"title": "Drill", "url": "/d/xyz/other"}]
 

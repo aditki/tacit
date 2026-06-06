@@ -1,0 +1,103 @@
+name: Vendor Spec Refresh
+
+on:
+  schedule:
+    # Mondays at 09:17 UTC.
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+    inputs:
+      grafana_openapi_url:
+        description: "Override Grafana OpenAPI spec URL"
+        required: false
+        type: string
+      opensearch_openapi_url:
+        description: "Override OpenSearch OpenAPI/JSON schema URL"
+        required: false
+        type: string
+      signalflow_openapi_url:
+        description: "Override Splunk Observability SignalFlow OpenAPI spec URL"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    env:
+      DEFAULT_GRAFANA_OPENAPI_URL: https://raw.githubusercontent.com/grafana/grafana/main/public/openapi3.json
+      DEFAULT_OPENSEARCH_OPENAPI_URL: https://opensearch-project.github.io/opensearch-api-specification/opensearch-openapi.yaml
+      # Splunk documents SignalFlow at:
+      # https://dev.splunk.com/observability/reference/api/signalflow/latest
+      # Configure SIGNALFLOW_OPENAPI_URL when a stable raw spec URL is available.
+      DEFAULT_SIGNALFLOW_OPENAPI_URL: ""
+      GRAFANA_OPENAPI_URL: ${{ inputs.grafana_openapi_url || vars.GRAFANA_OPENAPI_URL || '' }}
+      OPENSEARCH_OPENAPI_URL: ${{ inputs.opensearch_openapi_url || vars.OPENSEARCH_OPENAPI_URL || '' }}
+      SIGNALFLOW_OPENAPI_URL: ${{ inputs.signalflow_openapi_url || vars.SIGNALFLOW_OPENAPI_URL || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate Pydantic models from vendor specs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          output_dir="tests/contracts/vendor_specs"
+          mkdir -p "${output_dir}"
+          touch "${output_dir}/__init__.py"
+
+          grafana_url="${GRAFANA_OPENAPI_URL:-$DEFAULT_GRAFANA_OPENAPI_URL}"
+          opensearch_url="${OPENSEARCH_OPENAPI_URL:-$DEFAULT_OPENSEARCH_OPENAPI_URL}"
+          signalflow_url="${SIGNALFLOW_OPENAPI_URL:-$DEFAULT_SIGNALFLOW_OPENAPI_URL}"
+
+          generate_model() {
+            local vendor="$1"
+            local url="$2"
+
+            if [[ -z "${url}" ]]; then
+              echo "::error::No raw OpenAPI spec URL configured for ${vendor}."
+              echo "::error::Set ${vendor^^}_OPENAPI_URL as a repository variable or pass it via workflow_dispatch."
+              return 1
+            fi
+
+            echo "Generating ${vendor} contract models from ${url}"
+            local input_path
+            input_path="$(mktemp)"
+            curl -fsSL "${url}" -o "${input_path}"
+            uvx --from datamodel-code-generator datamodel-codegen \
+              --input "${input_path}" \
+              --output "${output_dir}/${vendor}_models.py" \
+              --output-model-type pydantic_v2.BaseModel
+          }
+
+          generate_model "grafana" "${grafana_url}"
+          generate_model "opensearch" "${opensearch_url}"
+          generate_model "signalflow" "${signalflow_url}"
+
+      - name: Format generated contracts
+        run: uv run black tests/contracts/vendor_specs
+
+      - name: Validate generated vendor contracts
+        run: uv run python -m tests.contracts.vendor_specs.validate --vendors grafana opensearch signalflow
+
+      - name: Open refresh pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.VENDOR_SPEC_REFRESH_TOKEN || github.token }}
+          branch: codex/vendor-spec-refresh
+          delete-branch: true
+          title: "Refresh generated vendor contract models"
+          commit-message: "Refresh generated vendor contract models"
+          body: |
+            Weekly automated refresh of generated Pydantic models from vendor API specs.
+
+            Sources:
+            - Grafana: `${{ env.GRAFANA_OPENAPI_URL || env.DEFAULT_GRAFANA_OPENAPI_URL }}`
+            - OpenSearch: `${{ env.OPENSEARCH_OPENAPI_URL || env.DEFAULT_OPENSEARCH_OPENAPI_URL }}`
+            - SignalFlow: `${{ env.SIGNALFLOW_OPENAPI_URL || 'not configured' }}`

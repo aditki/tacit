@@ -46,7 +46,7 @@ def signal_store_with_bootstrap(tmp_path):
     db_path = tmp_path / "test_signals.db"
     store = SignalStore(db_path=db_path)
     # Load from project root signals.yaml
-    yaml_path = Path(__file__).parent.parent / "signals.yaml"
+    yaml_path = Path(__file__).parent.parent.parent / "signals.yaml"
     if yaml_path.is_file():
         store.load_from_yaml(yaml_path)
     return store
@@ -1051,7 +1051,7 @@ signals:
 
     def test_load_project_signals_yaml(self):
         """Verify the actual project signals.yaml loads without errors."""
-        yaml_path = Path(__file__).parent.parent / "signals.yaml"
+        yaml_path = Path(__file__).parent.parent.parent / "signals.yaml"
         if not yaml_path.is_file():
             pytest.skip("signals.yaml not found")
 
@@ -1241,9 +1241,7 @@ class TestSignalCoverageDashboard:
         """Load the signal coverage dashboard JSON fixture."""
         import json
 
-        fixture_path = (
-            Path(__file__).parent.parent / "dev" / "grafana" / "provisioning" / "dashboards" / "signal_coverage.json"
-        )
+        fixture_path = Path(__file__).parent.parent.parent / "dev/grafana/provisioning/dashboards/signal_coverage.json"
         with open(fixture_path) as f:
             return json.load(f)
 
@@ -1413,7 +1411,7 @@ class TestSignalCoverageDashboard:
         # the signal_type in the bootstrap yaml
         import yaml
 
-        yaml_path = Path(__file__).parent.parent / "signals.yaml"
+        yaml_path = Path(__file__).parent.parent.parent / "signals.yaml"
         with open(yaml_path) as f:
             data = yaml.safe_load(f)
         sig_defs = data.get("signals", {})
@@ -1985,7 +1983,7 @@ class TestSignalFlowArchetypeGeneration:
 class TestLearningTabRendering:
 
     def _learning_load_section(self) -> str:
-        html = (Path(__file__).parent.parent / "dashforge" / "static" / "index.html").read_text()
+        html = (Path(__file__).parent.parent.parent / "dashforge" / "static" / "index.html").read_text()
         return html.split("async function loadIngestedDashboards()", 1)[1].split("async function approveDashboard", 1)[
             0
         ]
@@ -2003,7 +2001,7 @@ class TestLearningTabRendering:
         assert "Generated archetype YAML" in load_section
 
     def test_ingested_dashboard_approval_uses_data_attributes_not_inline_js(self):
-        html = (Path(__file__).parent.parent / "dashforge" / "static" / "index.html").read_text()
+        html = (Path(__file__).parent.parent.parent / "dashforge" / "static" / "index.html").read_text()
         load_section = self._learning_load_section()
         assert 'onclick="approveDashboard' not in load_section
         assert "data-dashboard-uid" in load_section

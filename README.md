@@ -621,6 +621,10 @@ dashforge/
 - [ ] **Self-observability** — DashForge exposes Prometheus metrics: prompt latency, query success rate, hallucination rate, dashboard usefulness, token cost, cache hit rate. (Per-step pipeline telemetry already logged; next step is Prometheus `/metrics` endpoint.)
 - [ ] **Correctness validation** — heuristics for SRE best practices (counter vs gauge, correct aggregation, valid RED/USE metrics), golden dashboard templates, domain-specific validation rules.
 
+### Enterprise — CI/CD & Contracts
+
+- [ ] **Vendor API contract generation** — scheduled CI job pulls official vendor OpenAPI / JSON Schema specs for Grafana, OpenSearch, and other supported observability backends, then regenerates hermetic Pydantic v2 contract models with `datamodel-code-generator` (for example: `datamodel-code-generator --input openapi.json --output tests/contracts/grafana_models.py --output-model-type pydantic_v2.BaseModel`). Run monthly and cache or commit generated test contracts so datasource adapters and dashboard publishers do not drift as vendors update APIs.
+
 ### Enterprise — Integrations
 
 - [ ] **Grafana App Plugin** *(highest-leverage UX move)* — native "Investigate with DashForge" side panel inside Grafana. Shifts DashForge from external AI service to native Grafana workflow. Engineers trust tools inside Grafana far more than external systems. Plugin surfaces a prompt input in Grafana's sidebar, calls DashForge API, and opens the generated dashboard in-place — zero context switch.

@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-extras --dev
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Black
+        run: uv run black --check .
+      - name: Mypy
+        run: uv run mypy dashforge
+
+  # Fast, hermetic, no network. Gates the rest.
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-extras --dev
+      - name: Unit tests
+        run: uv run pytest tests/unit -q
+
+  # Vendor contract tests (mocked HTTP). Run only after unit passes.
+  integration:
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-extras --dev
+      - name: Integration (contract) tests
+        run: uv run pytest tests/integration -m integration -q
+      - name: Generated vendor contract smoke test
+        run: uv run python -m tests.contracts.vendor_specs.validate --allow-empty
