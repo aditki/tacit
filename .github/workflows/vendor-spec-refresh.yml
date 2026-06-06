@@ -56,14 +56,22 @@ jobs:
           opensearch_url="${OPENSEARCH_OPENAPI_URL:-$DEFAULT_OPENSEARCH_OPENAPI_URL}"
           signalflow_url="${SIGNALFLOW_OPENAPI_URL:-$DEFAULT_SIGNALFLOW_OPENAPI_URL}"
 
+          generated_vendors=()
+
           generate_model() {
             local vendor="$1"
             local url="$2"
+            local required="${3:-required}"
 
             if [[ -z "${url}" ]]; then
-              echo "::error::No raw OpenAPI spec URL configured for ${vendor}."
-              echo "::error::Set ${vendor^^}_OPENAPI_URL as a repository variable or pass it via workflow_dispatch."
-              return 1
+              if [[ "${required}" == "required" ]]; then
+                echo "::error::No raw OpenAPI spec URL configured for ${vendor}."
+                echo "::error::Set ${vendor^^}_OPENAPI_URL as a repository variable or pass it via workflow_dispatch."
+                return 1
+              fi
+
+              echo "Skipping ${vendor}: no spec URL configured."
+              return 0
             fi
 
             echo "Generating ${vendor} contract models from ${url}"
@@ -74,22 +82,40 @@ jobs:
               --input "${input_path}" \
               --output "${output_dir}/${vendor}_models.py" \
               --output-model-type pydantic_v2.BaseModel
+            generated_vendors+=("${vendor}")
           }
 
           generate_model "grafana" "${grafana_url}"
           generate_model "opensearch" "${opensearch_url}"
-          generate_model "signalflow" "${signalflow_url}"
+          generate_model "signalflow" "${signalflow_url}" "optional"
+
+          printf '%s\n' "${generated_vendors[@]}" > "${output_dir}/vendors.txt"
 
       - name: Format generated contracts
         run: uv run black tests/contracts/vendor_specs
 
       - name: Validate generated vendor contracts
-        run: uv run python -m tests.contracts.vendor_specs.validate --vendors grafana opensearch signalflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t vendors < tests/contracts/vendor_specs/vendors.txt
+          uv run python -m tests.contracts.vendor_specs.validate --vendors "${vendors[@]}"
+
+      - name: Require refresh PR token
+        env:
+          VENDOR_SPEC_REFRESH_TOKEN: ${{ secrets.VENDOR_SPEC_REFRESH_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${VENDOR_SPEC_REFRESH_TOKEN}" ]]; then
+            echo "::error::VENDOR_SPEC_REFRESH_TOKEN is required so refresh PRs trigger normal CI workflows."
+            exit 1
+          fi
 
       - name: Open refresh pull request
         uses: peter-evans/create-pull-request@v6
         with:
-          token: ${{ secrets.VENDOR_SPEC_REFRESH_TOKEN || github.token }}
+          token: ${{ secrets.VENDOR_SPEC_REFRESH_TOKEN }}
           branch: codex/vendor-spec-refresh
           delete-branch: true
           title: "Refresh generated vendor contract models"

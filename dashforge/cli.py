@@ -7,6 +7,7 @@ import webbrowser
 from collections.abc import Callable
 from concurrent.futures import Future
 from pathlib import Path
+from typing import Any
 
 import click
 import yaml
@@ -42,13 +43,22 @@ def _get_version() -> str:
 VERSION = _get_version()
 
 # ── Rich helpers (graceful fallback) ─────────────────────────────────────────
+console: Any
+Prompt: Any | None
+Confirm: Any | None
+Table: Any | None
+
 try:
     from rich.console import Console
     from rich.panel import Panel
-    from rich.prompt import Confirm, Prompt
-    from rich.table import Table
+    from rich.prompt import Confirm as RichConfirm
+    from rich.prompt import Prompt as RichPrompt
+    from rich.table import Table as RichTable
 
     console = Console()
+    Prompt = RichPrompt
+    Confirm = RichConfirm
+    Table = RichTable
 
     def _success(msg: str) -> None:
         console.print(f"  [bold green]✔[/] {msg}")
@@ -68,10 +78,10 @@ try:
 except ImportError:
     # Fallback: plain text
     class _FakeConsole:
-        def print(self, msg: str = "", **kw) -> None:
+        def print(self, msg: str = "", **kw: Any) -> None:
             click.echo(msg)
 
-    console = _FakeConsole()  # type: ignore[assignment]
+    console = _FakeConsole()
 
     def _success(msg: str) -> None:
         click.echo(f"  ✔ {msg}")
@@ -88,9 +98,9 @@ except ImportError:
     def _header(msg: str) -> None:
         click.echo(f"\n{'─' * 60}\n  {msg}\n{'─' * 60}")
 
-    Prompt = None  # type: ignore[assignment,misc]
-    Confirm = None  # type: ignore[assignment,misc]
-    Table = None  # type: ignore[assignment,misc]
+    Prompt = None
+    Confirm = None
+    Table = None
 
 
 def _prompt(text: str, default: str = "") -> str:

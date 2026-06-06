@@ -92,6 +92,10 @@ def cloudwatch_metrics(*metrics: str) -> list[str]:
     return list(metrics)
 
 
+def cloudwatch_dimension_keys(*dimensions: str) -> list[str]:
+    return list(dimensions)
+
+
 # ── Elasticsearch / OpenSearch ───────────────────────────────────────────────
 
 

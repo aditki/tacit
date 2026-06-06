@@ -10,17 +10,19 @@ Skipped automatically on Python < 3.12 because the app transitively imports
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
-try:
-    from fastapi.testclient import TestClient
+if sys.version_info < (3, 12):  # pragma: no cover - env guard  # noqa: UP036
+    pytest.skip("DashForge API contract requires Python 3.12", allow_module_level=True)
 
-    import dashforge.dashboard_ingest as di
-    import dashforge.signals as signals_mod
-    from dashforge.main import app
-    from dashforge.signals import SignalStore
-except (SyntaxError, ImportError) as exc:  # pragma: no cover - env guard
-    pytest.skip(f"DashForge API contract requires Python 3.12 ({exc})", allow_module_level=True)
+from fastapi.testclient import TestClient
+
+import dashforge.dashboard_ingest as di
+import dashforge.signals as signals_mod
+from dashforge.main import app
+from dashforge.signals import SignalStore
 
 
 @pytest.fixture

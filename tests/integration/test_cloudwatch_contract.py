@@ -19,7 +19,9 @@ async def test_cloudwatch_discovery_resource_contract():
     respx.post(resource_url("cw-1", "metrics")).mock(
         return_value=Response(200, json=f.cloudwatch_metrics("HTTPCode_ELB_5XX", "Latency"))
     )
-    respx.post(resource_url("cw-1", "dimension-keys")).mock(return_value=Response(200, json=["LoadBalancer"]))
+    dimension_route = respx.post(resource_url("cw-1", "dimension-keys")).mock(
+        return_value=Response(200, json=f.cloudwatch_dimension_keys("LoadBalancer"))
+    )
 
     client = make_grafana_client()
     try:
@@ -30,3 +32,5 @@ async def test_cloudwatch_discovery_resource_contract():
     names = {e.name for e in entries}
     assert any(n.endswith("/HTTPCode_ELB_5XX") for n in names)
     assert all(e.query_language == "cloudwatch" for e in entries)
+    assert dimension_route.called
+    assert any(e.dimensions == ["LoadBalancer"] for e in entries)
