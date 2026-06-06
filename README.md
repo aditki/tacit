@@ -638,7 +638,7 @@ See also:
 - [x] Web UI: Learning tab — dashboard ingestion form (backend selector, UID, auto-approve toggle), ingested dashboard history with approval workflow
 - [x] Web UI: Signals tab — signal taxonomy browser (grouped by category, mapping counts, drill-down), teach signal mapping form for manual metric→signal associations
 - [x] XSS hardening — all server data escaped via `esc()` before `innerHTML` injection across all UI tabs
-- [x] Data persistence — SQLite databases mounted via Docker volume (`./data:/app/data`) for signals, feedback, and history
+- [x] Data persistence — SQLite databases mounted via a Docker named volume for signals, feedback, and history
 - [x] Public-beta CI baseline — lint, tests, integration contracts, Docker build, secret scan, fresh-install smoke
 - [x] Hardened Dockerfile — pinned uv image, non-root runtime user, healthcheck, `.dockerignore`
 - [x] Dev-only Compose split — app-only compose file plus explicit local demo stack

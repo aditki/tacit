@@ -53,7 +53,7 @@ services:
       GRAFANA_URL: http://grafana:3000
       SSL_CERT_FILE: ""
     volumes:
-      - ./data:/app/data
+      - dashforge_data:/app/data
     depends_on:
       - grafana
       - prometheus
@@ -62,4 +62,5 @@ services:
     #  - "host.docker.internal:host-gateway" # use "http://host.docker.internal:11434" in .env for LLM_API_BASE
 
 volumes:
+  dashforge_data:
   grafana_data:

@@ -15,7 +15,7 @@ services:
       - path: .env
         required: false
     volumes:
-      - ./data:/app/data
+      - dashforge_data:/app/data
     read_only: true
     tmpfs:
       - /tmp
@@ -23,3 +23,6 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+volumes:
+  dashforge_data:
