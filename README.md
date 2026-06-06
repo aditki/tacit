@@ -368,6 +368,7 @@ The signal taxonomy (`signals.yaml`) defines 12 categories with metric patterns:
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/v1/learn/dashboard` | Ingest a dashboard (requires `dashboard_uid`, optional `backend`, `auto_approve`) |
+| `POST` | `/api/v1/learn/dashboard/json` | Ingest an uploaded dashboard JSON export (Grafana now, parser registry ready for other vendors) |
 | `GET` | `/api/v1/learn/dashboards` | List ingested dashboards |
 | `POST` | `/api/v1/learn/dashboards/{uid}/approve` | Approve a pending ingested dashboard |
 | `GET` | `/api/v1/signals` | List all signal types with mapping counts |
