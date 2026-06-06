@@ -609,22 +609,22 @@ class SignalStore:
                 with open(candidate) as f:
                     return yaml.safe_load(f) or {}, str(candidate)
 
+        candidates = [
+            # Local editable overrides for source checkouts and container mounts.
+            Path("signals.yaml"),
+            Path(__file__).resolve().parent.parent / "signals.yaml",
+            # Backward-compatible fallback for older wheel/PyInstaller layouts.
+            Path(__file__).resolve().parent / "signals.yaml",
+        ]
+        for p in candidates:
+            if p.is_file():
+                with open(p) as f:
+                    return yaml.safe_load(f) or {}, str(p)
+
         resource = files("dashforge.data").joinpath("signals.yaml")
         if resource.is_file():
             with resource.open() as f:
                 return yaml.safe_load(f) or {}, "package:dashforge.data/signals.yaml"
-
-        if path is None:
-            candidates = [
-                # Backward-compatible fallbacks for old source layouts.
-                Path(__file__).resolve().parent.parent / "signals.yaml",
-                Path(__file__).resolve().parent / "signals.yaml",
-                Path("signals.yaml"),
-            ]
-            for p in candidates:
-                if p.is_file():
-                    with open(p) as f:
-                        return yaml.safe_load(f) or {}, str(p)
         return None, None
 
     def load_from_yaml(self, path: Path | None = None) -> int:
