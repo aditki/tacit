@@ -33,7 +33,7 @@ jobs:
           python-version: "3.12"
       - run: uv sync --all-extras --dev
       - name: Hermetic test suite
-        run: uv run pytest -q
+        run: uv run pytest -vv
 
   integration:
     runs-on: ubuntu-latest
@@ -45,7 +45,7 @@ jobs:
           python-version: "3.12"
       - run: uv sync --all-extras --dev
       - name: Hermetic vendor contract tests
-        run: uv run pytest tests/integration -m integration -q
+        run: uv run pytest tests/integration -m integration -vv
       - name: Generated vendor contract smoke test
         shell: bash
         run: |
@@ -69,14 +69,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - name: Gitleaks
-        uses: gitleaks/gitleaks-action@v2
+        uses: docker://zricethezav/gitleaks:v8.24.3
         with:
-          args: detect --no-git --redact --verbose
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          args: detect --source /github/workspace --no-git --redact --verbose
 
   fresh-install:
     strategy:
