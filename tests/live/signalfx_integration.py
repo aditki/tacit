@@ -4,7 +4,7 @@ Usage:
     # Ensure SIGNALFX_API_TOKEN is set and signalfx_realm is configured.
     # For metric ingestion, also set SIGNALFX_INGEST_TOKEN (a separate
     # token with ingest scope from Settings → Access Tokens).
-    python tests/test_signalfx_integration.py
+    python tests/live/signalfx_integration.py
 
 Steps:
 1. Ingest dummy metrics via the SignalFx ingest API

@@ -111,6 +111,24 @@ def _select_namespaces(keywords: list[str], available: list[str]) -> list[str]:
     return result[:10]
 
 
+def _coerce_dimension_keys(response: object) -> list[str]:
+    if isinstance(response, list):
+        dimensions: list[str] = []
+        for item in response:
+            if isinstance(item, str):
+                dimensions.append(item)
+            elif isinstance(item, dict):
+                value = item.get("value") or item.get("text") or item.get("name")
+                if value is not None:
+                    dimensions.append(str(value))
+        return dimensions
+
+    if isinstance(response, dict):
+        return [str(dim) for dim in response.keys()]
+
+    return []
+
+
 class CloudWatchAdapter(DatasourceAdapter):
 
     @property
@@ -130,16 +148,22 @@ class CloudWatchAdapter(DatasourceAdapter):
         namespace: str,
         metric_name: str,
     ) -> list[str]:
-        resp = await client.datasource_resource(
-            datasource.uid,
-            "dimension-keys",
-            {"region": region, "namespace": namespace, "metricName": metric_name},
-        )
-        if isinstance(resp, list):
-            return [str(dim) for dim in resp]
-        if isinstance(resp, dict):
-            return [str(dim) for dim in resp.keys()]
-        return []
+        try:
+            resp = await client.datasource_resource(
+                datasource.uid,
+                "dimension-keys",
+                {"region": region, "namespace": namespace, "metricName": metric_name},
+            )
+        except Exception as exc:
+            logger.warning(
+                "cloudwatch_dimension_keys_failed",
+                datasource=datasource.name,
+                namespace=namespace,
+                metric=metric_name,
+                error=str(exc),
+            )
+            return []
+        return _coerce_dimension_keys(resp)
 
     async def discover_metrics(
         self,

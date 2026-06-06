@@ -92,8 +92,8 @@ def cloudwatch_metrics(*metrics: str) -> list[str]:
     return list(metrics)
 
 
-def cloudwatch_dimension_keys(*dimensions: str) -> list[str]:
-    return list(dimensions)
+def cloudwatch_dimension_keys(*dimensions: str) -> list[dict[str, str]]:
+    return [{"value": dim} for dim in dimensions]
 
 
 # ── Elasticsearch / OpenSearch ───────────────────────────────────────────────

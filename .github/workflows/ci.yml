@@ -46,4 +46,13 @@ jobs:
       - name: Integration (contract) tests
         run: uv run pytest tests/integration -m integration -q
       - name: Generated vendor contract smoke test
-        run: uv run python -m tests.contracts.vendor_specs.validate --allow-empty
+        shell: bash
+        run: |
+          set -euo pipefail
+          vendors_file="tests/contracts/vendor_specs/vendors.txt"
+          if [[ -f "${vendors_file}" ]]; then
+            mapfile -t vendors < "${vendors_file}"
+            uv run python -m tests.contracts.vendor_specs.validate --vendors "${vendors[@]}"
+          else
+            uv run python -m tests.contracts.vendor_specs.validate --allow-empty
+          fi
