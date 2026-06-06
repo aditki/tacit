@@ -1776,5 +1776,5 @@ archetypes:
         row: Partitions
         unit: short
         queries:
-          - expr: 'kafka_log_log_logendoffset{topic!=""}'
+          - expr: 'kafka_log_log_logendoffset{{topic!=""}}'
             legend_format: "{{topic}}-{{partition}}"

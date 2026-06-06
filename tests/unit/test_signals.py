@@ -1518,6 +1518,41 @@ class TestArchetypeYamlBraceEscaping:
 
         assert "[ 1m ]" in expr.format(service_filter="", container_filter="", rate_interval="1m")
 
+    def test_kafka_topic_selector_literal_braces_compile(self):
+        from dashforge.archetypes.engine import compile_archetype
+        from dashforge.archetypes.templates import _load_archetypes_from_yaml
+        from dashforge.models.schemas import ArchetypeMatch, Intent
+
+        archetypes = _load_archetypes_from_yaml(Path(__file__).resolve().parents[2] / "dashforge/data/archetypes.yaml")
+        archetype = next(a for a in archetypes if a.id == "kafka_topic_throughput")
+        intent = Intent(
+            summary="kafka topic imbalance",
+            domain="messaging",
+            services=[],
+            signals=[],
+            keywords=["kafka", "topic"],
+            timerange="4h",
+            problem_type="kafka_topic_imbalance",
+            archetypes=[ArchetypeMatch(type="kafka_topic_imbalance", confidence=1.0)],
+        )
+
+        spec = compile_archetype(
+            archetype,
+            intent,
+            [
+                MetricEntry(
+                    name="kafka_log_log_logendoffset",
+                    datasource_uid="prom",
+                    datasource_name="Prometheus",
+                    datasource_type="prometheus",
+                    query_language="promql",
+                )
+            ],
+        )
+
+        exprs = [query.expr for panel in spec.panels for query in panel.queries]
+        assert 'kafka_log_log_logendoffset{topic!=""}' in exprs
+
 
 class TestSignalFlowCompileCompatibility:
 
