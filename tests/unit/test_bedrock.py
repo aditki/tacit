@@ -782,7 +782,7 @@ def test_pyproject_has_bedrock_optional_extra():
     import tomllib
     from pathlib import Path
 
-    toml_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    toml_path = Path(__file__).resolve().parent.parent.parent / "pyproject.toml"
     with open(toml_path, "rb") as f:
         data = tomllib.load(f)
 
@@ -798,7 +798,7 @@ def test_pyproject_boto3_minimum_version_supports_converse():
     import tomllib
     from pathlib import Path
 
-    toml_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    toml_path = Path(__file__).resolve().parent.parent.parent / "pyproject.toml"
     with open(toml_path, "rb") as f:
         data = tomllib.load(f)
 

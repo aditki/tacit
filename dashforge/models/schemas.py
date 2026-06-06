@@ -386,9 +386,7 @@ class TeachSignalRequest(BaseModel):
     datasource_types: list[str] | None = Field(
         default=None, description="Context: datasource types this mapping applies to"
     )
-    environments: list[str] | None = Field(
-        default=None, description="Context: environments this mapping applies to"
-    )
+    environments: list[str] | None = Field(default=None, description="Context: environments this mapping applies to")
     taught_by: str = Field(default="api", description="Provenance: who taught this mapping")
 
     @field_validator("signal_type")
@@ -413,9 +411,7 @@ class LearnDashboardRequest(BaseModel):
 
     model_config = {
         "extra": "forbid",
-        "json_schema_extra": {
-            "examples": [{"dashboard_uid": "abc123", "backend": "grafana", "auto_approve": False}]
-        },
+        "json_schema_extra": {"examples": [{"dashboard_uid": "abc123", "backend": "grafana", "auto_approve": False}]},
     }
 
     dashboard_uid: str = Field(description="Dashboard UID/ID to ingest (interpretation is backend-specific)")

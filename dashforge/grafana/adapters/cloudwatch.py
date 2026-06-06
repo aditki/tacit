@@ -111,6 +111,24 @@ def _select_namespaces(keywords: list[str], available: list[str]) -> list[str]:
     return result[:10]
 
 
+def _coerce_dimension_keys(response: object) -> list[str]:
+    if isinstance(response, list):
+        dimensions: list[str] = []
+        for item in response:
+            if isinstance(item, str):
+                dimensions.append(item)
+            elif isinstance(item, dict):
+                value = item.get("value") or item.get("text") or item.get("name")
+                if value is not None:
+                    dimensions.append(str(value))
+        return dimensions
+
+    if isinstance(response, dict):
+        return [str(dim) for dim in response.keys()]
+
+    return []
+
+
 class CloudWatchAdapter(DatasourceAdapter):
 
     @property
@@ -120,6 +138,32 @@ class CloudWatchAdapter(DatasourceAdapter):
     @property
     def supported_types(self) -> set[str]:
         return {"cloudwatch"}
+
+    async def _dimension_keys(
+        self,
+        client: GrafanaClient,
+        datasource: DatasourceInfo,
+        *,
+        region: str,
+        namespace: str,
+        metric_name: str,
+    ) -> list[str]:
+        try:
+            resp = await client.datasource_resource(
+                datasource.uid,
+                "dimension-keys",
+                {"region": region, "namespace": namespace, "metricName": metric_name},
+            )
+        except Exception as exc:
+            logger.warning(
+                "cloudwatch_dimension_keys_failed",
+                datasource=datasource.name,
+                namespace=namespace,
+                metric=metric_name,
+                error=str(exc),
+            )
+            return []
+        return _coerce_dimension_keys(resp)
 
     async def discover_metrics(
         self,
@@ -173,6 +217,13 @@ class CloudWatchAdapter(DatasourceAdapter):
             kw_lower = [k.lower() for k in keywords]
             for mname in metric_names:
                 if any(k in mname.lower() for k in kw_lower) or not kw_lower:
+                    dimensions = await self._dimension_keys(
+                        client,
+                        datasource,
+                        region=default_region,
+                        namespace=ns,
+                        metric_name=mname,
+                    )
                     entries.append(
                         MetricEntry(
                             name=f"{ns}/{mname}",
@@ -181,12 +232,20 @@ class CloudWatchAdapter(DatasourceAdapter):
                             datasource_type=datasource.type,
                             query_language=self.query_language,
                             namespace=ns,
+                            dimensions=dimensions,
                         )
                     )
 
             # Also include all metrics in this namespace if few matched
             if not any(e.namespace == ns for e in entries):
                 for mname in metric_names[:20]:
+                    dimensions = await self._dimension_keys(
+                        client,
+                        datasource,
+                        region=default_region,
+                        namespace=ns,
+                        metric_name=mname,
+                    )
                     entries.append(
                         MetricEntry(
                             name=f"{ns}/{mname}",
@@ -195,6 +254,7 @@ class CloudWatchAdapter(DatasourceAdapter):
                             datasource_type=datasource.type,
                             query_language=self.query_language,
                             namespace=ns,
+                            dimensions=dimensions,
                         )
                     )
 

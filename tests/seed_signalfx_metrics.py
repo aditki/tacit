@@ -333,7 +333,7 @@ def main():
 
     if success_count == len(batches):
         _ok("All ingested! Metrics should be searchable in ~30-60 seconds.")
-        _info("Run the integration test: python tests/test_signalfx_integration.py")
+        _info("Run the integration test: python tests/live/signalfx_integration.py")
         _info("Or try a prompt: 'high latency on the checkout service'")
     else:
         _fail(f"{len(batches) - success_count} batches failed")
