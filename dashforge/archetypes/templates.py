@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 import re
-from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -615,8 +614,11 @@ def get_archetypes_by_learning_context(
     classifier for every newly learned dashboard family.
     """
     exclude_ids = exclude_ids or set()
-    catalog_names = {getattr(entry, "name", "") for entry in catalog}
+    catalog_names = {getattr(entry, "name", "") for entry in catalog if getattr(entry, "name", "")}
     prompt_tokens = _intent_tokens(intent)
+    service_tokens = set()
+    for service in getattr(intent, "services", []) or []:
+        service_tokens |= _tokens(service)
     results: list[tuple[InvestigationArchetype, float]] = []
 
     for arch in ALL_ARCHETYPES:
@@ -634,7 +636,11 @@ def get_archetypes_by_learning_context(
         if expected_metrics:
             metric_score = min(len(expected_metrics & catalog_names) / max(min(len(expected_metrics), 4), 1), 1.0)
 
-        confidence = round((0.45 * token_score) + (0.55 * metric_score), 4)
+        service_score = 1.0 if service_tokens and service_tokens <= arch_tokens else 0.0
+        if catalog_names:
+            confidence = round((0.25 * token_score) + (0.55 * metric_score) + (0.20 * service_score), 4)
+        else:
+            confidence = round((0.55 * token_score) + (0.45 * service_score), 4)
         if confidence >= min_confidence:
             results.append((arch, confidence))
 

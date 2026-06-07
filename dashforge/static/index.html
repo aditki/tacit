@@ -639,7 +639,10 @@
         for (const inv of data.investigations) {
           const badge = statusBadge(inv.status);
           const prompt = inv.prompt.length > 50 ? inv.prompt.slice(0, 47) + '...' : inv.prompt;
-          const archs = (inv.archetypes || []).slice(0, 2).map(a => `${a.type}(${Math.round(a.confidence*100)}%)`).join(', ') || '—';
+          const archs = (inv.archetypes || []).slice(0, 2).map(a => {
+            const src = a.source === 'learned' ? ' learned' : '';
+            return `${a.type}(${Math.round(a.confidence*100)}%${src})`;
+          }).join(', ') || '—';
           html += `<tr>
             <td>${badge}</td>
             <td class="prompt-cell" title="${esc(inv.prompt)}">${esc(prompt)}</td>
@@ -665,7 +668,12 @@
         if (!resp.ok) throw new Error('Not found');
         const inv = await resp.json();
         const badge = statusBadge(inv.status);
-        const archs = (inv.archetypes || []).map(a => `${esc(a.type)} (${Math.round(a.confidence*100)}%)`).join(', ') || '—';
+        const archs = (inv.archetypes || []).map(a => {
+          const src = a.source ? `, ${a.source}` : '';
+          const selected = a.selected === false ? ', not selected' : '';
+          return `${a.type} (${Math.round(a.confidence*100)}%${src}${selected})`;
+        }).join(', ') || '—';
+        const intentSignals = (inv.intent_signals || []).map(s => esc(s)).join(', ') || '—';
         const metrics = (inv.metrics_selected || []).map(m => esc(m)).join(', ') || '—';
         const dsTypes = (inv.datasource_types || []).map(d => esc(d)).join(', ') || '—';
 
@@ -703,6 +711,7 @@
               <strong>Domain:</strong> ${esc(inv.intent_domain || '—')}<br>
               <strong>Services:</strong> ${esc((inv.intent_services || []).join(', ') || '—')}<br>
               <strong>Keywords:</strong> ${esc((inv.intent_keywords || []).join(', ') || '—')}<br>
+              <strong>Signals:</strong> ${intentSignals}<br>
               <strong>Problem type:</strong> ${esc(inv.problem_type || '—')}<br>
               <strong>Archetypes:</strong> ${esc(archs)}<br>
               <strong>Timerange:</strong> ${esc(inv.timerange || '—')}

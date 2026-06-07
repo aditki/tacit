@@ -6,7 +6,8 @@ from typing import Any, cast
 
 import structlog
 
-from dashforge.backends.base import DashboardFeatures, PublishResult
+from dashforge.backends.base import DashboardFeatures, DiscoveryStatus, PublishResult
+from dashforge.grafana.adapters.registry import get_adapter
 from dashforge.grafana.client import GrafanaClient
 from dashforge.grafana.dashboard import publish_dashboard as publish_dashboard_fn
 from dashforge.grafana.datasource import (
@@ -26,6 +27,7 @@ class GrafanaBackend:
 
     def __init__(self, client: GrafanaClient | None = None):
         self._client = client or GrafanaClient()
+        self.last_discovery_status = DiscoveryStatus()
 
     # ── Protocol properties ───────────────────────────────────────────
 
@@ -45,25 +47,77 @@ class GrafanaBackend:
         intent: Intent,
     ) -> list[MetricEntry]:
         try:
-            all_ds = await list_datasources(self._client)
-
-            signal_types = [s.value for s in intent.signals]
-            relevant_ds = filter_datasources_by_signal(all_ds, signal_types)
-            if not relevant_ds:
-                relevant_ds = filter_datasources_by_signal(all_ds, ["metrics"])
-
-            searchable_ds = filter_searchable_datasources(relevant_ds)
-            if not searchable_ds:
-                searchable_ds = filter_searchable_datasources(all_ds)
+            all_ds, searchable_ds = await self._select_searchable_datasources(intent)
 
             if not searchable_ds:
                 logger.warning("grafana_no_searchable_datasources")
+                self.last_discovery_status = DiscoveryStatus(
+                    available=True,
+                    datasource_count=len(all_ds),
+                    searchable_datasource_count=0,
+                )
                 return []
 
-            return await discover_all_metrics(self._client, searchable_ds, keywords)
-        except Exception:
-            logger.error("grafana_discover_failed", exc_info=True)
+            entries = await discover_all_metrics(self._client, searchable_ds, keywords)
+            self.last_discovery_status = DiscoveryStatus(
+                available=True,
+                datasource_count=len(all_ds),
+                searchable_datasource_count=len(searchable_ds),
+            )
+            return entries
+        except Exception as exc:
+            self.last_discovery_status = DiscoveryStatus(available=False, error=str(exc))
+            logger.error("grafana_discover_failed", error=str(exc), exc_info=True)
             return []
+
+    async def discover_datasource_targets(
+        self,
+        keywords: list[str],
+        intent: Intent,
+    ) -> list[MetricEntry]:
+        """Return datasource identities even when metric discovery is empty."""
+        del keywords
+        try:
+            all_ds, searchable_ds = await self._select_searchable_datasources(intent)
+        except Exception as exc:
+            self.last_discovery_status = DiscoveryStatus(available=False, error=str(exc))
+            logger.error("grafana_datasource_target_discovery_failed", error=str(exc), exc_info=True)
+            return []
+
+        self.last_discovery_status = DiscoveryStatus(
+            available=True,
+            datasource_count=len(all_ds),
+            searchable_datasource_count=len(searchable_ds),
+        )
+        targets: list[MetricEntry] = []
+        for ds in searchable_ds:
+            adapter = get_adapter(ds)
+            if adapter is None:
+                continue
+            targets.append(
+                MetricEntry(
+                    name="",
+                    datasource_uid=ds.uid,
+                    datasource_name=ds.name,
+                    datasource_type=ds.type,
+                    query_language=adapter.query_language,
+                )
+            )
+        return targets
+
+    async def _select_searchable_datasources(self, intent: Intent):
+        all_ds = await list_datasources(self._client)
+
+        signal_types = [s.value for s in intent.signals]
+        relevant_ds = filter_datasources_by_signal(all_ds, signal_types)
+        if not relevant_ds:
+            relevant_ds = filter_datasources_by_signal(all_ds, ["metrics"])
+
+        searchable_ds = filter_searchable_datasources(relevant_ds)
+        if not searchable_ds:
+            searchable_ds = filter_searchable_datasources(all_ds)
+
+        return all_ds, searchable_ds
 
     # ── Validation ────────────────────────────────────────────────────
 

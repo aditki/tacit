@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import structlog
 
-from dashforge.backends.base import DashboardFeatures, PublishResult
+from dashforge.backends.base import DashboardFeatures, DiscoveryStatus, PublishResult
 from dashforge.models.schemas import DashboardSpec, Intent, MetricEntry
 from dashforge.signalfx.client import SignalFxClient
 from dashforge.signalfx.discovery import discover_metrics as sfx_discover
@@ -22,6 +22,7 @@ class SignalFxBackend:
 
     def __init__(self, client: SignalFxClient | None = None):
         self._client = client or SignalFxClient()
+        self.last_discovery_status = DiscoveryStatus()
 
     # ── Protocol properties ───────────────────────────────────────────
 
@@ -41,10 +42,31 @@ class SignalFxBackend:
         intent: Intent,
     ) -> list[MetricEntry]:
         try:
-            return await sfx_discover(self._client, keywords)
-        except Exception:
-            logger.error("signalfx_discover_failed", exc_info=True)
+            entries = await sfx_discover(self._client, keywords)
+            self.last_discovery_status = DiscoveryStatus(available=True)
+            return entries
+        except Exception as exc:
+            self.last_discovery_status = DiscoveryStatus(available=False, error=str(exc))
+            logger.error("signalfx_discover_failed", error=str(exc), exc_info=True)
             return []
+
+    async def discover_datasource_targets(
+        self,
+        keywords: list[str],
+        intent: Intent,
+    ) -> list[MetricEntry]:
+        del keywords, intent
+        if not self.last_discovery_status.available:
+            return []
+        return [
+            MetricEntry(
+                name="",
+                datasource_uid="signalfx-direct",
+                datasource_name="SignalFx Direct",
+                datasource_type="signalfx",
+                query_language="signalflow",
+            )
+        ]
 
     # ── Validation ────────────────────────────────────────────────────
 
