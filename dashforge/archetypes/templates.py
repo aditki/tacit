@@ -422,15 +422,21 @@ def _load_archetypes_from_yaml(path: Path) -> list[InvestigationArchetype]:
     import yaml
 
     with open(path) as f:
-        data = yaml.safe_load(f) or {}
+        data = yaml.safe_load(f)
 
     return _load_archetypes_from_data(data)
 
 
-def _load_archetypes_from_data(data: dict) -> list[InvestigationArchetype]:
+def _load_archetypes_from_data(data: object) -> list[InvestigationArchetype]:
     """Parse archetype YAML data into InvestigationArchetype objects."""
+    if not isinstance(data, dict):
+        raise ValueError("archetype YAML must contain a mapping with an 'archetypes' list")
+    raw_archetypes = data.get("archetypes")
+    if not isinstance(raw_archetypes, list) or not raw_archetypes:
+        raise ValueError("archetype YAML must define at least one archetype")
+
     archetypes = []
-    for entry in data.get("archetypes", []):
+    for entry in raw_archetypes:
         panels = []
         for p in entry.get("panels", []):
             queries = [
@@ -470,6 +476,8 @@ def _load_archetypes_from_data(data: dict) -> list[InvestigationArchetype]:
                 default_timerange=entry.get("default_timerange", "1h"),
             )
         )
+    if not archetypes:
+        raise ValueError("archetype YAML did not load any archetypes")
     return archetypes
 
 
@@ -482,7 +490,7 @@ def _load_packaged_archetypes() -> list[InvestigationArchetype] | None:
         return None
 
     with resource.open() as f:
-        data = yaml.safe_load(f) or {}
+        data = yaml.safe_load(f)
     return _load_archetypes_from_data(data)
 
 
