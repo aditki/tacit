@@ -22,6 +22,7 @@ from dashforge.dashboard_ingest import (
     infer_signals_from_metrics,
     parse_dashboard_json,
 )
+from dashforge.dashboard_uploads import parse_uploaded_dashboard
 from dashforge.models.schemas import MetricEntry
 from dashforge.signals import (
     SignalStore,
@@ -716,6 +717,96 @@ class TestDashboardParsing:
         assert "sso_auth_latency_seconds_bucket" in result["metrics_found"]
         assert len(result["panel_titles"]) == 3
         assert len(result["metric_cooccurrence"]) > 0
+
+    def test_parse_uploaded_grafana_dashboard_features(self):
+        dashboard_json = {
+            "dashboard": {
+                "uid": "upload-dash",
+                "title": "Uploaded Grafana",
+                "tags": ["upload"],
+                "panels": [
+                    {
+                        "type": "timeseries",
+                        "title": "Request Rate",
+                        "targets": [
+                            {
+                                "expr": "sum(rate(http_requests_total[5m]))",
+                                "datasource": {"type": "prometheus", "uid": "prom"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+
+        features = parse_uploaded_dashboard(dashboard_json, vendor="grafana", source_name="upload.json")
+
+        assert features.dashboard_uid == "upload-dash"
+        assert features.backend_name == "grafana_json"
+        assert features.query_language == "promql"
+        assert features.metrics_found == ["http_requests_total"]
+        assert features.panel_count == 1
+
+    def test_parse_uploaded_signalfx_dashboard_features(self):
+        document = {
+            "dashboard": {"id": "sfx-dash", "name": "Uploaded SignalFx", "tags": ["upload"]},
+            "charts": [
+                {
+                    "name": "CPU",
+                    "options": {"programOptions": {"programText": "data('cpu.utilization').mean().publish()"}},
+                }
+            ],
+        }
+
+        features = parse_uploaded_dashboard(document, vendor="signalfx", source_name="sfx.json")
+
+        assert features.dashboard_uid == "sfx-dash"
+        assert features.backend_name == "signalfx_json"
+        assert features.query_language == "signalflow"
+        assert features.metrics_found == ["cpu.utilization"]
+        assert features.panel_count == 1
+
+    def test_parse_uploaded_signalfx_dashboard_with_nested_charts(self):
+        document = {
+            "dashboard": {
+                "id": "sfx-nested",
+                "name": "Nested SignalFx",
+                "tags": ["upload"],
+                "charts": [
+                    {
+                        "name": "Memory",
+                        "options": {
+                            "programOptions": {"programText": "data('container.memory.usage').mean().publish()"}
+                        },
+                    }
+                ],
+            }
+        }
+
+        features = parse_uploaded_dashboard(document, vendor="signalfx", source_name="sfx-nested.json")
+
+        assert features.dashboard_uid == "sfx-nested"
+        assert features.metrics_found == ["container.memory.usage"]
+        assert features.panel_count == 1
+        assert features.panel_titles == ["Memory"]
+
+    def test_parse_uploaded_signalfx_program_options_null_uses_program_text(self):
+        document = {
+            "dashboard": {"id": "sfx-null-options", "name": "Nullable SignalFx"},
+            "charts": [
+                {
+                    "name": "CPU",
+                    "options": {"programOptions": None},
+                    "programText": "data('cpu.utilization').mean().publish()",
+                }
+            ],
+        }
+
+        features = parse_uploaded_dashboard(document, vendor="signalfx", source_name="sfx-null.json")
+
+        assert features.dashboard_uid == "sfx-null-options"
+        assert features.metrics_found == ["cpu.utilization"]
+        assert features.panel_count == 1
 
     def test_parse_dashboard_with_rows(self):
         dashboard_json = {

@@ -702,6 +702,97 @@ def _features_to_dict(features) -> dict[str, Any]:
     return asdict(features)
 
 
+async def ingest_dashboard_features(
+    features: Any,
+    *,
+    auto_approve: bool = False,
+) -> dict[str, Any]:
+    """Infer, persist, and optionally approve already-extracted dashboard features."""
+    extracted = _features_to_dict(features)
+
+    signals = infer_signals_from_metrics(
+        features.metrics_found,
+        features.panels,
+    )
+
+    archetype_yaml = generate_archetype_yaml(extracted, signals)
+
+    store = get_signal_store()
+    status = "approved" if auto_approve else "pending"
+
+    store.record_ingested_dashboard(
+        dashboard_uid=features.dashboard_uid,
+        backend_name=features.backend_name,
+        dashboard_title=features.dashboard_title,
+        dashboard_tags=features.dashboard_tags,
+        metrics_found=features.metrics_found,
+        panel_count=features.panel_count,
+        row_groups=features.row_groups,
+        metric_cooccurrence=features.metric_cooccurrence,
+        aggregation_patterns=features.aggregation_patterns,
+        query_transformations=features.query_transformations,
+        panel_titles=features.panel_titles,
+        alert_links=features.alert_links,
+        drilldown_links=features.drilldown_links,
+        signals_inferred=signals,
+        archetype_generated=archetype_yaml,
+        status=status,
+    )
+
+    mappings_created = 0
+    if auto_approve:
+        source_ref = (
+            f"{features.backend_name}:{features.dashboard_uid}" if features.backend_name else features.dashboard_uid
+        )
+        for sig in signals:
+            if sig["confidence"] >= 0.5:
+                store.add_mapping(
+                    signal_type=sig["signal_type"],
+                    metric_pattern=sig["metric"],
+                    confidence=sig["confidence"],
+                    source_type="dashboard_ingest",
+                    source_refs=[source_ref],
+                )
+                mappings_created += 1
+        logger.info(
+            "dashboard_ingested_auto_approved",
+            uid=features.dashboard_uid,
+            backend=features.backend_name,
+            metrics=len(features.metrics_found),
+            signals=len(signals),
+            mappings_created=mappings_created,
+        )
+    else:
+        logger.info(
+            "dashboard_ingested_pending",
+            uid=features.dashboard_uid,
+            backend=features.backend_name,
+            metrics=len(features.metrics_found),
+            signals=len(signals),
+        )
+
+    result = {
+        "dashboard_uid": features.dashboard_uid,
+        "dashboard_title": features.dashboard_title,
+        "backend": features.backend_name,
+        "query_language": features.query_language,
+        "status": status,
+        "metrics_found": features.metrics_found,
+        "panel_count": features.panel_count,
+        "row_groups": features.row_groups,
+        "metric_cooccurrence": features.metric_cooccurrence,
+        "aggregation_patterns": features.aggregation_patterns,
+        "panel_titles": features.panel_titles,
+        "alert_links": features.alert_links,
+        "drilldown_links": features.drilldown_links,
+        "signals_inferred": signals,
+        "archetype_yaml": archetype_yaml,
+    }
+    if auto_approve:
+        result["mappings_created"] = mappings_created
+    return result
+
+
 async def ingest_dashboard(
     dashboard_uid: str,
     backend: Any | None = None,
@@ -762,89 +853,7 @@ async def ingest_dashboard(
         # Delegate fetch + parse to the backend (vendor-specific)
         features: DashboardFeatures = await backend.ingest_dashboard(dashboard_uid)
 
-        # Everything below is vendor-agnostic
-        extracted = _features_to_dict(features)
-
-        # Infer signals
-        signals = infer_signals_from_metrics(
-            features.metrics_found,
-            features.panels,
-        )
-
-        # Generate archetype YAML suggestion
-        archetype_yaml = generate_archetype_yaml(extracted, signals)
-
-        # Store in signal store
-        store = get_signal_store()
-        status = "approved" if auto_approve else "pending"
-
-        store.record_ingested_dashboard(
-            dashboard_uid=dashboard_uid,
-            backend_name=features.backend_name,
-            dashboard_title=features.dashboard_title,
-            dashboard_tags=features.dashboard_tags,
-            metrics_found=features.metrics_found,
-            panel_count=features.panel_count,
-            row_groups=features.row_groups,
-            metric_cooccurrence=features.metric_cooccurrence,
-            aggregation_patterns=features.aggregation_patterns,
-            query_transformations=features.query_transformations,
-            panel_titles=features.panel_titles,
-            alert_links=features.alert_links,
-            drilldown_links=features.drilldown_links,
-            signals_inferred=signals,
-            archetype_generated=archetype_yaml,
-            status=status,
-        )
-
-        # If auto-approved, create signal mappings from inferred signals
-        if auto_approve:
-            mappings_created = 0
-            source_ref = f"{features.backend_name}:{dashboard_uid}" if features.backend_name else dashboard_uid
-            for sig in signals:
-                if sig["confidence"] >= 0.5:  # only confident mappings
-                    store.add_mapping(
-                        signal_type=sig["signal_type"],
-                        metric_pattern=sig["metric"],
-                        confidence=sig["confidence"],
-                        source_type="dashboard_ingest",
-                        source_refs=[source_ref],
-                    )
-                    mappings_created += 1
-            logger.info(
-                "dashboard_ingested_auto_approved",
-                uid=dashboard_uid,
-                backend=features.backend_name,
-                metrics=len(features.metrics_found),
-                signals=len(signals),
-                mappings_created=mappings_created,
-            )
-        else:
-            logger.info(
-                "dashboard_ingested_pending",
-                uid=dashboard_uid,
-                backend=features.backend_name,
-                metrics=len(features.metrics_found),
-                signals=len(signals),
-            )
-
-        return {
-            "dashboard_uid": dashboard_uid,
-            "dashboard_title": features.dashboard_title,
-            "backend": features.backend_name,
-            "query_language": features.query_language,
-            "status": status,
-            "metrics_found": features.metrics_found,
-            "panel_count": features.panel_count,
-            "row_groups": features.row_groups,
-            "metric_cooccurrence": features.metric_cooccurrence,
-            "aggregation_patterns": features.aggregation_patterns,
-            "panel_titles": features.panel_titles,
-            "alert_links": features.alert_links,
-            "drilldown_links": features.drilldown_links,
-            "signals_inferred": signals,
-            "archetype_yaml": archetype_yaml,
-        }
+        return await ingest_dashboard_features(features, auto_approve=auto_approve)
 
     finally:
         if own_backends:

@@ -28,6 +28,7 @@ from dashforge.models.schemas import (
     FeedbackStatsResponse,
     HealthResponse,
     LearnDashboardRequest,
+    LearnDashboardUploadRequest,
     TeachSignalRequest,
     TeachSignalResponse,
 )
@@ -578,6 +579,40 @@ async def learn_from_dashboard(request: LearnDashboardRequest):
             status_code=500,
             detail=f"Failed to ingest dashboard '{request.dashboard_uid}'. "
             "Check that the UID exists and the backend is accessible.",
+        )
+
+
+@app.post(
+    "/api/v1/learn/dashboard/json",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Learning"],
+    summary="Learn from uploaded dashboard JSON",
+    response_description="Extracted features, inferred signals, and generated archetype YAML",
+)
+async def learn_from_dashboard_json(request: LearnDashboardUploadRequest):
+    """Ingest an uploaded dashboard JSON export without contacting the vendor.
+
+    The uploaded document is parsed through the dashboard upload parser registry
+    and then follows the same inference, persistence, YAML generation, and
+    approval workflow as backend-fetched dashboards.
+    """
+    from dashforge.dashboard_ingest import ingest_dashboard_features
+    from dashforge.dashboard_uploads import parse_uploaded_dashboard
+
+    try:
+        features = parse_uploaded_dashboard(
+            request.dashboard,
+            vendor=request.vendor,
+            source_name=request.source_name,
+        )
+        return await ingest_dashboard_features(features, auto_approve=request.auto_approve)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("dashboard_json_ingest_failed", vendor=request.vendor, source_name=request.source_name)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to ingest uploaded dashboard JSON. Check that the file is a supported dashboard export.",
         )
 
 
