@@ -634,15 +634,47 @@ async def approve_ingested_dashboard(dashboard_uid: str, backend: str | None = N
             signal_type = sig["signal_type"]
             metric = sig.get("metric", "")
             confidence = sig.get("confidence", 0.6)
-            if metric and confidence >= 0.5:
+            # Curated-taxonomy matches are trusted at >=0.5. Heuristic candidates
+            # must clear the conservative auto-teach gate (score+margin+>=2
+            # evidence sources, or an explicit name) so we don't poison the store.
+            if sig.get("source") == "heuristic":
+                should_teach = bool(metric) and bool(sig.get("auto_teach_eligible"))
+            else:
+                should_teach = bool(metric) and confidence >= 0.5
+            is_heuristic = sig.get("source") == "heuristic"
+            if should_teach:
+                # Record the signal's family (category) so the learned taxonomy
+                # carries semantic grouping, then persist the mapping. This is
+                # what makes each approval compound for the next ingest/prompt.
+                family = sig.get("signal_family", "")
+                if family:
+                    store.register_signal_type(signal_type=signal_type, category=family)
+                # Heuristic mappings enter as 'approved' (not 'trusted') and
+                # carry the ruleset version for later invalidate/replay.
                 store.add_mapping(
                     signal_type=signal_type,
                     metric_pattern=metric,
                     confidence=confidence,
                     source_type="dashboard_ingest",
                     source_refs=[source_ref],
+                    inference_version=sig.get("inference_version", ""),
+                    review_state="approved" if is_heuristic else "trusted",
                 )
                 mappings_created += 1
+            elif is_heuristic and metric:
+                # Held-back candidate → negative training data with the reason.
+                store.record_rejected_candidate(
+                    metric=metric,
+                    signal_family=sig.get("signal_family", ""),
+                    signal_name=signal_type,
+                    score=sig.get("score", 0.0),
+                    margin=sig.get("margin", 0.0),
+                    why_not=sig.get("why_not_auto_taught") or "low_score",
+                    evidence=sig.get("evidence", []),
+                    inference_version=sig.get("inference_version", ""),
+                    dashboard_uid=dashboard_uid,
+                    backend_name=ingested.get("backend_name", ""),
+                )
         else:
             # Legacy: plain string signal type — fall back to pattern matching
             signal_type = sig
@@ -665,12 +697,109 @@ async def approve_ingested_dashboard(dashboard_uid: str, backend: str | None = N
 
     store.approve_ingested_dashboard(dashboard_uid, backend_name=backend_name)
 
+    # Optionally register the generated archetype into the active override file
+    # and hot-reload, so approve makes it show up + routable (compounding).
+    archetype_registered = False
+    if settings.learning_auto_register_archetype and ingested.get("archetype_generated"):
+        from dashforge.archetypes.templates import append_archetype_to_yaml
+
+        try:
+            written = append_archetype_to_yaml(ingested["archetype_generated"])
+            archetype_registered = written is not None
+            if not archetype_registered:
+                logger.warning("archetype_autoregister_skipped", reason="no DASHFORGE_ARCHETYPES_PATH set")
+        except Exception:
+            logger.exception("archetype_autoregister_failed", uid=dashboard_uid)
+
     return {
         "dashboard_uid": dashboard_uid,
         "backend_name": ingested.get("backend_name", ""),
         "status": "approved",
         "mappings_created": mappings_created,
+        "archetype_registered": archetype_registered,
         "message": f"Dashboard approved, {mappings_created} signal mapping(s) created",
+    }
+
+
+@app.post(
+    "/api/v1/learn/dashboards/{dashboard_uid}/reject",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Learning"],
+    summary="Reject an ingested dashboard",
+    response_description="Rejection status; no signal mappings are created",
+)
+async def reject_ingested_dashboard(dashboard_uid: str, backend: str | None = None):
+    """Reject a pending ingested dashboard.
+
+    Rejecting does not create mappings. Heuristic candidates are retained as
+    negative examples so the inference rules can be audited or tuned later.
+    """
+    from dashforge.signals import get_signal_store
+
+    store = get_signal_store()
+    backend_name = backend
+    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend_name)
+    if ingested is None:
+        raise HTTPException(status_code=404, detail="Ingested dashboard not found")
+    if ingested["status"] != "pending":
+        return {"message": f"Dashboard already {ingested['status']}"}
+
+    rejected_candidates = 0
+    for sig in ingested.get("signals_inferred", []):
+        if isinstance(sig, dict) and sig.get("source") == "heuristic" and sig.get("metric"):
+            store.record_rejected_candidate(
+                metric=sig["metric"],
+                signal_family=sig.get("signal_family", ""),
+                signal_name=sig.get("signal_type", ""),
+                score=sig.get("score", 0.0),
+                margin=sig.get("margin", 0.0),
+                why_not="dashboard_rejected",
+                evidence=sig.get("evidence", []),
+                inference_version=sig.get("inference_version", ""),
+                dashboard_uid=dashboard_uid,
+                backend_name=ingested.get("backend_name", ""),
+            )
+            rejected_candidates += 1
+
+    if not store.reject_ingested_dashboard(dashboard_uid, backend_name=backend_name):
+        raise HTTPException(status_code=409, detail="Dashboard is no longer pending")
+
+    return {
+        "dashboard_uid": dashboard_uid,
+        "backend_name": ingested.get("backend_name", ""),
+        "status": "rejected",
+        "rejected_candidates": rejected_candidates,
+        "message": "Dashboard rejected; no mappings created",
+    }
+
+
+@app.post(
+    "/api/v1/learn/dashboards/{dashboard_uid}/ignore",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Learning"],
+    summary="Ignore an ingested dashboard",
+    response_description="Ignored status; no signal mappings or negative examples are created",
+)
+async def ignore_ingested_dashboard(dashboard_uid: str, backend: str | None = None):
+    """Ignore a pending ingested dashboard without creating mappings or negative examples."""
+    from dashforge.signals import get_signal_store
+
+    store = get_signal_store()
+    backend_name = backend
+    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend_name)
+    if ingested is None:
+        raise HTTPException(status_code=404, detail="Ingested dashboard not found")
+    if ingested["status"] != "pending":
+        return {"message": f"Dashboard already {ingested['status']}"}
+
+    if not store.ignore_ingested_dashboard(dashboard_uid, backend_name=backend_name):
+        raise HTTPException(status_code=409, detail="Dashboard is no longer pending")
+
+    return {
+        "dashboard_uid": dashboard_uid,
+        "backend_name": ingested.get("backend_name", ""),
+        "status": "ignored",
+        "message": "Dashboard ignored; no mappings created",
     }
 
 

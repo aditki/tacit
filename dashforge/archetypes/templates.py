@@ -12,7 +12,10 @@ touching Python code — just edit the YAML and restart.
 from __future__ import annotations
 
 import os
+import re
+from importlib.resources import files
 from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -513,6 +516,44 @@ def reload_archetypes() -> None:
     logger.info("archetypes_reloaded", count=len(ALL_ARCHETYPES))
 
 
+def append_archetype_to_yaml(archetype_yaml: str, path: Path | None = None) -> Path | None:
+    """Merge a generated archetype into the active override file, then reload.
+
+    De-dupes by archetype ``id`` (an existing id is overwritten). Returns the
+    path written, or ``None`` if no writable override is configured — we never
+    write into the packaged read-only archetypes, so this needs
+    ``DASHFORGE_ARCHETYPES_PATH`` (or an explicit ``path``).
+    """
+    import yaml
+
+    env_path = os.environ.get("DASHFORGE_ARCHETYPES_PATH")
+    target = path or (Path(env_path) if env_path else None)
+    if target is None:
+        return None
+
+    new_doc = yaml.safe_load(archetype_yaml) or {}
+    new_items = new_doc.get("archetypes", []) or []
+    if not new_items:
+        return None
+
+    existing = (yaml.safe_load(target.read_text()) if target.is_file() else {}) or {}
+    items = existing.get("archetypes", []) or []
+    by_id = {a.get("id"): i for i, a in enumerate(items) if isinstance(a, dict)}
+    for arch in new_items:
+        aid = arch.get("id")
+        if aid in by_id:
+            items[by_id[aid]] = arch  # overwrite same id
+        else:
+            items.append(arch)
+    existing["archetypes"] = items
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(yaml.safe_dump(existing, sort_keys=False, width=120))
+    reload_archetypes()
+    logger.info("archetype_registered_from_ingest", path=str(target), archetypes=len(new_items))
+    return target
+
+
 def get_archetype(problem_type: str) -> InvestigationArchetype | None:
     """Look up an archetype by problem_type. Returns None if no match."""
     return _ARCHETYPE_BY_PROBLEM.get(problem_type)
@@ -551,6 +592,90 @@ def get_archetypes_by_confidence(
         results.append((arch, match.confidence))
 
     return results
+
+
+def get_archetypes_by_learning_context(
+    intent: Any,
+    catalog: list[Any],
+    *,
+    min_confidence: float = 0.35,
+    exclude_ids: set[str] | None = None,
+) -> list[tuple[InvestigationArchetype, float]]:
+    """Retrieve archetypes by learned signal/metric overlap.
+
+    The intent classifier only knows labels it was trained/prompted to emit.
+    Generated archetypes from dashboard ingestion may have environment-specific
+    problem types, so we add a deterministic retrieval pass based on:
+
+    - prompt/intent text overlap with archetype ids, tags, problem types, and
+      required signals
+    - live catalog metric overlap with required_metrics and signal_bindings
+
+    This lets approved dashboard learning become routable without retraining the
+    classifier for every newly learned dashboard family.
+    """
+    exclude_ids = exclude_ids or set()
+    catalog_names = {getattr(entry, "name", "") for entry in catalog}
+    prompt_tokens = _intent_tokens(intent)
+    results: list[tuple[InvestigationArchetype, float]] = []
+
+    for arch in ALL_ARCHETYPES:
+        if arch.id in exclude_ids:
+            continue
+
+        arch_tokens = _archetype_tokens(arch)
+        token_score = 0.0
+        if prompt_tokens and arch_tokens:
+            token_score = min(len(prompt_tokens & arch_tokens) / max(min(len(prompt_tokens), 8), 1), 1.0)
+
+        expected_metrics = set(arch.required_metrics) | set(arch.signal_bindings.values())
+        expected_metrics = {m for m in expected_metrics if m}
+        metric_score = 0.0
+        if expected_metrics:
+            metric_score = min(len(expected_metrics & catalog_names) / max(min(len(expected_metrics), 4), 1), 1.0)
+
+        confidence = round((0.45 * token_score) + (0.55 * metric_score), 4)
+        if confidence >= min_confidence:
+            results.append((arch, confidence))
+
+    results.sort(key=lambda item: item[1], reverse=True)
+    return results
+
+
+def _tokens(value: str) -> set[str]:
+    return {t for t in re.split(r"[^a-z0-9]+", value.lower()) if len(t) >= 3}
+
+
+def _intent_tokens(intent: Any) -> set[str]:
+    parts: list[str] = [
+        getattr(intent, "summary", ""),
+        getattr(intent, "domain", ""),
+        getattr(intent, "problem_type", ""),
+    ]
+    parts.extend(getattr(intent, "services", []) or [])
+    parts.extend(getattr(intent, "keywords", []) or [])
+    for signal in getattr(intent, "signals", []) or []:
+        parts.append(getattr(signal, "value", str(signal)))
+    for match in getattr(intent, "archetypes", []) or []:
+        parts.append(getattr(match, "type", ""))
+    return _tokens(" ".join(parts))
+
+
+def _archetype_tokens(arch: InvestigationArchetype) -> set[str]:
+    parts = [
+        arch.id,
+        arch.name,
+        arch.description,
+        *arch.problem_types,
+        *arch.required_signals,
+        *arch.required_metrics,
+        *arch.signal_bindings.keys(),
+        *arch.signal_bindings.values(),
+        *arch.tags,
+    ]
+    for panel in arch.panels:
+        parts.extend([panel.title, panel.description, panel.row])
+    return _tokens(" ".join(parts))
 
 
 def list_problem_types() -> list[str]:

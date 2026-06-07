@@ -130,6 +130,11 @@ class Settings(BaseSettings):
     adapter_timeout_seconds: int = 30  # per-adapter timeout
     max_metric_catalog_size: int = 300  # total metrics across all datasources sent to LLM
 
+    # Dashboard ingestion / learning
+    # When True, approving an ingested dashboard also writes its generated
+    # archetype into DASHFORGE_ARCHETYPES_PATH and hot-reloads (compounding).
+    learning_auto_register_archetype: bool = False
+
     # HTTP API auth
     api_auth_enabled: bool = False  # set True to require API key
     api_auth_key: str = Field(default="", repr=False)

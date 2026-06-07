@@ -12,7 +12,11 @@ from dashforge.agents.metrics_discovery import discover_metrics
 from dashforge.agents.providers.base import TokenUsage
 from dashforge.agents.query_builder import build_dashboard
 from dashforge.archetypes.engine import blend_archetypes, compile_archetype
-from dashforge.archetypes.templates import get_archetype, get_archetypes_by_confidence
+from dashforge.archetypes.templates import (
+    get_archetype,
+    get_archetypes_by_confidence,
+    get_archetypes_by_learning_context,
+)
 from dashforge.backends import get_active_backends
 from dashforge.backends.base import PublishResult
 from dashforge.cache import llm_cache, make_cache_key
@@ -183,6 +187,17 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         # ── 4. Multi-label archetype matching ────────────────────
         t0 = time.monotonic()
         ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
+        ranked_ids = {arch.id for arch, _ in ranked_archetypes}
+        learned_archetypes = get_archetypes_by_learning_context(
+            intent,
+            metric_catalog,
+            min_confidence=0.35,
+            exclude_ids=ranked_ids,
+        )
+        if learned_archetypes:
+            ranked_archetypes.extend(learned_archetypes)
+            ranked_archetypes.sort(key=lambda item: item[1], reverse=True)
+
         # Fallback: try legacy single-label lookup
         if not ranked_archetypes:
             legacy = get_archetype(intent.problem_type)
@@ -221,6 +236,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 primary_archetype=primary_arch.id,
                 primary_confidence=primary_conf,
                 archetypes_matched=len(ranked_archetypes),
+                learned_archetypes_matched=len(learned_archetypes),
                 panels_generated=len(dashboard_spec.panels),
                 target_language=target_language,
                 signal_bindings_count=len(primary_arch.signal_bindings),

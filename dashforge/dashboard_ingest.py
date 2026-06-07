@@ -511,16 +511,26 @@ def infer_signals_from_metrics(
     metrics: list[str],
     panel_data: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Infer semantic signal types from a list of extracted metrics.
+    """Infer semantic signals from extracted metrics.
 
-    Uses the signal store's existing mappings + heuristic patterns.
-    Returns a list of {signal_type, metric, confidence, reason}.
+    Two layers:
+      1. Curated taxonomy — match metrics against signals already known/taught
+         (authoritative; highest confidence).
+      2. Deterministic heuristic inference (``signal_inference``) for everything
+         the taxonomy doesn't recognize, using metric morphology + panel context.
+         This is what lets *custom* metrics (e.g. ``felix_*``) map to signals
+         without anyone hand-teaching them first.
+
+    Returns a list of dicts with: signal_type (name), metric, confidence,
+    signal_family, source ('taxonomy'|'heuristic'), reason, evidence.
     """
     store = get_signal_store()
     all_signal_types = store.list_signal_types()
     inferred: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
+    matched_metrics: set[str] = set()
 
+    # 1. Curated taxonomy matches.
     for metric in metrics:
         for st in all_signal_types:
             signal_type = st["signal_type"]
@@ -532,14 +542,43 @@ def infer_signals_from_metrics(
                     key = (signal_type, metric)
                     if key not in seen:
                         seen.add(key)
+                        matched_metrics.add(metric)
                         inferred.append(
                             {
                                 "signal_type": signal_type,
                                 "metric": metric,
                                 "confidence": mapping.get("effective_confidence", mapping["confidence"]),
+                                "signal_family": st.get("category", ""),
+                                "source": "taxonomy",
                                 "reason": f"matches pattern '{mapping['metric_pattern']}'",
+                                "evidence": [f"matches taught pattern '{mapping['metric_pattern']}'"],
                             }
                         )
+
+    # 2. Heuristic fallback for metrics the taxonomy didn't recognize.
+    from dashforge.signal_inference import INFERENCE_VERSION
+    from dashforge.signal_inference import infer_signals as _infer_heuristic
+
+    unmatched = [m for m in dict.fromkeys(metrics) if m not in matched_metrics]
+    for sig in _infer_heuristic(unmatched, panel_data or []):
+        inferred.append(
+            {
+                "signal_type": sig.signal_name,
+                "metric": sig.metric,
+                "confidence": sig.confidence,
+                "score": sig.score,
+                "margin": sig.margin,
+                "confidence_label": sig.confidence_label,
+                "signal_family": sig.signal_family,
+                "source": "heuristic",
+                "reason": "; ".join(sig.evidence),
+                "evidence": sig.evidence,
+                "evidence_sources": sig.evidence_sources,
+                "auto_teach_eligible": sig.auto_teach_eligible,
+                "why_not_auto_taught": sig.why_not_auto_taught,
+                "inference_version": INFERENCE_VERSION,
+            }
+        )
 
     inferred.sort(key=lambda x: x["confidence"], reverse=True)
     return inferred
@@ -611,6 +650,12 @@ def generate_archetype_yaml(
     signal_bindings = {}
     required_signals = []
     for sig in signals:
+        # Don't bake weak heuristic guesses into generated archetypes. The raw
+        # queries still remain in the panels for review, but signal bindings
+        # should only contain taxonomy matches or candidates approval would
+        # actually teach into the store.
+        if sig.get("source") == "heuristic" and not sig.get("auto_teach_eligible"):
+            continue
         if sig["signal_type"] not in signal_bindings:
             signal_bindings[sig["signal_type"]] = sig["metric"]
             required_signals.append(sig["signal_type"])
