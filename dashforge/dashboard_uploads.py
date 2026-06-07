@@ -95,6 +95,8 @@ class SignalFxDashboardUploadParser:
     def parse(self, document: dict[str, Any], *, source_name: str = "") -> DashboardFeatures:
         dashboard = document.get("dashboard", document)
         charts = document.get("charts", [])
+        if not charts and isinstance(dashboard, dict):
+            charts = dashboard.get("charts", [])
         if isinstance(charts, dict):
             charts = list(charts.values())
         if not isinstance(charts, list):
@@ -126,7 +128,10 @@ def _parse_signalfx_dashboard_export(dashboard: dict[str, Any], charts: list[dic
             continue
         chart_name = chart.get("name", "") or chart.get("title", "")
         options = chart.get("options", {}) if isinstance(chart.get("options", {}), dict) else {}
-        program_text = options.get("programOptions", {}).get("programText", "") if isinstance(options, dict) else ""
+        program_options = options.get("programOptions", {})
+        if not isinstance(program_options, dict):
+            program_options = {}
+        program_text = program_options.get("programText", "")
         if not program_text:
             program_text = chart.get("programText", "")
 

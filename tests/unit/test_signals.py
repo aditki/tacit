@@ -768,6 +768,48 @@ class TestDashboardParsing:
         assert features.metrics_found == ["cpu.utilization"]
         assert features.panel_count == 1
 
+    def test_parse_uploaded_signalfx_dashboard_with_nested_charts(self):
+        document = {
+            "dashboard": {
+                "id": "sfx-nested",
+                "name": "Nested SignalFx",
+                "tags": ["upload"],
+                "charts": [
+                    {
+                        "name": "Memory",
+                        "options": {
+                            "programOptions": {"programText": "data('container.memory.usage').mean().publish()"}
+                        },
+                    }
+                ],
+            }
+        }
+
+        features = parse_uploaded_dashboard(document, vendor="signalfx", source_name="sfx-nested.json")
+
+        assert features.dashboard_uid == "sfx-nested"
+        assert features.metrics_found == ["container.memory.usage"]
+        assert features.panel_count == 1
+        assert features.panel_titles == ["Memory"]
+
+    def test_parse_uploaded_signalfx_program_options_null_uses_program_text(self):
+        document = {
+            "dashboard": {"id": "sfx-null-options", "name": "Nullable SignalFx"},
+            "charts": [
+                {
+                    "name": "CPU",
+                    "options": {"programOptions": None},
+                    "programText": "data('cpu.utilization').mean().publish()",
+                }
+            ],
+        }
+
+        features = parse_uploaded_dashboard(document, vendor="signalfx", source_name="sfx-null.json")
+
+        assert features.dashboard_uid == "sfx-null-options"
+        assert features.metrics_found == ["cpu.utilization"]
+        assert features.panel_count == 1
+
     def test_parse_dashboard_with_rows(self):
         dashboard_json = {
             "dashboard": {
