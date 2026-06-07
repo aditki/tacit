@@ -293,6 +293,22 @@
       <div class="actions">
         <button class="btn-primary" id="ingest-btn" onclick="ingestDashboard()">Ingest Dashboard</button>
       </div>
+      <hr class="section-divider">
+      <div class="result-label">Upload Dashboard JSON</div>
+      <div class="form-row">
+        <label>Vendor</label>
+        <select id="upload-vendor">
+          <option value="grafana">Grafana</option>
+          <option value="signalfx">SignalFx</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>JSON File</label>
+        <input type="file" id="dashboard-json-file" accept=".json,application/json">
+      </div>
+      <div class="actions">
+        <button class="btn-secondary" id="upload-json-btn" onclick="ingestDashboardJson()">Upload JSON</button>
+      </div>
       <div id="ingest-result"></div>
 
       <hr class="section-divider">
@@ -797,31 +813,74 @@
           throw new Error(errMsg(err, `HTTP ${resp.status}`));
         }
         const data = await resp.json();
-        const signals = (data.signals_inferred || []);
-        const signalChips = signals.slice(0, 20).map(s =>
-          `<span class="signal-chip">${esc(s.signal_type)} <span style="opacity:0.6">${Math.round((s.confidence||0)*100)}%</span></span>`
-        ).join('');
-
-        resultEl.innerHTML = `
-          <div class="result-card success" style="margin-top:1rem">
-            <div class="result-label">Ingestion ${esc(data.status)}</div>
-            <div class="ingest-title">${esc(data.dashboard_title || uid)}</div>
-            <div class="ingest-meta">
-              ${data.backend ? `<strong>Backend:</strong> ${esc(data.backend)} &middot; ` : ''}
-              <strong>${data.panel_count || 0}</strong> panels &middot;
-              <strong>${(data.metrics_found || []).length}</strong> metrics &middot;
-              <strong>${signals.length}</strong> signals inferred
-            </div>
-            <div class="ingest-metrics"><strong>Metrics:</strong> ${(data.metrics_found || []).map(m => `<code>${esc(m)}</code>`).join(', ')}</div>
-            ${signalChips ? `<div class="ingest-signals">${signalChips}</div>` : ''}
-            ${data.archetype_yaml ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Generated archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(data.archetype_yaml)}</pre></details>` : ''}
-          </div>`;
+        resultEl.innerHTML = renderIngestionResult(data, uid);
         loadIngestedDashboards();
       } catch (e) {
         resultEl.innerHTML = `<div class="result-card error" style="margin-top:1rem"><div class="result-label">Error</div><div class="result-meta" style="color:#fca5a5">${esc(e.message)}</div></div>`;
       } finally {
         btn.disabled = false;
         btn.textContent = 'Ingest Dashboard';
+      }
+    }
+
+    function renderIngestionResult(data, fallbackTitle) {
+      const signals = (data.signals_inferred || []);
+      const signalChips = signals.slice(0, 20).map(s =>
+        `<span class="signal-chip">${esc(s.signal_type)} <span style="opacity:0.6">${Math.round((s.confidence||0)*100)}%</span></span>`
+      ).join('');
+
+      return `
+        <div class="result-card success" style="margin-top:1rem">
+          <div class="result-label">Ingestion ${esc(data.status)}</div>
+          <div class="ingest-title">${esc(data.dashboard_title || fallbackTitle)}</div>
+          <div class="ingest-meta">
+            ${data.backend ? `<strong>Backend:</strong> ${esc(data.backend)} &middot; ` : ''}
+            ${data.query_language ? `<strong>Language:</strong> ${esc(data.query_language)} &middot; ` : ''}
+            <strong>${data.panel_count || 0}</strong> panels &middot;
+            <strong>${(data.metrics_found || []).length}</strong> metrics &middot;
+            <strong>${signals.length}</strong> signals inferred
+          </div>
+          <div class="ingest-metrics"><strong>Metrics:</strong> ${(data.metrics_found || []).map(m => `<code>${esc(m)}</code>`).join(', ')}</div>
+          ${signalChips ? `<div class="ingest-signals">${signalChips}</div>` : ''}
+          ${data.archetype_yaml ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Generated archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(data.archetype_yaml)}</pre></details>` : ''}
+        </div>`;
+    }
+
+    async function ingestDashboardJson() {
+      const fileInput = document.getElementById('dashboard-json-file');
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) { alert('Choose a dashboard JSON file'); return; }
+      const vendor = document.getElementById('upload-vendor').value;
+      const btn = document.getElementById('upload-json-btn');
+      const resultEl = document.getElementById('ingest-result');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>Uploading...';
+      resultEl.innerHTML = '<div class="status"><span class="spinner"></span>Parsing dashboard JSON...</div>';
+
+      try {
+        const dashboard = JSON.parse(await file.text());
+        const resp = await fetch(`${BASE}/api/v1/learn/dashboard/json`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            vendor,
+            source_name: file.name,
+            dashboard,
+            auto_approve: autoApprove,
+          }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+          throw new Error(errMsg(err, `HTTP ${resp.status}`));
+        }
+        const data = await resp.json();
+        resultEl.innerHTML = renderIngestionResult(data, file.name);
+        loadIngestedDashboards();
+      } catch (e) {
+        resultEl.innerHTML = `<div class="result-card error" style="margin-top:1rem"><div class="result-label">Error</div><div class="result-meta" style="color:#fca5a5">${esc(e.message)}</div></div>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Upload JSON';
       }
     }
 

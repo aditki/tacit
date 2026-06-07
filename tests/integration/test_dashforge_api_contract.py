@@ -90,7 +90,6 @@ def test_learn_post_valid(client, temp_store, monkeypatch):
     # "false" string is correctly coerced to a boolean -> pending, not approved.
     assert resp.json()["status"] == "pending"
 
-
 def test_reject_ingested_dashboard_marks_status_without_mappings(client, temp_store):
     temp_store.record_ingested_dashboard(
         "reject-me",
@@ -144,3 +143,45 @@ def test_ignore_ingested_dashboard_marks_status_quietly(client, temp_store):
     assert resp.json()["status"] == "ignored"
     assert temp_store.get_ingested_dashboard("ignore-me", backend_name="grafana")["status"] == "ignored"
     assert temp_store.list_rejected_candidates() == []
+
+
+def test_learn_dashboard_json_post_valid(client, temp_store, monkeypatch):
+    import ml_api.dependencies as di
+    monkeypatch.setattr(di, "get_signal_store", lambda: temp_store)
+    temp_store.load_from_yaml()
+
+    resp = client.post(
+        "/api/v1/learn/dashboard/json",
+        json={
+            "vendor": "grafana",
+            "source_name": "checkout.json",
+            "auto_approve": "false",
+            "dashboard": {
+                "dashboard": {
+                    "uid": "checkout-upload",
+                    "title": "Checkout Upload",
+                    "panels": [
+                        {
+                            "type": "timeseries",
+                            "title": "Request Rate",
+                            "targets": [
+                                {
+                                    "expr": "sum(rate(http_requests_total[5m]))",
+                                    "datasource": {"type": "prometheus", "uid": "prom"},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["dashboard_uid"] == "checkout-upload"
+    assert body["backend"] == "grafana_json"
+    assert body["status"] == "pending"
+    assert "http_requests_total" in body["metrics_found"]
+    stored = temp_store.get_ingested_dashboard("checkout-upload", backend_name="grafana_json")
+    assert stored is not None

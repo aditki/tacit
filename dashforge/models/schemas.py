@@ -443,3 +443,47 @@ class LearnDashboardRequest(BaseModel):
             if normalized == "false":
                 return False
         raise ValueError("auto_approve must be a boolean or the string 'true'/'false'")
+
+
+class LearnDashboardUploadRequest(BaseModel):
+    """Request body for ``POST /api/v1/learn/dashboard/json``."""
+
+    model_config = {
+        "extra": "forbid",
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "vendor": "grafana",
+                    "source_name": "checkout-prod.json",
+                    "auto_approve": False,
+                    "dashboard": {"dashboard": {"uid": "checkout-prod", "title": "Checkout Prod", "panels": []}},
+                }
+            ]
+        },
+    }
+
+    vendor: str = Field(default="grafana", description="Uploaded dashboard vendor: 'grafana' or 'signalfx'.")
+    source_name: str = Field(default="", description="Optional filename or provenance label for the uploaded JSON.")
+    dashboard: dict[str, Any] = Field(description="Exported dashboard JSON document.")
+    auto_approve: bool = Field(
+        default=False,
+        description="If true, approve and create signal mappings immediately; otherwise store as 'pending'.",
+    )
+
+    @field_validator("vendor")
+    @classmethod
+    def _strip_vendor(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not v:
+            raise ValueError("vendor must not be empty")
+        return v
+
+    @field_validator("source_name")
+    @classmethod
+    def _strip_source_name(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("auto_approve", mode="before")
+    @classmethod
+    def _parse_auto_approve(cls, v: Any) -> bool:
+        return LearnDashboardRequest._parse_auto_approve(v)
