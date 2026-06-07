@@ -1,0 +1,66 @@
+# DEV-ONLY compose stack for local demos.
+#
+# This stack intentionally enables anonymous Grafana Editor access and uses
+# admin/admin so a local demo can run without setup friction. Do not expose this
+# stack to the internet or use it for production/private-beta deployments.
+
+services:
+  # ── Grafana (local dev) ──────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana-oss:11.1.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_SECURITY_COOKIE_SAMESITE: "none"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./dev/grafana/provisioning:/etc/grafana/provisioning
+
+  # ── Fake app (metric source for testing) ─────────────────────────────
+  fake-app:
+    build: ./dev/fake_app
+    ports:
+      - "9091:9091"
+
+  # ── Prometheus (local dev) ───────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./dev/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-lifecycle"
+    depends_on:
+      - fake-app
+
+  # ── DashForge ─────────────────────────────────────────────────────────
+  dashforge:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GRAFANA_URL: http://grafana:3000
+      SSL_CERT_FILE: ""
+    volumes:
+      - dashforge_data:/app/data
+    depends_on:
+      - grafana
+      - prometheus
+    # Uncomment below if using something like ollama on the host and want to access it from the container
+    # extra_hosts:
+    #  - "host.docker.internal:host-gateway" # use "http://host.docker.internal:11434" in .env for LLM_API_BASE
+
+volumes:
+  dashforge_data:
+  grafana_data:

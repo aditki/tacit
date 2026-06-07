@@ -8,6 +8,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import time
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
@@ -45,10 +46,7 @@ def signal_store_with_bootstrap(tmp_path):
     """SignalStore loaded with bootstrap signals.yaml."""
     db_path = tmp_path / "test_signals.db"
     store = SignalStore(db_path=db_path)
-    # Load from project root signals.yaml
-    yaml_path = Path(__file__).parent.parent.parent / "signals.yaml"
-    if yaml_path.is_file():
-        store.load_from_yaml(yaml_path)
+    store.load_from_yaml()
     return store
 
 
@@ -1051,14 +1049,10 @@ signals:
 
     def test_load_project_signals_yaml(self):
         """Verify the actual project signals.yaml loads without errors."""
-        yaml_path = Path(__file__).parent.parent.parent / "signals.yaml"
-        if not yaml_path.is_file():
-            pytest.skip("signals.yaml not found")
-
         db_path = Path(tempfile.mktemp(suffix=".db"))
         try:
             store = SignalStore(db_path=db_path)
-            count = store.load_from_yaml(yaml_path)
+            count = store.load_from_yaml()
             assert count > 20  # should have many bootstrap mappings
             types = store.list_signal_types()
             assert len(types) > 10
@@ -1411,8 +1405,8 @@ class TestSignalCoverageDashboard:
         # the signal_type in the bootstrap yaml
         import yaml
 
-        yaml_path = Path(__file__).parent.parent.parent / "signals.yaml"
-        with open(yaml_path) as f:
+        resource = files("dashforge.data").joinpath("signals.yaml")
+        with resource.open() as f:
             data = yaml.safe_load(f)
         sig_defs = data.get("signals", {})
 
@@ -1523,6 +1517,41 @@ class TestArchetypeYamlBraceEscaping:
         expr = parsed["archetypes"][0]["panels"][0]["queries"][0]["expr"]
 
         assert "[ 1m ]" in expr.format(service_filter="", container_filter="", rate_interval="1m")
+
+    def test_kafka_topic_selector_literal_braces_compile(self):
+        from dashforge.archetypes.engine import compile_archetype
+        from dashforge.archetypes.templates import _load_archetypes_from_yaml
+        from dashforge.models.schemas import ArchetypeMatch, Intent
+
+        archetypes = _load_archetypes_from_yaml(Path(__file__).resolve().parents[2] / "dashforge/data/archetypes.yaml")
+        archetype = next(a for a in archetypes if a.id == "kafka_topic_throughput")
+        intent = Intent(
+            summary="kafka topic imbalance",
+            domain="messaging",
+            services=[],
+            signals=[],
+            keywords=["kafka", "topic"],
+            timerange="4h",
+            problem_type="kafka_topic_imbalance",
+            archetypes=[ArchetypeMatch(type="kafka_topic_imbalance", confidence=1.0)],
+        )
+
+        spec = compile_archetype(
+            archetype,
+            intent,
+            [
+                MetricEntry(
+                    name="kafka_log_log_logendoffset",
+                    datasource_uid="prom",
+                    datasource_name="Prometheus",
+                    datasource_type="prometheus",
+                    query_language="promql",
+                )
+            ],
+        )
+
+        exprs = [query.expr for panel in spec.panels for query in panel.queries]
+        assert 'kafka_log_log_logendoffset{topic!=""}' in exprs
 
 
 class TestSignalFlowCompileCompatibility:

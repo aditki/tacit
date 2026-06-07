@@ -13,4 +13,8 @@ venv/
 .DS_Store
 grafana_data/
 data/
+!dashforge/data/
+!dashforge/data/**
+dashforge/data/__pycache__/
+dashforge/data/**/*.py[cod]
 results.json

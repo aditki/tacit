@@ -6,7 +6,8 @@ KEYWORD_METRIC_MAP, then ingests realistic dummy datapoints so you can test
 the full DashForge → SignalFx pipeline with real prompts.
 
 Usage:
-    SIGNALFX_INGEST_TOKEN=<token> python scripts/seed_signalfx_metrics.py
+    SIGNALFX_INGEST_TOKEN=<token> python tests/seed_signalfx_metrics.py
+    SIGNALFX_INGEST_TOKEN=<token> python tests/seed_signalfx_metrics.py ./archetypes.yaml
 
 Requires SIGNALFX_API_TOKEN in config for realm lookup, and
 SIGNALFX_INGEST_TOKEN env var for ingestion.
@@ -20,6 +21,8 @@ import random
 import re
 import sys
 import time
+from importlib.resources import files
+from pathlib import Path
 
 import httpx
 import yaml
@@ -105,10 +108,35 @@ _PROMQL_FUNCS = {
 }
 
 
-def extract_metrics_from_archetypes(path: str) -> set[str]:
+def _resolve_archetypes_yaml(path: str | None = None):
+    if path:
+        candidate = Path(path)
+        if candidate.is_file():
+            return candidate
+        raise FileNotFoundError(f"archetypes YAML not found: {path}")
+
+    env_path = os.environ.get("DASHFORGE_ARCHETYPES_PATH", "").strip()
+    if env_path:
+        candidate = Path(env_path)
+        if candidate.is_file():
+            return candidate
+        raise FileNotFoundError(f"DASHFORGE_ARCHETYPES_PATH not found: {env_path}")
+
+    for candidate in (
+        Path("archetypes.yaml"),
+        Path(__file__).resolve().parents[1] / "archetypes.yaml",
+    ):
+        if candidate.is_file():
+            return candidate
+
+    return files("dashforge.data").joinpath("archetypes.yaml")
+
+
+def extract_metrics_from_archetypes(path: str | None = None) -> set[str]:
     """Parse archetypes.yaml and extract all metric names from PromQL expressions."""
-    with open(path) as f:
-        data = yaml.safe_load(f)
+    archetypes_yaml = _resolve_archetypes_yaml(path)
+    with archetypes_yaml.open() as f:
+        data = yaml.safe_load(f) or {}
 
     metrics: set[str] = set()
     for arch in data.get("archetypes", []):
@@ -293,7 +321,7 @@ def main():
     # 1. Extract metrics
     _header("Step 1: Extract Metrics")
 
-    archetype_path = os.path.join(os.path.dirname(__file__), "..", "archetypes.yaml")
+    archetype_path = sys.argv[1] if len(sys.argv) > 1 else None
     arch_metrics = extract_metrics_from_archetypes(archetype_path)
     _ok(f"Archetypes: {len(arch_metrics)} unique metrics")
 

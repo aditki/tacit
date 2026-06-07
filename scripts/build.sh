@@ -9,10 +9,10 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
 echo "── Installing build dependencies ──"
-pip install pyinstaller
+uv sync --all-extras --dev
 
 echo "── Building single binary ──"
-pyinstaller dashforge.spec --clean --noconfirm
+uv run pyinstaller dashforge.spec --clean --noconfirm
 
 BINARY="dist/dashforge"
 if [[ -f "$BINARY" ]]; then
