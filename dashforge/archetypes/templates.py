@@ -3,16 +3,17 @@
 Each archetype encodes known-good investigation patterns that SREs use daily.
 Query templates use {placeholders} resolved from the intent + discovered labels.
 
-Archetypes are loaded from ``archetypes.yaml`` if it exists (project root or
-``DASHFORGE_ARCHETYPES_PATH`` env var).  Otherwise, the hardcoded definitions
-below are used as the default.  This lets engineers edit templates without
-touching Python code — just edit the YAML and restart.
+Archetypes are loaded from ``DASHFORGE_ARCHETYPES_PATH`` or a local
+``archetypes.yaml`` override, then from packaged data.  Otherwise, the
+hardcoded definitions below are used as the default.  This lets engineers edit
+templates without touching Python code — just edit the YAML and restart.
 """
 
 from __future__ import annotations
 
 import os
 import re
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -425,8 +426,19 @@ def _load_archetypes_from_yaml(path: Path) -> list[InvestigationArchetype]:
     with open(path) as f:
         data = yaml.safe_load(f)
 
+    return _load_archetypes_from_data(data)
+
+
+def _load_archetypes_from_data(data: object) -> list[InvestigationArchetype]:
+    """Parse archetype YAML data into InvestigationArchetype objects."""
+    if not isinstance(data, dict):
+        raise ValueError("archetype YAML must contain a mapping with an 'archetypes' list")
+    raw_archetypes = data.get("archetypes")
+    if not isinstance(raw_archetypes, list) or not raw_archetypes:
+        raise ValueError("archetype YAML must define at least one archetype")
+
     archetypes = []
-    for entry in data.get("archetypes", []):
+    for entry in raw_archetypes:
         panels = []
         for p in entry.get("panels", []):
             queries = [
@@ -466,7 +478,22 @@ def _load_archetypes_from_yaml(path: Path) -> list[InvestigationArchetype]:
                 default_timerange=entry.get("default_timerange", "1h"),
             )
         )
+    if not archetypes:
+        raise ValueError("archetype YAML did not load any archetypes")
     return archetypes
+
+
+def _load_packaged_archetypes() -> list[InvestigationArchetype] | None:
+    """Load archetypes from package data for wheels and PyInstaller builds."""
+    import yaml
+
+    resource = files("dashforge.data").joinpath("archetypes.yaml")
+    if not resource.is_file():
+        return None
+
+    with resource.open() as f:
+        data = yaml.safe_load(f)
+    return _load_archetypes_from_data(data)
 
 
 def _build_registry() -> tuple[list[InvestigationArchetype], dict[str, InvestigationArchetype]]:
@@ -495,6 +522,27 @@ def _build_registry() -> tuple[list[InvestigationArchetype], dict[str, Investiga
             except Exception as e:
                 logger.warning("archetypes_yaml_load_failed", path=str(path), error=str(e))
 
+    try:
+        packaged_archetypes = _load_packaged_archetypes()
+        if packaged_archetypes is not None:
+            by_problem = {}
+            for arch in packaged_archetypes:
+                for pt in arch.problem_types:
+                    by_problem[pt] = arch
+            logger.info(
+                "archetypes_loaded_from_package",
+                path="package:dashforge.data/archetypes.yaml",
+                count=len(packaged_archetypes),
+                problem_types=len(by_problem),
+            )
+            return packaged_archetypes, by_problem
+    except Exception as e:
+        logger.warning(
+            "archetypes_package_yaml_load_failed",
+            path="package:dashforge.data/archetypes.yaml",
+            error=str(e),
+        )
+
     # Fallback to hardcoded Python definitions
     archetypes = [LATENCY_INVESTIGATION, ERROR_SPIKE, GOLDEN_SIGNALS, RESOURCE_SATURATION]
     by_problem = {}
@@ -509,7 +557,7 @@ ALL_ARCHETYPES, _ARCHETYPE_BY_PROBLEM = _build_registry()
 
 
 def reload_archetypes() -> None:
-    """Hot-reload archetypes from YAML. Call after editing archetypes.yaml."""
+    """Hot-reload archetypes from YAML. Call after editing the configured override."""
     global ALL_ARCHETYPES, _ARCHETYPE_BY_PROBLEM
     ALL_ARCHETYPES, _ARCHETYPE_BY_PROBLEM = _build_registry()
     logger.info("archetypes_reloaded", count=len(ALL_ARCHETYPES))

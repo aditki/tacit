@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -705,34 +707,50 @@ class SignalStore:
 
     # ── Bulk operations ──────────────────────────────────────────────────
 
+    def _load_yaml_data(self, path: Path | None = None) -> tuple[dict[str, Any], str] | tuple[None, None]:
+        """Load signal taxonomy from an explicit path or packaged data."""
+        import yaml
+
+        if path is not None:
+            if not path.is_file():
+                return None, None
+            with open(path) as f:
+                return yaml.safe_load(f) or {}, str(path)
+
+        env_path = os.environ.get("DASHFORGE_SIGNALS_PATH")
+        if env_path:
+            candidate = Path(env_path)
+            if candidate.is_file():
+                with open(candidate) as f:
+                    return yaml.safe_load(f) or {}, str(candidate)
+
+        candidates = [
+            # Local editable overrides for source checkouts and container mounts.
+            Path("signals.yaml"),
+            Path(__file__).resolve().parent.parent / "signals.yaml",
+            # Backward-compatible fallback for older wheel/PyInstaller layouts.
+            Path(__file__).resolve().parent / "signals.yaml",
+        ]
+        for p in candidates:
+            if p.is_file():
+                with open(p) as f:
+                    return yaml.safe_load(f) or {}, str(p)
+
+        resource = files("dashforge.data").joinpath("signals.yaml")
+        if resource.is_file():
+            with resource.open() as f:
+                return yaml.safe_load(f) or {}, "package:dashforge.data/signals.yaml"
+        return None, None
+
     def load_from_yaml(self, path: Path | None = None) -> int:
         """Load bootstrap signal definitions from signals.yaml.
 
         Returns the number of mappings loaded.
         """
-        import yaml
-
-        if path is None:
-            candidates = [
-                # Source checkout: signals.yaml at the project root.
-                Path(__file__).resolve().parent.parent / "signals.yaml",
-                # Installed wheel: packaged copy shipped inside the package
-                # (see force-include in pyproject.toml) so a CLI run from any
-                # directory still bootstraps the signal taxonomy.
-                Path(__file__).resolve().parent / "signals.yaml",
-                # Explicit per-invocation override in the working directory.
-                Path("signals.yaml"),
-            ]
-            for p in candidates:
-                if p.is_file():
-                    path = p
-                    break
-        if path is None or not path.is_file():
+        data, source = self._load_yaml_data(path)
+        if data is None:
             logger.info("signals_yaml_not_found")
             return 0
-
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
 
         count = 0
         for sig_type, sig_def in data.get("signals", {}).items():
@@ -752,7 +770,7 @@ class SignalStore:
                 )
                 count += 1
 
-        logger.info("signals_loaded_from_yaml", path=str(path), mappings=count)
+        logger.info("signals_loaded_from_yaml", path=source, mappings=count)
         return count
 
     # ── Ingested dashboard records ───────────────────────────────────────

@@ -130,7 +130,12 @@ class SignalFxBackend:
 
             # Extract SignalFlow programs from chart options
             options = chart.get("options", {})
-            program_text = options.get("programOptions", {}).get("programText", "")
+            if not isinstance(options, dict):
+                options = {}
+            program_options = options.get("programOptions", {})
+            if not isinstance(program_options, dict):
+                program_options = {}
+            program_text = program_options.get("programText", "")
             if not program_text:
                 # Fallback: some chart types put programs at top level
                 program_text = chart.get("programText", "")
@@ -151,7 +156,7 @@ class SignalFxBackend:
                     {
                         "title": chart_name,
                         "description": chart.get("description", ""),
-                        "panel_type": chart.get("options", {}).get("type", "TimeSeriesChart"),
+                        "panel_type": options.get("type", "TimeSeriesChart"),
                         "metrics": list(
                             dict.fromkeys(_extract_metrics_from_signalflow(program_text) if program_text else [])
                         ),

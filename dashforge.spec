@@ -12,13 +12,14 @@ a = Analysis(
     pathex=[root],
     binaries=[],
     datas=[
-        (os.path.join(root, "archetypes.yaml"), "."),
+        (os.path.join(root, "dashforge", "data"), "dashforge/data"),
         (os.path.join(root, "dashforge", "static"), "dashforge/static"),
     ],
     hiddenimports=[
         "dashforge.main",
         "dashforge.cli",
         "dashforge.config",
+        "dashforge.data",
         "dashforge.pipeline",
         "dashforge.feedback",
         "dashforge.ranking",
