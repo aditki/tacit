@@ -343,6 +343,23 @@ class TestArchetypeAutoRegister:
         felix = [a for a in doc["archetypes"] if a["id"] == "felix"]
         assert len(felix) == 1 and felix[0]["name"] == "Felix v2"
 
+    def test_new_override_file_is_seeded_with_existing_archetypes(self, tmp_path, monkeypatch):
+        target = tmp_path / "archetypes.yaml"
+        monkeypatch.setenv("DASHFORGE_ARCHETYPES_PATH", str(target))
+        try:
+            append_archetype_to_yaml("archetypes:\n- id: felix\n  name: Felix\n  problem_types: [felix]\n")
+            doc = _yaml.safe_load(target.read_text())
+            ids = {a["id"] for a in doc["archetypes"]}
+
+            assert "felix" in ids
+            assert "resource_saturation" in ids
+            reload_archetypes()
+            assert get_archetype("resource_saturation") is not None
+            assert get_archetype("felix") is not None
+        finally:
+            monkeypatch.delenv("DASHFORGE_ARCHETYPES_PATH", raising=False)
+            reload_archetypes()
+
     def test_register_and_reload_makes_it_routable(self, tmp_path, monkeypatch):
         target = tmp_path / "archetypes.yaml"
         monkeypatch.setenv("DASHFORGE_ARCHETYPES_PATH", str(target))

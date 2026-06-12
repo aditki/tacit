@@ -583,8 +583,17 @@ def append_archetype_to_yaml(archetype_yaml: str, path: Path | None = None) -> P
     if not new_items:
         return None
 
-    existing = (yaml.safe_load(target.read_text()) if target.is_file() else {}) or {}
-    items = existing.get("archetypes", []) or []
+    def _seed_archetypes() -> list[dict]:
+        return [arch.model_dump(mode="python") for arch in ALL_ARCHETYPES]
+
+    existing = yaml.safe_load(target.read_text()) if target.is_file() else None
+    if not isinstance(existing, dict):
+        existing = {}
+    items = existing.get("archetypes")
+    if not isinstance(items, list) or not items:
+        items = _seed_archetypes()
+    else:
+        items = list(items)
     by_id = {a.get("id"): i for i, a in enumerate(items) if isinstance(a, dict)}
     for arch in new_items:
         aid = arch.get("id")
