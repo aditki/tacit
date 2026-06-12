@@ -747,6 +747,56 @@ def _features_to_dict(features) -> dict[str, Any]:
     return asdict(features)
 
 
+def persist_inferred_signal_review(
+    *,
+    store: Any,
+    sig: dict[str, Any],
+    source_ref: str,
+    dashboard_uid: str,
+    backend_name: str = "",
+) -> bool:
+    """Persist one inferred signal using the same gate for all approval paths."""
+    signal_type = sig["signal_type"]
+    metric = sig.get("metric", "")
+    confidence = sig.get("confidence", 0.6)
+    is_heuristic = sig.get("source") == "heuristic"
+
+    if is_heuristic:
+        should_teach = bool(metric) and bool(sig.get("auto_teach_eligible"))
+    else:
+        should_teach = bool(metric) and confidence >= 0.5
+
+    if should_teach:
+        family = sig.get("signal_family", "")
+        if family:
+            store.register_signal_type(signal_type=signal_type, category=family)
+        store.add_mapping(
+            signal_type=signal_type,
+            metric_pattern=metric,
+            confidence=confidence,
+            source_type="dashboard_ingest",
+            source_refs=[source_ref],
+            inference_version=sig.get("inference_version", ""),
+            review_state="approved" if is_heuristic else "trusted",
+        )
+        return True
+
+    if is_heuristic and metric:
+        store.record_rejected_candidate(
+            metric=metric,
+            signal_family=sig.get("signal_family", ""),
+            signal_name=signal_type,
+            score=sig.get("score", 0.0),
+            margin=sig.get("margin", 0.0),
+            why_not=sig.get("why_not_auto_taught") or "low_score",
+            evidence=sig.get("evidence", []),
+            inference_version=sig.get("inference_version", ""),
+            dashboard_uid=dashboard_uid,
+            backend_name=backend_name,
+        )
+    return False
+
+
 async def ingest_dashboard_features(
     features: Any,
     *,
@@ -790,14 +840,13 @@ async def ingest_dashboard_features(
             f"{features.backend_name}:{features.dashboard_uid}" if features.backend_name else features.dashboard_uid
         )
         for sig in signals:
-            if sig["confidence"] >= 0.5:
-                store.add_mapping(
-                    signal_type=sig["signal_type"],
-                    metric_pattern=sig["metric"],
-                    confidence=sig["confidence"],
-                    source_type="dashboard_ingest",
-                    source_refs=[source_ref],
-                )
+            if persist_inferred_signal_review(
+                store=store,
+                sig=sig,
+                source_ref=source_ref,
+                dashboard_uid=features.dashboard_uid,
+                backend_name=features.backend_name,
+            ):
                 mappings_created += 1
         logger.info(
             "dashboard_ingested_auto_approved",

@@ -57,6 +57,26 @@ class TestInferenceEngine:
         rich = infer_signal("felix_int_dataplane_apply_time_seconds", panels)
         assert rich.confidence > bare.confidence
 
+    def test_duplicate_panel_context_does_not_exceed_source_caps(self):
+        panels = [
+            {
+                "title": "Memory",
+                "row": "Resources",
+                "unit": "bytes",
+                "metrics": ["opaque_value"],
+                "queries": ["opaque_value"],
+            }
+            for _ in range(3)
+        ]
+
+        sig = infer_signal("opaque_value", panels)
+
+        assert sig is not None
+        assert sig.signal_family == "resource_usage"
+        assert sig.score < 0.70
+        assert sig.auto_teach_eligible is False
+        assert sig.evidence_sources == ["group", "title", "unit"]
+
     def test_backlog_and_saturation(self):
         assert infer_signal("workqueue_depth").signal_family == "backlog"
         assert infer_signal("controller_runtime_webhook_requests_in_flight").signal_family == "saturation"

@@ -299,20 +299,26 @@ def infer_signal(metric: str, panels: list[dict[str, Any]] | None = None) -> Inf
 
     owning = _owning_panels(metric, panels)
 
-    # 3. Panel + description text (0.30, split across all matched families) and
-    #    5. row grouping (0.05).
+    # 3. Panel + description text (0.30, split across matched families) and
+    #    5. row grouping (0.05). Aggregate across owning panels first so
+    #    repeated/duplicate panels cannot exceed each source's advertised cap.
+    title_votes: dict[str, set[str]] = {}
+    group_votes: dict[str, set[str]] = {}
     for p in owning:
         text = " ".join(str(p.get(k, "")) for k in ("title", "description"))
-        hits = _text_families(text)
-        if hits:
-            per = _W_TITLE / len(hits)
-            for fam, why in hits:
-                vote(fam, per, why, "title")
+        for fam, why in _text_families(text):
+            title_votes.setdefault(fam, set()).add(why)
         row_hits = _text_families(str(p.get("row", "")))
-        if row_hits:
-            per = _W_GROUP / len(row_hits)
-            for fam, why in row_hits:
-                vote(fam, per, f"row grouping: {why}", "group")
+        for fam, why in row_hits:
+            group_votes.setdefault(fam, set()).add(f"row grouping: {why}")
+    if title_votes:
+        per = _W_TITLE / len(title_votes)
+        for fam, whys in title_votes.items():
+            vote(fam, per, "; ".join(sorted(whys)), "title")
+    if group_votes:
+        per = _W_GROUP / len(group_votes)
+        for fam, whys in group_votes.items():
+            vote(fam, per, "; ".join(sorted(whys)), "group")
     if owning:
         available_weight += _W_TITLE + _W_GROUP
 

@@ -90,6 +90,7 @@ def test_learn_post_valid(client, temp_store, monkeypatch):
     # "false" string is correctly coerced to a boolean -> pending, not approved.
     assert resp.json()["status"] == "pending"
 
+
 def test_reject_ingested_dashboard_marks_status_without_mappings(client, temp_store):
     temp_store.record_ingested_dashboard(
         "reject-me",
@@ -146,7 +147,6 @@ def test_ignore_ingested_dashboard_marks_status_quietly(client, temp_store):
 
 
 def test_learn_dashboard_json_post_valid(client, temp_store, monkeypatch):
-    import ml_api.dependencies as di
     monkeypatch.setattr(di, "get_signal_store", lambda: temp_store)
     temp_store.load_from_yaml()
 

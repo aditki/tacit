@@ -668,50 +668,16 @@ async def approve_ingested_dashboard(dashboard_uid: str, backend: str | None = N
         # Support both old format (plain signal type string) and new format
         # (dict with signal_type, metric, confidence)
         if isinstance(sig, dict):
-            signal_type = sig["signal_type"]
-            metric = sig.get("metric", "")
-            confidence = sig.get("confidence", 0.6)
-            # Curated-taxonomy matches are trusted at >=0.5. Heuristic candidates
-            # must clear the conservative auto-teach gate (score+margin+>=2
-            # evidence sources, or an explicit name) so we don't poison the store.
-            if sig.get("source") == "heuristic":
-                should_teach = bool(metric) and bool(sig.get("auto_teach_eligible"))
-            else:
-                should_teach = bool(metric) and confidence >= 0.5
-            is_heuristic = sig.get("source") == "heuristic"
-            if should_teach:
-                # Record the signal's family (category) so the learned taxonomy
-                # carries semantic grouping, then persist the mapping. This is
-                # what makes each approval compound for the next ingest/prompt.
-                family = sig.get("signal_family", "")
-                if family:
-                    store.register_signal_type(signal_type=signal_type, category=family)
-                # Heuristic mappings enter as 'approved' (not 'trusted') and
-                # carry the ruleset version for later invalidate/replay.
-                store.add_mapping(
-                    signal_type=signal_type,
-                    metric_pattern=metric,
-                    confidence=confidence,
-                    source_type="dashboard_ingest",
-                    source_refs=[source_ref],
-                    inference_version=sig.get("inference_version", ""),
-                    review_state="approved" if is_heuristic else "trusted",
-                )
+            from dashforge.dashboard_ingest import persist_inferred_signal_review
+
+            if persist_inferred_signal_review(
+                store=store,
+                sig=sig,
+                source_ref=source_ref,
+                dashboard_uid=dashboard_uid,
+                backend_name=ingested.get("backend_name", ""),
+            ):
                 mappings_created += 1
-            elif is_heuristic and metric:
-                # Held-back candidate → negative training data with the reason.
-                store.record_rejected_candidate(
-                    metric=metric,
-                    signal_family=sig.get("signal_family", ""),
-                    signal_name=signal_type,
-                    score=sig.get("score", 0.0),
-                    margin=sig.get("margin", 0.0),
-                    why_not=sig.get("why_not_auto_taught") or "low_score",
-                    evidence=sig.get("evidence", []),
-                    inference_version=sig.get("inference_version", ""),
-                    dashboard_uid=dashboard_uid,
-                    backend_name=ingested.get("backend_name", ""),
-                )
         else:
             # Legacy: plain string signal type — fall back to pattern matching
             signal_type = sig
