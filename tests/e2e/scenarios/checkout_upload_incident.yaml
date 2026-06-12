@@ -1,0 +1,102 @@
+id: checkout_upload_incident
+dashboard:
+  uid: checkout-edge-incident
+  title: Checkout Edge Incident Response
+  tags:
+    - checkout
+    - edge
+    - incident
+    - learned
+  panels:
+    - title: Request throughput
+      row: Traffic
+      unit: reqps
+      expr: sum(rate(checkout_edge_requests_total{service="checkout-edge"}[5m])) by (status)
+    - title: 5xx error rate
+      row: Errors
+      unit: reqps
+      expr: sum(rate(checkout_edge_errors_total{service="checkout-edge"}[5m])) by (route)
+    - title: P95 request latency
+      row: Latency
+      unit: s
+      expr: histogram_quantile(0.95, sum(rate(checkout_edge_request_duration_seconds_bucket{service="checkout-edge"}[5m])) by (le,route))
+    - title: In-flight requests
+      row: Saturation
+      unit: short
+      expr: checkout_edge_inflight_requests{service="checkout-edge"}
+    - title: DB pool wait time
+      row: Downstream
+      unit: s
+      expr: histogram_quantile(0.95, sum(rate(checkout_edge_db_pool_wait_seconds_bucket{service="checkout-edge"}[5m])) by (le))
+    - title: CPU usage
+      row: Resources
+      unit: s
+      expr: rate(checkout_edge_cpu_usage_seconds_total{container="checkout-edge"}[5m])
+    - title: Memory working set
+      row: Resources
+      unit: bytes
+      expr: checkout_edge_memory_working_set_bytes{container="checkout-edge"}
+noise_metrics:
+  - unrelated_cache_hits_total
+  - unrelated_queue_depth
+  - node_filesystem_size_bytes
+catalog_dimensions:
+  - service="checkout-edge"
+  - route="/payments"
+  - status="200,500"
+prompt_matrix:
+  services:
+    - checkout-edge
+  prompt_styles:
+    - "{service} is in an incident: {symptom}. Build the dashboard before creating anything noisy. {perturbation}"
+    - "Users report checkout failures and we need useful incident metrics for {service}. Focus on {symptom}. {perturbation}"
+    - "Can you investigate {service}? The current hypothesis is {symptom}; include enough evidence for triage. {perturbation}"
+  perturbations:
+    - ""
+    - "The alert name might be stale, so rely on learned dashboard signals."
+    - "Ignore vanity KPIs and show the signals an on-call engineer would need."
+  failure_modes:
+    - id: latency
+      symptom: "p95 latency is spiking after deploy"
+      expected_metrics:
+        - checkout_edge_request_duration_seconds
+        - checkout_edge_requests_total
+        - checkout_edge_db_pool_wait_seconds
+        - checkout_edge_errors_total
+        - checkout_edge_inflight_requests
+        - checkout_edge_cpu_usage_seconds_total
+        - checkout_edge_memory_working_set_bytes
+      critical_metrics:
+        - checkout_edge_request_duration_seconds
+        - checkout_edge_db_pool_wait_seconds
+    - id: errors
+      symptom: "5xx failures are rising on payment routes"
+      expected_metrics:
+        - checkout_edge_errors_total
+        - checkout_edge_requests_total
+        - checkout_edge_request_duration_seconds
+        - checkout_edge_db_pool_wait_seconds
+        - checkout_edge_inflight_requests
+        - checkout_edge_cpu_usage_seconds_total
+        - checkout_edge_memory_working_set_bytes
+      critical_metrics:
+        - checkout_edge_errors_total
+        - checkout_edge_requests_total
+    - id: saturation
+      symptom: "requests are piling up and pods look resource constrained"
+      expected_metrics:
+        - checkout_edge_inflight_requests
+        - checkout_edge_cpu_usage_seconds_total
+        - checkout_edge_memory_working_set_bytes
+        - checkout_edge_request_duration_seconds
+        - checkout_edge_requests_total
+        - checkout_edge_errors_total
+        - checkout_edge_db_pool_wait_seconds
+      critical_metrics:
+        - checkout_edge_inflight_requests
+        - checkout_edge_cpu_usage_seconds_total
+utility_thresholds:
+  min_metric_recall: 0.7
+  min_critical_recall: 1.0
+  min_signal_to_noise: 0.55
+  min_usefulness_score: 0.8
