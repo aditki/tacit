@@ -228,10 +228,7 @@ def evaluate_incident(spec: DashboardSpec, case: IncidentPromptCase) -> Incident
     signal_to_noise = len(matched) / len(found) if found else 0.0
     panel_score = min(len(spec.panels) / 6, 1.0)
     usefulness_score = (
-        (0.45 * critical_recall)
-        + (0.30 * metric_recall)
-        + (0.15 * signal_to_noise)
-        + (0.10 * panel_score)
+        (0.45 * critical_recall) + (0.30 * metric_recall) + (0.15 * signal_to_noise) + (0.10 * panel_score)
     )
     return IncidentEvaluation(
         found_metrics=found,
