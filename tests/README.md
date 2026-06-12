@@ -11,6 +11,9 @@ uv run python tests/validate.py tests/dashforge_validation_prompts.csv --mode ar
 # Full pipeline (requires running DashForge + Grafana + Prometheus stack)
 uv run python tests/validate.py tests/dashforge_validation_prompts.csv --mode pipeline
 
+# Upload-learning E2E framework (hermetic: fake backend + fake intent)
+uv run pytest tests/e2e -m e2e -q
+
 # Both
 uv run python tests/validate.py tests/dashforge_validation_prompts.csv --mode all --output results.json
 
@@ -29,6 +32,21 @@ The validation suite uses a **tiered evaluation framework**:
 | **Tier 1 — Retrieval Accuracy** | Metric recall, critical recall, weighted recall, SNR | Can the system retrieve relevant signals? **Most important.** |
 | **Tier 2 — Operational Utility** | Panels/dashboard, error rate, latency | Would an SRE actually use this dashboard? |
 | **Tier 3 — Investigation Coverage** | Archetype match (strict + soft) | Does the dashboard support the right investigation path? |
+
+## Upload-Learning E2E Framework
+
+`tests/e2e` validates the workflows that matter before dashboard creation:
+
+1. Upload a representative dashboard JSON.
+2. Infer semantic signals and keep the dashboard pending.
+3. Approve it, which creates signal mappings and registers the generated learned archetype.
+4. Run a combinatorial prompt matrix against the learned telemetry language.
+5. Score the generated dashboard spec for metric recall, critical evidence, signal-to-noise, and an incident usefulness score.
+
+It also covers manual signal teaching, rejecting uploaded dashboards without activating mappings, and the no-metrics failure path.
+The API-surface E2E tests additionally cover health, auth, archetype reload/listing, signal detail/stats, chart generation, investigation history, feedback, feedback insights, learning lists, ignore flows, and upload validation failures.
+
+The first scenario is `tests/e2e/scenarios/checkout_upload_incident.yaml`. Add more scenarios by defining dashboard panels, noise metrics, prompt styles, perturbations, failure modes, and utility thresholds. This keeps the scenario reviewable while still generating many prompt variants.
 
 ## Modes
 
