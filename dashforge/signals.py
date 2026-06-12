@@ -44,6 +44,14 @@ _DECAY_HALF_LIFE_DAYS = 90  # confidence halves every 90 days without use
 _MIN_CONFIDENCE = 0.05  # floor — never fully forget
 _TRUST_THRESHOLD = 0.15  # below this, mapping is excluded from resolution
 _CONTEXT_MISSING_PENALTY = 0.7  # lower rank when mapping has context caller lacks
+_REVIEW_STATE_RANK = {"candidate": 0, "approved": 1, "trusted": 2}
+
+
+def _stronger_review_state(existing: str, incoming: str) -> str:
+    """Return the higher-trust review state without allowing downgrades."""
+    existing_rank = _REVIEW_STATE_RANK.get(existing, 0)
+    incoming_rank = _REVIEW_STATE_RANK.get(incoming, 0)
+    return incoming if incoming_rank > existing_rank else existing
 
 
 def _db_path() -> Path:
@@ -78,6 +86,11 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     -- Provenance
     source_type         TEXT NOT NULL DEFAULT 'bootstrap',
     source_refs         TEXT NOT NULL DEFAULT '[]',
+    -- Which inference ruleset produced this (for invalidate/replay).
+    inference_version   TEXT NOT NULL DEFAULT '',
+    -- Lifecycle: heuristic mappings start 'candidate' → 'approved' → 'trusted';
+    -- curated/bootstrap/teach mappings are 'trusted' from the start.
+    review_state        TEXT NOT NULL DEFAULT 'trusted',
 
     -- Trust / decay
     use_count           INTEGER NOT NULL DEFAULT 0,
@@ -90,6 +103,22 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
 
     UNIQUE(signal_type, metric_pattern),
     FOREIGN KEY (signal_type) REFERENCES signal_types(signal_type)
+);
+
+-- Inferred candidates that were NOT auto-taught (negative training data).
+CREATE TABLE IF NOT EXISTS rejected_signal_candidates (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    dashboard_uid       TEXT NOT NULL DEFAULT '',
+    backend_name        TEXT NOT NULL DEFAULT '',
+    metric              TEXT NOT NULL,
+    signal_family       TEXT NOT NULL DEFAULT '',
+    signal_name         TEXT NOT NULL DEFAULT '',
+    score               REAL NOT NULL DEFAULT 0.0,
+    margin              REAL NOT NULL DEFAULT 0.0,
+    why_not             TEXT NOT NULL DEFAULT '',
+    evidence            TEXT NOT NULL DEFAULT '[]',
+    inference_version   TEXT NOT NULL DEFAULT '',
+    created_at          REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS ingested_dashboards (
@@ -150,7 +179,16 @@ class SignalStore:
         with self._conn() as conn:
             conn.executescript(_SCHEMA_SQL)
             self._ensure_ingested_dashboard_backend_scope(conn)
+            self._ensure_mapping_columns(conn)
         logger.info("signal_store_init", db_path=str(self._db_path))
+
+    def _ensure_mapping_columns(self, conn: sqlite3.Connection) -> None:
+        """Add newer columns to signal_metric_mappings on pre-existing DBs."""
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
+        if "inference_version" not in columns:
+            conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN inference_version TEXT NOT NULL DEFAULT ''")
+        if "review_state" not in columns:
+            conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN review_state TEXT NOT NULL DEFAULT 'trusted'")
 
     def _ensure_ingested_dashboard_backend_scope(self, conn: sqlite3.Connection) -> None:
         columns = [row["name"] for row in conn.execute("PRAGMA table_info(ingested_dashboards)").fetchall()]
@@ -287,12 +325,19 @@ class SignalStore:
         context_archetypes: list[str] | None = None,
         source_type: str = "bootstrap",
         source_refs: list[str] | None = None,
+        inference_version: str = "",
+        review_state: str = "trusted",
     ) -> int:
         """Add or update a signal-to-metric mapping. Returns mapping ID.
 
         ``confidence`` is a 0.0–1.0 score; out-of-range values (e.g. ``90``
         instead of ``0.9``) are rejected here so a single bad write cannot
         dominate resolution / effective-confidence sorting.
+
+        ``inference_version`` records which ruleset produced a heuristic mapping
+        (for later invalidate/replay). ``review_state`` is the lifecycle state
+        ('candidate' → 'approved' → 'trusted'); on conflict it is preserved
+        (re-teaching never downgrades trust).
         """
         if not 0.0 <= confidence <= 1.0:
             raise ValueError(f"confidence must be within [0.0, 1.0], got {confidence!r}")
@@ -318,7 +363,8 @@ class SignalStore:
             #   [...] → union with existing
             prior = conn.execute(
                 """SELECT context_services, context_datasource_types,
-                          context_environments, context_archetypes
+                          context_environments, context_archetypes,
+                          source_refs, inference_version, review_state
                      FROM signal_metric_mappings
                     WHERE signal_type = ? AND metric_pattern = ?""",
                 (signal_type, metric_pattern),
@@ -342,16 +388,26 @@ class SignalStore:
             ds_types = _merge(context_datasource_types, prior["context_datasource_types"] if prior else None)
             environments = _merge(context_environments, prior["context_environments"] if prior else None)
             archetypes = _merge(context_archetypes, prior["context_archetypes"] if prior else None)
+            existing_refs = json.loads(prior["source_refs"]) if prior and prior["source_refs"] else []
+            refs = list(existing_refs)
+            for ref in source_refs or []:
+                if ref not in refs:
+                    refs.append(ref)
+            merged_inference_version = inference_version or (prior["inference_version"] if prior else "")
+            merged_review_state = _stronger_review_state(prior["review_state"], review_state) if prior else review_state
 
             cursor = conn.execute(
                 """INSERT INTO signal_metric_mappings
                    (signal_type, metric_pattern, confidence,
                     context_services, context_datasource_types,
                     context_environments, context_archetypes,
-                    source_type, source_refs, created_at, last_seen)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_type, source_refs, inference_version, review_state,
+                    created_at, last_seen)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(signal_type, metric_pattern) DO UPDATE SET
                        confidence = MAX(excluded.confidence, signal_metric_mappings.confidence),
+                       inference_version = excluded.inference_version,
+                       review_state = excluded.review_state,
                        -- excluded.context_* already holds the merged scopes.
                        context_services = excluded.context_services,
                        context_datasource_types = excluded.context_datasource_types,
@@ -380,12 +436,71 @@ class SignalStore:
                     json.dumps(environments),
                     json.dumps(archetypes),
                     source_type,
-                    json.dumps(source_refs or []),
+                    json.dumps(refs),
+                    merged_inference_version,
+                    merged_review_state,
                     now,
                     now,
                 ),
             )
             return cursor.lastrowid or 0
+
+    def record_rejected_candidate(
+        self,
+        metric: str,
+        *,
+        signal_family: str = "",
+        signal_name: str = "",
+        score: float = 0.0,
+        margin: float = 0.0,
+        why_not: str = "",
+        evidence: list[str] | None = None,
+        inference_version: str = "",
+        dashboard_uid: str = "",
+        backend_name: str = "",
+    ) -> int:
+        """Persist an inferred candidate that was NOT auto-taught.
+
+        Rejections are negative training data — they record what the heuristic
+        proposed and why it was held back ('low_score'|'low_margin'|
+        'single_source_only'), so the ruleset can be tuned/replayed later.
+        """
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """INSERT INTO rejected_signal_candidates
+                   (dashboard_uid, backend_name, metric, signal_family, signal_name,
+                    score, margin, why_not, evidence, inference_version, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    dashboard_uid,
+                    backend_name,
+                    metric,
+                    signal_family,
+                    signal_name,
+                    score,
+                    margin,
+                    why_not,
+                    json.dumps(evidence or []),
+                    inference_version,
+                    time.time(),
+                ),
+            )
+            return cursor.lastrowid or 0
+
+    def list_rejected_candidates(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return recorded rejected candidates (newest first)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM rejected_signal_candidates ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if isinstance(d.get("evidence"), str):
+                d["evidence"] = json.loads(d["evidence"])
+            out.append(d)
+        return out
 
     def record_feedback(self, signal_type: str, metric_pattern: str, positive: bool) -> None:
         """Record positive/negative feedback for a mapping (anti-drift)."""
@@ -753,19 +868,39 @@ class SignalStore:
                 ).fetchall()
         return [_deserialize_ingested(r) for r in rows]
 
-    def approve_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> bool:
-        """Approve a pending ingested dashboard (activates its signal mappings)."""
+    def update_ingested_dashboard_status(
+        self,
+        dashboard_uid: str,
+        status: str,
+        backend_name: str | None = None,
+    ) -> bool:
+        """Move a pending ingested dashboard to a reviewed status."""
+        if status not in {"approved", "rejected", "ignored"}:
+            raise ValueError(f"unsupported ingested dashboard status: {status}")
+
         ingested = self.get_ingested_dashboard(dashboard_uid, backend_name)
         if ingested is None:
             return False
 
         with self._conn() as conn:
             cursor = conn.execute(
-                """UPDATE ingested_dashboards SET status = 'approved', reviewed_at = ?
+                """UPDATE ingested_dashboards SET status = ?, reviewed_at = ?
                    WHERE id = ? AND status = 'pending'""",
-                (time.time(), ingested["id"]),
+                (status, time.time(), ingested["id"]),
             )
             return cursor.rowcount > 0
+
+    def approve_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> bool:
+        """Approve a pending ingested dashboard (activates its signal mappings)."""
+        return self.update_ingested_dashboard_status(dashboard_uid, "approved", backend_name)
+
+    def reject_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> bool:
+        """Reject a pending ingested dashboard as unsuitable for learning."""
+        return self.update_ingested_dashboard_status(dashboard_uid, "rejected", backend_name)
+
+    def ignore_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> bool:
+        """Ignore a pending ingested dashboard without treating it as negative signal data."""
+        return self.update_ingested_dashboard_status(dashboard_uid, "ignored", backend_name)
 
     # ── Stats ────────────────────────────────────────────────────────────
 

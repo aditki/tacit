@@ -639,7 +639,10 @@
         for (const inv of data.investigations) {
           const badge = statusBadge(inv.status);
           const prompt = inv.prompt.length > 50 ? inv.prompt.slice(0, 47) + '...' : inv.prompt;
-          const archs = (inv.archetypes || []).slice(0, 2).map(a => `${a.type}(${Math.round(a.confidence*100)}%)`).join(', ') || '—';
+          const archs = (inv.archetypes || []).slice(0, 2).map(a => {
+            const src = a.source === 'learned' ? ' learned' : '';
+            return `${a.type}(${Math.round(a.confidence*100)}%${src})`;
+          }).join(', ') || '—';
           html += `<tr>
             <td>${badge}</td>
             <td class="prompt-cell" title="${esc(inv.prompt)}">${esc(prompt)}</td>
@@ -665,7 +668,12 @@
         if (!resp.ok) throw new Error('Not found');
         const inv = await resp.json();
         const badge = statusBadge(inv.status);
-        const archs = (inv.archetypes || []).map(a => `${esc(a.type)} (${Math.round(a.confidence*100)}%)`).join(', ') || '—';
+        const archs = (inv.archetypes || []).map(a => {
+          const src = a.source ? `, ${a.source}` : '';
+          const selected = a.selected === false ? ', not selected' : '';
+          return `${a.type} (${Math.round(a.confidence*100)}%${src}${selected})`;
+        }).join(', ') || '—';
+        const intentSignals = (inv.intent_signals || []).map(s => esc(s)).join(', ') || '—';
         const metrics = (inv.metrics_selected || []).map(m => esc(m)).join(', ') || '—';
         const dsTypes = (inv.datasource_types || []).map(d => esc(d)).join(', ') || '—';
 
@@ -703,6 +711,7 @@
               <strong>Domain:</strong> ${esc(inv.intent_domain || '—')}<br>
               <strong>Services:</strong> ${esc((inv.intent_services || []).join(', ') || '—')}<br>
               <strong>Keywords:</strong> ${esc((inv.intent_keywords || []).join(', ') || '—')}<br>
+              <strong>Signals:</strong> ${intentSignals}<br>
               <strong>Problem type:</strong> ${esc(inv.problem_type || '—')}<br>
               <strong>Archetypes:</strong> ${esc(archs)}<br>
               <strong>Timerange:</strong> ${esc(inv.timerange || '—')}
@@ -899,7 +908,9 @@
         for (const d of dashboards) {
           const badge = d.status === 'approved'
             ? '<span class="badge badge-success">approved</span>'
-            : '<span class="badge badge-running">pending</span>';
+            : d.status === 'pending'
+              ? '<span class="badge badge-running">pending</span>'
+              : `<span class="badge">${esc(d.status)}</span>`;
           const signals = (d.signals_inferred || []).slice(0, 8).map(s => {
             if (typeof s === 'string') {
               return `<span class="signal-chip">${esc(s)}</span>`;
@@ -914,14 +925,16 @@
           const archetypeYaml = d.archetype_generated
             ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Generated archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(d.archetype_generated)}</pre></details>`
             : '';
-          const approveBtn = d.status === 'pending'
-            ? `<button class="btn-sm btn-success approve-dashboard-btn" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Approve</button>`
+          const reviewBtns = d.status === 'pending'
+            ? `<button class="btn-sm btn-success review-dashboard-btn" data-dashboard-action="approve" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Approve</button>
+               <button class="btn-sm review-dashboard-btn" data-dashboard-action="reject" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Reject</button>
+               <button class="btn-sm review-dashboard-btn" data-dashboard-action="ignore" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Ignore</button>`
             : '';
           html += `
             <div class="ingest-card">
               <div style="display:flex;justify-content:space-between;align-items:center">
                 <span class="ingest-title">${esc(d.dashboard_title || d.dashboard_uid)}</span>
-                <span>${badge} ${approveBtn}</span>
+                <span>${badge} ${reviewBtns}</span>
               </div>
               <div class="ingest-meta">
                 UID: <code>${esc(d.dashboard_uid)}</code> &middot;
@@ -939,13 +952,17 @@
       }
     }
 
-    async function approveDashboard(uid, backend = '') {
+    async function reviewDashboard(uid, action, backend = '') {
       try {
         const backendQuery = backend ? `?backend=${encodeURIComponent(backend)}` : '';
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboards/${encodeURIComponent(uid)}/approve${backendQuery}`, { method: 'POST' });
-        if (!resp.ok) throw new Error('Approval failed');
+        const resp = await fetch(`${BASE}/api/v1/learn/dashboards/${encodeURIComponent(uid)}/${encodeURIComponent(action)}${backendQuery}`, { method: 'POST' });
+        if (!resp.ok) throw new Error(`${action} failed`);
         loadIngestedDashboards();
-      } catch (e) { alert('Approve failed: ' + e.message); }
+      } catch (e) { alert(`${action} failed: ` + e.message); }
+    }
+
+    async function approveDashboard(uid, backend = '') {
+      return reviewDashboard(uid, 'approve', backend);
     }
 
     /* ── Signals tab ──────────────────────────────────────────── */
@@ -1081,11 +1098,11 @@
       if (btn && btn.dataset.signal) showSignalDetail(btn.dataset.signal);
     });
 
-    // Delegate dashboard approval clicks so UIDs are never embedded in JS strings.
+    // Delegate dashboard review clicks so UIDs are never embedded in JS strings.
     document.getElementById('ingested-list').addEventListener('click', (e) => {
-      const btn = e.target.closest('.approve-dashboard-btn');
+      const btn = e.target.closest('.review-dashboard-btn');
       if (btn && btn.dataset.dashboardUid) {
-        approveDashboard(btn.dataset.dashboardUid, btn.dataset.dashboardBackend || '');
+        reviewDashboard(btn.dataset.dashboardUid, btn.dataset.dashboardAction || 'approve', btn.dataset.dashboardBackend || '');
       }
     });
 

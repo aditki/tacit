@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 
 import structlog
 
@@ -12,7 +13,11 @@ from dashforge.agents.metrics_discovery import discover_metrics
 from dashforge.agents.providers.base import TokenUsage
 from dashforge.agents.query_builder import build_dashboard
 from dashforge.archetypes.engine import blend_archetypes, compile_archetype
-from dashforge.archetypes.templates import get_archetype, get_archetypes_by_confidence
+from dashforge.archetypes.templates import (
+    get_archetype,
+    get_archetypes_by_confidence,
+    get_archetypes_by_learning_context,
+)
 from dashforge.backends import get_active_backends
 from dashforge.backends.base import PublishResult
 from dashforge.cache import llm_cache, make_cache_key
@@ -34,6 +39,66 @@ def _get_semaphore() -> asyncio.Semaphore:
     if _pipeline_semaphore is None:
         _pipeline_semaphore = asyncio.Semaphore(settings.pipeline_max_concurrent)
     return _pipeline_semaphore
+
+
+def _history_archetypes(
+    classifier_archetypes: list,
+    selected_archetypes: list[tuple[Any, float]],
+    learned_archetypes: list[tuple[Any, float]],
+) -> list[dict[str, object]]:
+    """Return history archetype records with selected learned matches included."""
+    learned_ids = {arch.id for arch, _ in learned_archetypes}
+    selected_ids = {arch.id for arch, _ in selected_archetypes}
+    records: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    for arch, confidence in selected_archetypes:
+        if arch.id in seen:
+            continue
+        seen.add(arch.id)
+        records.append(
+            {
+                "type": arch.id,
+                "name": arch.name,
+                "confidence": confidence,
+                "source": "learned" if arch.id in learned_ids else "classifier",
+                "selected": True,
+                "signals": sorted(set(arch.required_signals) | set(arch.signal_bindings.keys())),
+            }
+        )
+
+    for match in classifier_archetypes:
+        if match.type in seen or match.type in selected_ids:
+            continue
+        seen.add(match.type)
+        records.append(
+            {
+                "type": match.type,
+                "confidence": match.confidence,
+                "source": "classifier",
+                "selected": False,
+                "signals": [],
+            }
+        )
+
+    return records
+
+
+def _history_signals(intent_signals: list, selected_archetypes: list[tuple[Any, float]]) -> list[str]:
+    """Return intent signal types plus semantic signals from selected archetypes."""
+    values: list[str] = []
+    seen: set[str] = set()
+    for signal in intent_signals:
+        value = getattr(signal, "value", str(signal))
+        if value and value not in seen:
+            seen.add(value)
+            values.append(value)
+    for arch, _ in selected_archetypes:
+        for signal in [*arch.required_signals, *arch.signal_bindings.keys()]:
+            if signal and signal not in seen:
+                seen.add(signal)
+                values.append(signal)
+    return values
 
 
 async def run_pipeline(request: DashRequest) -> DashResponse:
@@ -139,12 +204,22 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         # ── 3. Metric discovery — each backend contributes ───────────
         t0 = time.monotonic()
         metric_catalog = []
+        datasource_catalog = []
         ds_types: list[str] = []
         for backend in backends:
             entries = await backend.discover_metrics(intent.keywords, intent)
             metric_catalog.extend(entries)
             if entries:
                 ds_types.append(backend.name)
+            else:
+                if not getattr(getattr(backend, "last_discovery_status", None), "available", True):
+                    continue
+                target_discovery = getattr(backend, "discover_datasource_targets", None)
+                if target_discovery is not None:
+                    targets = await target_discovery(intent.keywords, intent)
+                    datasource_catalog.extend(targets)
+                    if targets and backend.name not in ds_types:
+                        ds_types.append(backend.name)
         timings["metrics_fetch"] = time.monotonic() - t0
         stage_log(
             "metrics_fetch",
@@ -152,6 +227,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             backends_queried=len(backends),
             datasource_types=ds_types,
             metrics_found=len(metric_catalog),
+            datasource_targets_found=len(datasource_catalog),
         )
 
         try:
@@ -164,11 +240,56 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         except Exception:
             logger.warning("history_record_discovery_failed", exc_info=True)
 
-        if not metric_catalog:
+        catalog_for_compile = metric_catalog or datasource_catalog
+
+        if not catalog_for_compile:
+            ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
+            ranked_ids = {arch.id for arch, _ in ranked_archetypes}
+            learned_archetypes = get_archetypes_by_learning_context(
+                intent,
+                metric_catalog,
+                min_confidence=0.35,
+                exclude_ids=ranked_ids,
+            )
+            if learned_archetypes:
+                ranked_archetypes.extend(learned_archetypes)
+                ranked_archetypes.sort(key=lambda item: item[1], reverse=True)
+            try:
+                history.record_intent(
+                    inv_id,
+                    summary=intent.summary,
+                    domain=intent.domain,
+                    services=intent.services,
+                    keywords=intent.keywords,
+                    signals=_history_signals(intent.signals, ranked_archetypes),
+                    problem_type=intent.problem_type,
+                    archetypes=_history_archetypes(intent.archetypes, ranked_archetypes, learned_archetypes),
+                    timerange=intent.timerange,
+                )
+            except Exception:
+                logger.warning("history_record_selected_archetypes_failed", exc_info=True)
+
+            unavailable = [
+                backend.name
+                for backend in backends
+                if not getattr(getattr(backend, "last_discovery_status", None), "available", True)
+            ]
+            if unavailable:
+                names = ", ".join(unavailable)
+                error = f"Datasource discovery failed for: {names}"
+                summary = (
+                    f"Could not connect to {names} during datasource discovery. "
+                    "Verify the backend is running and reachable, then retry."
+                )
+            else:
+                error = "No metrics or datasource targets found"
+                summary = (
+                    "No metrics found across any datasource. " "Verify your datasources are configured and have data."
+                )
             history.finish(
                 inv_id,
                 status="failed",
-                error="No metrics found",
+                error=error,
                 timings=timings,
                 total_time=time.monotonic() - t_start,
             )
@@ -176,18 +297,43 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 dashboard_url="",
                 dashboard_uid="",
                 panel_count=0,
-                summary="No metrics found across any datasource. "
-                "Verify your datasources are configured and have data.",
+                summary=summary,
             )
 
         # ── 4. Multi-label archetype matching ────────────────────
         t0 = time.monotonic()
         ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
+        ranked_ids = {arch.id for arch, _ in ranked_archetypes}
+        learned_archetypes = get_archetypes_by_learning_context(
+            intent,
+            metric_catalog,
+            min_confidence=0.35,
+            exclude_ids=ranked_ids,
+        )
+        if learned_archetypes:
+            ranked_archetypes.extend(learned_archetypes)
+            ranked_archetypes.sort(key=lambda item: item[1], reverse=True)
+
         # Fallback: try legacy single-label lookup
         if not ranked_archetypes:
             legacy = get_archetype(intent.problem_type)
             if legacy is not None:
                 ranked_archetypes = [(legacy, 0.9)]
+
+        try:
+            history.record_intent(
+                inv_id,
+                summary=intent.summary,
+                domain=intent.domain,
+                services=intent.services,
+                keywords=intent.keywords,
+                signals=_history_signals(intent.signals, ranked_archetypes),
+                problem_type=intent.problem_type,
+                archetypes=_history_archetypes(intent.archetypes, ranked_archetypes, learned_archetypes),
+                timerange=intent.timerange,
+            )
+        except Exception:
+            logger.warning("history_record_selected_archetypes_failed", exc_info=True)
 
         # Target query language comes from the primary backend
         target_language = primary.query_language
@@ -204,14 +350,14 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 dashboard_spec = blend_archetypes(
                     ranked_archetypes,
                     intent,
-                    metric_catalog,
+                    catalog_for_compile,
                     target_language=target_language,
                 )
             else:
                 dashboard_spec = compile_archetype(
                     primary_arch,
                     intent,
-                    metric_catalog,
+                    catalog_for_compile,
                     target_language=target_language,
                 )
             timings["archetype_compile"] = time.monotonic() - t0
@@ -221,12 +367,31 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 primary_archetype=primary_arch.id,
                 primary_confidence=primary_conf,
                 archetypes_matched=len(ranked_archetypes),
+                learned_archetypes_matched=len(learned_archetypes),
                 panels_generated=len(dashboard_spec.panels),
                 target_language=target_language,
                 signal_bindings_count=len(primary_arch.signal_bindings),
             )
         else:
             # ── FREEFORM PATH: LLM-driven discovery + query generation ─
+            if not metric_catalog:
+                history.finish(
+                    inv_id,
+                    status="failed",
+                    error="No metrics found for freeform generation",
+                    timings=timings,
+                    total_time=time.monotonic() - t_start,
+                )
+                return DashResponse(
+                    dashboard_url="",
+                    dashboard_uid="",
+                    panel_count=0,
+                    summary=(
+                        "Datasource metadata was available, but no metrics matched your query. "
+                        "Approve or teach a dashboard pattern for this service, or connect a "
+                        "datasource with matching series."
+                    ),
+                )
 
             # Pre-rank to reduce LLM token cost
             t_prerank = time.monotonic()

@@ -91,6 +91,61 @@ def test_learn_post_valid(client, temp_store, monkeypatch):
     assert resp.json()["status"] == "pending"
 
 
+def test_reject_ingested_dashboard_marks_status_without_mappings(client, temp_store):
+    temp_store.record_ingested_dashboard(
+        "reject-me",
+        backend_name="grafana",
+        metrics_found=["custom_errors_total"],
+        signals_inferred=[
+            {
+                "signal_type": "custom_errors",
+                "metric": "custom_errors_total",
+                "source": "heuristic",
+                "signal_family": "errors",
+                "score": 0.9,
+                "margin": 0.4,
+                "evidence": ["name contains error"],
+                "inference_version": "test",
+            }
+        ],
+        status="pending",
+    )
+
+    resp = client.post("/api/v1/learn/dashboards/reject-me/reject?backend=grafana")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "rejected"
+    assert temp_store.get_ingested_dashboard("reject-me", backend_name="grafana")["status"] == "rejected"
+    assert temp_store.get_mappings_for_signal("custom_errors", include_decayed=True) == []
+    rejected = temp_store.list_rejected_candidates()
+    assert len(rejected) == 1
+    assert rejected[0]["why_not"] == "dashboard_rejected"
+
+
+def test_ignore_ingested_dashboard_marks_status_quietly(client, temp_store):
+    temp_store.record_ingested_dashboard(
+        "ignore-me",
+        backend_name="grafana",
+        metrics_found=["custom_errors_total"],
+        signals_inferred=[
+            {
+                "signal_type": "custom_errors",
+                "metric": "custom_errors_total",
+                "source": "heuristic",
+                "signal_family": "errors",
+            }
+        ],
+        status="pending",
+    )
+
+    resp = client.post("/api/v1/learn/dashboards/ignore-me/ignore?backend=grafana")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ignored"
+    assert temp_store.get_ingested_dashboard("ignore-me", backend_name="grafana")["status"] == "ignored"
+    assert temp_store.list_rejected_candidates() == []
+
+
 def test_learn_dashboard_json_post_valid(client, temp_store, monkeypatch):
     monkeypatch.setattr(di, "get_signal_store", lambda: temp_store)
     temp_store.load_from_yaml()

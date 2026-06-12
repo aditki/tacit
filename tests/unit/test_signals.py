@@ -1005,6 +1005,40 @@ class TestIngestedDashboards:
         assert stored["archetype_generated"] == result["archetype_yaml"]
         assert "archetypes:" in stored["archetype_generated"]
 
+    @pytest.mark.asyncio
+    async def test_auto_approve_honors_heuristic_auto_teach_gate(self, signal_store, monkeypatch):
+        from dashforge import dashboard_ingest as di
+
+        features = DashboardFeatures(
+            dashboard_uid="memory-context",
+            dashboard_title="Memory Context",
+            backend_name="grafana_json",
+            query_language="promql",
+            metrics_found=["opaque_value"],
+            panel_count=3,
+            panel_titles=["Memory", "Memory", "Memory"],
+            panels=[
+                {
+                    "title": "Memory",
+                    "queries": ["opaque_value"],
+                    "metrics": ["opaque_value"],
+                    "unit": "bytes",
+                    "row": "Resources",
+                }
+                for _ in range(3)
+            ],
+        )
+        monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
+
+        result = await di.ingest_dashboard_features(features, auto_approve=True)
+
+        assert result["mappings_created"] == 0
+        rejected = signal_store.list_rejected_candidates()
+        assert len(rejected) == 1
+        assert rejected[0]["metric"] == "opaque_value"
+        assert rejected[0]["why_not"] == "low_score"
+        assert signal_store.get_mappings_for_signal(rejected[0]["signal_name"]) == []
+
     def test_dashboard_uid_is_scoped_by_backend(self, signal_store):
         signal_store.record_ingested_dashboard(
             "shared-dash",

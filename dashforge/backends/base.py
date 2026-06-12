@@ -22,6 +22,16 @@ class PublishResult:
 
 
 @dataclass
+class DiscoveryStatus:
+    """Last discovery attempt status for user-facing failure decisions."""
+
+    available: bool = True
+    error: str = ""
+    datasource_count: int = 0
+    searchable_datasource_count: int = 0
+
+
+@dataclass
 class DashboardFeatures:
     """Vendor-agnostic features extracted from an existing dashboard.
 
@@ -71,6 +81,18 @@ class DashboardBackend(Protocol):
         intent: Intent,
     ) -> list[MetricEntry]:
         """Find metrics relevant to the investigation."""
+        ...
+
+    async def discover_datasource_targets(
+        self,
+        keywords: list[str],
+        intent: Intent,
+    ) -> list[MetricEntry]:
+        """Return datasource identities usable for query compilation.
+
+        Implementations may return metric entries with an empty ``name`` when
+        datasource metadata is available but metric discovery found no series.
+        """
         ...
 
     async def validate_queries(

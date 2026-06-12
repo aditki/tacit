@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from dashforge.models.schemas import (
     ArchetypeMatch,
     DashboardSpec,
+    DatasourceInfo,
     Intent,
     MetricEntry,
     PanelQuery,
@@ -441,6 +442,58 @@ def test_grafana_backend_discover_no_datasources():
         assert result == []
 
     print("[PASS] test_grafana_backend_discover_no_datasources")
+
+
+def test_grafana_backend_datasource_targets_when_metrics_absent():
+    from dashforge.backends.grafana import GrafanaBackend
+
+    mock_client = AsyncMock()
+    backend = GrafanaBackend(client=mock_client)
+    prom_ds = DatasourceInfo(
+        uid="prom1",
+        name="Prometheus",
+        type="prometheus",
+    )
+
+    with (
+        patch("dashforge.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list,
+        patch("dashforge.backends.grafana.filter_datasources_by_signal") as mock_filter,
+        patch("dashforge.backends.grafana.filter_searchable_datasources") as mock_searchable,
+    ):
+        mock_list.return_value = [prom_ds]
+        mock_filter.return_value = [prom_ds]
+        mock_searchable.return_value = [prom_ds]
+
+        intent = _make_intent()
+        result = asyncio.run(backend.discover_datasource_targets(intent.keywords, intent))
+
+        assert len(result) == 1
+        assert result[0].name == ""
+        assert result[0].datasource_uid == "prom1"
+        assert result[0].datasource_type == "prometheus"
+        assert result[0].query_language == "promql"
+        assert backend.last_discovery_status.available is True
+        assert backend.last_discovery_status.searchable_datasource_count == 1
+
+    print("[PASS] test_grafana_backend_datasource_targets_when_metrics_absent")
+
+
+def test_grafana_backend_marks_connection_failure_unavailable():
+    from dashforge.backends.grafana import GrafanaBackend
+
+    mock_client = AsyncMock()
+    backend = GrafanaBackend(client=mock_client)
+
+    with patch("dashforge.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list:
+        mock_list.side_effect = RuntimeError("connection refused")
+        intent = _make_intent()
+        result = asyncio.run(backend.discover_metrics(intent.keywords, intent))
+
+        assert result == []
+        assert backend.last_discovery_status.available is False
+        assert "connection refused" in backend.last_discovery_status.error
+
+    print("[PASS] test_grafana_backend_marks_connection_failure_unavailable")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

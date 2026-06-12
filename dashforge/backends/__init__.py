@@ -6,10 +6,16 @@ over these instead of using vendor-specific if/else branches.
 
 from __future__ import annotations
 
-from dashforge.backends.base import DashboardBackend, DashboardFeatures, PublishResult
+from dashforge.backends.base import DashboardBackend, DashboardFeatures, DiscoveryStatus, PublishResult
 from dashforge.config import settings
 
-__all__ = ["DashboardBackend", "DashboardFeatures", "PublishResult", "get_active_backends"]
+__all__ = [
+    "DashboardBackend",
+    "DashboardFeatures",
+    "DiscoveryStatus",
+    "PublishResult",
+    "get_active_backends",
+]
 
 
 def get_active_backends() -> list[DashboardBackend]:
