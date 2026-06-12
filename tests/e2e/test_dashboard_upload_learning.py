@@ -70,9 +70,7 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
     assert {"errors", "latency", "saturation"} <= inferred_families
     assert inferred_families & {"traffic", "throughput"}
 
-    approve = client.post(
-        f"/api/v1/learn/dashboards/{scenario['dashboard']['uid']}/approve?backend=grafana_json"
-    )
+    approve = client.post(f"/api/v1/learn/dashboards/{scenario['dashboard']['uid']}/approve?backend=grafana_json")
     assert approve.status_code == 200, approve.text
     approved = approve.json()
     assert approved["status"] == "approved"
