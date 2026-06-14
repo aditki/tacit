@@ -1021,11 +1021,14 @@ class TestIngestedDashboards:
         pending = signal_store.search_learning_context("checkout latency", service="checkout")
         assert pending[0]["metric_name"] == "checkout_custom_latency_ms"
         assert pending[0]["review_state"] == "candidate"
-        assert signal_store.search_learning_context(
-            "checkout latency",
-            service="checkout",
-            include_candidates=False,
-        ) == []
+        assert (
+            signal_store.search_learning_context(
+                "checkout latency",
+                service="checkout",
+                include_candidates=False,
+            )
+            == []
+        )
 
         assert signal_store.approve_ingested_dashboard("checkout-dash", backend_name="grafana_json")
         approved = signal_store.search_learning_context(
@@ -1498,12 +1501,15 @@ archetypes:
             "checkout_custom_latency_ms",
             "checkout_5xx_count",
         }
-        assert signal_store.resolve_signals_for_archetype(
-            signal_bindings=signal_bindings,
-            catalog=catalog,
-            context_datasource_type="prometheus",
-            target_query_language="promql",
-        ) == {}
+        assert (
+            signal_store.resolve_signals_for_archetype(
+                signal_bindings=signal_bindings,
+                catalog=catalog,
+                context_datasource_type="prometheus",
+                target_query_language="promql",
+            )
+            == {}
+        )
 
         approved = await di.ingest_dashboard_features(features, auto_approve=True)
 

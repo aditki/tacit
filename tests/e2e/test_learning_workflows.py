@@ -42,7 +42,7 @@ def _checkout_dashboard_upload() -> dict:
                         "targets": [
                             {
                                 "expr": (
-                                    'histogram_quantile(0.95, '
+                                    "histogram_quantile(0.95, "
                                     'sum(rate(checkout_custom_latency_ms{service="checkout"}[5m])) by (le))'
                                 ),
                                 "datasource": {"type": "prometheus", "uid": "prom"},

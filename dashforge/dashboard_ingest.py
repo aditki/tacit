@@ -1010,9 +1010,9 @@ def build_signal_quality_report(
                 "confidence": sig.get("confidence", 0.0),
                 "source": sig.get("source", ""),
                 "review_state": (
-                    "trusted" if sig.get("source") == "taxonomy"
-                    else "eligible" if sig.get("auto_teach_eligible")
-                    else "review"
+                    "trusted"
+                    if sig.get("source") == "taxonomy"
+                    else "eligible" if sig.get("auto_teach_eligible") else "review"
                 ),
                 "reason": sig.get("reason", ""),
                 "evidence": sig.get("evidence", []),
