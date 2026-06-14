@@ -50,10 +50,10 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "integration: hermetic vendor contract test (mocked HTTP via respx). Run after unit.",
-    "e2e: hermetic end-to-end workflow tests across API/CLI/store boundaries.",
+    "e2e: end-to-end workflow tests. Opt in for upload/learning/pipeline quality gates.",
 ]
-# Default `pytest` runs unit only; integration is opt-in via path or -m integration.
-addopts = "-m 'not integration'"
+# Default `pytest` runs unit only; integration/e2e are opt-in via path or -m marker.
+addopts = "-m 'not integration and not e2e'"
 
 [tool.ruff]
 target-version = "py312"

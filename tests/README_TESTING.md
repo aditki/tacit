@@ -14,6 +14,7 @@ tests/
 ```bash
 uv run pytest tests/unit -q                         # unit only
 uv run pytest tests/integration -m integration -q   # integration (vendor contracts)
+uv run pytest tests/e2e -m e2e -q                   # upload-learning workflow E2E
 uv run pytest -m "not integration"                  # explicit non-integration filter
 ```
 
@@ -50,6 +51,10 @@ request-contract model (e.g. `GrafanaDashboardSaveCommand`,
 | Graphite | `metrics/find` | — |
 | InfluxDB | `SHOW MEASUREMENTS` | — |
 | DashForge API | `/healthz`, `/api/v1/signals` | `/signals/teach`, `/learn/dashboard` |
+
+## E2E Workflow Tests
+
+`tests/e2e` covers upload -> signal learning -> prompt -> dashboard-spec, manual signal teaching, reject/ignore-style learning control, empty telemetry outcomes, and the broader API surface: system, auth, archetypes, signals, chart generation, history, feedback, insights, and learning validation. These tests are opt-in via `-m e2e` and are intended for release gates or nightly runs where usefulness metrics matter as much as technical success.
 
 > The DashForge API contract test requires Python 3.12 (the app imports
 > `agents.llm`, which uses 3.12 generic syntax); it auto-skips on older runtimes.
