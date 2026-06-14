@@ -23,16 +23,19 @@ store's taxonomy, and optionally auto-generates an archetype YAML snippet.
 from __future__ import annotations
 
 import re
+import threading
 from collections import defaultdict
 from typing import Any
 
 import promql_parser
 import structlog
+import yaml
 
 from dashforge.config import settings
 from dashforge.signals import get_signal_store
 
 logger = structlog.get_logger()
+_ARCHETYPE_REGISTRATION_LOCK = threading.Lock()
 
 # ── PromQL metric name extraction ────────────────────────────────────────────
 # Matches metric names in PromQL: word chars that look like identifiers.
@@ -841,7 +844,8 @@ def register_generated_archetype_if_enabled(archetype_yaml: str, *, dashboard_ui
     from dashforge.archetypes.templates import append_archetype_to_yaml
 
     try:
-        written = append_archetype_to_yaml(archetype_yaml)
+        with _ARCHETYPE_REGISTRATION_LOCK:
+            written = append_archetype_to_yaml(archetype_yaml)
         registered = written is not None
         if not registered:
             logger.warning(
@@ -853,6 +857,47 @@ def register_generated_archetype_if_enabled(archetype_yaml: str, *, dashboard_ui
     except Exception:
         logger.exception("archetype_autoregister_failed", uid=dashboard_uid)
         return False
+
+
+def register_generated_archetypes_if_enabled(
+    archetype_yamls: list[str],
+    *,
+    dashboard_uid: str = "bulk",
+) -> bool:
+    """Auto-register multiple generated archetypes with one YAML write/reload."""
+    if not settings.learning_auto_register_archetype:
+        return False
+    items: list[dict[str, Any]] = []
+    for archetype_yaml in archetype_yamls:
+        doc = yaml.safe_load(archetype_yaml) or {}
+        for item in doc.get("archetypes", []) or []:
+            if isinstance(item, dict):
+                items.append(item)
+    if not items:
+        return False
+    return register_generated_archetype_if_enabled(
+        yaml.safe_dump({"archetypes": items}, sort_keys=False, width=120),
+        dashboard_uid=dashboard_uid,
+    )
+
+
+def _normalize_signal_records(signals: list[dict[str, Any]] | list[str]) -> list[dict[str, Any]]:
+    """Return signal records as dictionaries, preserving legacy string entries."""
+    normalized: list[dict[str, Any]] = []
+    for sig in signals:
+        if isinstance(sig, dict):
+            normalized.append(sig)
+        elif isinstance(sig, str):
+            normalized.append(
+                {
+                    "signal_type": sig,
+                    "metric": "",
+                    "confidence": 0.0,
+                    "source": "legacy",
+                    "reason": "Legacy ingested dashboard stored only the signal name.",
+                }
+            )
+    return normalized
 
 
 def approve_ingested_dashboard_record(
@@ -878,6 +923,7 @@ def approve_ingested_dashboard_record(
         }
 
     mappings_created = 0
+    activated_pairs: set[tuple[str, str]] = set()
     source_ref = f"{ingested['backend_name']}:{dashboard_uid}" if ingested.get("backend_name") else dashboard_uid
     for sig in ingested.get("signals_inferred", []):
         if isinstance(sig, dict):
@@ -889,6 +935,7 @@ def approve_ingested_dashboard_record(
                 backend_name=ingested.get("backend_name", ""),
             ):
                 mappings_created += 1
+                activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
         else:
             from dashforge.signals import _metric_matches_pattern
 
@@ -907,9 +954,16 @@ def approve_ingested_dashboard_record(
                             review_state="approved",
                         )
                         mappings_created += 1
+                        activated_pairs.add((metric, sig))
                         break
 
     store.approve_ingested_dashboard(dashboard_uid, backend_name=backend_name)
+    store.update_learning_context_review_state(
+        dashboard_uid,
+        "approved",
+        backend_name=backend_name,
+        activated_pairs=activated_pairs,
+    )
     archetype_registered = register_generated_archetype_if_enabled(
         ingested.get("archetype_generated", ""),
         dashboard_uid=dashboard_uid,
@@ -978,13 +1032,15 @@ def reject_ingested_dashboard_record(
 def build_signal_quality_report(
     *,
     metrics: list[str],
-    signals: list[dict[str, Any]],
+    signals: list[dict[str, Any]] | list[str],
 ) -> dict[str, Any]:
     """Summarize how conservatively DashForge understood an ingested dashboard."""
     metrics = list(dict.fromkeys(metrics))
+    signals = _normalize_signal_records(signals)
     mapped_metrics = sorted({sig.get("metric", "") for sig in signals if sig.get("metric")})
     taxonomy = [sig for sig in signals if sig.get("source") == "taxonomy"]
     heuristic = [sig for sig in signals if sig.get("source") == "heuristic"]
+    legacy = [sig for sig in signals if sig.get("source") == "legacy"]
     auto_teachable = [sig for sig in heuristic if sig.get("auto_teach_eligible")]
     held_for_review = [sig for sig in heuristic if not sig.get("auto_teach_eligible")]
 
@@ -1000,6 +1056,7 @@ def build_signal_quality_report(
         "metrics_unmapped": [metric for metric in metrics if metric not in mapped_metrics],
         "taxonomy_matches": len(taxonomy),
         "heuristic_candidates": len(heuristic),
+        "legacy_signals": len(legacy),
         "auto_teach_eligible": len(auto_teachable),
         "held_for_review": len(held_for_review),
         "confidence_buckets": confidence_buckets,
@@ -1026,10 +1083,11 @@ def build_signal_quality_report(
 def build_learning_impact_report(
     *,
     metrics: list[str],
-    signals: list[dict[str, Any]],
+    signals: list[dict[str, Any]] | list[str],
     approved: bool = False,
 ) -> dict[str, Any]:
     """Show what approval would change for future dashboard generation."""
+    signals = _normalize_signal_records(signals)
     taxonomy_metrics = sorted(
         {sig.get("metric", "") for sig in signals if sig.get("source") == "taxonomy" and sig.get("metric")}
     )
@@ -1093,6 +1151,7 @@ async def ingest_dashboard_features(
     features: Any,
     *,
     auto_approve: bool = False,
+    register_archetype: bool = True,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted dashboard features."""
     extracted = _features_to_dict(features)
@@ -1131,19 +1190,9 @@ async def ingest_dashboard_features(
         archetype_generated=archetype_yaml,
         status=status,
     )
-    indexed_context_rows = store.index_dashboard_context(
-        dashboard_uid=features.dashboard_uid,
-        backend_name=features.backend_name,
-        dashboard_title=features.dashboard_title,
-        dashboard_tags=features.dashboard_tags,
-        panels=features.panels,
-        metrics_found=features.metrics_found,
-        signals_inferred=signals,
-        status=status,
-    )
-
     mappings_created = 0
     archetype_registered = False
+    activated_pairs: set[tuple[str, str]] = set()
     if auto_approve:
         source_ref = (
             f"{features.backend_name}:{features.dashboard_uid}" if features.backend_name else features.dashboard_uid
@@ -1157,10 +1206,12 @@ async def ingest_dashboard_features(
                 backend_name=features.backend_name,
             ):
                 mappings_created += 1
-        archetype_registered = register_generated_archetype_if_enabled(
-            archetype_yaml,
-            dashboard_uid=features.dashboard_uid,
-        )
+                activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
+        if register_archetype:
+            archetype_registered = register_generated_archetype_if_enabled(
+                archetype_yaml,
+                dashboard_uid=features.dashboard_uid,
+            )
         logger.info(
             "dashboard_ingested_auto_approved",
             uid=features.dashboard_uid,
@@ -1178,6 +1229,18 @@ async def ingest_dashboard_features(
             metrics=len(features.metrics_found),
             signals=len(signals),
         )
+
+    indexed_context_rows = store.index_dashboard_context(
+        dashboard_uid=features.dashboard_uid,
+        backend_name=features.backend_name,
+        dashboard_title=features.dashboard_title,
+        dashboard_tags=features.dashboard_tags,
+        panels=features.panels,
+        metrics_found=features.metrics_found,
+        signals_inferred=signals,
+        status=status,
+        activated_pairs=activated_pairs if auto_approve else None,
+    )
 
     result = {
         "dashboard_uid": features.dashboard_uid,
@@ -1210,6 +1273,7 @@ async def ingest_dashboard(
     backend: Any | None = None,
     backend_name: str = "",
     auto_approve: bool = False,
+    register_archetype: bool = True,
 ) -> dict[str, Any]:
     """Full ingestion pipeline: fetch → extract → infer signals → store.
 
@@ -1265,7 +1329,11 @@ async def ingest_dashboard(
         # Delegate fetch + parse to the backend (vendor-specific)
         features: DashboardFeatures = await backend.ingest_dashboard(dashboard_uid)
 
-        return await ingest_dashboard_features(features, auto_approve=auto_approve)
+        return await ingest_dashboard_features(
+            features,
+            auto_approve=auto_approve,
+            register_archetype=register_archetype,
+        )
 
     finally:
         if own_backends:
@@ -1320,6 +1388,7 @@ async def learn_backend_dashboards(
                         uid,
                         backend=backend,
                         auto_approve=auto_approve,
+                        register_archetype=not auto_approve,
                     )
                 return (
                     {
@@ -1331,6 +1400,7 @@ async def learn_backend_dashboards(
                         "indexed_context_rows": result.get("indexed_context_rows", 0),
                         "mappings_created": result.get("mappings_created", 0),
                         "archetype_registered": result.get("archetype_registered", False),
+                        "archetype_yaml": result.get("archetype_yaml", ""),
                     },
                     None,
                 )
@@ -1349,6 +1419,24 @@ async def learn_backend_dashboards(
             if failure is not None:
                 failures.append(failure)
                 totals["dashboards_failed"] += 1
+
+        if auto_approve:
+            archetype_yamls = [
+                str(item.get("archetype_yaml", ""))
+                for item in learned
+                if item.get("archetype_yaml")
+            ]
+            archetype_registered = register_generated_archetypes_if_enabled(
+                archetype_yamls,
+                dashboard_uid=f"{backend_name}:bulk",
+            )
+            if archetype_registered:
+                for item in learned:
+                    if item.get("archetype_yaml"):
+                        item["archetype_registered"] = True
+            totals["archetypes_registered"] = len(archetype_yamls) if archetype_registered else 0
+        else:
+            totals["archetypes_registered"] = 0
 
         return {
             "backend": backend_name,

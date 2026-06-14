@@ -97,11 +97,15 @@ class SignalFxBackend:
         groups = data.get("results", []) if isinstance(data, dict) else data
         out: list[dict] = []
         for group in groups if isinstance(groups, list) else []:
-            dashboards = group.get("dashboards", []) if isinstance(group, dict) else []
+            if not isinstance(group, dict):
+                continue
+            dashboards = group.get("dashboardConfigs") or group.get("dashboards", [])
             for dashboard in dashboards if isinstance(dashboards, list) else []:
                 if isinstance(dashboard, dict):
-                    uid = dashboard.get("id", "") or dashboard.get("dashboardId", "")
-                    title = dashboard.get("name", "") or dashboard.get("title", "")
+                    uid = dashboard.get("dashboardId", "") or dashboard.get("id", "")
+                    title = (
+                        dashboard.get("name", "") or dashboard.get("dashboardName", "") or dashboard.get("title", "")
+                    )
                 else:
                     uid = str(dashboard)
                     title = ""

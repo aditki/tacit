@@ -987,6 +987,7 @@ class TestIngestedDashboards:
                     "metric": "checkout_custom_latency_ms",
                     "source": "heuristic",
                     "confidence": 0.88,
+                    "auto_teach_eligible": True,
                     "reason": "Panel title and metric name indicate checkout latency",
                 }
             ],
@@ -1011,6 +1012,7 @@ class TestIngestedDashboards:
                     "metric": "checkout_custom_latency_ms",
                     "source": "heuristic",
                     "confidence": 0.88,
+                    "auto_teach_eligible": True,
                     "reason": "Panel title and metric name indicate checkout latency",
                 }
             ],
@@ -1030,7 +1032,11 @@ class TestIngestedDashboards:
             == []
         )
 
-        assert signal_store.approve_ingested_dashboard("checkout-dash", backend_name="grafana_json")
+        approve_ingested_dashboard_record(
+            dashboard_uid="checkout-dash",
+            backend_name="grafana_json",
+            store=signal_store,
+        )
         approved = signal_store.search_learning_context(
             "checkout latency",
             service="checkout",
@@ -1061,6 +1067,7 @@ class TestIngestedDashboards:
                     "metric": "checkout_5xx_count",
                     "source": "heuristic",
                     "confidence": 0.91,
+                    "auto_teach_eligible": True,
                     "reason": "5xx metric indicates errors",
                 }
             ],
@@ -1212,6 +1219,51 @@ class TestIngestedDashboards:
         assert archetype_path.exists()
         assert "checkout_autoreg" in archetype_path.read_text()
 
+    @pytest.mark.asyncio
+    async def test_auto_approve_keeps_held_candidates_out_of_approved_context(self, signal_store, monkeypatch):
+        from dashforge import dashboard_ingest as di
+
+        monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
+        features = DashboardFeatures(
+            dashboard_uid="held-autoapprove",
+            dashboard_title="Held Autoapprove",
+            backend_name="grafana_json",
+            query_language="promql",
+            metrics_found=["opaque_value"],
+            panel_count=1,
+            panel_titles=["Opaque"],
+            panels=[
+                {
+                    "title": "Opaque",
+                    "queries": ['opaque_value{service="checkout"}'],
+                    "metrics": ["opaque_value"],
+                }
+            ],
+        )
+
+        monkeypatch.setattr(
+            di,
+            "infer_signals_from_metrics",
+            lambda *_args, **_kwargs: [
+                {
+                    "signal_type": "supporting_evidence",
+                    "metric": "opaque_value",
+                    "source": "heuristic",
+                    "signal_family": "unknown",
+                    "confidence": 0.2,
+                    "auto_teach_eligible": False,
+                    "why_not_auto_taught": "low_score",
+                }
+            ],
+        )
+
+        result = await di.ingest_dashboard_features(features, auto_approve=True)
+
+        assert result["mappings_created"] == 0
+        assert signal_store.search_learning_context("opaque", service="checkout", include_candidates=False) == []
+        candidate = signal_store.search_learning_context("opaque", service="checkout")
+        assert candidate[0]["review_state"] == "candidate"
+
     def test_manual_approval_registers_generated_archetype(self, signal_store, monkeypatch, tmp_path):
         from dashforge import dashboard_ingest as di
 
@@ -1253,6 +1305,75 @@ archetypes:
         assert result["status"] == "approved"
         assert result["archetype_registered"] is True
         assert "checkout_manual" in archetype_path.read_text()
+
+    def test_manual_approval_keeps_held_candidates_out_of_approved_context(self, signal_store):
+        if not signal_store._learning_index_available():
+            pytest.skip("SQLite FTS5 is not available")
+
+        signals = [
+            {
+                "signal_type": "request_latency",
+                "metric": "checkout_custom_latency_ms",
+                "source": "heuristic",
+                "signal_family": "latency",
+                "confidence": 0.9,
+                "auto_teach_eligible": True,
+            },
+            {
+                "signal_type": "supporting_evidence",
+                "metric": "opaque_value",
+                "source": "heuristic",
+                "signal_family": "unknown",
+                "confidence": 0.2,
+                "auto_teach_eligible": False,
+                "why_not_auto_taught": "low_score",
+            },
+        ]
+        signal_store.record_ingested_dashboard(
+            "held-manual",
+            backend_name="grafana_json",
+            metrics_found=["checkout_custom_latency_ms", "opaque_value"],
+            signals_inferred=signals,
+            status="pending",
+        )
+        signal_store.index_dashboard_context(
+            dashboard_uid="held-manual",
+            backend_name="grafana_json",
+            dashboard_title="Held Manual",
+            dashboard_tags=["service:checkout"],
+            panels=[
+                {
+                    "title": "Checkout latency",
+                    "queries": ['checkout_custom_latency_ms{service="checkout"}'],
+                    "metrics": ["checkout_custom_latency_ms"],
+                },
+                {
+                    "title": "Opaque",
+                    "queries": ['opaque_value{service="checkout"}'],
+                    "metrics": ["opaque_value"],
+                },
+            ],
+            metrics_found=["checkout_custom_latency_ms", "opaque_value"],
+            signals_inferred=signals,
+            status="pending",
+        )
+
+        result = approve_ingested_dashboard_record(
+            dashboard_uid="held-manual",
+            backend_name="grafana_json",
+            store=signal_store,
+        )
+
+        assert result["mappings_created"] == 1
+        approved = signal_store.search_learning_context(
+            "checkout latency",
+            service="checkout",
+            include_candidates=False,
+        )
+        assert approved[0]["metric_name"] == "checkout_custom_latency_ms"
+        assert signal_store.search_learning_context("opaque", service="checkout", include_candidates=False) == []
+        candidate = signal_store.search_learning_context("opaque", service="checkout")
+        assert candidate[0]["review_state"] == "candidate"
 
     def test_reject_record_persists_negative_training_data(self, signal_store):
         signal_store.record_ingested_dashboard(
@@ -1366,6 +1487,22 @@ archetypes:
         assert report["explanations"][0]["review_state"] == "trusted"
         assert report["explanations"][1]["review_state"] == "eligible"
         assert report["explanations"][2]["why_not_auto_taught"] == "low_score"
+
+    def test_signal_reports_tolerate_legacy_string_signals(self):
+        quality = build_signal_quality_report(
+            metrics=["legacy_metric_total"],
+            signals=["request_rate", "error_rate"],
+        )
+        impact = build_learning_impact_report(
+            metrics=["legacy_metric_total"],
+            signals=["request_rate", "error_rate"],
+        )
+
+        assert quality["legacy_signals"] == 2
+        assert quality["metrics_mapped"] == 0
+        assert quality["explanations"][0]["signal_type"] == "request_rate"
+        assert quality["explanations"][0]["source"] == "legacy"
+        assert impact["unresolved_metrics"] == ["legacy_metric_total"]
 
     def test_learning_impact_report_shows_before_after_mapping_gain(self):
         signals = [
@@ -1525,6 +1662,62 @@ archetypes:
             "http_request_duration_seconds": "checkout_custom_latency_ms",
             "http_requests_total": "checkout_5xx_count",
         }
+
+    @pytest.mark.asyncio
+    async def test_bulk_auto_approve_registers_archetypes_once(self, signal_store, monkeypatch):
+        import dashforge.backends as backends_mod
+        from dashforge import dashboard_ingest as di
+
+        class FakeBackend:
+            name = "grafana"
+
+            async def list_dashboards(self, limit=500):
+                return [
+                    {"uid": "checkout-a", "title": "Checkout A"},
+                    {"uid": "checkout-b", "title": "Checkout B"},
+                ]
+
+            async def ingest_dashboard(self, uid):
+                return DashboardFeatures(
+                    dashboard_uid=uid,
+                    dashboard_title=uid.replace("-", " ").title(),
+                    backend_name="grafana",
+                    query_language="promql",
+                    metrics_found=[f"{uid.replace('-', '_')}_latency_ms"],
+                    panel_count=1,
+                    panel_titles=["Latency"],
+                    panels=[
+                        {
+                            "title": "Latency",
+                            "queries": [f"{uid.replace('-', '_')}_latency_ms"],
+                            "metrics": [f"{uid.replace('-', '_')}_latency_ms"],
+                        }
+                    ],
+                )
+
+            async def close(self):
+                return None
+
+        calls = []
+
+        def fake_register(archetype_yaml, *, dashboard_uid=""):
+            calls.append((dashboard_uid, archetype_yaml))
+            return True
+
+        monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
+        monkeypatch.setattr(di.settings, "learning_auto_register_archetype", True)
+        monkeypatch.setattr(backends_mod, "get_active_backends", lambda: [FakeBackend()])
+        monkeypatch.setattr(di, "register_generated_archetype_if_enabled", fake_register)
+
+        result = await di.learn_backend_dashboards("grafana", auto_approve=True)
+
+        assert result["dashboards_learned"] == 2
+        assert result["archetypes_registered"] == 2
+        assert len(calls) == 1
+        assert calls[0][0] == "grafana:bulk"
+        assert "checkout_a" in calls[0][1]
+        assert "checkout_b" in calls[0][1]
+        assert all(item["archetype_registered"] for item in result["learned"])
 
     def test_dashboard_uid_is_scoped_by_backend(self, signal_store):
         signal_store.record_ingested_dashboard(

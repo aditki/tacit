@@ -874,6 +874,7 @@ class SignalStore:
         metrics_found: list[str] | None = None,
         signals_inferred: list[dict[str, Any]] | list[str] | None = None,
         status: str = "pending",
+        activated_pairs: set[tuple[str, str]] | None = None,
     ) -> int:
         """Index learned dashboard context for fast operational-language retrieval.
 
@@ -894,7 +895,6 @@ class SignalStore:
             if metric:
                 signal_by_metric.setdefault(metric, []).append(sig)
 
-        review_state = "approved" if status == "approved" else "candidate"
         rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str, str, str, str, float]] = []
         indexed_at = time.time()
         panel_items = panels or []
@@ -925,6 +925,13 @@ class SignalStore:
                     )
                     service_text = " ".join(services)
                     signal_type = str(sig.get("signal_type", ""))
+                    review_state = _learning_row_review_state(
+                        status=status,
+                        metric=metric,
+                        signal_type=signal_type,
+                        sig=sig,
+                        activated_pairs=activated_pairs,
+                    )
                     reason = str(sig.get("reason", ""))
                     provenance = " ".join(
                         part
@@ -980,6 +987,7 @@ class SignalStore:
         dashboard_uid: str,
         review_state: str,
         backend_name: str | None = None,
+        activated_pairs: set[tuple[str, str]] | None = None,
     ) -> int:
         """Reflect dashboard approval/rejection in the retrieval index."""
         if not self._learning_index_available():
@@ -987,6 +995,35 @@ class SignalStore:
         backend = backend_name if backend_name is not None else ""
         with self._conn() as conn:
             try:
+                if review_state == "approved" and activated_pairs is not None:
+                    if backend_name is None:
+                        cursor = conn.execute(
+                            "UPDATE learning_context_fts SET review_state = 'candidate' WHERE dashboard_uid = ?",
+                            (dashboard_uid,),
+                        )
+                    else:
+                        cursor = conn.execute(
+                            """UPDATE learning_context_fts SET review_state = 'candidate'
+                               WHERE dashboard_uid = ? AND backend_name = ?""",
+                            (dashboard_uid, backend),
+                        )
+                    rows_updated = cursor.rowcount
+                    for metric, signal_type in activated_pairs:
+                        if backend_name is None:
+                            cursor = conn.execute(
+                                """UPDATE learning_context_fts SET review_state = 'approved'
+                                   WHERE dashboard_uid = ? AND metric_name = ? AND signal_type = ?""",
+                                (dashboard_uid, metric, signal_type),
+                            )
+                        else:
+                            cursor = conn.execute(
+                                """UPDATE learning_context_fts SET review_state = 'approved'
+                                   WHERE dashboard_uid = ? AND backend_name = ?
+                                     AND metric_name = ? AND signal_type = ?""",
+                                (dashboard_uid, backend, metric, signal_type),
+                            )
+                        rows_updated += cursor.rowcount
+                    return rows_updated
                 if backend_name is None:
                     cursor = conn.execute(
                         "UPDATE learning_context_fts SET review_state = ? WHERE dashboard_uid = ?",
@@ -1192,8 +1229,8 @@ class SignalStore:
             )
             changed = cursor.rowcount > 0
         if changed:
-            review_state = "approved" if status == "approved" else status
-            self.update_learning_context_review_state(dashboard_uid, review_state, backend_name)
+            if status != "approved":
+                self.update_learning_context_review_state(dashboard_uid, status, backend_name)
         return changed
 
     def approve_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> bool:
@@ -1333,6 +1370,27 @@ def _fts_query(text: str) -> str:
         escaped = token.replace('"', '""')
         terms.append(f'"{escaped}"')
     return " OR ".join(dict.fromkeys(terms))
+
+
+def _learning_row_review_state(
+    *,
+    status: str,
+    metric: str,
+    signal_type: str,
+    sig: dict[str, Any],
+    activated_pairs: set[tuple[str, str]] | None = None,
+) -> str:
+    if status in {"rejected", "ignored"}:
+        return status
+    if status != "approved":
+        return "candidate"
+    if activated_pairs is not None:
+        return "approved" if (metric, signal_type) in activated_pairs else "candidate"
+    if not metric or not signal_type:
+        return "candidate"
+    if sig.get("source") == "heuristic":
+        return "approved" if sig.get("auto_teach_eligible") else "candidate"
+    return "trusted" if sig.get("confidence", 0.0) >= 0.5 else "candidate"
 
 
 def _deserialize_mapping(row: sqlite3.Row) -> dict[str, Any]:

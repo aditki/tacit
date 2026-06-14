@@ -195,6 +195,24 @@ def test_learn_dashboard_json_post_valid(client, temp_store, monkeypatch):
     assert "learning_impact" in dashboard
 
 
+def test_list_ingested_dashboards_handles_legacy_string_signals(client, temp_store):
+    temp_store.record_ingested_dashboard(
+        "legacy-signals",
+        backend_name="grafana",
+        metrics_found=["legacy_metric_total"],
+        signals_inferred=["request_rate", "error_rate"],
+        status="pending",
+    )
+
+    resp = client.get("/api/v1/learn/dashboards")
+
+    assert resp.status_code == 200
+    dashboard = resp.json()["dashboards"][0]
+    assert dashboard["signals_inferred"] == ["request_rate", "error_rate"]
+    assert dashboard["signal_quality"]["legacy_signals"] == 2
+    assert dashboard["learning_impact"]["unresolved_metrics"] == ["legacy_metric_total"]
+
+
 def test_learning_search_and_service_summary(client, temp_store):
     if not temp_store._learning_index_available():
         pytest.skip("SQLite FTS5 is not available")
@@ -218,6 +236,7 @@ def test_learning_search_and_service_summary(client, temp_store):
                 "metric": "checkout_custom_latency_ms",
                 "source": "heuristic",
                 "confidence": 0.87,
+                "auto_teach_eligible": True,
                 "reason": "Panel title and metric name indicate latency",
             }
         ],

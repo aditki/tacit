@@ -886,6 +886,7 @@ def _print_bulk_learning_summary(result: dict):
     _info(f"Indexed context rows: {result.get('indexed_context_rows', 0)}")
     if result.get("auto_approve"):
         _info(f"Mappings created: {result.get('mappings_created', 0)}")
+        _info(f"Archetypes registered: {result.get('archetypes_registered', 0)}")
 
     learned = result.get("learned", [])
     if learned:
