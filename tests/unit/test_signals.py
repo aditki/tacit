@@ -16,11 +16,15 @@ import pytest
 from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from dashforge.backends.base import DashboardFeatures
 from dashforge.dashboard_ingest import (
+    approve_ingested_dashboard_record,
+    build_learning_impact_report,
+    build_signal_quality_report,
     extract_aggregation_patterns,
     extract_metrics_from_promql,
     generate_archetype_yaml,
     infer_signals_from_metrics,
     parse_dashboard_json,
+    reject_ingested_dashboard_record,
 )
 from dashforge.dashboard_uploads import parse_uploaded_dashboard
 from dashforge.models.schemas import MetricEntry
@@ -966,6 +970,174 @@ class TestIngestedDashboards:
         assert result["panel_count"] == 3
         assert result["status"] == "pending"
 
+    def test_learning_context_index_respects_review_state(self, signal_store):
+        if not signal_store._learning_index_available():
+            pytest.skip("SQLite FTS5 is not available")
+
+        signal_store.record_ingested_dashboard(
+            "checkout-dash",
+            backend_name="grafana_json",
+            dashboard_title="Checkout Service Health",
+            dashboard_tags=["service:checkout"],
+            metrics_found=["checkout_custom_latency_ms"],
+            panel_count=1,
+            signals_inferred=[
+                {
+                    "signal_type": "request_latency",
+                    "metric": "checkout_custom_latency_ms",
+                    "source": "heuristic",
+                    "confidence": 0.88,
+                    "reason": "Panel title and metric name indicate checkout latency",
+                }
+            ],
+            status="pending",
+        )
+        indexed = signal_store.index_dashboard_context(
+            dashboard_uid="checkout-dash",
+            backend_name="grafana_json",
+            dashboard_title="Checkout Service Health",
+            dashboard_tags=["service:checkout"],
+            panels=[
+                {
+                    "title": "Checkout p95 latency",
+                    "queries": ['histogram_quantile(0.95, checkout_custom_latency_ms{service="checkout"})'],
+                    "metrics": ["checkout_custom_latency_ms"],
+                }
+            ],
+            metrics_found=["checkout_custom_latency_ms"],
+            signals_inferred=[
+                {
+                    "signal_type": "request_latency",
+                    "metric": "checkout_custom_latency_ms",
+                    "source": "heuristic",
+                    "confidence": 0.88,
+                    "reason": "Panel title and metric name indicate checkout latency",
+                }
+            ],
+            status="pending",
+        )
+
+        assert indexed == 1
+        pending = signal_store.search_learning_context("checkout latency", service="checkout")
+        assert pending[0]["metric_name"] == "checkout_custom_latency_ms"
+        assert pending[0]["review_state"] == "candidate"
+        assert signal_store.search_learning_context(
+            "checkout latency",
+            service="checkout",
+            include_candidates=False,
+        ) == []
+
+        assert signal_store.approve_ingested_dashboard("checkout-dash", backend_name="grafana_json")
+        approved = signal_store.search_learning_context(
+            "checkout latency",
+            service="checkout",
+            include_candidates=False,
+        )
+        assert approved[0]["review_state"] == "approved"
+
+    def test_describe_service_summarizes_learned_context(self, signal_store):
+        if not signal_store._learning_index_available():
+            pytest.skip("SQLite FTS5 is not available")
+
+        signal_store.index_dashboard_context(
+            dashboard_uid="checkout-dash",
+            backend_name="grafana_json",
+            dashboard_title="Checkout Service Health",
+            dashboard_tags=["service:checkout"],
+            panels=[
+                {
+                    "title": "Checkout errors",
+                    "queries": ['sum(rate(checkout_5xx_count{service="checkout"}[5m]))'],
+                    "metrics": ["checkout_5xx_count"],
+                }
+            ],
+            metrics_found=["checkout_5xx_count"],
+            signals_inferred=[
+                {
+                    "signal_type": "error_rate",
+                    "metric": "checkout_5xx_count",
+                    "source": "heuristic",
+                    "confidence": 0.91,
+                    "reason": "5xx metric indicates errors",
+                }
+            ],
+            status="approved",
+        )
+
+        summary = signal_store.describe_service("checkout", include_candidates=False)
+
+        assert summary["service"] == "checkout"
+        assert summary["trusted_context_rows"] == 1
+        assert summary["candidate_context_rows"] == 0
+        assert summary["dashboards"][0]["dashboard_title"] == "Checkout Service Health"
+        assert summary["top_metrics"][0]["metric"] == "checkout_5xx_count"
+        assert summary["signals"] == {"error_rate": 1}
+
+    def test_rejected_and_ignored_context_are_excluded_from_default_search(self, signal_store):
+        if not signal_store._learning_index_available():
+            pytest.skip("SQLite FTS5 is not available")
+
+        for uid, status in (("rejected-dash", "rejected"), ("ignored-dash", "ignored")):
+            signal_store.index_dashboard_context(
+                dashboard_uid=uid,
+                backend_name="grafana_json",
+                dashboard_title="Checkout Service Health",
+                dashboard_tags=["service:checkout"],
+                panels=[
+                    {
+                        "title": "Checkout latency",
+                        "queries": ['checkout_custom_latency_ms{service="checkout"}'],
+                        "metrics": ["checkout_custom_latency_ms"],
+                    }
+                ],
+                metrics_found=["checkout_custom_latency_ms"],
+                signals_inferred=[
+                    {
+                        "signal_type": "request_latency",
+                        "metric": "checkout_custom_latency_ms",
+                        "source": "heuristic",
+                        "confidence": 0.88,
+                    }
+                ],
+                status="pending",
+            )
+            signal_store.update_learning_context_review_state(uid, status, backend_name="grafana_json")
+
+        assert signal_store.search_learning_context("checkout latency", service="checkout") == []
+
+    def test_describe_service_does_not_fallback_to_other_services(self, signal_store):
+        if not signal_store._learning_index_available():
+            pytest.skip("SQLite FTS5 is not available")
+
+        signal_store.index_dashboard_context(
+            dashboard_uid="payments-dash",
+            backend_name="grafana_json",
+            dashboard_title="Payments Service Health",
+            dashboard_tags=["service:payments"],
+            panels=[
+                {
+                    "title": "Checkout-adjacent payment latency",
+                    "queries": ['payment_latency_ms{service="payments"}'],
+                    "metrics": ["payment_latency_ms"],
+                }
+            ],
+            metrics_found=["payment_latency_ms"],
+            signals_inferred=[
+                {
+                    "signal_type": "request_latency",
+                    "metric": "payment_latency_ms",
+                    "source": "heuristic",
+                    "confidence": 0.88,
+                }
+            ],
+            status="approved",
+        )
+
+        summary = signal_store.describe_service("checkout", include_candidates=False)
+
+        assert summary["matched_context_rows"] == 0
+        assert summary["top_metrics"] == []
+
     @pytest.mark.asyncio
     async def test_ingest_dashboard_persists_generated_archetype(self, signal_store, monkeypatch):
         from dashforge import dashboard_ingest as di
@@ -1006,6 +1178,113 @@ class TestIngestedDashboards:
         assert "archetypes:" in stored["archetype_generated"]
 
     @pytest.mark.asyncio
+    async def test_auto_approve_registers_generated_archetype(self, signal_store, monkeypatch, tmp_path):
+        from dashforge import dashboard_ingest as di
+
+        monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
+        monkeypatch.setattr(di.settings, "learning_auto_register_archetype", True)
+        archetype_path = tmp_path / "learned_archetypes.yaml"
+        monkeypatch.setenv("DASHFORGE_ARCHETYPES_PATH", str(archetype_path))
+
+        features = DashboardFeatures(
+            dashboard_uid="checkout-autoreg",
+            dashboard_title="Checkout Autoreg",
+            backend_name="grafana_json",
+            query_language="promql",
+            metrics_found=["checkout_custom_latency_ms"],
+            panel_count=1,
+            panel_titles=["Checkout Latency"],
+            panels=[
+                {
+                    "title": "Checkout Latency",
+                    "queries": ["checkout_custom_latency_ms"],
+                    "metrics": ["checkout_custom_latency_ms"],
+                }
+            ],
+        )
+
+        result = await di.ingest_dashboard_features(features, auto_approve=True)
+
+        assert result["archetype_registered"] is True
+        assert archetype_path.exists()
+        assert "checkout_autoreg" in archetype_path.read_text()
+
+    def test_manual_approval_registers_generated_archetype(self, signal_store, monkeypatch, tmp_path):
+        from dashforge import dashboard_ingest as di
+
+        monkeypatch.setattr(di.settings, "learning_auto_register_archetype", True)
+        archetype_path = tmp_path / "learned_archetypes.yaml"
+        monkeypatch.setenv("DASHFORGE_ARCHETYPES_PATH", str(archetype_path))
+
+        signal_store.record_ingested_dashboard(
+            "checkout-manual",
+            backend_name="grafana_json",
+            metrics_found=["checkout_5xx_count"],
+            signals_inferred=[
+                {
+                    "signal_type": "error_rate",
+                    "metric": "checkout_5xx_count",
+                    "source": "heuristic",
+                    "confidence": 0.9,
+                    "auto_teach_eligible": True,
+                }
+            ],
+            archetype_generated="""
+archetypes:
+  - id: checkout_manual
+    name: Checkout Manual
+    problem_types: [checkout_manual]
+    signals: [metrics]
+    default_timerange: 1h
+    panels: []
+""",
+            status="pending",
+        )
+
+        result = approve_ingested_dashboard_record(
+            dashboard_uid="checkout-manual",
+            backend_name="grafana_json",
+            store=signal_store,
+        )
+
+        assert result["status"] == "approved"
+        assert result["archetype_registered"] is True
+        assert "checkout_manual" in archetype_path.read_text()
+
+    def test_reject_record_persists_negative_training_data(self, signal_store):
+        signal_store.record_ingested_dashboard(
+            "checkout-reject",
+            backend_name="grafana_json",
+            metrics_found=["checkout_5xx_count"],
+            signals_inferred=[
+                {
+                    "signal_type": "error_rate",
+                    "metric": "checkout_5xx_count",
+                    "source": "heuristic",
+                    "signal_family": "errors",
+                    "score": 0.91,
+                    "margin": 0.5,
+                    "evidence": ["name contains 5xx"],
+                    "inference_version": "test",
+                }
+            ],
+            status="pending",
+        )
+
+        result = reject_ingested_dashboard_record(
+            dashboard_uid="checkout-reject",
+            backend_name="grafana_json",
+            store=signal_store,
+        )
+
+        assert result["status"] == "rejected"
+        assert result["rejected_candidates"] == 1
+        rejected = signal_store.list_rejected_candidates()
+        assert rejected[0]["metric"] == "checkout_5xx_count"
+        assert rejected[0]["why_not"] == "dashboard_rejected"
+        assert rejected[0]["dashboard_uid"] == "checkout-reject"
+
+    @pytest.mark.asyncio
     async def test_auto_approve_honors_heuristic_auto_teach_gate(self, signal_store, monkeypatch):
         from dashforge import dashboard_ingest as di
 
@@ -1038,6 +1317,208 @@ class TestIngestedDashboards:
         assert rejected[0]["metric"] == "opaque_value"
         assert rejected[0]["why_not"] == "low_score"
         assert signal_store.get_mappings_for_signal(rejected[0]["signal_name"]) == []
+
+    def test_signal_quality_report_explains_inference_decisions(self):
+        signals = [
+            {
+                "signal_type": "request_latency",
+                "metric": "http_request_duration_seconds",
+                "confidence": 0.95,
+                "source": "taxonomy",
+                "reason": "matches taught pattern",
+                "evidence": ["matches taught pattern"],
+            },
+            {
+                "signal_type": "cache_saturation",
+                "metric": "redis_evictions_total",
+                "confidence": 0.74,
+                "source": "heuristic",
+                "reason": "metric contains eviction",
+                "evidence": ["name suggests cache pressure"],
+                "auto_teach_eligible": True,
+            },
+            {
+                "signal_type": "supporting_evidence",
+                "metric": "opaque_value",
+                "confidence": 0.2,
+                "source": "heuristic",
+                "reason": "weak single source",
+                "evidence": ["panel title only"],
+                "auto_teach_eligible": False,
+                "why_not_auto_taught": "low_score",
+            },
+        ]
+
+        report = build_signal_quality_report(
+            metrics=["http_request_duration_seconds", "redis_evictions_total", "opaque_value", "unmapped_metric"],
+            signals=signals,
+        )
+
+        assert report["metrics_total"] == 4
+        assert report["metrics_mapped"] == 3
+        assert report["metrics_unmapped"] == ["unmapped_metric"]
+        assert report["taxonomy_matches"] == 1
+        assert report["auto_teach_eligible"] == 1
+        assert report["held_for_review"] == 1
+        assert report["explanations"][0]["review_state"] == "trusted"
+        assert report["explanations"][1]["review_state"] == "eligible"
+        assert report["explanations"][2]["why_not_auto_taught"] == "low_score"
+
+    def test_learning_impact_report_shows_before_after_mapping_gain(self):
+        signals = [
+            {
+                "signal_type": "request_latency",
+                "metric": "http_request_duration_seconds",
+                "confidence": 0.95,
+                "source": "taxonomy",
+                "reason": "matches taught pattern",
+            },
+            {
+                "signal_type": "cache_saturation",
+                "metric": "redis_evictions_total",
+                "confidence": 0.74,
+                "source": "heuristic",
+                "reason": "metric contains eviction",
+                "auto_teach_eligible": True,
+            },
+            {
+                "signal_type": "supporting_evidence",
+                "metric": "opaque_value",
+                "confidence": 0.2,
+                "source": "heuristic",
+                "reason": "weak single source",
+                "auto_teach_eligible": False,
+            },
+        ]
+
+        report = build_learning_impact_report(
+            metrics=["http_request_duration_seconds", "redis_evictions_total", "opaque_value"],
+            signals=signals,
+        )
+
+        assert report["recognized_metrics_before_learning"] == 1
+        assert report["recognized_metrics_after_approval"] == 2
+        assert report["active_mappings_before_learning"] == 1
+        assert report["candidate_mappings_pending_approval"] == 1
+        assert report["new_active_mappings_after_approval"] == 0
+        assert report["new_mappings_available"] == 1
+        assert report["newly_understood_metrics"][0]["mapping_state"] == "candidate"
+        assert report["newly_active_metrics_after_approval"] == []
+        assert report["newly_understood_metrics"][0]["metric"] == "redis_evictions_total"
+        assert report["unresolved_metrics"] == ["opaque_value"]
+
+    def test_learning_impact_report_marks_approved_candidates_active(self):
+        signals = [
+            {
+                "signal_type": "cache_saturation",
+                "metric": "redis_evictions_total",
+                "confidence": 0.74,
+                "source": "heuristic",
+                "reason": "metric contains eviction",
+                "auto_teach_eligible": True,
+            },
+        ]
+
+        report = build_learning_impact_report(
+            metrics=["redis_evictions_total"],
+            signals=signals,
+            approved=True,
+        )
+
+        assert report["candidate_mappings_pending_approval"] == 0
+        assert report["new_active_mappings_after_approval"] == 1
+        assert report["newly_understood_metrics"][0]["mapping_state"] == "approved"
+        assert report["newly_active_metrics_after_approval"][0]["metric"] == "redis_evictions_total"
+
+    @pytest.mark.asyncio
+    async def test_before_after_learning_fixture_resolves_custom_checkout_metrics(self, signal_store, monkeypatch):
+        from dashforge import dashboard_ingest as di
+
+        monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
+        catalog = [
+            MetricEntry(
+                name="checkout_custom_latency_ms",
+                datasource_uid="prom",
+                datasource_name="Prometheus",
+                datasource_type="prometheus",
+                query_language="promql",
+            ),
+            MetricEntry(
+                name="checkout_5xx_count",
+                datasource_uid="prom",
+                datasource_name="Prometheus",
+                datasource_type="prometheus",
+                query_language="promql",
+            ),
+        ]
+        signal_bindings = {
+            "request_latency": "http_request_duration_seconds",
+            "error_rate": "http_requests_total",
+        }
+
+        before = signal_store.resolve_signals_for_archetype(
+            signal_bindings=signal_bindings,
+            catalog=catalog,
+            context_datasource_type="prometheus",
+            target_query_language="promql",
+        )
+        assert before == {}
+
+        features = DashboardFeatures(
+            dashboard_uid="checkout-custom-ops",
+            dashboard_title="Checkout Custom Ops",
+            backend_name="grafana_json",
+            query_language="promql",
+            metrics_found=["checkout_custom_latency_ms", "checkout_5xx_count"],
+            panel_count=2,
+            panel_titles=["Checkout Latency", "Checkout 5xx Errors"],
+            panels=[
+                {
+                    "title": "Checkout Latency",
+                    "queries": ["checkout_custom_latency_ms"],
+                    "metrics": ["checkout_custom_latency_ms"],
+                    "unit": "ms",
+                    "row": "Latency",
+                },
+                {
+                    "title": "Checkout 5xx Errors",
+                    "queries": ["checkout_5xx_count"],
+                    "metrics": ["checkout_5xx_count"],
+                    "unit": "short",
+                    "row": "Errors",
+                },
+            ],
+        )
+
+        pending = await di.ingest_dashboard_features(features, auto_approve=False)
+
+        assert pending["learning_impact"]["candidate_mappings_pending_approval"] == 2
+        assert pending["learning_impact"]["new_active_mappings_after_approval"] == 0
+        assert {m["metric"] for m in pending["learning_impact"]["newly_understood_metrics"]} == {
+            "checkout_custom_latency_ms",
+            "checkout_5xx_count",
+        }
+        assert signal_store.resolve_signals_for_archetype(
+            signal_bindings=signal_bindings,
+            catalog=catalog,
+            context_datasource_type="prometheus",
+            target_query_language="promql",
+        ) == {}
+
+        approved = await di.ingest_dashboard_features(features, auto_approve=True)
+
+        assert approved["learning_impact"]["candidate_mappings_pending_approval"] == 0
+        assert approved["learning_impact"]["new_active_mappings_after_approval"] == 2
+        after = signal_store.resolve_signals_for_archetype(
+            signal_bindings=signal_bindings,
+            catalog=catalog,
+            context_datasource_type="prometheus",
+            target_query_language="promql",
+        )
+        assert after == {
+            "http_request_duration_seconds": "checkout_custom_latency_ms",
+            "http_requests_total": "checkout_5xx_count",
+        }
 
     def test_dashboard_uid_is_scoped_by_backend(self, signal_store):
         signal_store.record_ingested_dashboard(

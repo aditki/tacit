@@ -22,6 +22,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -45,6 +46,11 @@ _MIN_CONFIDENCE = 0.05  # floor — never fully forget
 _TRUST_THRESHOLD = 0.15  # below this, mapping is excluded from resolution
 _CONTEXT_MISSING_PENALTY = 0.7  # lower rank when mapping has context caller lacks
 _REVIEW_STATE_RANK = {"candidate": 0, "approved": 1, "trusted": 2}
+_SQLITE_BUSY_TIMEOUT_MS = 30_000
+
+
+class LearningIndexUnavailable(RuntimeError):
+    """Raised when SQLite FTS5-backed learning retrieval is unavailable."""
 
 
 def _stronger_review_state(existing: str, incoming: str) -> str:
@@ -153,6 +159,26 @@ CREATE INDEX IF NOT EXISTS idx_smm_signal ON signal_metric_mappings(signal_type)
 CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern);
 """
 
+_FTS_SCHEMA_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS learning_context_fts USING fts5(
+    source_kind,
+    source_id UNINDEXED,
+    backend_name UNINDEXED,
+    dashboard_uid UNINDEXED,
+    dashboard_title,
+    dashboard_tags,
+    panel_title,
+    metric_name,
+    query_text,
+    service,
+    signal_type,
+    review_state UNINDEXED,
+    reason,
+    provenance,
+    indexed_at UNINDEXED
+);
+"""
+
 
 class SignalStore:
     """SQLite-backed semantic signal mapping store."""
@@ -163,9 +189,10 @@ class SignalStore:
 
     @contextmanager
     def _conn(self):
-        conn = sqlite3.connect(str(self._db_path))
+        conn = sqlite3.connect(str(self._db_path), timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
         try:
             yield conn
             conn.commit()
@@ -178,9 +205,17 @@ class SignalStore:
     def _ensure_schema(self):
         with self._conn() as conn:
             conn.executescript(_SCHEMA_SQL)
+            self._ensure_learning_index(conn)
             self._ensure_ingested_dashboard_backend_scope(conn)
             self._ensure_mapping_columns(conn)
         logger.info("signal_store_init", db_path=str(self._db_path))
+
+    def _ensure_learning_index(self, conn: sqlite3.Connection) -> None:
+        """Create the FTS5 operational knowledge index when available."""
+        try:
+            conn.executescript(_FTS_SCHEMA_SQL)
+        except sqlite3.OperationalError as exc:
+            logger.warning("learning_context_fts_unavailable", error=str(exc))
 
     def _ensure_mapping_columns(self, conn: sqlite3.Connection) -> None:
         """Add newer columns to signal_metric_mappings on pre-existing DBs."""
@@ -828,6 +863,273 @@ class SignalStore:
                 ),
             )
 
+    def index_dashboard_context(
+        self,
+        *,
+        dashboard_uid: str,
+        backend_name: str = "",
+        dashboard_title: str = "",
+        dashboard_tags: list[str] | None = None,
+        panels: list[dict[str, Any]] | None = None,
+        metrics_found: list[str] | None = None,
+        signals_inferred: list[dict[str, Any]] | list[str] | None = None,
+        status: str = "pending",
+    ) -> int:
+        """Index learned dashboard context for fast operational-language retrieval.
+
+        The index is intentionally a retrieval aid, not the trust source of
+        truth. Mapping approval still lives in ``signal_metric_mappings`` and
+        dashboard review state still lives in ``ingested_dashboards``.
+        """
+        if not self._learning_index_available():
+            return 0
+
+        tags = dashboard_tags or []
+        metrics = list(dict.fromkeys(metrics_found or []))
+        signal_by_metric: dict[str, list[dict[str, Any]]] = {}
+        for sig in signals_inferred or []:
+            if not isinstance(sig, dict):
+                continue
+            metric = sig.get("metric", "")
+            if metric:
+                signal_by_metric.setdefault(metric, []).append(sig)
+
+        review_state = "approved" if status == "approved" else "candidate"
+        rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str, str, str, str, float]] = []
+        indexed_at = time.time()
+        panel_items = panels or []
+        if not panel_items and metrics:
+            panel_items = [{"title": "", "queries": [], "metrics": metrics}]
+
+        for panel_index, panel in enumerate(panel_items):
+            panel_title = str(panel.get("title", "") or "")
+            query_values = panel.get("queries", [])
+            if not isinstance(query_values, list):
+                query_values = [str(query_values)]
+            query_text = "\n".join(str(q) for q in query_values if q)
+            panel_metrics = _panel_metrics(panel, metrics)
+            if not panel_metrics and metrics:
+                panel_metrics = metrics
+
+            for metric in panel_metrics:
+                related_signals = signal_by_metric.get(metric) or [{}]
+                for sig_index, sig in enumerate(related_signals):
+                    if not isinstance(sig, dict):
+                        sig = {}
+                    services = _infer_services_for_learning(
+                        metric=metric,
+                        query_text=query_text,
+                        dashboard_title=dashboard_title,
+                        panel_title=panel_title,
+                        tags=tags,
+                    )
+                    service_text = " ".join(services)
+                    signal_type = str(sig.get("signal_type", ""))
+                    reason = str(sig.get("reason", ""))
+                    provenance = " ".join(
+                        part
+                        for part in (
+                            f"source:{sig.get('source', '')}" if sig.get("source") else "",
+                            f"family:{sig.get('signal_family', '')}" if sig.get("signal_family") else "",
+                            f"confidence:{sig.get('confidence', '')}" if sig.get("confidence") else "",
+                        )
+                        if part
+                    )
+                    rows.append(
+                        (
+                            "dashboard_panel",
+                            f"{backend_name}:{dashboard_uid}:{panel_index}:{metric}:{sig_index}",
+                            backend_name,
+                            dashboard_uid,
+                            dashboard_title,
+                            " ".join(tags),
+                            panel_title,
+                            metric,
+                            query_text,
+                            service_text,
+                            signal_type,
+                            review_state,
+                            reason,
+                            provenance,
+                            indexed_at,
+                        )
+                    )
+
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "DELETE FROM learning_context_fts WHERE dashboard_uid = ? AND backend_name = ?",
+                    (dashboard_uid, backend_name),
+                )
+                conn.executemany(
+                    """INSERT INTO learning_context_fts
+                       (source_kind, source_id, backend_name, dashboard_uid,
+                        dashboard_title, dashboard_tags, panel_title, metric_name,
+                        query_text, service, signal_type, review_state, reason,
+                        provenance, indexed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+        except sqlite3.OperationalError as exc:
+            logger.warning("learning_context_index_failed", error=str(exc))
+            return 0
+        return len(rows)
+
+    def update_learning_context_review_state(
+        self,
+        dashboard_uid: str,
+        review_state: str,
+        backend_name: str | None = None,
+    ) -> int:
+        """Reflect dashboard approval/rejection in the retrieval index."""
+        if not self._learning_index_available():
+            return 0
+        backend = backend_name if backend_name is not None else ""
+        with self._conn() as conn:
+            try:
+                if backend_name is None:
+                    cursor = conn.execute(
+                        "UPDATE learning_context_fts SET review_state = ? WHERE dashboard_uid = ?",
+                        (review_state, dashboard_uid),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """UPDATE learning_context_fts SET review_state = ?
+                           WHERE dashboard_uid = ? AND backend_name = ?""",
+                        (review_state, dashboard_uid, backend),
+                    )
+                return cursor.rowcount
+            except sqlite3.OperationalError as exc:
+                logger.warning("learning_context_review_state_update_failed", error=str(exc))
+                return 0
+
+    def search_learning_context(
+        self,
+        query: str,
+        *,
+        service: str = "",
+        include_candidates: bool = True,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Search the learned operational knowledge index."""
+        if not self._learning_index_available():
+            raise LearningIndexUnavailable(
+                "Learned-context search requires SQLite FTS5, but this SQLite build does not provide it."
+            )
+
+        match_query = _fts_query(query)
+        if not match_query:
+            return []
+
+        clauses = ["learning_context_fts MATCH ?"]
+        params: list[Any] = [match_query]
+        if service:
+            clauses.append("lower(service) LIKE ?")
+            params.append(f"%{service.lower()}%")
+        if not include_candidates:
+            clauses.append("review_state IN ('approved', 'trusted')")
+        else:
+            clauses.append("review_state NOT IN ('rejected', 'ignored')")
+        params.append(limit)
+
+        sql = f"""SELECT rowid, *, bm25(learning_context_fts) AS rank
+                  FROM learning_context_fts
+                  WHERE {' AND '.join(clauses)}
+                  ORDER BY rank
+                  LIMIT ?"""
+        with self._conn() as conn:
+            try:
+                rows = conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError as exc:
+                logger.warning("learning_context_search_failed", query=query, error=str(exc))
+                return []
+        return [dict(row) for row in rows]
+
+    def describe_service(
+        self,
+        service: str,
+        *,
+        include_candidates: bool = True,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Summarize what DashForge has learned about a service."""
+        rows = self.search_learning_context(
+            service,
+            service=service,
+            include_candidates=include_candidates,
+            limit=limit,
+        )
+
+        dashboards: dict[str, dict[str, Any]] = {}
+        metrics: dict[str, dict[str, Any]] = {}
+        signals: dict[str, int] = {}
+        panels: dict[str, int] = {}
+        trusted_rows = 0
+        candidate_rows = 0
+
+        for row in rows:
+            state = row.get("review_state", "")
+            if state in {"approved", "trusted"}:
+                trusted_rows += 1
+            else:
+                candidate_rows += 1
+
+            dash_key = f"{row.get('backend_name', '')}:{row.get('dashboard_uid', '')}"
+            dashboards.setdefault(
+                dash_key,
+                {
+                    "dashboard_uid": row.get("dashboard_uid", ""),
+                    "backend_name": row.get("backend_name", ""),
+                    "dashboard_title": row.get("dashboard_title", ""),
+                    "review_state": state,
+                },
+            )
+            metric = row.get("metric_name", "")
+            if metric:
+                metrics.setdefault(
+                    metric,
+                    {
+                        "metric": metric,
+                        "signal_types": [],
+                        "review_states": [],
+                        "example_panel": row.get("panel_title", ""),
+                    },
+                )
+                signal_type = row.get("signal_type", "")
+                if signal_type and signal_type not in metrics[metric]["signal_types"]:
+                    metrics[metric]["signal_types"].append(signal_type)
+                if state and state not in metrics[metric]["review_states"]:
+                    metrics[metric]["review_states"].append(state)
+
+            signal_type = row.get("signal_type", "")
+            if signal_type:
+                signals[signal_type] = signals.get(signal_type, 0) + 1
+
+            panel_title = row.get("panel_title", "")
+            if panel_title:
+                panels[panel_title] = panels.get(panel_title, 0) + 1
+
+        return {
+            "service": service,
+            "matched_context_rows": len(rows),
+            "trusted_context_rows": trusted_rows,
+            "candidate_context_rows": candidate_rows,
+            "dashboards": list(dashboards.values()),
+            "top_metrics": sorted(metrics.values(), key=lambda m: len(m["signal_types"]), reverse=True)[:12],
+            "signals": dict(sorted(signals.items(), key=lambda item: item[1], reverse=True)),
+            "top_panels": [
+                {"panel_title": title, "matches": count}
+                for title, count in sorted(panels.items(), key=lambda item: item[1], reverse=True)[:10]
+            ],
+        }
+
+    def _learning_index_available(self) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'learning_context_fts'"
+            ).fetchone()
+            return row is not None
+
     def get_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> dict[str, Any] | None:
         """Get ingested dashboard record."""
         with self._conn() as conn:
@@ -888,7 +1190,11 @@ class SignalStore:
                    WHERE id = ? AND status = 'pending'""",
                 (status, time.time(), ingested["id"]),
             )
-            return cursor.rowcount > 0
+            changed = cursor.rowcount > 0
+        if changed:
+            review_state = "approved" if status == "approved" else status
+            self.update_learning_context_review_state(dashboard_uid, review_state, backend_name)
+        return changed
 
     def approve_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> bool:
         """Approve a pending ingested dashboard (activates its signal mappings)."""
@@ -927,6 +1233,106 @@ class SignalStore:
 
 
 # ── Helper functions ─────────────────────────────────────────────────────────
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:/-]+")
+_LABEL_SERVICE_RE = re.compile(
+    r"(?:^|[,{\s])(?:service|app|application|container|pod|job)\s*(?:=|=~)\s*['\"]([^'\"]+)['\"]"
+)
+_GENERIC_METRIC_PREFIXES = {
+    "http",
+    "grpc",
+    "request",
+    "requests",
+    "response",
+    "duration",
+    "latency",
+    "error",
+    "errors",
+    "cpu",
+    "memory",
+    "container",
+    "pod",
+    "node",
+    "kube",
+    "jvm",
+    "process",
+    "redis",
+    "kafka",
+    "envoy",
+    "nginx",
+    "prometheus",
+}
+
+
+def _panel_metrics(panel: dict[str, Any], fallback_metrics: list[str]) -> list[str]:
+    raw = panel.get("metrics", [])
+    metrics: list[str] = []
+    if isinstance(raw, list):
+        metrics.extend(str(m) for m in raw if m)
+    elif raw:
+        metrics.append(str(raw))
+
+    if metrics:
+        return list(dict.fromkeys(metrics))
+
+    queries = panel.get("queries", [])
+    if not isinstance(queries, list):
+        queries = [queries]
+    query_text = "\n".join(str(q) for q in queries if q)
+    if not query_text:
+        return []
+    return [metric for metric in fallback_metrics if metric and metric in query_text]
+
+
+def _infer_services_for_learning(
+    *,
+    metric: str,
+    query_text: str,
+    dashboard_title: str,
+    panel_title: str,
+    tags: list[str],
+) -> list[str]:
+    candidates: list[str] = []
+
+    def add(value: str) -> None:
+        cleaned = value.strip().strip("*").strip()
+        cleaned = re.sub(r"^\.\*", "", cleaned)
+        cleaned = re.sub(r"\.\*$", "", cleaned)
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+
+    for tag in tags:
+        if ":" in tag:
+            key, value = tag.split(":", 1)
+            if key.lower() in {"service", "app", "application", "component", "team"}:
+                add(value)
+
+    for match in _LABEL_SERVICE_RE.findall(query_text):
+        add(match)
+
+    first = re.split(r"[_.:-]+", metric, maxsplit=1)[0].lower() if metric else ""
+    if first and first not in _GENERIC_METRIC_PREFIXES and len(first) > 2:
+        add(first)
+
+    text = f"{dashboard_title} {panel_title}".lower()
+    for suffix in ("service", "api", "worker", "gateway"):
+        for match in re.findall(rf"\b([a-z0-9][a-z0-9_-]+)[\s_-]+{suffix}\b", text):
+            if match not in _GENERIC_METRIC_PREFIXES:
+                add(match)
+
+    return candidates
+
+
+def _fts_query(text: str) -> str:
+    terms = []
+    for token in _TOKEN_RE.findall(text.lower()):
+        token = token.strip("-_.:/")
+        if len(token) < 2:
+            continue
+        escaped = token.replace('"', '""')
+        terms.append(f'"{escaped}"')
+    return " OR ".join(dict.fromkeys(terms))
 
 
 def _deserialize_mapping(row: sqlite3.Row) -> dict[str, Any]:

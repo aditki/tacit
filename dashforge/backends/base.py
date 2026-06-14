@@ -121,6 +121,13 @@ class DashboardBackend(Protocol):
         """
         ...
 
+    async def list_dashboards(self, limit: int = 500) -> list[dict]:
+        """Return dashboard summaries that can be passed to ``ingest_dashboard``.
+
+        Each item should include at least ``uid`` and may include ``title``.
+        """
+        ...
+
     async def close(self) -> None:
         """Release HTTP clients and other resources."""
         ...

@@ -73,6 +73,7 @@ _OVERRIDE_RULES: list[tuple[str, re.Pattern[str], str]] = [
 # Explicit, high-strength name rules (>=0.9) may auto-teach with a single source.
 # (regex, family, strength, evidence)
 _NAME_RULES: list[tuple[re.Pattern[str], str, float, str]] = [
+    (re.compile(r"([45]xx|http_?5\d\d|status_?5\d\d)"), "errors", 1.0, "name indicates HTTP errors"),
     (re.compile(r"(errors?|_err)(_total|_count)?(\b|_|$)"), "errors", 1.0, "name contains 'error'"),
     (re.compile(r"(_failed|_failures?|_failing)"), "errors", 1.0, "name contains 'fail'"),
     (re.compile(r"(_dropped|_drops?|_discard|_rejected)"), "errors", 0.9, "name indicates drops/rejects"),
