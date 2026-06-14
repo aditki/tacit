@@ -1421,11 +1421,7 @@ async def learn_backend_dashboards(
                 totals["dashboards_failed"] += 1
 
         if auto_approve:
-            archetype_yamls = [
-                str(item.get("archetype_yaml", ""))
-                for item in learned
-                if item.get("archetype_yaml")
-            ]
+            archetype_yamls = [str(item.get("archetype_yaml", "")) for item in learned if item.get("archetype_yaml")]
             archetype_registered = register_generated_archetypes_if_enabled(
                 archetype_yamls,
                 dashboard_uid=f"{backend_name}:bulk",
