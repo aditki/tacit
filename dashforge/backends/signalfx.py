@@ -91,6 +91,38 @@ class SignalFxBackend:
         dashboard_json = cast(dict[str, Any], await self._client._get(f"/v2/dashboard/{uid}"))
         return await self._parse_sfx_dashboard(dashboard_json)
 
+    async def list_dashboards(self, limit: int = 500) -> list[dict]:
+        """List SignalFx dashboards from dashboard groups when available."""
+        data = await self._client.list_dashboard_groups(limit=min(limit, 200))
+        groups = data.get("results", []) if isinstance(data, dict) else data
+        out: list[dict] = []
+        for group in groups if isinstance(groups, list) else []:
+            if not isinstance(group, dict):
+                continue
+            dashboards = group.get("dashboardConfigs") or group.get("dashboards", [])
+            for dashboard in dashboards if isinstance(dashboards, list) else []:
+                if isinstance(dashboard, dict):
+                    uid = dashboard.get("dashboardId", "") or dashboard.get("id", "")
+                    title = (
+                        dashboard.get("name", "") or dashboard.get("dashboardName", "") or dashboard.get("title", "")
+                    )
+                else:
+                    uid = str(dashboard)
+                    title = ""
+                if not uid:
+                    continue
+                out.append(
+                    {
+                        "uid": uid,
+                        "title": title,
+                        "folder": group.get("name", "") if isinstance(group, dict) else "",
+                        "backend": self.name,
+                    }
+                )
+                if len(out) >= limit:
+                    return out
+        return out
+
     async def _parse_sfx_dashboard(self, dashboard_json: dict) -> DashboardFeatures:
         """Parse a SignalFx dashboard + its charts into DashboardFeatures."""
         uid = dashboard_json.get("id", "")

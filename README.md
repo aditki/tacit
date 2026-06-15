@@ -177,7 +177,8 @@ That's it. Three commands from zero to a generated investigation artifact.
 | `dashforge doctor`                    | Validates Grafana + SignalFx connectivity, datasource permissions, LLM key, archetypes, cache state |
 | `dashforge connect grafana`           | Test & persist a Grafana connection (interactive or `--url` / `--api-key` flags)                    |
 | `dashforge connect signalfx`          | Test & persist a Splunk SignalFx connection (interactive or `--realm` / `--token` flags)            |
-| `dashforge test [-p "custom prompt"]` | Runs a full investigation pipeline and opens the resulting dashboard artifact                       |
+| `dashforge test [-p "custom prompt"]` | Runs a full investigation pipeline and opens the resulting dashboard                                |
+| `dashforge learn dashboard <uid>`     | Ingests an existing dashboard and reports signal quality + before/after learning impact             |
 | `dashforge serve`                     | Starts the API server (+ Slack if configured)                                                       |
 | `dashforge history list`              | List recent investigations with status, timings, archetypes                                         |
 | `dashforge history show <id>`         | Full investigation detail (intent → metrics → queries → result)                                     |
@@ -351,6 +352,12 @@ keeps that learning reviewable:
 
 Via the **Web UI** — go to the **Learning** tab, enter a dashboard UID, select the backend, and click "Ingest Dashboard".
 
+Via the **CLI**:
+
+```bash
+dashforge learn dashboard my-service-overview --backend grafana
+```
+
 Via the **API**:
 
 ```bash
@@ -358,6 +365,14 @@ curl -X POST http://localhost:8000/api/v1/learn/dashboard \
   -H "Content-Type: application/json" \
   -d '{"dashboard_uid": "my-service-overview", "backend": "grafana", "auto_approve": true}'
 ```
+
+Ingestion responses include `signal_quality` and `learning_impact` so reviewers can see:
+
+- which metrics already matched the taxonomy
+- which heuristic mappings are candidates pending approval
+- which mappings are active after approval/trust
+- which candidates were held back and why
+- how many metrics would be recognized before vs. after approval
 
 ### Teach a Signal Mapping
 
