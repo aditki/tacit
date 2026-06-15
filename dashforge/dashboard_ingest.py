@@ -957,10 +957,8 @@ def approve_ingested_dashboard_record(
                         activated_pairs.add((metric, sig))
                         break
 
-    store.approve_ingested_dashboard(dashboard_uid, backend_name=backend_name)
-    store.update_learning_context_review_state(
+    store.approve_ingested_dashboard(
         dashboard_uid,
-        "approved",
         backend_name=backend_name,
         activated_pairs=activated_pairs,
     )

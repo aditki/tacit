@@ -1375,6 +1375,68 @@ archetypes:
         candidate = signal_store.search_learning_context("opaque", service="checkout")
         assert candidate[0]["review_state"] == "candidate"
 
+    def test_store_direct_approval_syncs_fts_for_eligible_rows(self, signal_store):
+        if not signal_store._learning_index_available():
+            pytest.skip("SQLite FTS5 is not available")
+
+        signals = [
+            {
+                "signal_type": "request_latency",
+                "metric": "checkout_custom_latency_ms",
+                "source": "heuristic",
+                "signal_family": "latency",
+                "confidence": 0.9,
+                "auto_teach_eligible": True,
+            },
+            {
+                "signal_type": "supporting_evidence",
+                "metric": "opaque_value",
+                "source": "heuristic",
+                "signal_family": "unknown",
+                "confidence": 0.2,
+                "auto_teach_eligible": False,
+            },
+        ]
+        signal_store.record_ingested_dashboard(
+            "direct-approve",
+            backend_name="grafana_json",
+            metrics_found=["checkout_custom_latency_ms", "opaque_value"],
+            signals_inferred=signals,
+            status="pending",
+        )
+        signal_store.index_dashboard_context(
+            dashboard_uid="direct-approve",
+            backend_name="grafana_json",
+            dashboard_title="Direct Approve",
+            dashboard_tags=["service:checkout"],
+            panels=[
+                {
+                    "title": "Checkout latency",
+                    "queries": ['checkout_custom_latency_ms{service="checkout"}'],
+                    "metrics": ["checkout_custom_latency_ms"],
+                },
+                {
+                    "title": "Opaque",
+                    "queries": ['opaque_value{service="checkout"}'],
+                    "metrics": ["opaque_value"],
+                },
+            ],
+            metrics_found=["checkout_custom_latency_ms", "opaque_value"],
+            signals_inferred=signals,
+            status="pending",
+        )
+
+        assert signal_store.approve_ingested_dashboard("direct-approve", backend_name="grafana_json")
+
+        approved = signal_store.search_learning_context(
+            "checkout latency",
+            service="checkout",
+            include_candidates=False,
+        )
+        assert approved[0]["metric_name"] == "checkout_custom_latency_ms"
+        assert signal_store.search_learning_context("opaque", service="checkout", include_candidates=False) == []
+        assert signal_store.search_learning_context("opaque", service="checkout")[0]["review_state"] == "candidate"
+
     def test_reject_record_persists_negative_training_data(self, signal_store):
         signal_store.record_ingested_dashboard(
             "checkout-reject",

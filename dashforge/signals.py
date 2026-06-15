@@ -1212,6 +1212,7 @@ class SignalStore:
         dashboard_uid: str,
         status: str,
         backend_name: str | None = None,
+        activated_pairs: set[tuple[str, str]] | None = None,
     ) -> bool:
         """Move a pending ingested dashboard to a reviewed status."""
         if status not in {"approved", "rejected", "ignored"}:
@@ -1229,13 +1230,33 @@ class SignalStore:
             )
             changed = cursor.rowcount > 0
         if changed:
-            if status != "approved":
+            if status == "approved":
+                pairs = activated_pairs
+                if pairs is None:
+                    pairs = _eligible_pairs_from_ingested_signals(ingested.get("signals_inferred", []))
+                self.update_learning_context_review_state(
+                    dashboard_uid,
+                    "approved",
+                    backend_name,
+                    activated_pairs=pairs,
+                )
+            else:
                 self.update_learning_context_review_state(dashboard_uid, status, backend_name)
         return changed
 
-    def approve_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> bool:
+    def approve_ingested_dashboard(
+        self,
+        dashboard_uid: str,
+        backend_name: str | None = None,
+        activated_pairs: set[tuple[str, str]] | None = None,
+    ) -> bool:
         """Approve a pending ingested dashboard (activates its signal mappings)."""
-        return self.update_ingested_dashboard_status(dashboard_uid, "approved", backend_name)
+        return self.update_ingested_dashboard_status(
+            dashboard_uid,
+            "approved",
+            backend_name,
+            activated_pairs=activated_pairs,
+        )
 
     def reject_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> bool:
         """Reject a pending ingested dashboard as unsuitable for learning."""
@@ -1391,6 +1412,23 @@ def _learning_row_review_state(
     if sig.get("source") == "heuristic":
         return "approved" if sig.get("auto_teach_eligible") else "candidate"
     return "trusted" if sig.get("confidence", 0.0) >= 0.5 else "candidate"
+
+
+def _eligible_pairs_from_ingested_signals(signals: list[Any]) -> set[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    for sig in signals:
+        if not isinstance(sig, dict):
+            continue
+        metric = sig.get("metric", "")
+        signal_type = sig.get("signal_type", "")
+        if not metric or not signal_type:
+            continue
+        if sig.get("source") == "heuristic":
+            if sig.get("auto_teach_eligible"):
+                pairs.add((metric, signal_type))
+        elif sig.get("confidence", 0.0) >= 0.5:
+            pairs.add((metric, signal_type))
+    return pairs
 
 
 def _deserialize_mapping(row: sqlite3.Row) -> dict[str, Any]:
