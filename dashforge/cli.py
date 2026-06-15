@@ -807,6 +807,304 @@ def test_run(prompt: str | None, open_browser: bool):
         _info("Run `dashforge doctor` to check your setup")
 
 
+# ── dashforge learn ──────────────────────────────────────────────────────────
+@cli.group()
+def learn():
+    """Learn operational language from existing dashboards."""
+    pass
+
+
+@learn.command("dashboard")
+@click.argument("dashboard_uid")
+@click.option("--backend", default="", help="Backend name, e.g. grafana or signalfx")
+@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool):
+    """Ingest a dashboard and show what DashForge learned."""
+    _header("Learn Dashboard")
+    _load_env()
+
+    import asyncio
+
+    async def _run():
+        from dashforge.dashboard_ingest import ingest_dashboard
+
+        return await ingest_dashboard(
+            dashboard_uid=dashboard_uid,
+            backend_name=backend,
+            auto_approve=auto_approve,
+        )
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as e:
+        _fail(f"Dashboard ingestion failed: {e}")
+        _info("Run `dashforge doctor` to check backend connectivity.")
+        return
+
+    quality = result.get("signal_quality", {})
+    impact = result.get("learning_impact", {})
+    _success(f"Ingested {result.get('dashboard_title') or dashboard_uid}")
+    _info(f"Status: {result.get('status', 'pending')}")
+    _info(f"Panels: {result.get('panel_count', 0)}")
+    _info(f"Metrics found: {len(result.get('metrics_found', []))}")
+    _info(f"Signals inferred: {len(result.get('signals_inferred', []))}")
+    _info(
+        "Learning impact: "
+        f"{impact.get('active_mappings_before_learning', 0)} active before, "
+        f"{impact.get('candidate_mappings_pending_approval', 0)} candidate pending approval, "
+        f"{impact.get('new_active_mappings_after_approval', 0)} newly active"
+    )
+    if quality:
+        _info(
+            "Inference quality: "
+            f"{quality.get('taxonomy_matches', 0)} taxonomy, "
+            f"{quality.get('heuristic_candidates', 0)} heuristic, "
+            f"{quality.get('held_for_review', 0)} held for review"
+        )
+    explanations = quality.get("explanations", [])[:8]
+    if explanations:
+        _info("Top inferred mappings:")
+        for item in explanations:
+            confidence = round(item.get("confidence", 0.0) * 100)
+            review = item.get("review_state", "")
+            _info(
+                f"  {item.get('signal_type', 'unknown')} <- {item.get('metric', '')} "
+                f"({confidence}%, {item.get('source', '')}, {review})"
+            )
+            if item.get("reason"):
+                _info(f"    {item['reason']}")
+    if auto_approve:
+        _info(f"Mappings created: {result.get('mappings_created', 0)}")
+
+
+def _print_bulk_learning_summary(result: dict):
+    _success(f"Learned from {result.get('dashboards_learned', 0)} {result.get('backend')} dashboards")
+    _info(f"Dashboards discovered: {result.get('dashboards_discovered', 0)}")
+    _info(f"Dashboards failed: {result.get('dashboards_failed', 0)}")
+    _info(f"Metrics found: {result.get('metrics_found', 0)}")
+    _info(f"Signals inferred: {result.get('signals_inferred', 0)}")
+    _info(f"Indexed context rows: {result.get('indexed_context_rows', 0)}")
+    if result.get("auto_approve"):
+        _info(f"Mappings created: {result.get('mappings_created', 0)}")
+        _info(f"Archetypes registered: {result.get('archetypes_registered', 0)}")
+
+    learned = result.get("learned", [])
+    if learned:
+        _info("Top learned dashboards:")
+        for item in learned[:10]:
+            _info(
+                f"  • {item.get('dashboard_title') or item.get('dashboard_uid')} "
+                f"({item.get('metrics_found', 0)} metrics, "
+                f"{item.get('signals_inferred', 0)} signals, "
+                f"{item.get('indexed_context_rows', 0)} indexed rows)"
+            )
+
+    failures = result.get("failures", [])
+    if failures:
+        _info("Failures:")
+        for item in failures[:5]:
+            _fail(f"  {item.get('dashboard_uid')}: {item.get('error')}")
+
+
+def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
+    _header(f"Learn {backend_name.title()} Dashboards")
+    _load_env()
+
+    import asyncio
+
+    async def _run():
+        from dashforge.dashboard_ingest import learn_backend_dashboards
+
+        return await learn_backend_dashboards(
+            backend_name,
+            auto_approve=auto_approve,
+            limit=limit,
+        )
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as e:
+        _fail(f"Bulk learning failed: {e}")
+        _info("Run `dashforge doctor` to check backend connectivity.")
+        return
+
+    _print_bulk_learning_summary(result)
+
+
+@learn.command("grafana")
+@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+@click.option("--limit", default=500, show_default=True, help="Maximum dashboards to crawl")
+def learn_grafana(auto_approve: bool, limit: int):
+    """Crawl Grafana dashboards and persist learned operational context."""
+    _run_backend_learning("grafana", auto_approve, limit)
+
+
+@learn.command("signalfx")
+@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+@click.option("--limit", default=500, show_default=True, help="Maximum dashboards to crawl")
+def learn_signalfx(auto_approve: bool, limit: int):
+    """Crawl SignalFx dashboards and persist learned operational context."""
+    _run_backend_learning("signalfx", auto_approve, limit)
+
+
+@learn.command("approve")
+@click.argument("dashboard_uid")
+@click.option("--backend", default="", help="Backend name, e.g. grafana_json or signalfx")
+def learn_approve(dashboard_uid: str, backend: str):
+    """Approve a pending learned dashboard and activate mappings."""
+    _header("Approve Learned Dashboard")
+    _load_env()
+
+    from dashforge.dashboard_ingest import approve_ingested_dashboard_record
+
+    try:
+        result = approve_ingested_dashboard_record(
+            dashboard_uid=dashboard_uid,
+            backend_name=backend or None,
+        )
+    except LookupError:
+        _fail("Ingested dashboard not found")
+        return
+
+    if result.get("status") == "approved":
+        _success(result.get("message", "Dashboard approved"))
+        _info(f"Mappings created: {result.get('mappings_created', 0)}")
+        _info(f"Archetype registered: {result.get('archetype_registered', False)}")
+    else:
+        _info(result.get("message", f"Dashboard already {result.get('status')}"))
+
+
+@learn.command("reject")
+@click.argument("dashboard_uid")
+@click.option("--backend", default="", help="Backend name, e.g. grafana_json or signalfx")
+def learn_reject(dashboard_uid: str, backend: str):
+    """Reject a pending learned dashboard and remove it from default retrieval."""
+    _header("Reject Learned Dashboard")
+    _load_env()
+
+    from dashforge.dashboard_ingest import reject_ingested_dashboard_record
+
+    try:
+        result = reject_ingested_dashboard_record(
+            dashboard_uid=dashboard_uid,
+            backend_name=backend or None,
+        )
+    except LookupError:
+        _fail("Ingested dashboard not found or not pending")
+        return
+    except RuntimeError:
+        _fail("Dashboard is no longer pending")
+        return
+
+    if result.get("status") == "rejected":
+        _success(result.get("message", "Dashboard rejected"))
+        _info(f"Rejected candidates recorded: {result.get('rejected_candidates', 0)}")
+    else:
+        _info(result.get("message", f"Dashboard already {result.get('status')}"))
+
+
+@learn.command("ignore")
+@click.argument("dashboard_uid")
+@click.option("--backend", default="", help="Backend name, e.g. grafana_json or signalfx")
+def learn_ignore(dashboard_uid: str, backend: str):
+    """Ignore a pending learned dashboard without negative training data."""
+    _header("Ignore Learned Dashboard")
+    _load_env()
+
+    from dashforge.signals import get_signal_store
+
+    store = get_signal_store()
+    if store.ignore_ingested_dashboard(dashboard_uid, backend_name=backend or None):
+        _success("Dashboard ignored")
+    else:
+        _fail("Ingested dashboard not found or not pending")
+
+
+@learn.command("search")
+@click.argument("query")
+@click.option("--service", default="", help="Optional service/component filter")
+@click.option("--approved-only", is_flag=True, help="Only show approved/trusted context")
+@click.option("--limit", default=10, show_default=True, help="Maximum context rows")
+def learn_search(query: str, service: str, approved_only: bool, limit: int):
+    """Search learned dashboards, panels, metrics, and signal mappings."""
+    _header("Search Learned Context")
+    _load_env()
+
+    from dashforge.signals import LearningIndexUnavailable, get_signal_store
+
+    store = get_signal_store()
+    try:
+        rows = store.search_learning_context(
+            query,
+            service=service,
+            include_candidates=not approved_only,
+            limit=limit,
+        )
+    except LearningIndexUnavailable as e:
+        _fail(str(e))
+        return
+    if not rows:
+        _info("No learned context matched.")
+        return
+
+    for row in rows:
+        state = row.get("review_state", "candidate")
+        _info(
+            f"• {row.get('metric_name', '')} → {row.get('signal_type', '') or 'unclassified'} "
+            f"({state}, {row.get('dashboard_title', '')} / {row.get('panel_title', '')})"
+        )
+        if row.get("reason"):
+            _info(f"  {row['reason']}")
+
+
+@learn.command("service")
+@click.argument("service")
+@click.option("--approved-only", is_flag=True, help="Only use approved/trusted context")
+@click.option("--limit", default=50, show_default=True, help="Maximum context rows")
+def learn_service(service: str, approved_only: bool, limit: int):
+    """Describe a service from learned operational context."""
+    _header(f"Service Context: {service}")
+    _load_env()
+
+    from dashforge.signals import LearningIndexUnavailable, get_signal_store
+
+    try:
+        summary = get_signal_store().describe_service(
+            service,
+            include_candidates=not approved_only,
+            limit=limit,
+        )
+    except LearningIndexUnavailable as e:
+        _fail(str(e))
+        return
+    _info(f"Matched context rows: {summary.get('matched_context_rows', 0)}")
+    _info(f"Trusted rows: {summary.get('trusted_context_rows', 0)}")
+    _info(f"Candidate rows: {summary.get('candidate_context_rows', 0)}")
+
+    dashboards = summary.get("dashboards", [])
+    if dashboards:
+        _info("Dashboards:")
+        for dashboard in dashboards[:8]:
+            _info(
+                f"  • {dashboard.get('dashboard_title') or dashboard.get('dashboard_uid')} "
+                f"({dashboard.get('backend_name')}, {dashboard.get('review_state')})"
+            )
+
+    metrics = summary.get("top_metrics", [])
+    if metrics:
+        _info("Metrics:")
+        for metric in metrics[:10]:
+            signals = ", ".join(metric.get("signal_types", [])) or "unclassified"
+            states = ", ".join(metric.get("review_states", []))
+            _info(f"  • {metric.get('metric')} → {signals} ({states})")
+
+    signals = summary.get("signals", {})
+    if signals:
+        _info("Signals:")
+        for signal, count in list(signals.items())[:10]:
+            _info(f"  • {signal}: {count}")
+
+
 # ── dashforge serve ──────────────────────────────────────────────────────────
 @cli.command()
 @click.option("--host", default="0.0.0.0", help="Bind host")

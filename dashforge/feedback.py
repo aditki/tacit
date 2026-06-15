@@ -34,6 +34,7 @@ def _sanitize_uid(uid: str) -> str:
 logger = structlog.get_logger()
 
 _DEFAULT_DB_PATH = Path("data/dashforge_feedback.db")
+_SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 
 def _db_path() -> Path:
@@ -88,9 +89,10 @@ class FeedbackStore:
 
     @contextmanager
     def _conn(self):
-        conn = sqlite3.connect(str(self._db_path))
+        conn = sqlite3.connect(str(self._db_path), timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
         try:
             yield conn
             conn.commit()
