@@ -611,6 +611,7 @@ See also:
 
 - [Operational Cognition design doc](docs/operational-cognition.md)
 - [Evaluation results](docs/evaluation.md)
+- [Architecture Decision Records](docs/adr/README.md)
 
 ### Completed
 
