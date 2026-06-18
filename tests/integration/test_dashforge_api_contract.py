@@ -183,5 +183,82 @@ def test_learn_dashboard_json_post_valid(client, temp_store, monkeypatch):
     assert body["backend"] == "grafana_json"
     assert body["status"] == "pending"
     assert "http_requests_total" in body["metrics_found"]
+    assert body["signal_quality"]["metrics_total"] == 1
+    assert "recognized_metrics_before_learning" in body["learning_impact"]
     stored = temp_store.get_ingested_dashboard("checkout-upload", backend_name="grafana_json")
     assert stored is not None
+
+    listed = client.get("/api/v1/learn/dashboards")
+    assert listed.status_code == 200
+    dashboard = listed.json()["dashboards"][0]
+    assert dashboard["signal_quality"]["metrics_total"] == 1
+    assert "learning_impact" in dashboard
+
+
+def test_list_ingested_dashboards_handles_legacy_string_signals(client, temp_store):
+    temp_store.record_ingested_dashboard(
+        "legacy-signals",
+        backend_name="grafana",
+        metrics_found=["legacy_metric_total"],
+        signals_inferred=["request_rate", "error_rate"],
+        status="pending",
+    )
+
+    resp = client.get("/api/v1/learn/dashboards")
+
+    assert resp.status_code == 200
+    dashboard = resp.json()["dashboards"][0]
+    assert dashboard["signals_inferred"] == ["request_rate", "error_rate"]
+    assert dashboard["signal_quality"]["legacy_signals"] == 2
+    assert dashboard["learning_impact"]["unresolved_metrics"] == ["legacy_metric_total"]
+
+
+def test_learning_search_and_service_summary(client, temp_store):
+    if not temp_store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+
+    temp_store.index_dashboard_context(
+        dashboard_uid="checkout-dash",
+        backend_name="grafana_json",
+        dashboard_title="Checkout Service Health",
+        dashboard_tags=["service:checkout"],
+        panels=[
+            {
+                "title": "Checkout latency",
+                "queries": ['histogram_quantile(0.95, checkout_custom_latency_ms{service="checkout"})'],
+                "metrics": ["checkout_custom_latency_ms"],
+            }
+        ],
+        metrics_found=["checkout_custom_latency_ms"],
+        signals_inferred=[
+            {
+                "signal_type": "request_latency",
+                "metric": "checkout_custom_latency_ms",
+                "source": "heuristic",
+                "confidence": 0.87,
+                "auto_teach_eligible": True,
+                "reason": "Panel title and metric name indicate latency",
+            }
+        ],
+        status="approved",
+    )
+
+    search = client.get("/api/v1/learning/search?q=checkout%20latency&service=checkout&include_candidates=false")
+    assert search.status_code == 200
+    assert search.json()["count"] == 1
+    assert search.json()["results"][0]["metric_name"] == "checkout_custom_latency_ms"
+
+    service = client.get("/api/v1/services/checkout?include_candidates=false")
+    assert service.status_code == 200
+    body = service.json()
+    assert body["trusted_context_rows"] == 1
+    assert body["top_metrics"][0]["metric"] == "checkout_custom_latency_ms"
+
+
+def test_learning_search_reports_unavailable_fts(client, temp_store, monkeypatch):
+    monkeypatch.setattr(temp_store, "_learning_index_available", lambda: False)
+
+    resp = client.get("/api/v1/learning/search?q=checkout")
+
+    assert resp.status_code == 503
+    assert "SQLite FTS5" in resp.json()["detail"]

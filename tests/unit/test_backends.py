@@ -416,6 +416,32 @@ def test_signalfx_backend_close():
     print("[PASS] test_signalfx_backend_close")
 
 
+def test_signalfx_backend_list_dashboards_reads_dashboard_configs():
+    from dashforge.backends.signalfx import SignalFxBackend
+
+    mock_client = AsyncMock()
+    mock_client.list_dashboard_groups.return_value = {
+        "results": [
+            {
+                "name": "Checkout Group",
+                "dashboardConfigs": [
+                    {"dashboardId": "dash-1", "name": "Checkout Health"},
+                    {"dashboardId": "dash-2", "dashboardName": "Checkout Errors"},
+                ],
+            }
+        ]
+    }
+    backend = SignalFxBackend(client=mock_client)
+
+    dashboards = asyncio.run(backend.list_dashboards(limit=10))
+
+    assert dashboards == [
+        {"uid": "dash-1", "title": "Checkout Health", "folder": "Checkout Group", "backend": "signalfx"},
+        {"uid": "dash-2", "title": "Checkout Errors", "folder": "Checkout Group", "backend": "signalfx"},
+    ]
+    print("[PASS] test_signalfx_backend_list_dashboards_reads_dashboard_configs")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 14. GrafanaBackend — discover returns empty when no searchable datasources
 # ═══════════════════════════════════════════════════════════════════════════

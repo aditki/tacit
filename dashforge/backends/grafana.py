@@ -161,6 +161,29 @@ class GrafanaBackend:
             panels=extracted["panels"],
         )
 
+    async def list_dashboards(self, limit: int = 500) -> list[dict]:
+        """List Grafana dashboards discoverable by the configured token."""
+        raw = await self._client._get(
+            "/api/search",
+            params={"type": "dash-db", "limit": limit},
+        )
+        dashboards = raw if isinstance(raw, list) else []
+        out: list[dict] = []
+        for item in dashboards:
+            uid = item.get("uid") if isinstance(item, dict) else ""
+            if not uid:
+                continue
+            out.append(
+                {
+                    "uid": uid,
+                    "title": item.get("title", ""),
+                    "folder": item.get("folderTitle", ""),
+                    "url": item.get("url", ""),
+                    "backend": self.name,
+                }
+            )
+        return out[:limit]
+
     # ── Cleanup ───────────────────────────────────────────────────────
 
     async def close(self) -> None:

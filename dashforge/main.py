@@ -9,7 +9,7 @@ from pathlib import Path
 
 import structlog
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -616,6 +616,37 @@ async def learn_from_dashboard_json(request: LearnDashboardUploadRequest):
         )
 
 
+@app.post(
+    "/api/v1/learn/{backend_name}",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Learning"],
+    summary="Crawl and learn from all dashboards in a backend",
+    response_description="Bulk dashboard learning summary",
+)
+async def learn_backend(
+    backend_name: str = PathParam(description="Backend name: grafana or signalfx"),
+    auto_approve: bool = Query(False, description="Immediately approve eligible inferred mappings"),
+    limit: int = Query(500, ge=1, le=5000, description="Maximum dashboards to crawl"),
+):
+    """Crawl a connected backend and persist learned dashboard context."""
+    from dashforge.dashboard_ingest import learn_backend_dashboards
+
+    try:
+        return await learn_backend_dashboards(
+            backend_name=backend_name,
+            auto_approve=auto_approve,
+            limit=limit,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("backend_learning_failed", backend=backend_name)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to learn dashboards from backend '{backend_name}'. Check backend connectivity.",
+        )
+
+
 @app.get(
     "/api/v1/learn/dashboards",
     dependencies=[Depends(verify_api_key)],
@@ -630,11 +661,77 @@ async def list_ingested_dashboards(
     """List dashboards that have been ingested for learning.
 
     Filter by status: 'pending', 'approved', or 'rejected'."""
+    from dashforge.dashboard_ingest import build_learning_impact_report, build_signal_quality_report
     from dashforge.signals import get_signal_store
 
     store = get_signal_store()
     dashboards = store.list_ingested_dashboards(status=status, limit=limit)
+    for dashboard in dashboards:
+        metrics = dashboard.get("metrics_found", [])
+        signals = dashboard.get("signals_inferred", [])
+        if isinstance(metrics, list) and isinstance(signals, list):
+            dashboard["signal_quality"] = build_signal_quality_report(metrics=metrics, signals=signals)
+            dashboard["learning_impact"] = build_learning_impact_report(
+                metrics=metrics,
+                signals=signals,
+                approved=dashboard.get("status") == "approved",
+            )
     return {"count": len(dashboards), "dashboards": dashboards}
+
+
+@app.get(
+    "/api/v1/learning/search",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Learning"],
+    summary="Search learned operational context",
+    response_description="FTS-ranked learned context rows",
+)
+async def search_learning_context(
+    q: str = Query(..., min_length=1),
+    service: str = "",
+    include_candidates: bool = True,
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Search learned dashboard/panel/metric context."""
+    from dashforge.signals import LearningIndexUnavailable, get_signal_store
+
+    store = get_signal_store()
+    try:
+        rows = store.search_learning_context(
+            q,
+            service=service,
+            include_candidates=include_candidates,
+            limit=limit,
+        )
+    except LearningIndexUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"query": q, "count": len(rows), "results": rows}
+
+
+@app.get(
+    "/api/v1/services/{service_name}",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Learning"],
+    summary="Describe a service from learned operational context",
+    response_description="Service-level learned dashboards, metrics, panels, and signals",
+)
+async def describe_service(
+    service_name: str = PathParam(description="Service/component name to describe"),
+    include_candidates: bool = True,
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Answer “what do we know about this service?” from learned context."""
+    from dashforge.signals import LearningIndexUnavailable, get_signal_store
+
+    store = get_signal_store()
+    try:
+        return store.describe_service(
+            service_name,
+            include_candidates=include_candidates,
+            limit=limit,
+        )
+    except LearningIndexUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @app.post(
@@ -649,79 +746,17 @@ async def approve_ingested_dashboard(dashboard_uid: str, backend: str | None = N
 
     This creates signal-to-metric mappings from the inferred signals with
     provenance tracking back to the source dashboard."""
+    from dashforge.dashboard_ingest import approve_ingested_dashboard_record
     from dashforge.signals import get_signal_store
 
-    store = get_signal_store()
-    backend_name = backend
-
-    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend_name)
-    if ingested is None:
+    try:
+        return approve_ingested_dashboard_record(
+            dashboard_uid=dashboard_uid,
+            backend_name=backend,
+            store=get_signal_store(),
+        )
+    except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")
-
-    if ingested["status"] != "pending":
-        return {"message": f"Dashboard already {ingested['status']}"}
-
-    # Create signal mappings from inferred signals
-    mappings_created = 0
-    source_ref = f"{ingested['backend_name']}:{dashboard_uid}" if ingested.get("backend_name") else dashboard_uid
-    for sig in ingested.get("signals_inferred", []):
-        # Support both old format (plain signal type string) and new format
-        # (dict with signal_type, metric, confidence)
-        if isinstance(sig, dict):
-            from dashforge.dashboard_ingest import persist_inferred_signal_review
-
-            if persist_inferred_signal_review(
-                store=store,
-                sig=sig,
-                source_ref=source_ref,
-                dashboard_uid=dashboard_uid,
-                backend_name=ingested.get("backend_name", ""),
-            ):
-                mappings_created += 1
-        else:
-            # Legacy: plain string signal type — fall back to pattern matching
-            signal_type = sig
-            for metric in ingested.get("metrics_found", []):
-                from dashforge.signals import _metric_matches_pattern
-
-                signal_data = store.get_signal_type(signal_type)
-                if signal_data:
-                    for mapping in signal_data.get("mappings", []):
-                        if _metric_matches_pattern(metric, mapping["metric_pattern"]):
-                            store.add_mapping(
-                                signal_type=signal_type,
-                                metric_pattern=metric,
-                                confidence=mapping.get("confidence", 0.6),
-                                source_type="dashboard_ingest",
-                                source_refs=[source_ref],
-                            )
-                            mappings_created += 1
-                            break
-
-    store.approve_ingested_dashboard(dashboard_uid, backend_name=backend_name)
-
-    # Optionally register the generated archetype into the active override file
-    # and hot-reload, so approve makes it show up + routable (compounding).
-    archetype_registered = False
-    if settings.learning_auto_register_archetype and ingested.get("archetype_generated"):
-        from dashforge.archetypes.templates import append_archetype_to_yaml
-
-        try:
-            written = append_archetype_to_yaml(ingested["archetype_generated"])
-            archetype_registered = written is not None
-            if not archetype_registered:
-                logger.warning("archetype_autoregister_skipped", reason="no DASHFORGE_ARCHETYPES_PATH set")
-        except Exception:
-            logger.exception("archetype_autoregister_failed", uid=dashboard_uid)
-
-    return {
-        "dashboard_uid": dashboard_uid,
-        "backend_name": ingested.get("backend_name", ""),
-        "status": "approved",
-        "mappings_created": mappings_created,
-        "archetype_registered": archetype_registered,
-        "message": f"Dashboard approved, {mappings_created} signal mapping(s) created",
-    }
 
 
 @app.post(
@@ -737,43 +772,19 @@ async def reject_ingested_dashboard(dashboard_uid: str, backend: str | None = No
     Rejecting does not create mappings. Heuristic candidates are retained as
     negative examples so the inference rules can be audited or tuned later.
     """
+    from dashforge.dashboard_ingest import reject_ingested_dashboard_record
     from dashforge.signals import get_signal_store
 
-    store = get_signal_store()
-    backend_name = backend
-    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend_name)
-    if ingested is None:
+    try:
+        return reject_ingested_dashboard_record(
+            dashboard_uid=dashboard_uid,
+            backend_name=backend,
+            store=get_signal_store(),
+        )
+    except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")
-    if ingested["status"] != "pending":
-        return {"message": f"Dashboard already {ingested['status']}"}
-
-    rejected_candidates = 0
-    for sig in ingested.get("signals_inferred", []):
-        if isinstance(sig, dict) and sig.get("source") == "heuristic" and sig.get("metric"):
-            store.record_rejected_candidate(
-                metric=sig["metric"],
-                signal_family=sig.get("signal_family", ""),
-                signal_name=sig.get("signal_type", ""),
-                score=sig.get("score", 0.0),
-                margin=sig.get("margin", 0.0),
-                why_not="dashboard_rejected",
-                evidence=sig.get("evidence", []),
-                inference_version=sig.get("inference_version", ""),
-                dashboard_uid=dashboard_uid,
-                backend_name=ingested.get("backend_name", ""),
-            )
-            rejected_candidates += 1
-
-    if not store.reject_ingested_dashboard(dashboard_uid, backend_name=backend_name):
+    except RuntimeError:
         raise HTTPException(status_code=409, detail="Dashboard is no longer pending")
-
-    return {
-        "dashboard_uid": dashboard_uid,
-        "backend_name": ingested.get("backend_name", ""),
-        "status": "rejected",
-        "rejected_candidates": rejected_candidates,
-        "message": "Dashboard rejected; no mappings created",
-    }
 
 
 @app.post(

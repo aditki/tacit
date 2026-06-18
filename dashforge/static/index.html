@@ -837,6 +837,7 @@
       const signalChips = signals.slice(0, 20).map(s =>
         `<span class="signal-chip">${esc(s.signal_type)} <span style="opacity:0.6">${Math.round((s.confidence||0)*100)}%</span></span>`
       ).join('');
+      const quality = renderSignalQuality(data.signal_quality, data.learning_impact);
 
       return `
         <div class="result-card success" style="margin-top:1rem">
@@ -850,9 +851,41 @@
             <strong>${signals.length}</strong> signals inferred
           </div>
           <div class="ingest-metrics"><strong>Metrics:</strong> ${(data.metrics_found || []).map(m => `<code>${esc(m)}</code>`).join(', ')}</div>
+          ${quality}
           ${signalChips ? `<div class="ingest-signals">${signalChips}</div>` : ''}
           ${data.archetype_yaml ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Generated archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(data.archetype_yaml)}</pre></details>` : ''}
         </div>`;
+    }
+
+    function renderSignalQuality(quality, impact) {
+      if (!quality && !impact) return '';
+      const q = quality || {};
+      const i = impact || {};
+      const explanations = (q.explanations || []).slice(0, 12).map(e => `
+        <tr>
+          <td><code>${esc(e.metric || '')}</code></td>
+          <td>${esc(e.signal_type || '')}</td>
+          <td>${esc(e.source || '')}</td>
+          <td>${Math.round((e.confidence || 0) * 100)}%</td>
+          <td>${esc(e.review_state || '')}</td>
+          <td>${esc(e.reason || e.why_not_auto_taught || '')}</td>
+        </tr>
+      `).join('');
+      return `
+        <div class="ingest-meta" style="margin-top:0.6rem">
+          <strong>Learning impact:</strong>
+          ${i.active_mappings_before_learning ?? i.recognized_metrics_before_learning ?? 0} active before &middot;
+          ${i.candidate_mappings_pending_approval ?? 0} candidate pending approval &middot;
+          ${i.new_active_mappings_after_approval ?? 0} newly active &middot;
+          ${q.held_for_review ?? 0} held for review
+        </div>
+        ${explanations ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Signal inference reasons</summary>
+          <table style="width:100%;font-size:0.72rem;color:#9ca3af;margin-top:0.4rem;border-collapse:collapse">
+            <thead><tr><th align="left">Metric</th><th align="left">Signal</th><th align="left">Source</th><th align="left">Confidence</th><th align="left">Review</th><th align="left">Reason</th></tr></thead>
+            <tbody>${explanations}</tbody>
+          </table>
+        </details>` : ''}
+      `;
     }
 
     async function ingestDashboardJson() {
@@ -925,6 +958,7 @@
           const archetypeYaml = d.archetype_generated
             ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Generated archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(d.archetype_generated)}</pre></details>`
             : '';
+          const quality = renderSignalQuality(d.signal_quality, d.learning_impact);
           const reviewBtns = d.status === 'pending'
             ? `<button class="btn-sm btn-success review-dashboard-btn" data-dashboard-action="approve" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Approve</button>
                <button class="btn-sm review-dashboard-btn" data-dashboard-action="reject" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Reject</button>
@@ -943,6 +977,7 @@
                 ${(d.metrics_found || []).length} metrics
               </div>
               ${signals ? `<div class="ingest-signals">${signals}</div>` : ''}
+              ${quality}
               ${archetypeYaml}
             </div>`;
         }

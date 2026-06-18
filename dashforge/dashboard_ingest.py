@@ -23,15 +23,19 @@ store's taxonomy, and optionally auto-generates an archetype YAML snippet.
 from __future__ import annotations
 
 import re
+import threading
 from collections import defaultdict
 from typing import Any
 
 import promql_parser
 import structlog
+import yaml
 
+from dashforge.config import settings
 from dashforge.signals import get_signal_store
 
 logger = structlog.get_logger()
+_ARCHETYPE_REGISTRATION_LOCK = threading.Lock()
 
 # ── PromQL metric name extraction ────────────────────────────────────────────
 # Matches metric names in PromQL: word chars that look like identifiers.
@@ -561,9 +565,11 @@ def infer_signals_from_metrics(
 
     unmatched = [m for m in dict.fromkeys(metrics) if m not in matched_metrics]
     for sig in _infer_heuristic(unmatched, panel_data or []):
+        signal_type = _canonical_signal_type_for_heuristic(sig)
         inferred.append(
             {
-                "signal_type": sig.signal_name,
+                "signal_type": signal_type,
+                "raw_signal_type": sig.signal_name,
                 "metric": sig.metric,
                 "confidence": sig.confidence,
                 "score": sig.score,
@@ -582,6 +588,40 @@ def infer_signals_from_metrics(
 
     inferred.sort(key=lambda x: x["confidence"], reverse=True)
     return inferred
+
+
+def _canonical_signal_type_for_heuristic(sig: Any) -> str:
+    """Map heuristic families onto canonical signals used by archetypes."""
+    metric = sig.metric.lower()
+    family = sig.signal_family
+    if family == "latency":
+        if any(token in metric for token in ("db", "sql", "query")):
+            return "db_query_latency"
+        if "dns" in metric:
+            return "dns_latency"
+        return "request_latency"
+    if family == "errors":
+        if "dns" in metric:
+            return "dns_failures"
+        if any(token in metric for token in ("tls", "cert", "handshake")):
+            return "tls_handshake_failures"
+        return "error_rate"
+    if family == "traffic":
+        return "request_rate"
+    if family == "backlog":
+        if "lag" in metric:
+            return "consumer_lag"
+        return "queue_depth"
+    if family == "resource_usage":
+        if "cpu" in metric:
+            return "cpu_usage"
+        if "memory" in metric or "_mem_" in metric:
+            return "memory_usage"
+        if "disk" in metric:
+            return "disk_usage"
+    if family == "saturation":
+        return "in_flight_requests"
+    return sig.signal_name
 
 
 # ── Archetype generation ─────────────────────────────────────────────────────
@@ -797,10 +837,319 @@ def persist_inferred_signal_review(
     return False
 
 
+def register_generated_archetype_if_enabled(archetype_yaml: str, *, dashboard_uid: str = "") -> bool:
+    """Auto-register a generated archetype when learning compounding is enabled."""
+    if not settings.learning_auto_register_archetype or not archetype_yaml:
+        return False
+    from dashforge.archetypes.templates import append_archetype_to_yaml
+
+    try:
+        with _ARCHETYPE_REGISTRATION_LOCK:
+            written = append_archetype_to_yaml(archetype_yaml)
+        registered = written is not None
+        if not registered:
+            logger.warning(
+                "archetype_autoregister_skipped",
+                uid=dashboard_uid,
+                reason="no DASHFORGE_ARCHETYPES_PATH set",
+            )
+        return registered
+    except Exception:
+        logger.exception("archetype_autoregister_failed", uid=dashboard_uid)
+        return False
+
+
+def register_generated_archetypes_if_enabled(
+    archetype_yamls: list[str],
+    *,
+    dashboard_uid: str = "bulk",
+) -> bool:
+    """Auto-register multiple generated archetypes with one YAML write/reload."""
+    if not settings.learning_auto_register_archetype:
+        return False
+    items: list[dict[str, Any]] = []
+    for archetype_yaml in archetype_yamls:
+        doc = yaml.safe_load(archetype_yaml) or {}
+        for item in doc.get("archetypes", []) or []:
+            if isinstance(item, dict):
+                items.append(item)
+    if not items:
+        return False
+    return register_generated_archetype_if_enabled(
+        yaml.safe_dump({"archetypes": items}, sort_keys=False, width=120),
+        dashboard_uid=dashboard_uid,
+    )
+
+
+def _normalize_signal_records(signals: list[dict[str, Any]] | list[str]) -> list[dict[str, Any]]:
+    """Return signal records as dictionaries, preserving legacy string entries."""
+    normalized: list[dict[str, Any]] = []
+    for sig in signals:
+        if isinstance(sig, dict):
+            normalized.append(sig)
+        elif isinstance(sig, str):
+            normalized.append(
+                {
+                    "signal_type": sig,
+                    "metric": "",
+                    "confidence": 0.0,
+                    "source": "legacy",
+                    "reason": "Legacy ingested dashboard stored only the signal name.",
+                }
+            )
+    return normalized
+
+
+def approve_ingested_dashboard_record(
+    *,
+    dashboard_uid: str,
+    backend_name: str | None = None,
+    store: Any | None = None,
+) -> dict[str, Any]:
+    """Approve a pending ingested dashboard and activate learned artifacts."""
+    store = store or get_signal_store()
+    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend_name)
+    if ingested is None:
+        raise LookupError("Ingested dashboard not found")
+
+    if ingested["status"] != "pending":
+        return {
+            "dashboard_uid": dashboard_uid,
+            "backend_name": ingested.get("backend_name", ""),
+            "status": ingested["status"],
+            "mappings_created": 0,
+            "archetype_registered": False,
+            "message": f"Dashboard already {ingested['status']}",
+        }
+
+    mappings_created = 0
+    activated_pairs: set[tuple[str, str]] = set()
+    source_ref = f"{ingested['backend_name']}:{dashboard_uid}" if ingested.get("backend_name") else dashboard_uid
+    for sig in ingested.get("signals_inferred", []):
+        if isinstance(sig, dict):
+            if persist_inferred_signal_review(
+                store=store,
+                sig=sig,
+                source_ref=source_ref,
+                dashboard_uid=dashboard_uid,
+                backend_name=ingested.get("backend_name", ""),
+            ):
+                mappings_created += 1
+                activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
+        else:
+            from dashforge.signals import _metric_matches_pattern
+
+            signal_data = store.get_signal_type(sig)
+            if not signal_data:
+                continue
+            for metric in ingested.get("metrics_found", []):
+                for mapping in signal_data.get("mappings", []):
+                    if _metric_matches_pattern(metric, mapping["metric_pattern"]):
+                        store.add_mapping(
+                            signal_type=sig,
+                            metric_pattern=metric,
+                            confidence=mapping.get("confidence", 0.6),
+                            source_type="dashboard_ingest",
+                            source_refs=[source_ref],
+                            review_state="approved",
+                        )
+                        mappings_created += 1
+                        activated_pairs.add((metric, sig))
+                        break
+
+    store.approve_ingested_dashboard(
+        dashboard_uid,
+        backend_name=backend_name,
+        activated_pairs=activated_pairs,
+    )
+    archetype_registered = register_generated_archetype_if_enabled(
+        ingested.get("archetype_generated", ""),
+        dashboard_uid=dashboard_uid,
+    )
+
+    return {
+        "dashboard_uid": dashboard_uid,
+        "backend_name": ingested.get("backend_name", ""),
+        "status": "approved",
+        "mappings_created": mappings_created,
+        "archetype_registered": archetype_registered,
+        "message": f"Dashboard approved, {mappings_created} signal mapping(s) created",
+    }
+
+
+def reject_ingested_dashboard_record(
+    *,
+    dashboard_uid: str,
+    backend_name: str | None = None,
+    store: Any | None = None,
+) -> dict[str, Any]:
+    """Reject a pending ingested dashboard and persist heuristic negatives."""
+    store = store or get_signal_store()
+    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend_name)
+    if ingested is None:
+        raise LookupError("Ingested dashboard not found")
+
+    if ingested["status"] != "pending":
+        return {
+            "dashboard_uid": dashboard_uid,
+            "backend_name": ingested.get("backend_name", ""),
+            "status": ingested["status"],
+            "rejected_candidates": 0,
+            "message": f"Dashboard already {ingested['status']}",
+        }
+
+    rejected_candidates = 0
+    for sig in ingested.get("signals_inferred", []):
+        if isinstance(sig, dict) and sig.get("source") == "heuristic" and sig.get("metric"):
+            store.record_rejected_candidate(
+                metric=sig["metric"],
+                signal_family=sig.get("signal_family", ""),
+                signal_name=sig.get("signal_type", ""),
+                score=sig.get("score", 0.0),
+                margin=sig.get("margin", 0.0),
+                why_not="dashboard_rejected",
+                evidence=sig.get("evidence", []),
+                inference_version=sig.get("inference_version", ""),
+                dashboard_uid=dashboard_uid,
+                backend_name=ingested.get("backend_name", ""),
+            )
+            rejected_candidates += 1
+
+    if not store.reject_ingested_dashboard(dashboard_uid, backend_name=backend_name):
+        raise RuntimeError("Dashboard is no longer pending")
+
+    return {
+        "dashboard_uid": dashboard_uid,
+        "backend_name": ingested.get("backend_name", ""),
+        "status": "rejected",
+        "rejected_candidates": rejected_candidates,
+        "message": "Dashboard rejected; no mappings created",
+    }
+
+
+def build_signal_quality_report(
+    *,
+    metrics: list[str],
+    signals: list[dict[str, Any]] | list[str],
+) -> dict[str, Any]:
+    """Summarize how conservatively DashForge understood an ingested dashboard."""
+    metrics = list(dict.fromkeys(metrics))
+    signals = _normalize_signal_records(signals)
+    mapped_metrics = sorted({sig.get("metric", "") for sig in signals if sig.get("metric")})
+    taxonomy = [sig for sig in signals if sig.get("source") == "taxonomy"]
+    heuristic = [sig for sig in signals if sig.get("source") == "heuristic"]
+    legacy = [sig for sig in signals if sig.get("source") == "legacy"]
+    auto_teachable = [sig for sig in heuristic if sig.get("auto_teach_eligible")]
+    held_for_review = [sig for sig in heuristic if not sig.get("auto_teach_eligible")]
+
+    confidence_buckets = {
+        "high": sum(1 for sig in signals if sig.get("confidence", 0.0) >= 0.8),
+        "medium": sum(1 for sig in signals if 0.5 <= sig.get("confidence", 0.0) < 0.8),
+        "low": sum(1 for sig in signals if sig.get("confidence", 0.0) < 0.5),
+    }
+
+    return {
+        "metrics_total": len(metrics),
+        "metrics_mapped": len(mapped_metrics),
+        "metrics_unmapped": [metric for metric in metrics if metric not in mapped_metrics],
+        "taxonomy_matches": len(taxonomy),
+        "heuristic_candidates": len(heuristic),
+        "legacy_signals": len(legacy),
+        "auto_teach_eligible": len(auto_teachable),
+        "held_for_review": len(held_for_review),
+        "confidence_buckets": confidence_buckets,
+        "explanations": [
+            {
+                "signal_type": sig.get("signal_type", ""),
+                "metric": sig.get("metric", ""),
+                "confidence": sig.get("confidence", 0.0),
+                "source": sig.get("source", ""),
+                "review_state": (
+                    "trusted"
+                    if sig.get("source") == "taxonomy"
+                    else "eligible" if sig.get("auto_teach_eligible") else "review"
+                ),
+                "reason": sig.get("reason", ""),
+                "evidence": sig.get("evidence", []),
+                "why_not_auto_taught": sig.get("why_not_auto_taught", ""),
+            }
+            for sig in signals
+        ],
+    }
+
+
+def build_learning_impact_report(
+    *,
+    metrics: list[str],
+    signals: list[dict[str, Any]] | list[str],
+    approved: bool = False,
+) -> dict[str, Any]:
+    """Show what approval would change for future dashboard generation."""
+    signals = _normalize_signal_records(signals)
+    taxonomy_metrics = sorted(
+        {sig.get("metric", "") for sig in signals if sig.get("source") == "taxonomy" and sig.get("metric")}
+    )
+    teachable = [
+        sig
+        for sig in signals
+        if sig.get("metric")
+        and (
+            (sig.get("source") == "heuristic" and sig.get("auto_teach_eligible"))
+            or (sig.get("source") != "heuristic" and sig.get("confidence", 0.0) >= 0.5)
+        )
+    ]
+    teachable_metrics = sorted({sig.get("metric", "") for sig in teachable if sig.get("metric")})
+    before = len(taxonomy_metrics)
+    after = len(sorted(set(taxonomy_metrics) | set(teachable_metrics)))
+    candidate_metrics = [metric for metric in teachable_metrics if metric not in taxonomy_metrics]
+    active_after_approval = candidate_metrics if approved else []
+    unresolved = [
+        metric
+        for metric in dict.fromkeys(metrics)
+        if metric not in taxonomy_metrics and metric not in teachable_metrics
+    ]
+
+    return {
+        "recognized_metrics_before_learning": before,
+        "recognized_metrics_after_approval": after,
+        "active_mappings_before_learning": before,
+        "active_mappings_after_approval": before + len(active_after_approval),
+        "candidate_mappings_pending_approval": 0 if approved else len(candidate_metrics),
+        "new_active_mappings_after_approval": len(active_after_approval),
+        "new_mappings_available": len(candidate_metrics),
+        "newly_understood_metrics": [
+            {
+                "metric": sig.get("metric", ""),
+                "signal_type": sig.get("signal_type", ""),
+                "confidence": sig.get("confidence", 0.0),
+                "source": sig.get("source", ""),
+                "mapping_state": "approved" if approved else "candidate",
+                "reason": sig.get("reason", ""),
+            }
+            for sig in teachable
+            if sig.get("metric") in candidate_metrics
+        ],
+        "newly_active_metrics_after_approval": [
+            {
+                "metric": sig.get("metric", ""),
+                "signal_type": sig.get("signal_type", ""),
+                "confidence": sig.get("confidence", 0.0),
+                "source": sig.get("source", ""),
+                "mapping_state": "approved",
+                "reason": sig.get("reason", ""),
+            }
+            for sig in teachable
+            if sig.get("metric") in active_after_approval
+        ],
+        "unresolved_metrics": unresolved,
+    }
+
+
 async def ingest_dashboard_features(
     features: Any,
     *,
     auto_approve: bool = False,
+    register_archetype: bool = True,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted dashboard features."""
     extracted = _features_to_dict(features)
@@ -808,6 +1157,12 @@ async def ingest_dashboard_features(
     signals = infer_signals_from_metrics(
         features.metrics_found,
         features.panels,
+    )
+    signal_quality = build_signal_quality_report(metrics=features.metrics_found, signals=signals)
+    learning_impact = build_learning_impact_report(
+        metrics=features.metrics_found,
+        signals=signals,
+        approved=auto_approve,
     )
 
     archetype_yaml = generate_archetype_yaml(extracted, signals)
@@ -833,8 +1188,9 @@ async def ingest_dashboard_features(
         archetype_generated=archetype_yaml,
         status=status,
     )
-
     mappings_created = 0
+    archetype_registered = False
+    activated_pairs: set[tuple[str, str]] = set()
     if auto_approve:
         source_ref = (
             f"{features.backend_name}:{features.dashboard_uid}" if features.backend_name else features.dashboard_uid
@@ -848,6 +1204,12 @@ async def ingest_dashboard_features(
                 backend_name=features.backend_name,
             ):
                 mappings_created += 1
+                activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
+        if register_archetype:
+            archetype_registered = register_generated_archetype_if_enabled(
+                archetype_yaml,
+                dashboard_uid=features.dashboard_uid,
+            )
         logger.info(
             "dashboard_ingested_auto_approved",
             uid=features.dashboard_uid,
@@ -855,6 +1217,7 @@ async def ingest_dashboard_features(
             metrics=len(features.metrics_found),
             signals=len(signals),
             mappings_created=mappings_created,
+            archetype_registered=archetype_registered,
         )
     else:
         logger.info(
@@ -864,6 +1227,18 @@ async def ingest_dashboard_features(
             metrics=len(features.metrics_found),
             signals=len(signals),
         )
+
+    indexed_context_rows = store.index_dashboard_context(
+        dashboard_uid=features.dashboard_uid,
+        backend_name=features.backend_name,
+        dashboard_title=features.dashboard_title,
+        dashboard_tags=features.dashboard_tags,
+        panels=features.panels,
+        metrics_found=features.metrics_found,
+        signals_inferred=signals,
+        status=status,
+        activated_pairs=activated_pairs if auto_approve else None,
+    )
 
     result = {
         "dashboard_uid": features.dashboard_uid,
@@ -880,10 +1255,14 @@ async def ingest_dashboard_features(
         "alert_links": features.alert_links,
         "drilldown_links": features.drilldown_links,
         "signals_inferred": signals,
+        "signal_quality": signal_quality,
+        "learning_impact": learning_impact,
+        "indexed_context_rows": indexed_context_rows,
         "archetype_yaml": archetype_yaml,
     }
     if auto_approve:
         result["mappings_created"] = mappings_created
+        result["archetype_registered"] = archetype_registered
     return result
 
 
@@ -892,6 +1271,7 @@ async def ingest_dashboard(
     backend: Any | None = None,
     backend_name: str = "",
     auto_approve: bool = False,
+    register_archetype: bool = True,
 ) -> dict[str, Any]:
     """Full ingestion pipeline: fetch → extract → infer signals → store.
 
@@ -947,9 +1327,118 @@ async def ingest_dashboard(
         # Delegate fetch + parse to the backend (vendor-specific)
         features: DashboardFeatures = await backend.ingest_dashboard(dashboard_uid)
 
-        return await ingest_dashboard_features(features, auto_approve=auto_approve)
+        return await ingest_dashboard_features(
+            features,
+            auto_approve=auto_approve,
+            register_archetype=register_archetype,
+        )
 
     finally:
         if own_backends:
             for b in all_backends:
                 await b.close()
+
+
+async def learn_backend_dashboards(
+    backend_name: str,
+    *,
+    auto_approve: bool = False,
+    limit: int = 500,
+) -> dict[str, Any]:
+    """Crawl a backend and learn from every discoverable dashboard."""
+    import asyncio
+
+    from dashforge.backends import get_active_backends
+
+    all_backends = get_active_backends()
+    if not all_backends:
+        raise RuntimeError("No active backends configured for dashboard learning")
+
+    try:
+        matched = [b for b in all_backends if b.name == backend_name]
+        if not matched:
+            available = [b.name for b in all_backends]
+            raise ValueError(f"Backend '{backend_name}' not found. Available: {available}")
+        backend = matched[0]
+        dashboards = await backend.list_dashboards(limit=limit)
+
+        learned: list[dict[str, Any]] = []
+        failures: list[dict[str, str]] = []
+        totals = {
+            "dashboards_discovered": len(dashboards),
+            "dashboards_learned": 0,
+            "dashboards_failed": 0,
+            "metrics_found": 0,
+            "signals_inferred": 0,
+            "indexed_context_rows": 0,
+            "mappings_created": 0,
+        }
+
+        sem = asyncio.Semaphore(max(1, settings.adapter_max_concurrent))
+
+        async def learn_one(item: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+            uid = item.get("uid", "")
+            if not uid:
+                return None, None
+            try:
+                async with sem:
+                    result = await ingest_dashboard(
+                        uid,
+                        backend=backend,
+                        auto_approve=auto_approve,
+                        register_archetype=not auto_approve,
+                    )
+                return (
+                    {
+                        "dashboard_uid": result.get("dashboard_uid", uid),
+                        "dashboard_title": result.get("dashboard_title", item.get("title", "")),
+                        "status": result.get("status", "pending"),
+                        "metrics_found": len(result.get("metrics_found", [])),
+                        "signals_inferred": len(result.get("signals_inferred", [])),
+                        "indexed_context_rows": result.get("indexed_context_rows", 0),
+                        "mappings_created": result.get("mappings_created", 0),
+                        "archetype_registered": result.get("archetype_registered", False),
+                        "archetype_yaml": result.get("archetype_yaml", ""),
+                    },
+                    None,
+                )
+            except Exception as exc:
+                return None, {"dashboard_uid": uid, "title": item.get("title", ""), "error": str(exc)}
+
+        results = await asyncio.gather(*(learn_one(item) for item in dashboards))
+        for learned_item, failure in results:
+            if learned_item is not None:
+                learned.append(learned_item)
+                totals["dashboards_learned"] += 1
+                totals["metrics_found"] += int(learned_item.get("metrics_found", 0) or 0)
+                totals["signals_inferred"] += int(learned_item.get("signals_inferred", 0) or 0)
+                totals["indexed_context_rows"] += int(learned_item.get("indexed_context_rows", 0) or 0)
+                totals["mappings_created"] += int(learned_item.get("mappings_created", 0) or 0)
+            if failure is not None:
+                failures.append(failure)
+                totals["dashboards_failed"] += 1
+
+        if auto_approve:
+            archetype_yamls = [str(item.get("archetype_yaml", "")) for item in learned if item.get("archetype_yaml")]
+            archetype_registered = register_generated_archetypes_if_enabled(
+                archetype_yamls,
+                dashboard_uid=f"{backend_name}:bulk",
+            )
+            if archetype_registered:
+                for item in learned:
+                    if item.get("archetype_yaml"):
+                        item["archetype_registered"] = True
+            totals["archetypes_registered"] = len(archetype_yamls) if archetype_registered else 0
+        else:
+            totals["archetypes_registered"] = 0
+
+        return {
+            "backend": backend_name,
+            "auto_approve": auto_approve,
+            **totals,
+            "learned": learned,
+            "failures": failures,
+        }
+    finally:
+        for backend in all_backends:
+            await backend.close()
