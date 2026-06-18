@@ -21,4 +21,4 @@ production-readiness claims.
 | [ADR-011](011-logs-traces-as-evidence-types.md) | Logs and traces should be introduced as evidence types | Deferred | Future work |
 | [ADR-012](012-lightweight-service-context.md) | Service context is a lightweight bridge toward operational memory | Proposed | Not implemented |
 | [ADR-013](013-adoption-time-to-value-and-trust.md) | Adoption depends on time-to-value and trust, not more agents | Accepted | Partially implemented |
-
+| [ADR-014](014-dashforge-is-not-a-system-of-record.md) | DashForge Is Not a System of Record | Accepted | Partially implemented |
