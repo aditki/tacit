@@ -1,0 +1,25 @@
+schema_version: 1
+scenario_id: clickstack-payment-cache
+dataset: clickstack-sample
+source:
+  url: https://storage.googleapis.com/hyperdx/sample.tar.gz
+  documentation: https://clickhouse.com/docs/use-cases/observability/clickstack/getting-started/sample-data
+  license: Apache-2.0
+prompt: >-
+  Investigate the ClickStack payment cache saturation incident. Show the Visa
+  validation cache size, payment transaction rate, Redis memory, cache hit
+  ratio, evictions, and client pressure using the real imported telemetry.
+ground_truth:
+  fault_types:
+    - cache_saturation
+    - error_spike
+  affected_services:
+    - checkout
+    - payment
+  root_cause_services:
+    - payment
+  root_cause_summary: Visa validation cache reached its maximum size in the payment service.
+expected_signals:
+  - visa_validation_cache.size
+  - error_rate
+  - request_latency

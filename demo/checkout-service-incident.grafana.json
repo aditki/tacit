@@ -1,0 +1,224 @@
+{
+  "dashboard": {
+    "uid": "checkout-service-incident",
+    "title": "Checkout Service Incident Response",
+    "tags": [
+      "checkout",
+      "service",
+      "incident",
+      "learned"
+    ],
+    "panels": [
+      {
+        "id": 1,
+        "type": "timeseries",
+        "title": "Request throughput",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prom-e2e"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "reqps"
+          }
+        },
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total{service=\"checkout-service\"}[5m])) by (status)",
+            "legendFormat": "{{status}}",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prom-e2e"
+            }
+          }
+        ],
+        "gridPos": {
+          "x": 0,
+          "y": 0,
+          "w": 12,
+          "h": 8
+        }
+      },
+      {
+        "id": 2,
+        "type": "timeseries",
+        "title": "5xx error rate",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prom-e2e"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "reqps"
+          }
+        },
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total{service=\"checkout-service\",status=~\"5..\"}[5m])) by (path)",
+            "legendFormat": "{{path}}",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prom-e2e"
+            }
+          }
+        ],
+        "gridPos": {
+          "x": 12,
+          "y": 0,
+          "w": 12,
+          "h": 8
+        }
+      },
+      {
+        "id": 3,
+        "type": "timeseries",
+        "title": "P95 request latency",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prom-e2e"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          }
+        },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service=\"checkout-service\"}[5m])) by (le,path))",
+            "legendFormat": "p95 {{path}}",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prom-e2e"
+            }
+          }
+        ],
+        "gridPos": {
+          "x": 0,
+          "y": 8,
+          "w": 12,
+          "h": 8
+        }
+      },
+      {
+        "id": 4,
+        "type": "timeseries",
+        "title": "In-flight requests",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prom-e2e"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          }
+        },
+        "targets": [
+          {
+            "expr": "http_requests_in_flight{service=\"checkout-service\"}",
+            "legendFormat": "{{instance}}",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prom-e2e"
+            }
+          }
+        ],
+        "gridPos": {
+          "x": 12,
+          "y": 8,
+          "w": 12,
+          "h": 8
+        }
+      },
+      {
+        "id": 5,
+        "type": "timeseries",
+        "title": "DB query latency",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prom-e2e"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          }
+        },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(db_query_duration_seconds_bucket{service=\"checkout-service\",database=\"orders_db\"}[5m])) by (le,operation))",
+            "legendFormat": "p95 {{operation}}",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prom-e2e"
+            }
+          }
+        ],
+        "gridPos": {
+          "x": 0,
+          "y": 16,
+          "w": 12,
+          "h": 8
+        }
+      },
+      {
+        "id": 6,
+        "type": "timeseries",
+        "title": "CPU usage",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prom-e2e"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          }
+        },
+        "targets": [
+          {
+            "expr": "process_cpu_usage_ratio{service=\"checkout-service\"}",
+            "legendFormat": "{{service}}",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prom-e2e"
+            }
+          }
+        ],
+        "gridPos": {
+          "x": 12,
+          "y": 16,
+          "w": 12,
+          "h": 8
+        }
+      },
+      {
+        "id": 7,
+        "type": "timeseries",
+        "title": "Memory working set",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prom-e2e"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "bytes"
+          }
+        },
+        "targets": [
+          {
+            "expr": "process_memory_bytes{service=\"checkout-service\"}",
+            "legendFormat": "{{service}}",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prom-e2e"
+            }
+          }
+        ],
+        "gridPos": {
+          "x": 0,
+          "y": 24,
+          "w": 12,
+          "h": 8
+        }
+      }
+    ]
+  }
+}

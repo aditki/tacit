@@ -215,7 +215,15 @@ class FeedbackStore:
         with self._conn() as conn:
             total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
             if total == 0:
-                return {"total_feedback": 0}
+                return {
+                    "total_feedback": 0,
+                    "total_dashboards": 0,
+                    "useful_rate": None,
+                    "avg_symptom_visibility": None,
+                    "avg_root_cause_support": None,
+                    "avg_noise_level": None,
+                    "avg_investigation_speed": None,
+                }
 
             row = conn.execute("""
                 SELECT

@@ -41,6 +41,29 @@ services:
     depends_on:
       - fake-app
 
+  # Historical/imported metrics for real-dataset evaluation. Grafana sees this
+  # through its standard Prometheus datasource API.
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.144.0
+    ports:
+      - "8428:8428"
+    command:
+      - "-storageDataPath=/victoria-metrics-data"
+      - "-retentionPeriod=30d"
+    volumes:
+      - victoriametrics_data:/victoria-metrics-data
+
+  # M1 accepts metrics only. Logs and traces are added in the multimodal milestone.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.153.0
+    command: ["--config=/etc/otelcol-contrib/config.yml"]
+    ports:
+      - "4318:4318"
+    volumes:
+      - ./dev/otel-collector/config.yml:/etc/otelcol-contrib/config.yml:ro
+    depends_on:
+      - victoriametrics
+
   # ── DashForge ─────────────────────────────────────────────────────────
   dashforge:
     build: .
@@ -52,11 +75,15 @@ services:
     environment:
       GRAFANA_URL: http://grafana:3000
       SSL_CERT_FILE: ""
+      # The demo intentionally proves the review -> reuse loop in one session.
+      LEARNING_AUTO_REGISTER_ARCHETYPE: "true"
+      DASHFORGE_ARCHETYPES_PATH: /app/data/demo-archetypes.yaml
     volumes:
       - dashforge_data:/app/data
     depends_on:
       - grafana
       - prometheus
+      - victoriametrics
     # Uncomment below if using something like ollama on the host and want to access it from the container
     # extra_hosts:
     #  - "host.docker.internal:host-gateway" # use "http://host.docker.internal:11434" in .env for LLM_API_BASE
@@ -64,3 +91,4 @@ services:
 volumes:
   dashforge_data:
   grafana_data:
+  victoriametrics_data:
