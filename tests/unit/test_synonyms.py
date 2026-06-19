@@ -52,6 +52,19 @@ def test_colloquial_metaphors_do_not_inject():
     assert "cache" not in expand_operational_terms("did key churn hurt the request path")
 
 
+def test_colloquial_tier_phrase_masks_embedded_memory_keyword():
+    evidence = operational_evidence("the in-memory tier looks unhealthy")
+
+    assert "memory" not in high_confidence_keywords("the in-memory tier looks unhealthy")
+    assert any(item.keyword == "cache" and item.tier == "colloquial" for item in evidence)
+
+
+def test_standalone_memory_outside_colloquial_phrase_still_injects():
+    keywords = high_confidence_keywords("the memory tier has high process memory usage")
+
+    assert "memory" in keywords
+
+
 def test_colloquial_surfaces_as_scored_evidence_with_provenance():
     ev = operational_evidence("the fast-data layer was squeezed")
     by_kw = {e.keyword: e for e in ev}

@@ -94,3 +94,55 @@ def test_shared_promql_metric_routes_to_datasource_with_requested_service():
     dashboard = compile_archetype(archetype, intent, catalog)
 
     assert dashboard.panels[0].queries[0].datasource_uid == "checkout-prom"
+
+
+def test_multi_metric_query_routes_when_one_datasource_owns_all_metrics():
+    archetype = InvestigationArchetype(
+        id="ratio-test",
+        name="Ratio test",
+        problem_types=["errors"],
+        required_metrics=["request_errors_total", "requests_total"],
+        panels=[
+            PanelTemplate(
+                title="Error ratio",
+                queries=[QueryTemplate(expr="request_errors_total / requests_total")],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="inspect errors",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["errors"],
+        timerange="1h",
+        problem_type="errors",
+        archetypes=[ArchetypeMatch(type="errors", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name="unrelated_metric",
+            datasource_uid="default-prom",
+            datasource_name="Default",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+        MetricEntry(
+            name="request_errors_total",
+            datasource_uid="service-prom",
+            datasource_name="Service",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+        MetricEntry(
+            name="requests_total",
+            datasource_uid="service-prom",
+            datasource_name="Service",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    assert dashboard.panels[0].queries[0].datasource_uid == "service-prom"

@@ -189,9 +189,21 @@ def _resolve_promql_query_target(
         ]
         if len(candidates) == 1:
             return QueryTarget.from_metric(candidates[0])
+
+        owners_by_metric = {
+            metric: {entry.datasource_uid for entry in candidates if entry.name == metric} for metric in metric_names
+        }
+        if owners_by_metric and all(owners_by_metric.values()):
+            common_owners = set.intersection(*owners_by_metric.values())
+            if len(common_owners) == 1:
+                owner = next(iter(common_owners))
+                return QueryTarget.from_metric(next(entry for entry in candidates if entry.datasource_uid == owner))
+
         service_candidates = [entry for entry in candidates if metric_matches_services(entry, intent.services)]
-        if len(service_candidates) == 1:
-            return QueryTarget.from_metric(service_candidates[0])
+        service_owners = {entry.datasource_uid for entry in service_candidates}
+        if len(service_owners) == 1:
+            owner = next(iter(service_owners))
+            return QueryTarget.from_metric(next(entry for entry in service_candidates if entry.datasource_uid == owner))
     return default_target
 
 
@@ -773,19 +785,15 @@ def _archetype_live_coverage(
             except Exception:
                 pass
     for required_metric in required_metrics:
-        try:
-            if any(
-                re.fullmatch(required_metric, name)
-                or any(
-                    name.endswith(suffix) and re.fullmatch(required_metric, name[: -len(suffix)])
-                    for suffix in _PROMETHEUS_HISTOGRAM_SUFFIXES
-                )
-                for name in catalog_names
-            ):
-                resolved += 1
-        except re.error:
-            if required_metric in catalog_names:
-                resolved += 1
+        if any(
+            name == required_metric
+            or any(
+                name.endswith(suffix) and name[: -len(suffix)] == required_metric
+                for suffix in _PROMETHEUS_HISTOGRAM_SUFFIXES
+            )
+            for name in catalog_names
+        ):
+            resolved += 1
 
     return resolved / (len(signals) + len(required_metrics))
 

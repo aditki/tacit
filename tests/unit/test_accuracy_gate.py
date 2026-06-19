@@ -199,6 +199,29 @@ async def test_validation_skips_non_prometheus_grafana_queries():
 
 
 @pytest.mark.asyncio
+async def test_validation_probes_prometheus_datasource_despite_language_mismatch():
+    client = AsyncMock()
+    client.datasource_proxy_get.return_value = {
+        "status": "error",
+        "errorType": "bad_data",
+        "error": "parse error",
+    }
+    query = PanelQuery(
+        expr='{service_name="checkout"} |= "error"',
+        datasource_uid="prom",
+        datasource_type="prometheus",
+        query_language="logql",
+    )
+    catalog = [_metric("http_requests_total", "prom")]
+
+    filtered, warnings = await validate_dashboard_queries(client, _dashboard(query), catalog)
+
+    assert filtered.panels == []
+    assert any("invalid syntax" in warning for warning in warnings)
+    client.datasource_proxy_get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_prometheus_http_422_is_reported_as_syntax_error():
     client = AsyncMock()
     request = httpx.Request("GET", "https://grafana.test/query")
@@ -311,6 +334,32 @@ def test_archetype_ranking_includes_required_metrics_without_signals():
     )
 
     assert ranked[0][0].id == "covered-required-metrics"
+
+
+def test_archetype_coverage_treats_required_metric_as_literal():
+    dotted = InvestigationArchetype(
+        id="dotted",
+        name="dotted",
+        problem_types=["dotted"],
+        required_metrics=["cpu.utilization"],
+        panels=[PanelTemplate(title="CPU", queries=[QueryTemplate(expr="cpu.utilization")])],
+        tags=["auto-generated"],
+    )
+    covered = InvestigationArchetype(
+        id="covered",
+        name="covered",
+        problem_types=["covered"],
+        required_metrics=["real_metric"],
+        panels=[PanelTemplate(title="Real", queries=[QueryTemplate(expr="real_metric")])],
+    )
+
+    ranked = rank_archetypes_by_coverage(
+        [(dotted, 0.99), (covered, 0.60)],
+        [_metric("cpuXutilization"), _metric("real_metric")],
+        max_archetypes=1,
+    )
+
+    assert ranked[0][0].id == "covered"
 
 
 @pytest.mark.parametrize("suffix", ["_bucket", "_sum", "_count"])

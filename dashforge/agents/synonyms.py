@@ -198,12 +198,23 @@ def operational_evidence(text: str) -> list[SynonymEvidence]:
     only its highest-scoring occurrence.
     """
     best: dict[str, SynonymEvidence] = {}
-    for patterns, tier, score in (
-        (_CONVENTIONAL_C, "conventional", _CONVENTIONAL_SCORE),
-        (_COLLOQUIAL_C, "colloquial", _COLLOQUIAL_SCORE),
+
+    # Colloquial phrases can contain otherwise conventional words (for example
+    # "in-memory tier"). Mask those spans before conventional matching so the
+    # embedded word cannot bypass the lower-confidence confirmation gate. A
+    # separate standalone occurrence elsewhere in the prompt still matches.
+    masked = list(text)
+    for pattern, _ in _COLLOQUIAL_C:
+        for match in pattern.finditer(text):
+            masked[match.start() : match.end()] = " " * (match.end() - match.start())
+    conventional_text = "".join(masked)
+
+    for patterns, tier, score, source_text in (
+        (_CONVENTIONAL_C, "conventional", _CONVENTIONAL_SCORE, conventional_text),
+        (_COLLOQUIAL_C, "colloquial", _COLLOQUIAL_SCORE, text),
     ):
         for pattern, kws in patterns:
-            m = pattern.search(text)
+            m = pattern.search(source_text)
             if not m:
                 continue
             phrase = m.group(0).lower()

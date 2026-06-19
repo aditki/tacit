@@ -52,9 +52,9 @@ async def _probe_query(
     """
     normalized_type = (datasource_type or "").lower()
     normalized_language = (query_language or "").lower()
-    if (normalized_language and normalized_language != "promql") or (
-        normalized_type and normalized_type not in _PROMETHEUS_PROBE_TYPES
-    ):
+    unsupported_type = normalized_type and normalized_type not in _PROMETHEUS_PROBE_TYPES
+    unsupported_unrouted_language = not normalized_type and normalized_language and normalized_language != "promql"
+    if unsupported_type or unsupported_unrouted_language:
         logger.debug(
             "query_check_skipped",
             datasource_type=normalized_type,
