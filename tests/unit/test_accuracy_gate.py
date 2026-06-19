@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from dashforge.archetypes.engine import blend_archetypes, rank_archetypes_by_coverage
+from dashforge.archetypes.engine import _panel_signature, blend_archetypes, rank_archetypes_by_coverage
 from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from dashforge.cache import metric_cache
 from dashforge.catalog import catalog_for_services
@@ -471,6 +471,94 @@ def test_archetype_ranking_does_not_boost_weak_learned_match(monkeypatch):
     )
 
     assert ranked[0][0].id == "generic"
+
+
+def test_archetype_coverage_resolves_signals_only_for_requested_service(monkeypatch, tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.register_signal_type("cache_evictions", category="caching")
+    store.add_mapping("cache_evictions", "*cache_evictions*", confidence=0.9)
+    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+
+    learned_cache = InvestigationArchetype(
+        id="learned-cache",
+        name="learned cache",
+        problem_types=["cache"],
+        required_signals=["cache_evictions"],
+        signal_bindings={"cache_evictions": "missing_default"},
+        panels=[PanelTemplate(title="Cache", queries=[QueryTemplate(expr="missing_default")])],
+        tags=["learned"],
+    )
+    checkout = InvestigationArchetype(
+        id="checkout",
+        name="checkout",
+        problem_types=["latency"],
+        required_metrics=["checkout_requests_total"],
+        panels=[PanelTemplate(title="Requests", queries=[QueryTemplate(expr="checkout_requests_total")])],
+    )
+    checkout_metric = _metric("checkout_requests_total")
+    checkout_metric.dimensions = ["service={checkout}"]
+    payment_cache = _metric("payment_cache_evictions_total")
+    payment_cache.dimensions = ["service={payment}"]
+
+    ranked = rank_archetypes_by_coverage(
+        [(learned_cache, 0.99), (checkout, 0.60)],
+        [checkout_metric, payment_cache],
+        services=["checkout"],
+        max_archetypes=1,
+    )
+
+    assert ranked[0][0].id == "checkout"
+
+
+def test_archetype_coverage_uses_native_query_language(monkeypatch):
+    monkeypatch.setattr(settings, "learned_archetype_min_coverage", 0.75)
+    monkeypatch.setattr(settings, "learned_archetype_boost", 0.15)
+    cloudwatch = InvestigationArchetype(
+        id="learned-cloudwatch",
+        name="learned cloudwatch",
+        problem_types=["elb-errors"],
+        required_metrics=["HTTPCode_ELB_5XX"],
+        panels=[
+            PanelTemplate(
+                title="ELB errors",
+                queries=[
+                    QueryTemplate(
+                        expr="HTTPCode_ELB_5XX",
+                        query_language="cloudwatch",
+                        datasource_type="cloudwatch",
+                    )
+                ],
+            )
+        ],
+        tags=["learned"],
+    )
+    generic = _archetype("generic", "prometheus_metric")
+    catalog = [
+        _metric("prometheus_metric"),
+        MetricEntry(
+            name="HTTPCode_ELB_5XX",
+            datasource_uid="cloudwatch",
+            datasource_name="CloudWatch",
+            datasource_type="cloudwatch",
+            query_language="cloudwatch",
+        ),
+    ]
+
+    ranked = rank_archetypes_by_coverage(
+        [(generic, 0.80), (cloudwatch, 0.70)],
+        catalog,
+        target_language="promql",
+        max_archetypes=2,
+    )
+
+    assert ranked[0][0].id == "learned-cloudwatch"
+
+
+def test_panel_signature_preserves_datasource_identity():
+    first = PanelSpec(title="Requests A", queries=[_query("rate(requests_total[5m])", "prom-a")])
+    second = PanelSpec(title="Requests B", queries=[_query("rate(requests_total[5m])", "prom-b")])
+
+    assert _panel_signature(first) != _panel_signature(second)
 
 
 def test_signal_resolution_uses_type_labels_and_otel_scope_to_rank(tmp_path):

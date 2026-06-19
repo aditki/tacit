@@ -146,3 +146,50 @@ def test_multi_metric_query_routes_when_one_datasource_owns_all_metrics():
     dashboard = compile_archetype(archetype, intent, catalog)
 
     assert dashboard.panels[0].queries[0].datasource_uid == "service-prom"
+
+
+def test_service_owner_must_cover_every_metric_in_query():
+    archetype = InvestigationArchetype(
+        id="cache-ratio",
+        name="Cache ratio",
+        problem_types=["cache"],
+        required_metrics=["redis_keyspace_hits_total", "redis_keyspace_misses_total"],
+        panels=[
+            PanelTemplate(
+                title="Hit ratio",
+                queries=[QueryTemplate(expr="redis_keyspace_hits_total / redis_keyspace_misses_total")],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="checkout cache ratio",
+        domain="application",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["cache"],
+        timerange="1h",
+        problem_type="cache",
+        archetypes=[ArchetypeMatch(type="cache", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name="redis_keyspace_misses_total",
+            datasource_uid="default-prom",
+            datasource_name="Default",
+            datasource_type="prometheus",
+            query_language="promql",
+            dimensions=["service={payment}"],
+        ),
+        MetricEntry(
+            name="redis_keyspace_hits_total",
+            datasource_uid="checkout-prom",
+            datasource_name="Checkout",
+            datasource_type="prometheus",
+            query_language="promql",
+            dimensions=["service={checkout}"],
+        ),
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    assert dashboard.panels[0].queries[0].datasource_uid == "default-prom"

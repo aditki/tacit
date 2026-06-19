@@ -412,6 +412,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 ranked_archetypes,
                 catalog_for_compile,
                 target_language=target_language,
+                services=intent.services,
                 max_archetypes=settings.max_blended_archetypes,
                 min_secondary_coverage=settings.min_secondary_coverage,
             )
