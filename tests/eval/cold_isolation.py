@@ -183,12 +183,7 @@ def _verify() -> int:
         print(f"  learned archetypes   : {len(learned)} (expect 0)")
         print(f"  metric cache size    : {metric_cache.size} (expect 0)")
         print(f"  llm cache size       : {llm_cache.size} (expect 0)")
-        ok = (
-            state.signal_mappings_loaded > 0
-            and len(learned) == 0
-            and metric_cache.size == 0
-            and llm_cache.size == 0
-        )
+        ok = state.signal_mappings_loaded > 0 and len(learned) == 0 and metric_cache.size == 0 and llm_cache.size == 0
         print(f"  CLEAN BASELINE       : {ok}")
         return 0 if ok else 1
 

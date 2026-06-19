@@ -295,6 +295,8 @@ signals:
     metric_patterns:
       - pattern: "*cache*hits*"
         confidence: 0.85
+      - pattern: "*cache*hit*"
+        confidence: 0.7
       - pattern: "*keyspace_hits*"
         confidence: 0.9
       - pattern: "*_cache_hits_total"

@@ -47,11 +47,23 @@ def signal_store(tmp_path):
 
 
 @pytest.fixture
-def signal_store_with_bootstrap(tmp_path):
-    """SignalStore loaded with bootstrap signals.yaml."""
+def signal_store_with_bootstrap(tmp_path, monkeypatch):
+    """SignalStore loaded with bootstrap signals.yaml.
+
+    Also redirects the global ``get_signal_store`` accessor to this fresh store so
+    helpers like ``infer_signals_from_metrics`` (which resolve the store globally)
+    don't read the developer's persisted ``data/dashforge_signals.db``. Without
+    this, a stale local DB can make tests pass locally while failing on a hermetic
+    CI runner.
+    """
     db_path = tmp_path / "test_signals.db"
     store = SignalStore(db_path=db_path)
     store.load_from_yaml()
+    import dashforge.dashboard_ingest as _ingest
+    import dashforge.signals as _signals
+
+    monkeypatch.setattr(_signals, "get_signal_store", lambda: store)
+    monkeypatch.setattr(_ingest, "get_signal_store", lambda: store)
     return store
 
 
@@ -1812,7 +1824,8 @@ archetypes:
     def test_existing_uid_unique_table_migrates_to_backend_scope(self, tmp_path):
         db_path = tmp_path / "legacy_signals.db"
         with sqlite3.connect(db_path) as conn:
-            conn.executescript("""
+            conn.executescript(
+                """
                 CREATE TABLE ingested_dashboards (
                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                     dashboard_uid       TEXT NOT NULL UNIQUE,
@@ -1835,7 +1848,8 @@ archetypes:
                 );
                 INSERT INTO ingested_dashboards (dashboard_uid, dashboard_title, created_at)
                 VALUES ('shared-dash', 'Legacy Grafana', 1.0);
-            """)
+            """
+            )
 
         store = SignalStore(db_path=db_path)
         store.record_ingested_dashboard(
@@ -2247,7 +2261,11 @@ class TestSignalCoverageDashboard:
 
     def test_covers_cache_signal(self, inferred_signals):
         types = {s["signal_type"] for s in inferred_signals}
-        assert "cache_hit_ratio" in types
+        # The caching taxonomy was split into precise signals (hits/misses/ratio/
+        # evictions/size); a hit/miss counter resolves to one of these. The test's
+        # intent is that *a cache signal is covered*, not one specific name.
+        cache_signals = {"cache_hit_ratio", "cache_hits", "cache_misses", "cache_evictions", "cache_size"}
+        assert types & cache_signals, f"No cache signal covered in {sorted(types)}"
 
     def test_covers_stability_signal(self, inferred_signals):
         types = {s["signal_type"] for s in inferred_signals}

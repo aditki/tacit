@@ -787,11 +787,7 @@ def rank_archetypes_by_coverage(
         coverage = _archetype_live_coverage(arch, catalog, target_language)
         # Unknown coverage (no declared signals) keeps the classifier confidence.
         effective = confidence if coverage is None else confidence * coverage
-        if (
-            "learned" in arch.tags
-            and coverage is not None
-            and coverage >= settings.learned_archetype_min_coverage
-        ):
+        if "learned" in arch.tags and coverage is not None and coverage >= settings.learned_archetype_min_coverage:
             # Learned and classifier retrieval scores are not calibrated on
             # the same scale. Prefer learned context only with strong live
             # evidence, and keep the adjustment deliberately bounded.

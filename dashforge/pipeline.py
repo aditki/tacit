@@ -252,13 +252,13 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 from dashforge.agents.synonyms import SynonymEvidence, confirm_colloquial
                 from dashforge.signals import get_signal_store
 
-                store = get_signal_store()
+                signal_store = get_signal_store()
                 _resolve_cache: dict[str, bool] = {}
 
                 def _signal_resolves(sig: str) -> bool:
                     if sig not in _resolve_cache:
                         try:
-                            hits = store.resolve_signal(
+                            hits = signal_store.resolve_signal(
                                 sig, metric_catalog, target_query_language=primary.query_language
                             )
                             _resolve_cache[sig] = bool(hits)
@@ -687,7 +687,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         try:
             from dashforge.feedback import get_feedback_store
 
-            store = get_feedback_store()
+            feedback_store = get_feedback_store()
             metrics_used = list(
                 {
                     q.expr.split("{")[0].split("(")[-1].strip()
@@ -696,7 +696,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     if q.expr
                 }
             )
-            store.record_provenance(
+            feedback_store.record_provenance(
                 dashboard_uid=effective_uid,
                 prompt=request.prompt,
                 problem_type=intent.problem_type,

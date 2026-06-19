@@ -239,12 +239,15 @@ class SignalStore:
                 self._rebuild_ingested_dashboards_table(conn)
                 return
 
-        conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_uid_backend
-               ON ingested_dashboards(dashboard_uid, backend_name)""")
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_uid_backend
+               ON ingested_dashboards(dashboard_uid, backend_name)"""
+        )
 
     def _rebuild_ingested_dashboards_table(self, conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE ingested_dashboards RENAME TO ingested_dashboards_old")
-        conn.executescript("""
+        conn.executescript(
+            """
             CREATE TABLE ingested_dashboards (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 dashboard_uid       TEXT NOT NULL,
@@ -267,8 +270,10 @@ class SignalStore:
                 reviewed_at         REAL,
                 UNIQUE(dashboard_uid, backend_name)
             );
-        """)
-        conn.execute("""INSERT INTO ingested_dashboards
+        """
+        )
+        conn.execute(
+            """INSERT INTO ingested_dashboards
                (id, dashboard_uid, backend_name, dashboard_title, dashboard_tags,
                 metrics_found, panel_count, row_groups, metric_cooccurrence,
                 aggregation_patterns, query_transformations, panel_titles,
@@ -279,12 +284,17 @@ class SignalStore:
                       aggregation_patterns, query_transformations, panel_titles,
                       alert_links, drilldown_links, status, signals_inferred,
                       archetype_generated, created_at, reviewed_at
-               FROM ingested_dashboards_old""")
+               FROM ingested_dashboards_old"""
+        )
         conn.execute("DROP TABLE ingested_dashboards_old")
-        conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_uid_backend
-               ON ingested_dashboards(dashboard_uid, backend_name)""")
-        conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_uid_backend
-               ON ingested_dashboards(dashboard_uid, backend_name)""")
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_uid_backend
+               ON ingested_dashboards(dashboard_uid, backend_name)"""
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_ingested_uid_backend
+               ON ingested_dashboards(dashboard_uid, backend_name)"""
+        )
 
     # ── Signal type CRUD ─────────────────────────────────────────────────
 
@@ -318,12 +328,14 @@ class SignalStore:
     def list_signal_types(self) -> list[dict[str, Any]]:
         """List all registered signal types with mapping counts."""
         with self._conn() as conn:
-            rows = conn.execute("""SELECT st.*, COUNT(m.id) AS mapping_count
+            rows = conn.execute(
+                """SELECT st.*, COUNT(m.id) AS mapping_count
                    FROM signal_types st
                    LEFT JOIN signal_metric_mappings m
                      ON st.signal_type = m.signal_type
                    GROUP BY st.signal_type
-                   ORDER BY st.category, st.signal_type""").fetchall()
+                   ORDER BY st.category, st.signal_type"""
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def get_signal_type(self, signal_type: str) -> dict[str, Any] | None:
@@ -1279,11 +1291,15 @@ class SignalStore:
             mapping_count = conn.execute("SELECT COUNT(*) FROM signal_metric_mappings").fetchone()[0]
             ingested_count = conn.execute("SELECT COUNT(*) FROM ingested_dashboards").fetchone()[0]
 
-            by_source = conn.execute("""SELECT source_type, COUNT(*) as n
-                   FROM signal_metric_mappings GROUP BY source_type""").fetchall()
+            by_source = conn.execute(
+                """SELECT source_type, COUNT(*) as n
+                   FROM signal_metric_mappings GROUP BY source_type"""
+            ).fetchall()
 
-            by_category = conn.execute("""SELECT category, COUNT(*) as n
-                   FROM signal_types GROUP BY category""").fetchall()
+            by_category = conn.execute(
+                """SELECT category, COUNT(*) as n
+                   FROM signal_types GROUP BY category"""
+            ).fetchall()
 
         return {
             "signal_types": signal_count,

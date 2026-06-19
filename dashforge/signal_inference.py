@@ -54,9 +54,7 @@ _W_QUERY = 0.10
 _W_GROUP = 0.05
 
 # Metadata/info metrics that are not operational signals → never classify.
-_IGNORE_RE = re.compile(
-    r"(_info$|build_info|_build_info|_version|version_info|_created$|created_|^scrape_|^logback_)"
-)
+_IGNORE_RE = re.compile(r"(_info$|build_info|_build_info|_version|version_info|_created$|created_|^scrape_|^logback_)")
 
 # Time-point / lifecycle overrides: these end in _seconds but are NOT latency.
 # (family, regex, evidence)
@@ -402,9 +400,7 @@ def infer_signal(
     # classifiers. This keeps sparse catalogs useful without turning generic
     # counters or labels into confident semantic guesses.
     normalized_type = metric_type.lower()
-    if normalized_type in {"histogram", "summary", "gaugehistogram"} and any(
-        word in name for word in _TIME_WORDS
-    ):
+    if normalized_type in {"histogram", "summary", "gaugehistogram"} and any(word in name for word in _TIME_WORDS):
         vote("latency", 0.10, f"{normalized_type} time metric → latency", "metric_type")
         available_weight += 0.10
     elif normalized_type in {"counter", "sum"}:
@@ -421,8 +417,8 @@ def infer_signal(
             (r"\b(queue|messaging|kafka|consumer)\b", "backlog"),
             (r"\b(cpu|memory|disk|filesystem|container|process)\b", "resource_usage"),
         )
-        for pattern, family in scope_rules:
-            if re.search(pattern, scope_text) and scores[family] > 0:
+        for scope_pattern, family in scope_rules:
+            if re.search(scope_pattern, scope_text) and scores[family] > 0:
                 vote(family, 0.10, f"labels/scope confirm {family}", "scope")
                 available_weight += 0.10
                 break
