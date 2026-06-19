@@ -97,6 +97,8 @@ async def validate_dashboard_queries(
     client: GrafanaClient,
     spec: DashboardSpec,
     catalog: list[MetricEntry] | None = None,
+    *,
+    catalog_authoritative: bool = False,
 ) -> tuple[DashboardSpec, list[str]]:
     """Validate dashboard queries independently. Returns (filtered_spec, warnings).
 
@@ -105,9 +107,10 @@ async def validate_dashboard_queries(
     failing query is dropped, not the whole panel. A panel survives if at least
     one of its queries returns data (or is an unprobeable type). When ``catalog``
     is provided, queries whose datasource UID is unknown or whose metric is
-    absent from the catalog are dropped and flagged (hallucination/routing);
-    when it is omitted, those checks are skipped so older callers behave as
-    before, just per-query instead of per-panel.
+    absent from an explicitly authoritative catalog are dropped and flagged
+    (hallucination/routing). Discovered catalogs are advisory by default because
+    provider discovery may be capped or filtered; their misses are probed rather
+    than treated as proof that a metric does not exist.
     """
     valid_panels: list[PanelSpec] = []
     warnings: list[str] = []
@@ -123,8 +126,8 @@ async def validate_dashboard_queries(
                 if entry.name:
                     catalog_names_by_uid[entry.datasource_uid].add(entry.name)
 
-    # Apply static routing/existence checks before probing, then probe only
-    # queries that reference metrics owned by their routed datasource.
+    # Apply static routing checks before probing. Metric existence checks are
+    # static only when the caller explicitly marks the catalog authoritative.
     flat: list[tuple[int, PanelQuery]] = [
         (panel_idx, q) for panel_idx, panel in enumerate(spec.panels) for q in panel.queries
     ]
@@ -142,7 +145,7 @@ async def validate_dashboard_queries(
             # existence/data checks to the backend probe instead of declaring
             # every query absent. Non-Prometheus queries have provider-specific
             # identifiers and must not be parsed as PromQL.
-            if owned_names and is_promql:
+            if catalog_authoritative and owned_names and is_promql:
                 refs = _referenced_metrics(query.expr, "promql")
                 if refs and not refs.issubset(owned_names):
                     return QUERY_ABSENT

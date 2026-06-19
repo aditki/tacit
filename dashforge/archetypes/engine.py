@@ -24,6 +24,8 @@ from dashforge.models.schemas import (
 
 logger = structlog.get_logger()
 
+_PROMETHEUS_HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
+
 # Characters that are special in RE2 (used by PromQL) and need escaping.
 # Note: dash `-` is NOT special in RE2 outside character classes.
 _RE2_SPECIAL = frozenset(r"\.+*?()[]{}|^$")
@@ -766,7 +768,14 @@ def _archetype_live_coverage(
                 pass
     for required_metric in required_metrics:
         try:
-            if any(re.fullmatch(required_metric, name) for name in catalog_names):
+            if any(
+                re.fullmatch(required_metric, name)
+                or any(
+                    name.endswith(suffix) and re.fullmatch(required_metric, name[: -len(suffix)])
+                    for suffix in _PROMETHEUS_HISTOGRAM_SUFFIXES
+                )
+                for name in catalog_names
+            ):
                 resolved += 1
         except re.error:
             if required_metric in catalog_names:

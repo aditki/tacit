@@ -7,10 +7,13 @@ duck-typed intents.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-_CACHE_TERMS = {"redis", "cache", "eviction", "evictions", "memory", "keyspace"}
-_LATENCY_TERMS = {"latency", "duration", "response", "slow", "requests", "request"}
+_CACHE_TERMS = {"redis", "cache", "eviction", "evictions", "keyspace", "hit_ratio", "cache_hit_ratio"}
+_CACHE_PHRASES = {"cache hit ratio", "cache miss", "cache misses"}
+_LATENCY_TERMS = {"latency", "duration", "slow", "slowness", "timeout", "timeouts"}
+_LATENCY_PHRASES = {"response time", "response times", "request time", "request times"}
 _CACHE_ARCHETYPES = {"redis_saturation"}
 _LATENCY_ARCHETYPES = {"latency_investigation", "api_response_time_spike", "golden_signals"}
 
@@ -18,10 +21,20 @@ _LATENCY_ARCHETYPES = {"latency_investigation", "api_response_time_spike", "gold
 def signals(intent: Any) -> dict[str, Any]:
     archetypes = {match.type for match in intent.archetypes if match.confidence >= 0.3}
     words = {str(word).lower() for word in intent.keywords}
-    summary_words = set(str(intent.summary).lower().replace("/", " ").split())
+    summary = " ".join(re.findall(r"[a-z0-9_]+", str(intent.summary).lower()))
+    padded_summary = f" {summary} "
+    summary_words = set(summary.split())
     evidence = words | summary_words
-    has_cache = bool(archetypes & _CACHE_ARCHETYPES) or bool(evidence & _CACHE_TERMS)
-    has_latency = bool(archetypes & _LATENCY_ARCHETYPES) or bool(evidence & _LATENCY_TERMS)
+    has_cache = (
+        bool(archetypes & _CACHE_ARCHETYPES)
+        or bool(evidence & _CACHE_TERMS)
+        or any(f" {phrase} " in padded_summary for phrase in _CACHE_PHRASES)
+    )
+    has_latency = (
+        bool(archetypes & _LATENCY_ARCHETYPES)
+        or bool(evidence & _LATENCY_TERMS)
+        or any(f" {phrase} " in padded_summary for phrase in _LATENCY_PHRASES)
+    )
     return {
         "archetypes": sorted(archetypes),
         "keywords": sorted(words),

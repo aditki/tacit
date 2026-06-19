@@ -60,6 +60,22 @@ def test_archetype_evidence_counts_as_cache():
     assert signals(via_archetype)["has_cache"]
 
 
+def test_generic_memory_and_request_words_do_not_satisfy_signal_expectations():
+    generic = _Intent(keywords=["memory", "requests"], summary="memory used by incoming requests")
+
+    result = signals(generic)
+
+    assert not result["has_cache"]
+    assert not result["has_latency"]
+    assert not evaluate(generic, {"class": "reworded"})[0]
+
+
+def test_contextual_response_time_counts_as_latency():
+    contextual = _Intent(keywords=["redis"], summary="Redis response times increased")
+
+    assert signals(contextual)["has_latency"]
+
+
 def test_holdout_fixture_is_label_complete():
     """Every holdout prompt must carry the labels the scorer relies on."""
     corpus = json.loads((_FIX / "clickstack_prompts_holdout.json").read_text())

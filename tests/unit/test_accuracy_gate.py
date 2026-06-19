@@ -63,7 +63,12 @@ async def test_validation_requires_metrics_to_exist_in_routed_datasource():
     client = AsyncMock()
     catalog = [_metric("only_in_a", "a"), _metric("shared_name", "b")]
 
-    filtered, warnings = await validate_dashboard_queries(client, _dashboard(_query("shared_name", "a")), catalog)
+    filtered, warnings = await validate_dashboard_queries(
+        client,
+        _dashboard(_query("shared_name", "a")),
+        catalog,
+        catalog_authoritative=True,
+    )
 
     assert filtered.panels == []
     assert any("metric not in catalog" in warning for warning in warnings)
@@ -79,6 +84,7 @@ async def test_validation_rejects_query_when_any_referenced_metric_is_absent():
         client,
         _dashboard(_query("real_metric + invented_metric")),
         catalog,
+        catalog_authoritative=True,
     )
 
     assert filtered.panels == []
@@ -96,6 +102,7 @@ async def test_validation_drops_only_bad_query_from_mixed_panel():
         client,
         _dashboard(_query("real_metric"), _query("invented_metric")),
         catalog,
+        catalog_authoritative=True,
     )
 
     assert [query.expr for query in filtered.panels[0].queries] == ["real_metric"]
@@ -113,6 +120,23 @@ async def test_validation_probes_target_only_catalog_instead_of_marking_absent()
         client,
         _dashboard(_query("metric_not_enumerated", "target-only")),
         [target],
+    )
+
+    assert len(filtered.panels) == 1
+    assert not any("metric not in catalog" in warning for warning in warnings)
+    client.datasource_proxy_get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_validation_probes_metric_missing_from_partial_catalog():
+    client = AsyncMock()
+    client.datasource_proxy_get.return_value = {"status": "success", "data": {"result": [{"metric": {}}]}}
+    partial_catalog = [_metric("catalog_was_capped_before_this_metric")]
+
+    filtered, warnings = await validate_dashboard_queries(
+        client,
+        _dashboard(_query("real_metric_omitted_by_cap")),
+        partial_catalog,
     )
 
     assert len(filtered.panels) == 1
@@ -260,6 +284,32 @@ def test_archetype_ranking_includes_required_metrics_without_signals():
     )
 
     assert ranked[0][0].id == "covered-required-metrics"
+
+
+@pytest.mark.parametrize("suffix", ["_bucket", "_sum", "_count"])
+def test_archetype_coverage_treats_histogram_series_as_base_metric(suffix):
+    latency = InvestigationArchetype(
+        id="latency",
+        name="latency",
+        problem_types=["latency"],
+        required_metrics=["http_request_duration_seconds"],
+        panels=[PanelTemplate(title="Latency", queries=[QueryTemplate(expr="latency")])],
+    )
+    unrelated = InvestigationArchetype(
+        id="unrelated",
+        name="unrelated",
+        problem_types=["general"],
+        required_metrics=["other_metric"],
+        panels=[PanelTemplate(title="Other", queries=[QueryTemplate(expr="other_metric")])],
+    )
+
+    ranked = rank_archetypes_by_coverage(
+        [(unrelated, 0.99), (latency, 0.8)],
+        [_metric(f"http_request_duration_seconds{suffix}")],
+        max_archetypes=1,
+    )
+
+    assert ranked[0][0].id == "latency"
 
 
 def test_colloquial_evidence_broadens_discovery_without_mutating_intent():

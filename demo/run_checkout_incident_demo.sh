@@ -122,7 +122,7 @@ PY
   echo
 
   echo "7. Fetching recent investigation history"
-  request_json GET "/api/v1/history?limit=3" | pretty
+  request_json GET "/api/v1/investigations?limit=3" | pretty
 fi
 
 echo
