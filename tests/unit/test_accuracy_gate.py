@@ -1,0 +1,284 @@
+import json
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import httpx
+import pytest
+
+from dashforge.archetypes.engine import blend_archetypes, rank_archetypes_by_coverage
+from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from dashforge.cache import metric_cache
+from dashforge.config import settings
+from dashforge.grafana.adapters.prometheus import PrometheusAdapter
+from dashforge.models.schemas import (
+    ArchetypeMatch,
+    DashboardSpec,
+    DatasourceInfo,
+    Intent,
+    MetricEntry,
+    PanelQuery,
+    PanelSpec,
+    SignalType,
+)
+from dashforge.signals import SignalStore, _unit_compatibility
+from dashforge.validation import validate_dashboard_queries
+
+
+def _metric(name: str, uid: str = "real") -> MetricEntry:
+    return MetricEntry(
+        name=name,
+        datasource_uid=uid,
+        datasource_name=uid,
+        datasource_type="prometheus",
+        query_language="promql",
+    )
+
+
+def _dashboard(*queries: PanelQuery) -> DashboardSpec:
+    return DashboardSpec(title="gate", panels=[PanelSpec(title="Evidence", queries=list(queries))])
+
+
+def _query(expr: str, uid: str = "real") -> PanelQuery:
+    return PanelQuery(expr=expr, datasource_uid=uid, datasource_type="prometheus", query_language="promql")
+
+
+def test_clickstack_prompt_corpus_has_required_size_and_classes():
+    path = Path(__file__).parents[1] / "eval" / "fixtures" / "clickstack_prompts.json"
+    fixture = json.loads(path.read_text())
+
+    assert 25 <= len(fixture["prompts"]) <= 40
+    assert {item["class"] for item in fixture["prompts"]} == {
+        "precise",
+        "vague",
+        "noisy",
+        "misleading",
+        "reworded",
+    }
+
+
+@pytest.mark.asyncio
+async def test_validation_requires_metrics_to_exist_in_routed_datasource():
+    client = AsyncMock()
+    catalog = [_metric("only_in_a", "a"), _metric("shared_name", "b")]
+
+    filtered, warnings = await validate_dashboard_queries(client, _dashboard(_query("shared_name", "a")), catalog)
+
+    assert filtered.panels == []
+    assert any("metric not in catalog" in warning for warning in warnings)
+    client.datasource_proxy_get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validation_rejects_query_when_any_referenced_metric_is_absent():
+    client = AsyncMock()
+    catalog = [_metric("real_metric")]
+
+    filtered, warnings = await validate_dashboard_queries(
+        client,
+        _dashboard(_query("real_metric + invented_metric")),
+        catalog,
+    )
+
+    assert filtered.panels == []
+    assert any("metric not in catalog" in warning for warning in warnings)
+    client.datasource_proxy_get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validation_drops_only_bad_query_from_mixed_panel():
+    client = AsyncMock()
+    client.datasource_proxy_get.return_value = {"status": "success", "data": {"result": [{"metric": {}}]}}
+    catalog = [_metric("real_metric")]
+
+    filtered, warnings = await validate_dashboard_queries(
+        client,
+        _dashboard(_query("real_metric"), _query("invented_metric")),
+        catalog,
+    )
+
+    assert [query.expr for query in filtered.panels[0].queries] == ["real_metric"]
+    assert any("metric not in catalog" in warning for warning in warnings)
+    client.datasource_proxy_get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_prometheus_http_422_is_reported_as_syntax_error():
+    client = AsyncMock()
+    request = httpx.Request("GET", "https://grafana.test/query")
+    response = httpx.Response(
+        422,
+        request=request,
+        json={"status": "error", "errorType": "bad_data", "error": "parse error"},
+    )
+    client.datasource_proxy_get.side_effect = httpx.HTTPStatusError(
+        "unprocessable entity",
+        request=request,
+        response=response,
+    )
+
+    filtered, warnings = await validate_dashboard_queries(
+        client,
+        _dashboard(_query("real_metric")),
+        [_metric("real_metric")],
+    )
+
+    assert filtered.panels == []
+    assert any("invalid syntax" in warning for warning in warnings)
+
+
+def test_prometheus_metadata_lookup_handles_exported_suffixes():
+    metadata = {
+        "request_duration_seconds": ("seconds", "histogram"),
+        "transactions_total": ("", "counter"),
+    }
+
+    assert PrometheusAdapter._metadata_for("request_duration_seconds_bucket", metadata) == (
+        "seconds",
+        "histogram",
+    )
+    assert PrometheusAdapter._metadata_for("transactions_total", metadata) == ("", "counter")
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metadata_is_loaded_from_datasource_api():
+    metric_cache.invalidate()
+    client = AsyncMock()
+    client.datasource_proxy_get.return_value = {
+        "status": "success",
+        "data": {"request_duration_seconds": [{"unit": "seconds", "type": "histogram"}]},
+    }
+    datasource = DatasourceInfo(uid="metadata-test", name="Metadata", type="prometheus")
+
+    try:
+        metadata = await PrometheusAdapter()._get_metric_metadata(client, datasource)
+    finally:
+        metric_cache.invalidate()
+
+    assert metadata == {"request_duration_seconds": ("seconds", "histogram")}
+
+
+def test_unit_compatibility_rewards_matches_and_penalizes_conflicts():
+    assert _unit_compatibility("seconds", "ms") > 1.0
+    assert _unit_compatibility("seconds", "bytes") < 1.0
+    assert _unit_compatibility("seconds", "") == 1.0
+
+
+def _archetype(archetype_id: str, metric_name: str, panel_count: int = 1) -> InvestigationArchetype:
+    return InvestigationArchetype(
+        id=archetype_id,
+        name=archetype_id,
+        description="",
+        problem_types=[archetype_id],
+        required_signals=[f"{archetype_id}_signal"],
+        signal_bindings={f"{archetype_id}_signal": metric_name},
+        panels=[
+            PanelTemplate(title=f"{archetype_id}-{index}", queries=[QueryTemplate(expr=metric_name)])
+            for index in range(panel_count)
+        ],
+    )
+
+
+def test_archetype_ranking_prefers_live_coverage_over_raw_confidence():
+    uncovered = _archetype("uncovered", "missing_metric")
+    covered = _archetype("covered", "real_metric")
+
+    ranked = rank_archetypes_by_coverage(
+        [(uncovered, 0.99), (covered, 0.7)],
+        [_metric("real_metric")],
+        max_archetypes=1,
+    )
+
+    assert [archetype.id for archetype, _ in ranked] == ["covered"]
+
+
+def test_archetype_ranking_prefers_strong_learned_match(monkeypatch):
+    monkeypatch.setattr(settings, "learned_archetype_min_coverage", 0.75)
+    monkeypatch.setattr(settings, "learned_archetype_boost", 0.15)
+    learned = _archetype("learned_specific", "real_metric")
+    learned.tags = ["learned"]
+    generic = _archetype("generic", "real_metric")
+    generic.required_signals.append("missing_signal")
+    generic.signal_bindings["missing_signal"] = "missing_metric"
+
+    ranked = rank_archetypes_by_coverage(
+        [(generic, 0.95), (learned, 0.70)],
+        [_metric("real_metric")],
+        max_archetypes=2,
+    )
+
+    assert ranked[0][0].id == "learned_specific"
+
+
+def test_archetype_ranking_does_not_boost_weak_learned_match(monkeypatch):
+    monkeypatch.setattr(settings, "learned_archetype_min_coverage", 0.75)
+    monkeypatch.setattr(settings, "learned_archetype_boost", 0.15)
+    learned = _archetype("learned_weak", "missing_metric")
+    learned.tags = ["learned"]
+    generic = _archetype("generic", "real_metric")
+
+    ranked = rank_archetypes_by_coverage(
+        [(learned, 0.99), (generic, 0.60)],
+        [_metric("real_metric")],
+        max_archetypes=2,
+    )
+
+    assert ranked[0][0].id == "generic"
+
+
+def test_signal_resolution_uses_type_labels_and_otel_scope_to_rank(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.register_signal_type("request_latency", category="latency", unit="s")
+    store.add_mapping("request_latency", "*request_duration*", confidence=0.8)
+    weak = MetricEntry(
+        name="worker_request_duration_seconds",
+        datasource_uid="prom",
+        datasource_name="prom",
+        datasource_type="prometheus",
+        query_language="promql",
+        unit="s",
+        metric_type="gauge",
+    )
+    otel = MetricEntry(
+        name="http_server_request_duration_seconds",
+        datasource_uid="prom",
+        datasource_name="prom",
+        datasource_type="prometheus",
+        query_language="promql",
+        namespace="otel.instrumentation.scope=http.server",
+        dimensions=["http.request.method", "http.response.status_code", "service.name"],
+        unit="s",
+        metric_type="histogram",
+    )
+
+    hits = store.resolve_signal("request_latency", [weak, otel], target_query_language="promql")
+
+    assert [entry.name for entry, _ in hits] == [otel.name, weak.name]
+    assert hits[0][1] > hits[1][1]
+
+
+def test_blending_enforces_archetype_and_panel_caps(monkeypatch):
+    monkeypatch.setattr(settings, "max_blended_archetypes", 2)
+    monkeypatch.setattr(settings, "max_dashboard_panels", 3)
+    monkeypatch.setattr(settings, "min_secondary_coverage", 0.0)
+    first = _archetype("first", "first_metric", panel_count=2)
+    second = _archetype("second", "second_metric", panel_count=2)
+    third = _archetype("third", "third_metric", panel_count=2)
+    intent = Intent(
+        summary="bounded dashboard",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=[],
+        timerange="1h",
+        problem_type="first",
+        archetypes=[ArchetypeMatch(type="first", confidence=1.0)],
+    )
+
+    dashboard = blend_archetypes(
+        [(first, 0.9), (second, 0.8), (third, 0.7)],
+        intent,
+        [_metric("first_metric"), _metric("second_metric"), _metric("third_metric")],
+    )
+
+    assert len(dashboard.panels) == 3
+    assert all("third" not in panel.title for panel in dashboard.panels)

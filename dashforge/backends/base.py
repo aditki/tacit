@@ -98,8 +98,14 @@ class DashboardBackend(Protocol):
     async def validate_queries(
         self,
         spec: DashboardSpec,
+        catalog: list[MetricEntry] | None = None,
     ) -> tuple[DashboardSpec, list[str]]:
-        """Drop panels whose queries return no data.
+        """Validate queries and drop the ones that fail.
+
+        Each query is judged independently on existence, syntax, and data
+        presence; failing queries are dropped and a panel survives if any of
+        its queries returns data. ``catalog`` (the discovered metrics) enables
+        the existence/UID checks; when omitted those checks are skipped.
 
         Returns (filtered_spec, list_of_warnings).
         """

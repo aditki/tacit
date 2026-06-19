@@ -12,6 +12,7 @@ import re
 import structlog
 
 from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from dashforge.config import settings
 from dashforge.models.schemas import (
     DashboardSpec,
     Intent,
@@ -720,6 +721,102 @@ def compile_archetype(
     return spec
 
 
+def _archetype_live_coverage(
+    archetype: InvestigationArchetype,
+    catalog: list[MetricEntry],
+    target_language: str = "promql",
+) -> float | None:
+    """Fraction of an archetype's signals that resolve against the live catalog.
+
+    Returns ``None`` when the archetype declares no signals (coverage cannot be
+    measured, so callers should fall back to classifier confidence alone).
+    """
+    signals = set(archetype.required_signals) | set(archetype.signal_bindings.keys())
+    if not signals:
+        return None
+
+    target_lang = target_language.lower()
+    catalog_names = {
+        e.name for e in catalog if e.name and (not target_lang or (e.query_language or "").lower() == target_lang)
+    }
+
+    store = None
+    try:
+        from dashforge.signals import get_signal_store
+
+        store = get_signal_store()
+    except Exception:
+        store = None
+
+    resolved = 0
+    for sig in signals:
+        default_metric = archetype.signal_bindings.get(sig, "")
+        if default_metric and default_metric in catalog_names:
+            resolved += 1
+            continue
+        if store is not None:
+            try:
+                if store.resolve_signal(sig, catalog, target_query_language=target_language):
+                    resolved += 1
+            except Exception:
+                pass
+    return resolved / len(signals)
+
+
+def rank_archetypes_by_coverage(
+    ranked_archetypes: list[tuple[InvestigationArchetype, float]],
+    catalog: list[MetricEntry],
+    *,
+    target_language: str = "promql",
+    max_archetypes: int | None = None,
+    min_secondary_coverage: float = 0.0,
+) -> list[tuple[InvestigationArchetype, float]]:
+    """Re-rank archetypes by classifier_confidence × live signal coverage.
+
+    This prefers a strongly-matching (well-covered) archetype over numerous
+    generic templates whose signals are absent from the environment, then caps
+    the list so blending cannot explode into many loosely-matched archetypes.
+    The primary archetype (rank 0 after re-sort) is always kept; secondaries
+    below ``min_secondary_coverage`` are dropped.
+    """
+    if not ranked_archetypes:
+        return ranked_archetypes
+
+    scored: list[tuple[InvestigationArchetype, float, float, float]] = []
+    for arch, confidence in ranked_archetypes:
+        coverage = _archetype_live_coverage(arch, catalog, target_language)
+        # Unknown coverage (no declared signals) keeps the classifier confidence.
+        effective = confidence if coverage is None else confidence * coverage
+        if (
+            "learned" in arch.tags
+            and coverage is not None
+            and coverage >= settings.learned_archetype_min_coverage
+        ):
+            # Learned and classifier retrieval scores are not calibrated on
+            # the same scale. Prefer learned context only with strong live
+            # evidence, and keep the adjustment deliberately bounded.
+            effective += settings.learned_archetype_boost * coverage
+        scored.append((arch, confidence, coverage if coverage is not None else -1.0, effective))
+
+    scored.sort(key=lambda x: x[3], reverse=True)
+
+    kept: list[tuple[InvestigationArchetype, float]] = []
+    for rank, (arch, confidence, coverage, effective) in enumerate(scored):
+        if rank > 0 and coverage >= 0.0 and coverage < min_secondary_coverage:
+            logger.info(
+                "archetype_dropped_low_coverage",
+                archetype=arch.id,
+                confidence=confidence,
+                coverage=round(coverage, 3),
+            )
+            continue
+        kept.append((arch, confidence))
+        if max_archetypes is not None and len(kept) >= max_archetypes:
+            break
+
+    return kept
+
+
 def blend_archetypes(
     ranked_archetypes: list[tuple[InvestigationArchetype, float]],
     intent: Intent,
@@ -749,26 +846,49 @@ def blend_archetypes(
     if not ranked_archetypes:
         raise ValueError("blend_archetypes called with empty archetype list")
 
+    # Coverage-rank and cap the archetype set BEFORE blending so a flood of
+    # loosely-matched generic templates can't add dozens of irrelevant panels.
+    ranked_archetypes = rank_archetypes_by_coverage(
+        ranked_archetypes,
+        catalog,
+        target_language=target_language,
+        max_archetypes=settings.max_blended_archetypes,
+        min_secondary_coverage=settings.min_secondary_coverage,
+    )
+    max_panels = settings.max_dashboard_panels
+
     primary_arch, primary_conf = ranked_archetypes[0]
     primary_spec = compile_archetype(primary_arch, intent, catalog, target_language=target_language)
 
-    # Track existing panel titles to avoid duplicates
-    existing_titles: set[str] = {p.title.lower() for p in primary_spec.panels}
+    # De-dup on the panel's *query signature* (the set of normalized query
+    # expressions), not just its title — so the same panel arriving from two
+    # archetypes under different titles collapses, while distinct views of the
+    # same metric (e.g. p99 vs avg latency) are preserved.
+    def _panel_signature(panel: PanelSpec) -> frozenset[str] | str:
+        exprs = {re.sub(r"\s+", "", q.expr.lower()) for q in panel.queries if q.expr}
+        return frozenset(exprs) if exprs else panel.title.lower()
+
+    seen_signatures: set[frozenset[str] | str] = {_panel_signature(p) for p in primary_spec.panels}
     blended_panels = list(primary_spec.panels)
     blended_tags = list(primary_spec.tags)
 
     for arch, conf in ranked_archetypes[1:]:
         if conf < secondary_min_confidence:
             continue
+        if len(blended_panels) >= max_panels:
+            break
 
         secondary_spec = compile_archetype(arch, intent, catalog, target_language=target_language)
         added = 0
         for panel in secondary_spec.panels:
-            if panel.title.lower() not in existing_titles:
+            if len(blended_panels) >= max_panels:
+                break
+            sig = _panel_signature(panel)
+            if sig not in seen_signatures:
                 # Tag panel with its source archetype for traceability
                 panel_with_row = panel.model_copy(update={"row": panel.row or arch.name})
                 blended_panels.append(panel_with_row)
-                existing_titles.add(panel.title.lower())
+                seen_signatures.add(sig)
                 added += 1
 
         if added > 0:
@@ -789,7 +909,7 @@ def blend_archetypes(
         title=title,
         tags=list(dict.fromkeys(blended_tags)),  # dedupe preserving order
         timerange=intent.timerange or primary_arch.default_timerange,
-        panels=blended_panels,
+        panels=blended_panels[:max_panels],
     )
 
     logger.info(
@@ -797,7 +917,7 @@ def blend_archetypes(
         primary=primary_arch.id,
         primary_confidence=primary_conf,
         total_archetypes=len(ranked_archetypes),
-        total_panels=len(blended_panels),
+        total_panels=len(spec.panels),
     )
 
     return spec

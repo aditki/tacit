@@ -29,6 +29,8 @@ signals:
         confidence: 0.95
       - pattern: "*_request_duration_*"
         confidence: 0.7
+      - pattern: "*request_duration*"
+        confidence: 0.7
       - pattern: "*_latency_seconds*"
         confidence: 0.7
       - pattern: "*_response_time*"
@@ -279,12 +281,104 @@ signals:
     category: caching
     unit: percentunit
     metric_patterns:
-      - pattern: "*cache*hit*"
-        confidence: 0.85
-      - pattern: "*cache*miss*"
-        confidence: 0.8
       - pattern: "*cache*ratio*"
+        confidence: 0.8
+      - pattern: "*cache*hit*ratio*"
+        confidence: 0.85
+      - pattern: "*hit_rate*"
+        confidence: 0.6
+
+  cache_hits:
+    description: Cache hit count (counter)
+    category: caching
+    unit: short
+    metric_patterns:
+      - pattern: "*cache*hits*"
+        confidence: 0.85
+      - pattern: "*keyspace_hits*"
+        confidence: 0.9
+      - pattern: "*_cache_hits_total"
+        confidence: 0.9
+
+  cache_misses:
+    description: Cache miss count (counter)
+    category: caching
+    unit: short
+    metric_patterns:
+      - pattern: "*cache*miss*"
+        confidence: 0.85
+      - pattern: "*keyspace_misses*"
+        confidence: 0.9
+      - pattern: "*_cache_misses_total"
+        confidence: 0.9
+
+  cache_evictions:
+    description: Cache key evictions
+    category: caching
+    unit: short
+    metric_patterns:
+      - pattern: "*evicted_keys*"
+        confidence: 0.9
+      - pattern: "*keys_evicted*"
+        confidence: 0.9
+      - pattern: "*_evictions*"
+        confidence: 0.85
+      - pattern: "*cache*evict*"
+        confidence: 0.85
+      - pattern: "*expired_keys*"
+        confidence: 0.7
+      - pattern: "*keys_expired*"
+        confidence: 0.7
+
+  cache_size:
+    description: Cache entry count / size
+    category: caching
+    unit: short
+    metric_patterns:
+      - pattern: "*cache*size*"
+        confidence: 0.8
+      - pattern: "*cache*entries*"
+        confidence: 0.8
+      - pattern: "*keyspace*keys*"
         confidence: 0.75
+      - pattern: "*db_keys*"
+        confidence: 0.6
+
+  cache_memory_pressure:
+    description: Cache memory usage / pressure (e.g. Redis maxmemory)
+    category: caching
+    unit: bytes
+    metric_patterns:
+      - pattern: "*used_memory*"
+        confidence: 0.8
+      - pattern: "*memory_used*"
+        confidence: 0.6
+      - pattern: "*maxmemory*"
+        confidence: 0.85
+      - pattern: "*mem_fragmentation*"
+        confidence: 0.8
+      - pattern: "*memory_used_bytes"
+        confidence: 0.55
+
+  client_pressure:
+    description: Connected/blocked client pressure on a cache or datastore
+    category: saturation
+    unit: short
+    metric_patterns:
+      - pattern: "*connected_clients*"
+        confidence: 0.85
+      - pattern: "*clients_connected*"
+        confidence: 0.85
+      - pattern: "*blocked_clients*"
+        confidence: 0.85
+      - pattern: "*clients_blocked*"
+        confidence: 0.85
+      - pattern: "*rejected_connections*"
+        confidence: 0.85
+      - pattern: "*connections_rejected*"
+        confidence: 0.85
+      - pattern: "*client_recent_max*"
+        confidence: 0.6
 
   # ── Networking ─────────────────────────────────────────────────────────
 

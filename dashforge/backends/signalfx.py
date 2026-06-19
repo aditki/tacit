@@ -73,7 +73,9 @@ class SignalFxBackend:
     async def validate_queries(
         self,
         spec: DashboardSpec,
+        catalog: list[MetricEntry] | None = None,
     ) -> tuple[DashboardSpec, list[str]]:
+        del catalog  # SignalFlow validation checks metric existence via its own API
         return await validate_signalflow_queries(self._client, spec)
 
     # ── Publish ───────────────────────────────────────────────────────

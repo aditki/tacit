@@ -1,0 +1,23 @@
+{
+  "dataset": "clickstack",
+  "role": "holdout",
+  "note": "UNTOUCHED holdout. None of these wordings informed the synonym table. Positives use fresh paraphrases (some with only novel metaphors the deterministic layer is NOT expected to catch — those rely on the LLM). Negatives use trigger phrases in non-cache senses to check the layer does not false-positive. Use this, not clickstack_prompts.json, to claim generalization.",
+  "incident": "redis_cache_pressure",
+  "prompts": [
+    {"class": "paraphrase", "text": "Latency on the checkout endpoint climbed while Redis eviction counters rose.", "expects_cache": true, "expects_latency": true},
+    {"class": "paraphrase", "text": "Payment requests slowed and the cache hit ratio dropped sharply.", "expects_cache": true, "expects_latency": true},
+    {"class": "paraphrase", "text": "Connected clients on Redis spiked as response times degraded.", "expects_cache": true, "expects_latency": true},
+    {"class": "paraphrase", "text": "High memory on the cache node correlates with slower API duration.", "expects_cache": true, "expects_latency": true},
+
+    {"class": "novel_metaphor", "text": "Is the hot store shedding records while user journeys drag?", "expects_cache": true, "expects_latency": true},
+    {"class": "novel_metaphor", "text": "The quick-lookup layer seems to be spilling items as pages crawl.", "expects_cache": true, "expects_latency": true},
+    {"class": "novel_metaphor", "text": "Could the ephemeral lookup store be overflowing while orders stall?", "expects_cache": true, "expects_latency": true},
+
+    {"class": "negative", "text": "Rotate the signing keys; key churn after the deploy locked users out.", "expects_cache": false, "forbidden_keywords": ["cache", "eviction"]},
+    {"class": "negative", "text": "The mocking layer for our unit tests uses an in-memory tier to stub calls.", "expects_cache": false, "forbidden_keywords": ["cache"]},
+    {"class": "negative", "text": "Customers discarded entries from their shopping list before checkout.", "expects_cache": false, "forbidden_keywords": ["cache", "eviction"]},
+    {"class": "negative", "text": "Headroom in the sprint budget is tight this quarter.", "expects_cache": false, "forbidden_keywords": ["cache"]},
+    {"class": "negative", "text": "Connection demand for the webinar exceeded the seat limit.", "expects_cache": false, "forbidden_keywords": ["cache", "eviction"]},
+    {"class": "negative", "text": "Reuse efficiency of the conference rooms improved after the policy change.", "expects_cache": false, "forbidden_keywords": ["cache"]}
+  ]
+}

@@ -184,7 +184,7 @@ def test_grafana_backend_validate_queries():
         result_spec, warnings = asyncio.run(backend.validate_queries(spec))
         assert len(result_spec.panels) == 1
         assert warnings == []
-        mock_val.assert_called_once_with(mock_client, spec)
+        mock_val.assert_called_once_with(mock_client, spec, None)
 
     print("[PASS] test_grafana_backend_validate_queries")
 

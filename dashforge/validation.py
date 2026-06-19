@@ -10,10 +10,11 @@ import re
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
+import httpx
 import structlog
 
 from dashforge.grafana.client import GrafanaClient
-from dashforge.models.schemas import DashboardSpec, PanelSpec
+from dashforge.models.schemas import DashboardSpec, MetricEntry, PanelQuery, PanelSpec
 
 if TYPE_CHECKING:
     from dashforge.signalfx.client import SignalFxClient
@@ -23,79 +24,158 @@ logger = structlog.get_logger()
 # Regex to extract metric names from SignalFlow data('metric_name', ...)
 _SFX_DATA_RE = re.compile(r"data\(\s*['\"]([^'\"]+)['\"]\s*[),]")
 
+# Per-query verdicts kept deliberately distinct so callers never conflate a
+# fabricated metric with a real-but-sparse one.
+QUERY_OK = "ok"  # returned data in-window
+QUERY_EMPTY = "empty"  # valid + exists, but no series in-window (sparse)
+QUERY_SYNTAX = "syntax_error"  # query failed to parse/compile
+QUERY_ABSENT = "absent"  # metric is not in the routed datasource catalog
+QUERY_BAD_UID = "bad_uid"  # datasource UID is not among discovered datasources
+QUERY_SKIPPED = "skipped"  # datasource type we cannot probe via the prom API
+QUERY_ERROR = "error"  # transport/other error — cannot classify
 
-async def _check_query(
+
+async def _probe_query(
     client: GrafanaClient,
     datasource_uid: str,
     datasource_type: str,
     expr: str,
-) -> bool:
-    """Check if a query returns data for datasources we can validate via Prometheus API."""
+) -> str:
+    """Probe a single query and return one of the QUERY_* verdicts.
+
+    Separates *syntax validity* from *data presence* by reading the Prometheus
+    response status, so a real-but-sparse metric (success + empty result) is
+    never reported as a parse failure.
+    """
     normalized_type = (datasource_type or "").lower()
     if normalized_type in {"cloudwatch"}:
         logger.debug("query_check_skipped", datasource_type=normalized_type, reason="unsupported_datasource_validation")
-        return True
+        return QUERY_SKIPPED
 
     try:
         encoded = quote(expr, safe="")
         data = await client.datasource_proxy_get(datasource_uid, f"api/v1/query?query={encoded}")
+        if isinstance(data, dict) and data.get("status") == "error":
+            err_type = (data.get("errorType") or "").lower()
+            if err_type in {"bad_data", "parse", "execution"}:
+                logger.warning("query_syntax_error", expr=expr[:80], error_type=err_type)
+                return QUERY_SYNTAX
+            return QUERY_ERROR
         result = data.get("data", {}).get("result", []) if isinstance(data, dict) else []
-        has_data = len(result) > 0
-        logger.debug(
-            "query_check",
-            expr=expr[:80],
-            datasource_type=normalized_type,
-            has_data=has_data,
-            result_count=len(result),
-        )
-        return has_data
+        verdict = QUERY_OK if len(result) > 0 else QUERY_EMPTY
+        logger.debug("query_check", expr=expr[:80], datasource_type=normalized_type, verdict=verdict)
+        return verdict
+    except httpx.HTTPStatusError as e:
+        try:
+            payload = e.response.json()
+        except Exception:
+            payload = {}
+        error_type = str(payload.get("errorType", "")).lower() if isinstance(payload, dict) else ""
+        if e.response.status_code in {400, 422} or error_type in {"bad_data", "parse", "execution"}:
+            logger.warning("query_syntax_error", expr=expr[:80], status=e.response.status_code)
+            return QUERY_SYNTAX
+        logger.warning("query_check_http_error", expr=expr[:80], status=e.response.status_code)
+        return QUERY_ERROR
     except Exception as e:
         logger.warning("query_check_error", expr=expr[:80], datasource_type=normalized_type, error=str(e))
-        return False
+        return QUERY_ERROR
+
+
+def _referenced_metrics(expr: str, query_language: str) -> set[str]:
+    """Best-effort metric names referenced by a query (PromQL only)."""
+    if query_language and query_language.lower() not in ("", "promql"):
+        return set()
+    try:
+        from dashforge.dashboard_ingest import extract_metrics_from_promql
+
+        return set(extract_metrics_from_promql(expr))
+    except Exception:
+        return set()
 
 
 async def validate_dashboard_queries(
     client: GrafanaClient,
     spec: DashboardSpec,
+    catalog: list[MetricEntry] | None = None,
 ) -> tuple[DashboardSpec, list[str]]:
-    """Validate that dashboard panels have data. Returns (filtered_spec, warnings).
+    """Validate dashboard queries independently. Returns (filtered_spec, warnings).
 
-    Removes panels where ALL queries return no data.
-    Keeps panels where at least one query returns data.
-    Returns warnings listing which panels were dropped.
+    Each query is judged on three independent axes — *exists* (in the routed
+    datasource catalog), *syntax valid*, and *returns data in-window* — and the
+    failing query is dropped, not the whole panel. A panel survives if at least
+    one of its queries returns data (or is an unprobeable type). When ``catalog``
+    is provided, queries whose datasource UID is unknown or whose metric is
+    absent from the catalog are dropped and flagged (hallucination/routing);
+    when it is omitted, those checks are skipped so older callers behave as
+    before, just per-query instead of per-panel.
     """
     valid_panels: list[PanelSpec] = []
     warnings: list[str] = []
 
-    # Collect all (panel_idx, datasource_uid, datasource_type, expr) to check
-    checks: list[tuple[int, str, str, str]] = []
-    for panel_idx, panel in enumerate(spec.panels):
-        for query in panel.queries:
-            checks.append((panel_idx, query.datasource_uid, query.datasource_type, query.expr))
-
-    if not checks:
+    if not any(panel.queries for panel in spec.panels):
         return spec, ["No queries to validate"]
 
-    # Run all checks concurrently
-    tasks = [_check_query(client, ds_uid, ds_type, expr) for _, ds_uid, ds_type, expr in checks]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    catalog_names_by_uid: dict[str, set[str]] = {}
+    if catalog:
+        for entry in catalog:
+            if entry.datasource_uid:
+                catalog_names_by_uid.setdefault(entry.datasource_uid, set())
+                if entry.name:
+                    catalog_names_by_uid[entry.datasource_uid].add(entry.name)
 
-    # Group results by panel
-    panel_has_data: dict[int, bool] = {}
-    check_idx = 0
-    for panel_idx, panel in enumerate(spec.panels):
-        has_any_data = False
-        for _ in panel.queries:
-            result = results[check_idx]
-            if isinstance(result, bool) and result:
-                has_any_data = True
-            check_idx += 1
-        panel_has_data[panel_idx] = has_any_data
+    # Apply static routing/existence checks before probing, then probe only
+    # queries that reference metrics owned by their routed datasource.
+    flat: list[tuple[int, PanelQuery]] = [
+        (panel_idx, q) for panel_idx, panel in enumerate(spec.panels) for q in panel.queries
+    ]
 
-    # Filter panels
+    async def _validate_query(query: PanelQuery) -> str:
+        if catalog:
+            if query.datasource_uid not in catalog_names_by_uid:
+                return QUERY_BAD_UID
+            refs = _referenced_metrics(query.expr, query.query_language)
+            owned_names = catalog_names_by_uid[query.datasource_uid]
+            if refs and not refs.issubset(owned_names):
+                return QUERY_ABSENT
+        return await _probe_query(client, query.datasource_uid, query.datasource_type, query.expr)
+
+    probe_results = await asyncio.gather(*[_validate_query(q) for _, q in flat], return_exceptions=True)
+
+    # Resolve a verdict per query.
+    verdicts: dict[int, str] = {}
+    for i, (_, q) in enumerate(flat):
+        probe = probe_results[i]
+        verdicts[i] = probe if isinstance(probe, str) else QUERY_ERROR
+
+    hallucinated = 0
+    idx = 0
     for panel_idx, panel in enumerate(spec.panels):
-        if panel_has_data.get(panel_idx, False):
-            valid_panels.append(panel)
+        kept_queries: list[PanelQuery] = []
+        panel_has_data = False
+        for q in panel.queries:
+            verdict = verdicts[idx]
+            idx += 1
+            if verdict in (QUERY_OK, QUERY_SKIPPED):
+                kept_queries.append(q)
+                panel_has_data = True
+            elif verdict == QUERY_ABSENT:
+                hallucinated += 1
+                warnings.append(f'Panel "{panel.title}" — query dropped: metric not in catalog ({q.expr[:60]})')
+                logger.warning("query_absent_from_catalog", panel=panel.title, expr=q.expr[:80])
+            elif verdict == QUERY_BAD_UID:
+                warnings.append(
+                    f'Panel "{panel.title}" — query dropped: datasource not discovered ({q.datasource_uid})'
+                )
+                logger.warning("query_bad_uid", panel=panel.title, uid=q.datasource_uid)
+            elif verdict == QUERY_SYNTAX:
+                warnings.append(f'Panel "{panel.title}" — query dropped: invalid syntax ({q.expr[:60]})')
+            elif verdict == QUERY_EMPTY:
+                warnings.append(f'Panel "{panel.title}" — query dropped: no series in window ({q.expr[:60]})')
+            else:  # QUERY_ERROR
+                warnings.append(f'Panel "{panel.title}" — query dropped: validation error ({q.expr[:60]})')
+
+        if panel_has_data and kept_queries:
+            valid_panels.append(panel.model_copy(update={"queries": kept_queries}))
         else:
             warnings.append(f'Panel "{panel.title}" dropped — no matching series')
             logger.warning("panel_no_data", panel=panel.title, queries=[q.expr[:80] for q in panel.queries])
@@ -106,9 +186,9 @@ async def validate_dashboard_queries(
 
     logger.info(
         "query_validation_complete",
-        total_panels=len(spec.panels) + len(warnings),
         valid_panels=len(valid_panels),
-        dropped=len(warnings),
+        hallucinated_queries=hallucinated,
+        warnings=len(warnings),
     )
 
     return spec, warnings

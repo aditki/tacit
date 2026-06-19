@@ -116,6 +116,68 @@ Tie the first real-data milestone directly to the existing checkout incident dem
 - The run produces one successful investigation-history record.
 - The demo remains runnable with one documented command after the stack starts.
 
+#### M1 Accuracy Assessment
+
+Overall: promising beta accuracy, but not yet trustworthy without validation gates. Roughly 6.5/10.
+
+**What worked well**
+
+- Intent classification was strong. It consistently recognized error spikes, cache saturation, resource pressure, and payment-service context.
+- The canonical real-data prompt selected all six relevant ClickStack panels.
+- Query validation successfully rejected many nonexistent or incompatible metrics instead of publishing fabricated evidence.
+- After the routing fixes, every final target used the correct real-telemetry datasource.
+
+**Where accuracy weakened**
+
+- Broad prompts caused aggressive archetype blending and produced 20+ irrelevant candidate panels.
+- Before our fixes, plausible dashboards silently used synthetic data instead of the requested dataset.
+- Signal inference understood only 3 of 9 ClickStack metrics confidently.
+- Cache hits, misses, and evictions were incorrectly classified as generic request-rate signals.
+- Cache size and Redis client pressure were left unmapped.
+- Metric conventions and labels caused otherwise sensible generic templates to return no data.
+- Dashboard summaries can mention datasources used before validation, rather than only those in surviving panels.
+
+**Scorecard**
+
+| Dimension | Score |
+|---|---|
+| Intent/archetype recognition | 8/10 |
+| Query hallucination protection | 8/10 |
+| Metric semantic understanding | 5/10 |
+| Datasource routing after fixes | 8/10 |
+| Robustness to prompt variation | 5/10 |
+| Real-world investigation usefulness | 7/10 learned, 4–5/10 cold |
+
+The synthetic benchmark's 90% top-1 archetype accuracy is credible for classification, but its 78.9% metric recall likely overstates real-world performance. With only one fully validated external scenario, a statistical accuracy claim would be premature. The encouraging part is that the architecture fails visibly: unsupported panels are dropped and the real-data tests exposed incorrect routing. M2 (LO2) and M3 (GAMMA) will tell us whether ClickStack was a repeatable capability or a well-tuned success case.
+
+**Required work**
+
+- Build 25–40 paraphrases of the ClickStack incident: vague, precise, noisy, misleading, and differently worded.
+- Evaluate cold-start and learned-dashboard performance separately.
+- Use metric metadata, units, labels, and OTel scope to improve semantic inference.
+- Add explicit cache signals: size, hit ratio, misses, evictions, memory pressure, client pressure.
+- Rank archetypes by live metric coverage before blending them.
+- Prefer a strongly matching learned archetype over numerous generic templates.
+- Cap irrelevant archetype blending and panel count.
+- Ensure summaries describe only surviving panels and datasources.
+- Validate each query independently, not merely whether one query in a panel returns data.
+
+**Release gates**
+
+| Gate | Target |
+|---|---|
+| Semantic mapping precision | ≥90% |
+| Semantic mapping coverage | ≥80% |
+| Critical-signal recall (cold) | ≥75% |
+| Critical-signal recall (learned) | ≥90% |
+| Correct datasource routing | 100% |
+| Hallucinated published metrics | 0 |
+| Irrelevant surviving panels | <15% |
+| Supported prompt variants producing useful dashboards | ≥85% |
+| Typical dashboard size | 4–10 panels |
+
+Use tiny slices from LO2 or GAMMA to prevent overfitting to ClickStack, but postpone full ingestion. First make the reasoning robust across wording and metric conventions; then use larger datasets to test scale and generalization.
+
 ### M2: LO2 Sample Metrics
 
 **Branch:** `codex/dataset-lo2-metrics`

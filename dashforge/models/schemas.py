@@ -59,6 +59,13 @@ class Intent(BaseModel):
         "(highest first). Used as retrieval priors for metric ranking "
         "and template blending.",
     )
+    keyword_evidence: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Scored operational-synonym evidence with provenance: "
+        "[{keyword, score, tier, source}]. Conventional terms are also folded "
+        "into 'keywords'; colloquial (low-score) terms are advisory only and "
+        "must be confirmed against live coverage / learned archetypes before use.",
+    )
 
 
 # ── Context Enrichment ───────────────────────────────────────────────────────
@@ -103,6 +110,14 @@ class MetricEntry(BaseModel):
         description="Metric namespace or group (e.g. 'AWS/ELB', 'node_exporter', 'kube-state-metrics')",
     )
     dimensions: list[str] = Field(default_factory=list, description="Available dimensions / label names")
+    unit: str = Field(
+        default="",
+        description="Metric unit from datasource metadata (e.g. 'seconds', 'bytes', 'percent'). Empty if unknown.",
+    )
+    metric_type: str = Field(
+        default="",
+        description="Metric type from datasource metadata: counter, gauge, histogram, summary. Empty if unknown.",
+    )
 
 
 class QueryTarget(BaseModel):

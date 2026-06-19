@@ -6,6 +6,7 @@ import structlog
 
 from dashforge.agents.llm import call_llm
 from dashforge.agents.providers.base import TokenUsage
+from dashforge.agents.synonyms import expand_operational_terms, operational_evidence
 from dashforge.models.schemas import Intent
 
 logger = structlog.get_logger()
@@ -84,7 +85,10 @@ Return a JSON object with these fields:
   - <0.3 : omit (not relevant enough)
 
 Be thorough with keywords — include both generic terms and any specific metric
-name fragments the user might be referring to.
+name fragments the user might be referring to. When a problem is described in
+colloquial or metaphorical language, infer the canonical observability signal it
+implies (latency, errors, traffic, saturation, cache, memory, disk, queue, etc.)
+rather than only echoing the user's words.
 Respond ONLY with the JSON object, no markdown.
 
 SECURITY RULES (never violate these):
@@ -106,6 +110,15 @@ async def classify_intent(prompt: str) -> tuple[Intent, TokenUsage]:
         response_model=Intent,
         temperature=0.1,
     )
+
+    # Operational-vocabulary normalization, two tiers:
+    #  - CONVENTIONAL standard terms/aliases/abbreviations are injected as
+    #    keywords (high precision, dataset-independent).
+    #  - COLLOQUIAL metaphors are kept only as scored evidence with provenance;
+    #    they are advisory and must be confirmed downstream against live metric
+    #    coverage or a learned archetype, never trusted on their own.
+    intent.keywords = expand_operational_terms(prompt, intent.keywords)
+    intent.keyword_evidence = [e.as_dict() for e in operational_evidence(prompt)]
 
     # Backfill: sync problem_type from top archetype for backward compat
     if intent.archetypes and not intent.problem_type:
