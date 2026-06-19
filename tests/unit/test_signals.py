@@ -1824,8 +1824,7 @@ archetypes:
     def test_existing_uid_unique_table_migrates_to_backend_scope(self, tmp_path):
         db_path = tmp_path / "legacy_signals.db"
         with sqlite3.connect(db_path) as conn:
-            conn.executescript(
-                """
+            conn.executescript("""
                 CREATE TABLE ingested_dashboards (
                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                     dashboard_uid       TEXT NOT NULL UNIQUE,
@@ -1848,8 +1847,7 @@ archetypes:
                 );
                 INSERT INTO ingested_dashboards (dashboard_uid, dashboard_title, created_at)
                 VALUES ('shared-dash', 'Legacy Grafana', 1.0);
-            """
-            )
+            """)
 
         store = SignalStore(db_path=db_path)
         store.record_ingested_dashboard(
