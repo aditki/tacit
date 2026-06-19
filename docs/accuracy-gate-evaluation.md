@@ -288,6 +288,50 @@ there is no observed development-set regression. The lower holdout score is a
 generalization gap exposed by independent data, not a regression on the original
 baseline. The 92% remains development evidence only.
 
+**Model comparison — development set, current strict scorer (N=5).** Both runs use
+the same expectation-aware scorer (`tests/eval/prompt_scoring.py`, phrase-based; this
+is stricter than the lenient scorer behind the 92% figure above, so compare within
+this table only). Qwen3 Coder 30B is local; Claude Opus 4.8 was run on 2026-06-19 via
+`prompt_variation_harness.py --provider anthropic --model claude-opus-4-8 --corpus dev
+--trials 5` (Opus 4.8 rejects `temperature`, so it ran at default sampling — higher
+trial-to-trial variance).
+
+| Class | Qwen3 Coder 30B | Claude Opus 4.8 | Δ |
+|---|---:|---:|---:|
+| Precise | 100% | 100% | — |
+| Noisy | 100% | 100% | — |
+| Misleading | 83% | **100%** | +17 |
+| Reworded | 67% | **90%** | +23 |
+| Vague | 50% | 50% | 0 |
+| **Positive useful rate** | **120/150 (80%)** | **132/150 (88%)** | **+8** |
+| Negative correct rate | — | 30/30 (100%) | — |
+
+Opus clears the ≥85% gate (Qwen does not under this scorer). The entire +8 is
+concentrated in the two classes that measure paraphrase and distractor comprehension
+(reworded, misleading); negatives stayed at 100%, so the gain is real comprehension,
+not leakage returning under a stronger model.
+
+**Vague is flat because it is a labeling artifact, not a model limit.** All three
+failing vague prompts went 0/5 because the prompt contains no cache cue, yet the gold
+label expects cache (hindsight knowledge of the Redis incident):
+
+- *"Checkout is slow. Show me what is under pressure."* — Opus returned a correct broad
+  investigation (latency/saturation/cpu/memory) and did not invent cache.
+- *"Why did response times get bad during the traffic spike?"* — no cache cue; correct
+  latency/throughput intent.
+- *"Investigate the checkout slowdown without assuming the cause."* — the prompt
+  explicitly forbids assuming a cause; staying broad is the correct behavior, penalized
+  by an `expects_cache=true` label.
+
+The lone reworded miss (*"Did key churn and connection load make the request path take
+longer?"*, 2/5) is a genuinely ambiguous metaphor — Opus split between a DB-connection
+and a cache-eviction reading. This is exactly the case the live-coverage confirmation
+step resolves end-to-end but the intent-only harness cannot. Net: the 88% ceiling is
+now set mostly by eval labels, not by Opus. Recommended follow-ups (not yet applied):
+re-examine the three vague labels on principle, and run Opus on the *intent step only*
+in production where its comprehension gain is cheap (~1.6K-token call). The frozen
+holdout was **not** rerun for this comparison.
+
 ## Baseline results — offline morphology harness (cold-isolated)
 
 Measured by `tests/eval/gate_harness.py` under `cold_isolation()`, against labeled

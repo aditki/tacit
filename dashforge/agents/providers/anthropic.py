@@ -12,6 +12,10 @@ logger = structlog.get_logger()
 
 JSON_PREAMBLE = "Respond ONLY with a valid JSON object. No markdown, no explanation."
 
+# Newer Claude models (Opus 4.8+) reject the `temperature` parameter. We discover
+# this at runtime and remember it per-model so we only pay the failed call once.
+_NO_TEMPERATURE_MODELS: set[str] = set()
+
 
 def _response_text(response) -> str:
     for block in response.content:
@@ -19,6 +23,12 @@ def _response_text(response) -> str:
         if isinstance(text, str):
             return text
     return ""
+
+
+def _is_temperature_unsupported(exc: Exception) -> bool:
+    """True if a 400 says the model doesn't accept `temperature`."""
+    msg = str(getattr(exc, "message", "") or exc).lower()
+    return "temperature" in msg and ("deprecated" in msg or "unsupported" in msg or "not supported" in msg)
 
 
 class AnthropicProvider(LLMProvider):
@@ -33,6 +43,27 @@ class AnthropicProvider(LLMProvider):
             return TokenUsage(prompt_tokens=inp, completion_tokens=out, total_tokens=inp + out)
         return TokenUsage()
 
+    async def _create(self, system: str, user_prompt: str, temperature: float):
+        """Call messages.create, omitting `temperature` for models that reject it."""
+        model = settings.llm_model
+        kwargs = {
+            "model": model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+        if model not in _NO_TEMPERATURE_MODELS:
+            kwargs["temperature"] = temperature
+        try:
+            return await self._client.messages.create(**kwargs)
+        except anthropic.BadRequestError as exc:
+            if "temperature" in kwargs and _is_temperature_unsupported(exc):
+                logger.info("anthropic_temperature_unsupported", model=model)
+                _NO_TEMPERATURE_MODELS.add(model)
+                kwargs.pop("temperature", None)
+                return await self._client.messages.create(**kwargs)
+            raise
+
     async def chat_json(
         self,
         system_prompt: str,
@@ -40,13 +71,7 @@ class AnthropicProvider(LLMProvider):
         temperature: float = 0.2,
     ) -> LLMResult:
         system = f"{system_prompt}\n\n{JSON_PREAMBLE}"
-        response = await self._client.messages.create(
-            model=settings.llm_model,
-            max_tokens=4096,
-            temperature=temperature,
-            system=system,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
+        response = await self._create(system, user_prompt, temperature)
         raw = _response_text(response)
         logger.debug("anthropic_raw", raw=raw[:500])
         return LLMResult(text=raw, usage=self._extract_usage(response))
@@ -57,11 +82,5 @@ class AnthropicProvider(LLMProvider):
         user_prompt: str,
         temperature: float = 0.3,
     ) -> LLMResult:
-        response = await self._client.messages.create(
-            model=settings.llm_model,
-            max_tokens=4096,
-            temperature=temperature,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
+        response = await self._create(system_prompt, user_prompt, temperature)
         return LLMResult(text=_response_text(response), usage=self._extract_usage(response))

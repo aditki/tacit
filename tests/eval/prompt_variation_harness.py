@@ -112,17 +112,41 @@ def _resolve_corpus(name: str) -> Path:
     raise SystemExit(f"corpus not found: {name}")
 
 
+def _apply_model_overrides(provider: str, model: str, api_key: str, api_base: str) -> None:
+    """Point the pipeline at a chosen provider/model for this run.
+
+    Resets the cached provider singleton so a new provider/model/key takes effect
+    even though ``get_provider()`` memoizes.
+    """
+    if provider:
+        settings.llm_provider = provider
+    if model:
+        settings.llm_model = model
+    if api_key:
+        settings.llm_api_key = api_key
+    if api_base:
+        settings.llm_api_base = api_base
+    try:
+        import dashforge.agents.providers.registry as _registry
+
+        _registry._provider = None  # force rebuild with the new settings
+    except Exception:
+        pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Repeated prompt-variation gate (expectation-aware).")
     parser.add_argument("--trials", type=int, default=5)
     parser.add_argument("--corpus", default="dev", help="'dev', 'holdout', a fixture name, or a path.")
     parser.add_argument("--json", default="")
-    parser.add_argument("--api-base", default="", help="Override the configured local LLM API base.")
+    parser.add_argument("--provider", default="", help="LLM provider: anthropic | openai | ollama | bedrock | azure.")
+    parser.add_argument("--model", default="", help="Model string, e.g. 'claude-opus-4-8' or 'qwen3-coder:30b'.")
+    parser.add_argument("--api-key", default="", help="API key for the provider (or set via env/.env).")
+    parser.add_argument("--api-base", default="", help="Override the LLM API base (e.g. local Ollama).")
     args = parser.parse_args()
     if args.trials < 1:
         parser.error("--trials must be at least 1")
-    if args.api_base:
-        settings.llm_api_base = args.api_base
+    _apply_model_overrides(args.provider, args.model, args.api_key, args.api_base)
     corpus_path = _resolve_corpus(args.corpus)
     report = asyncio.run(run(args.trials, corpus_path))
     if report.get("role") == "holdout":
