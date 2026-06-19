@@ -39,6 +39,11 @@ from dashforge.signal_inference import infer_signal
 from tests.eval.cold_isolation import cold_isolation
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+MIN_SEMANTIC_PRECISION = 0.90
+MIN_SEMANTIC_RECALL = 0.80
+MIN_SEMANTIC_COVERAGE = 0.80
+MIN_COLD_RESOLUTION = 0.75
+MIN_LEARNED_RESOLUTION = 0.90
 
 
 @dataclass
@@ -272,6 +277,30 @@ def _aggregate(rows: list[dict[str, Any]], keys: list[str]) -> dict[str, int]:
     return {k: sum(r[k] for r in rows) for k in keys}
 
 
+def gate_failures(report: dict[str, Any]) -> list[str]:
+    """Return explicit gate failures; an empty list means the offline gate passes."""
+    failures: list[str] = []
+    for row in report["classification"]:
+        dataset = row["dataset"]
+        for metric, threshold in (
+            ("precision", MIN_SEMANTIC_PRECISION),
+            ("recall", MIN_SEMANTIC_RECALL),
+            ("coverage", MIN_SEMANTIC_COVERAGE),
+        ):
+            if row[metric] < threshold:
+                failures.append(f"{dataset} semantic {metric} {row[metric]:.4f} < {threshold:.2f}")
+    for row in report["cold_resolution"]:
+        if row["recall"] < MIN_COLD_RESOLUTION:
+            failures.append(f"{row['dataset']} cold resolution {row['recall']:.4f} < {MIN_COLD_RESOLUTION:.2f}")
+    for row in report["learned_resolution"]:
+        if row["recall"] < MIN_LEARNED_RESOLUTION:
+            failures.append(f"{row['dataset']} learned resolution {row['recall']:.4f} < {MIN_LEARNED_RESOLUTION:.2f}")
+    for row in report["learned_selection"]:
+        if not row["passed"]:
+            failures.append(f"{row['dataset']} learned selection chose {row['selected']} instead of {row['expected']}")
+    return failures
+
+
 def _print(report: dict[str, Any]) -> None:
     print("\n=== Semantic mapping: metric -> signal family (morphology + catalog metadata) ===")
     print(f"{'dataset':12s} {'role':8s} {'TP':>3} {'FP':>3} {'FN':>3} {'prec':>6} {'recall':>7} {'cover':>6}")
@@ -313,11 +342,19 @@ def main() -> int:
     parser.add_argument("--json", type=str, default="", help="Write the full report to this JSON path.")
     args = parser.parse_args()
     report = run()
+    failures = gate_failures(report)
+    report["gate"] = {"passed": not failures, "failures": failures}
     _print(report)
+    if failures:
+        print("\n=== OFFLINE GATE FAILED ===")
+        for failure in failures:
+            print(f"- {failure}")
+    else:
+        print("\n=== OFFLINE GATE PASSED ===")
     if args.json:
         Path(args.json).write_text(json.dumps(report, indent=2))
         print(f"\nwrote {args.json}")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

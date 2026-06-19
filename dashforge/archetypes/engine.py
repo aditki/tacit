@@ -726,19 +726,23 @@ def _archetype_live_coverage(
     catalog: list[MetricEntry],
     target_language: str = "promql",
 ) -> float | None:
-    """Fraction of an archetype's signals that resolve against the live catalog.
+    """Fraction of an archetype's declared evidence covered by the live catalog.
 
-    Returns ``None`` when the archetype declares no signals (coverage cannot be
-    measured, so callers should fall back to classifier confidence alone).
+    Evidence includes semantic signals/bindings and legacy ``required_metrics``.
+    Returns ``None`` when no evidence is declared or the catalog contains only
+    datasource targets without metric names, because coverage is then unknown.
     """
     signals = set(archetype.required_signals) | set(archetype.signal_bindings.keys())
-    if not signals:
+    required_metrics = set(archetype.required_metrics)
+    if not signals and not required_metrics:
         return None
 
     target_lang = target_language.lower()
     catalog_names = {
         e.name for e in catalog if e.name and (not target_lang or (e.query_language or "").lower() == target_lang)
     }
+    if not catalog_names:
+        return None
 
     store = None
     try:
@@ -760,7 +764,15 @@ def _archetype_live_coverage(
                     resolved += 1
             except Exception:
                 pass
-    return resolved / len(signals)
+    for required_metric in required_metrics:
+        try:
+            if any(re.fullmatch(required_metric, name) for name in catalog_names):
+                resolved += 1
+        except re.error:
+            if required_metric in catalog_names:
+                resolved += 1
+
+    return resolved / (len(signals) + len(required_metrics))
 
 
 def rank_archetypes_by_coverage(

@@ -101,6 +101,23 @@ def _history_signals(intent_signals: list, selected_archetypes: list[tuple[Any, 
     return values
 
 
+def _discovery_keywords(intent: Any) -> list[str]:
+    """Include advisory evidence when searching provider-scoped catalogs.
+
+    Colloquial evidence may broaden discovery so providers such as CloudWatch
+    can inspect the relevant namespace. It does not become trusted intent until
+    post-discovery semantic-signal confirmation succeeds.
+    """
+    keywords = list(intent.keywords)
+    seen = {str(keyword).lower() for keyword in keywords}
+    for item in intent.keyword_evidence:
+        keyword = str(item.get("keyword", ""))
+        if keyword and keyword.lower() not in seen:
+            seen.add(keyword.lower())
+            keywords.append(keyword)
+    return keywords
+
+
 async def run_pipeline(request: DashRequest) -> DashResponse:
     """End-to-end: natural language → Grafana dashboard URL."""
     bind_request_id()
@@ -203,11 +220,12 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
 
         # ── 3. Metric discovery — each backend contributes ───────────
         t0 = time.monotonic()
+        discovery_keywords = _discovery_keywords(intent)
         metric_catalog = []
         datasource_catalog = []
         ds_types: list[str] = []
         for backend in backends:
-            entries = await backend.discover_metrics(intent.keywords, intent)
+            entries = await backend.discover_metrics(discovery_keywords, intent)
             metric_catalog.extend(entries)
             if entries:
                 ds_types.append(backend.name)
@@ -216,7 +234,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     continue
                 target_discovery = getattr(backend, "discover_datasource_targets", None)
                 if target_discovery is not None:
-                    targets = await target_discovery(intent.keywords, intent)
+                    targets = await target_discovery(discovery_keywords, intent)
                     datasource_catalog.extend(targets)
                     if targets and backend.name not in ds_types:
                         ds_types.append(backend.name)

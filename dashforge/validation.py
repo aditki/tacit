@@ -133,10 +133,19 @@ async def validate_dashboard_queries(
         if catalog:
             if query.datasource_uid not in catalog_names_by_uid:
                 return QUERY_BAD_UID
-            refs = _referenced_metrics(query.expr, query.query_language)
             owned_names = catalog_names_by_uid[query.datasource_uid]
-            if refs and not refs.issubset(owned_names):
-                return QUERY_ABSENT
+            is_promql = (query.query_language or "").lower() == "promql" or (
+                not query.query_language and (query.datasource_type or "").lower() == "prometheus"
+            )
+            # Empty owned_names means discovery found the datasource target but
+            # could not enumerate its metrics. Routing is still known, so defer
+            # existence/data checks to the backend probe instead of declaring
+            # every query absent. Non-Prometheus queries have provider-specific
+            # identifiers and must not be parsed as PromQL.
+            if owned_names and is_promql:
+                refs = _referenced_metrics(query.expr, "promql")
+                if refs and not refs.issubset(owned_names):
+                    return QUERY_ABSENT
         return await _probe_query(client, query.datasource_uid, query.datasource_type, query.expr)
 
     probe_results = await asyncio.gather(*[_validate_query(q) for _, q in flat], return_exceptions=True)

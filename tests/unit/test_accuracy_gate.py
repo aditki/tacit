@@ -20,8 +20,10 @@ from dashforge.models.schemas import (
     PanelSpec,
     SignalType,
 )
+from dashforge.pipeline import _discovery_keywords
 from dashforge.signals import SignalStore, _unit_compatibility
 from dashforge.validation import validate_dashboard_queries
+from tests.eval.gate_harness import gate_failures
 
 
 def _metric(name: str, uid: str = "real") -> MetricEntry:
@@ -99,6 +101,50 @@ async def test_validation_drops_only_bad_query_from_mixed_panel():
     assert [query.expr for query in filtered.panels[0].queries] == ["real_metric"]
     assert any("metric not in catalog" in warning for warning in warnings)
     client.datasource_proxy_get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_validation_probes_target_only_catalog_instead_of_marking_absent():
+    client = AsyncMock()
+    client.datasource_proxy_get.return_value = {"status": "success", "data": {"result": [{"metric": {}}]}}
+    target = _metric("", "target-only")
+
+    filtered, warnings = await validate_dashboard_queries(
+        client,
+        _dashboard(_query("metric_not_enumerated", "target-only")),
+        [target],
+    )
+
+    assert len(filtered.panels) == 1
+    assert not any("metric not in catalog" in warning for warning in warnings)
+    client.datasource_proxy_get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_validation_does_not_parse_cloudwatch_metric_as_promql():
+    client = AsyncMock()
+    catalog = [
+        MetricEntry(
+            name="AWS/ApplicationELB/HTTPCode_ELB_5XX",
+            datasource_uid="cloudwatch",
+            datasource_name="CloudWatch",
+            datasource_type="cloudwatch",
+            query_language="cloudwatch",
+        )
+    ]
+    query = PanelQuery(
+        expr="HTTPCode_ELB_5XX",
+        datasource_uid="cloudwatch",
+        datasource_type="cloudwatch",
+        query_language="",
+        cloudwatch_namespace="AWS/ApplicationELB",
+    )
+
+    filtered, warnings = await validate_dashboard_queries(client, _dashboard(query), catalog)
+
+    assert len(filtered.panels) == 1
+    assert not any("metric not in catalog" in warning for warning in warnings)
+    client.datasource_proxy_get.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -189,6 +235,48 @@ def test_archetype_ranking_prefers_live_coverage_over_raw_confidence():
     )
 
     assert [archetype.id for archetype, _ in ranked] == ["covered"]
+
+
+def test_archetype_ranking_includes_required_metrics_without_signals():
+    uncovered = InvestigationArchetype(
+        id="uncovered-required-metrics",
+        name="uncovered",
+        problem_types=["uncovered"],
+        required_metrics=["missing_metric"],
+        panels=[PanelTemplate(title="Missing", queries=[QueryTemplate(expr="missing_metric")])],
+    )
+    covered = InvestigationArchetype(
+        id="covered-required-metrics",
+        name="covered",
+        problem_types=["covered"],
+        required_metrics=["real_metric"],
+        panels=[PanelTemplate(title="Real", queries=[QueryTemplate(expr="real_metric")])],
+    )
+
+    ranked = rank_archetypes_by_coverage(
+        [(uncovered, 0.99), (covered, 0.60)],
+        [_metric("real_metric")],
+        max_archetypes=1,
+    )
+
+    assert ranked[0][0].id == "covered-required-metrics"
+
+
+def test_colloquial_evidence_broadens_discovery_without_mutating_intent():
+    intent = Intent(
+        summary="the in-memory tier is squeezed",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["saturation"],
+        timerange="1h",
+        problem_type="general",
+        archetypes=[],
+        keyword_evidence=[{"keyword": "cache", "score": 0.4, "tier": "colloquial", "source": "in-memory tier"}],
+    )
+
+    assert _discovery_keywords(intent) == ["saturation", "cache"]
+    assert intent.keywords == ["saturation"]
 
 
 def test_archetype_ranking_prefers_strong_learned_match(monkeypatch):
@@ -282,3 +370,16 @@ def test_blending_enforces_archetype_and_panel_caps(monkeypatch):
 
     assert len(dashboard.panels) == 3
     assert all("third" not in panel.title for panel in dashboard.panels)
+
+
+def test_offline_gate_reports_semantic_and_selection_regressions():
+    report = {
+        "classification": [{"dataset": "regressed", "precision": 0.89, "recall": 0.79, "coverage": 0.79}],
+        "cold_resolution": [{"dataset": "regressed", "recall": 0.74}],
+        "learned_resolution": [{"dataset": "regressed", "recall": 0.89}],
+        "learned_selection": [{"dataset": "regressed", "selected": "generic", "expected": "learned", "passed": False}],
+    }
+
+    failures = gate_failures(report)
+
+    assert len(failures) == 6
