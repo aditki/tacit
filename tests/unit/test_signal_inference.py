@@ -103,6 +103,10 @@ class TestInferenceHardening:
         sig = infer_signal("node_uptime_seconds")
         assert sig is not None and sig.signal_family == "availability"
 
+    def test_probe_status_is_availability(self):
+        sig = infer_signal("httpcheck_status")
+        assert sig is not None and sig.signal_family == "availability"
+
     def test_cert_expiry_is_security(self):
         sig = infer_signal("ssl_cert_expiry_seconds")
         assert sig is not None and sig.signal_family == "security"
@@ -118,6 +122,16 @@ class TestInferenceHardening:
         sig = infer_signal("app_errors_total", panels)
         assert sig.signal_family == "errors"
         assert any("confirms counter" in e for e in sig.evidence)
+
+    @pytest.mark.parametrize(
+        "metric",
+        ["http_response_status_code_total", "http_service_response_status_code_total"],
+    )
+    def test_http_status_code_counter_is_traffic_not_availability(self, metric):
+        sig = infer_signal(metric)
+
+        assert sig is not None
+        assert sig.signal_family == "traffic"
 
     def test_bucket_without_time_is_not_latency(self):
         panels = [{"title": "Response size", "unit": "bytes", "metrics": ["response_size_bytes_bucket"], "queries": []}]

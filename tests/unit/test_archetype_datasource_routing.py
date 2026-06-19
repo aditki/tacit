@@ -193,3 +193,48 @@ def test_service_owner_must_cover_every_metric_in_query():
     dashboard = compile_archetype(archetype, intent, catalog)
 
     assert dashboard.panels[0].queries[0].datasource_uid == "default-prom"
+
+
+def test_single_discovered_operand_does_not_reroute_multi_metric_query():
+    archetype = InvestigationArchetype(
+        id="partial-ratio",
+        name="Partial ratio",
+        problem_types=["errors"],
+        required_metrics=["errors_total", "requests_total"],
+        panels=[
+            PanelTemplate(
+                title="Error ratio",
+                queries=[QueryTemplate(expr="errors_total / requests_total")],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="error ratio",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["errors"],
+        timerange="1h",
+        problem_type="errors",
+        archetypes=[ArchetypeMatch(type="errors", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name="default_only_metric",
+            datasource_uid="default-prom",
+            datasource_name="Default",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+        MetricEntry(
+            name="errors_total",
+            datasource_uid="partial-prom",
+            datasource_name="Partial",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    assert dashboard.panels[0].queries[0].datasource_uid == "default-prom"

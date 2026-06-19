@@ -554,6 +554,23 @@ def test_archetype_coverage_uses_native_query_language(monkeypatch):
     assert ranked[0][0].id == "learned-cloudwatch"
 
 
+def test_archetype_coverage_keeps_metrics_without_service_metadata(monkeypatch):
+    monkeypatch.setattr(settings, "learned_archetype_min_coverage", 0.75)
+    monkeypatch.setattr(settings, "learned_archetype_boost", 0.15)
+    learned = _archetype("learned-unscoped", "unscoped_metric")
+    learned.tags = ["learned"]
+    generic = _archetype("generic", "generic_metric")
+
+    ranked = rank_archetypes_by_coverage(
+        [(generic, 0.80), (learned, 0.70)],
+        [_metric("generic_metric"), _metric("unscoped_metric")],
+        services=["checkout"],
+        max_archetypes=2,
+    )
+
+    assert ranked[0][0].id == "learned-unscoped"
+
+
 def test_panel_signature_preserves_datasource_identity():
     first = PanelSpec(title="Requests A", queries=[_query("rate(requests_total[5m])", "prom-a")])
     second = PanelSpec(title="Requests B", queries=[_query("rate(requests_total[5m])", "prom-b")])

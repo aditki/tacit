@@ -142,7 +142,11 @@ _NAME_RULES: list[tuple[re.Pattern[str], str, float, str]] = [
         "name indicates availability/health",
     ),
     (
-        re.compile(r"(restarts?|status$|_status_|healthcheck_status)"),
+        re.compile(
+            r"(restarts?|(?:health|http|tcp|dns)check_status|"
+            r"(?:pod|node|container|deployment|replica|connector|task|job|process|service)"
+            r".*_status(?!_code)(?:_|$)|(?:lifecycle|health|readiness)_status)"
+        ),
         "availability",
         0.85,
         "name indicates lifecycle status",

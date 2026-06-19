@@ -187,7 +187,7 @@ def _resolve_promql_query_target(
             and _datasource_type_matches(entry.datasource_type, "prometheus")
             and (not entry.query_language or entry.query_language.lower() == "promql")
         ]
-        if len(candidates) == 1:
+        if len(metric_names) == 1 and len(candidates) == 1:
             return QueryTarget.from_metric(candidates[0])
 
         owners_by_metric = {
@@ -797,7 +797,7 @@ def _archetype_live_coverage(
     named_catalog = [entry for entry in catalog if entry.name]
     if not named_catalog:
         return None
-    scoped_catalog = catalog_for_services(named_catalog, services or [])
+    scoped_catalog = catalog_for_services(named_catalog, services or [], include_unscoped=True)
     query_languages = _archetype_query_languages(archetype, target_language)
     coverage_catalog = [entry for entry in scoped_catalog if (entry.query_language or "").lower() in query_languages]
     catalog_names = {entry.name for entry in coverage_catalog}
