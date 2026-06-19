@@ -650,14 +650,17 @@ class SignalStore:
         target_lang = target_query_language.lower()
         target_ds = context_datasource_type.lower()
         matched: list[tuple[MetricEntry, float]] = []
-        seen_metrics: set[str] = set()
+        seen_metrics: set[tuple[str, str]] = set()
+
+        sig_type = self.get_signal_type(signal_type)
 
         for mapping in mappings:
             pattern = mapping["metric_pattern"]
             eff_conf = mapping["effective_confidence"]
 
             for entry in catalog:
-                if entry.name in seen_metrics:
+                metric_key = (entry.datasource_uid, entry.name)
+                if metric_key in seen_metrics:
                     continue
                 # Restrict to the target backend's query language so we never
                 # substitute a cross-backend metric into the wrong template.
@@ -666,8 +669,9 @@ class SignalStore:
                 if target_ds and not _datasource_type_matches(entry.datasource_type, target_ds):
                     continue
                 if _metric_matches_pattern(entry.name, pattern):
-                    matched.append((entry, eff_conf))
-                    seen_metrics.add(entry.name)
+                    adjusted = eff_conf * _metric_metadata_compatibility(signal_type, sig_type or {}, entry)
+                    matched.append((entry, round(adjusted, 4)))
+                    seen_metrics.add(metric_key)
 
         matched.sort(key=lambda x: x[1], reverse=True)
         return matched
@@ -1511,6 +1515,85 @@ def _datasource_type_matches(candidate: str, requested: str) -> bool:
     if candidate in _SIGNALFX_DATASOURCE_TYPES and requested in _SIGNALFX_DATASOURCE_TYPES:
         return True
     return False
+
+
+# Coarse unit classes for cross-checking a candidate metric's datasource unit
+# against the expected unit of the signal it would resolve.
+_UNIT_CLASSES: list[tuple[str, frozenset[str]]] = [
+    ("time", frozenset({"s", "ms", "ns", "us", "µs", "seconds", "milliseconds", "nanoseconds"})),
+    ("bytes", frozenset({"bytes", "decbytes", "bits", "kb", "mb", "gb", "kib", "mib", "gib"})),
+    ("percent", frozenset({"percent", "percentunit", "%"})),
+    ("rate", frozenset({"ops", "reqps", "rps", "cps", "wps", "/s", "persec"})),
+]
+
+
+def _unit_class(unit: str) -> str:
+    unit = (unit or "").strip().lower()
+    if not unit:
+        return ""
+    for name, members in _UNIT_CLASSES:
+        if unit in members:
+            return name
+    return ""
+
+
+def _unit_compatibility(expected_unit: str, metric_unit: str) -> float:
+    """Multiplier for a candidate's confidence based on unit agreement.
+
+    Conservative: only acts when *both* the signal's expected unit and the
+    candidate metric's datasource unit are known and classifiable. A clear
+    contradiction down-ranks the candidate; agreement gives a small boost;
+    anything unknown is left unchanged (multiplier 1.0) so callers without
+    metadata are unaffected.
+    """
+    exp = _unit_class(expected_unit)
+    got = _unit_class(metric_unit)
+    if not exp or not got:
+        return 1.0
+    if exp == got:
+        return 1.1
+    return 0.5
+
+
+def _metric_metadata_compatibility(
+    signal_type: str,
+    signal_definition: dict[str, Any],
+    entry: MetricEntry,
+) -> float:
+    """Score datasource metadata that supports or contradicts a name match.
+
+    Pattern matching remains mandatory. Metadata only reorders candidates that
+    already match a curated or learned pattern, which keeps this conservative
+    for providers that expose incomplete labels or OTel scope information.
+    """
+    score = _unit_compatibility(signal_definition.get("unit", ""), entry.unit)
+    category = str(signal_definition.get("category", "")).lower()
+    metric_type = (entry.metric_type or "").lower()
+
+    if category == "latency":
+        if metric_type in {"histogram", "summary", "gaugehistogram"}:
+            score *= 1.15
+        elif metric_type in {"gauge", "info"} and _unit_class(entry.unit) != "time":
+            score *= 0.8
+    elif category in {"throughput", "errors"} and metric_type in {"counter", "sum"}:
+        score *= 1.1
+    elif category in {"saturation", "resource", "resource_usage", "capacity"} and metric_type == "gauge":
+        score *= 1.05
+
+    context = " ".join([entry.namespace, *entry.dimensions]).lower()
+    semantic_hints: tuple[str, ...] = ()
+    if signal_type.startswith(("request_", "api_", "error_")):
+        semantic_hints = ("http", "rpc", "route", "method", "status_code")
+    elif signal_type.startswith("cache_"):
+        semantic_hints = ("cache", "redis", "memcached", "keyspace", "db")
+    elif signal_type in {"queue_depth", "consumer_lag", "message_rate"}:
+        semantic_hints = ("queue", "messaging", "kafka", "consumer", "destination")
+    elif signal_type in {"cpu_usage", "memory_usage", "disk_usage", "network_bytes"}:
+        semantic_hints = ("host", "container", "process", "pod", "device")
+    if context and semantic_hints and any(hint in context for hint in semantic_hints):
+        score *= 1.08
+
+    return score
 
 
 def _missing_context_multiplier(

@@ -7,3 +7,11 @@ datasources:
     url: http://prometheus:9090
     isDefault: true
     editable: true
+
+  - name: Real Telemetry
+    uid: real-telemetry
+    type: prometheus
+    access: proxy
+    url: http://victoriametrics:8428
+    isDefault: false
+    editable: true

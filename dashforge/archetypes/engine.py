@@ -12,6 +12,8 @@ import re
 import structlog
 
 from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from dashforge.catalog import catalog_for_services, metric_matches_services
+from dashforge.config import settings
 from dashforge.models.schemas import (
     DashboardSpec,
     Intent,
@@ -22,6 +24,8 @@ from dashforge.models.schemas import (
 )
 
 logger = structlog.get_logger()
+
+_PROMETHEUS_HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
 
 # Characters that are special in RE2 (used by PromQL) and need escaping.
 # Note: dash `-` is NOT special in RE2 outside character classes.
@@ -163,6 +167,49 @@ def _resolve_query_target(
         datasource_type=datasource_type,
         query_language=query_language,
     )
+
+
+def _resolve_promql_query_target(
+    catalog: list[MetricEntry],
+    expr: str,
+    default_target: QueryTarget,
+    intent: Intent,
+) -> QueryTarget:
+    """Route a PromQL query to the datasource that actually owns its metrics."""
+    from dashforge.dashboard_ingest import extract_metrics_from_promql
+
+    metric_names = set(extract_metrics_from_promql(expr))
+    if metric_names:
+        candidates = [
+            entry
+            for entry in catalog
+            if entry.name in metric_names
+            and _datasource_type_matches(entry.datasource_type, "prometheus")
+            and (not entry.query_language or entry.query_language.lower() == "promql")
+        ]
+        if len(metric_names) == 1 and len(candidates) == 1:
+            return QueryTarget.from_metric(candidates[0])
+
+        owners_by_metric = {
+            metric: {entry.datasource_uid for entry in candidates if entry.name == metric} for metric in metric_names
+        }
+        if owners_by_metric and all(owners_by_metric.values()):
+            common_owners = set.intersection(*owners_by_metric.values())
+            if len(common_owners) == 1:
+                owner = next(iter(common_owners))
+                return QueryTarget.from_metric(next(entry for entry in candidates if entry.datasource_uid == owner))
+
+        service_candidates = [entry for entry in candidates if metric_matches_services(entry, intent.services)]
+        service_owners = {entry.datasource_uid for entry in service_candidates}
+        complete_service_owners = {
+            owner
+            for owner in service_owners
+            if all(owner in owners_by_metric.get(metric, set()) for metric in metric_names)
+        }
+        if len(complete_service_owners) == 1:
+            owner = next(iter(complete_service_owners))
+            return QueryTarget.from_metric(next(entry for entry in service_candidates if entry.datasource_uid == owner))
+    return default_target
 
 
 def _resolve_rate_interval(intent: Intent) -> str:
@@ -629,7 +676,9 @@ def compile_archetype(
                     # Compile the resolved PromQL template directly to SignalFlow.
                     legend = qt.legend_format or pt.title
                     expr = _promql_template_to_signalflow(expr, service_filter, container_filter, legend)
-                query_target = default_target
+                    query_target = default_target
+                else:
+                    query_target = _resolve_promql_query_target(catalog, expr, default_target, intent)
             else:
                 # Non-PromQL queries are honored verbatim — no PromQL
                 # format/escaping or PromQL→SignalFlow conversion.
@@ -697,6 +746,169 @@ def compile_archetype(
     return spec
 
 
+def _archetype_query_languages(
+    archetype: InvestigationArchetype,
+    target_language: str,
+) -> set[str]:
+    """Return native query languages used by an archetype for this backend."""
+    datasource_languages = {
+        "cloudwatch": "cloudwatch",
+        "loki": "logql",
+        "graphite": "graphite",
+        "influxdb": "influxql",
+        "elasticsearch": "lucene",
+        "opensearch": "lucene",
+        "signalfx": "signalflow",
+        "grafana-signalfx-datasource": "signalflow",
+    }
+    fallback = target_language.lower()
+    languages: set[str] = set()
+    for panel in archetype.panels:
+        for query in panel.queries:
+            datasource_type = (query.datasource_type or "").lower()
+            if datasource_type in datasource_languages:
+                languages.add(datasource_languages[datasource_type])
+                continue
+            query_language = (query.query_language or "").lower()
+            if datasource_type in _PROMETHEUS_DATASOURCE_TYPES and query_language in {"", "promql"}:
+                languages.add(fallback or "promql")
+            elif query_language:
+                languages.add(query_language)
+    return languages or {fallback or "promql"}
+
+
+def _archetype_live_coverage(
+    archetype: InvestigationArchetype,
+    catalog: list[MetricEntry],
+    target_language: str = "promql",
+    services: list[str] | None = None,
+) -> float | None:
+    """Fraction of an archetype's declared evidence covered by the live catalog.
+
+    Evidence includes semantic signals/bindings and legacy ``required_metrics``.
+    Returns ``None`` when no evidence is declared or the catalog contains only
+    datasource targets without metric names, because coverage is then unknown.
+    """
+    signals = set(archetype.required_signals) | set(archetype.signal_bindings.keys())
+    required_metrics = set(archetype.required_metrics)
+    if not signals and not required_metrics:
+        return None
+
+    named_catalog = [entry for entry in catalog if entry.name]
+    if not named_catalog:
+        return None
+    scoped_catalog = catalog_for_services(named_catalog, services or [], include_unscoped=True)
+    query_languages = _archetype_query_languages(archetype, target_language)
+    coverage_catalog = [entry for entry in scoped_catalog if (entry.query_language or "").lower() in query_languages]
+    catalog_names = {entry.name for entry in coverage_catalog}
+    if not catalog_names:
+        return 0.0
+
+    store = None
+    try:
+        from dashforge.signals import get_signal_store
+
+        store = get_signal_store()
+    except Exception:
+        store = None
+
+    resolved = 0
+    for sig in signals:
+        default_metric = archetype.signal_bindings.get(sig, "")
+        if default_metric and default_metric in catalog_names:
+            resolved += 1
+            continue
+        if store is not None:
+            try:
+                if store.resolve_signal(
+                    sig,
+                    coverage_catalog,
+                    context_service=services[0] if services else "",
+                ):
+                    resolved += 1
+            except Exception:
+                pass
+    for required_metric in required_metrics:
+        if any(
+            name == required_metric
+            or any(
+                name.endswith(suffix) and name[: -len(suffix)] == required_metric
+                for suffix in _PROMETHEUS_HISTOGRAM_SUFFIXES
+            )
+            for name in catalog_names
+        ):
+            resolved += 1
+
+    return resolved / (len(signals) + len(required_metrics))
+
+
+def rank_archetypes_by_coverage(
+    ranked_archetypes: list[tuple[InvestigationArchetype, float]],
+    catalog: list[MetricEntry],
+    *,
+    target_language: str = "promql",
+    services: list[str] | None = None,
+    max_archetypes: int | None = None,
+    min_secondary_coverage: float = 0.0,
+) -> list[tuple[InvestigationArchetype, float]]:
+    """Re-rank archetypes by classifier_confidence × live signal coverage.
+
+    This prefers a strongly-matching (well-covered) archetype over numerous
+    generic templates whose signals are absent from the environment, then caps
+    the list so blending cannot explode into many loosely-matched archetypes.
+    The primary archetype (rank 0 after re-sort) is always kept; secondaries
+    below ``min_secondary_coverage`` are dropped.
+    """
+    if not ranked_archetypes:
+        return ranked_archetypes
+
+    scored: list[tuple[InvestigationArchetype, float, float, float]] = []
+    for arch, confidence in ranked_archetypes:
+        coverage = _archetype_live_coverage(arch, catalog, target_language, services)
+        # Unknown coverage (no declared signals) keeps the classifier confidence.
+        effective = confidence if coverage is None else confidence * coverage
+        is_learned = bool({"learned", "auto-generated"} & set(arch.tags))
+        if is_learned and coverage is not None and coverage >= settings.learned_archetype_min_coverage:
+            # Learned and classifier retrieval scores are not calibrated on
+            # the same scale. Prefer learned context only with strong live
+            # evidence, and keep the adjustment deliberately bounded.
+            effective += settings.learned_archetype_boost * coverage
+        scored.append((arch, confidence, coverage if coverage is not None else -1.0, effective))
+
+    scored.sort(key=lambda x: x[3], reverse=True)
+
+    kept: list[tuple[InvestigationArchetype, float]] = []
+    for rank, (arch, confidence, coverage, effective) in enumerate(scored):
+        if rank > 0 and coverage >= 0.0 and coverage < min_secondary_coverage:
+            logger.info(
+                "archetype_dropped_low_coverage",
+                archetype=arch.id,
+                confidence=confidence,
+                coverage=round(coverage, 3),
+            )
+            continue
+        kept.append((arch, confidence))
+        if max_archetypes is not None and len(kept) >= max_archetypes:
+            break
+
+    return kept
+
+
+def _panel_signature(panel: PanelSpec) -> frozenset[tuple[str, str, str, str]] | str:
+    """Identify equivalent panels without collapsing cross-datasource evidence."""
+    queries = {
+        (
+            re.sub(r"\s+", "", query.expr.lower()),
+            query.datasource_uid,
+            query.datasource_type.lower(),
+            query.query_language.lower(),
+        )
+        for query in panel.queries
+        if query.expr
+    }
+    return frozenset(queries) if queries else panel.title.lower()
+
+
 def blend_archetypes(
     ranked_archetypes: list[tuple[InvestigationArchetype, float]],
     intent: Intent,
@@ -726,26 +938,48 @@ def blend_archetypes(
     if not ranked_archetypes:
         raise ValueError("blend_archetypes called with empty archetype list")
 
+    # Coverage-rank and cap the archetype set BEFORE blending so a flood of
+    # loosely-matched generic templates can't add dozens of irrelevant panels.
+    ranked_archetypes = rank_archetypes_by_coverage(
+        ranked_archetypes,
+        catalog,
+        target_language=target_language,
+        services=intent.services,
+        max_archetypes=settings.max_blended_archetypes,
+        min_secondary_coverage=settings.min_secondary_coverage,
+    )
+    max_panels = settings.max_dashboard_panels
+
     primary_arch, primary_conf = ranked_archetypes[0]
     primary_spec = compile_archetype(primary_arch, intent, catalog, target_language=target_language)
 
-    # Track existing panel titles to avoid duplicates
-    existing_titles: set[str] = {p.title.lower() for p in primary_spec.panels}
+    # De-dup on the panel's *query signature* (the set of normalized query
+    # expressions), not just its title — so the same panel arriving from two
+    # archetypes under different titles collapses, while distinct views of the
+    # same metric (e.g. p99 vs avg latency) are preserved.
+    seen_signatures: set[frozenset[tuple[str, str, str, str]] | str] = {
+        _panel_signature(p) for p in primary_spec.panels
+    }
     blended_panels = list(primary_spec.panels)
     blended_tags = list(primary_spec.tags)
 
     for arch, conf in ranked_archetypes[1:]:
         if conf < secondary_min_confidence:
             continue
+        if len(blended_panels) >= max_panels:
+            break
 
         secondary_spec = compile_archetype(arch, intent, catalog, target_language=target_language)
         added = 0
         for panel in secondary_spec.panels:
-            if panel.title.lower() not in existing_titles:
+            if len(blended_panels) >= max_panels:
+                break
+            sig = _panel_signature(panel)
+            if sig not in seen_signatures:
                 # Tag panel with its source archetype for traceability
                 panel_with_row = panel.model_copy(update={"row": panel.row or arch.name})
                 blended_panels.append(panel_with_row)
-                existing_titles.add(panel.title.lower())
+                seen_signatures.add(sig)
                 added += 1
 
         if added > 0:
@@ -766,7 +1000,7 @@ def blend_archetypes(
         title=title,
         tags=list(dict.fromkeys(blended_tags)),  # dedupe preserving order
         timerange=intent.timerange or primary_arch.default_timerange,
-        panels=blended_panels,
+        panels=blended_panels[:max_panels],
     )
 
     logger.info(
@@ -774,7 +1008,7 @@ def blend_archetypes(
         primary=primary_arch.id,
         primary_confidence=primary_conf,
         total_archetypes=len(ranked_archetypes),
-        total_panels=len(blended_panels),
+        total_panels=len(spec.panels),
     )
 
     return spec

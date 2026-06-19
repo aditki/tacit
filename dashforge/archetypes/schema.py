@@ -55,8 +55,8 @@ class InvestigationArchetype(BaseModel):
     )
     required_metrics: list[str] = Field(
         default_factory=list,
-        description="Metric name patterns this archetype needs (regex-style), "
-        "e.g. ['http_requests_total', 'http_request_duration_seconds.*']",
+        description="Literal metric names this archetype needs, "
+        "e.g. ['http_requests_total', 'http_request_duration_seconds']",
     )
     required_signals: list[str] = Field(
         default_factory=list,

@@ -1,0 +1,33 @@
+{
+  "dataset": "lo2",
+  "role": "holdout",
+  "datasource_uid": "lo2-prom",
+  "datasource_type": "prometheus",
+  "query_language": "promql",
+  "source": "Convention-faithful synthetic slice. The real LO2 archive (Zenodo 14265858) is not fetchable from this sandbox; metric NAMES follow LO2's Spring/Micrometer microservice + Caffeine/Memcached cache conventions so the slice tests whether the semantic layer generalizes across naming styles, NOT the real labeled incidents. Treated as a holdout — never used to tune the rules.",
+  "prompt": "A microservice API is returning errors under load; check request errors, latency, cache behavior, and resource pressure.",
+  "critical_signals": [
+    {"signal_type": "error_rate", "expected_metric": "service_errors_total"},
+    {"signal_type": "cache_hits", "expected_metric": "cache_hits_total"},
+    {"signal_type": "cache_misses", "expected_metric": "cache_misses_total"},
+    {"signal_type": "cache_evictions", "expected_metric": "cache_evictions_total"},
+    {"signal_type": "cpu_usage", "expected_metric": "process_cpu_usage"}
+  ],
+  "metrics": [
+    {"name": "service_requests_total", "unit": "", "type": "counter", "family": "traffic", "present": true},
+    {"name": "service_errors_total", "unit": "", "type": "counter", "family": "errors", "present": true},
+    {"name": "service_request_failures_total", "unit": "", "type": "counter", "family": "errors", "present": true},
+    {"name": "http_server_requests_seconds", "unit": "s", "type": "histogram", "family": "latency", "present": true},
+    {"name": "cache_hits_total", "unit": "", "type": "counter", "family": "caching", "present": true},
+    {"name": "cache_misses_total", "unit": "", "type": "counter", "family": "caching", "present": true},
+    {"name": "cache_evictions_total", "unit": "", "type": "counter", "family": "caching", "present": true},
+    {"name": "caffeine_cache_eviction_count", "unit": "", "type": "counter", "family": "caching", "present": true},
+    {"name": "memcached_items_evicted", "unit": "", "type": "counter", "family": "caching", "present": true},
+    {"name": "cache_size", "unit": "", "type": "gauge", "family": "caching", "present": true},
+    {"name": "process_cpu_usage", "unit": "", "type": "gauge", "family": "resource_usage", "present": true},
+    {"name": "jvm_memory_used_bytes", "unit": "bytes", "type": "gauge", "family": "resource_usage", "present": true},
+    {"name": "hikaricp_connections_active", "unit": "", "type": "gauge", "family": "saturation", "present": true},
+    {"name": "logback_events_total", "unit": "", "type": "counter", "family": "none", "present": true},
+    {"name": "application_build_info", "unit": "", "type": "gauge", "family": "none", "present": true}
+  ]
+}

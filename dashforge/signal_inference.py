@@ -33,10 +33,11 @@ SIGNAL_FAMILIES = (
     "resource_usage",
     "security",
     "capacity",
+    "caching",
 )
 
 # Bump when rules change so learned mappings can be invalidated/replayed.
-INFERENCE_VERSION = "1.0"
+INFERENCE_VERSION = "1.1"
 
 MIN_SCORE = 0.25  # below this we emit nothing rather than guess
 
@@ -53,7 +54,7 @@ _W_QUERY = 0.10
 _W_GROUP = 0.05
 
 # Metadata/info metrics that are not operational signals → never classify.
-_IGNORE_RE = re.compile(r"(_info$|build_info|_build_info|_version|version_info|_created$|created_)")
+_IGNORE_RE = re.compile(r"(_info$|build_info|_build_info|_version|version_info|_created$|created_|^scrape_|^logback_)")
 
 # Time-point / lifecycle overrides: these end in _seconds but are NOT latency.
 # (family, regex, evidence)
@@ -86,6 +87,47 @@ _NAME_RULES: list[tuple[re.Pattern[str], str, float, str]] = [
     (re.compile(r"(_depth|_backlog|_pending|_lag|queue)"), "backlog", 0.9, "name indicates a queue/backlog"),
     (re.compile(r"(inflight|in_flight|concurrent)"), "saturation", 0.85, "name indicates concurrency"),
     (
+        # Match both Redis-INFO order (connected_clients) and OTLP semconv
+        # order (clients_connected); same for blocked/rejected.
+        re.compile(
+            r"(connected_clients|clients_connected|blocked_clients|clients_blocked"
+            r"|rejected_connections|connections_rejected|client_recent_max)"
+        ),
+        "saturation",
+        1.0,
+        "name indicates client pressure",
+    ),
+    (
+        re.compile(
+            r"(active_requests|requests_active|open_requests|requests_in_progress"
+            r"|active_connections|connections_active)"
+        ),
+        "saturation",
+        0.9,
+        "name indicates active request pressure",
+    ),
+    # Cache rules sit ABOVE the generic traffic/_total rules so cache counters
+    # are not misread as request-rate traffic.
+    (
+        re.compile(r"(keyspace_hits|keyspace_misses|cache_hits?|cache_miss|_cache_hit|_cache_miss)"),
+        "caching",
+        0.95,
+        "name indicates cache hits/misses",
+    ),
+    (
+        # Both word orders: evicted_keys / keys_evicted, expired_keys / keys_expired.
+        re.compile(r"(evicted_keys|keys_evicted|expired_keys|keys_expired|_evicted\b|_evictions?|cache_evict)"),
+        "caching",
+        0.9,
+        "name indicates cache evictions",
+    ),
+    (
+        re.compile(r"(cache_size|cache_entries|redis_db_keys|redis_keys_count)"),
+        "caching",
+        0.7,
+        "name indicates cache size",
+    ),
+    (
         re.compile(r"(cpu|memory|_mem_|disk|_bytes|utilization|usage|file_descriptors|_fd_)"),
         "resource_usage",
         0.8,
@@ -98,6 +140,16 @@ _NAME_RULES: list[tuple[re.Pattern[str], str, float, str]] = [
         "availability",
         0.8,
         "name indicates availability/health",
+    ),
+    (
+        re.compile(
+            r"(restarts?|(?:health|http|tcp|dns)check_status|"
+            r"(?:pod|node|container|deployment|replica|connector|task|job|process|service)"
+            r".*_status(?!_code)(?:_|$)|(?:lifecycle|health|readiness)_status)"
+        ),
+        "availability",
+        0.85,
+        "name indicates lifecycle status",
     ),
     (
         re.compile(r"(unauthorized|denied|forbidden|_tls_|_cert|auth_fail|security)"),
@@ -129,6 +181,7 @@ _TEXT_RULES: list[tuple[re.Pattern[str], str, str]] = [
     (re.compile(r"\b(up|health|availab|ready|uptime)"), "availability", "title mentions availability"),
     (re.compile(r"\b(denied|unauthorized|tls|cert|security|auth)"), "security", "title mentions security"),
     (re.compile(r"\b(capacity|number of|total hosts|total nodes|policies)"), "capacity", "title mentions capacity"),
+    (re.compile(r"\b(cache|eviction|evicted|hit ratio|hit rate|keyspace)"), "caching", "title mentions caching"),
 ]
 
 _UNIT_FAMILY: list[tuple[re.Pattern[str], str]] = [
@@ -257,7 +310,15 @@ def _owning_panels(metric: str, panels: list[dict[str, Any]]) -> list[dict[str, 
     return owning
 
 
-def infer_signal(metric: str, panels: list[dict[str, Any]] | None = None) -> InferredSignal | None:
+def infer_signal(
+    metric: str,
+    panels: list[dict[str, Any]] | None = None,
+    *,
+    unit: str = "",
+    metric_type: str = "",
+    dimensions: list[str] | None = None,
+    namespace: str = "",
+) -> InferredSignal | None:
     """Infer a single metric's candidate signal, or None if weak/metadata."""
     panels = panels or []
     name = metric.lower()
@@ -323,19 +384,48 @@ def infer_signal(metric: str, panels: list[dict[str, Any]] | None = None) -> Inf
     if owning:
         available_weight += _W_TITLE + _W_GROUP
 
-    # 4. Unit (0.15).
+    # 4. Unit (0.15). Cold discovery supplies datasource metadata directly;
+    # dashboard ingestion can still supply the unit through owning panels.
     unit_voted = False
-    for p in owning:
-        unit = str(p.get("unit", "")).lower()
+    candidate_units = [unit, *(str(p.get("unit", "")) for p in owning)]
+    for raw_unit in candidate_units:
+        normalized_unit = str(raw_unit).lower()
         for pattern, family in _UNIT_FAMILY:
-            if unit and pattern.search(unit):
-                vote(family, _W_UNIT, f"unit '{unit}' → {family}", "unit")
+            if normalized_unit and pattern.search(normalized_unit):
+                vote(family, _W_UNIT, f"unit '{normalized_unit}' → {family}", "unit")
                 unit_voted = True
                 break
         if unit_voted:
             break
-    if owning:
+    if owning or unit:
         available_weight += _W_UNIT
+
+    # Metric type and label/scope metadata are tie breakers, not standalone
+    # classifiers. This keeps sparse catalogs useful without turning generic
+    # counters or labels into confident semantic guesses.
+    normalized_type = metric_type.lower()
+    if normalized_type in {"histogram", "summary", "gaugehistogram"} and any(word in name for word in _TIME_WORDS):
+        vote("latency", 0.10, f"{normalized_type} time metric → latency", "metric_type")
+        available_weight += 0.10
+    elif normalized_type in {"counter", "sum"}:
+        leader = max(scores, key=lambda family: scores[family])
+        if scores[leader] > 0:
+            vote(leader, 0.05, f"{normalized_type} confirms {leader}", "metric_type")
+            available_weight += 0.05
+
+    scope_text = " ".join([namespace, *(dimensions or [])]).lower()
+    if scope_text:
+        scope_rules = (
+            (r"\b(http|rpc|route|method|status_code)\b", "traffic"),
+            (r"\b(cache|redis|memcached|keyspace)\b", "caching"),
+            (r"\b(queue|messaging|kafka|consumer)\b", "backlog"),
+            (r"\b(cpu|memory|disk|filesystem|container|process)\b", "resource_usage"),
+        )
+        for scope_pattern, family in scope_rules:
+            if re.search(scope_pattern, scope_text) and scores[family] > 0:
+                vote(family, 0.10, f"labels/scope confirm {family}", "scope")
+                available_weight += 0.10
+                break
 
     # 6. Query shape (0.10): histogram → latency; rate/increase confirms
     #    counter-ness and BOOSTS the leading family rather than forcing traffic.

@@ -136,6 +136,50 @@ class PrometheusAdapter(DatasourceAdapter):
         )
         return catalog
 
+    async def _get_metric_metadata(
+        self,
+        client: GrafanaClient,
+        datasource: DatasourceInfo,
+    ) -> dict[str, tuple[str, str]]:
+        """Return {base_metric_name: (unit, type)} from /api/v1/metadata.
+
+        Prometheus metadata is keyed by the *base* metric name (without the
+        histogram/summary suffixes ``_bucket``/``_sum``/``_count``), so callers
+        should look up the base name. Cached alongside the catalog.
+        """
+        cache_key = make_cache_key("prom_metadata", datasource.uid)
+        cached = metric_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        meta: dict[str, tuple[str, str]] = {}
+        try:
+            data = await client.datasource_proxy_get(datasource.uid, "api/v1/metadata")
+            payload = data.get("data", {}) if isinstance(data, dict) else {}
+            for name, entries in payload.items():
+                if not entries:
+                    continue
+                first = entries[0] if isinstance(entries, list) else entries
+                if isinstance(first, dict):
+                    meta[name] = (first.get("unit", "") or "", first.get("type", "") or "")
+        except Exception:
+            logger.debug("prometheus_metadata_fetch_failed", datasource=datasource.name)
+
+        metric_cache.set(cache_key, meta)
+        return meta
+
+    @staticmethod
+    def _metadata_for(name: str, meta: dict[str, tuple[str, str]]) -> tuple[str, str]:
+        """Look up metadata by metric name, falling back to the histogram base."""
+        if name in meta:
+            return meta[name]
+        for suffix in ("_bucket", "_sum", "_count", "_total"):
+            if name.endswith(suffix):
+                base = name[: -len(suffix)]
+                if base in meta:
+                    return meta[base]
+        return ("", "")
+
     async def discover_metrics(
         self,
         client: GrafanaClient,
@@ -154,22 +198,30 @@ class PrometheusAdapter(DatasourceAdapter):
         unmatched = [n for n in all_names if n not in set(matched)]
         filtered = (matched + unmatched)[:_MAX_CATALOG_SIZE]
 
+        metadata = await self._get_metric_metadata(client, datasource)
+
         logger.info(
             "prometheus_metrics_discovered",
             datasource=datasource.name,
             total=len(all_names),
             filtered=len(filtered),
             cache_size=metric_cache.size,
+            metadata_entries=len(metadata),
         )
 
-        return [
-            MetricEntry(
-                name=name,
-                datasource_uid=datasource.uid,
-                datasource_name=datasource.name,
-                datasource_type=datasource.type,
-                query_language=self.query_language,
-                dimensions=catalog.get(name, []),
+        entries: list[MetricEntry] = []
+        for name in filtered:
+            unit, metric_type = self._metadata_for(name, metadata)
+            entries.append(
+                MetricEntry(
+                    name=name,
+                    datasource_uid=datasource.uid,
+                    datasource_name=datasource.name,
+                    datasource_type=datasource.type,
+                    query_language=self.query_language,
+                    dimensions=catalog.get(name, []),
+                    unit=unit,
+                    metric_type=metric_type,
+                )
             )
-            for name in filtered
-        ]
+        return entries

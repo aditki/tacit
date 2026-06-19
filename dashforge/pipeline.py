@@ -12,7 +12,7 @@ from dashforge.agents.intent import classify_intent
 from dashforge.agents.metrics_discovery import discover_metrics
 from dashforge.agents.providers.base import TokenUsage
 from dashforge.agents.query_builder import build_dashboard
-from dashforge.archetypes.engine import blend_archetypes, compile_archetype
+from dashforge.archetypes.engine import blend_archetypes, compile_archetype, rank_archetypes_by_coverage
 from dashforge.archetypes.templates import (
     get_archetype,
     get_archetypes_by_confidence,
@@ -21,6 +21,7 @@ from dashforge.archetypes.templates import (
 from dashforge.backends import get_active_backends
 from dashforge.backends.base import PublishResult
 from dashforge.cache import llm_cache, make_cache_key
+from dashforge.catalog import catalog_for_services
 from dashforge.config import settings
 from dashforge.context.enrichment import enrich_context
 from dashforge.history import get_investigation_store
@@ -99,6 +100,23 @@ def _history_signals(intent_signals: list, selected_archetypes: list[tuple[Any, 
                 seen.add(signal)
                 values.append(signal)
     return values
+
+
+def _discovery_keywords(intent: Any) -> list[str]:
+    """Include advisory evidence when searching provider-scoped catalogs.
+
+    Colloquial evidence may broaden discovery so providers such as CloudWatch
+    can inspect the relevant namespace. It does not become trusted intent until
+    post-discovery semantic-signal confirmation succeeds.
+    """
+    keywords = list(intent.keywords)
+    seen = {str(keyword).lower() for keyword in keywords}
+    for item in intent.keyword_evidence:
+        keyword = str(item.get("keyword", ""))
+        if keyword and keyword.lower() not in seen:
+            seen.add(keyword.lower())
+            keywords.append(keyword)
+    return keywords
 
 
 async def run_pipeline(request: DashRequest) -> DashResponse:
@@ -203,11 +221,12 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
 
         # ── 3. Metric discovery — each backend contributes ───────────
         t0 = time.monotonic()
+        discovery_keywords = _discovery_keywords(intent)
         metric_catalog = []
         datasource_catalog = []
         ds_types: list[str] = []
         for backend in backends:
-            entries = await backend.discover_metrics(intent.keywords, intent)
+            entries = await backend.discover_metrics(discovery_keywords, intent)
             metric_catalog.extend(entries)
             if entries:
                 ds_types.append(backend.name)
@@ -216,7 +235,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     continue
                 target_discovery = getattr(backend, "discover_datasource_targets", None)
                 if target_discovery is not None:
-                    targets = await target_discovery(intent.keywords, intent)
+                    targets = await target_discovery(discovery_keywords, intent)
                     datasource_catalog.extend(targets)
                     if targets and backend.name not in ds_types:
                         ds_types.append(backend.name)
@@ -241,6 +260,53 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             logger.warning("history_record_discovery_failed", exc_info=True)
 
         catalog_for_compile = metric_catalog or datasource_catalog
+
+        # Confirm advisory (colloquial) synonym evidence via SCOPED signal
+        # coverage: a metaphor implying "cache" becomes a real keyword only if a
+        # cache signal actually resolves against the discovered metrics, using
+        # the signal store — not a global substring match. Keeps ambiguous
+        # evidence from steering the investigation on its own.
+        try:
+            if intent.keyword_evidence and metric_catalog:
+                from dashforge.agents.synonyms import SynonymEvidence, confirm_colloquial
+                from dashforge.signals import get_signal_store
+
+                signal_store = get_signal_store()
+                _resolve_cache: dict[str, bool] = {}
+                confirmation_catalog = catalog_for_services(metric_catalog, intent.services)
+                context_service = intent.services[0] if intent.services else ""
+
+                def _signal_resolves(sig: str) -> bool:
+                    if sig not in _resolve_cache:
+                        try:
+                            hits = signal_store.resolve_signal(
+                                sig,
+                                confirmation_catalog,
+                                context_service=context_service,
+                                target_query_language=primary.query_language,
+                            )
+                            _resolve_cache[sig] = bool(hits)
+                        except Exception:
+                            _resolve_cache[sig] = False
+                    return _resolve_cache[sig]
+
+                evidence = [
+                    SynonymEvidence(
+                        keyword=str(e.get("keyword", "")),
+                        score=float(e.get("score", 0.0)),
+                        tier=str(e.get("tier", "")),
+                        source=str(e.get("source", "")),
+                    )
+                    for e in intent.keyword_evidence
+                ]
+                confirmed = confirm_colloquial(evidence, _signal_resolves)
+                for kw in confirmed:
+                    if kw not in intent.keywords:
+                        intent.keywords.append(kw)
+                if confirmed:
+                    logger.info("colloquial_evidence_confirmed", keywords=confirmed)
+        except Exception:
+            logger.warning("colloquial_confirmation_failed", exc_info=True)
 
         if not catalog_for_compile:
             ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
@@ -337,6 +403,19 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
 
         # Target query language comes from the primary backend
         target_language = primary.query_language
+
+        # Coverage-rank + cap before deciding compile vs blend, so a strongly
+        # matching archetype wins over many generic templates and the panel
+        # explosion is bounded.
+        if ranked_archetypes:
+            ranked_archetypes = rank_archetypes_by_coverage(
+                ranked_archetypes,
+                catalog_for_compile,
+                target_language=target_language,
+                services=intent.services,
+                max_archetypes=settings.max_blended_archetypes,
+                min_secondary_coverage=settings.min_secondary_coverage,
+            )
 
         if ranked_archetypes:
             primary_arch, primary_conf = ranked_archetypes[0]
@@ -487,7 +566,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         # ── 5. Validate queries — primary backend validates ──────────
         t0 = time.monotonic()
         panels_before = len(dashboard_spec.panels)
-        dashboard_spec, validation_warnings = await primary.validate_queries(dashboard_spec)
+        dashboard_spec, validation_warnings = await primary.validate_queries(dashboard_spec, catalog_for_compile)
         timings["query_validation"] = time.monotonic() - t0
         stage_log(
             "query_validation",
@@ -562,11 +641,22 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         effective_url = grafana_result.url or sfx_result.url or ""
 
         path_used = "archetype" if ranked_archetypes else "freeform"
-        ds_info = (
-            ", ".join({e.datasource_name for e in metric_catalog[:5]})
-            if ranked_archetypes
-            else ", ".join({m.datasource_name for m in discovery.metrics})
-        )
+        # Report only the datasources that actually back a *surviving* panel,
+        # never the full discovery catalog. Map each surviving query's UID back
+        # to a human name via the discovered catalogs, falling back to type.
+        uid_to_name: dict[str, str] = {}
+        for entry in [*metric_catalog, *datasource_catalog]:
+            if entry.datasource_uid and entry.datasource_name:
+                uid_to_name.setdefault(entry.datasource_uid, entry.datasource_name)
+        surviving_ds: list[str] = []
+        seen_ds: set[str] = set()
+        for panel in dashboard_spec.panels:
+            for q in panel.queries:
+                name = uid_to_name.get(q.datasource_uid) or q.datasource_type or q.datasource_uid
+                if name and name not in seen_ds:
+                    seen_ds.add(name)
+                    surviving_ds.append(name)
+        ds_info = ", ".join(surviving_ds) if surviving_ds else "none"
         summary_parts = [
             f"Created dashboard **{dashboard_spec.title}** with " f"{len(dashboard_spec.panels)} panels.",
             f"Timerange: last {dashboard_spec.timerange}",
@@ -584,11 +674,10 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
 
         # Record validation results
         try:
-            pre_validation_panels = len(dashboard_spec.panels) + len(validation_warnings)
             history.record_validation(
                 inv_id,
                 warnings=validation_warnings,
-                panels_dropped=pre_validation_panels - len(dashboard_spec.panels),
+                panels_dropped=max(panels_before - len(dashboard_spec.panels), 0),
                 final_panel_count=len(dashboard_spec.panels),
             )
         except Exception:
@@ -623,7 +712,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         try:
             from dashforge.feedback import get_feedback_store
 
-            store = get_feedback_store()
+            feedback_store = get_feedback_store()
             metrics_used = list(
                 {
                     q.expr.split("{")[0].split("(")[-1].strip()
@@ -632,7 +721,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     if q.expr
                 }
             )
-            store.record_provenance(
+            feedback_store.record_provenance(
                 dashboard_uid=effective_uid,
                 prompt=request.prompt,
                 problem_type=intent.problem_type,

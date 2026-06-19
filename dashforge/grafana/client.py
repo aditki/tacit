@@ -22,13 +22,15 @@ class GrafanaClient:
         self.base_url = (base_url or settings.grafana_url).rstrip("/")
         self.api_key = api_key or settings.grafana_api_key
         self.org_id = org_id or settings.grafana_org_id
+        headers = {
+            "Content-Type": "application/json",
+            "X-Grafana-Org-Id": str(self.org_id),
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "X-Grafana-Org-Id": str(self.org_id),
-            },
+            headers=headers,
             timeout=30.0,
         )
 

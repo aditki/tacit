@@ -1,0 +1,43 @@
+{
+  "dataset": "clickstack",
+  "role": "development",
+  "note": "FROZEN DEVELOPMENT SET. The operational-synonym layer was tuned while observing failures on these exact prompts, so results here are post-tuning dev accuracy, NOT independent evidence of generalization. Measure generalization on clickstack_prompts_holdout.json instead.",
+  "incident": "redis_cache_pressure",
+  "required_concepts": ["latency", "cache", "memory", "clients"],
+  "prompts": [
+    {"class": "precise", "text": "Investigate rising HTTP latency alongside Redis evictions, memory use, and connected clients."},
+    {"class": "precise", "text": "Chart request duration, cache hit and miss behavior, Redis memory pressure, evictions, and client pressure."},
+    {"class": "precise", "text": "Find whether Redis memory exhaustion and client saturation explain the API latency increase."},
+    {"class": "precise", "text": "Correlate p95 request latency with cache size, misses, evicted keys, used memory, and blocked clients."},
+    {"class": "precise", "text": "Build an incident view for HTTP duration and Redis cache capacity, eviction, memory, and connections."},
+    {"class": "precise", "text": "Check cache hit ratio, misses and evictions against request latency and Redis client load."},
+
+    {"class": "vague", "text": "Checkout is slow. Show me what is under pressure."},
+    {"class": "vague", "text": "Something around the payment cache looks unhealthy."},
+    {"class": "vague", "text": "Why did response times get bad during the traffic spike?"},
+    {"class": "vague", "text": "The service degraded. Look at the cache and its dependencies."},
+    {"class": "vague", "text": "Users are waiting longer and Redis might be involved."},
+    {"class": "vague", "text": "Investigate the checkout slowdown without assuming the cause."},
+
+    {"class": "noisy", "text": "SEV2 checkout latency up after lunch; deploy looked normal, Kafka had a blip, Redis memory and clients seem weird."},
+    {"class": "noisy", "text": "Payments slow, no clear 5xx jump, CPU okay, cache misses and evictions may have moved."},
+    {"class": "noisy", "text": "Customer reports timeouts; pods are stable but cache size, memory, and connections changed around 14:05."},
+    {"class": "noisy", "text": "Could be network, JVM, or Redis. Compare request duration with cache pressure and client load."},
+    {"class": "noisy", "text": "Traffic rose 20%, latency doubled, deployment unchanged; inspect Redis hit rate, memory, evictions, and blocked clients."},
+    {"class": "noisy", "text": "Checkout red, auth green, database mostly green, Redis yellow. Find the useful latency and cache signals."},
+
+    {"class": "misleading", "text": "This looks like CPU saturation, but verify whether cache evictions or Redis clients better explain the latency."},
+    {"class": "misleading", "text": "Assume the database is slow, then challenge that assumption using request and cache evidence."},
+    {"class": "misleading", "text": "The alert says network loss; check whether memory pressure in Redis is the actual bottleneck."},
+    {"class": "misleading", "text": "A deploy happened nearby, but test the cache-pressure hypothesis before blaming the release."},
+    {"class": "misleading", "text": "Errors are flat, so this cannot be Redis. Prove or disprove that with latency, eviction, and client metrics."},
+    {"class": "misleading", "text": "Kafka lag is noisy. Focus only if it explains the checkout latency better than cache pressure."},
+
+    {"class": "reworded", "text": "Did key churn and connection load make the request path take longer?"},
+    {"class": "reworded", "text": "Compare response-time deterioration with object retention, removals, and Redis consumer load."},
+    {"class": "reworded", "text": "Was the fast-data layer squeezed when checkout duration climbed?"},
+    {"class": "reworded", "text": "Relate slower transactions to key removals, working-set growth, and open Redis connections."},
+    {"class": "reworded", "text": "Show whether the in-memory tier ran out of headroom as requests slowed."},
+    {"class": "reworded", "text": "Investigate response delay through reuse efficiency, discarded entries, memory headroom, and connection demand."}
+  ]
+}

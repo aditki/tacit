@@ -130,6 +130,14 @@ class Settings(BaseSettings):
     adapter_timeout_seconds: int = 30  # per-adapter timeout
     max_metric_catalog_size: int = 300  # total metrics across all datasources sent to LLM
 
+    # Archetype blending caps — bound the irrelevant-panel explosion from
+    # blending many loosely-matched archetypes.
+    max_blended_archetypes: int = 3  # primary + up to N-1 secondaries
+    max_dashboard_panels: int = 10  # hard ceiling on a blended dashboard's panels
+    min_secondary_coverage: float = 0.25  # drop secondaries below this live-signal coverage
+    learned_archetype_min_coverage: float = 0.75
+    learned_archetype_boost: float = 0.15
+
     # Dashboard ingestion / learning
     # When True, approving an ingested dashboard also writes its generated
     # archetype into DASHFORGE_ARCHETYPES_PATH and hot-reloads (compounding).

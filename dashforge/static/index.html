@@ -549,12 +549,10 @@
       const el = document.getElementById('stats-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const [statsResp, analysisResp] = await Promise.all([
-          fetch(`${BASE}/api/v1/feedback/stats`),
-          fetch(`${BASE}/api/v1/feedback/analysis`),
+        const [stats, analysis] = await Promise.all([
+          fetchJson(`${BASE}/api/v1/feedback/stats`),
+          fetchJson(`${BASE}/api/v1/feedback/analysis`),
         ]);
-        const stats = await statsResp.json();
-        const analysis = await analysisResp.json();
 
         if (!stats.total_feedback && stats.total_feedback !== 0) {
           el.innerHTML = '<div class="status">No feedback collected yet. Generate a dashboard and rate it!</div>';
@@ -789,6 +787,26 @@
         }).join('; ');
       }
       return fallback;
+    }
+
+    async function fetchJson(url, options) {
+      const resp = await fetch(url, options);
+      const text = await resp.text();
+      let body = null;
+      if (text) {
+        try {
+          body = JSON.parse(text);
+        } catch {
+          if (!resp.ok) {
+            throw new Error(`${resp.status} ${resp.statusText}: ${text.slice(0, 160)}`);
+          }
+          throw new Error(`Invalid JSON response: ${text.slice(0, 160)}`);
+        }
+      }
+      if (!resp.ok) {
+        throw new Error(errMsg(body, `${resp.status} ${resp.statusText}`));
+      }
+      return body ?? {};
     }
 
     /* ── Learning tab ─────────────────────────────────────────── */

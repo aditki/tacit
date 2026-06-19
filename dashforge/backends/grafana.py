@@ -124,8 +124,9 @@ class GrafanaBackend:
     async def validate_queries(
         self,
         spec: DashboardSpec,
+        catalog: list[MetricEntry] | None = None,
     ) -> tuple[DashboardSpec, list[str]]:
-        return await validate_dashboard_queries(self._client, spec)
+        return await validate_dashboard_queries(self._client, spec, catalog)
 
     # ── Publish ───────────────────────────────────────────────────────
 

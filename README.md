@@ -26,6 +26,10 @@ DashForge is an experimental operational cognition layer for incident response. 
 > *"High latency on the checkout service in the last hour"*
 > → an investigation artifact with request rate, error rate, p99 latency, CPU, memory, and pod restarts — published as a Grafana or SignalFx dashboard and recorded with provenance for review.
 
+## Demo
+
+Want the fastest way to see the idea? Run the [checkout incident demo](demo/README.md). It uploads a known-good Grafana dashboard, lets DashForge infer reusable observability signals, approves those signals, and then asks for a fresh investigation dashboard from one plain-English incident prompt.
+
 ---
 
 ## Why?

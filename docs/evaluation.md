@@ -128,3 +128,7 @@ Near-term evaluation work:
 - separate demo-service results from external-vendor contract results
 
 The evaluation goal is not to prove DashForge is done. It is to make progress measurable.
+
+## Real Telemetry Roadmap
+
+The synthetic benchmark remains the fast regression layer. The staged plan for evaluating DashForge with public metrics, logs, and traces is documented in [Real Telemetry Dataset Testing Roadmap](telemetry-dataset-testing-roadmap.md). Its first milestone is attached to the checkout demo; later datasets are isolated in separate branches and evaluated against source-specific ground truth.

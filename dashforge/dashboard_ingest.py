@@ -764,7 +764,7 @@ def generate_archetype_yaml(
         "required_metrics": extracted["metrics_found"][:10],
         "required_signals": required_signals[:10],
         "signal_bindings": signal_bindings,
-        "tags": extracted.get("dashboard_tags", []) + ["auto-generated"],
+        "tags": list(dict.fromkeys(extracted.get("dashboard_tags", []) + ["auto-generated", "learned"])),
         "default_timerange": "1h",
         "panels": panels,
     }

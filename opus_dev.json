@@ -1,0 +1,836 @@
+{
+  "corpus": "clickstack_prompts.json",
+  "role": "development",
+  "provider": "anthropic",
+  "model": "claude-opus-4-8",
+  "prompts": 30,
+  "trials_per_prompt": 5,
+  "positive_useful_rate": 0.88,
+  "negative_correct_rate": 1.0,
+  "prompt_rate_mean": 0.88,
+  "prompt_rate_stddev": 0.3124,
+  "worst_prompt_rate": 0.0,
+  "class_rates": {
+    "misleading": 1.0,
+    "noisy": 1.0,
+    "precise": 1.0,
+    "reworded": 0.9,
+    "vague": 0.5
+  },
+  "gate": 0.85,
+  "passed": true,
+  "results": [
+    {
+      "prompt_index": 1,
+      "class": "precise",
+      "polarity": "positive",
+      "prompt": "Investigate rising HTTP latency alongside Redis evictions, memory use, and connected clients.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 2,
+      "class": "precise",
+      "polarity": "positive",
+      "prompt": "Chart request duration, cache hit and miss behavior, Redis memory pressure, evictions, and client pressure.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 3,
+      "class": "precise",
+      "polarity": "positive",
+      "prompt": "Find whether Redis memory exhaustion and client saturation explain the API latency increase.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 4,
+      "class": "precise",
+      "polarity": "positive",
+      "prompt": "Correlate p95 request latency with cache size, misses, evicted keys, used memory, and blocked clients.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 5,
+      "class": "precise",
+      "polarity": "positive",
+      "prompt": "Build an incident view for HTTP duration and Redis cache capacity, eviction, memory, and connections.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 6,
+      "class": "precise",
+      "polarity": "positive",
+      "prompt": "Check cache hit ratio, misses and evictions against request latency and Redis client load.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 7,
+      "class": "vague",
+      "polarity": "positive",
+      "prompt": "Checkout is slow. Show me what is under pressure.",
+      "passed": 0,
+      "trials": 5,
+      "rate": 0.0,
+      "failures": [
+        {
+          "trial": 1,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "distributed_tracing_investigation",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "third_party_dependency_degradation"
+          ],
+          "keywords": [
+            "cpu",
+            "disk",
+            "error_rate",
+            "io_wait",
+            "latency",
+            "memory",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 2,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "distributed_tracing_investigation",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "third_party_dependency_degradation",
+            "threadpool_starvation"
+          ],
+          "keywords": [
+            "cpu",
+            "disk",
+            "error_rate",
+            "io_wait",
+            "latency",
+            "memory",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 3,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "distributed_tracing_investigation",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "storage_io_bottleneck",
+            "third_party_dependency_degradation"
+          ],
+          "keywords": [
+            "cpu",
+            "disk",
+            "error_rate",
+            "io_wait",
+            "latency",
+            "memory",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 4,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "distributed_tracing_investigation",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "third_party_dependency_degradation",
+            "threadpool_starvation"
+          ],
+          "keywords": [
+            "cpu",
+            "error_rate",
+            "latency",
+            "memory",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 5,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "distributed_tracing_investigation",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "third_party_dependency_degradation",
+            "threadpool_starvation"
+          ],
+          "keywords": [
+            "cpu",
+            "disk",
+            "error_rate",
+            "io_wait",
+            "latency",
+            "memory",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        }
+      ]
+    },
+    {
+      "prompt_index": 8,
+      "class": "vague",
+      "polarity": "positive",
+      "prompt": "Something around the payment cache looks unhealthy.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 9,
+      "class": "vague",
+      "polarity": "positive",
+      "prompt": "Why did response times get bad during the traffic spike?",
+      "passed": 0,
+      "trials": 5,
+      "rate": 0.0,
+      "failures": [
+        {
+          "trial": 1,
+          "archetypes": [
+            "api_response_time_spike",
+            "autoscaling_instability",
+            "capacity_planning",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "threadpool_starvation"
+          ],
+          "keywords": [
+            "error_rate",
+            "latency",
+            "p95",
+            "p99",
+            "requests",
+            "response_time",
+            "rps",
+            "saturation",
+            "throughput",
+            "traffic"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 2,
+          "archetypes": [
+            "api_response_time_spike",
+            "autoscaling_instability",
+            "db_connection_pool_exhaustion",
+            "golden_signals",
+            "latency_investigation",
+            "rate_limiting_investigation",
+            "resource_saturation",
+            "threadpool_starvation"
+          ],
+          "keywords": [
+            "cpu",
+            "error_rate",
+            "latency",
+            "memory",
+            "p95",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput",
+            "traffic"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 3,
+          "archetypes": [
+            "api_response_time_spike",
+            "autoscaling_instability",
+            "db_connection_pool_exhaustion",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "threadpool_starvation"
+          ],
+          "keywords": [
+            "cpu",
+            "error_rate",
+            "latency",
+            "memory",
+            "p95",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput",
+            "traffic"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 4,
+          "archetypes": [
+            "api_response_time_spike",
+            "autoscaling_instability",
+            "capacity_planning",
+            "db_connection_pool_exhaustion",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "threadpool_starvation"
+          ],
+          "keywords": [
+            "cpu",
+            "error_rate",
+            "latency",
+            "p95",
+            "p99",
+            "requests",
+            "response_time",
+            "rps",
+            "saturation",
+            "throughput",
+            "traffic"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 5,
+          "archetypes": [
+            "api_response_time_spike",
+            "autoscaling_instability",
+            "capacity_planning",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "threadpool_starvation"
+          ],
+          "keywords": [
+            "cpu",
+            "error_rate",
+            "latency",
+            "memory",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput",
+            "traffic"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        }
+      ]
+    },
+    {
+      "prompt_index": 10,
+      "class": "vague",
+      "polarity": "positive",
+      "prompt": "The service degraded. Look at the cache and its dependencies.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 11,
+      "class": "vague",
+      "polarity": "positive",
+      "prompt": "Users are waiting longer and Redis might be involved.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 12,
+      "class": "vague",
+      "polarity": "positive",
+      "prompt": "Investigate the checkout slowdown without assuming the cause.",
+      "passed": 0,
+      "trials": 5,
+      "rate": 0.0,
+      "failures": [
+        {
+          "trial": 1,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "deployment_regression",
+            "distributed_tracing_investigation",
+            "error_spike",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "third_party_dependency_degradation"
+          ],
+          "keywords": [
+            "5xx",
+            "cpu",
+            "error_rate",
+            "latency",
+            "memory",
+            "p95",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 2,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "deployment_regression",
+            "distributed_tracing_investigation",
+            "error_spike",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "third_party_dependency_degradation"
+          ],
+          "keywords": [
+            "5xx",
+            "cpu",
+            "error_rate",
+            "latency",
+            "memory",
+            "p95",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 3,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "deployment_regression",
+            "distributed_tracing_investigation",
+            "error_spike",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "third_party_dependency_degradation"
+          ],
+          "keywords": [
+            "5xx",
+            "cpu",
+            "error_rate",
+            "latency",
+            "memory",
+            "p95",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 4,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "deployment_regression",
+            "distributed_tracing_investigation",
+            "error_spike",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "third_party_dependency_degradation"
+          ],
+          "keywords": [
+            "5xx",
+            "cpu",
+            "error_rate",
+            "latency",
+            "memory",
+            "p95",
+            "p99",
+            "queue_depth",
+            "requests",
+            "response_time",
+            "saturation",
+            "throughput"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 5,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "deployment_regression",
+            "distributed_tracing_investigation",
+            "error_spike",
+            "golden_signals",
+            "latency_investigation",
+            "resource_saturation",
+            "third_party_dependency_degradation"
+          ],
+          "keywords": [
+            "5xx",
+            "cpu",
+            "error_rate",
+            "latency",
+            "memory",
+            "p99",
+            "queue_depth",
+            "requests",
+            "saturation",
+            "throughput"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        }
+      ]
+    },
+    {
+      "prompt_index": 13,
+      "class": "noisy",
+      "polarity": "positive",
+      "prompt": "SEV2 checkout latency up after lunch; deploy looked normal, Kafka had a blip, Redis memory and clients seem weird.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 14,
+      "class": "noisy",
+      "polarity": "positive",
+      "prompt": "Payments slow, no clear 5xx jump, CPU okay, cache misses and evictions may have moved.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 15,
+      "class": "noisy",
+      "polarity": "positive",
+      "prompt": "Customer reports timeouts; pods are stable but cache size, memory, and connections changed around 14:05.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 16,
+      "class": "noisy",
+      "polarity": "positive",
+      "prompt": "Could be network, JVM, or Redis. Compare request duration with cache pressure and client load.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 17,
+      "class": "noisy",
+      "polarity": "positive",
+      "prompt": "Traffic rose 20%, latency doubled, deployment unchanged; inspect Redis hit rate, memory, evictions, and blocked clients.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 18,
+      "class": "noisy",
+      "polarity": "positive",
+      "prompt": "Checkout red, auth green, database mostly green, Redis yellow. Find the useful latency and cache signals.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 19,
+      "class": "misleading",
+      "polarity": "positive",
+      "prompt": "This looks like CPU saturation, but verify whether cache evictions or Redis clients better explain the latency.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 20,
+      "class": "misleading",
+      "polarity": "positive",
+      "prompt": "Assume the database is slow, then challenge that assumption using request and cache evidence.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 21,
+      "class": "misleading",
+      "polarity": "positive",
+      "prompt": "The alert says network loss; check whether memory pressure in Redis is the actual bottleneck.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 22,
+      "class": "misleading",
+      "polarity": "positive",
+      "prompt": "A deploy happened nearby, but test the cache-pressure hypothesis before blaming the release.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 23,
+      "class": "misleading",
+      "polarity": "positive",
+      "prompt": "Errors are flat, so this cannot be Redis. Prove or disprove that with latency, eviction, and client metrics.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 24,
+      "class": "misleading",
+      "polarity": "positive",
+      "prompt": "Kafka lag is noisy. Focus only if it explains the checkout latency better than cache pressure.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 25,
+      "class": "reworded",
+      "polarity": "positive",
+      "prompt": "Did key churn and connection load make the request path take longer?",
+      "passed": 2,
+      "trials": 5,
+      "rate": 0.4,
+      "failures": [
+        {
+          "trial": 2,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "distributed_tracing_investigation",
+            "dns_certificate_failures",
+            "latency_investigation",
+            "mtls_rejections",
+            "resource_saturation"
+          ],
+          "keywords": [
+            "active_connections",
+            "connection_pool",
+            "connections",
+            "handshake_errors",
+            "latency",
+            "p99",
+            "request_duration",
+            "requests",
+            "saturation",
+            "throughput",
+            "tls_handshake"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 3,
+          "archetypes": [
+            "db_connection_pool_exhaustion",
+            "distributed_tracing_investigation",
+            "dns_certificate_failures",
+            "latency_investigation",
+            "mtls_rejections",
+            "resource_saturation"
+          ],
+          "keywords": [
+            "certificate",
+            "connection_count",
+            "connections",
+            "handshake_errors",
+            "latency",
+            "p99",
+            "request_duration",
+            "saturation",
+            "throughput",
+            "tls_handshake"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        },
+        {
+          "trial": 5,
+          "archetypes": [
+            "api_response_time_spike",
+            "db_connection_pool_exhaustion",
+            "distributed_tracing_investigation",
+            "dns_certificate_failures",
+            "latency_investigation",
+            "mtls_rejections",
+            "resource_saturation"
+          ],
+          "keywords": [
+            "certificate",
+            "connection_count",
+            "connections",
+            "handshake",
+            "key_rotation",
+            "latency",
+            "p99",
+            "request_duration",
+            "requests",
+            "saturation",
+            "throughput",
+            "tls_handshake"
+          ],
+          "has_cache": false,
+          "has_latency": true
+        }
+      ]
+    },
+    {
+      "prompt_index": 26,
+      "class": "reworded",
+      "polarity": "positive",
+      "prompt": "Compare response-time deterioration with object retention, removals, and Redis consumer load.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 27,
+      "class": "reworded",
+      "polarity": "positive",
+      "prompt": "Was the fast-data layer squeezed when checkout duration climbed?",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 28,
+      "class": "reworded",
+      "polarity": "positive",
+      "prompt": "Relate slower transactions to key removals, working-set growth, and open Redis connections.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 29,
+      "class": "reworded",
+      "polarity": "positive",
+      "prompt": "Show whether the in-memory tier ran out of headroom as requests slowed.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    },
+    {
+      "prompt_index": 30,
+      "class": "reworded",
+      "polarity": "positive",
+      "prompt": "Investigate response delay through reuse efficiency, discarded entries, memory headroom, and connection demand.",
+      "passed": 5,
+      "trials": 5,
+      "rate": 1.0,
+      "failures": []
+    }
+  ]
+}

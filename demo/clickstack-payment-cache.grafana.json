@@ -1,0 +1,115 @@
+{
+  "dashboard": {
+    "uid": "clickstack-payment-cache",
+    "title": "ClickStack Payment Cache Incident",
+    "tags": [
+      "clickstack",
+      "payment",
+      "checkout",
+      "cache",
+      "real-telemetry"
+    ],
+    "panels": [
+      {
+        "id": 1,
+        "type": "timeseries",
+        "title": "Visa validation cache size",
+        "datasource": {"type": "prometheus", "uid": "real-telemetry"},
+        "fieldConfig": {"defaults": {"unit": "short"}},
+        "targets": [
+          {
+            "expr": "visa_validation_cache_size_entries",
+            "legendFormat": "cache entries",
+            "datasource": {"type": "prometheus", "uid": "real-telemetry"}
+          }
+        ],
+        "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8}
+      },
+      {
+        "id": 2,
+        "type": "timeseries",
+        "title": "Payment transaction rate",
+        "datasource": {"type": "prometheus", "uid": "real-telemetry"},
+        "fieldConfig": {"defaults": {"unit": "reqps"}},
+        "targets": [
+          {
+            "expr": "sum(rate(app_payment_transactions_total[1m])) by (app_payment_currency)",
+            "legendFormat": "{{app_payment_currency}}",
+            "datasource": {"type": "prometheus", "uid": "real-telemetry"}
+          }
+        ],
+        "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8}
+      },
+      {
+        "id": 3,
+        "type": "timeseries",
+        "title": "Redis cache hit ratio",
+        "datasource": {"type": "prometheus", "uid": "real-telemetry"},
+        "fieldConfig": {"defaults": {"unit": "percentunit"}},
+        "targets": [
+          {
+            "expr": "rate(redis_keyspace_hits_total[1m]) / (rate(redis_keyspace_hits_total[1m]) + rate(redis_keyspace_misses_total[1m]))",
+            "legendFormat": "hit ratio",
+            "datasource": {"type": "prometheus", "uid": "real-telemetry"}
+          }
+        ],
+        "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8}
+      },
+      {
+        "id": 4,
+        "type": "timeseries",
+        "title": "Redis memory usage",
+        "datasource": {"type": "prometheus", "uid": "real-telemetry"},
+        "fieldConfig": {"defaults": {"unit": "bytes"}},
+        "targets": [
+          {
+            "expr": "redis_memory_used_bytes",
+            "legendFormat": "used",
+            "datasource": {"type": "prometheus", "uid": "real-telemetry"}
+          },
+          {
+            "expr": "redis_memory_peak_bytes",
+            "legendFormat": "peak",
+            "datasource": {"type": "prometheus", "uid": "real-telemetry"}
+          }
+        ],
+        "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8}
+      },
+      {
+        "id": 5,
+        "type": "timeseries",
+        "title": "Redis evictions",
+        "datasource": {"type": "prometheus", "uid": "real-telemetry"},
+        "fieldConfig": {"defaults": {"unit": "ops"}},
+        "targets": [
+          {
+            "expr": "rate(redis_keys_evicted_total[1m])",
+            "legendFormat": "evictions",
+            "datasource": {"type": "prometheus", "uid": "real-telemetry"}
+          }
+        ],
+        "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8}
+      },
+      {
+        "id": 6,
+        "type": "timeseries",
+        "title": "Redis connected and blocked clients",
+        "datasource": {"type": "prometheus", "uid": "real-telemetry"},
+        "fieldConfig": {"defaults": {"unit": "short"}},
+        "targets": [
+          {
+            "expr": "redis_clients_connected",
+            "legendFormat": "connected",
+            "datasource": {"type": "prometheus", "uid": "real-telemetry"}
+          },
+          {
+            "expr": "redis_clients_blocked",
+            "legendFormat": "blocked",
+            "datasource": {"type": "prometheus", "uid": "real-telemetry"}
+          }
+        ],
+        "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8}
+      }
+    ]
+  }
+}

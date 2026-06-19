@@ -87,7 +87,12 @@ class CapturingBackend:
         del keywords, intent
         return []
 
-    async def validate_queries(self, spec: DashboardSpec) -> tuple[DashboardSpec, list[str]]:
+    async def validate_queries(
+        self,
+        spec: DashboardSpec,
+        catalog: list[MetricEntry] | None = None,
+    ) -> tuple[DashboardSpec, list[str]]:
+        del catalog
         return spec, []
 
     async def publish(self, spec: DashboardSpec) -> PublishResult:

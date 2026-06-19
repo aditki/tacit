@@ -1,0 +1,30 @@
+{
+  "dataset": "gamma",
+  "role": "holdout",
+  "datasource_uid": "gamma-prom",
+  "datasource_type": "prometheus",
+  "query_language": "promql",
+  "source": "Convention-faithful synthetic slice. The real GAMMA archive (Kaggle microservices-bottleneck-detection) is not fetchable from this sandbox; metric NAMES follow GAMMA's resource-bottleneck conventions (cpu/memory/io/network/latency) so the slice tests naming-convention generalization, NOT the real injected-fault labels. Treated as a holdout.",
+  "prompt": "Latency rose without obvious errors; find the resource bottleneck across cpu, memory, disk, and network.",
+  "critical_signals": [
+    {"signal_type": "cpu_usage", "expected_metric": "cpu_usage"},
+    {"signal_type": "request_latency", "expected_metric": "request_latency_seconds"},
+    {"signal_type": "network_bytes", "expected_metric": "network_io_bytes"},
+    {"signal_type": "error_rate", "expected_metric": "error_count"}
+  ],
+  "metrics": [
+    {"name": "cpu_usage", "unit": "percent", "type": "gauge", "family": "resource_usage", "present": true},
+    {"name": "memory_usage", "unit": "percent", "type": "gauge", "family": "resource_usage", "present": true},
+    {"name": "disk_io_bytes", "unit": "bytes", "type": "counter", "family": "resource_usage", "present": true},
+    {"name": "network_io_bytes", "unit": "bytes", "type": "counter", "family": "resource_usage", "present": true},
+    {"name": "request_latency_seconds", "unit": "s", "type": "histogram", "family": "latency", "present": true},
+    {"name": "response_time_ms", "unit": "ms", "type": "histogram", "family": "latency", "present": true},
+    {"name": "request_rate", "unit": "", "type": "counter", "family": "traffic", "present": true},
+    {"name": "error_count", "unit": "", "type": "counter", "family": "errors", "present": true},
+    {"name": "service_cache_hit_ratio", "unit": "percent", "type": "gauge", "family": "caching", "present": true},
+    {"name": "service_cache_misses", "unit": "", "type": "counter", "family": "caching", "present": true},
+    {"name": "queue_backlog", "unit": "", "type": "gauge", "family": "backlog", "present": true},
+    {"name": "pod_restarts_total", "unit": "", "type": "counter", "family": "availability", "present": true},
+    {"name": "scrape_duration_seconds", "unit": "s", "type": "gauge", "family": "none", "present": true}
+  ]
+}

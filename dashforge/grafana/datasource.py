@@ -32,6 +32,28 @@ SIGNAL_TYPE_MAP: dict[str, set[str]] = {
 }
 
 
+def _cap_metric_results(results: list[list[MetricEntry]], max_total: int) -> list[MetricEntry]:
+    """Cap a multi-datasource catalog without starving later datasources."""
+    total = sum(len(entries) for entries in results)
+    if total <= max_total:
+        return [entry for entries in results for entry in entries]
+
+    capped: list[MetricEntry] = []
+    offset = 0
+    while len(capped) < max_total:
+        added = False
+        for entries in results:
+            if offset < len(entries):
+                capped.append(entries[offset])
+                added = True
+                if len(capped) == max_total:
+                    break
+        if not added:
+            break
+        offset += 1
+    return capped
+
+
 async def list_datasources(client: GrafanaClient) -> list[DatasourceInfo]:
     """Fetch all datasources from Grafana and return typed info objects."""
     raw = await client.list_datasources()
@@ -103,19 +125,16 @@ async def discover_all_metrics(
 
     # Run all adapter discoveries concurrently (bounded by semaphore)
     results = await asyncio.gather(*[_discover_one(ds) for ds in datasources])
-    all_entries: list[MetricEntry] = []
-    for entries in results:
-        all_entries.extend(entries)
-
     # Cap total catalog size to stay within LLM context limits
     max_total = settings.max_metric_catalog_size
-    if len(all_entries) > max_total:
+    original_count = sum(len(entries) for entries in results)
+    if original_count > max_total:
         logger.warning(
             "metric_catalog_capped",
-            original=len(all_entries),
+            original=original_count,
             capped_to=max_total,
         )
-        all_entries = all_entries[:max_total]
+    all_entries = _cap_metric_results(results, max_total)
 
     logger.info(
         "cross_datasource_discovery_complete",
