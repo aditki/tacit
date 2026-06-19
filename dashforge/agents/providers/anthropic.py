@@ -44,24 +44,36 @@ class AnthropicProvider(LLMProvider):
         return TokenUsage()
 
     async def _create(self, system: str, user_prompt: str, temperature: float):
-        """Call messages.create, omitting `temperature` for models that reject it."""
+        """Call messages.create, omitting `temperature` for models that reject it.
+
+        Uses two explicit call shapes (rather than a dynamic kwargs dict) so the
+        SDK's typed overloads still apply.
+        """
         model = settings.llm_model
-        kwargs = {
-            "model": model,
-            "max_tokens": 4096,
-            "system": system,
-            "messages": [{"role": "user", "content": user_prompt}],
-        }
-        if model not in _NO_TEMPERATURE_MODELS:
-            kwargs["temperature"] = temperature
+
+        async def _without_temperature():
+            return await self._client.messages.create(
+                model=model,
+                max_tokens=4096,
+                system=system,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+
+        if model in _NO_TEMPERATURE_MODELS:
+            return await _without_temperature()
         try:
-            return await self._client.messages.create(**kwargs)
+            return await self._client.messages.create(
+                model=model,
+                max_tokens=4096,
+                temperature=temperature,
+                system=system,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
         except anthropic.BadRequestError as exc:
-            if "temperature" in kwargs and _is_temperature_unsupported(exc):
+            if _is_temperature_unsupported(exc):
                 logger.info("anthropic_temperature_unsupported", model=model)
                 _NO_TEMPERATURE_MODELS.add(model)
-                kwargs.pop("temperature", None)
-                return await self._client.messages.create(**kwargs)
+                return await _without_temperature()
             raise
 
     async def chat_json(
