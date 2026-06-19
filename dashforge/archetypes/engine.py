@@ -12,6 +12,7 @@ import re
 import structlog
 
 from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from dashforge.catalog import metric_matches_services
 from dashforge.config import settings
 from dashforge.models.schemas import (
     DashboardSpec,
@@ -172,20 +173,25 @@ def _resolve_promql_query_target(
     catalog: list[MetricEntry],
     expr: str,
     default_target: QueryTarget,
+    intent: Intent,
 ) -> QueryTarget:
     """Route a PromQL query to the datasource that actually owns its metrics."""
     from dashforge.dashboard_ingest import extract_metrics_from_promql
 
     metric_names = set(extract_metrics_from_promql(expr))
     if metric_names:
-        for entry in catalog:
-            if entry.name not in metric_names:
-                continue
-            if not _datasource_type_matches(entry.datasource_type, "prometheus"):
-                continue
-            if entry.query_language and entry.query_language.lower() != "promql":
-                continue
-            return QueryTarget.from_metric(entry)
+        candidates = [
+            entry
+            for entry in catalog
+            if entry.name in metric_names
+            and _datasource_type_matches(entry.datasource_type, "prometheus")
+            and (not entry.query_language or entry.query_language.lower() == "promql")
+        ]
+        if len(candidates) == 1:
+            return QueryTarget.from_metric(candidates[0])
+        service_candidates = [entry for entry in candidates if metric_matches_services(entry, intent.services)]
+        if len(service_candidates) == 1:
+            return QueryTarget.from_metric(service_candidates[0])
     return default_target
 
 
@@ -655,7 +661,7 @@ def compile_archetype(
                     expr = _promql_template_to_signalflow(expr, service_filter, container_filter, legend)
                     query_target = default_target
                 else:
-                    query_target = _resolve_promql_query_target(catalog, expr, default_target)
+                    query_target = _resolve_promql_query_target(catalog, expr, default_target, intent)
             else:
                 # Non-PromQL queries are honored verbatim — no PromQL
                 # format/escaping or PromQL→SignalFlow conversion.
@@ -808,7 +814,8 @@ def rank_archetypes_by_coverage(
         coverage = _archetype_live_coverage(arch, catalog, target_language)
         # Unknown coverage (no declared signals) keeps the classifier confidence.
         effective = confidence if coverage is None else confidence * coverage
-        if "learned" in arch.tags and coverage is not None and coverage >= settings.learned_archetype_min_coverage:
+        is_learned = bool({"learned", "auto-generated"} & set(arch.tags))
+        if is_learned and coverage is not None and coverage >= settings.learned_archetype_min_coverage:
             # Learned and classifier retrieval scores are not calibrated on
             # the same scale. Prefer learned context only with strong live
             # evidence, and keep the adjustment deliberately bounded.

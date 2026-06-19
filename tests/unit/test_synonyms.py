@@ -39,6 +39,13 @@ def test_conventional_terms_inject():
     assert {"redis", "cache", "eviction", "latency", "memory"} <= set(out)
 
 
+def test_memcached_does_not_inject_redis():
+    out = expand_operational_terms("Memcached evictions increased")
+
+    assert "cache" in out
+    assert "redis" not in out
+
+
 def test_colloquial_metaphors_do_not_inject():
     # Pure-metaphor prompt: nothing should be auto-injected as a keyword.
     assert expand_operational_terms("the fast-data layer was squeezed") == []

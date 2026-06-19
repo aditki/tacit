@@ -74,7 +74,7 @@ _CONVENTIONAL: list[tuple[str, frozenset[str]]] = [
     ("keyspace", frozenset({"cache"})),
     # Datastore / cache engines (vendor aliases)
     ("redis", frozenset({"redis", "cache"})),
-    ("memcached", frozenset({"redis", "cache"})),
+    ("memcached", frozenset({"cache"})),
     ("elasticache", frozenset({"redis", "cache"})),
     # Memory / resources
     ("memory", frozenset({"memory"})),

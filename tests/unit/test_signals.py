@@ -952,6 +952,7 @@ class TestArchetypeGeneration:
         assert "SSO Service Health" in yaml_str
         assert "sso_auth_requests_total" in yaml_str
         assert "auto-generated" in yaml_str
+        assert "learned" in yaml_str
         import yaml
 
         parsed = yaml.safe_load(yaml_str)

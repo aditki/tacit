@@ -21,6 +21,7 @@ from dashforge.archetypes.templates import (
 from dashforge.backends import get_active_backends
 from dashforge.backends.base import PublishResult
 from dashforge.cache import llm_cache, make_cache_key
+from dashforge.catalog import catalog_for_services
 from dashforge.config import settings
 from dashforge.context.enrichment import enrich_context
 from dashforge.history import get_investigation_store
@@ -272,12 +273,17 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
 
                 signal_store = get_signal_store()
                 _resolve_cache: dict[str, bool] = {}
+                confirmation_catalog = catalog_for_services(metric_catalog, intent.services)
+                context_service = intent.services[0] if intent.services else ""
 
                 def _signal_resolves(sig: str) -> bool:
                     if sig not in _resolve_cache:
                         try:
                             hits = signal_store.resolve_signal(
-                                sig, metric_catalog, target_query_language=primary.query_language
+                                sig,
+                                confirmation_catalog,
+                                context_service=context_service,
+                                target_query_language=primary.query_language,
                             )
                             _resolve_cache[sig] = bool(hits)
                         except Exception:

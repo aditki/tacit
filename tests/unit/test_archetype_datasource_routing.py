@@ -47,3 +47,50 @@ def test_promql_query_routes_to_datasource_that_owns_metric():
     dashboard = compile_archetype(archetype, intent, catalog)
 
     assert dashboard.panels[0].queries[0].datasource_uid == "real-telemetry"
+
+
+def test_shared_promql_metric_routes_to_datasource_with_requested_service():
+    archetype = InvestigationArchetype(
+        id="shared-metric-test",
+        name="Shared metric test",
+        problem_types=["latency"],
+        required_metrics=["http_requests_total"],
+        panels=[
+            PanelTemplate(
+                title="Requests",
+                queries=[QueryTemplate(expr="rate(http_requests_total{{{service_filter}}}[5m])")],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="checkout is slow",
+        domain="application",
+        services=["checkout-service"],
+        signals=[SignalType.METRICS],
+        keywords=["latency"],
+        timerange="1h",
+        problem_type="latency",
+        archetypes=[ArchetypeMatch(type="latency", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name="http_requests_total",
+            datasource_uid="inventory-prom",
+            datasource_name="Inventory",
+            datasource_type="prometheus",
+            query_language="promql",
+            dimensions=["service={inventory}"],
+        ),
+        MetricEntry(
+            name="http_requests_total",
+            datasource_uid="checkout-prom",
+            datasource_name="Checkout",
+            datasource_type="prometheus",
+            query_language="promql",
+            dimensions=["service={checkout}"],
+        ),
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    assert dashboard.panels[0].queries[0].datasource_uid == "checkout-prom"

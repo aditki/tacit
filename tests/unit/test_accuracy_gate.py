@@ -8,6 +8,7 @@ import pytest
 from dashforge.archetypes.engine import blend_archetypes, rank_archetypes_by_coverage
 from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from dashforge.cache import metric_cache
+from dashforge.catalog import catalog_for_services
 from dashforge.config import settings
 from dashforge.grafana.adapters.prometheus import PrometheusAdapter
 from dashforge.models.schemas import (
@@ -172,6 +173,32 @@ async def test_validation_does_not_parse_cloudwatch_metric_as_promql():
 
 
 @pytest.mark.asyncio
+async def test_validation_skips_non_prometheus_grafana_queries():
+    client = AsyncMock()
+    query = PanelQuery(
+        expr='{service_name="checkout"} |= "error"',
+        datasource_uid="loki",
+        datasource_type="",
+        query_language="logql",
+    )
+    catalog = [
+        MetricEntry(
+            name="logs",
+            datasource_uid="loki",
+            datasource_name="Loki",
+            datasource_type="loki",
+            query_language="logql",
+        )
+    ]
+
+    filtered, warnings = await validate_dashboard_queries(client, _dashboard(query), catalog)
+
+    assert len(filtered.panels) == 1
+    assert not warnings
+    client.datasource_proxy_get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_prometheus_http_422_is_reported_as_syntax_error():
     client = AsyncMock()
     request = httpx.Request("GET", "https://grafana.test/query")
@@ -329,22 +356,56 @@ def test_colloquial_evidence_broadens_discovery_without_mutating_intent():
     assert intent.keywords == ["saturation"]
 
 
+def test_colloquial_confirmation_catalog_is_scoped_to_requested_service(tmp_path):
+    checkout_metric = _metric("http_requests_total")
+    checkout_metric.dimensions = ["service={checkout}"]
+    payment_cache = _metric("redis_keys_evicted")
+    payment_cache.dimensions = ["service={payment}"]
+
+    scoped = catalog_for_services([checkout_metric, payment_cache], ["checkout-service"])
+
+    assert scoped == [checkout_metric]
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.register_signal_type("cache_evictions", category="caching")
+    store.add_mapping("cache_evictions", "*keys_evicted*", confidence=0.9)
+    assert not store.resolve_signal(
+        "cache_evictions",
+        scoped,
+        context_service="checkout-service",
+        target_query_language="promql",
+    )
+
+
 def test_archetype_ranking_prefers_strong_learned_match(monkeypatch):
     monkeypatch.setattr(settings, "learned_archetype_min_coverage", 0.75)
     monkeypatch.setattr(settings, "learned_archetype_boost", 0.15)
     learned = _archetype("learned_specific", "real_metric")
     learned.tags = ["learned"]
     generic = _archetype("generic", "real_metric")
-    generic.required_signals.append("missing_signal")
-    generic.signal_bindings["missing_signal"] = "missing_metric"
 
     ranked = rank_archetypes_by_coverage(
-        [(generic, 0.95), (learned, 0.70)],
+        [(generic, 0.80), (learned, 0.70)],
         [_metric("real_metric")],
         max_archetypes=2,
     )
 
     assert ranked[0][0].id == "learned_specific"
+
+
+def test_archetype_ranking_boosts_ingestion_generated_match(monkeypatch):
+    monkeypatch.setattr(settings, "learned_archetype_min_coverage", 0.75)
+    monkeypatch.setattr(settings, "learned_archetype_boost", 0.15)
+    generated = _archetype("generated_specific", "real_metric")
+    generated.tags = ["auto-generated"]
+    generic = _archetype("generic", "real_metric")
+
+    ranked = rank_archetypes_by_coverage(
+        [(generic, 0.80), (generated, 0.70)],
+        [_metric("real_metric")],
+        max_archetypes=2,
+    )
+
+    assert ranked[0][0].id == "generated_specific"
 
 
 def test_archetype_ranking_does_not_boost_weak_learned_match(monkeypatch):

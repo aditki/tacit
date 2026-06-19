@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+_PROMETHEUS_PROBE_TYPES = {"prometheus", "mimir", "cortex", "thanos"}
+
 # Regex to extract metric names from SignalFlow data('metric_name', ...)
 _SFX_DATA_RE = re.compile(r"data\(\s*['\"]([^'\"]+)['\"]\s*[),]")
 
@@ -40,6 +42,7 @@ async def _probe_query(
     datasource_uid: str,
     datasource_type: str,
     expr: str,
+    query_language: str = "",
 ) -> str:
     """Probe a single query and return one of the QUERY_* verdicts.
 
@@ -48,8 +51,16 @@ async def _probe_query(
     never reported as a parse failure.
     """
     normalized_type = (datasource_type or "").lower()
-    if normalized_type in {"cloudwatch"}:
-        logger.debug("query_check_skipped", datasource_type=normalized_type, reason="unsupported_datasource_validation")
+    normalized_language = (query_language or "").lower()
+    if (normalized_language and normalized_language != "promql") or (
+        normalized_type and normalized_type not in _PROMETHEUS_PROBE_TYPES
+    ):
+        logger.debug(
+            "query_check_skipped",
+            datasource_type=normalized_type,
+            query_language=normalized_language,
+            reason="unsupported_datasource_validation",
+        )
         return QUERY_SKIPPED
 
     try:
@@ -149,7 +160,13 @@ async def validate_dashboard_queries(
                 refs = _referenced_metrics(query.expr, "promql")
                 if refs and not refs.issubset(owned_names):
                     return QUERY_ABSENT
-        return await _probe_query(client, query.datasource_uid, query.datasource_type, query.expr)
+        return await _probe_query(
+            client,
+            query.datasource_uid,
+            query.datasource_type,
+            query.expr,
+            query.query_language,
+        )
 
     probe_results = await asyncio.gather(*[_validate_query(q) for _, q in flat], return_exceptions=True)
 
