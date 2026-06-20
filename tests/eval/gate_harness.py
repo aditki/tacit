@@ -11,7 +11,7 @@ cold-isolated runtime, with explicit numerators/denominators:
 
 It deliberately does NOT measure the "returns data in-window" axis, datasource
 routing against a live stack, or LLM intent variance — those need the running
-Grafana/VictoriaMetrics stack and the real ingested datasets (roadmap M2/M3).
+Grafana/VictoriaMetrics stack and the real ingested datasets (starting with GAMMA in roadmap M2).
 
 ClickStack is a curated 34-metric primary morphology slice; LO2 and GAMMA are
 synthetic *holdouts* whose metric names follow each dataset's conventions. The

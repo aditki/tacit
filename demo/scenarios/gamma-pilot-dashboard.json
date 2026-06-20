@@ -1,0 +1,69 @@
+{
+  "dashboard": {
+    "uid": "gamma-pilot-known-good",
+    "title": "GAMMA Service Bottleneck Investigation",
+    "tags": ["gamma", "bottleneck", "known-good"],
+    "panels": [
+      {
+        "id": 1,
+        "title": "Compose RPC p95 Latency by Service",
+        "type": "timeseries",
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "max by (service) (gamma_request_latency_seconds{dataset=\"gamma\", endpoint=\"compose\"})",
+            "legendFormat": "{{service}}"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Compose Request Rate by Service",
+        "type": "timeseries",
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "sum by (service) (gamma_request_rate{dataset=\"gamma\", endpoint=\"compose\"})",
+            "legendFormat": "{{service}}"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Container CPU by Service",
+        "type": "timeseries",
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "sum by (service) (rate(gamma_container_cpu_usage_seconds_total{dataset=\"gamma\"}[5m]))",
+            "legendFormat": "{{service}}"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Container Memory by Service",
+        "type": "timeseries",
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "sum by (service) (gamma_container_memory_usage_bytes{dataset=\"gamma\"})",
+            "legendFormat": "{{service}}"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Container Network Throughput by Service",
+        "type": "timeseries",
+        "targets": [
+          {
+            "refId": "A",
+            "expr": "sum by (service) (rate(gamma_container_network_receive_bytes_total{dataset=\"gamma\"}[5m]) + rate(gamma_container_network_transmit_bytes_total{dataset=\"gamma\"}[5m]))",
+            "legendFormat": "{{service}}"
+          }
+        ]
+      }
+    ]
+  }
+}

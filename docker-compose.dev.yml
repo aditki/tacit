@@ -64,6 +64,43 @@ services:
     depends_on:
       - victoriametrics
 
+  # Isolated GAMMA evaluation surface. It sees only the imported GAMMA
+  # datasource, so synthetic demo metrics cannot satisfy a test accidentally.
+  gamma-grafana:
+    profiles: ["gamma"]
+    image: grafana/grafana-oss:11.1.0
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+    volumes:
+      - gamma_grafana_data:/var/lib/grafana
+      - ./dev/gamma-grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - victoriametrics
+
+  gamma-dashforge:
+    profiles: ["gamma"]
+    build: .
+    ports:
+      - "8001:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GRAFANA_URL: http://gamma-grafana:3000
+      SSL_CERT_FILE: ""
+      LEARNING_AUTO_REGISTER_ARCHETYPE: "true"
+      DASHFORGE_ARCHETYPES_PATH: /app/data/gamma-archetypes.yaml
+    volumes:
+      - gamma_dashforge_data:/app/data
+    depends_on:
+      - gamma-grafana
+      - victoriametrics
+
   # ── DashForge ─────────────────────────────────────────────────────────
   dashforge:
     build: .
@@ -92,3 +129,5 @@ volumes:
   dashforge_data:
   grafana_data:
   victoriametrics_data:
+  gamma_dashforge_data:
+  gamma_grafana_data:
