@@ -1,6 +1,7 @@
 from dashforge.archetypes.engine import compile_archetype
 from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from dashforge.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
+from dashforge.signals import SignalStore
 
 
 def test_promql_query_routes_to_datasource_that_owns_metric():
@@ -238,3 +239,151 @@ def test_single_discovered_operand_does_not_reroute_multi_metric_query():
     dashboard = compile_archetype(archetype, intent, catalog)
 
     assert dashboard.panels[0].queries[0].datasource_uid == "default-prom"
+
+
+def test_legacy_required_metrics_bind_through_live_semantic_signals(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.load_from_yaml()
+    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    archetype = InvestigationArchetype(
+        id="resource-saturation",
+        name="Resource saturation",
+        problem_types=["resource_saturation"],
+        required_metrics=["container_cpu_usage_seconds_total", "container_memory_working_set_bytes"],
+        panels=[
+            PanelTemplate(
+                title="CPU",
+                queries=[QueryTemplate(expr="rate(container_cpu_usage_seconds_total[5m])")],
+            ),
+            PanelTemplate(
+                title="Memory",
+                queries=[QueryTemplate(expr="container_memory_working_set_bytes")],
+            ),
+        ],
+    )
+    intent = Intent(
+        summary="resource pressure",
+        domain="infrastructure",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["cpu", "memory"],
+        timerange="1h",
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name="gamma_container_cpu_usage_seconds_total",
+            datasource_uid="gamma",
+            datasource_name="GAMMA",
+            datasource_type="prometheus",
+            query_language="promql",
+            metric_type="counter",
+        ),
+        MetricEntry(
+            name="gamma_container_memory_working_set_bytes",
+            datasource_uid="gamma",
+            datasource_name="GAMMA",
+            datasource_type="prometheus",
+            query_language="promql",
+            metric_type="gauge",
+        ),
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    expressions = [query.expr for panel in dashboard.panels for query in panel.queries]
+    assert "rate(gamma_container_cpu_usage_seconds_total[5m])" in expressions
+    assert "gamma_container_memory_working_set_bytes" in expressions
+
+
+def test_legacy_binding_abstains_when_multiple_services_are_equally_plausible(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.load_from_yaml()
+    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    archetype = InvestigationArchetype(
+        id="resource-saturation",
+        name="Resource saturation",
+        problem_types=["resource_saturation"],
+        required_metrics=["container_cpu_usage_seconds_total"],
+        panels=[
+            PanelTemplate(
+                title="CPU",
+                queries=[QueryTemplate(expr="rate(container_cpu_usage_seconds_total[5m])")],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="resource pressure",
+        domain="infrastructure",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["cpu"],
+        timerange="1h",
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name=f"{service}_container_cpu_usage_seconds_total",
+            datasource_uid="gamma",
+            datasource_name="GAMMA",
+            datasource_type="prometheus",
+            query_language="promql",
+            metric_type="counter",
+        )
+        for service in ("checkout", "payments")
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    assert dashboard.panels[0].queries[0].expr == "rate(container_cpu_usage_seconds_total[5m])"
+
+
+def test_legacy_binding_rejects_gauge_for_histogram_template(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.load_from_yaml()
+    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    archetype = InvestigationArchetype(
+        id="latency",
+        name="Latency",
+        problem_types=["latency"],
+        required_metrics=["http_request_duration_seconds"],
+        panels=[
+            PanelTemplate(
+                title="p95",
+                queries=[
+                    QueryTemplate(
+                        expr=(
+                            "histogram_quantile(0.95, "
+                            "sum(rate(http_request_duration_seconds_bucket[5m])) by (le))"
+                        )
+                    )
+                ],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="latency",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["latency"],
+        timerange="1h",
+        problem_type="latency",
+        archetypes=[ArchetypeMatch(type="latency", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name="gamma_request_latency_seconds",
+            datasource_uid="gamma",
+            datasource_name="GAMMA",
+            datasource_type="prometheus",
+            query_language="promql",
+            metric_type="gauge",
+        )
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    assert "http_request_duration_seconds_bucket" in dashboard.panels[0].queries[0].expr

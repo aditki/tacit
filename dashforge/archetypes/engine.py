@@ -567,6 +567,132 @@ def _apply_metric_substitutions(
     )
 
 
+def _legacy_metric_signal(
+    store,
+    default_metric: str,
+    catalog: list[MetricEntry],
+    target_language: str,
+) -> str:
+    """Infer the taxonomy signal represented by a legacy required metric."""
+    if not catalog:
+        return ""
+    exemplar = catalog[0]
+    pseudo = MetricEntry(
+        name=default_metric,
+        datasource_uid=exemplar.datasource_uid,
+        datasource_name=exemplar.datasource_name,
+        datasource_type=exemplar.datasource_type,
+        query_language=target_language or exemplar.query_language,
+    )
+    candidates: list[tuple[str, float]] = []
+    for signal in store.list_signal_types():
+        signal_type = str(signal.get("signal_type", ""))
+        if not signal_type:
+            continue
+        matches = store.resolve_signal(
+            signal_type,
+            [pseudo],
+            target_query_language=target_language,
+        )
+        if matches:
+            candidates.append((signal_type, matches[0][1]))
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return candidates[0][0] if candidates else ""
+
+
+def _substitution_shape_compatible(
+    archetype: InvestigationArchetype,
+    default_metric: str,
+    candidate: MetricEntry,
+) -> bool:
+    """Reject semantic substitutions that would change the required query shape."""
+    expressions = [query.expr for panel in archetype.panels for query in panel.queries if default_metric in query.expr]
+    if not expressions:
+        return False
+    name = candidate.name
+    metric_type = (candidate.metric_type or "").lower()
+    if any(f"{default_metric}_bucket" in expr for expr in expressions):
+        return name.endswith("_bucket") or metric_type == "histogram"
+    rate_pattern = re.compile(rf"\b(?:rate|irate|increase)\([^)]*\b{re.escape(default_metric)}\b")
+    uses_rate = any(rate_pattern.search(expr) for expr in expressions)
+    counter_shaped = metric_type in {"counter", "histogram", "summary"} or name.endswith(
+        ("_total", "_count", "_sum", "_bucket")
+    )
+    return not uses_rate or counter_shaped
+
+
+def _unambiguous_legacy_candidate(
+    resolved: list[tuple[MetricEntry, float]],
+    archetype: InvestigationArchetype,
+    default_metric: str,
+) -> tuple[MetricEntry, float] | None:
+    """Return a unique best compatible metric, or abstain on an unresolved tie.
+
+    Raw datasets often encode service identity in the metric name instead of a
+    label.  Picking the first equally scored service would make a valid query,
+    but not a justified one.
+    """
+    compatible = [
+        (candidate, confidence)
+        for candidate, confidence in resolved
+        if _substitution_shape_compatible(archetype, default_metric, candidate)
+    ]
+    if not compatible:
+        return None
+    best_confidence = compatible[0][1]
+    best = [item for item in compatible if item[1] == best_confidence]
+    best_names = {candidate.name for candidate, _ in best}
+    return best[0] if len(best_names) == 1 else None
+
+
+def _resolve_legacy_required_metrics(
+    archetype: InvestigationArchetype,
+    store,
+    catalog: list[MetricEntry],
+    intent: Intent,
+    target_language: str,
+) -> dict[str, str]:
+    """Resolve legacy required_metrics through the semantic taxonomy."""
+    catalog_names = {entry.name for entry in catalog}
+    substitutions: dict[str, str] = {}
+    for default_metric in archetype.required_metrics:
+        if default_metric in catalog_names:
+            continue
+        signal_type = _legacy_metric_signal(store, default_metric, catalog, target_language)
+        if not signal_type:
+            continue
+        resolved = store.resolve_signal(
+            signal_type,
+            catalog,
+            context_service=intent.services[0] if intent.services else "",
+            context_datasource_type=_datasource_type_for_language(target_language),
+            context_archetype=archetype.id,
+            target_query_language=target_language,
+        )
+        selected = _unambiguous_legacy_candidate(resolved, archetype, default_metric)
+        if selected is None:
+            if resolved:
+                logger.info(
+                    "legacy_metric_signal_ambiguous",
+                    archetype=archetype.id,
+                    default_metric=default_metric,
+                    signal=signal_type,
+                    candidate_count=len(resolved),
+                )
+            continue
+        candidate, confidence = selected
+        substitutions[default_metric] = candidate.name
+        logger.info(
+            "legacy_metric_signal_resolved",
+            archetype=archetype.id,
+            default_metric=default_metric,
+            signal=signal_type,
+            resolved_to=candidate.name,
+            confidence=confidence,
+        )
+    return substitutions
+
+
 def _resolve_archetype_signals(
     archetype: InvestigationArchetype,
     catalog: list[MetricEntry],
@@ -581,7 +707,7 @@ def _resolve_archetype_signals(
     for (e.g. don't pull a SignalFx metric into a PromQL dashboard).
     Returns the (possibly modified) archetype.
     """
-    if not archetype.signal_bindings:
+    if not archetype.signal_bindings and not archetype.required_metrics:
         return archetype
 
     try:
@@ -596,6 +722,15 @@ def _resolve_archetype_signals(
             context_archetype=archetype.id,
             target_query_language=target_language,
         )
+        legacy_substitutions = _resolve_legacy_required_metrics(
+            archetype,
+            store,
+            catalog,
+            intent,
+            target_language,
+        )
+        for default_metric, resolved_metric in legacy_substitutions.items():
+            substitutions.setdefault(default_metric, resolved_metric)
         if substitutions:
             logger.info(
                 "archetype_signals_resolved",
