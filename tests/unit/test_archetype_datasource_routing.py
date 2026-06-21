@@ -297,6 +297,102 @@ def test_legacy_required_metrics_bind_through_live_semantic_signals(tmp_path, mo
     assert "gamma_container_memory_working_set_bytes" in expressions
 
 
+def test_legacy_metric_existence_is_scoped_to_target_backend(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.load_from_yaml()
+    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    archetype = InvestigationArchetype(
+        id="resource-saturation",
+        name="Resource saturation",
+        problem_types=["resource_saturation"],
+        required_metrics=["container_cpu_usage_seconds_total"],
+        panels=[
+            PanelTemplate(
+                title="CPU",
+                queries=[QueryTemplate(expr="rate(container_cpu_usage_seconds_total[5m])")],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="resource pressure",
+        domain="infrastructure",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["cpu"],
+        timerange="1h",
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name="container_cpu_usage_seconds_total",
+            datasource_uid="signalfx",
+            datasource_name="SignalFx",
+            datasource_type="signalfx",
+            query_language="signalflow",
+            metric_type="counter",
+        ),
+        MetricEntry(
+            name="gamma_container_cpu_usage_seconds_total",
+            datasource_uid="prometheus",
+            datasource_name="Prometheus",
+            datasource_type="prometheus",
+            query_language="promql",
+            metric_type="counter",
+        ),
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog, target_language="promql")
+
+    query = dashboard.panels[0].queries[0]
+    assert query.expr == "rate(gamma_container_cpu_usage_seconds_total[5m])"
+    assert query.datasource_uid == "prometheus"
+
+
+def test_legacy_binding_uses_requested_service_before_tie_abstention(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.load_from_yaml()
+    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    archetype = InvestigationArchetype(
+        id="resource-saturation",
+        name="Resource saturation",
+        problem_types=["resource_saturation"],
+        required_metrics=["container_cpu_usage_seconds_total"],
+        panels=[
+            PanelTemplate(
+                title="CPU",
+                queries=[QueryTemplate(expr="rate(container_cpu_usage_seconds_total[5m])")],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="checkout resource pressure",
+        domain="infrastructure",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["cpu"],
+        timerange="1h",
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name=f"{service}_container_cpu_usage_seconds_total",
+            datasource_uid="gamma",
+            datasource_name="GAMMA",
+            datasource_type="prometheus",
+            query_language="promql",
+            metric_type="counter",
+            dimensions=[f"service={{{service}}}"],
+        )
+        for service in ("checkout", "payments")
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    assert "checkout_container_cpu_usage_seconds_total" in dashboard.panels[0].queries[0].expr
+
+
 def test_legacy_binding_abstains_when_multiple_services_are_equally_plausible(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()

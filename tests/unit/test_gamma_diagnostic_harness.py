@@ -1,7 +1,10 @@
 from tests.eval.gamma_diagnostic_harness import (
+    DEFAULT_EXPECTATION,
+    ISOLATED_VM_SERIES_SELECTOR,
     _detect_cause_assertion,
     _evaluate_controls,
     _evaluate_predictions,
+    _replace_gamma_metrics,
 )
 
 
@@ -109,6 +112,47 @@ def test_cause_assertion_detector_is_independent_of_ranking():
     )
 
     assert assertion == {"asserted": True, "matches": ["root cause"]}
+
+
+def test_cause_assertion_detector_ignores_explicit_negation():
+    for summary in (
+        "The slowdown is not due to CPU.",
+        "There is no bottleneck in the observed window.",
+        "A root cause was not established.",
+    ):
+        assert _detect_cause_assertion(summary, []) == {"asserted": False, "matches": []}
+
+
+def test_gamma_harness_clears_every_series_from_its_isolated_vm(tmp_path):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": {"result": [{"value": [0, "1"]}]}}
+
+    class Client:
+        def __init__(self):
+            self.posts = []
+
+        def post(self, url, **kwargs):
+            self.posts.append((url, kwargs))
+            return Response()
+
+        def get(self, url, **kwargs):
+            return Response()
+
+    client = Client()
+    metrics = tmp_path / "gamma.prom"
+    metrics.write_text('gamma_metric{dataset="gamma"} 1 1000\n')
+
+    _replace_gamma_metrics(client, "http://victoriametrics", metrics)
+
+    assert client.posts[0][1]["params"]["match[]"] == ISOLATED_VM_SERIES_SELECTOR
+
+
+def test_gamma_harness_defaults_to_post_fix_expectations():
+    assert DEFAULT_EXPECTATION == "post-fix"
 
 
 def test_two_controls_are_provisional_not_an_acceptance_gate():

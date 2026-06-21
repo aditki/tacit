@@ -45,6 +45,7 @@ CONTROL_CASES = PROTOCOL["control_cases"]
 EXPECTED_EVIDENCE_SIGNALS = set(PROTOCOL["expected_evidence_signals"])
 MIN_EVIDENCE_RECALL = float(PROTOCOL["minimum_evidence_recall"])
 MIN_CONTROL_SCENARIOS = int(PROTOCOL["minimum_control_scenarios"])
+DEFAULT_EXPECTATION = "post-fix"
 CAUSE_ASSERTION_PATTERNS = (
     re.compile(r"\broot cause\b", re.IGNORECASE),
     re.compile(r"\bculprit\b", re.IGNORECASE),
@@ -53,6 +54,7 @@ CAUSE_ASSERTION_PATTERNS = (
     re.compile(r"\bbottleneck(?:ed)?\b", re.IGNORECASE),
     re.compile(r"\bresponsible for\b", re.IGNORECASE),
 )
+ISOLATED_VM_SERIES_SELECTOR = '{__name__=~".+"}'
 
 PREDICTED_OUTCOMES = PROTOCOL["expected_outcomes"]
 
@@ -83,7 +85,7 @@ def _first_metric(metrics_path: Path) -> str:
 def _replace_gamma_metrics(client: httpx.Client, vm_url: str, metrics_path: Path) -> None:
     response = client.post(
         f"{vm_url}/api/v1/admin/tsdb/delete_series",
-        params={"match[]": '{dataset="gamma"}'},
+        params={"match[]": ISOLATED_VM_SERIES_SELECTOR},
     )
     response.raise_for_status()
     with metrics_path.open("rb") as payload:
@@ -131,10 +133,31 @@ def _evidence_signals(generated_queries: list[dict[str, Any]]) -> list[str]:
     return sorted(present)
 
 
+def _cause_match_is_negated(text: str, start: int, end: int) -> bool:
+    before = text[max(0, start - 48) : start]
+    after = text[end : end + 48]
+    negated_before = re.search(
+        r"\b(?:no|not|without|cannot|can't|isn't|wasn't)\b(?:\s+\w+){0,3}\s*$",
+        before,
+        re.IGNORECASE,
+    )
+    negated_after = re.match(
+        r"\s+(?:(?:is|was|appears|seems)\s+)?(?:not|unlikely|unsupported|unconfirmed|absent|ruled out)\b",
+        after,
+        re.IGNORECASE,
+    )
+    return bool(negated_before or negated_after)
+
+
 def _detect_cause_assertion(summary: str, generated_queries: list[dict[str, Any]]) -> dict[str, Any]:
     text = " ".join([summary, *(query.get("panel_title", "") for query in generated_queries)])
     matches = sorted(
-        {match.group(0).lower() for pattern in CAUSE_ASSERTION_PATTERNS for match in pattern.finditer(text)}
+        {
+            match.group(0).lower()
+            for pattern in CAUSE_ASSERTION_PATTERNS
+            for match in pattern.finditer(text)
+            if not _cause_match_is_negated(text, match.start(), match.end())
+        }
     )
     return {"asserted": bool(matches), "matches": matches}
 
@@ -411,7 +434,7 @@ def main() -> int:
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--model", default="qwen3-coder:30b-a3b-q4_K_M")
     parser.add_argument("--json", type=Path)
-    parser.add_argument("--expect", choices=("pre-fix", "post-fix"), default="pre-fix")
+    parser.add_argument("--expect", choices=("pre-fix", "post-fix"), default=DEFAULT_EXPECTATION)
     args = parser.parse_args()
     with _evaluation_settings(args.grafana_url, args.ollama_url, args.model):
         report = asyncio.run(run(args))

@@ -653,19 +653,27 @@ def _resolve_legacy_required_metrics(
     target_language: str,
 ) -> dict[str, str]:
     """Resolve legacy required_metrics through the semantic taxonomy."""
-    catalog_names = {entry.name for entry in catalog}
+    target_datasource_type = _datasource_type_for_language(target_language)
+    target_catalog = [
+        entry
+        for entry in catalog
+        if (not target_language or (entry.query_language or "").lower() == target_language.lower())
+        and _datasource_type_matches(entry.datasource_type, target_datasource_type)
+    ]
+    resolution_catalog = catalog_for_services(target_catalog, intent.services, include_unscoped=True)
+    catalog_names = {entry.name for entry in resolution_catalog}
     substitutions: dict[str, str] = {}
     for default_metric in archetype.required_metrics:
         if default_metric in catalog_names:
             continue
-        signal_type = _legacy_metric_signal(store, default_metric, catalog, target_language)
+        signal_type = _legacy_metric_signal(store, default_metric, target_catalog, target_language)
         if not signal_type:
             continue
         resolved = store.resolve_signal(
             signal_type,
-            catalog,
+            resolution_catalog,
             context_service=intent.services[0] if intent.services else "",
-            context_datasource_type=_datasource_type_for_language(target_language),
+            context_datasource_type=target_datasource_type,
             context_archetype=archetype.id,
             target_query_language=target_language,
         )
