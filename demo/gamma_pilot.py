@@ -26,7 +26,7 @@ DEFAULT_SCENARIO = "cpu_aug12_25min_200_0"
 OPAQUE_SCENARIO_ID = "gamma-0001"
 BUCKET_SECONDS = 15
 
-INFRA_SUFFIXES = {
+INFRA_NORMALIZED_NAMES = {
     "container_cpu_usage_seconds_total": "gamma_container_cpu_usage_seconds_total",
     "container_memory_usage_bytes": "gamma_container_memory_usage_bytes",
     "container_fs_reads_bytes_total": "gamma_container_fs_reads_bytes_total",
@@ -34,6 +34,18 @@ INFRA_SUFFIXES = {
     "container_network_receive_bytes_total": "gamma_container_network_receive_bytes_total",
     "container_network_transmit_bytes_total": "gamma_container_network_transmit_bytes_total",
 }
+
+INFRA_CANONICAL_NAMES = {
+    **{key: key for key in INFRA_NORMALIZED_NAMES},
+    "container_memory_usage_bytes": "container_memory_working_set_bytes",
+}
+
+RESOURCE_KEYS = ("cpu", "mem", "net", "io")
+
+
+def _prometheus_metric_name(value: str) -> str:
+    """Make a source filename legal as a Prometheus metric identifier."""
+    return re.sub(r"[^a-zA-Z0-9_:]", "_", value)
 
 
 def _read_json(archive: zipfile.ZipFile, member: str):
@@ -65,6 +77,35 @@ def _placement(archive: zipfile.ZipFile) -> dict[str, str]:
         for service, node in csv.reader(io.TextIOWrapper(source, encoding="utf-8")):
             result[service.strip()] = node.strip()
     return result
+
+
+def _fault_groups(args: dict[str, object]) -> list[dict[str, object]]:
+    """Normalize legacy single-resource and newer multi-resource args schemas."""
+    legacy_nodes = args.get("bottlenecked_nodes")
+    if legacy_nodes:
+        fault_type = str(args.get("bottleneck_type") or "cpu").lower()
+        return [
+            {
+                "fault_type": fault_type,
+                "nodes": list(legacy_nodes),
+                "intensity": list(args.get("interference_percentage") or []),
+            }
+        ]
+
+    groups = []
+    for resource in RESOURCE_KEYS:
+        nodes = args.get(f"{resource}_bottlenecked_nodes")
+        if nodes:
+            groups.append(
+                {
+                    "fault_type": "memory" if resource == "mem" else resource,
+                    "nodes": list(nodes),
+                    "intensity": list(args.get(f"{resource}_interference_percentage") or []),
+                }
+            )
+    if not groups:
+        raise ValueError("scenario args contain no bottlenecked nodes")
+    return groups
 
 
 def _labels(values: dict[str, str]) -> str:
@@ -129,13 +170,14 @@ def _application_samples(
 def _infra_samples(
     archive: zipfile.ZipFile,
     scenario: str,
+    naming: str,
 ) -> Iterable[tuple[str, dict[str, str], float, float]]:
     prefix = f"raw_dataset/{scenario}/prom_metrics/"
     for member in archive.namelist():
         if not member.startswith(prefix):
             continue
         filename = member.removeprefix(prefix)
-        for source_suffix, normalized_metric in INFRA_SUFFIXES.items():
+        for source_suffix, normalized_metric in INFRA_NORMALIZED_NAMES.items():
             marker = f"_{source_suffix}"
             if not filename.endswith(marker):
                 continue
@@ -145,8 +187,16 @@ def _infra_samples(
                 "scenario_id": OPAQUE_SCENARIO_ID,
                 "service": service,
             }
+            if naming == "canonical":
+                metric_name = INFRA_CANONICAL_NAMES[source_suffix]
+            elif naming == "prefixed":
+                metric_name = f"gamma_{INFRA_CANONICAL_NAMES[source_suffix]}"
+            elif naming == "raw":
+                metric_name = _prometheus_metric_name(filename)
+            else:
+                metric_name = normalized_metric
             for timestamp, value in _read_metric_points(archive, member):
-                yield normalized_metric, labels, float(value), float(timestamp)
+                yield metric_name, labels, float(value), float(timestamp)
             break
 
 
@@ -208,18 +258,26 @@ def _rebase(
     }
 
 
-def build(archive_path: Path, scenario: str, mode: str, output_dir: Path) -> tuple[Path, Path]:
+def build(
+    archive_path: Path,
+    scenario: str,
+    mode: str,
+    output_dir: Path,
+    *,
+    naming: str = "normalized",
+) -> tuple[Path, Path]:
     with zipfile.ZipFile(archive_path) as archive:
         args = _read_json(archive, f"raw_dataset/{scenario}/args.txt")
         placement = _placement(archive)
-        bottlenecked_nodes = set(args["bottlenecked_nodes"])
+        fault_groups = _fault_groups(args)
+        bottlenecked_nodes = {node for group in fault_groups for node in group["nodes"]}
         root_cause_services = sorted(service for service, node in placement.items() if node in bottlenecked_nodes)
 
         samples: list[tuple[str, dict[str, str], float, float]] = []
         if mode in {"application", "combined"}:
             samples.extend(_application_samples(archive, scenario))
         if mode in {"infrastructure", "combined"}:
-            samples.extend(_infra_samples(archive, scenario))
+            samples.extend(_infra_samples(archive, scenario, naming))
 
         if not samples:
             raise ValueError(f"no samples produced for {mode=}")
@@ -234,7 +292,8 @@ def build(archive_path: Path, scenario: str, mode: str, output_dir: Path) -> tup
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = output_dir / f"{mode}.prom"
+    output_stem = mode if naming == "normalized" else f"{mode}-{naming}"
+    metrics_path = output_dir / f"{output_stem}.prom"
     metrics_path.write_text("\n".join(lines) + "\n")
 
     # This file is scorer-only. Never send its ground_truth block to DashForge.
@@ -243,15 +302,18 @@ def build(archive_path: Path, scenario: str, mode: str, output_dir: Path) -> tup
         "dataset": "gamma",
         "scenario_id": OPAQUE_SCENARIO_ID,
         "evidence_mode": mode,
+        "metric_naming": naming,
         "source_archive": archive_path.name,
         "source_scenario": scenario,
         "sample_count": len(samples),
         "timestamp_transform": timestamp_transform,
         "ground_truth": {
-            "fault_types": ["cpu_contention"],
+            "fault_types": sorted({str(window["fault_type"]) for window in fault_windows}),
             "root_cause_nodes": sorted(bottlenecked_nodes),
             "root_cause_services": root_cause_services,
-            "interference_intensity": args["interference_percentage"],
+            "interference_intensity": {
+                str(group["fault_type"]): group["intensity"] for group in fault_groups
+            },
             "interference_windows": fault_windows,
         },
         "prohibited_evidence": [
@@ -263,7 +325,7 @@ def build(archive_path: Path, scenario: str, mode: str, output_dir: Path) -> tup
             "GAMMA label columns",
         ],
     }
-    manifest_path = output_dir / f"{mode}.manifest.json"
+    manifest_path = output_dir / f"{output_stem}.manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     return metrics_path, manifest_path
 
@@ -273,9 +335,21 @@ def main() -> int:
     parser.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
     parser.add_argument("--scenario", default=DEFAULT_SCENARIO)
     parser.add_argument("--mode", choices=("application", "infrastructure", "combined"), required=True)
+    parser.add_argument(
+        "--naming",
+        choices=("normalized", "canonical", "prefixed", "raw"),
+        default="normalized",
+        help="Infrastructure metric naming representation for diagnostic arms.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("data/gamma/pilot"))
     args = parser.parse_args()
-    metrics_path, manifest_path = build(args.archive, args.scenario, args.mode, args.output_dir)
+    metrics_path, manifest_path = build(
+        args.archive,
+        args.scenario,
+        args.mode,
+        args.output_dir,
+        naming=args.naming,
+    )
     print(metrics_path)
     print(manifest_path)
     return 0

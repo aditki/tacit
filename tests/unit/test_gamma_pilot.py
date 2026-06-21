@@ -1,6 +1,14 @@
 import zipfile
 
-from demo.gamma_pilot import _labels, _percentile, _read_metric_points, _rebase
+from demo.gamma_pilot import (
+    INFRA_CANONICAL_NAMES,
+    _fault_groups,
+    _labels,
+    _percentile,
+    _prometheus_metric_name,
+    _read_metric_points,
+    _rebase,
+)
 
 
 def test_percentile_uses_nearest_rank():
@@ -29,3 +37,42 @@ def test_rebase_preserves_relative_time():
     assert transform["replay_end"] == 1_000.0
     assert lines[0].endswith("970000")
     assert lines[1].endswith("1000000")
+
+
+def test_canonical_memory_name_matches_packaged_archetype():
+    assert INFRA_CANONICAL_NAMES["container_memory_usage_bytes"] == "container_memory_working_set_bytes"
+
+
+def test_raw_metric_filename_is_prometheus_safe_without_hiding_semantics():
+    assert (
+        _prometheus_metric_name("compose-post-service_container_cpu_usage_seconds_total")
+        == "compose_post_service_container_cpu_usage_seconds_total"
+    )
+
+
+def test_fault_groups_support_legacy_single_resource_schema():
+    groups = _fault_groups(
+        {
+            "bottleneck_type": "memory",
+            "bottlenecked_nodes": ["node-a"],
+            "interference_percentage": [75],
+        }
+    )
+
+    assert groups == [{"fault_type": "memory", "nodes": ["node-a"], "intensity": [75]}]
+
+
+def test_fault_groups_support_new_multi_resource_schema():
+    groups = _fault_groups(
+        {
+            "cpu_bottlenecked_nodes": ["node-a"],
+            "cpu_interference_percentage": [80],
+            "mem_bottlenecked_nodes": ["node-b"],
+            "mem_interference_percentage": [90],
+        }
+    )
+
+    assert groups == [
+        {"fault_type": "cpu", "nodes": ["node-a"], "intensity": [80]},
+        {"fault_type": "memory", "nodes": ["node-b"], "intensity": [90]},
+    ]

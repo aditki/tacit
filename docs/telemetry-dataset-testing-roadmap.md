@@ -184,7 +184,7 @@ Use the frozen convention-faithful GAMMA slice only as a regression guard; it is
 
 **Branch:** `codex/dataset-gamma-bottlenecks`
 
-**Status:** Bounded real-data pilot started on 2026-06-19. The first CPU scenario exposed a cold-start compilation gap: live GAMMA signals were discovered but packaged archetypes emitted hard-coded generic metrics. One learned Qwen generation produced a valid five-panel dashboard and two cached API replays reproduced it; this is template-replay evidence, not three independent model trials or learned generalization. See `docs/results/gamma-pilot-baseline-2026-06-19.md`.
+**Status:** Bounded real-data pilot started on 2026-06-19. Six-stage diagnostics isolated the first cold-start failure between semantic mapping and query binding. Live-signal substitution now handles a `gamma_` vendor prefix (`0/3` to `3/3` independent prompts) while deliberately abstaining on raw service-prefixed metrics with ambiguous ownership (`0/3`). Positive evidence recall is frozen at canonical `6/6` and prefix-only `6/6`, preventing silence from passing. The initial control observation was zero false culprits over two cases, which is pending data rather than pass/fail. A frozen 20-case matrix now spans distinct healthy and evidence-absent CPU, memory, network, and mixed scenarios and must run successfully before fallback. Application-only symptoms still produce no surviving panel and culprit ranking remains unimplemented. See `docs/results/gamma-pilot-baseline-2026-06-19.md` and `docs/results/gamma-naming-diagnostic-2026-06-20.md`.
 
 - download the archive through Kaggle and record its version, license, and checksum;
 - inventory the real file schemas before writing normalization rules;
@@ -197,6 +197,12 @@ Use the frozen convention-faithful GAMMA slice only as a regression guard; it is
 **Pilot gates:** reproducible download and checksum, schema inventory, machine-readable ground truth, bounded labels, timestamp alignment, successful VictoriaMetrics import, Grafana discovery, and at least one non-empty DashForge investigation using real GAMMA metrics.
 
 **Evaluation gates:** fault-type recall, culprit-service top-k accuracy, mixed-bottleneck recall, unsupported-cause rate, and bounded panel duplication. Record cold-start and learned-dashboard results separately, and preserve the first real-corpus result as the untuned baseline.
+
+**Execution order:** Freeze and hash the protocol, prompts, scorer, expected arm outcomes, and denominators before a run.
+Require positive evidence recall during binding so silence cannot pass. Use the lightweight cause-assertion detector for
+healthy/evidence-absent controls before full ranking exists. Run the controls before guarded fallback, immediately after
+fallback, and again after culprit ranking. Do not open the larger scenario gate until at least 20 controls have been
+scored with explicit scenario-level numerators and denominators.
 
 ### M3: Alibaba Scale Metrics
 

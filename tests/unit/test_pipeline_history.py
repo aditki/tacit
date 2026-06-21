@@ -1,6 +1,11 @@
 from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
-from dashforge.models.schemas import ArchetypeMatch, SignalType
-from dashforge.pipeline import _history_archetypes, _history_signals
+from dashforge.models.schemas import ArchetypeMatch, DashboardSpec, MetricEntry, PanelQuery, PanelSpec, SignalType
+from dashforge.pipeline import (
+    _compiled_query_diagnostics,
+    _history_archetypes,
+    _history_signals,
+    _semantic_mapping_diagnostics,
+)
 
 
 def _arch(
@@ -21,6 +26,16 @@ def _arch(
                 queries=[QueryTemplate(expr="up", legend_format="{{instance}}")],
             )
         ],
+    )
+
+
+def _metric(name: str) -> MetricEntry:
+    return MetricEntry(
+        name=name,
+        datasource_uid="gamma-telemetry",
+        datasource_name="GAMMA Telemetry",
+        datasource_type="prometheus",
+        query_language="promql",
     )
 
 
@@ -56,3 +71,41 @@ def test_history_signals_include_semantic_archetype_signals():
     signals = _history_signals([SignalType.METRICS], [(learned, 0.82)])
 
     assert signals == ["metrics", "container_memory_usage", "pod_memory_pressure"]
+
+
+def test_semantic_mapping_diagnostics_is_independent_of_exact_binding():
+    catalog = [
+        _metric("gamma_container_cpu_usage_seconds_total"),
+        _metric("opaque_metric"),
+    ]
+
+    status, reason, details = _semantic_mapping_diagnostics(catalog)
+
+    assert status == "partial"
+    assert reason == "some_metrics_unmapped"
+    assert details["mapped"] == {"gamma_container_cpu_usage_seconds_total": "resource_usage"}
+    assert details["unmapped"] == ["opaque_metric"]
+
+
+def test_compiled_query_diagnostics_reports_missing_live_bindings():
+    spec = DashboardSpec(
+        title="CPU",
+        panels=[
+            PanelSpec(
+                title="CPU",
+                queries=[
+                    PanelQuery(
+                        expr="rate(container_cpu_usage_seconds_total[5m])",
+                        datasource_uid="gamma-telemetry",
+                    )
+                ],
+            )
+        ],
+    )
+    catalog = [_metric("gamma_container_cpu_usage_seconds_total")]
+
+    status, reason, details = _compiled_query_diagnostics(spec, catalog)
+
+    assert status == "failed"
+    assert reason == "compiled_metrics_absent_from_catalog"
+    assert details["missing_metrics"] == ["container_cpu_usage_seconds_total"]

@@ -78,3 +78,6 @@ Split learned transfer into two experiments:
 
 - **Vocabulary transfer:** teach mappings for all resource families, use only a CPU incident example, then test untouched memory/network incidents. This tests reasoning with vocabulary held constant.
 - **Template transfer:** teach only the CPU dashboard and CPU metric vocabulary, then test memory/network. This tests whether the system generalizes beyond an exact learned template and is expected to be substantially harder.
+
+The first instrumented naming diagnostic and live-signal binding fix are recorded in
+`docs/results/gamma-naming-diagnostic-2026-06-20.md`. The frozen baseline above remains unchanged.

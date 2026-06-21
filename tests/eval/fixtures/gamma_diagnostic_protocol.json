@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "status": "frozen-for-future-runs",
+  "note": "Do not tune prompts, expected outcomes, or thresholds from GAMMA diagnostic failures.",
+  "arm_prompts": [
+    "Several services show resource pressure. Identify abnormal CPU and memory usage across the application.",
+    "Find which services are constrained by processor or memory saturation during this window.",
+    "Investigate service-level resource saturation and show the CPU and memory evidence."
+  ],
+  "control_cases": [
+    {
+      "id": "healthy-cpu-low-load",
+      "kind": "healthy",
+      "family": "cpu",
+      "scenario": "cpu_aug12_25min_200_0",
+      "prompt": "Review current service health and show useful evidence without assuming a fault."
+    },
+    {
+      "id": "healthy-cpu-second-high-load",
+      "kind": "healthy",
+      "family": "cpu",
+      "scenario": "cpu_aug30_25min_800_0",
+      "prompt": "Check whether the services look healthy in this window; do not invent an incident."
+    },
+    {
+      "id": "healthy-cpu-high-load",
+      "kind": "healthy",
+      "family": "cpu",
+      "scenario": "cpu_aug18_25min_800_0",
+      "prompt": "Summarize the available service-health evidence and only flag a cause if the data supports one."
+    },
+    {
+      "id": "healthy-cpu-short-run",
+      "kind": "healthy",
+      "family": "cpu",
+      "scenario": "cpu_sept20_10min_800_0",
+      "prompt": "Inspect this quiet window for abnormal resource behavior without presuming degradation."
+    },
+    {
+      "id": "healthy-memory-run-a",
+      "kind": "healthy",
+      "family": "memory",
+      "scenario": "mem_sep22_10min_800_0",
+      "prompt": "Show a neutral service-health view for this period and avoid naming an unsupported cause."
+    },
+    {
+      "id": "healthy-memory-run-b",
+      "kind": "healthy",
+      "family": "memory",
+      "scenario": "mem_sep25_10min_800_5",
+      "prompt": "Are the application and resources behaving normally here? Base any conclusion on visible evidence."
+    },
+    {
+      "id": "healthy-network-run-a",
+      "kind": "healthy",
+      "family": "network",
+      "scenario": "net_oct4_10min_800_0",
+      "prompt": "Review this baseline window for service health without assuming network trouble."
+    },
+    {
+      "id": "healthy-network-run-b",
+      "kind": "healthy",
+      "family": "network",
+      "scenario": "net_oct4_10min_800_15",
+      "prompt": "Present useful baseline telemetry and abstain from causal claims unless they are supported."
+    },
+    {
+      "id": "healthy-mixed-run-a",
+      "kind": "healthy",
+      "family": "cpu_memory",
+      "scenario": "cpu_mem_sep29_10min_800_0",
+      "prompt": "Check the pre-incident service state and report only abnormalities that are actually visible."
+    },
+    {
+      "id": "healthy-mixed-run-b",
+      "kind": "healthy",
+      "family": "cpu_memory",
+      "scenario": "cpu_mem_oct2_10min_800_0",
+      "prompt": "Build a conservative health view for this stable interval with no assumed bottleneck."
+    },
+    {
+      "id": "symptom-only-cpu-low-load",
+      "kind": "evidence_absent",
+      "family": "cpu",
+      "scenario": "cpu_sept20_10min_800_1",
+      "prompt": "Requests slowed during this window. Show the symptom, but do not assert a resource cause without evidence."
+    },
+    {
+      "id": "symptom-only-cpu-second-high-load",
+      "kind": "evidence_absent",
+      "family": "cpu",
+      "scenario": "cpu_sept20_10min_800_2",
+      "prompt": "Response time degraded. Visualize the application symptom and leave the cause unresolved if resources are absent."
+    },
+    {
+      "id": "symptom-only-cpu-high-load",
+      "kind": "evidence_absent",
+      "family": "cpu",
+      "scenario": "cpu_sept20_10min_800_3",
+      "prompt": "Investigate slower requests using the evidence available here; do not infer an unseen infrastructure fault."
+    },
+    {
+      "id": "symptom-only-cpu-short-run",
+      "kind": "evidence_absent",
+      "family": "cpu",
+      "scenario": "cpu_sept20_10min_800_4",
+      "prompt": "Show where application latency changed and explicitly avoid guessing why when causal telemetry is missing."
+    },
+    {
+      "id": "symptom-only-memory-run-a",
+      "kind": "evidence_absent",
+      "family": "memory",
+      "scenario": "mem_sep22_10min_800_1",
+      "prompt": "Users observed a slowdown. Surface request timing and traffic evidence without blaming memory or CPU."
+    },
+    {
+      "id": "symptom-only-memory-run-b",
+      "kind": "evidence_absent",
+      "family": "memory",
+      "scenario": "mem_sep25_10min_800_6",
+      "prompt": "Confirm whether response latency moved in this interval, and abstain from a resource diagnosis."
+    },
+    {
+      "id": "symptom-only-network-run-a",
+      "kind": "evidence_absent",
+      "family": "network",
+      "scenario": "net_oct4_10min_800_1",
+      "prompt": "Requests took longer. Show the application-level evidence without assuming a network bottleneck."
+    },
+    {
+      "id": "symptom-only-network-run-b",
+      "kind": "evidence_absent",
+      "family": "network",
+      "scenario": "net_oct4_10min_800_16",
+      "prompt": "Examine the reported delay using only observable request signals and make no unsupported causal claim."
+    },
+    {
+      "id": "symptom-only-mixed-run-a",
+      "kind": "evidence_absent",
+      "family": "cpu_memory",
+      "scenario": "cpu_mem_sep29_10min_800_1",
+      "prompt": "Chart the service slowdown, but keep infrastructure causes open because resource evidence is unavailable."
+    },
+    {
+      "id": "symptom-only-mixed-run-b",
+      "kind": "evidence_absent",
+      "family": "cpu_memory",
+      "scenario": "cpu_mem_oct2_10min_800_1",
+      "prompt": "Determine whether request behavior changed and stop short of naming a bottleneck without supporting metrics."
+    }
+  ],
+  "expected_evidence_signals": ["cpu", "memory"],
+  "minimum_evidence_recall": 0.8,
+  "minimum_control_scenarios": 20,
+  "expected_outcomes": {
+    "pre-fix": {
+      "canonical": "dashboard",
+      "prefixed": "no_dashboard",
+      "raw": "no_dashboard"
+    },
+    "post-fix": {
+      "canonical": "dashboard",
+      "prefixed": "dashboard",
+      "raw": "no_dashboard"
+    }
+  }
+}

@@ -71,6 +71,9 @@ CREATE TABLE IF NOT EXISTS investigations (
     validation_warnings TEXT NOT NULL DEFAULT '[]', -- JSON array
     panels_dropped      INTEGER NOT NULL DEFAULT 0,
 
+    -- Diagnostic stage outcomes
+    stage_outcomes TEXT NOT NULL DEFAULT '{}', -- JSON: {stage: {status, reason_code, details}}
+
     -- Result
     dashboard_uid TEXT NOT NULL DEFAULT '',
     dashboard_url TEXT NOT NULL DEFAULT '',
@@ -118,6 +121,9 @@ class InvestigationStore:
     def _ensure_schema(self):
         with self._conn() as conn:
             conn.executescript(_SCHEMA_SQL)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
+            if "stage_outcomes" not in columns:
+                conn.execute("ALTER TABLE investigations ADD COLUMN stage_outcomes TEXT NOT NULL DEFAULT '{}'")
         logger.info("investigation_store_init", db_path=str(self._db_path))
 
     # ── Write operations ──────────────────────────────────────────────────
@@ -239,6 +245,34 @@ class InvestigationStore:
                 ),
             )
 
+    def record_stage(
+        self,
+        inv_id: str,
+        stage: str,
+        *,
+        status: str,
+        reason_code: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist one reason-coded diagnostic stage outcome."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT stage_outcomes FROM investigations WHERE id=?", (inv_id,)).fetchone()
+            if row is None:
+                return
+            try:
+                outcomes = json.loads(row[0] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                outcomes = {}
+            outcomes[stage] = {
+                "status": status,
+                "reason_code": reason_code,
+                "details": details or {},
+            }
+            conn.execute(
+                "UPDATE investigations SET stage_outcomes=? WHERE id=?",
+                (json.dumps(outcomes), inv_id),
+            )
+
     def finish(
         self,
         inv_id: str,
@@ -252,10 +286,23 @@ class InvestigationStore:
     ) -> None:
         """Record the final result of an investigation."""
         with self._conn() as conn:
+            row = conn.execute("SELECT stage_outcomes FROM investigations WHERE id=?", (inv_id,)).fetchone()
+            try:
+                outcomes = json.loads(row[0] or "{}") if row else {}
+            except (json.JSONDecodeError, TypeError):
+                outcomes = {}
+            outcomes.setdefault(
+                "ranking",
+                {
+                    "status": "skipped",
+                    "reason_code": "culprit_ranking_not_implemented",
+                    "details": {},
+                },
+            )
             conn.execute(
                 """UPDATE investigations SET
                    status=?, dashboard_uid=?, dashboard_url=?,
-                   error=?, timings=?, total_time=?, finished_at=?
+                   error=?, timings=?, total_time=?, finished_at=?, stage_outcomes=?
                    WHERE id=?""",
                 (
                     status,
@@ -265,6 +312,7 @@ class InvestigationStore:
                     json.dumps(timings or {}),
                     total_time,
                     time.time(),
+                    json.dumps(outcomes),
                     inv_id,
                 ),
             )
@@ -345,6 +393,7 @@ class InvestigationStore:
             "metrics_selected",
             "generated_queries",
             "validation_warnings",
+            "stage_outcomes",
             "timings",
         ):
             if key in d and isinstance(d[key], str):

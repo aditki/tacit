@@ -31,6 +31,77 @@ from dashforge.ranking import prerank_metrics
 
 logger = structlog.get_logger()
 
+
+def _record_stage(history, inv_id: str, stage: str, status: str, reason_code: str, **details) -> None:
+    """Best-effort persistence for diagnostic stage outcomes."""
+    try:
+        history.record_stage(
+            inv_id,
+            stage,
+            status=status,
+            reason_code=reason_code,
+            details=details,
+        )
+    except Exception:
+        logger.warning("history_record_stage_failed", stage=stage, exc_info=True)
+
+
+def _semantic_mapping_diagnostics(metric_catalog) -> tuple[str, str, dict]:
+    """Measure deterministic name-level semantic mapping independently of binding."""
+    from dashforge.signal_inference import infer_signals
+
+    names = list(dict.fromkeys(entry.name for entry in metric_catalog if entry.name))
+    inferred = infer_signals(names)
+    mapped = {item.metric: item.signal_family for item in inferred}
+    unmapped = [name for name in names if name not in mapped]
+    if not names:
+        return "skipped", "no_named_metrics", {"metrics_total": 0}
+    if not mapped:
+        status, reason = "failed", "no_metrics_semantically_mapped"
+    elif unmapped:
+        status, reason = "partial", "some_metrics_unmapped"
+    else:
+        status, reason = "passed", "all_metrics_semantically_mapped"
+    return status, reason, {
+        "metrics_total": len(names),
+        "metrics_mapped": len(mapped),
+        "coverage": round(len(mapped) / len(names), 4),
+        "mapped": mapped,
+        "unmapped": unmapped,
+    }
+
+
+def _compiled_query_diagnostics(dashboard_spec, catalog) -> tuple[str, str, dict]:
+    """Compare compiled PromQL references with the live catalog before probing."""
+    from dashforge.dashboard_ingest import extract_metrics_from_promql
+
+    catalog_names = {entry.name for entry in catalog if entry.name}
+    references: set[str] = set()
+    query_count = 0
+    for panel in dashboard_spec.panels:
+        for query in panel.queries:
+            if not query.expr:
+                continue
+            query_count += 1
+            if (query.query_language or "promql").lower() in {"", "promql"}:
+                references.update(extract_metrics_from_promql(query.expr))
+    present = sorted(references & catalog_names)
+    missing = sorted(references - catalog_names)
+    if not references:
+        status, reason = "skipped", "no_promql_metric_references"
+    elif missing and present:
+        status, reason = "partial", "some_compiled_metrics_absent_from_catalog"
+    elif missing:
+        status, reason = "failed", "compiled_metrics_absent_from_catalog"
+    else:
+        status, reason = "passed", "all_compiled_metrics_present"
+    return status, reason, {
+        "query_count": query_count,
+        "referenced_metrics": sorted(references),
+        "present_metrics": present,
+        "missing_metrics": missing,
+    }
+
 # Concurrency gate — prevents thundering-herd on LLM + Grafana APIs
 _pipeline_semaphore: asyncio.Semaphore | None = None
 
@@ -260,6 +331,46 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             logger.warning("history_record_discovery_failed", exc_info=True)
 
         catalog_for_compile = metric_catalog or datasource_catalog
+        if metric_catalog:
+            _record_stage(
+                history,
+                inv_id,
+                "discovery",
+                "passed",
+                "named_metrics_discovered",
+                metric_count=len(metric_catalog),
+                datasource_count=len(ds_types),
+                datasource_uids=sorted({entry.datasource_uid for entry in metric_catalog}),
+            )
+        elif datasource_catalog:
+            _record_stage(
+                history,
+                inv_id,
+                "discovery",
+                "partial",
+                "datasource_targets_without_metric_names",
+                target_count=len(datasource_catalog),
+                datasource_count=len(ds_types),
+            )
+        else:
+            _record_stage(
+                history,
+                inv_id,
+                "discovery",
+                "failed",
+                "no_metrics_or_datasource_targets",
+                datasource_count=len(ds_types),
+            )
+
+        mapping_status, mapping_reason, mapping_details = _semantic_mapping_diagnostics(metric_catalog)
+        _record_stage(
+            history,
+            inv_id,
+            "semantic_mapping",
+            mapping_status,
+            mapping_reason,
+            **mapping_details,
+        )
 
         # Confirm advisory (colloquial) synonym evidence via SCOPED signal
         # coverage: a metaphor implying "cache" becomes a real keyword only if a
@@ -563,6 +674,41 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 panels_generated=len(dashboard_spec.panels),
             )
 
+        binding_status, binding_reason, binding_details = _compiled_query_diagnostics(
+            dashboard_spec,
+            catalog_for_compile,
+        )
+        _record_stage(
+            history,
+            inv_id,
+            "binding",
+            binding_status,
+            binding_reason,
+            **binding_details,
+        )
+        compiled_query_count = sum(len(panel.queries) for panel in dashboard_spec.panels)
+        if compiled_query_count:
+            _record_stage(
+                history,
+                inv_id,
+                "compilation",
+                "passed",
+                "queries_compiled",
+                panel_count=len(dashboard_spec.panels),
+                query_count=compiled_query_count,
+                path="archetype" if ranked_archetypes else "freeform",
+            )
+        else:
+            _record_stage(
+                history,
+                inv_id,
+                "compilation",
+                "failed",
+                "no_queries_compiled",
+                panel_count=len(dashboard_spec.panels),
+                path="archetype" if ranked_archetypes else "freeform",
+            )
+
         # ── 5. Validate queries — primary backend validates ──────────
         t0 = time.monotonic()
         panels_before = len(dashboard_spec.panels)
@@ -575,6 +721,23 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             panels_before=panels_before,
             panels_after=len(dashboard_spec.panels),
             warnings=len(validation_warnings),
+        )
+        panels_after = len(dashboard_spec.panels)
+        if panels_after == 0:
+            validation_status, validation_reason = "failed", "all_panels_rejected"
+        elif panels_after < panels_before:
+            validation_status, validation_reason = "partial", "some_panels_rejected"
+        else:
+            validation_status, validation_reason = "passed", "all_panels_survived"
+        _record_stage(
+            history,
+            inv_id,
+            "validation",
+            validation_status,
+            validation_reason,
+            panels_before=panels_before,
+            panels_after=panels_after,
+            warnings=validation_warnings,
         )
 
         # Record queries after validation
