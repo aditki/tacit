@@ -218,6 +218,7 @@ def _interference_windows(
                 f"{prefix}{fault_type}_{node}_phases",
             ]
             member = next((candidate for candidate in candidates if candidate in archive_members), "")
+            shared_phase_file = member == f"{prefix}{node}_phases"
             if not member:
                 fallbacks = sorted(
                     candidate
@@ -227,14 +228,19 @@ def _interference_windows(
                 if len(fallbacks) != 1:
                     raise ValueError(f"cannot identify phase file for {scenario=} {fault_type=} {node=}: {fallbacks}")
                 member = fallbacks[0]
+                shared_phase_file = False
 
             with archive.open(member) as source:
                 events = []
                 for line in io.TextIOWrapper(source, encoding="utf-8"):
                     match = pattern.search(line)
                     if match:
+                        phase_fault_type = match.group(1).lower()
+                        if shared_phase_file and phase_fault_type != fault_type:
+                            continue
                         events.append(
                             {
+                                "phase_fault_type": phase_fault_type,
                                 "intensity": float(match.group(2)),
                                 "event": match.group(3),
                                 "source_time": float(match.group(4)),

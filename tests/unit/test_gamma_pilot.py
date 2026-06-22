@@ -106,3 +106,46 @@ def test_interference_windows_use_args_family_with_mislabeled_phase_file(tmp_pat
             "replay_end": 130.0,
         }
     ]
+
+
+def test_interference_windows_filter_shared_phase_events_by_fault_type(tmp_path):
+    archive_path = tmp_path / "gamma.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "raw_dataset/mixed-run/node-a_phases",
+            "Bottleneck of type cpu with measure 0.8 starts at 100\n"
+            "Bottleneck of type cpu with measure 0.8 ends at 120\n"
+            "Bottleneck of type memory with measure 0.9 starts at 200\n"
+            "Bottleneck of type memory with measure 0.9 ends at 240\n",
+        )
+    with zipfile.ZipFile(archive_path) as archive:
+        windows = _interference_windows(
+            archive,
+            "mixed-run",
+            [
+                {"fault_type": "cpu", "nodes": ["node-a"], "intensity": [80]},
+                {"fault_type": "memory", "nodes": ["node-a"], "intensity": [90]},
+            ],
+            offset=10,
+        )
+
+    assert windows == [
+        {
+            "node": "node-a",
+            "fault_type": "cpu",
+            "intensity": 0.8,
+            "source_start": 100.0,
+            "source_end": 120.0,
+            "replay_start": 110.0,
+            "replay_end": 130.0,
+        },
+        {
+            "node": "node-a",
+            "fault_type": "memory",
+            "intensity": 0.9,
+            "source_start": 200.0,
+            "source_end": 240.0,
+            "replay_start": 210.0,
+            "replay_end": 250.0,
+        },
+    ]

@@ -217,6 +217,41 @@ def test_evidence_only_tracks_archetypes_that_contributed_panels():
     assert [archetype.id for archetype, _ in contributed] == ["resource-saturation"]
 
 
+def test_evidence_includes_secondary_panels_with_existing_rows():
+    primary = _resource_archetype()
+    secondary = InvestigationArchetype(
+        id="secondary-latency",
+        name="Secondary Latency",
+        problem_types=["latency"],
+        required_metrics=["latency_metric"],
+        panels=[
+            PanelTemplate(
+                title="Latency",
+                row="Application",
+                queries=[QueryTemplate(expr="latency_metric")],
+            )
+        ],
+    )
+    dashboard = DashboardSpec(
+        title="Compiled",
+        panels=[
+            PanelSpec(
+                title="CPU",
+                queries=[PanelQuery(expr="rate(container_cpu_usage_seconds_total[5m])", datasource_uid="gamma")],
+            ),
+            PanelSpec(
+                title="Latency",
+                row="Application",
+                queries=[PanelQuery(expr="latency_metric", datasource_uid="gamma")],
+            ),
+        ],
+    )
+
+    contributed = contributing_archetypes([(primary, 0.9), (secondary, 0.8)], dashboard)
+
+    assert [archetype.id for archetype, _ in contributed] == ["resource-saturation", "secondary-latency"]
+
+
 def test_evidence_observations_measure_survival_after_validation():
     requirements = requirements_for_archetype(_resource_archetype(), _intent())
     resolutions = [

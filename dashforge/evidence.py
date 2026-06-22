@@ -89,14 +89,14 @@ def contributing_archetypes(
     """Return selected archetypes that actually contributed compiled panels."""
     if not ranked_archetypes or not dashboard_spec.panels:
         return []
-    panel_titles = {panel.title for panel in dashboard_spec.panels}
-    panel_rows = {panel.row for panel in dashboard_spec.panels if panel.row}
     contributed: list[tuple[InvestigationArchetype, float]] = []
     for index, (archetype, confidence) in enumerate(ranked_archetypes):
         template_titles = {panel.title for panel in archetype.panels}
-        if index == 0 and panel_titles.intersection(template_titles):
+        template_rows = {panel.row for panel in archetype.panels if panel.row}
+        matching_panels = [panel for panel in dashboard_spec.panels if panel.title in template_titles]
+        if index == 0 and matching_panels:
             contributed.append((archetype, confidence))
-        elif archetype.name in panel_rows:
+        elif any(panel.row == archetype.name or panel.row in template_rows for panel in matching_panels):
             contributed.append((archetype, confidence))
     return contributed
 
