@@ -1,0 +1,10 @@
+apiVersion: 1
+
+datasources:
+  - name: GAMMA Telemetry
+    uid: gamma-telemetry
+    type: prometheus
+    access: proxy
+    url: http://victoriametrics:8428
+    isDefault: true
+    editable: false

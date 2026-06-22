@@ -39,12 +39,14 @@ VictoriaMetrics is exposed to Grafana as a standard Prometheus datasource, so th
 | Dataset | Signals | Ground truth | Scale / access | Primary DashForge use |
 |---|---|---|---|---|
 | [ClickStack sample](https://clickhouse.com/docs/use-cases/observability/clickstack/getting-started/sample-data) | Metrics, logs, traces | Checkout failure caused by a full payment cache | Small OTLP JSON archive | Demo and end-to-end multimodal smoke test |
-| [LO2](https://zenodo.org/records/14265858) | Metrics and logs; limited single-span traces | Correct and 53 labeled API error tests | 1.1 GB sample; 46.5 GB full archive, about 540 GB expanded | Labeled anomaly and noisy-catalog evaluation |
+| [LO2](https://zenodo.org/records/14265858) | Primarily service logs; sparse metrics and mostly empty/single-span traces | Correct runs, expected OAuth2 rejection cases, and a small number of broken runs | 1.1 GB sample; 46.5 GB full archive, about 540 GB expanded | Negative-control, missing-artifact, log-noise, and ingestion-scale evaluation |
 | [GAMMA](https://www.kaggle.com/datasets/gagansomashekar/microservices-bottleneck-detection-dataset) | Metrics, logs, request traces | Injected single and simultaneous resource bottlenecks | About 40 million traces; Apache-2.0 | Multi-bottleneck localization |
 | [Alibaba microservice trace 2021](https://github.com/alibaba/clusterdata/blob/master/cluster-trace-microservices-v2021/README.md) | Node/container metrics, call rate, response time, call graphs | Production behavior rather than injected fault labels | About 61 GB compressed | Scale, cardinality, topology, and downstream-latency evaluation |
 | [Illinois/FIRM traces](https://databank.illinois.edu/datasets/IDB-6738796) | Unsampled preprocessed traces | Anomaly target encoded by file; execution paths supplied | 2.98 GB; CC0 | Trace culprit ranking across four benchmark applications |
 
-LO2 should be treated primarily as a metrics-and-logs dataset. Its published traces generally contain a single span and many trace files are empty. The Illinois dataset should remain trace-shaped; converting component duration vectors into synthetic metrics would discard its execution-path and culprit-localization value.
+LO2 is not a primary root-cause accuracy benchmark. Its appendix reports 1,740 correct runs out of 93,583, 934,935 empty artifacts, and an almost-always-empty aggregate Jaeger trace. Correct and error cases also have sharply different artifact sizes, creating an easy leakage path through run duration and file volume. Use LO2 to test whether DashForge avoids inventing infrastructure causes for expected functional rejections, handles sparse artifacts, retrieves evidence from very noisy logs, and scales ingestion. Any LO2 evaluation must exclude filenames, expected HTTP outcomes, artifact size, run duration, and missing-file counts from model evidence and scoring.
+
+The Illinois dataset should remain trace-shaped; converting component duration vectors into synthetic metrics would discard its execution-path and culprit-localization value.
 
 ## Normalization Contract
 
@@ -148,7 +150,7 @@ Overall: promising beta accuracy, but not yet trustworthy without validation gat
 | Robustness to prompt variation | 5/10 |
 | Real-world investigation usefulness | 7/10 learned, 4–5/10 cold |
 
-The synthetic benchmark's 90% top-1 archetype accuracy is credible for classification, but its 78.9% metric recall likely overstates real-world performance. With only one fully validated external scenario, a statistical accuracy claim would be premature. The encouraging part is that the architecture fails visibly: unsupported panels are dropped and the real-data tests exposed incorrect routing. M2 (LO2) and M3 (GAMMA) will tell us whether ClickStack was a repeatable capability or a well-tuned success case.
+The synthetic benchmark's 90% top-1 archetype accuracy is credible for classification, but its 78.9% metric recall likely overstates real-world performance. With only one fully validated external scenario, a statistical accuracy claim would be premature. The encouraging part is that the architecture fails visibly: unsupported panels are dropped and the real-data tests exposed incorrect routing. M2 (GAMMA) will tell us whether ClickStack was a repeatable capability or a well-tuned success case.
 
 **Required work**
 
@@ -176,33 +178,33 @@ The synthetic benchmark's 90% top-1 archetype accuracy is credible for classific
 | Supported prompt variants producing useful dashboards | ≥85% |
 | Typical dashboard size | 4–10 panels |
 
-Use tiny slices from LO2 or GAMMA to prevent overfitting to ClickStack, but postpone full ingestion. First make the reasoning robust across wording and metric conventions; then use larger datasets to test scale and generalization.
+Use the frozen convention-faithful GAMMA slice only as a regression guard; it is not evidence about the real incidents. Preserve its existing failures and move to the real GAMMA corpus rather than tuning further against curated fixtures.
 
-### M2: LO2 Sample Metrics
-
-**Branch:** `codex/dataset-lo2-metrics`
-
-- download and checksum `lo2-sample.zip`;
-- reuse the authors' merged per-run CSV files;
-- normalize the first 100 runs into bounded Prometheus series;
-- preserve correct/error labels in scenario manifests;
-- compare generated dashboards for correct and erroneous API runs;
-- add metric-selection precision, recall, and noise scoring.
-
-**Exit gates:** repeatable import, no unbounded labels, labeled normal/error scenarios, and measurable dashboard differences between paired runs.
-
-### M3: GAMMA Multi-Bottleneck Metrics
+### M2: GAMMA Multi-Bottleneck Metrics
 
 **Branch:** `codex/dataset-gamma-bottlenecks`
 
+**Status:** Bounded real-data pilot started on 2026-06-19. Six-stage diagnostics isolated the first cold-start failure between semantic mapping and query binding. Live-signal substitution now handles a `gamma_` vendor prefix (`0/3` to `3/3` independent prompts) while deliberately abstaining on raw service-prefixed metrics with ambiguous ownership (`0/3`). Positive evidence recall is frozen at canonical `6/6` and prefix-only `6/6`, preventing silence from passing. The initial control observation was zero false culprits over two cases, which is pending data rather than pass/fail. A frozen 20-case matrix now spans distinct healthy and evidence-absent CPU, memory, network, and mixed scenarios and must run successfully before fallback. Application-only symptoms still produce no surviving panel and culprit ranking remains unimplemented. See `docs/results/gamma-pilot-baseline-2026-06-19.md` and `docs/results/gamma-naming-diagnostic-2026-06-20.md`.
+
+- download the archive through Kaggle and record its version, license, and checksum;
+- inventory the real file schemas before writing normalization rules;
+- begin with a bounded pilot containing baseline, single-bottleneck, and simultaneous-bottleneck scenarios;
 - ingest CPU, memory, I/O, network, and request-latency time series;
 - model interference intensity, duration, VM, and affected services in manifests;
 - cover single-resource and simultaneous bottlenecks;
 - test whether DashForge ranks multiple plausible causes without flooding the dashboard.
 
-**Exit gates:** fault-type recall, culprit-service top-k accuracy, and bounded panel duplication across mixed bottlenecks.
+**Pilot gates:** reproducible download and checksum, schema inventory, machine-readable ground truth, bounded labels, timestamp alignment, successful VictoriaMetrics import, Grafana discovery, and at least one non-empty DashForge investigation using real GAMMA metrics.
 
-### M4: Alibaba Scale Metrics
+**Evaluation gates:** fault-type recall, culprit-service top-k accuracy, mixed-bottleneck recall, unsupported-cause rate, and bounded panel duplication. Record cold-start and learned-dashboard results separately, and preserve the first real-corpus result as the untuned baseline.
+
+**Execution order:** Freeze and hash the protocol, prompts, scorer, expected arm outcomes, and denominators before a run.
+Require positive evidence recall during binding so silence cannot pass. Use the lightweight cause-assertion detector for
+healthy/evidence-absent controls before full ranking exists. Run the controls before guarded fallback, immediately after
+fallback, and again after culprit ranking. Do not open the larger scenario gate until at least 20 controls have been
+scored with explicit scenario-level numerators and denominators.
+
+### M3: Alibaba Scale Metrics
 
 **Branch:** `codex/dataset-alibaba-scale`
 
@@ -213,7 +215,7 @@ Use tiny slices from LO2 or GAMMA to prevent overfitting to ClickStack, but post
 
 **Exit gates:** full metric corpus imports without loading archives wholly into memory, DashForge discovers useful signals under catalog limits, and representative queries stay within the agreed latency budget.
 
-### M5: ClickStack Logs and Traces
+### M4: ClickStack Logs and Traces
 
 **Branch:** `codex/demo-multimodal-investigation`
 
@@ -224,7 +226,7 @@ Use tiny slices from LO2 or GAMMA to prevent overfitting to ClickStack, but post
 
 **Exit gates:** the plan cites at least one metric, trace, and log fact; unsupported claims are rejected; and the known payment-cache root cause ranks first.
 
-### M6: Illinois/FIRM Trace Culprit Ranking
+### M5: Illinois/FIRM Trace Culprit Ranking
 
 **Branch:** `codex/dataset-firm-traces`
 
@@ -236,16 +238,19 @@ Use tiny slices from LO2 or GAMMA to prevent overfitting to ClickStack, but post
 
 **Exit gates:** execution paths survive conversion, trace IDs remain out of metric labels, and the injected component appears in DashForge's top-k investigation steps.
 
-### M7: Full LO2 Logs and Scale Run
+### M6: LO2 Negative-Control and Log-Scale Run
 
 **Branch:** `codex/dataset-lo2-full`
 
-- import the full metric corpus incrementally;
+- audit a small stratified sample of correct, expected OAuth2 rejection, and broken runs before full ingestion;
+- treat expected 400/401/404 responses as functional outcomes rather than infrastructure incidents;
+- explicitly exclude artifact size, run duration, filenames, outcome labels, and missing-file counts from investigation evidence;
+- import any useful metric corpus incrementally only if the audit finds stable, comparable time series;
 - ingest service logs into Loki with run/test/service labels;
 - apply the dataset authors' log-reduction guidance to avoid initialization leakage;
-- evaluate API-error classification and evidence retrieval over the full corpus.
+- evaluate abstention from unsupported infrastructure causes, sparse-artifact handling, log deduplication, and evidence retrieval over the full corpus.
 
-**Exit gates:** bounded disk and memory use, resumable imports, no label explosion, and stable results across repeated runs.
+**Exit gates:** zero use of prohibited leakage features, bounded disk and memory use, resumable imports, no label explosion, low unsupported-cause rate on expected functional rejections, and stable evidence retrieval across repeated runs.
 
 ## Evaluation Matrix
 
@@ -262,6 +267,7 @@ Every scenario records:
 9. Unsupported-claim rate.
 10. Ingestion time, catalog size, query latency, and storage use.
 11. Repeatability across at least five LLM runs.
+12. Dataset-specific leakage checks and prohibited evidence fields.
 
 Results belong in versioned scenario reports, not in the source datasets themselves. Synthetic tests remain the fast regression layer; these dataset milestones become the realism and operational-usefulness layer.
 

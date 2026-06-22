@@ -389,7 +389,7 @@ across prompt variants. The intent proxy has been measured separately: developme
 accuracy is 92%, while the frozen holdout failed at 65.71% positive usefulness and
 83.33% negative correctness. Per-query validation, blending caps, and dedup are
 unit-verified, but their gate numbers require the running stack and real ingested
-datasets (roadmap M2/M3).
+datasets (starting with real GAMMA in roadmap M2).
 
 To reproduce: `python -m tests.eval.gate_harness --json report.json` (runs cold-isolated).
 
@@ -412,7 +412,7 @@ evidence against an obvious naming-convention regression, not a catalog-level or
 incident-level accuracy result. The harness already
 proved its worth by catching a real convention-overfit (Redis-INFO vs OTLP naming)
 that a ClickStack-only run would have hidden. What remains before a full go/no-go:
-(a) ingest and label the real ClickStack/LO2/GAMMA-style datasets; (b) run live-stack
+(a) ingest and label the real GAMMA dataset, with LO2 retained for later negative-control and log-scale testing; (b) run live-stack
 routing, hallucination, relevance, and data-window gates; (c) measure service-scoped
 signal confirmation at catalog scale; and (d) carry the frozen prompt-holdout failures
 forward without tuning them. The current system is ready for the large-dataset

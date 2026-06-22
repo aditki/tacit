@@ -21,15 +21,20 @@ class TTLCache:
     def __init__(self, default_ttl: int = 300):
         self._store: dict[str, tuple[float, Any]] = {}
         self._default_ttl = default_ttl
+        self._hits = 0
+        self._misses = 0
 
     def get(self, key: str) -> Any | None:
         entry = self._store.get(key)
         if entry is None:
+            self._misses += 1
             return None
         expires_at, value = entry
         if time.monotonic() > expires_at:
             del self._store[key]
+            self._misses += 1
             return None
+        self._hits += 1
         return value
 
     def set(self, key: str, value: Any, ttl: int | None = None) -> None:
@@ -50,6 +55,14 @@ class TTLCache:
     @property
     def size(self) -> int:
         return len(self._store)
+
+    @property
+    def stats(self) -> dict[str, int]:
+        return {"hits": self._hits, "misses": self._misses, "size": len(self._store)}
+
+    def reset_stats(self) -> None:
+        self._hits = 0
+        self._misses = 0
 
 
 # ── Global cache instances ───────────────────────────────────────────────
