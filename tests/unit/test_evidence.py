@@ -453,6 +453,75 @@ def test_skipped_validation_survives_but_does_not_count_as_observed():
     assert summary["critical_survival_recall"] == 0.0
 
 
+def test_signalfx_exists_validation_counts_as_observed_surviving_evidence():
+    archetype = InvestigationArchetype(
+        id="signalfx-cpu",
+        name="SignalFx CPU",
+        problem_types=["resource_saturation"],
+        required_metrics=["container_cpu_usage_seconds_total"],
+        panels=[
+            PanelTemplate(
+                title="CPU",
+                queries=[QueryTemplate(expr="data('container_cpu_usage_seconds_total').publish()")],
+            )
+        ],
+    )
+    requirements = requirements_for_archetype(archetype, _intent())
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="default_metric_present",
+            metric="container_cpu_usage_seconds_total",
+            datasource_uid="sfx",
+            datasource_type="signalfx",
+            query_language="signalflow",
+        )
+    ]
+    pre_validation = DashboardSpec(
+        title="SignalFx",
+        panels=[
+            PanelSpec(
+                title="CPU",
+                queries=[
+                    PanelQuery(
+                        expr="data('container_cpu_usage_seconds_total').publish()",
+                        datasource_uid="sfx",
+                        datasource_type="signalfx",
+                        query_language="signalflow",
+                    )
+                ],
+            )
+        ],
+    )
+    post_validation = DashboardSpec(
+        title="SignalFx",
+        panels=[
+            PanelSpec(
+                title="CPU",
+                queries=[
+                    PanelQuery(
+                        expr="data('container_cpu_usage_seconds_total').publish()",
+                        datasource_uid="sfx",
+                        datasource_type="signalfx",
+                        query_language="signalflow",
+                        validation_status="exists",
+                        validation_has_data=False,
+                    )
+                ],
+            )
+        ],
+    )
+
+    observations = observe_evidence(requirements, resolutions, pre_validation, post_validation)
+    summary = summarize_evidence(requirements, resolutions, observations)
+
+    assert observations[0].survived is True
+    assert observations[0].non_empty is True
+    assert observations[0].rejection_reason == ""
+    assert summary["critical_survival_recall"] == 1.0
+
+
 def test_histogram_bucket_query_counts_as_observed_base_histogram_evidence():
     archetype = InvestigationArchetype(
         id="latency",

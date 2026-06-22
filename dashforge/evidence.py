@@ -353,7 +353,9 @@ def observe_evidence(
                         "syntax_error",
                         "error",
                     }
-                    if validation_status:
+                    if validation_status == "exists":
+                        non_empty = survived
+                    elif validation_status:
                         non_empty = bool(surviving_query and surviving_query.validation_has_data)
                     else:
                         non_empty = survived
