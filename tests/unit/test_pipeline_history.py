@@ -1,3 +1,5 @@
+from promql_parser import parse
+
 from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from dashforge.evidence import requirements_for_archetype
 from dashforge.models.schemas import (
@@ -186,9 +188,11 @@ def test_symptom_evidence_dashboard_preserves_resolved_application_symptoms():
     ]
     assert [panel.title for panel in dashboard.panels] == ["Observed Request Latency", "Observed Request Rate"]
     assert [panel.queries[0].expr for panel in dashboard.panels] == [
-        'gamma_request_latency_seconds{service=~"checkout\\-service"}',
-        'gamma_request_rate{service=~"checkout\\-service"}',
+        'gamma_request_latency_seconds{service=~"checkout-service"}',
+        'gamma_request_rate{service=~"checkout-service"}',
     ]
+    for panel in dashboard.panels:
+        parse(panel.queries[0].expr)
 
 
 def test_symptom_evidence_dashboard_does_not_promote_resource_evidence():

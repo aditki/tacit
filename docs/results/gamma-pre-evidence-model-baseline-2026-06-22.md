@@ -51,4 +51,3 @@ it contains generated dashboard details and expanded per-run diagnostics.
 Proceed to the first-class evidence model, not guarded fallback. Preserve canonical/prefixed `6/6`, raw neutral
 ownership abstention, and `0/20` false culprits. Make the first usefulness gate convert the ten discovered application
 symptoms into validated observations and surviving symptom evidence without asserting a resource cause.
-

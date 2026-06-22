@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from typing import Any, cast
 
@@ -136,9 +135,11 @@ def _compiled_query_diagnostics(dashboard_spec, catalog) -> tuple[str, str, dict
 
 
 def _promql_service_selector(services: list[str]) -> str:
+    from dashforge.archetypes.engine import _re2_escape
+
     if not services:
         return ""
-    escaped = "|".join(re.escape(service) for service in services if service)
+    escaped = "|".join(_re2_escape(service) for service in services if service)
     return f'{{service=~"{escaped}"}}' if escaped else ""
 
 
@@ -156,7 +157,6 @@ def _build_symptom_evidence_dashboard(
     This is intentionally not a root-cause fallback. It only surfaces resolved
     symptom evidence that already came from selected archetype requirements.
     """
-    requirements_by_id = {requirement.id: requirement for requirement in requirements}
     resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
     service_selector = _promql_service_selector(intent.services)
     panels: list[PanelSpec] = []
