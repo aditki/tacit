@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
@@ -24,10 +24,15 @@ from dashforge.cache import llm_cache, make_cache_key
 from dashforge.catalog import catalog_for_services
 from dashforge.config import settings
 from dashforge.context.enrichment import enrich_context
-from dashforge.evidence import observe_evidence, resolve_requirements_for_archetypes, summarize_evidence
+from dashforge.evidence import (
+    contributing_archetypes,
+    observe_evidence,
+    resolve_requirements_for_archetypes,
+    summarize_evidence,
+)
 from dashforge.history import get_investigation_store
 from dashforge.logging import bind_request_id, stage_log, unbind_request_id
-from dashforge.models.schemas import DashRequest, DashResponse
+from dashforge.models.schemas import DashRequest, DashResponse, EvidenceRequirement, EvidenceResolution
 from dashforge.ranking import prerank_metrics
 
 logger = structlog.get_logger()
@@ -684,13 +689,13 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 panels_generated=len(dashboard_spec.panels),
             )
 
-        evidence_requirements = []
-        evidence_resolutions = []
-        evidence_observations = []
+        evidence_requirements: list[EvidenceRequirement] = []
+        evidence_resolutions: list[EvidenceResolution] = []
         if ranked_archetypes:
             try:
+                evidence_archetypes = contributing_archetypes(ranked_archetypes, dashboard_spec)
                 evidence_requirements, evidence_resolutions = resolve_requirements_for_archetypes(
-                    ranked_archetypes,
+                    evidence_archetypes,
                     intent,
                     catalog_for_compile,
                     target_language=target_language,
@@ -777,8 +782,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     evidence_resolutions,
                     evidence_observations,
                 )
-                critical_total = int(evidence_summary["critical_total"])
-                critical_observed = int(evidence_summary["critical_observed"])
+                critical_total = cast(int, evidence_summary["critical_total"])
+                critical_observed = cast(int, evidence_summary["critical_observed"])
                 if critical_total and critical_observed == critical_total:
                     evidence_status, evidence_reason = "passed", "all_critical_evidence_observed"
                 elif critical_observed:

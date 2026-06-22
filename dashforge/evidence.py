@@ -82,6 +82,30 @@ def requirements_for_archetypes(
     return requirements
 
 
+def contributing_archetypes(
+    ranked_archetypes: list[tuple[InvestigationArchetype, float]],
+    dashboard_spec: DashboardSpec,
+) -> list[tuple[InvestigationArchetype, float]]:
+    """Return selected archetypes that actually contributed compiled panels."""
+    if not ranked_archetypes or not dashboard_spec.panels:
+        return []
+    panel_titles = {panel.title for panel in dashboard_spec.panels}
+    panel_rows = {panel.row for panel in dashboard_spec.panels if panel.row}
+    contributed: list[tuple[InvestigationArchetype, float]] = []
+    for index, (archetype, confidence) in enumerate(ranked_archetypes):
+        template_titles = {panel.title for panel in archetype.panels}
+        if index == 0 and panel_titles.intersection(template_titles):
+            contributed.append((archetype, confidence))
+        elif archetype.name in panel_rows:
+            contributed.append((archetype, confidence))
+    return contributed
+
+
+def _unique_owner(entries: list[MetricEntry]) -> MetricEntry | None:
+    owners = {(entry.datasource_uid, entry.datasource_type, entry.query_language) for entry in entries}
+    return entries[0] if len(owners) == 1 else None
+
+
 def resolve_requirements_for_archetype(
     archetype: InvestigationArchetype,
     intent: Intent,
@@ -91,8 +115,8 @@ def resolve_requirements_for_archetype(
 ) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
     """Resolve one archetype's evidence needs against the live catalog."""
     from dashforge.archetypes.engine import (
+        _archetype_query_languages,
         _datasource_type_for_language,
-        _datasource_type_matches,
         _legacy_metric_signal,
         _substitution_shape_compatible,
     )
@@ -102,12 +126,9 @@ def resolve_requirements_for_archetype(
     if not requirements:
         return requirements, []
 
-    target_datasource_type = _datasource_type_for_language(target_language)
+    query_languages = _archetype_query_languages(archetype, target_language)
     target_catalog = [
-        entry
-        for entry in catalog
-        if (not target_language or (entry.query_language or "").lower() == target_language.lower())
-        and _datasource_type_matches(entry.datasource_type, target_datasource_type)
+        entry for entry in catalog if not query_languages or (entry.query_language or "").lower() in query_languages
     ]
     resolution_catalog = catalog_for_services(target_catalog, intent.services, include_unscoped=True)
     catalog_by_name: dict[str, list[MetricEntry]] = defaultdict(list)
@@ -145,10 +166,20 @@ def resolve_requirements_for_archetype(
     for requirement in requirements:
         default_metric = requirement.default_metric
         if default_metric and default_metric in catalog_by_name:
+            owner = _unique_owner(catalog_by_name[default_metric])
+            if owner is None:
+                resolutions.append(
+                    EvidenceResolution(
+                        requirement_id=requirement.id,
+                        status="unresolved",
+                        reason_code="ambiguous_default_metric_owner",
+                    )
+                )
+                continue
             resolutions.append(
                 resolved_from_entry(
                     requirement,
-                    catalog_by_name[default_metric][0],
+                    owner,
                     reason_code="default_metric_present",
                 )
             )
@@ -166,7 +197,13 @@ def resolve_requirements_for_archetype(
 
         signal_type = requirement.signal_type
         if not signal_type and default_metric:
-            signal_type = _legacy_metric_signal(store, default_metric, target_catalog, target_language)
+            for language in sorted(query_languages or {target_language}):
+                language_catalog = [
+                    entry for entry in target_catalog if (entry.query_language or "").lower() == language.lower()
+                ]
+                signal_type = _legacy_metric_signal(store, default_metric, language_catalog, language)
+                if signal_type:
+                    break
         if not signal_type:
             resolutions.append(
                 EvidenceResolution(
@@ -177,14 +214,20 @@ def resolve_requirements_for_archetype(
             )
             continue
 
-        resolved = store.resolve_signal(
-            signal_type,
-            resolution_catalog,
-            context_service=intent.services[0] if intent.services else "",
-            context_datasource_type=target_datasource_type,
-            context_archetype=archetype.id,
-            target_query_language=target_language,
-        )
+        resolved: list[tuple[MetricEntry, float]] = []
+        for language in sorted(query_languages or {target_language}):
+            target_datasource_type = _datasource_type_for_language(language)
+            resolved.extend(
+                store.resolve_signal(
+                    signal_type,
+                    resolution_catalog,
+                    context_service=intent.services[0] if intent.services else "",
+                    context_datasource_type=target_datasource_type,
+                    context_archetype=archetype.id,
+                    target_query_language=language,
+                )
+            )
+        resolved.sort(key=lambda item: item[1], reverse=True)
         compatible = [
             (entry, score)
             for entry, score in resolved
@@ -200,21 +243,22 @@ def resolve_requirements_for_archetype(
             )
             continue
 
-        best_score = compatible[0][1]
-        best = [item for item in compatible if item[1] == best_score]
-        best_names = {entry.name for entry, _ in best}
-        if len(best_names) > 1:
-            resolutions.append(
-                EvidenceResolution(
-                    requirement_id=requirement.id,
-                    status="unresolved",
-                    reason_code="ambiguous_live_signal",
-                    semantic_score=best_score,
+        if requirement.evidence_type != "semantic_signal":
+            best_score = compatible[0][1]
+            best = [item for item in compatible if item[1] == best_score]
+            best_names = {entry.name for entry, _ in best}
+            if len(best_names) > 1:
+                resolutions.append(
+                    EvidenceResolution(
+                        requirement_id=requirement.id,
+                        status="unresolved",
+                        reason_code="ambiguous_live_signal",
+                        semantic_score=best_score,
+                    )
                 )
-            )
-            continue
+                continue
 
-        entry, score = best[0]
+        entry, score = compatible[0]
         resolutions.append(
             resolved_from_entry(
                 requirement,
