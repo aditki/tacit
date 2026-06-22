@@ -37,6 +37,7 @@ from dashforge.models.schemas import (
     DashboardSpec,
     DashRequest,
     DashResponse,
+    EvidenceObservation,
     EvidenceRequirement,
     EvidenceResolution,
     Intent,
@@ -153,7 +154,7 @@ def _dimension_label_values(dimension: str) -> tuple[str, list[str]]:
     label = key.strip()
     if not separator:
         return label, []
-    values = [value.strip() for value in raw_value.strip().strip("{}").split(",")]
+    values = [value.strip().strip("\"'") for value in raw_value.strip().strip("{}").split(",")]
     return label, [value for value in values if value]
 
 
@@ -201,9 +202,22 @@ def _is_counter_metric(metric: str, entry: MetricEntry | None) -> bool:
 
 
 def _symptom_query_expr(signal_type: str, metric: str, selector: str, entry: MetricEntry | None) -> str:
+    metric_lower = metric.lower()
+    if signal_type in {"request_latency", "api_latency"} and metric_lower.endswith("_bucket"):
+        return f"histogram_quantile(0.95, sum(rate({metric}{selector}[5m])) by (le))"
     if signal_type == "request_rate" and _is_counter_metric(metric, entry):
         return f"sum(rate({metric}{selector}[5m]))"
+    if signal_type == "error_rate" and _is_counter_metric(metric, entry):
+        if any(token in metric_lower for token in ("error", "errors", "failure", "failures", "5xx")):
+            return f"sum(rate({metric}{selector}[5m]))"
+        return ""
     return f"{metric}{selector}"
+
+
+def _symptom_unit(signal_type: str, metric: str, entry: MetricEntry | None) -> str:
+    if signal_type == "error_rate" and _is_counter_metric(metric, entry):
+        return "ops"
+    return _SYMPTOM_SIGNAL_PANELS[signal_type][2]
 
 
 def _symptom_signal_type(requirement: EvidenceRequirement, resolution: EvidenceResolution) -> str:
@@ -317,20 +331,23 @@ def _build_symptom_evidence_dashboard(
         if key in seen:
             continue
         seen.add(key)
-        rescue_resolutions.append(resolution)
-        title, description, unit = _SYMPTOM_SIGNAL_PANELS[signal_type]
+        title, description, _ = _SYMPTOM_SIGNAL_PANELS[signal_type]
         metric_entry = _catalog_entry_for_resolution(resolution, catalog)
         service_selector = _promql_service_selector(intent.services, metric_entry)
+        query_expr = _symptom_query_expr(signal_type, resolution.metric, service_selector, metric_entry)
+        if not query_expr:
+            continue
+        rescue_resolutions.append(resolution)
         panels.append(
             PanelSpec(
                 title=title,
                 description=description,
                 row="Observed Symptoms",
                 source_archetype=requirement.source,
-                unit=unit,
+                unit=_symptom_unit(signal_type, resolution.metric, metric_entry),
                 queries=[
                     PanelQuery(
-                        expr=_symptom_query_expr(signal_type, resolution.metric, service_selector, metric_entry),
+                        expr=query_expr,
                         legend_format="{{service}}",
                         datasource_uid=resolution.datasource_uid,
                         datasource_type=resolution.datasource_type or "prometheus",
@@ -350,6 +367,25 @@ def _build_symptom_evidence_dashboard(
         ),
         rescue_resolutions,
     )
+
+
+def _missing_critical_symptom_requirements(
+    requirements: list[EvidenceRequirement],
+    resolutions: list[EvidenceResolution],
+    observations: list[EvidenceObservation],
+) -> list[EvidenceRequirement]:
+    observed_ids = {observation.requirement_id for observation in observations if observation.non_empty}
+    resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
+    missing: list[EvidenceRequirement] = []
+    for requirement in requirements:
+        if requirement.priority != "critical" or requirement.id in observed_ids:
+            continue
+        resolution = resolutions_by_id.get(requirement.id)
+        if resolution is None:
+            resolution = EvidenceResolution(requirement_id=requirement.id, status="unknown", reason_code="unknown")
+        if _symptom_signal_type(requirement, resolution) in _SYMPTOM_SIGNAL_PANELS:
+            missing.append(requirement)
+    return missing
 
 
 # Concurrency gate — prevents thundering-herd on LLM + Grafana APIs
@@ -978,10 +1014,25 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         panels_before = len(dashboard_spec.panels)
         pre_validation_spec = dashboard_spec.model_copy(deep=True)
         dashboard_spec, validation_warnings = await primary.validate_queries(dashboard_spec, catalog_for_compile)
-        if not dashboard_spec.panels and evidence_requirements:
-            original_validation_warnings = list(validation_warnings)
-            symptom_pre_validation_spec, symptom_resolutions = _build_symptom_evidence_dashboard(
+        rescue_requirements: list[EvidenceRequirement] = []
+        if evidence_requirements:
+            initial_evidence_observations = observe_evidence(
                 evidence_requirements,
+                evidence_resolutions,
+                pre_validation_spec,
+                dashboard_spec,
+            )
+            rescue_requirements = _missing_critical_symptom_requirements(
+                evidence_requirements,
+                evidence_resolutions,
+                initial_evidence_observations,
+            )
+        if rescue_requirements:
+            original_validation_warnings = list(validation_warnings)
+            original_panels_before = panels_before
+            original_panels_after = len(dashboard_spec.panels)
+            symptom_pre_validation_spec, symptom_resolutions = _build_symptom_evidence_dashboard(
+                rescue_requirements,
                 evidence_resolutions,
                 intent,
                 catalog=catalog_for_compile,
@@ -993,14 +1044,14 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     symptom_pre_validation_spec,
                     catalog_for_compile,
                 )
-                validation_warnings.extend(symptom_warnings)
                 _record_stage(
                     history,
                     inv_id,
                     "symptom_evidence_rescue",
                     "passed" if symptom_spec.panels else "failed",
                     "symptom_panels_validated" if symptom_spec.panels else "symptom_panels_rejected",
-                    original_panels_before=panels_before,
+                    original_panels_before=original_panels_before,
+                    original_panels_after=original_panels_after,
                     original_warnings=original_validation_warnings,
                     panels_before=len(symptom_pre_validation_spec.panels),
                     panels_after=len(symptom_spec.panels),
@@ -1013,10 +1064,27 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                         if resolution.requirement_id not in rescue_requirement_ids
                     ]
                     evidence_resolutions.extend(symptom_resolutions)
-                    pre_validation_spec = symptom_pre_validation_spec
-                    dashboard_spec = symptom_spec
-                    panels_before = len(symptom_pre_validation_spec.panels)
-                    validation_warnings = symptom_warnings
+                    if original_panels_after:
+                        pre_validation_spec = pre_validation_spec.model_copy(
+                            update={
+                                "panels": [
+                                    *pre_validation_spec.panels,
+                                    *symptom_pre_validation_spec.panels,
+                                ]
+                            }
+                        )
+                        dashboard_spec = dashboard_spec.model_copy(
+                            update={"panels": [*dashboard_spec.panels, *symptom_spec.panels]}
+                        )
+                        panels_before = original_panels_before + len(symptom_pre_validation_spec.panels)
+                        validation_warnings.extend(symptom_warnings)
+                    else:
+                        pre_validation_spec = symptom_pre_validation_spec
+                        dashboard_spec = symptom_spec
+                        panels_before = len(symptom_pre_validation_spec.panels)
+                        validation_warnings = symptom_warnings
+                else:
+                    validation_warnings.extend(symptom_warnings)
             else:
                 _record_stage(
                     history,
