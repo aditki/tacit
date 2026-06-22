@@ -352,6 +352,70 @@ def test_skipped_validation_survives_but_does_not_count_as_observed():
     assert summary["critical_survival_recall"] == 0.0
 
 
+def test_signalfx_exists_validation_survives_but_does_not_count_as_observed():
+    archetype = InvestigationArchetype(
+        id="signalfx-latency",
+        name="SignalFx Latency",
+        problem_types=["latency"],
+        required_metrics=["request.duration"],
+        panels=[PanelTemplate(title="Latency", queries=[QueryTemplate(expr="data('request.duration').mean()")])],
+    )
+    requirements = requirements_for_archetype(archetype, _intent())
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="request.duration",
+            datasource_uid="sfx",
+            datasource_type="signalfx",
+            query_language="signalflow",
+        )
+    ]
+    pre_validation = DashboardSpec(
+        title="SignalFx",
+        panels=[
+            PanelSpec(
+                title="Latency",
+                queries=[
+                    PanelQuery(
+                        expr="data('request.duration').mean()",
+                        datasource_uid="sfx",
+                        datasource_type="signalfx",
+                        query_language="signalflow",
+                    )
+                ],
+            )
+        ],
+    )
+    post_validation = DashboardSpec(
+        title="SignalFx",
+        panels=[
+            PanelSpec(
+                title="Latency",
+                queries=[
+                    PanelQuery(
+                        expr="data('request.duration').mean()",
+                        datasource_uid="sfx",
+                        datasource_type="signalfx",
+                        query_language="signalflow",
+                        validation_status="exists",
+                        validation_has_data=False,
+                    )
+                ],
+            )
+        ],
+    )
+
+    observations = observe_evidence(requirements, resolutions, pre_validation, post_validation)
+    summary = summarize_evidence(requirements, resolutions, observations)
+
+    assert observations[0].survived is True
+    assert observations[0].non_empty is False
+    assert observations[0].rejection_reason == "exists"
+    assert summary["critical_survival_recall"] == 0.0
+
+
 def test_evidence_observation_matches_metric_tokens_not_substrings():
     requirements = requirements_for_archetype(_resource_archetype(), _intent())
     resolutions = [

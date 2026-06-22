@@ -158,6 +158,11 @@ def _dimension_label_values(dimension: str) -> tuple[str, list[str]]:
     return label, [value for value in values if value]
 
 
+def _service_value_matches(value: str, aliases: set[str]) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return any(re.search(rf"(?:^|-){re.escape(alias)}(?:-|$)", normalized) for alias in aliases)
+
+
 def _promql_service_selector(services: list[str], metric_entry: MetricEntry | None = None) -> str:
     from dashforge.archetypes.engine import _re2_escape
 
@@ -172,7 +177,7 @@ def _promql_service_selector(services: list[str], metric_entry: MetricEntry | No
         if label.lower() not in _SERVICE_SELECTOR_LABELS:
             continue
         if values:
-            selected = [value for value in values if _service_aliases(value) & aliases]
+            selected = [value for value in values if _service_value_matches(value, aliases)]
             if not selected:
                 continue
             escaped = "|".join(_re2_escape(value) for value in sorted(selected))
@@ -193,7 +198,7 @@ def _signalflow_service_filter(services: list[str], metric_entry: MetricEntry | 
         if label.lower() not in _SERVICE_SELECTOR_LABELS:
             continue
         if values:
-            selected = [value for value in values if _service_aliases(value) & aliases]
+            selected = [value for value in values if _service_value_matches(value, aliases)]
             if not selected:
                 continue
             value = sorted(selected)[0]
@@ -328,13 +333,14 @@ def _build_symptom_evidence_dashboard(
         if not (supports_promql or supports_signalflow):
             continue
         key = (signal_type, resolution.metric, resolution.datasource_uid)
-        if key in seen:
-            continue
-        seen.add(key)
         metric_entry = _catalog_entry_for_resolution(resolution, catalog)
         query_expr = _symptom_query_expr(signal_type, resolution, intent, metric_entry)
         if not query_expr:
             continue
+        if key in seen:
+            rescue_resolutions.append(resolution)
+            continue
+        seen.add(key)
         rescue_resolutions.append(resolution)
         title, description, _ = _SYMPTOM_SIGNAL_PANELS[signal_type]
         panels.append(
