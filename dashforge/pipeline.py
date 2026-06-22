@@ -57,6 +57,7 @@ _SYMPTOM_SIGNAL_PANELS = {
 }
 
 _SERVICE_SELECTOR_LABELS = ("service", "service_name", "service.name", "app", "application", "container", "pod")
+_PROMETHEUS_COMPATIBLE_DATASOURCE_TYPES = {"", "prometheus", "mimir", "cortex", "thanos"}
 
 
 def _record_stage(history, inv_id: str, stage: str, status: str, reason_code: str, **details) -> None:
@@ -325,7 +326,9 @@ def _build_symptom_evidence_dashboard(
             continue
         query_language = (resolution.query_language or "promql").lower()
         datasource_type = (resolution.datasource_type or "prometheus").lower()
-        supports_promql = query_language in {"", "promql"} and datasource_type in {"", "prometheus"}
+        supports_promql = (
+            query_language in {"", "promql"} and datasource_type in _PROMETHEUS_COMPATIBLE_DATASOURCE_TYPES
+        )
         supports_signalflow = query_language == "signalflow" or datasource_type in {
             "signalfx",
             "grafana-signalfx-datasource",
@@ -429,6 +432,7 @@ def _resolve_direct_symptom_evidence(
         scoped_catalog,
         context_service=intent.services[0] if intent.services else "",
         context_datasource_type=_datasource_type_for_language(target_language),
+        context_archetype=requirement.source,
         target_query_language=target_language,
     )
     if not resolved:
@@ -450,7 +454,6 @@ def _resolve_direct_symptom_evidence(
         semantic_score=score,
         ownership_score=1.0,
     )
-
 
 # Concurrency gate — prevents thundering-herd on LLM + Grafana APIs
 _pipeline_semaphore: asyncio.Semaphore | None = None
@@ -1145,8 +1148,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     else:
                         pre_validation_spec = symptom_pre_validation_spec
                         dashboard_spec = symptom_spec
-                        panels_before = len(symptom_pre_validation_spec.panels)
-                        validation_warnings = symptom_warnings
+                        panels_before = original_panels_before + len(symptom_pre_validation_spec.panels)
             else:
                 _record_stage(
                     history,

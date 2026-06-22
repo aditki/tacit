@@ -301,6 +301,56 @@ def test_symptom_evidence_dashboard_resolves_direct_latency_when_template_shape_
     assert rescue_resolutions[0].reason_code == "direct_symptom_signal_resolved"
 
 
+def test_symptom_evidence_dashboard_allows_prometheus_compatible_datasources():
+    archetype = InvestigationArchetype(
+        id="latency_investigation",
+        name="Latency Investigation",
+        problem_types=["latency_investigation"],
+        required_metrics=["http_request_duration_seconds"],
+        panels=[
+            PanelTemplate(
+                title="Latency",
+                queries=[
+                    QueryTemplate(expr="histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))")
+                ],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="checkout requests slowed",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["latency"],
+        problem_type="latency_investigation",
+        archetypes=[ArchetypeMatch(type="latency_investigation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="default_metric_present",
+            metric="http_request_duration_seconds",
+            datasource_uid="gamma-telemetry",
+            datasource_type="mimir",
+            query_language="promql",
+        )
+    ]
+
+    dashboard, _ = _build_symptom_evidence_dashboard(
+        requirements,
+        resolutions,
+        intent,
+        catalog=[_metric("http_request_duration_seconds", datasource_type="mimir")],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert [panel.title for panel in dashboard.panels] == ["Observed Request Latency"]
+    assert dashboard.panels[0].queries[0].datasource_type == "mimir"
+
+
 def test_symptom_evidence_dashboard_uses_catalog_label_selector_and_rates_counter():
     archetype = InvestigationArchetype(
         id="traffic_investigation",
