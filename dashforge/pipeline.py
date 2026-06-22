@@ -267,6 +267,8 @@ def _signalflow_symptom_query(signal_type: str, metric: str, filt: str, entry: M
     metric_lower = metric.lower()
     if signal_type in {"request_latency", "api_latency"} and metric_lower.endswith("_bucket"):
         return f"data('{metric.removesuffix('_bucket')}'{filt}).percentile(pct=95).publish(label='p95')"
+    if signal_type in {"request_latency", "api_latency"} and metric_lower.endswith(("_sum", "_count")):
+        return ""
     if signal_type == "request_rate" and _is_counter_metric(metric, entry):
         return f"data('{metric}'{filt}, rollup='rate').sum().publish(label='rate')"
     if signal_type == "error_rate" and _is_counter_metric(metric, entry):
@@ -284,7 +286,7 @@ def _symptom_query_expr(
 ) -> str:
     query_language = (resolution.query_language or "promql").lower()
     datasource_type = (resolution.datasource_type or "prometheus").lower()
-    if query_language in {"", "promql"} and datasource_type in {"", "prometheus"}:
+    if query_language in {"", "promql"} and datasource_type in _PROMETHEUS_COMPATIBLE_DATASOURCE_TYPES:
         selector = _promql_service_selector(intent.services, metric_entry)
         return _promql_symptom_query(signal_type, resolution.metric, selector, metric_entry)
     if query_language == "signalflow" or datasource_type in {"signalfx", "grafana-signalfx-datasource"}:
@@ -383,11 +385,15 @@ def _missing_critical_symptom_requirements(
     resolutions: list[EvidenceResolution],
     observations: list[EvidenceObservation],
 ) -> list[EvidenceRequirement]:
-    observed_ids = {observation.requirement_id for observation in observations if observation.non_empty}
+    surfaced_ids = {
+        observation.requirement_id
+        for observation in observations
+        if observation.non_empty or (observation.survived and observation.rejection_reason == "exists")
+    }
     resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
     missing: list[EvidenceRequirement] = []
     for requirement in requirements:
-        if requirement.priority != "critical" or requirement.id in observed_ids:
+        if requirement.priority != "critical" or requirement.id in surfaced_ids:
             continue
         resolution = resolutions_by_id.get(requirement.id)
         if resolution is None:
@@ -456,6 +462,7 @@ def _resolve_direct_symptom_evidence(
         semantic_score=score,
         ownership_score=1.0,
     )
+
 
 # Concurrency gate — prevents thundering-herd on LLM + Grafana APIs
 _pipeline_semaphore: asyncio.Semaphore | None = None

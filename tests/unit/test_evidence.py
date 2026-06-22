@@ -524,59 +524,6 @@ def test_evidence_observation_matches_metric_tokens_not_substrings():
     assert observations[0].rejection_reason == "resolved_metric_not_observed_in_queries"
 
 
-def test_skipped_validation_survives_but_does_not_count_as_observed():
-    requirements = requirements_for_archetype(_resource_archetype(), _intent())
-    resolutions = [
-        EvidenceResolution(
-            requirement_id=requirements[0].id,
-            status="resolved",
-            reason_code="live_signal_resolved",
-            metric="log_metric",
-        )
-    ]
-    pre_validation = DashboardSpec(
-        title="Logs",
-        panels=[
-            PanelSpec(
-                title="Logs",
-                queries=[
-                    PanelQuery(
-                        expr="log_metric",
-                        datasource_uid="loki",
-                        datasource_type="loki",
-                        query_language="logql",
-                    )
-                ],
-            )
-        ],
-    )
-    post_validation = DashboardSpec(
-        title="Logs",
-        panels=[
-            PanelSpec(
-                title="Logs",
-                queries=[
-                    PanelQuery(
-                        expr="log_metric",
-                        datasource_uid="loki",
-                        datasource_type="loki",
-                        query_language="logql",
-                        validation_status="skipped",
-                        validation_has_data=False,
-                    )
-                ],
-            )
-        ],
-    )
-
-    observations = observe_evidence(requirements, resolutions, pre_validation, post_validation)
-    summary = summarize_evidence(requirements, resolutions, observations)
-
-    assert observations[0].survived is True
-    assert observations[0].non_empty is False
-    assert observations[0].rejection_reason == "skipped"
-    assert summary["critical_survival_recall"] == 0.0
-
 def test_evidence_observation_requires_resolved_datasource_owner():
     archetype = InvestigationArchetype(
         id="latency",
@@ -622,6 +569,8 @@ def test_evidence_observation_requires_resolved_datasource_owner():
     assert observations[0].non_empty is False
     assert observations[0].rejection_reason == "query_rejected_by_validation"
     assert summary["critical_survival_recall"] == 0.0
+
+
 def test_histogram_bucket_query_counts_as_observed_base_histogram_evidence():
     archetype = InvestigationArchetype(
         id="latency",

@@ -635,6 +635,50 @@ def test_symptom_evidence_dashboard_rates_clear_error_counters():
     assert dashboard.panels[0].unit == "ops"
 
 
+def test_symptom_evidence_dashboard_abstains_on_latency_sum_count_helpers():
+    archetype = InvestigationArchetype(
+        id="latency_investigation",
+        name="Latency Investigation",
+        problem_types=["latency_investigation"],
+        required_signals=["request_latency"],
+        signal_bindings={"request_latency": "http_request_duration_seconds_sum"},
+        panels=[PanelTemplate(title="Latency", queries=[QueryTemplate(expr="http_request_duration_seconds_sum")])],
+    )
+    intent = Intent(
+        summary="checkout requests slowed",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["latency"],
+        problem_type="latency_investigation",
+        archetypes=[ArchetypeMatch(type="latency_investigation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="http_request_duration_seconds_sum",
+            datasource_uid="gamma-telemetry",
+            datasource_type="prometheus",
+            query_language="promql",
+        )
+    ]
+
+    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+        requirements,
+        resolutions,
+        intent,
+        catalog=[_metric("http_request_duration_seconds_sum", metric_type="counter")],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert dashboard.panels == []
+    assert rescue_resolutions == []
+
+
 def test_symptom_evidence_dashboard_builds_signalflow_panels():
     archetype = InvestigationArchetype(
         id="latency_investigation",
@@ -778,50 +822,6 @@ def test_symptom_evidence_dashboard_preserves_error_context_for_request_counter(
     assert rescue_resolutions == []
 
 
-def test_symptom_evidence_dashboard_abstains_on_latency_sum_count_helpers():
-    archetype = InvestigationArchetype(
-        id="latency_investigation",
-        name="Latency Investigation",
-        problem_types=["latency_investigation"],
-        required_signals=["request_latency"],
-        signal_bindings={"request_latency": "http_request_duration_seconds_sum"},
-        panels=[PanelTemplate(title="Latency", queries=[QueryTemplate(expr="http_request_duration_seconds_sum")])],
-    )
-    intent = Intent(
-        summary="checkout requests slowed",
-        domain="application",
-        services=[],
-        signals=[SignalType.METRICS],
-        keywords=["latency"],
-        problem_type="latency_investigation",
-        archetypes=[ArchetypeMatch(type="latency_investigation", confidence=0.9)],
-    )
-    requirements = requirements_for_archetype(archetype, intent)
-    resolutions = [
-        EvidenceResolution(
-            requirement_id=requirements[0].id,
-            status="resolved",
-            reason_code="live_signal_resolved",
-            metric="http_request_duration_seconds_sum",
-            datasource_uid="gamma-telemetry",
-            datasource_type="prometheus",
-            query_language="promql",
-        )
-    ]
-
-    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
-        requirements,
-        resolutions,
-        intent,
-        catalog=[_metric("http_request_duration_seconds_sum", metric_type="counter")],
-        target_language="promql",
-        timerange="15m",
-    )
-
-    assert dashboard.panels == []
-    assert rescue_resolutions == []
-
-
 def test_missing_critical_symptom_requirements_detects_partial_dashboard_gap():
     archetype = InvestigationArchetype(
         id="latency_and_cpu",
@@ -876,3 +876,48 @@ def test_missing_critical_symptom_requirements_detects_partial_dashboard_gap():
     missing = _missing_critical_symptom_requirements(requirements, resolutions, observations)
 
     assert [requirement.signal_type for requirement in missing] == ["request_latency"]
+
+
+def test_missing_critical_symptom_requirements_treats_signalfx_exists_as_surfaced():
+    archetype = InvestigationArchetype(
+        id="latency_investigation",
+        name="Latency Investigation",
+        problem_types=["latency"],
+        required_signals=["request_latency"],
+        signal_bindings={"request_latency": "request.duration"},
+        panels=[PanelTemplate(title="Latency", queries=[QueryTemplate(expr="data('request.duration')")])],
+    )
+    intent = Intent(
+        summary="checkout is slow",
+        domain="application",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["latency"],
+        problem_type="latency",
+        archetypes=[ArchetypeMatch(type="latency", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="request.duration",
+            datasource_uid="sfx",
+            datasource_type="signalfx",
+            query_language="signalflow",
+        )
+    ]
+    observations = [
+        EvidenceObservation(
+            requirement_id=requirements[0].id,
+            resolution_metric="request.duration",
+            survived=True,
+            non_empty=False,
+            rejection_reason="exists",
+        )
+    ]
+
+    missing = _missing_critical_symptom_requirements(requirements, resolutions, observations)
+
+    assert missing == []
