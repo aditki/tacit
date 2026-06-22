@@ -122,9 +122,7 @@ def _protocol_fingerprint() -> dict[str, str]:
 
 
 def _evidence_signals(generated_queries: list[dict[str, Any]]) -> list[str]:
-    text = " ".join(
-        f"{query.get('panel_title', '')} {query.get('expr', '')}" for query in generated_queries
-    ).lower()
+    text = " ".join(f"{query.get('panel_title', '')} {query.get('expr', '')}" for query in generated_queries).lower()
     present = set()
     if "cpu" in text or "processor" in text:
         present.add("cpu")
@@ -212,9 +210,7 @@ def _healthy_slice(metrics_path: Path, manifest_path: Path, output_dir: Path) ->
         min(window["replay_start"] for window in manifest["ground_truth"]["interference_windows"]) * 1000
     )
     lines = [
-        line
-        for line in metrics_path.read_text().splitlines()
-        if line and int(line.rsplit(" ", 1)[1]) < first_fault_ms
+        line for line in metrics_path.read_text().splitlines() if line and int(line.rsplit(" ", 1)[1]) < first_fault_ms
     ]
     if not lines:
         raise ValueError("healthy control produced no pre-interference samples")
@@ -263,9 +259,7 @@ def _evaluate_controls(controls: dict[str, dict[str, Any]]) -> dict[str, Any]:
             for control in evidence_absent
         ),
         "control_cache_hits_are_zero": all(
-            cache["hits"] == 0
-            for control in controls.values()
-            for cache in control["cache_stats"].values()
+            cache["hits"] == 0 for control in controls.values() for cache in control["cache_stats"].values()
         ),
         "control_sample_size_meets_gate": len(controls) >= MIN_CONTROL_SCENARIOS,
         "control_classes_are_balanced": len(healthy) >= 10 and len(evidence_absent) >= 10,
@@ -303,17 +297,12 @@ def _evaluate_controls(controls: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
 
 def _mapping_coverages(arm: dict[str, Any]) -> list[float]:
-    return [
-        row["stages"].get("semantic_mapping", {}).get("details", {}).get("coverage", 0.0)
-        for row in arm["results"]
-    ]
+    return [row["stages"].get("semantic_mapping", {}).get("details", {}).get("coverage", 0.0) for row in arm["results"]]
 
 
 def _evidence_recall(arm: dict[str, Any]) -> dict[str, float | int]:
     denominator = len(arm["results"]) * len(EXPECTED_EVIDENCE_SIGNALS)
-    numerator = sum(
-        len(EXPECTED_EVIDENCE_SIGNALS.intersection(row["evidence_signals"])) for row in arm["results"]
-    )
+    numerator = sum(len(EXPECTED_EVIDENCE_SIGNALS.intersection(row["evidence_signals"])) for row in arm["results"])
     return {"numerator": numerator, "denominator": denominator, "recall": numerator / denominator}
 
 

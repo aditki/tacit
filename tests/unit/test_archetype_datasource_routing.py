@@ -451,8 +451,7 @@ def test_legacy_binding_rejects_gauge_for_histogram_template(tmp_path, monkeypat
                 queries=[
                     QueryTemplate(
                         expr=(
-                            "histogram_quantile(0.95, "
-                            "sum(rate(http_request_duration_seconds_bucket[5m])) by (le))"
+                            "histogram_quantile(0.95, " "sum(rate(http_request_duration_seconds_bucket[5m])) by (le))"
                         )
                     )
                 ],

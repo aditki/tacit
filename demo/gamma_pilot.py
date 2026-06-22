@@ -311,9 +311,7 @@ def build(
             "fault_types": sorted({str(window["fault_type"]) for window in fault_windows}),
             "root_cause_nodes": sorted(bottlenecked_nodes),
             "root_cause_services": root_cause_services,
-            "interference_intensity": {
-                str(group["fault_type"]): group["intensity"] for group in fault_groups
-            },
+            "interference_intensity": {str(group["fault_type"]): group["intensity"] for group in fault_groups},
             "interference_windows": fault_windows,
         },
         "prohibited_evidence": [

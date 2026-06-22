@@ -23,7 +23,7 @@ def _arm(dashboards: int, coverage: float):
                     "semantic_mapping": {
                         "details": {"coverage": coverage},
                     }
-                }
+                },
             }
         ],
     }

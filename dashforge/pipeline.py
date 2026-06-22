@@ -62,13 +62,17 @@ def _semantic_mapping_diagnostics(metric_catalog) -> tuple[str, str, dict]:
         status, reason = "partial", "some_metrics_unmapped"
     else:
         status, reason = "passed", "all_metrics_semantically_mapped"
-    return status, reason, {
-        "metrics_total": len(names),
-        "metrics_mapped": len(mapped),
-        "coverage": round(len(mapped) / len(names), 4),
-        "mapped": mapped,
-        "unmapped": unmapped,
-    }
+    return (
+        status,
+        reason,
+        {
+            "metrics_total": len(names),
+            "metrics_mapped": len(mapped),
+            "coverage": round(len(mapped) / len(names), 4),
+            "mapped": mapped,
+            "unmapped": unmapped,
+        },
+    )
 
 
 def _compiled_query_diagnostics(dashboard_spec, catalog) -> tuple[str, str, dict]:
@@ -95,12 +99,17 @@ def _compiled_query_diagnostics(dashboard_spec, catalog) -> tuple[str, str, dict
         status, reason = "failed", "compiled_metrics_absent_from_catalog"
     else:
         status, reason = "passed", "all_compiled_metrics_present"
-    return status, reason, {
-        "query_count": query_count,
-        "referenced_metrics": sorted(references),
-        "present_metrics": present,
-        "missing_metrics": missing,
-    }
+    return (
+        status,
+        reason,
+        {
+            "query_count": query_count,
+            "referenced_metrics": sorted(references),
+            "present_metrics": present,
+            "missing_metrics": missing,
+        },
+    )
+
 
 # Concurrency gate — prevents thundering-herd on LLM + Grafana APIs
 _pipeline_semaphore: asyncio.Semaphore | None = None
