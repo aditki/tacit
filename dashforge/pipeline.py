@@ -167,11 +167,15 @@ def _service_value_matches(value: str, aliases: set[str]) -> bool:
 def _promql_service_selector(services: list[str], metric_entry: MetricEntry | None = None) -> str:
     from dashforge.archetypes.engine import _re2_escape
 
-    if not services or metric_entry is None:
+    if not services:
         return ""
+    target = services[0].lower().replace(" ", "-")
+    fallback = f'{{service=~".*{_re2_escape(target)}.*"}}' if target else ""
+    if metric_entry is None:
+        return fallback
     aliases = {alias for service in services for alias in _service_aliases(service)}
     if not aliases:
-        return ""
+        return fallback
 
     for dimension in metric_entry.dimensions:
         label, values = _dimension_label_values(dimension)
@@ -183,9 +187,8 @@ def _promql_service_selector(services: list[str], metric_entry: MetricEntry | No
                 continue
             escaped = "|".join(_re2_escape(value) for value in sorted(selected))
             return f'{{{label}=~"{escaped}"}}'
-        escaped = "|".join(_re2_escape(service) for service in services if service)
-        return f'{{{label}=~"{escaped}"}}' if escaped else ""
-    return ""
+        return f'{{{label}=~".*{_re2_escape(target)}.*"}}' if target else ""
+    return fallback
 
 
 def _signalflow_service_filter(services: list[str], metric_entry: MetricEntry | None = None) -> str:

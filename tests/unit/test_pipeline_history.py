@@ -393,6 +393,48 @@ def test_symptom_evidence_dashboard_uses_catalog_label_selector_and_rates_counte
     assert dashboard.panels[0].queries[0].expr == 'sum(rate(http_requests_total{app=~"checkout-service"}[5m]))'
 
 
+def test_symptom_evidence_dashboard_scopes_promql_when_service_labels_unsampled():
+    archetype = InvestigationArchetype(
+        id="traffic_investigation",
+        name="Traffic Investigation",
+        problem_types=["traffic_investigation"],
+        required_metrics=["http_requests_total"],
+        panels=[PanelTemplate(title="Traffic", queries=[QueryTemplate(expr="rate(http_requests_total[5m])")])],
+    )
+    intent = Intent(
+        summary="checkout traffic changed",
+        domain="application",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["traffic"],
+        problem_type="traffic_investigation",
+        archetypes=[ArchetypeMatch(type="traffic_investigation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="http_requests_total",
+            datasource_uid="gamma-telemetry",
+            datasource_type="prometheus",
+            query_language="promql",
+        )
+    ]
+
+    dashboard, _ = _build_symptom_evidence_dashboard(
+        requirements,
+        resolutions,
+        intent,
+        catalog=[_metric("http_requests_total", metric_type="counter")],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert dashboard.panels[0].queries[0].expr == 'sum(rate(http_requests_total{service=~".*checkout.*"}[5m]))'
+
+
 def test_symptom_evidence_dashboard_keeps_service_variant_selector():
     archetype = InvestigationArchetype(
         id="traffic_investigation",
