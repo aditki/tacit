@@ -303,7 +303,10 @@ def observe_evidence(
     """Record whether resolved evidence appears in a query that survived validation."""
     requirements_by_id = {requirement.id: requirement for requirement in requirements}
     surviving_queries = {
-        (query.expr, query.datasource_uid) for panel in post_validation.panels for query in panel.queries if query.expr
+        (query.expr, query.datasource_uid): query
+        for panel in post_validation.panels
+        for query in panel.queries
+        if query.expr
     }
     observations: list[EvidenceObservation] = []
 
@@ -328,7 +331,21 @@ def observe_evidence(
                 if not query.expr:
                     continue
                 if any(_query_mentions_metric(query.expr, token) for token in metric_tokens):
-                    survived = (query.expr, query.datasource_uid) in surviving_queries
+                    surviving_query = surviving_queries.get((query.expr, query.datasource_uid))
+                    survived = surviving_query is not None
+                    validation_status = surviving_query.validation_status if surviving_query else ""
+                    valid_query = survived and validation_status not in {
+                        "absent",
+                        "bad_uid",
+                        "syntax_error",
+                        "error",
+                    }
+                    if validation_status == "exists":
+                        non_empty = survived
+                    elif validation_status:
+                        non_empty = bool(surviving_query and surviving_query.validation_has_data)
+                    else:
+                        non_empty = survived
                     matches.append(
                         EvidenceObservation(
                             requirement_id=requirement.id,
@@ -336,10 +353,18 @@ def observe_evidence(
                             panel_title=panel.title,
                             query=query.expr,
                             datasource_uid=query.datasource_uid,
-                            valid_query=survived,
-                            non_empty=survived,
+                            valid_query=valid_query,
+                            non_empty=non_empty,
                             survived=survived,
-                            rejection_reason="" if survived else "query_rejected_by_validation",
+                            rejection_reason=(
+                                ""
+                                if non_empty
+                                else (
+                                    validation_status or "query_rejected_by_validation"
+                                    if survived
+                                    else "query_rejected_by_validation"
+                                )
+                            ),
                         )
                     )
         if matches:
@@ -362,7 +387,7 @@ def summarize_evidence(
 ) -> dict[str, object]:
     """Return compact counts suitable for stage history and benchmark gates."""
     resolved_ids = {resolution.requirement_id for resolution in resolutions if resolution.status == "resolved"}
-    surviving_ids = {observation.requirement_id for observation in observations if observation.survived}
+    surviving_ids = {observation.requirement_id for observation in observations if observation.non_empty}
     critical_ids = {requirement.id for requirement in requirements if requirement.priority == "critical"}
     critical_resolved = critical_ids & resolved_ids
     critical_survived = critical_ids & surviving_ids

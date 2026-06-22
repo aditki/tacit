@@ -291,6 +291,67 @@ def test_evidence_observations_measure_survival_after_validation():
     assert {obs.rejection_reason for obs in observations} == {"", "query_rejected_by_validation"}
 
 
+def test_skipped_validation_survives_but_does_not_count_as_observed():
+    archetype = InvestigationArchetype(
+        id="logs",
+        name="Logs",
+        problem_types=["logs"],
+        required_metrics=["log_metric"],
+        panels=[PanelTemplate(title="Logs", queries=[QueryTemplate(expr="log_metric")])],
+    )
+    requirements = requirements_for_archetype(archetype, _intent())
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="log_metric",
+        )
+    ]
+    pre_validation = DashboardSpec(
+        title="Logs",
+        panels=[
+            PanelSpec(
+                title="Logs",
+                queries=[
+                    PanelQuery(
+                        expr="log_metric",
+                        datasource_uid="loki",
+                        datasource_type="loki",
+                        query_language="logql",
+                    )
+                ],
+            )
+        ],
+    )
+    post_validation = DashboardSpec(
+        title="Logs",
+        panels=[
+            PanelSpec(
+                title="Logs",
+                queries=[
+                    PanelQuery(
+                        expr="log_metric",
+                        datasource_uid="loki",
+                        datasource_type="loki",
+                        query_language="logql",
+                        validation_status="skipped",
+                        validation_has_data=False,
+                    )
+                ],
+            )
+        ],
+    )
+
+    observations = observe_evidence(requirements, resolutions, pre_validation, post_validation)
+    summary = summarize_evidence(requirements, resolutions, observations)
+
+    assert observations[0].survived is True
+    assert observations[0].non_empty is False
+    assert observations[0].rejection_reason == "skipped"
+    assert summary["critical_survival_recall"] == 0.0
+
+
 def test_evidence_observation_matches_metric_tokens_not_substrings():
     requirements = requirements_for_archetype(_resource_archetype(), _intent())
     resolutions = [

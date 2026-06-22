@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any, cast
 
@@ -36,6 +37,7 @@ from dashforge.models.schemas import (
     DashboardSpec,
     DashRequest,
     DashResponse,
+    EvidenceObservation,
     EvidenceRequirement,
     EvidenceResolution,
     Intent,
@@ -53,6 +55,8 @@ _SYMPTOM_SIGNAL_PANELS = {
     "request_rate": ("Observed Request Rate", "Application request traffic evidence", "reqps"),
     "error_rate": ("Observed Error Rate", "Application error evidence", "percentunit"),
 }
+
+_SERVICE_SELECTOR_LABELS = ("service", "service_name", "service.name", "app", "application", "container", "pod")
 
 
 def _record_stage(history, inv_id: str, stage: str, status: str, reason_code: str, **details) -> None:
@@ -134,13 +138,151 @@ def _compiled_query_diagnostics(dashboard_spec, catalog) -> tuple[str, str, dict
     )
 
 
-def _promql_service_selector(services: list[str]) -> str:
+def _service_aliases(service: str) -> set[str]:
+    normalized = re.sub(r"[^a-z0-9]+", "-", service.lower()).strip("-")
+    if not normalized:
+        return set()
+    aliases = {normalized}
+    for suffix in ("-service", "-svc"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix):
+            aliases.add(normalized[: -len(suffix)])
+    return aliases
+
+
+def _dimension_label_values(dimension: str) -> tuple[str, list[str]]:
+    key, separator, raw_value = dimension.partition("=")
+    label = key.strip()
+    if not separator:
+        return label, []
+    values = [value.strip().strip("\"'") for value in raw_value.strip().strip("{}").split(",")]
+    return label, [value for value in values if value]
+
+
+def _promql_service_selector(services: list[str], metric_entry: MetricEntry | None = None) -> str:
     from dashforge.archetypes.engine import _re2_escape
 
-    if not services:
+    if not services or metric_entry is None:
         return ""
-    escaped = "|".join(_re2_escape(service) for service in services if service)
-    return f'{{service=~"{escaped}"}}' if escaped else ""
+    aliases = {alias for service in services for alias in _service_aliases(service)}
+    if not aliases:
+        return ""
+
+    for dimension in metric_entry.dimensions:
+        label, values = _dimension_label_values(dimension)
+        if label.lower() not in _SERVICE_SELECTOR_LABELS:
+            continue
+        if values:
+            selected = [value for value in values if _service_aliases(value) & aliases]
+            if not selected:
+                continue
+            escaped = "|".join(_re2_escape(value) for value in sorted(selected))
+            return f'{{{label}=~"{escaped}"}}'
+        escaped = "|".join(_re2_escape(service) for service in services if service)
+        return f'{{{label}=~"{escaped}"}}' if escaped else ""
+    return ""
+
+
+def _signalflow_service_filter(services: list[str], metric_entry: MetricEntry | None = None) -> str:
+    if not services or metric_entry is None:
+        return ""
+    aliases = {alias for service in services for alias in _service_aliases(service)}
+    if not aliases:
+        return ""
+    for dimension in metric_entry.dimensions:
+        label, values = _dimension_label_values(dimension)
+        if label.lower() not in _SERVICE_SELECTOR_LABELS:
+            continue
+        if values:
+            selected = [value for value in values if _service_aliases(value) & aliases]
+            if not selected:
+                continue
+            value = sorted(selected)[0]
+        else:
+            value = services[0]
+        return f", filter=filter('{label}', '{value}')"
+    return ""
+
+
+def _catalog_entry_for_resolution(resolution: EvidenceResolution, catalog: list[MetricEntry]) -> MetricEntry | None:
+    for entry in catalog:
+        if entry.name != resolution.metric:
+            continue
+        if resolution.datasource_uid and entry.datasource_uid != resolution.datasource_uid:
+            continue
+        if resolution.datasource_type and entry.datasource_type != resolution.datasource_type:
+            continue
+        if resolution.query_language and entry.query_language != resolution.query_language:
+            continue
+        return entry
+    return None
+
+
+def _is_counter_metric(metric: str, entry: MetricEntry | None) -> bool:
+    metric_type = (entry.metric_type if entry else "").lower()
+    return metric_type == "counter" or metric.endswith(("_total", "_count"))
+
+
+def _symptom_signal_type(requirement: EvidenceRequirement, resolution: EvidenceResolution) -> str:
+    if requirement.signal_type:
+        return requirement.signal_type
+    metric_text = " ".join([requirement.default_metric, resolution.metric]).lower()
+    source_text = " ".join([requirement.id, requirement.source]).lower()
+    if "error" in metric_text or "5xx" in metric_text or "error" in source_text:
+        return "error_rate"
+    if "latency" in metric_text or "duration" in metric_text:
+        return "request_latency"
+    if "request_rate" in metric_text or "requests_total" in metric_text:
+        return "request_rate"
+    return ""
+
+
+def _symptom_unit(signal_type: str, metric: str, entry: MetricEntry | None) -> str:
+    if signal_type == "error_rate" and _is_counter_metric(metric, entry):
+        return "ops"
+    return _SYMPTOM_SIGNAL_PANELS[signal_type][2]
+
+
+def _promql_symptom_query(signal_type: str, metric: str, selector: str, entry: MetricEntry | None) -> str:
+    metric_lower = metric.lower()
+    if signal_type in {"request_latency", "api_latency"} and metric_lower.endswith("_bucket"):
+        return f"histogram_quantile(0.95, sum(rate({metric}{selector}[5m])) by (le))"
+    if signal_type == "request_rate" and _is_counter_metric(metric, entry):
+        return f"sum(rate({metric}{selector}[5m]))"
+    if signal_type == "error_rate" and _is_counter_metric(metric, entry):
+        if any(token in metric_lower for token in ("error", "errors", "failure", "failures", "5xx")):
+            return f"sum(rate({metric}{selector}[5m]))"
+        return ""
+    return f"{metric}{selector}"
+
+
+def _signalflow_symptom_query(signal_type: str, metric: str, filt: str, entry: MetricEntry | None) -> str:
+    metric_lower = metric.lower()
+    if signal_type in {"request_latency", "api_latency"} and metric_lower.endswith("_bucket"):
+        return f"data('{metric.removesuffix('_bucket')}'{filt}).percentile(pct=95).publish(label='p95')"
+    if signal_type == "request_rate" and _is_counter_metric(metric, entry):
+        return f"data('{metric}'{filt}, rollup='rate').sum().publish(label='rate')"
+    if signal_type == "error_rate" and _is_counter_metric(metric, entry):
+        if any(token in metric_lower for token in ("error", "errors", "failure", "failures", "5xx")):
+            return f"data('{metric}'{filt}, rollup='rate').sum().publish(label='errors')"
+        return ""
+    return f"data('{metric}'{filt}).mean().publish(label='value')"
+
+
+def _symptom_query_expr(
+    signal_type: str,
+    resolution: EvidenceResolution,
+    intent: Intent,
+    metric_entry: MetricEntry | None,
+) -> str:
+    query_language = (resolution.query_language or "promql").lower()
+    datasource_type = (resolution.datasource_type or "prometheus").lower()
+    if query_language in {"", "promql"} and datasource_type in {"", "prometheus"}:
+        selector = _promql_service_selector(intent.services, metric_entry)
+        return _promql_symptom_query(signal_type, resolution.metric, selector, metric_entry)
+    if query_language == "signalflow" or datasource_type in {"signalfx", "grafana-signalfx-datasource"}:
+        filt = _signalflow_service_filter(intent.services, metric_entry)
+        return _signalflow_symptom_query(signal_type, resolution.metric, filt, metric_entry)
+    return ""
 
 
 def _build_symptom_evidence_dashboard(
@@ -158,7 +300,6 @@ def _build_symptom_evidence_dashboard(
     symptom evidence that already came from selected archetype requirements.
     """
     resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
-    service_selector = _promql_service_selector(intent.services)
     panels: list[PanelSpec] = []
     rescue_resolutions: list[EvidenceResolution] = []
     seen: set[tuple[str, str, str]] = set()
@@ -174,32 +315,37 @@ def _build_symptom_evidence_dashboard(
             )
         if resolution is None or resolution.status != "resolved" or not resolution.metric:
             continue
-        signal_type = requirement.signal_type
-        if not signal_type and "latency" in resolution.metric:
-            signal_type = "request_latency"
-        elif not signal_type and ("request_rate" in resolution.metric or "requests_total" in resolution.metric):
-            signal_type = "request_rate"
+        signal_type = _symptom_signal_type(requirement, resolution)
         if signal_type not in _SYMPTOM_SIGNAL_PANELS:
             continue
         query_language = (resolution.query_language or "promql").lower()
         datasource_type = (resolution.datasource_type or "prometheus").lower()
-        if query_language not in {"", "promql"} or datasource_type not in {"", "prometheus"}:
+        supports_promql = query_language in {"", "promql"} and datasource_type in {"", "prometheus"}
+        supports_signalflow = query_language == "signalflow" or datasource_type in {
+            "signalfx",
+            "grafana-signalfx-datasource",
+        }
+        if not (supports_promql or supports_signalflow):
             continue
         key = (signal_type, resolution.metric, resolution.datasource_uid)
         if key in seen:
             continue
         seen.add(key)
+        metric_entry = _catalog_entry_for_resolution(resolution, catalog)
+        query_expr = _symptom_query_expr(signal_type, resolution, intent, metric_entry)
+        if not query_expr:
+            continue
         rescue_resolutions.append(resolution)
-        title, description, unit = _SYMPTOM_SIGNAL_PANELS[signal_type]
+        title, description, _ = _SYMPTOM_SIGNAL_PANELS[signal_type]
         panels.append(
             PanelSpec(
                 title=title,
                 description=description,
                 row="Observed Symptoms",
-                unit=unit,
+                unit=_symptom_unit(signal_type, resolution.metric, metric_entry),
                 queries=[
                     PanelQuery(
-                        expr=f"{resolution.metric}{service_selector}",
+                        expr=query_expr,
                         legend_format="{{service}}",
                         datasource_uid=resolution.datasource_uid,
                         datasource_type=resolution.datasource_type or "prometheus",
@@ -218,6 +364,25 @@ def _build_symptom_evidence_dashboard(
         ),
         rescue_resolutions,
     )
+
+
+def _missing_critical_symptom_requirements(
+    requirements: list[EvidenceRequirement],
+    resolutions: list[EvidenceResolution],
+    observations: list[EvidenceObservation],
+) -> list[EvidenceRequirement]:
+    observed_ids = {observation.requirement_id for observation in observations if observation.non_empty}
+    resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
+    missing: list[EvidenceRequirement] = []
+    for requirement in requirements:
+        if requirement.priority != "critical" or requirement.id in observed_ids:
+            continue
+        resolution = resolutions_by_id.get(requirement.id)
+        if resolution is None:
+            resolution = EvidenceResolution(requirement_id=requirement.id, status="unknown", reason_code="unknown")
+        if _symptom_signal_type(requirement, resolution) in _SYMPTOM_SIGNAL_PANELS:
+            missing.append(requirement)
+    return missing
 
 
 def _resolve_direct_symptom_evidence(
@@ -263,8 +428,8 @@ def _resolve_direct_symptom_evidence(
         return None
     best_score = resolved[0][1]
     best = [item for item in resolved if item[1] == best_score]
-    best_names = {entry.name for entry, _ in best}
-    if len(best_names) > 1:
+    best_owners = {(entry.name, entry.datasource_uid, entry.datasource_type, entry.query_language) for entry, _ in best}
+    if len(best_owners) > 1:
         return None
     entry, score = best[0]
     return EvidenceResolution(
@@ -906,9 +1071,25 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         panels_before = len(dashboard_spec.panels)
         pre_validation_spec = dashboard_spec.model_copy(deep=True)
         dashboard_spec, validation_warnings = await primary.validate_queries(dashboard_spec, catalog_for_compile)
-        if not dashboard_spec.panels and evidence_requirements:
-            symptom_pre_validation_spec, symptom_resolutions = _build_symptom_evidence_dashboard(
+        rescue_requirements: list[EvidenceRequirement] = []
+        if evidence_requirements:
+            initial_evidence_observations = observe_evidence(
                 evidence_requirements,
+                evidence_resolutions,
+                pre_validation_spec,
+                dashboard_spec,
+            )
+            rescue_requirements = _missing_critical_symptom_requirements(
+                evidence_requirements,
+                evidence_resolutions,
+                initial_evidence_observations,
+            )
+        if rescue_requirements:
+            original_validation_warnings = list(validation_warnings)
+            original_panels_before = panels_before
+            original_panels_after = len(dashboard_spec.panels)
+            symptom_pre_validation_spec, symptom_resolutions = _build_symptom_evidence_dashboard(
+                rescue_requirements,
                 evidence_resolutions,
                 intent,
                 catalog=catalog_for_compile,
@@ -927,6 +1108,9 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     "symptom_evidence_rescue",
                     "passed" if symptom_spec.panels else "failed",
                     "symptom_panels_validated" if symptom_spec.panels else "symptom_panels_rejected",
+                    original_panels_before=original_panels_before,
+                    original_panels_after=original_panels_after,
+                    original_warnings=original_validation_warnings,
                     panels_before=len(symptom_pre_validation_spec.panels),
                     panels_after=len(symptom_spec.panels),
                 )
@@ -938,8 +1122,24 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                         if resolution.requirement_id not in rescue_requirement_ids
                     ]
                     evidence_resolutions.extend(symptom_resolutions)
-                    pre_validation_spec = symptom_pre_validation_spec
-                    dashboard_spec = symptom_spec
+                    if original_panels_after:
+                        pre_validation_spec = pre_validation_spec.model_copy(
+                            update={
+                                "panels": [
+                                    *pre_validation_spec.panels,
+                                    *symptom_pre_validation_spec.panels,
+                                ]
+                            }
+                        )
+                        dashboard_spec = dashboard_spec.model_copy(
+                            update={"panels": [*dashboard_spec.panels, *symptom_spec.panels]}
+                        )
+                        panels_before = original_panels_before + len(symptom_pre_validation_spec.panels)
+                    else:
+                        pre_validation_spec = symptom_pre_validation_spec
+                        dashboard_spec = symptom_spec
+                        panels_before = len(symptom_pre_validation_spec.panels)
+                        validation_warnings = symptom_warnings
             else:
                 _record_stage(
                     history,
