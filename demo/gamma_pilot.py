@@ -203,38 +203,57 @@ def _infra_samples(
 def _interference_windows(
     archive: zipfile.ZipFile,
     scenario: str,
-    nodes: set[str],
+    fault_groups: list[dict[str, object]],
     offset: float,
 ) -> list[dict[str, object]]:
     pattern = re.compile(r"Bottleneck of type (\w+) with measure ([\d.]+) (starts|ends) at ([\d.]+)")
     windows: list[dict[str, object]] = []
-    for node in sorted(nodes):
-        member = f"raw_dataset/{scenario}/{node}_phases"
-        with archive.open(member) as source:
-            events = []
-            for line in io.TextIOWrapper(source, encoding="utf-8"):
-                match = pattern.search(line)
-                if match:
-                    events.append(
-                        {
-                            "fault_type": match.group(1).lower(),
-                            "intensity": float(match.group(2)),
-                            "event": match.group(3),
-                            "source_time": float(match.group(4)),
-                        }
+    archive_members = set(archive.namelist())
+    for group in fault_groups:
+        fault_type = str(group["fault_type"])
+        for node in sorted(group["nodes"]):
+            prefix = f"raw_dataset/{scenario}/"
+            candidates = [
+                f"{prefix}{node}_phases",
+                f"{prefix}{fault_type}_{node}_phases",
+            ]
+            member = next((candidate for candidate in candidates if candidate in archive_members), "")
+            if not member:
+                fallbacks = sorted(
+                    candidate
+                    for candidate in archive_members
+                    if candidate.startswith(prefix) and candidate.endswith(f"_{node}_phases")
+                )
+                if len(fallbacks) != 1:
+                    raise ValueError(
+                        f"cannot identify phase file for {scenario=} {fault_type=} {node=}: {fallbacks}"
                     )
-        for start, end in zip(events[::2], events[1::2], strict=True):
-            windows.append(
-                {
-                    "node": node,
-                    "fault_type": start["fault_type"],
-                    "intensity": start["intensity"],
-                    "source_start": start["source_time"],
-                    "source_end": end["source_time"],
-                    "replay_start": start["source_time"] + offset,
-                    "replay_end": end["source_time"] + offset,
-                }
-            )
+                member = fallbacks[0]
+
+            with archive.open(member) as source:
+                events = []
+                for line in io.TextIOWrapper(source, encoding="utf-8"):
+                    match = pattern.search(line)
+                    if match:
+                        events.append(
+                            {
+                                "intensity": float(match.group(2)),
+                                "event": match.group(3),
+                                "source_time": float(match.group(4)),
+                            }
+                        )
+            for start, end in zip(events[::2], events[1::2], strict=True):
+                windows.append(
+                    {
+                        "node": node,
+                        "fault_type": fault_type,
+                        "intensity": start["intensity"],
+                        "source_start": start["source_time"],
+                        "source_end": end["source_time"],
+                        "replay_start": start["source_time"] + offset,
+                        "replay_end": end["source_time"] + offset,
+                    }
+                )
     return windows
 
 
@@ -287,7 +306,7 @@ def build(
         fault_windows = _interference_windows(
             archive,
             scenario,
-            bottlenecked_nodes,
+            fault_groups,
             timestamp_transform["offset_seconds"],
         )
 

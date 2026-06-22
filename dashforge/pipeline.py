@@ -24,6 +24,7 @@ from dashforge.cache import llm_cache, make_cache_key
 from dashforge.catalog import catalog_for_services
 from dashforge.config import settings
 from dashforge.context.enrichment import enrich_context
+from dashforge.evidence import observe_evidence, resolve_requirements_for_archetypes, summarize_evidence
 from dashforge.history import get_investigation_store
 from dashforge.logging import bind_request_id, stage_log, unbind_request_id
 from dashforge.models.schemas import DashRequest, DashResponse
@@ -683,6 +684,20 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 panels_generated=len(dashboard_spec.panels),
             )
 
+        evidence_requirements = []
+        evidence_resolutions = []
+        evidence_observations = []
+        if ranked_archetypes:
+            try:
+                evidence_requirements, evidence_resolutions = resolve_requirements_for_archetypes(
+                    ranked_archetypes,
+                    intent,
+                    catalog_for_compile,
+                    target_language=target_language,
+                )
+            except Exception:
+                logger.warning("evidence_resolution_failed", exc_info=True)
+
         binding_status, binding_reason, binding_details = _compiled_query_diagnostics(
             dashboard_spec,
             catalog_for_compile,
@@ -721,6 +736,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         # ── 5. Validate queries — primary backend validates ──────────
         t0 = time.monotonic()
         panels_before = len(dashboard_spec.panels)
+        pre_validation_spec = dashboard_spec.model_copy(deep=True)
         dashboard_spec, validation_warnings = await primary.validate_queries(dashboard_spec, catalog_for_compile)
         timings["query_validation"] = time.monotonic() - t0
         stage_log(
@@ -748,6 +764,46 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             panels_after=panels_after,
             warnings=validation_warnings,
         )
+        try:
+            if evidence_requirements:
+                evidence_observations = observe_evidence(
+                    evidence_requirements,
+                    evidence_resolutions,
+                    pre_validation_spec,
+                    dashboard_spec,
+                )
+                evidence_summary = summarize_evidence(
+                    evidence_requirements,
+                    evidence_resolutions,
+                    evidence_observations,
+                )
+                critical_total = int(evidence_summary["critical_total"])
+                critical_observed = int(evidence_summary["critical_observed"])
+                if critical_total and critical_observed == critical_total:
+                    evidence_status, evidence_reason = "passed", "all_critical_evidence_observed"
+                elif critical_observed:
+                    evidence_status, evidence_reason = "partial", "some_critical_evidence_observed"
+                else:
+                    evidence_status, evidence_reason = "failed", "no_critical_evidence_observed"
+                _record_stage(
+                    history,
+                    inv_id,
+                    "evidence",
+                    evidence_status,
+                    evidence_reason,
+                    **evidence_summary,
+                )
+            else:
+                _record_stage(
+                    history,
+                    inv_id,
+                    "evidence",
+                    "skipped",
+                    "no_declared_evidence_requirements",
+                    path="archetype" if ranked_archetypes else "freeform",
+                )
+        except Exception:
+            logger.warning("history_record_evidence_failed", exc_info=True)
 
         # Record queries after validation
         try:

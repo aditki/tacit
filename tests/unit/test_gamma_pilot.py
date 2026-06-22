@@ -3,6 +3,7 @@ import zipfile
 from demo.gamma_pilot import (
     INFRA_CANONICAL_NAMES,
     _fault_groups,
+    _interference_windows,
     _labels,
     _percentile,
     _prometheus_metric_name,
@@ -75,4 +76,33 @@ def test_fault_groups_support_new_multi_resource_schema():
     assert groups == [
         {"fault_type": "cpu", "nodes": ["node-a"], "intensity": [80]},
         {"fault_type": "memory", "nodes": ["node-b"], "intensity": [90]},
+    ]
+
+
+def test_interference_windows_use_args_family_with_mislabeled_phase_file(tmp_path):
+    archive_path = tmp_path / "gamma.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "raw_dataset/net-run/memory_node-a_phases",
+            "Bottleneck of type memory with measure 0.3 starts at 100\n"
+            "Bottleneck of type memory with measure 0.3 ends at 120\n",
+        )
+    with zipfile.ZipFile(archive_path) as archive:
+        windows = _interference_windows(
+            archive,
+            "net-run",
+            [{"fault_type": "net", "nodes": ["node-a"], "intensity": [30]}],
+            offset=10,
+        )
+
+    assert windows == [
+        {
+            "node": "node-a",
+            "fault_type": "net",
+            "intensity": 0.3,
+            "source_start": 100.0,
+            "source_end": 120.0,
+            "replay_start": 110.0,
+            "replay_end": 130.0,
+        }
     ]

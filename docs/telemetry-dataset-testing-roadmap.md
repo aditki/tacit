@@ -184,7 +184,7 @@ Use the frozen convention-faithful GAMMA slice only as a regression guard; it is
 
 **Branch:** `codex/dataset-gamma-bottlenecks`
 
-**Status:** Bounded real-data pilot started on 2026-06-19. Six-stage diagnostics isolated the first cold-start failure between semantic mapping and query binding. Live-signal substitution now handles a `gamma_` vendor prefix (`0/3` to `3/3` independent prompts) while deliberately abstaining on raw service-prefixed metrics with ambiguous ownership (`0/3`). Positive evidence recall is frozen at canonical `6/6` and prefix-only `6/6`, preventing silence from passing. The initial control observation was zero false culprits over two cases, which is pending data rather than pass/fail. A frozen 20-case matrix now spans distinct healthy and evidence-absent CPU, memory, network, and mixed scenarios and must run successfully before fallback. Application-only symptoms still produce no surviving panel and culprit ranking remains unimplemented. See `docs/results/gamma-pilot-baseline-2026-06-19.md` and `docs/results/gamma-naming-diagnostic-2026-06-20.md`.
+**Status:** The frozen 29-run pre-evidence-model baseline completed on 2026-06-22. Canonical and prefix-only evidence recall both passed at `6/6`; raw neutral ownership abstained at `0/3` dashboards; the diverse controls recorded `0/20` false culprits and `20/20` abstentions with zero cache hits. All ten evidence-absent symptoms were discovered, but symptom panel survival was `0/10`, and culprit ranking remains unavailable. Proceed to first-class evidence requirements/resolutions/observations before fallback. See `docs/results/gamma-pilot-baseline-2026-06-19.md`, `docs/results/gamma-naming-diagnostic-2026-06-20.md`, and `docs/results/gamma-pre-evidence-model-baseline-2026-06-22.md`.
 
 - download the archive through Kaggle and record its version, license, and checksum;
 - inventory the real file schemas before writing normalization rules;
@@ -203,6 +203,11 @@ Require positive evidence recall during binding so silence cannot pass. Use the 
 healthy/evidence-absent controls before full ranking exists. Run the controls before guarded fallback, immediately after
 fallback, and again after culprit ranking. Do not open the larger scenario gate until at least 20 controls have been
 scored with explicit scenario-level numerators and denominators.
+
+**PR sequence:** First introduce the lightweight evidence lifecycle (`EvidenceRequirement`, `EvidenceResolution`,
+`EvidenceObservation`) and record evidence survival without changing dashboard behavior. Then use those objects to
+preserve symptom evidence in evidence-absent controls. Only after survival is measurable should guarded fallback produce
+candidate evidence, followed by culprit top-k scoring.
 
 ### M3: Alibaba Scale Metrics
 
