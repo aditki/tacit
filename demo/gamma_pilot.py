@@ -225,9 +225,7 @@ def _interference_windows(
                     if candidate.startswith(prefix) and candidate.endswith(f"_{node}_phases")
                 )
                 if len(fallbacks) != 1:
-                    raise ValueError(
-                        f"cannot identify phase file for {scenario=} {fault_type=} {node=}: {fallbacks}"
-                    )
+                    raise ValueError(f"cannot identify phase file for {scenario=} {fault_type=} {node=}: {fallbacks}")
                 member = fallbacks[0]
 
             with archive.open(member) as source:

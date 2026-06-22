@@ -259,10 +259,7 @@ def observe_evidence(
     """Record whether resolved evidence appears in a query that survived validation."""
     requirements_by_id = {requirement.id: requirement for requirement in requirements}
     surviving_queries = {
-        (query.expr, query.datasource_uid)
-        for panel in post_validation.panels
-        for query in panel.queries
-        if query.expr
+        (query.expr, query.datasource_uid) for panel in post_validation.panels for query in panel.queries if query.expr
     }
     observations: list[EvidenceObservation] = []
 
