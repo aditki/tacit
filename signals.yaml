@@ -81,6 +81,8 @@ signals:
         confidence: 0.95
       - pattern: "*_requests_total"
         confidence: 0.8
+      - pattern: "*_request_rate"
+        confidence: 0.75
       - pattern: "*_request_count*"
         confidence: 0.7
       - pattern: "*_req_total"
