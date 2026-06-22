@@ -193,6 +193,41 @@ def test_default_metric_with_multiple_owners_abstains_from_evidence_owner():
     assert resolutions[0].reason_code == "ambiguous_default_metric_owner"
 
 
+def test_live_signal_required_metric_with_multiple_owners_abstains(monkeypatch, tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.register_signal_type("custom_latency", category="latency")
+    store.add_mapping("custom_latency", "*latency*", confidence=0.9)
+    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    archetype = InvestigationArchetype(
+        id="latency",
+        name="Latency",
+        problem_types=["latency"],
+        required_metrics=["canonical_latency_seconds"],
+        panels=[PanelTemplate(title="Latency", queries=[QueryTemplate(expr="canonical_latency_seconds")])],
+    )
+    catalog = [
+        MetricEntry(
+            name="service_latency_seconds",
+            datasource_uid="prom-a",
+            datasource_name="Prom A",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+        MetricEntry(
+            name="service_latency_seconds",
+            datasource_uid="prom-b",
+            datasource_name="Prom B",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+    ]
+
+    _, resolutions = resolve_requirements_for_archetype(archetype, _intent(), catalog)
+
+    assert resolutions[0].status == "unresolved"
+    assert resolutions[0].reason_code == "ambiguous_live_signal"
+
+
 def test_evidence_only_tracks_archetypes_that_contributed_panels():
     primary = _resource_archetype()
     omitted = InvestigationArchetype(
@@ -250,6 +285,54 @@ def test_evidence_includes_secondary_panels_with_existing_rows():
     contributed = contributing_archetypes([(primary, 0.9), (secondary, 0.8)], dashboard)
 
     assert [archetype.id for archetype, _ in contributed] == ["resource-saturation", "secondary-latency"]
+
+
+def test_contributing_archetypes_prefer_source_metadata_over_shared_title_row():
+    primary = _resource_archetype()
+    omitted = InvestigationArchetype(
+        id="omitted-latency",
+        name="Omitted Latency",
+        problem_types=["latency"],
+        required_metrics=["omitted_latency"],
+        panels=[
+            PanelTemplate(
+                title="Latency",
+                row="Application",
+                queries=[QueryTemplate(expr="omitted_latency")],
+            )
+        ],
+    )
+    contributed = InvestigationArchetype(
+        id="contributed-latency",
+        name="Contributed Latency",
+        problem_types=["latency"],
+        required_metrics=["contributed_latency"],
+        panels=[
+            PanelTemplate(
+                title="Latency",
+                row="Application",
+                queries=[QueryTemplate(expr="contributed_latency")],
+            )
+        ],
+    )
+    dashboard = DashboardSpec(
+        title="Compiled",
+        panels=[
+            PanelSpec(
+                title="Latency",
+                row="Application",
+                source_archetype="contributed-latency",
+                queries=[PanelQuery(expr="contributed_latency", datasource_uid="gamma")],
+            )
+        ],
+    )
+
+    result = contributing_archetypes(
+        [(primary, 0.9), (omitted, 0.8), (contributed, 0.7)],
+        dashboard,
+    )
+
+    assert [archetype.id for archetype, _ in result] == ["contributed-latency"]
 
 
 def test_evidence_observations_measure_survival_after_validation():
@@ -439,3 +522,98 @@ def test_evidence_observation_matches_metric_tokens_not_substrings():
     observations = observe_evidence(requirements, resolutions, pre_validation, pre_validation)
 
     assert observations[0].rejection_reason == "resolved_metric_not_observed_in_queries"
+
+
+def test_skipped_validation_survives_but_does_not_count_as_observed():
+    requirements = requirements_for_archetype(_resource_archetype(), _intent())
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="log_metric",
+        )
+    ]
+    pre_validation = DashboardSpec(
+        title="Logs",
+        panels=[
+            PanelSpec(
+                title="Logs",
+                queries=[
+                    PanelQuery(
+                        expr="log_metric",
+                        datasource_uid="loki",
+                        datasource_type="loki",
+                        query_language="logql",
+                    )
+                ],
+            )
+        ],
+    )
+    post_validation = DashboardSpec(
+        title="Logs",
+        panels=[
+            PanelSpec(
+                title="Logs",
+                queries=[
+                    PanelQuery(
+                        expr="log_metric",
+                        datasource_uid="loki",
+                        datasource_type="loki",
+                        query_language="logql",
+                        validation_status="skipped",
+                        validation_has_data=False,
+                    )
+                ],
+            )
+        ],
+    )
+
+    observations = observe_evidence(requirements, resolutions, pre_validation, post_validation)
+    summary = summarize_evidence(requirements, resolutions, observations)
+
+    assert observations[0].survived is True
+    assert observations[0].non_empty is False
+    assert observations[0].rejection_reason == "skipped"
+    assert summary["critical_survival_recall"] == 0.0
+
+
+def test_histogram_bucket_query_counts_as_observed_base_histogram_evidence():
+    archetype = InvestigationArchetype(
+        id="latency",
+        name="Latency",
+        problem_types=["latency"],
+        required_metrics=["http_request_duration_seconds"],
+        panels=[
+            PanelTemplate(
+                title="Latency",
+                queries=[
+                    QueryTemplate(expr="histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))")
+                ],
+            )
+        ],
+    )
+    requirements = requirements_for_archetype(archetype, _intent())
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="default_metric_present",
+            metric="http_request_duration_seconds",
+        )
+    ]
+    query = PanelQuery(
+        expr="histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+        datasource_uid="gamma",
+        validation_status="ok",
+        validation_has_data=True,
+    )
+    dashboard = DashboardSpec(
+        title="Latency",
+        panels=[PanelSpec(title="Latency", queries=[query])],
+    )
+
+    observations = observe_evidence(requirements, resolutions, dashboard, dashboard)
+
+    assert observations[0].survived is True
+    assert observations[0].non_empty is True

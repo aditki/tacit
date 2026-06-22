@@ -348,6 +348,7 @@ def _build_symptom_evidence_dashboard(
                 title=title,
                 description=description,
                 row="Observed Symptoms",
+                source_archetype=requirement.source,
                 unit=_symptom_unit(signal_type, resolution.metric, metric_entry),
                 queries=[
                     PanelQuery(

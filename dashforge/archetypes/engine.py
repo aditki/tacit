@@ -860,6 +860,7 @@ def compile_archetype(
                 description=pt.description,
                 panel_type=pt.panel_type,
                 row=pt.row,
+                source_archetype=archetype.id,
                 queries=panel_queries,
                 unit=pt.unit,
             )

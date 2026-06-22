@@ -195,6 +195,7 @@ class PanelSpec(BaseModel):
     queries: list[PanelQuery]
     unit: str = Field(default="", description="Grafana unit id, e.g. 'percentunit', 's', 'bytes'")
     thresholds: list[dict[str, Any]] = Field(default_factory=list)
+    source_archetype: str = Field(default="", description="Archetype id that compiled this panel, when known")
     row: str = Field(
         default="",
         description="Optional row/section name for grouping, e.g. 'Latency', 'Traffic'. Leave empty for no grouping.",
