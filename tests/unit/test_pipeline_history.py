@@ -43,13 +43,20 @@ def _arch(
     )
 
 
-def _metric(name: str, *, dimensions: list[str] | None = None, metric_type: str = "") -> MetricEntry:
+def _metric(
+    name: str,
+    *,
+    dimensions: list[str] | None = None,
+    metric_type: str = "",
+    datasource_type: str = "prometheus",
+    query_language: str = "promql",
+) -> MetricEntry:
     return MetricEntry(
         name=name,
         datasource_uid="gamma-telemetry",
         datasource_name="GAMMA Telemetry",
-        datasource_type="prometheus",
-        query_language="promql",
+        datasource_type=datasource_type,
+        query_language=query_language,
         dimensions=dimensions or [],
         metric_type=metric_type,
     )
@@ -226,6 +233,113 @@ def test_symptom_evidence_dashboard_treats_duration_default_as_latency():
 
     assert [panel.title for panel in dashboard.panels] == ["Observed Request Latency"]
     assert dashboard.panels[0].queries[0].expr == "http_request_duration_seconds"
+
+
+def test_symptom_evidence_dashboard_allows_prometheus_compatible_datasources():
+    archetype = InvestigationArchetype(
+        id="latency_investigation",
+        name="Latency Investigation",
+        problem_types=["latency_investigation"],
+        required_metrics=["http_request_duration_seconds"],
+        panels=[
+            PanelTemplate(
+                title="Latency",
+                queries=[
+                    QueryTemplate(expr="histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))")
+                ],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="checkout requests slowed",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["latency"],
+        problem_type="latency_investigation",
+        archetypes=[ArchetypeMatch(type="latency_investigation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="default_metric_present",
+            metric="http_request_duration_seconds",
+            datasource_uid="gamma-telemetry",
+            datasource_type="mimir",
+            query_language="promql",
+        )
+    ]
+
+    dashboard, _ = _build_symptom_evidence_dashboard(
+        requirements,
+        resolutions,
+        intent,
+        catalog=[_metric("http_request_duration_seconds", datasource_type="mimir")],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert [panel.title for panel in dashboard.panels] == ["Observed Request Latency"]
+    assert dashboard.panels[0].queries[0].datasource_type == "mimir"
+
+
+def test_symptom_evidence_dashboard_uses_archetype_context_for_direct_resolution(monkeypatch, tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.load_from_yaml()
+    store.add_mapping(
+        "request_latency",
+        "generic_latency_seconds",
+        0.8,
+        context_archetypes=[],
+        source_type="test",
+    )
+    store.add_mapping(
+        "request_latency",
+        "learned_latency_seconds",
+        0.9,
+        context_archetypes=["latency_investigation"],
+        source_type="test",
+    )
+    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    archetype = InvestigationArchetype(
+        id="latency_investigation",
+        name="Latency Investigation",
+        problem_types=["latency_investigation"],
+        required_signals=["request_latency"],
+        signal_bindings={"request_latency": "http_request_duration_seconds"},
+        panels=[PanelTemplate(title="Latency", queries=[QueryTemplate(expr="http_request_duration_seconds")])],
+    )
+    intent = Intent(
+        summary="checkout requests slowed",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["latency"],
+        problem_type="latency_investigation",
+        archetypes=[ArchetypeMatch(type="latency_investigation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    unresolved = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="unresolved",
+            reason_code="no_compatible_live_signal",
+        )
+    ]
+
+    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+        requirements,
+        unresolved,
+        intent,
+        catalog=[_metric("generic_latency_seconds"), _metric("learned_latency_seconds")],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert dashboard.panels[0].queries[0].expr == "learned_latency_seconds"
+    assert rescue_resolutions[0].metric == "learned_latency_seconds"
 
 
 def test_symptom_evidence_dashboard_wraps_counter_request_rate():

@@ -321,8 +321,7 @@ async def validate_signalflow_queries(
             valid_panels.append(panel.model_copy(update={"queries": kept_queries}))
         else:
             warnings.append(
-                f'Panel "{panel.title}" dropped — metrics not found in SignalFx: '
-                f'{", ".join(missing_for_panel[:5])}'
+                f'Panel "{panel.title}" dropped — metrics not found in SignalFx: ' f'{", ".join(missing_for_panel[:5])}'
             )
             logger.warning("sfx_panel_no_data", panel=panel.title, missing_metrics=missing_for_panel[:5])
 
