@@ -356,7 +356,14 @@ def test_evidence_observations_measure_survival_after_validation():
         panels=[
             PanelSpec(
                 title="CPU",
-                queries=[PanelQuery(expr="rate(gamma_container_cpu_usage_seconds_total[5m])", datasource_uid="gamma")],
+                queries=[
+                    PanelQuery(
+                        expr="rate(gamma_container_cpu_usage_seconds_total[5m])",
+                        datasource_uid="gamma",
+                        validation_status="ok",
+                        validation_has_data=True,
+                    )
+                ],
             ),
             PanelSpec(
                 title="Memory",
@@ -432,6 +439,47 @@ def test_skipped_validation_survives_but_does_not_count_as_observed():
     assert observations[0].survived is True
     assert observations[0].non_empty is False
     assert observations[0].rejection_reason == "skipped"
+    assert summary["critical_survival_recall"] == 0.0
+
+
+def test_unstamped_surviving_query_does_not_count_as_observed():
+    archetype = InvestigationArchetype(
+        id="native",
+        name="Native",
+        problem_types=["native"],
+        required_metrics=["request.duration"],
+        panels=[PanelTemplate(title="Native", queries=[QueryTemplate(expr="data('request.duration')")])],
+    )
+    requirements = requirements_for_archetype(archetype, _intent())
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="request.duration",
+            datasource_uid="sfx",
+            datasource_type="signalfx",
+            query_language="signalflow",
+        )
+    ]
+    query = PanelQuery(
+        expr="data('request.duration')",
+        datasource_uid="sfx",
+        datasource_type="signalfx",
+        query_language="signalflow",
+    )
+    dashboard = DashboardSpec(
+        title="Native",
+        panels=[PanelSpec(title="Native", queries=[query])],
+    )
+
+    observations = observe_evidence(requirements, resolutions, dashboard, dashboard)
+    summary = summarize_evidence(requirements, resolutions, observations)
+
+    assert observations[0].survived is True
+    assert observations[0].valid_query is True
+    assert observations[0].non_empty is False
+    assert observations[0].rejection_reason == "query_validation_unverified"
     assert summary["critical_survival_recall"] == 0.0
 
 

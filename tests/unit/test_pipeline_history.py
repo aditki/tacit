@@ -733,6 +733,60 @@ def test_symptom_evidence_dashboard_builds_signalflow_panels():
     assert query.expr == "data('request.duration', filter=filter('service', 'checkout')).mean().publish(label='value')"
 
 
+def test_symptom_evidence_dashboard_scopes_signalflow_when_dimension_values_unsampled():
+    archetype = InvestigationArchetype(
+        id="latency_investigation",
+        name="Latency Investigation",
+        problem_types=["latency_investigation"],
+        required_signals=["request_latency"],
+        signal_bindings={"request_latency": "request.duration"},
+        panels=[PanelTemplate(title="Latency", queries=[QueryTemplate(expr="data('request.duration')")])],
+    )
+    intent = Intent(
+        summary="checkout requests slowed",
+        domain="application",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["latency"],
+        problem_type="latency_investigation",
+        archetypes=[ArchetypeMatch(type="latency_investigation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="request.duration",
+            datasource_uid="sfx",
+            datasource_type="signalfx",
+            query_language="signalflow",
+        )
+    ]
+
+    dashboard, _ = _build_symptom_evidence_dashboard(
+        requirements,
+        resolutions,
+        intent,
+        catalog=[
+            _metric(
+                "request.duration",
+                dimensions=["service"],
+                datasource_uid="sfx",
+                datasource_type="signalfx",
+                query_language="signalflow",
+            )
+        ],
+        target_language="signalflow",
+        timerange="15m",
+    )
+
+    query = dashboard.panels[0].queries[0]
+    assert (
+        query.expr == "data('request.duration', filter=filter('service', '*checkout*')).mean().publish(label='value')"
+    )
+
+
 def test_symptom_evidence_dashboard_abstains_on_tied_metric_owners(monkeypatch, tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()

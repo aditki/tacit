@@ -364,10 +364,13 @@ def observe_evidence(
                         "syntax_error",
                         "error",
                     }
-                    if validation_status:
-                        non_empty = bool(surviving_query and surviving_query.validation_has_data)
-                    else:
-                        non_empty = survived
+                    non_empty = bool(surviving_query and validation_status and surviving_query.validation_has_data)
+                    rejection_reason = ""
+                    if not non_empty:
+                        if survived:
+                            rejection_reason = validation_status or "query_validation_unverified"
+                        else:
+                            rejection_reason = "query_rejected_by_validation"
                     matches.append(
                         EvidenceObservation(
                             requirement_id=requirement.id,
@@ -378,15 +381,7 @@ def observe_evidence(
                             valid_query=valid_query,
                             non_empty=non_empty,
                             survived=survived,
-                            rejection_reason=(
-                                ""
-                                if non_empty
-                                else (
-                                    validation_status or "query_rejected_by_validation"
-                                    if survived
-                                    else "query_rejected_by_validation"
-                                )
-                            ),
+                            rejection_reason=rejection_reason,
                         )
                     )
         if matches:

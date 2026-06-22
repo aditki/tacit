@@ -189,11 +189,15 @@ def _promql_service_selector(services: list[str], metric_entry: MetricEntry | No
 
 
 def _signalflow_service_filter(services: list[str], metric_entry: MetricEntry | None = None) -> str:
-    if not services or metric_entry is None:
+    if not services:
         return ""
+    target = services[0].lower().replace(" ", "-").replace("'", "\\'")
+    fallback = f", filter=filter('service', '*{target}*')" if target else ""
+    if metric_entry is None:
+        return fallback
     aliases = {alias for service in services for alias in _service_aliases(service)}
     if not aliases:
-        return ""
+        return fallback
     for dimension in metric_entry.dimensions:
         label, values = _dimension_label_values(dimension)
         if label.lower() not in _SERVICE_SELECTOR_LABELS:
@@ -204,9 +208,9 @@ def _signalflow_service_filter(services: list[str], metric_entry: MetricEntry | 
                 continue
             value = sorted(selected)[0]
         else:
-            value = services[0]
+            return fallback
         return f", filter=filter('{label}', '{value}')"
-    return ""
+    return fallback
 
 
 def _catalog_entry_for_resolution(resolution: EvidenceResolution, catalog: list[MetricEntry]) -> MetricEntry | None:
