@@ -185,7 +185,14 @@ async def validate_dashboard_queries(
             verdict = verdicts[idx]
             idx += 1
             if verdict in (QUERY_OK, QUERY_SKIPPED):
-                kept_queries.append(q)
+                kept_queries.append(
+                    q.model_copy(
+                        update={
+                            "validation_status": verdict,
+                            "validation_has_data": verdict == QUERY_OK,
+                        }
+                    )
+                )
                 panel_has_data = True
             elif verdict == QUERY_ABSENT:
                 hallucinated += 1
@@ -267,13 +274,12 @@ async def validate_signalflow_queries(
 
     # Collect unique metric names across all panels for batch checking
     all_metrics: set[str] = set()
-    panel_metrics: dict[int, list[str]] = {}
+    query_metrics: dict[tuple[int, int], list[str]] = {}
     for panel_idx, panel in enumerate(spec.panels):
-        metrics = []
-        for q in panel.queries:
-            metrics.extend(_extract_signalflow_metrics(q.expr))
-        panel_metrics[panel_idx] = metrics
-        all_metrics.update(metrics)
+        for query_idx, q in enumerate(panel.queries):
+            metrics = _extract_signalflow_metrics(q.expr)
+            query_metrics[(panel_idx, query_idx)] = metrics
+            all_metrics.update(metrics)
 
     if not all_metrics:
         logger.warning("sfx_validation_no_metrics", reason="no data() calls found in any panel")
@@ -284,22 +290,50 @@ async def validate_signalflow_queries(
     tasks = [_check_metric_exists(sfx_client, m, cache) for m in all_metrics]
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Filter panels: keep if at least one referenced metric exists
+    # Filter panels: keep only queries whose own referenced metrics exist.
     for panel_idx, panel in enumerate(spec.panels):
-        metrics = panel_metrics.get(panel_idx, [])
-        if not metrics:
-            # No data() calls → keep the panel (might be a static/text panel)
-            valid_panels.append(panel)
-            continue
+        helper_queries: list[PanelQuery] = []
+        verified_data_queries: list[PanelQuery] = []
+        missing_for_panel: list[str] = []
+        panel_has_data_queries = any(
+            query_metrics.get((panel_idx, query_idx)) for query_idx, _ in enumerate(panel.queries)
+        )
+        for query_idx, query in enumerate(panel.queries):
+            metrics = query_metrics.get((panel_idx, query_idx), [])
+            if not metrics:
+                helper_queries.append(query)
+                continue
+            missing = [metric for metric in metrics if not cache.get(metric, False)]
+            if missing:
+                missing_for_panel.extend(missing)
+                warnings.append(
+                    f'Panel "{panel.title}" — query dropped: metrics not found in SignalFx: '
+                    f'{", ".join(missing[:5])}'
+                )
+                continue
+            verified_data_queries.append(
+                query.model_copy(
+                    update={
+                        "validation_status": "exists",
+                        "validation_has_data": False,
+                    }
+                )
+            )
 
-        has_any = any(cache.get(m, False) for m in metrics)
-        if has_any:
-            valid_panels.append(panel)
+        if not panel_has_data_queries:
+            kept_queries = helper_queries
+        elif verified_data_queries:
+            kept_queries = [*verified_data_queries, *helper_queries]
+        else:
+            kept_queries = []
+
+        if kept_queries:
+            valid_panels.append(panel.model_copy(update={"queries": kept_queries}))
         else:
             warnings.append(
-                f'Panel "{panel.title}" dropped — metrics not found in SignalFx: ' f'{", ".join(metrics[:5])}'
+                f'Panel "{panel.title}" dropped — metrics not found in SignalFx: ' f'{", ".join(missing_for_panel[:5])}'
             )
-            logger.warning("sfx_panel_no_data", panel=panel.title, missing_metrics=metrics[:5])
+            logger.warning("sfx_panel_no_data", panel=panel.title, missing_metrics=missing_for_panel[:5])
 
     spec = spec.model_copy(update={"panels": valid_panels})
     if not valid_panels:

@@ -179,6 +179,8 @@ class PanelQuery(BaseModel):
         ),
     )
     cloudwatch_region: str = Field(default="", description="AWS region for this CloudWatch query, e.g. 'us-east-1'")
+    validation_status: str = Field(default="", description="Validation verdict for this query, e.g. ok/skipped")
+    validation_has_data: bool = Field(default=False, description="Whether validation proved this query returned data")
 
 
 class PanelSpec(BaseModel):
@@ -193,6 +195,7 @@ class PanelSpec(BaseModel):
     queries: list[PanelQuery]
     unit: str = Field(default="", description="Grafana unit id, e.g. 'percentunit', 's', 'bytes'")
     thresholds: list[dict[str, Any]] = Field(default_factory=list)
+    source_archetype: str = Field(default="", description="Archetype id that compiled this panel, when known")
     row: str = Field(
         default="",
         description="Optional row/section name for grouping, e.g. 'Latency', 'Traffic'. Leave empty for no grouping.",
@@ -206,6 +209,49 @@ class DashboardSpec(BaseModel):
     tags: list[str] = Field(default_factory=list)
     timerange: str = "1h"
     panels: list[PanelSpec]
+
+
+# ── Evidence model ───────────────────────────────────────────────────────────
+
+
+class EvidenceRequirement(BaseModel):
+    """A signal or metric the investigation needs before it can claim support."""
+
+    id: str = Field(description="Stable requirement id within one investigation")
+    evidence_type: str = Field(description="semantic_signal or required_metric")
+    signal_type: str = Field(default="", description="Semantic signal family, when known")
+    default_metric: str = Field(default="", description="Canonical/template metric name requested by an archetype")
+    priority: str = Field(default="critical", description="critical or supporting")
+    service_scope: list[str] = Field(default_factory=list, description="Requested service context")
+    source: str = Field(default="", description="Where the requirement came from, e.g. archetype id")
+
+
+class EvidenceResolution(BaseModel):
+    """How a requirement resolved, or why it abstained."""
+
+    requirement_id: str
+    status: str = Field(description="resolved, unresolved, or unknown")
+    reason_code: str
+    metric: str = ""
+    datasource_uid: str = ""
+    datasource_type: str = ""
+    query_language: str = ""
+    semantic_score: float = 0.0
+    ownership_score: float = 0.0
+
+
+class EvidenceObservation(BaseModel):
+    """Whether resolved evidence survived into a validated query/panel."""
+
+    requirement_id: str
+    resolution_metric: str = ""
+    panel_title: str = ""
+    query: str = ""
+    datasource_uid: str = ""
+    valid_query: bool = False
+    non_empty: bool = False
+    survived: bool = False
+    rejection_reason: str = ""
 
 
 # ── Pipeline request / response ──────────────────────────────────────────────
