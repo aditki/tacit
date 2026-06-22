@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any, cast
 
@@ -32,10 +33,27 @@ from dashforge.evidence import (
 )
 from dashforge.history import get_investigation_store
 from dashforge.logging import bind_request_id, stage_log, unbind_request_id
-from dashforge.models.schemas import DashRequest, DashResponse, EvidenceRequirement, EvidenceResolution
+from dashforge.models.schemas import (
+    DashboardSpec,
+    DashRequest,
+    DashResponse,
+    EvidenceRequirement,
+    EvidenceResolution,
+    Intent,
+    MetricEntry,
+    PanelQuery,
+    PanelSpec,
+)
 from dashforge.ranking import prerank_metrics
 
 logger = structlog.get_logger()
+
+_SYMPTOM_SIGNAL_PANELS = {
+    "request_latency": ("Observed Request Latency", "Application request timing evidence", "s"),
+    "api_latency": ("Observed API Latency", "Application API timing evidence", "s"),
+    "request_rate": ("Observed Request Rate", "Application request traffic evidence", "reqps"),
+    "error_rate": ("Observed Error Rate", "Application error evidence", "percentunit"),
+}
 
 
 def _record_stage(history, inv_id: str, stage: str, status: str, reason_code: str, **details) -> None:
@@ -114,6 +132,149 @@ def _compiled_query_diagnostics(dashboard_spec, catalog) -> tuple[str, str, dict
             "present_metrics": present,
             "missing_metrics": missing,
         },
+    )
+
+
+def _promql_service_selector(services: list[str]) -> str:
+    if not services:
+        return ""
+    escaped = "|".join(re.escape(service) for service in services if service)
+    return f'{{service=~"{escaped}"}}' if escaped else ""
+
+
+def _resolve_direct_symptom_evidence(
+    requirement: EvidenceRequirement,
+    intent: Intent,
+    catalog: list[MetricEntry],
+    *,
+    target_language: str,
+) -> EvidenceResolution | None:
+    """Resolve symptom evidence for direct observation panels.
+
+    This is intentionally separate from the archetype binder. It skips template
+    shape compatibility because the rescue panel queries the resolved symptom
+    metric directly, then relies on normal datasource validation.
+    """
+    from dashforge.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal
+    from dashforge.signals import get_signal_store
+
+    try:
+        store = get_signal_store()
+    except Exception:
+        return None
+
+    target_catalog = [
+        entry for entry in catalog if (entry.query_language or "").lower() in {"", target_language.lower()}
+    ]
+    scoped_catalog = catalog_for_services(target_catalog, intent.services, include_unscoped=True)
+    signal_type = requirement.signal_type or _legacy_metric_signal(
+        store,
+        requirement.default_metric,
+        scoped_catalog,
+        target_language,
+    )
+    if signal_type not in _SYMPTOM_SIGNAL_PANELS:
+        return None
+    resolved = store.resolve_signal(
+        signal_type,
+        scoped_catalog,
+        context_service=intent.services[0] if intent.services else "",
+        context_datasource_type=_datasource_type_for_language(target_language),
+        target_query_language=target_language,
+    )
+    if not resolved:
+        return None
+    best_score = resolved[0][1]
+    best = [item for item in resolved if item[1] == best_score]
+    best_owners = {(entry.name, entry.datasource_uid, entry.datasource_type, entry.query_language) for entry, _ in best}
+    if len(best_owners) > 1:
+        return None
+    entry, score = best[0]
+    return EvidenceResolution(
+        requirement_id=requirement.id,
+        status="resolved",
+        reason_code="direct_symptom_signal_resolved",
+        metric=entry.name,
+        datasource_uid=entry.datasource_uid,
+        datasource_type=entry.datasource_type,
+        query_language=entry.query_language,
+        semantic_score=score,
+        ownership_score=1.0,
+    )
+
+
+def _build_symptom_evidence_dashboard(
+    requirements: list[EvidenceRequirement],
+    resolutions: list[EvidenceResolution],
+    intent: Intent,
+    *,
+    catalog: list[MetricEntry],
+    target_language: str,
+    timerange: str,
+) -> tuple[DashboardSpec, list[EvidenceResolution]]:
+    """Build direct, validation-gated panels for observed application symptoms."""
+    resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
+    service_selector = _promql_service_selector(intent.services)
+    panels: list[PanelSpec] = []
+    rescue_resolutions: list[EvidenceResolution] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for requirement in requirements:
+        resolution = resolutions_by_id.get(requirement.id)
+        if resolution is None or resolution.status != "resolved" or not resolution.metric:
+            resolution = _resolve_direct_symptom_evidence(
+                requirement,
+                intent,
+                catalog,
+                target_language=target_language,
+            )
+        if resolution is None or resolution.status != "resolved" or not resolution.metric:
+            continue
+        signal_type = requirement.signal_type
+        if not signal_type and "latency" in resolution.metric:
+            signal_type = "request_latency"
+        elif not signal_type and ("request_rate" in resolution.metric or "requests_total" in resolution.metric):
+            signal_type = "request_rate"
+        if signal_type not in _SYMPTOM_SIGNAL_PANELS:
+            continue
+        query_language = (resolution.query_language or "promql").lower()
+        datasource_type = (resolution.datasource_type or "prometheus").lower()
+        if query_language not in {"", "promql"} or datasource_type not in {"", "prometheus"}:
+            continue
+        key = (signal_type, resolution.metric, resolution.datasource_uid)
+        if key in seen:
+            continue
+        seen.add(key)
+        rescue_resolutions.append(resolution)
+        title, description, unit = _SYMPTOM_SIGNAL_PANELS[signal_type]
+        panels.append(
+            PanelSpec(
+                title=title,
+                description=description,
+                row="Observed Symptoms",
+                source_archetype=requirement.source,
+                unit=unit,
+                queries=[
+                    PanelQuery(
+                        expr=f"{resolution.metric}{service_selector}",
+                        legend_format="{{service}}",
+                        datasource_uid=resolution.datasource_uid,
+                        datasource_type=resolution.datasource_type or "prometheus",
+                        query_language=resolution.query_language or "promql",
+                    )
+                ],
+            )
+        )
+
+    title_service = intent.services[0].title() if intent.services else "Service"
+    return (
+        DashboardSpec(
+            title=f"{title_service} — Observed Symptoms",
+            tags=["dashforge", "evidence", "symptom"],
+            timerange=timerange,
+            panels=panels,
+        ),
+        rescue_resolutions,
     )
 
 
@@ -743,6 +904,48 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         panels_before = len(dashboard_spec.panels)
         pre_validation_spec = dashboard_spec.model_copy(deep=True)
         dashboard_spec, validation_warnings = await primary.validate_queries(dashboard_spec, catalog_for_compile)
+        if not dashboard_spec.panels and evidence_requirements:
+            symptom_pre_validation_spec, symptom_resolutions = _build_symptom_evidence_dashboard(
+                evidence_requirements,
+                evidence_resolutions,
+                intent,
+                catalog=catalog_for_compile,
+                target_language=target_language,
+                timerange=pre_validation_spec.timerange,
+            )
+            if symptom_pre_validation_spec.panels:
+                symptom_spec, symptom_warnings = await primary.validate_queries(
+                    symptom_pre_validation_spec,
+                    catalog_for_compile,
+                )
+                validation_warnings.extend(symptom_warnings)
+                _record_stage(
+                    history,
+                    inv_id,
+                    "symptom_evidence_rescue",
+                    "passed" if symptom_spec.panels else "failed",
+                    "symptom_panels_validated" if symptom_spec.panels else "symptom_panels_rejected",
+                    panels_before=len(symptom_pre_validation_spec.panels),
+                    panels_after=len(symptom_spec.panels),
+                )
+                if symptom_spec.panels:
+                    rescue_requirement_ids = {resolution.requirement_id for resolution in symptom_resolutions}
+                    evidence_resolutions = [
+                        resolution
+                        for resolution in evidence_resolutions
+                        if resolution.requirement_id not in rescue_requirement_ids
+                    ]
+                    evidence_resolutions.extend(symptom_resolutions)
+                    pre_validation_spec = symptom_pre_validation_spec
+                    dashboard_spec = symptom_spec
+            else:
+                _record_stage(
+                    history,
+                    inv_id,
+                    "symptom_evidence_rescue",
+                    "skipped",
+                    "no_resolved_symptom_evidence",
+                )
         timings["query_validation"] = time.monotonic() - t0
         stage_log(
             "query_validation",

@@ -26,6 +26,7 @@ from dashforge.models.schemas import (
 )
 
 _METRIC_TOKEN_CHARS = r"A-Za-z0-9_:."
+_PROMETHEUS_HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
 
 
 def _query_mentions_metric(expr: str, metric: str) -> bool:
@@ -33,6 +34,12 @@ def _query_mentions_metric(expr: str, metric: str) -> bool:
         return False
     pattern = re.compile(rf"(?<![{_METRIC_TOKEN_CHARS}]){re.escape(metric)}(?![{_METRIC_TOKEN_CHARS}])")
     return bool(pattern.search(expr))
+
+
+def _query_mentions_requirement_metric(expr: str, metric: str) -> bool:
+    if _query_mentions_metric(expr, metric):
+        return True
+    return any(_query_mentions_metric(expr, f"{metric}{suffix}") for suffix in _PROMETHEUS_HISTOGRAM_SUFFIXES)
 
 
 def requirements_for_archetype(
@@ -89,6 +96,10 @@ def contributing_archetypes(
     """Return selected archetypes that actually contributed compiled panels."""
     if not ranked_archetypes or not dashboard_spec.panels:
         return []
+    source_ids = {panel.source_archetype for panel in dashboard_spec.panels if panel.source_archetype}
+    if source_ids:
+        return [(archetype, confidence) for archetype, confidence in ranked_archetypes if archetype.id in source_ids]
+
     contributed: list[tuple[InvestigationArchetype, float]] = []
     for index, (archetype, confidence) in enumerate(ranked_archetypes):
         template_titles = {panel.title for panel in archetype.panels}
@@ -246,8 +257,10 @@ def resolve_requirements_for_archetype(
         if requirement.evidence_type != "semantic_signal":
             best_score = compatible[0][1]
             best = [item for item in compatible if item[1] == best_score]
-            best_names = {entry.name for entry, _ in best}
-            if len(best_names) > 1:
+            best_owners = {
+                (entry.name, entry.datasource_uid, entry.datasource_type, entry.query_language) for entry, _ in best
+            }
+            if len(best_owners) > 1:
                 resolutions.append(
                     EvidenceResolution(
                         requirement_id=requirement.id,
@@ -303,7 +316,10 @@ def observe_evidence(
     """Record whether resolved evidence appears in a query that survived validation."""
     requirements_by_id = {requirement.id: requirement for requirement in requirements}
     surviving_queries = {
-        (query.expr, query.datasource_uid) for panel in post_validation.panels for query in panel.queries if query.expr
+        (query.expr, query.datasource_uid): query
+        for panel in post_validation.panels
+        for query in panel.queries
+        if query.expr
     }
     observations: list[EvidenceObservation] = []
 
@@ -327,8 +343,20 @@ def observe_evidence(
             for query in panel.queries:
                 if not query.expr:
                     continue
-                if any(_query_mentions_metric(query.expr, token) for token in metric_tokens):
-                    survived = (query.expr, query.datasource_uid) in surviving_queries
+                if any(_query_mentions_requirement_metric(query.expr, token) for token in metric_tokens):
+                    surviving_query = surviving_queries.get((query.expr, query.datasource_uid))
+                    survived = surviving_query is not None
+                    validation_status = surviving_query.validation_status if surviving_query else ""
+                    valid_query = survived and validation_status not in {
+                        "absent",
+                        "bad_uid",
+                        "syntax_error",
+                        "error",
+                    }
+                    if validation_status:
+                        non_empty = bool(surviving_query and surviving_query.validation_has_data)
+                    else:
+                        non_empty = survived
                     matches.append(
                         EvidenceObservation(
                             requirement_id=requirement.id,
@@ -336,10 +364,18 @@ def observe_evidence(
                             panel_title=panel.title,
                             query=query.expr,
                             datasource_uid=query.datasource_uid,
-                            valid_query=survived,
-                            non_empty=survived,
+                            valid_query=valid_query,
+                            non_empty=non_empty,
                             survived=survived,
-                            rejection_reason="" if survived else "query_rejected_by_validation",
+                            rejection_reason=(
+                                ""
+                                if non_empty
+                                else (
+                                    validation_status or "query_rejected_by_validation"
+                                    if survived
+                                    else "query_rejected_by_validation"
+                                )
+                            ),
                         )
                     )
         if matches:
@@ -362,7 +398,7 @@ def summarize_evidence(
 ) -> dict[str, object]:
     """Return compact counts suitable for stage history and benchmark gates."""
     resolved_ids = {resolution.requirement_id for resolution in resolutions if resolution.status == "resolved"}
-    surviving_ids = {observation.requirement_id for observation in observations if observation.survived}
+    surviving_ids = {observation.requirement_id for observation in observations if observation.non_empty}
     critical_ids = {requirement.id for requirement in requirements if requirement.priority == "critical"}
     critical_resolved = critical_ids & resolved_ids
     critical_survived = critical_ids & surviving_ids

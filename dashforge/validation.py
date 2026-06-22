@@ -185,7 +185,14 @@ async def validate_dashboard_queries(
             verdict = verdicts[idx]
             idx += 1
             if verdict in (QUERY_OK, QUERY_SKIPPED):
-                kept_queries.append(q)
+                kept_queries.append(
+                    q.model_copy(
+                        update={
+                            "validation_status": verdict,
+                            "validation_has_data": verdict == QUERY_OK,
+                        }
+                    )
+                )
                 panel_has_data = True
             elif verdict == QUERY_ABSENT:
                 hallucinated += 1
@@ -294,7 +301,21 @@ async def validate_signalflow_queries(
 
         has_any = any(cache.get(m, False) for m in metrics)
         if has_any:
-            valid_panels.append(panel)
+            valid_panels.append(
+                panel.model_copy(
+                    update={
+                        "queries": [
+                            q.model_copy(
+                                update={
+                                    "validation_status": "exists",
+                                    "validation_has_data": False,
+                                }
+                            )
+                            for q in panel.queries
+                        ]
+                    }
+                )
+            )
         else:
             warnings.append(
                 f'Panel "{panel.title}" dropped — metrics not found in SignalFx: ' f'{", ".join(metrics[:5])}'

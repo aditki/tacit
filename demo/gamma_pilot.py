@@ -214,8 +214,8 @@ def _interference_windows(
         for node in sorted(group["nodes"]):
             prefix = f"raw_dataset/{scenario}/"
             candidates = [
-                f"{prefix}{node}_phases",
                 f"{prefix}{fault_type}_{node}_phases",
+                f"{prefix}{node}_phases",
             ]
             member = next((candidate for candidate in candidates if candidate in archive_members), "")
             shared_phase_file = member == f"{prefix}{node}_phases"
