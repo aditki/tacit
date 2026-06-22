@@ -307,6 +307,16 @@ def resolve_requirements_for_archetypes(
     return requirements, resolutions
 
 
+def _query_matches_resolution_owner(query, resolution: EvidenceResolution) -> bool:
+    if resolution.datasource_uid and query.datasource_uid != resolution.datasource_uid:
+        return False
+    if resolution.datasource_type and query.datasource_type != resolution.datasource_type:
+        return False
+    if resolution.query_language and query.query_language != resolution.query_language:
+        return False
+    return True
+
+
 def observe_evidence(
     requirements: list[EvidenceRequirement],
     resolutions: list[EvidenceResolution],
@@ -345,7 +355,9 @@ def observe_evidence(
                     continue
                 if any(_query_mentions_requirement_metric(query.expr, token) for token in metric_tokens):
                     surviving_query = surviving_queries.get((query.expr, query.datasource_uid))
-                    survived = surviving_query is not None
+                    survived = surviving_query is not None and _query_matches_resolution_owner(
+                        surviving_query, resolution
+                    )
                     validation_status = surviving_query.validation_status if surviving_query else ""
                     valid_query = survived and validation_status not in {
                         "absent",
@@ -353,9 +365,7 @@ def observe_evidence(
                         "syntax_error",
                         "error",
                     }
-                    if validation_status == "exists":
-                        non_empty = survived
-                    elif validation_status:
+                    if validation_status:
                         non_empty = bool(surviving_query and surviving_query.validation_has_data)
                     else:
                         non_empty = survived

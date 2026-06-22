@@ -48,12 +48,13 @@ def _metric(
     *,
     dimensions: list[str] | None = None,
     metric_type: str = "",
+    datasource_uid: str = "gamma-telemetry",
     datasource_type: str = "prometheus",
     query_language: str = "promql",
 ) -> MetricEntry:
     return MetricEntry(
         name=name,
-        datasource_uid="gamma-telemetry",
+        datasource_uid=datasource_uid,
         datasource_name="GAMMA Telemetry",
         datasource_type=datasource_type,
         query_language=query_language,
@@ -556,6 +557,93 @@ def test_symptom_evidence_dashboard_skips_generic_counter_as_error_rate():
         resolutions,
         intent,
         catalog=[_metric("http_requests_total", metric_type="counter")],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert dashboard.panels == []
+    assert rescue_resolutions == []
+
+
+def test_symptom_evidence_dashboard_preserves_error_context_for_request_counter():
+    archetype = InvestigationArchetype(
+        id="error_spike",
+        name="Error Spike",
+        problem_types=["error_spike"],
+        required_metrics=["http_requests_total"],
+        panels=[PanelTemplate(title="Errors", queries=[QueryTemplate(expr='http_requests_total{status=~"5.."}')])],
+    )
+    intent = Intent(
+        summary="checkout errors increased",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["errors"],
+        problem_type="error_spike",
+        archetypes=[ArchetypeMatch(type="error_spike", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="http_requests_total",
+            datasource_uid="gamma-telemetry",
+            datasource_type="prometheus",
+            query_language="promql",
+        )
+    ]
+
+    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+        requirements,
+        resolutions,
+        intent,
+        catalog=[_metric("http_requests_total", metric_type="counter")],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert dashboard.panels == []
+    assert rescue_resolutions == []
+
+
+def test_symptom_evidence_dashboard_abstains_on_latency_sum_count_helpers():
+    archetype = InvestigationArchetype(
+        id="latency_investigation",
+        name="Latency Investigation",
+        problem_types=["latency_investigation"],
+        required_signals=["request_latency"],
+        signal_bindings={"request_latency": "http_request_duration_seconds_sum"},
+        panels=[PanelTemplate(title="Latency", queries=[QueryTemplate(expr="http_request_duration_seconds_sum")])],
+    )
+    intent = Intent(
+        summary="checkout requests slowed",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["latency"],
+        problem_type="latency_investigation",
+        archetypes=[ArchetypeMatch(type="latency_investigation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="http_request_duration_seconds_sum",
+            datasource_uid="gamma-telemetry",
+            datasource_type="prometheus",
+            query_language="promql",
+        )
+    ]
+
+    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+        requirements,
+        resolutions,
+        intent,
+        catalog=[_metric("http_request_duration_seconds_sum", metric_type="counter")],
         target_language="promql",
         timerange="15m",
     )

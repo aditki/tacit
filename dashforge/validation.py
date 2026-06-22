@@ -292,13 +292,16 @@ async def validate_signalflow_queries(
 
     # Filter panels: keep only queries whose own referenced metrics exist.
     for panel_idx, panel in enumerate(spec.panels):
-        kept_queries: list[PanelQuery] = []
+        helper_queries: list[PanelQuery] = []
+        verified_data_queries: list[PanelQuery] = []
         missing_for_panel: list[str] = []
+        panel_has_data_queries = any(
+            query_metrics.get((panel_idx, query_idx)) for query_idx, _ in enumerate(panel.queries)
+        )
         for query_idx, query in enumerate(panel.queries):
             metrics = query_metrics.get((panel_idx, query_idx), [])
             if not metrics:
-                # No data() calls → keep the query (might be a static/text query).
-                kept_queries.append(query)
+                helper_queries.append(query)
                 continue
             missing = [metric for metric in metrics if not cache.get(metric, False)]
             if missing:
@@ -308,7 +311,7 @@ async def validate_signalflow_queries(
                     f'{", ".join(missing[:5])}'
                 )
                 continue
-            kept_queries.append(
+            verified_data_queries.append(
                 query.model_copy(
                     update={
                         "validation_status": "exists",
@@ -316,6 +319,13 @@ async def validate_signalflow_queries(
                     }
                 )
             )
+
+        if not panel_has_data_queries:
+            kept_queries = helper_queries
+        elif verified_data_queries:
+            kept_queries = [*verified_data_queries, *helper_queries]
+        else:
+            kept_queries = []
 
         if kept_queries:
             valid_panels.append(panel.model_copy(update={"queries": kept_queries}))

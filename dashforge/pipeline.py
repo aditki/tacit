@@ -206,6 +206,8 @@ def _symptom_query_expr(signal_type: str, metric: str, selector: str, entry: Met
     metric_lower = metric.lower()
     if signal_type in {"request_latency", "api_latency"} and metric_lower.endswith("_bucket"):
         return f"histogram_quantile(0.95, sum(rate({metric}{selector}[5m])) by (le))"
+    if signal_type in {"request_latency", "api_latency"} and metric_lower.endswith(("_sum", "_count")):
+        return ""
     if signal_type == "request_rate" and _is_counter_metric(metric, entry):
         return f"sum(rate({metric}{selector}[5m]))"
     if signal_type == "error_rate" and _is_counter_metric(metric, entry):
@@ -224,13 +226,14 @@ def _symptom_unit(signal_type: str, metric: str, entry: MetricEntry | None) -> s
 def _symptom_signal_type(requirement: EvidenceRequirement, resolution: EvidenceResolution) -> str:
     if requirement.signal_type:
         return requirement.signal_type
-    text = " ".join([requirement.default_metric, resolution.metric]).lower()
-    if "latency" in text or "duration" in text:
-        return "request_latency"
-    if "request_rate" in text or "requests_total" in text:
-        return "request_rate"
-    if "error" in text or "5xx" in text:
+    metric_text = " ".join([requirement.default_metric, resolution.metric]).lower()
+    source_text = " ".join([requirement.id, requirement.source]).lower()
+    if "error" in metric_text or "5xx" in metric_text or "error" in source_text:
         return "error_rate"
+    if "latency" in metric_text or "duration" in metric_text:
+        return "request_latency"
+    if "request_rate" in metric_text or "requests_total" in metric_text:
+        return "request_rate"
     return ""
 
 
