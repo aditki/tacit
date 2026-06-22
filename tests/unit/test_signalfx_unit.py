@@ -827,6 +827,45 @@ def test_validate_signalflow_drops_missing_sibling_query():
     print("[PASS] test_validate_signalflow_drops_missing_sibling_query")
 
 
+def test_validate_signalflow_drops_helpers_when_all_data_queries_missing():
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from dashforge.validation import validate_signalflow_queries
+
+    mock_client = AsyncMock()
+    mock_client.get_metric = AsyncMock(side_effect=Exception("404 Not Found"))
+
+    spec = DashboardSpec(
+        title="Split SignalFx",
+        timerange="1h",
+        panels=[
+            PanelSpec(
+                title="Split",
+                panel_type="timeseries",
+                queries=[
+                    PanelQuery(
+                        expr="A = data('missing.metric')",
+                        datasource_uid="sfx",
+                        datasource_type="signalfx",
+                    ),
+                    PanelQuery(
+                        expr="A.mean().publish(label='missing')",
+                        datasource_uid="sfx",
+                        datasource_type="signalfx",
+                    ),
+                ],
+            )
+        ],
+    )
+
+    result_spec, warnings = asyncio.run(validate_signalflow_queries(mock_client, spec))
+
+    assert result_spec.panels == []
+    assert any("Split" in warning for warning in warnings)
+    print("[PASS] test_validate_signalflow_drops_helpers_when_all_data_queries_missing")
+
+
 def test_validate_signalflow_all_missing():
     import asyncio
     from unittest.mock import AsyncMock
@@ -932,6 +971,7 @@ if __name__ == "__main__":
     test_validate_signalflow_drops_missing_panels()
     test_validate_signalflow_keeps_all_when_valid()
     test_validate_signalflow_drops_missing_sibling_query()
+    test_validate_signalflow_drops_helpers_when_all_data_queries_missing()
     test_validate_signalflow_all_missing()
 
     print("\n=== All SignalFx unit tests passed ===")

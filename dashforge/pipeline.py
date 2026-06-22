@@ -252,6 +252,8 @@ def _promql_symptom_query(signal_type: str, metric: str, selector: str, entry: M
     metric_lower = metric.lower()
     if signal_type in {"request_latency", "api_latency"} and metric_lower.endswith("_bucket"):
         return f"histogram_quantile(0.95, sum(rate({metric}{selector}[5m])) by (le))"
+    if signal_type in {"request_latency", "api_latency"} and metric_lower.endswith(("_sum", "_count")):
+        return ""
     if signal_type == "request_rate" and _is_counter_metric(metric, entry):
         return f"sum(rate({metric}{selector}[5m]))"
     if signal_type == "error_rate" and _is_counter_metric(metric, entry):

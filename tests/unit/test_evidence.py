@@ -577,7 +577,51 @@ def test_skipped_validation_survives_but_does_not_count_as_observed():
     assert observations[0].rejection_reason == "skipped"
     assert summary["critical_survival_recall"] == 0.0
 
+def test_evidence_observation_requires_resolved_datasource_owner():
+    archetype = InvestigationArchetype(
+        id="latency",
+        name="Latency",
+        problem_types=["latency"],
+        required_metrics=["request_latency_seconds"],
+        panels=[PanelTemplate(title="Latency", queries=[QueryTemplate(expr="request_latency_seconds")])],
+    )
+    requirements = requirements_for_archetype(archetype, _intent())
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="request_latency_seconds",
+            datasource_uid="resolved-prom",
+            datasource_type="prometheus",
+            query_language="promql",
+        )
+    ]
+    pre_validation = DashboardSpec(
+        title="Latency",
+        panels=[
+            PanelSpec(
+                title="Latency",
+                queries=[
+                    PanelQuery(
+                        expr="request_latency_seconds",
+                        datasource_uid="other-prom",
+                        datasource_type="prometheus",
+                        query_language="promql",
+                    )
+                ],
+            )
+        ],
+    )
+    post_validation = DashboardSpec(title="Latency", panels=[pre_validation.panels[0]])
 
+    observations = observe_evidence(requirements, resolutions, pre_validation, post_validation)
+    summary = summarize_evidence(requirements, resolutions, observations)
+
+    assert observations[0].survived is False
+    assert observations[0].non_empty is False
+    assert observations[0].rejection_reason == "query_rejected_by_validation"
+    assert summary["critical_survival_recall"] == 0.0
 def test_histogram_bucket_query_counts_as_observed_base_histogram_evidence():
     archetype = InvestigationArchetype(
         id="latency",
