@@ -11,9 +11,7 @@ from dashforge.agents.intent import classify_intent
 from dashforge.agents.metrics_discovery import discover_metrics
 from dashforge.agents.providers.base import TokenUsage
 from dashforge.agents.query_builder import build_dashboard
-from dashforge.archetypes.engine import blend_archetypes, compile_archetype, rank_archetypes_by_coverage
 from dashforge.archetypes.templates import (
-    get_archetype,
     get_archetypes_by_confidence,
     get_archetypes_by_learning_context,
 )
@@ -22,37 +20,31 @@ from dashforge.backends.base import PublishResult
 from dashforge.cache import llm_cache, make_cache_key
 from dashforge.config import settings
 from dashforge.context.enrichment import enrich_context
-from dashforge.dependencies import PipelineDependencies
-from dashforge.errors import EvidenceResolutionError
-from dashforge.evidence import (
-    contributing_archetypes,
-    resolve_requirements_for_archetypes,
-)
+from dashforge.dependencies import PipelineDependencies, _get_feedback_store
 from dashforge.history import get_investigation_store
 from dashforge.logging import bind_request_id, stage_log, unbind_request_id
 from dashforge.models.schemas import (
     DashRequest,
     DashResponse,
-    EvidenceRequirement,
-    EvidenceResolution,
 )
 from dashforge.pipeline.discovery import (
-    confirm_colloquial_keywords,
-    discover_catalogs,
     discovery_keywords,
-    discovery_stage_status,
     semantic_mapping_diagnostics,
 )
 from dashforge.pipeline.recording import (
+    PipelineRecorder,
     compiled_query_diagnostics,
     dashboard_summary,
     history_archetypes,
     history_signals,
     query_history_payload,
-    record_selected_intent,
-    record_stage,
     surviving_datasource_names,
 )
+from dashforge.pipeline.stages.archetypes import compile_selected_archetypes, select_archetypes
+from dashforge.pipeline.stages.discovery import run_discovery_stage
+from dashforge.pipeline.stages.evidence import run_evidence_stage
+from dashforge.pipeline.stages.intent import run_intent_stage
+from dashforge.pipeline.stages.publish import publish_dashboard
 from dashforge.pipeline.validation import validate_dashboard_and_evidence
 from dashforge.ranking import prerank_metrics
 
@@ -81,6 +73,7 @@ def _default_dependencies() -> PipelineDependencies:
         settings=settings,
         backend_factory=get_active_backends,
         history_store_factory=get_investigation_store,
+        feedback_store_factory=_get_feedback_store,
         llm_cache=llm_cache,
         cache_key_factory=make_cache_key,
     )
@@ -156,90 +149,37 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
     timings: dict[str, float] = {}
     history = deps.history_store_factory()
     inv_id = history.start(request.prompt, request.user_id or "", request.channel_id or "")
+    recorder = PipelineRecorder(history, inv_id)
 
     cumulative_tokens = TokenUsage()
 
     try:
         # ── 1. Intent Agent ──────────────────────────────────────────
-        t0 = time.monotonic()
-        intent, intent_usage = await classify_intent(request.prompt)
-        timings["intent"] = time.monotonic() - t0
-        cumulative_tokens = cumulative_tokens + intent_usage
-        stage_log(
-            "intent",
-            (time.monotonic() - t0) * 1000,
-            token_usage=intent_usage,
-            prompt=request.prompt[:100],
+        intent_stage = await run_intent_stage(
+            prompt=request.prompt,
             user_id=request.user_id,
-            archetypes_detected=len(intent.archetypes),
-            domain=intent.domain,
+            classify=classify_intent,
+            enrich=enrich_context,
+            timings=timings,
         )
-
-        try:
-            history.record_intent(
-                inv_id,
-                summary=intent.summary,
-                domain=intent.domain,
-                services=intent.services,
-                keywords=intent.keywords,
-                signals=[s.value for s in intent.signals],
-                problem_type=intent.problem_type,
-                archetypes=[{"type": a.type, "confidence": a.confidence} for a in intent.archetypes],
-                timerange=intent.timerange,
-            )
-        except Exception:
-            logger.warning("history_record_intent_failed", exc_info=True)
-
-        # ── 2. Context enrichment (optional) ───────────────────
-        t0 = time.monotonic()
-        context_chunks = await enrich_context(intent)
-        timings["context"] = time.monotonic() - t0
-        stage_log(
-            "context_enrichment",
-            (time.monotonic() - t0) * 1000,
-            chunks_returned=len(context_chunks),
-        )
+        intent = intent_stage.intent
+        context_chunks = intent_stage.context_chunks
+        cumulative_tokens = cumulative_tokens + intent_stage.token_usage
+        recorder.intent(intent)
 
         # ── 3. Metric discovery — each backend contributes ───────────
-        t0 = time.monotonic()
-        catalog_discovery = await discover_catalogs(backends, intent)
+        discovery_stage = await run_discovery_stage(
+            backends=backends,
+            primary=primary,
+            intent=intent,
+            timings=timings,
+            recorder=recorder,
+        )
+        catalog_discovery = discovery_stage.discovery
         metric_catalog = catalog_discovery.metric_catalog
         datasource_catalog = catalog_discovery.datasource_catalog
         catalog_for_compile = catalog_discovery.catalog_for_compile
-        timings["metrics_fetch"] = time.monotonic() - t0
-        stage_log(
-            "metrics_fetch",
-            (time.monotonic() - t0) * 1000,
-            backends_queried=len(backends),
-            datasource_types=catalog_discovery.datasource_types,
-            metrics_found=len(metric_catalog),
-            datasource_targets_found=len(datasource_catalog),
-        )
-
-        try:
-            history.record_discovery(
-                inv_id,
-                datasources_found=len(catalog_discovery.datasource_types),
-                datasource_types=catalog_discovery.datasource_types,
-                metrics_catalog_size=len(metric_catalog),
-            )
-        except Exception:
-            logger.warning("history_record_discovery_failed", exc_info=True)
-
-        discovery_status, discovery_reason, discovery_details = discovery_stage_status(catalog_discovery)
-        record_stage(history, inv_id, "discovery", discovery_status, discovery_reason, **discovery_details)
-
-        mapping_status, mapping_reason, mapping_details = semantic_mapping_diagnostics(metric_catalog)
-        record_stage(
-            history,
-            inv_id,
-            "semantic_mapping",
-            mapping_status,
-            mapping_reason,
-            **mapping_details,
-        )
-
-        confirmed_keywords = confirm_colloquial_keywords(intent, metric_catalog, primary.query_language)
+        confirmed_keywords = discovery_stage.confirmed_keywords
         if confirmed_keywords:
             logger.info("colloquial_evidence_confirmed", keywords=confirmed_keywords)
 
@@ -255,7 +195,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             if learned_archetypes:
                 ranked_archetypes.extend(learned_archetypes)
                 ranked_archetypes.sort(key=lambda item: item[1], reverse=True)
-            record_selected_intent(history, inv_id, intent, ranked_archetypes, learned_archetypes)
+            recorder.selected_intent(intent, ranked_archetypes, learned_archetypes)
 
             unavailable = [
                 backend.name
@@ -274,8 +214,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
                 summary = (
                     "No metrics found across any datasource. " "Verify your datasources are configured and have data."
                 )
-            history.finish(
-                inv_id,
+            recorder.finish(
                 status="failed",
                 error=error,
                 timings=timings,
@@ -289,82 +228,31 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             )
 
         # ── 4. Multi-label archetype matching ────────────────────
-        t0 = time.monotonic()
-        ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
-        ranked_ids = {arch.id for arch, _ in ranked_archetypes}
-        learned_archetypes = get_archetypes_by_learning_context(
-            intent,
-            metric_catalog,
-            min_confidence=0.35,
-            exclude_ids=ranked_ids,
-        )
-        if learned_archetypes:
-            ranked_archetypes.extend(learned_archetypes)
-            ranked_archetypes.sort(key=lambda item: item[1], reverse=True)
-
-        # Fallback: try legacy single-label lookup
-        if not ranked_archetypes:
-            legacy = get_archetype(intent.problem_type)
-            if legacy is not None:
-                ranked_archetypes = [(legacy, 0.9)]
-
-        record_selected_intent(history, inv_id, intent, ranked_archetypes, learned_archetypes)
-
-        # Target query language comes from the primary backend
         target_language = primary.query_language
+        selection = select_archetypes(
+            intent=intent,
+            metric_catalog=metric_catalog,
+            catalog_for_compile=catalog_for_compile,
+            target_language=target_language,
+            settings=runtime_settings,
+        )
+        ranked_archetypes = selection.ranked_archetypes
+        learned_archetypes = selection.learned_archetypes
 
-        # Coverage-rank + cap before deciding compile vs blend, so a strongly
-        # matching archetype wins over many generic templates and the panel
-        # explosion is bounded.
-        if ranked_archetypes:
-            ranked_archetypes = rank_archetypes_by_coverage(
-                ranked_archetypes,
-                catalog_for_compile,
-                target_language=target_language,
-                services=intent.services,
-                max_archetypes=runtime_settings.max_blended_archetypes,
-                min_secondary_coverage=runtime_settings.min_secondary_coverage,
-            )
+        recorder.selected_intent(intent, ranked_archetypes, learned_archetypes)
 
-        if ranked_archetypes:
-            primary_arch, primary_conf = ranked_archetypes[0]
-            # ── ARCHETYPE PATH: deterministic, no LLM needed ──────────
-
-            # Signal resolution happens inside compile_archetype/blend_archetypes
-            # via _resolve_archetype_signals — substitutes missing metrics
-            # with signal-resolved alternatives from the live catalog.
-
-            if len(ranked_archetypes) > 1:
-                dashboard_spec = blend_archetypes(
-                    ranked_archetypes,
-                    intent,
-                    catalog_for_compile,
-                    target_language=target_language,
-                )
-            else:
-                dashboard_spec = compile_archetype(
-                    primary_arch,
-                    intent,
-                    catalog_for_compile,
-                    target_language=target_language,
-                )
-            timings["archetype_compile"] = time.monotonic() - t0
-            stage_log(
-                "archetype_compile",
-                (time.monotonic() - t0) * 1000,
-                primary_archetype=primary_arch.id,
-                primary_confidence=primary_conf,
-                archetypes_matched=len(ranked_archetypes),
-                learned_archetypes_matched=len(learned_archetypes),
-                panels_generated=len(dashboard_spec.panels),
-                target_language=target_language,
-                signal_bindings_count=len(primary_arch.signal_bindings),
-            )
+        compilation = compile_selected_archetypes(
+            selection=selection,
+            intent=intent,
+            catalog_for_compile=catalog_for_compile,
+            timings=timings,
+        )
+        if compilation is not None:
+            dashboard_spec = compilation.dashboard_spec
         else:
             # ── FREEFORM PATH: LLM-driven discovery + query generation ─
             if not metric_catalog:
-                history.finish(
-                    inv_id,
+                recorder.finish(
                     status="failed",
                     error="No metrics found for freeform generation",
                     timings=timings,
@@ -421,8 +309,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             )
 
             if not discovery.metrics:
-                history.finish(
-                    inv_id,
+                recorder.finish(
                     status="failed",
                     error="No relevant metrics found by LLM",
                     timings=timings,
@@ -445,8 +332,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
                 logger.warning("llm_hallucinated_uids_dropped", dropped=dropped)
 
             if not discovery.metrics:
-                history.finish(
-                    inv_id,
+                recorder.finish(
                     status="failed",
                     error="All LLM-selected metrics had invalid datasource UIDs",
                     timings=timings,
@@ -472,41 +358,24 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
                 panels_generated=len(dashboard_spec.panels),
             )
 
-        evidence_requirements: list[EvidenceRequirement] = []
-        evidence_resolutions: list[EvidenceResolution] = []
-        if ranked_archetypes:
-            try:
-                evidence_archetypes = contributing_archetypes(ranked_archetypes, dashboard_spec)
-                evidence_requirements, evidence_resolutions = resolve_requirements_for_archetypes(
-                    evidence_archetypes,
-                    intent,
-                    catalog_for_compile,
-                    target_language=target_language,
-                )
-            except Exception:
-                logger.warning(
-                    "evidence_resolution_failed",
-                    error_type=EvidenceResolutionError.__name__,
-                    exc_info=True,
-                )
+        evidence_stage = run_evidence_stage(
+            ranked_archetypes=ranked_archetypes,
+            dashboard_spec=dashboard_spec,
+            intent=intent,
+            catalog=catalog_for_compile,
+            target_language=target_language,
+        )
+        evidence_requirements = evidence_stage.requirements
+        evidence_resolutions = evidence_stage.resolutions
 
         binding_status, binding_reason, binding_details = compiled_query_diagnostics(
             dashboard_spec,
             catalog_for_compile,
         )
-        record_stage(
-            history,
-            inv_id,
-            "binding",
-            binding_status,
-            binding_reason,
-            **binding_details,
-        )
+        recorder.stage("binding", binding_status, binding_reason, **binding_details)
         compiled_query_count = sum(len(panel.queries) for panel in dashboard_spec.panels)
         if compiled_query_count:
-            record_stage(
-                history,
-                inv_id,
+            recorder.stage(
                 "compilation",
                 "passed",
                 "queries_compiled",
@@ -515,9 +384,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
                 path="archetype" if ranked_archetypes else "freeform",
             )
         else:
-            record_stage(
-                history,
-                inv_id,
+            recorder.stage(
                 "compilation",
                 "failed",
                 "no_queries_compiled",
@@ -529,14 +396,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
         t0 = time.monotonic()
 
         def record_validation_stage(stage: str, status: str, reason_code: str, **details) -> None:
-            record_stage(
-                history,
-                inv_id,
-                stage,
-                status,
-                reason_code,
-                **details,
-            )
+            recorder.stage(stage, status, reason_code, **details)
 
         validation_result = await validate_dashboard_and_evidence(
             primary=primary,
@@ -563,21 +423,10 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
         )
 
         # Record queries after validation
-        try:
-            queries_for_history, metrics_for_history = query_history_payload(dashboard_spec)
-            history.record_queries(
-                inv_id,
-                metrics_selected=metrics_for_history,
-                generated_queries=queries_for_history,
-                panel_count=len(dashboard_spec.panels),
-                path_used="archetype" if ranked_archetypes else "freeform",
-            )
-        except Exception:
-            logger.warning("history_record_queries_failed", exc_info=True)
+        recorder.queries(dashboard_spec, path_used="archetype" if ranked_archetypes else "freeform")
 
         if not dashboard_spec.panels:
-            history.finish(
-                inv_id,
+            recorder.finish(
                 status="failed",
                 error="All panels empty after validation",
                 timings=timings,
@@ -593,21 +442,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             )
 
         # ── 6. Publish — each backend publishes independently ────────
-        publish_results: dict[str, PublishResult] = {}
-        for backend in backends:
-            t0 = time.monotonic()
-            try:
-                result = await backend.publish(dashboard_spec)
-                publish_results[backend.name] = result
-            except Exception:
-                logger.warning("publish_failed", backend=backend.name, exc_info=True)
-            timings[f"{backend.name}_publish"] = time.monotonic() - t0
-            stage_log(
-                "publish",
-                (time.monotonic() - t0) * 1000,
-                backend=backend.name,
-                success=backend.name in publish_results,
-            )
+        publish_results = await publish_dashboard(backends=backends, dashboard_spec=dashboard_spec, timings=timings)
 
         # Effective identifiers — first successful backend wins
         grafana_result = publish_results.get("grafana", PublishResult())
@@ -628,15 +463,11 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
         timings_rounded = {k: round(v, 2) for k, v in timings.items()}
 
         # Record validation results
-        try:
-            history.record_validation(
-                inv_id,
-                warnings=validation_warnings,
-                panels_dropped=max(panels_before - len(dashboard_spec.panels), 0),
-                final_panel_count=len(dashboard_spec.panels),
-            )
-        except Exception:
-            logger.warning("history_record_validation_failed", exc_info=True)
+        recorder.validation(
+            validation_warnings,
+            panels_before=panels_before,
+            final_panel_count=len(dashboard_spec.panels),
+        )
 
         stage_log(
             "pipeline_complete",
@@ -651,23 +482,17 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
         )
 
         # Record final result
-        try:
-            history.finish(
-                inv_id,
-                status="success",
-                dashboard_uid=effective_uid,
-                dashboard_url=effective_url,
-                timings=timings_rounded,
-                total_time=total_s,
-            )
-        except Exception:
-            logger.warning("history_finish_failed", exc_info=True)
+        recorder.finish(
+            status="success",
+            dashboard_uid=effective_uid,
+            dashboard_url=effective_url,
+            timings=timings_rounded,
+            total_time=total_s,
+        )
 
         # ── 7. Record provenance for feedback system ──────────────────
         try:
-            from dashforge.feedback import get_feedback_store
-
-            feedback_store = get_feedback_store()
+            feedback_store = deps.feedback_store_factory()
             _, metrics_used = query_history_payload(dashboard_spec)
             feedback_store.record_provenance(
                 dashboard_uid=effective_uid,

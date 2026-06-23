@@ -24,6 +24,7 @@ class PipelineDependencies:
     settings: Settings
     backend_factory: Callable[[], list[DashboardBackend]]
     history_store_factory: Callable[[], Any]
+    feedback_store_factory: Callable[[], Any]
     llm_cache: Any
     cache_key_factory: Callable[..., str]
 
@@ -33,9 +34,17 @@ class PipelineDependencies:
             settings=settings,
             backend_factory=get_active_backends,
             history_store_factory=get_investigation_store,
+            feedback_store_factory=_get_feedback_store,
             llm_cache=llm_cache,
             cache_key_factory=make_cache_key,
         )
+
+
+def _get_feedback_store() -> Any:
+    """Resolve the feedback store lazily so monkeypatched runtimes are honored."""
+    from dashforge import feedback
+
+    return feedback.get_feedback_store()
 
 
 def get_default_dependencies() -> PipelineDependencies:

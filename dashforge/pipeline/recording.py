@@ -13,6 +13,102 @@ from dashforge.models.schemas import DashboardSpec, Intent, MetricEntry, SignalT
 logger = structlog.get_logger()
 
 
+class PipelineRecorder:
+    """Centralize best-effort history writes and diagnostic stage recording."""
+
+    def __init__(self, history: Any, investigation_id: str):
+        self.history = history
+        self.investigation_id = investigation_id
+
+    def stage(self, stage: str, status: str, reason_code: str, **details: Any) -> None:
+        record_stage(self.history, self.investigation_id, stage, status, reason_code, **details)
+
+    def intent(self, intent: Intent) -> None:
+        try:
+            self.history.record_intent(
+                self.investigation_id,
+                summary=intent.summary,
+                domain=intent.domain,
+                services=intent.services,
+                keywords=intent.keywords,
+                signals=[s.value for s in intent.signals],
+                problem_type=intent.problem_type,
+                archetypes=[{"type": a.type, "confidence": a.confidence} for a in intent.archetypes],
+                timerange=intent.timerange,
+            )
+        except Exception:
+            logger.warning(
+                "history_record_intent_failed",
+                error_type=HistoryWriteFailed.__name__,
+                exc_info=True,
+            )
+
+    def selected_intent(
+        self,
+        intent: Intent,
+        ranked_archetypes: list[tuple[Any, float]],
+        learned_archetypes: list[tuple[Any, float]],
+    ) -> None:
+        record_selected_intent(self.history, self.investigation_id, intent, ranked_archetypes, learned_archetypes)
+
+    def discovery(self, catalog_discovery: Any) -> None:
+        try:
+            self.history.record_discovery(
+                self.investigation_id,
+                datasources_found=len(catalog_discovery.datasource_types),
+                datasource_types=catalog_discovery.datasource_types,
+                metrics_catalog_size=len(catalog_discovery.metric_catalog),
+            )
+        except Exception:
+            logger.warning(
+                "history_record_discovery_failed",
+                error_type=HistoryWriteFailed.__name__,
+                exc_info=True,
+            )
+
+    def queries(self, dashboard_spec: DashboardSpec, *, path_used: str) -> None:
+        try:
+            queries_for_history, metrics_for_history = query_history_payload(dashboard_spec)
+            self.history.record_queries(
+                self.investigation_id,
+                metrics_selected=metrics_for_history,
+                generated_queries=queries_for_history,
+                panel_count=len(dashboard_spec.panels),
+                path_used=path_used,
+            )
+        except Exception:
+            logger.warning(
+                "history_record_queries_failed",
+                error_type=HistoryWriteFailed.__name__,
+                exc_info=True,
+            )
+
+    def validation(self, warnings: list[str], *, panels_before: int, final_panel_count: int) -> None:
+        try:
+            self.history.record_validation(
+                self.investigation_id,
+                warnings=warnings,
+                panels_dropped=max(panels_before - final_panel_count, 0),
+                final_panel_count=final_panel_count,
+            )
+        except Exception:
+            logger.warning(
+                "history_record_validation_failed",
+                error_type=HistoryWriteFailed.__name__,
+                exc_info=True,
+            )
+
+    def finish(self, **kwargs: Any) -> None:
+        try:
+            self.history.finish(self.investigation_id, **kwargs)
+        except Exception:
+            logger.warning(
+                "history_finish_failed",
+                error_type=HistoryWriteFailed.__name__,
+                exc_info=True,
+            )
+
+
 def record_stage(history: Any, inv_id: str, stage: str, status: str, reason_code: str, **details: Any) -> None:
     """Best-effort persistence for diagnostic stage outcomes."""
     try:
