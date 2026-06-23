@@ -1,7 +1,13 @@
 from promql_parser import parse
 
 from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
-from dashforge.evidence import requirements_for_archetype
+from dashforge.evidence import SUPPORTED_OBSERVATION, requirements_for_archetype
+from dashforge.evidence_artifacts import (
+    build_evidence_gap_dashboard,
+    build_symptom_evidence_dashboard,
+    missing_critical_evidence_gap_requirements,
+    missing_critical_symptom_requirements,
+)
 from dashforge.models.schemas import (
     ArchetypeMatch,
     DashboardSpec,
@@ -14,11 +20,9 @@ from dashforge.models.schemas import (
     SignalType,
 )
 from dashforge.pipeline import (
-    _build_symptom_evidence_dashboard,
     _compiled_query_diagnostics,
     _history_archetypes,
     _history_signals,
-    _missing_critical_symptom_requirements,
     _semantic_mapping_diagnostics,
 )
 from dashforge.signals import SignalStore
@@ -184,7 +188,7 @@ def test_symptom_evidence_dashboard_preserves_resolved_application_symptoms():
         ),
     ]
 
-    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+    dashboard, rescue_resolutions = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -238,7 +242,7 @@ def test_symptom_evidence_dashboard_does_not_promote_resource_evidence():
         )
     ]
 
-    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+    dashboard, rescue_resolutions = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -287,7 +291,7 @@ def test_symptom_evidence_dashboard_resolves_direct_latency_when_template_shape_
         )
     ]
 
-    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+    dashboard, rescue_resolutions = build_symptom_evidence_dashboard(
         requirements,
         unresolved,
         intent,
@@ -338,7 +342,7 @@ def test_symptom_evidence_dashboard_allows_prometheus_compatible_datasources():
         )
     ]
 
-    dashboard, _ = _build_symptom_evidence_dashboard(
+    dashboard, _ = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -381,7 +385,7 @@ def test_symptom_evidence_dashboard_uses_catalog_label_selector_and_rates_counte
         )
     ]
 
-    dashboard, _ = _build_symptom_evidence_dashboard(
+    dashboard, _ = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -423,7 +427,7 @@ def test_symptom_evidence_dashboard_scopes_promql_when_service_labels_unsampled(
         )
     ]
 
-    dashboard, _ = _build_symptom_evidence_dashboard(
+    dashboard, _ = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -465,7 +469,7 @@ def test_symptom_evidence_dashboard_keeps_service_variant_selector():
         )
     ]
 
-    dashboard, _ = _build_symptom_evidence_dashboard(
+    dashboard, _ = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -528,7 +532,7 @@ def test_symptom_evidence_dashboard_records_duplicate_resolutions_while_deduping
         ),
     ]
 
-    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+    dashboard, rescue_resolutions = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -575,7 +579,7 @@ def test_symptom_evidence_dashboard_renders_histogram_bucket_latency():
         )
     ]
 
-    dashboard, _ = _build_symptom_evidence_dashboard(
+    dashboard, _ = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -619,7 +623,7 @@ def test_symptom_evidence_dashboard_preserves_error_spike_as_error_rate():
         )
     ]
 
-    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+    dashboard, rescue_resolutions = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -663,7 +667,7 @@ def test_symptom_evidence_dashboard_rates_clear_error_counters():
         )
     ]
 
-    dashboard, _ = _build_symptom_evidence_dashboard(
+    dashboard, _ = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -708,7 +712,7 @@ def test_symptom_evidence_dashboard_abstains_on_latency_sum_count_helpers():
         )
     ]
 
-    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+    dashboard, rescue_resolutions = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -752,7 +756,7 @@ def test_symptom_evidence_dashboard_builds_signalflow_panels():
         )
     ]
 
-    dashboard, _ = _build_symptom_evidence_dashboard(
+    dashboard, _ = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -806,7 +810,7 @@ def test_symptom_evidence_dashboard_scopes_signalflow_when_dimension_values_unsa
         )
     ]
 
-    dashboard, _ = _build_symptom_evidence_dashboard(
+    dashboard, _ = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -859,7 +863,7 @@ def test_symptom_evidence_dashboard_abstains_on_tied_metric_owners(monkeypatch, 
         )
     ]
 
-    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+    dashboard, rescue_resolutions = build_symptom_evidence_dashboard(
         requirements,
         unresolved,
         intent,
@@ -905,7 +909,7 @@ def test_symptom_evidence_dashboard_preserves_error_context_for_request_counter(
         )
     ]
 
-    dashboard, rescue_resolutions = _build_symptom_evidence_dashboard(
+    dashboard, rescue_resolutions = build_symptom_evidence_dashboard(
         requirements,
         resolutions,
         intent,
@@ -918,7 +922,7 @@ def test_symptom_evidence_dashboard_preserves_error_context_for_request_counter(
     assert rescue_resolutions == []
 
 
-def test_missing_critical_symptom_requirements_detects_partial_dashboard_gap():
+def testmissing_critical_symptom_requirements_detects_partial_dashboard_gap():
     archetype = InvestigationArchetype(
         id="latency_and_cpu",
         name="Latency and CPU",
@@ -963,18 +967,19 @@ def test_missing_critical_symptom_requirements_detects_partial_dashboard_gap():
         ),
         EvidenceObservation(
             requirement_id=requirements[1].id,
+            outcome=SUPPORTED_OBSERVATION,
             resolution_metric="container_cpu_usage_seconds_total",
             survived=True,
             non_empty=True,
         ),
     ]
 
-    missing = _missing_critical_symptom_requirements(requirements, resolutions, observations)
+    missing = missing_critical_symptom_requirements(requirements, resolutions, observations)
 
     assert [requirement.signal_type for requirement in missing] == ["request_latency"]
 
 
-def test_missing_critical_symptom_requirements_treats_signalfx_exists_as_surfaced():
+def testmissing_critical_symptom_requirements_treats_signalfx_exists_as_surfaced():
     archetype = InvestigationArchetype(
         id="latency_investigation",
         name="Latency Investigation",
@@ -1014,6 +1019,259 @@ def test_missing_critical_symptom_requirements_treats_signalfx_exists_as_surface
         )
     ]
 
-    missing = _missing_critical_symptom_requirements(requirements, resolutions, observations)
+    missing = missing_critical_symptom_requirements(requirements, resolutions, observations)
 
     assert missing == []
+
+
+def test_evidence_gap_dashboard_resolves_supported_resource_observation(monkeypatch, tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.load_from_yaml()
+    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    archetype = _arch(
+        "resource_saturation",
+        required_signals=["cpu_usage"],
+        signal_bindings={"cpu_usage": "container_cpu_usage_seconds_total"},
+    )
+    intent = Intent(
+        summary="checkout resource pressure",
+        domain="infrastructure",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["cpu"],
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    unresolved = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="unresolved",
+            reason_code="no_compatible_live_signal",
+        )
+    ]
+
+    dashboard, gap_resolutions = build_evidence_gap_dashboard(
+        requirements,
+        unresolved,
+        intent,
+        catalog=[
+            _metric(
+                "gamma_container_cpu_usage_seconds_total",
+                dimensions=["service={checkout}"],
+                metric_type="counter",
+            )
+        ],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert dashboard.tags == ["dashforge", "evidence", "gap-observation"]
+    assert dashboard.panels[0].title == "Supported CPU Observation"
+    assert dashboard.panels[0].row == "Supported Observations"
+    assert dashboard.panels[0].queries[0].expr == (
+        'sum(rate(gamma_container_cpu_usage_seconds_total{service=~"checkout"}[5m]))'
+    )
+    assert gap_resolutions[0].reason_code == "evidence_gap_supported_observation"
+    panel_text = " ".join(
+        [
+            dashboard.title,
+            dashboard.panels[0].title,
+            dashboard.panels[0].description,
+            dashboard.panels[0].row,
+        ]
+    ).lower()
+    assert "culprit" not in panel_text
+    assert "root cause" not in panel_text
+    assert "caused by" not in panel_text
+
+
+def test_evidence_gap_dashboard_requires_requested_service_scope(monkeypatch, tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.load_from_yaml()
+    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    archetype = _arch(
+        "resource_saturation",
+        required_signals=["cpu_usage"],
+        signal_bindings={"cpu_usage": "container_cpu_usage_seconds_total"},
+    )
+    intent = Intent(
+        summary="checkout resource pressure",
+        domain="infrastructure",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["cpu"],
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+
+    dashboard, gap_resolutions = build_evidence_gap_dashboard(
+        requirements,
+        [
+            EvidenceResolution(
+                requirement_id=requirements[0].id,
+                status="unresolved",
+                reason_code="no_compatible_live_signal",
+            )
+        ],
+        intent,
+        catalog=[_metric("gamma_container_cpu_usage_seconds_total", dimensions=["service={payments}"])],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert dashboard.panels == []
+    assert gap_resolutions == []
+
+
+def test_evidence_gap_dashboard_requires_catalog_owner_for_service_scope():
+    archetype = _arch(
+        "resource_saturation",
+        required_signals=["cpu_usage"],
+        signal_bindings={"cpu_usage": "container_cpu_usage_seconds_total"},
+    )
+    intent = Intent(
+        summary="checkout resource pressure",
+        domain="infrastructure",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["cpu"],
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+
+    dashboard, gap_resolutions = build_evidence_gap_dashboard(
+        requirements,
+        [
+            EvidenceResolution(
+                requirement_id=requirements[0].id,
+                status="resolved",
+                reason_code="live_signal_resolved",
+                metric="gamma_container_cpu_usage_seconds_total",
+                datasource_uid="gamma",
+                datasource_type="prometheus",
+                query_language="promql",
+            )
+        ],
+        intent,
+        catalog=[],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert dashboard.panels == []
+    assert gap_resolutions == []
+
+
+def test_evidence_gap_dashboard_abstains_on_ambiguous_owners(monkeypatch, tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.load_from_yaml()
+    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    archetype = _arch(
+        "resource_saturation",
+        required_signals=["cpu_usage"],
+        signal_bindings={"cpu_usage": "container_cpu_usage_seconds_total"},
+    )
+    intent = Intent(
+        summary="resource pressure",
+        domain="infrastructure",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["cpu"],
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+
+    dashboard, gap_resolutions = build_evidence_gap_dashboard(
+        requirements,
+        [
+            EvidenceResolution(
+                requirement_id=requirements[0].id,
+                status="unresolved",
+                reason_code="ambiguous_live_signal",
+            )
+        ],
+        intent,
+        catalog=[
+            _metric("gamma_container_cpu_usage_seconds_total", datasource_uid="prom-a"),
+            _metric("gamma_container_cpu_usage_seconds_total", datasource_uid="prom-b"),
+        ],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert dashboard.panels == []
+    assert gap_resolutions == []
+
+
+def testmissing_critical_evidence_gap_requirements_excludes_symptoms_and_surfaced_evidence():
+    archetype = InvestigationArchetype(
+        id="mixed",
+        name="Mixed",
+        problem_types=["mixed"],
+        required_signals=["request_latency", "cpu_usage", "memory_usage"],
+        signal_bindings={
+            "request_latency": "http_request_duration_seconds",
+            "cpu_usage": "container_cpu_usage_seconds_total",
+            "memory_usage": "container_memory_working_set_bytes",
+        },
+        panels=[PanelTemplate(title="Mixed", queries=[QueryTemplate(expr="up")])],
+    )
+    intent = Intent(
+        summary="checkout slow and resource pressure",
+        domain="application",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["latency", "cpu"],
+        problem_type="mixed",
+        archetypes=[ArchetypeMatch(type="mixed", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirements[0].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="http_request_duration_seconds",
+        ),
+        EvidenceResolution(
+            requirement_id=requirements[1].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="container_cpu_usage_seconds_total",
+        ),
+        EvidenceResolution(
+            requirement_id=requirements[2].id,
+            status="resolved",
+            reason_code="live_signal_resolved",
+            metric="container_memory_working_set_bytes",
+        ),
+    ]
+    observations = [
+        EvidenceObservation(
+            requirement_id=requirements[0].id,
+            resolution_metric="http_request_duration_seconds",
+            survived=False,
+            non_empty=False,
+        ),
+        EvidenceObservation(
+            requirement_id=requirements[1].id,
+            outcome=SUPPORTED_OBSERVATION,
+            resolution_metric="container_cpu_usage_seconds_total",
+            survived=True,
+            non_empty=True,
+        ),
+        EvidenceObservation(
+            requirement_id=requirements[2].id,
+            resolution_metric="container_memory_working_set_bytes",
+            survived=False,
+            non_empty=False,
+        ),
+    ]
+
+    missing = missing_critical_evidence_gap_requirements(requirements, resolutions, observations)
+
+    assert [requirement.signal_type for requirement in missing] == ["memory_usage"]

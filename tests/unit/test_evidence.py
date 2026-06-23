@@ -1,5 +1,9 @@
 from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from dashforge.evidence import (
+    AMBIGUOUS_EVIDENCE,
+    MISSING_EVIDENCE,
+    SUPPORTED_OBSERVATION,
+    build_evidence_records,
     contributing_archetypes,
     observe_evidence,
     requirements_for_archetype,
@@ -9,7 +13,10 @@ from dashforge.evidence import (
 from dashforge.models.schemas import (
     ArchetypeMatch,
     DashboardSpec,
+    EvidenceLifecycleStatus,
+    EvidenceObservation,
     EvidenceResolution,
+    EvidenceResolutionStatus,
     Intent,
     MetricEntry,
     PanelQuery,
@@ -101,6 +108,46 @@ def test_evidence_resolves_prefixed_live_metrics(monkeypatch, tmp_path):
     assert all(resolution.reason_code == "live_signal_resolved" for resolution in resolutions)
 
 
+def test_evidence_record_preserves_primary_failure_and_gap_observation():
+    requirements = requirements_for_archetype(_resource_archetype(), _intent())
+    primary = EvidenceResolution(
+        requirement_id=requirements[0].id,
+        status=EvidenceResolutionStatus.UNRESOLVED,
+        reason_code="no_compatible_live_signal",
+    )
+    gap = EvidenceResolution(
+        requirement_id=requirements[0].id,
+        status=EvidenceResolutionStatus.RESOLVED,
+        reason_code="evidence_gap_supported_observation",
+        metric="gamma_container_cpu_usage_seconds_total",
+        datasource_uid="gamma",
+        datasource_type="prometheus",
+        query_language="promql",
+    )
+    observation = EvidenceObservation(
+        requirement_id=requirements[0].id,
+        outcome=SUPPORTED_OBSERVATION,
+        resolution_metric="gamma_container_cpu_usage_seconds_total",
+        valid_query=True,
+        non_empty=True,
+        survived=True,
+    )
+
+    records = build_evidence_records(requirements, [primary, gap], [observation])
+    summary = summarize_evidence(requirements, [primary, gap], [observation])
+
+    assert records[0].primary_resolution == primary
+    assert records[0].gap_resolution == gap
+    assert records[0].observation == observation
+    assert records[0].final_status == EvidenceLifecycleStatus.SUPPORTED_OBSERVATION
+    assert summary["critical_observed"] == 1
+    assert summary["lifecycle_statuses"] == {
+        "supported_observation": 1,
+        "required": 1,
+    }
+    assert summary["records"][0]["final_status"] == EvidenceLifecycleStatus.SUPPORTED_OBSERVATION
+
+
 def test_evidence_resolution_includes_native_query_languages():
     archetype = InvestigationArchetype(
         id="learned-cloudwatch",
@@ -187,10 +234,17 @@ def test_default_metric_with_multiple_owners_abstains_from_evidence_owner():
         ),
     ]
 
-    _, resolutions = resolve_requirements_for_archetype(archetype, _intent(), catalog)
+    requirements, resolutions = resolve_requirements_for_archetype(archetype, _intent(), catalog)
+    observations = observe_evidence(
+        requirements,
+        resolutions,
+        DashboardSpec(title="empty", panels=[]),
+        DashboardSpec(title="empty", panels=[]),
+    )
 
     assert resolutions[0].status == "unresolved"
     assert resolutions[0].reason_code == "ambiguous_default_metric_owner"
+    assert observations[0].outcome == AMBIGUOUS_EVIDENCE
 
 
 def test_live_signal_required_metric_with_multiple_owners_abstains(monkeypatch, tmp_path):
@@ -379,6 +433,7 @@ def test_evidence_observations_measure_survival_after_validation():
     assert summary["critical_resolution_recall"] == 1.0
     assert summary["critical_survival_recall"] == 0.5
     assert {obs.rejection_reason for obs in observations} == {"", "query_rejected_by_validation"}
+    assert {obs.outcome for obs in observations} == {SUPPORTED_OBSERVATION, MISSING_EVIDENCE}
 
 
 def test_skipped_validation_survives_but_does_not_count_as_observed():
@@ -438,6 +493,7 @@ def test_skipped_validation_survives_but_does_not_count_as_observed():
 
     assert observations[0].survived is True
     assert observations[0].non_empty is False
+    assert observations[0].outcome == MISSING_EVIDENCE
     assert observations[0].rejection_reason == "skipped"
     assert summary["critical_survival_recall"] == 0.0
 
@@ -479,6 +535,7 @@ def test_unstamped_surviving_query_does_not_count_as_observed():
     assert observations[0].survived is True
     assert observations[0].valid_query is True
     assert observations[0].non_empty is False
+    assert observations[0].outcome == MISSING_EVIDENCE
     assert observations[0].rejection_reason == "query_validation_unverified"
     assert summary["critical_survival_recall"] == 0.0
 
@@ -543,6 +600,7 @@ def test_signalfx_exists_validation_survives_but_does_not_count_as_observed():
 
     assert observations[0].survived is True
     assert observations[0].non_empty is False
+    assert observations[0].outcome == MISSING_EVIDENCE
     assert observations[0].rejection_reason == "exists"
     assert summary["critical_survival_recall"] == 0.0
 
@@ -570,6 +628,7 @@ def test_evidence_observation_matches_metric_tokens_not_substrings():
     observations = observe_evidence(requirements, resolutions, pre_validation, pre_validation)
 
     assert observations[0].rejection_reason == "resolved_metric_not_observed_in_queries"
+    assert observations[0].outcome == MISSING_EVIDENCE
 
 
 def test_evidence_observation_requires_resolved_datasource_owner():
@@ -615,6 +674,7 @@ def test_evidence_observation_requires_resolved_datasource_owner():
 
     assert observations[0].survived is False
     assert observations[0].non_empty is False
+    assert observations[0].outcome == MISSING_EVIDENCE
     assert observations[0].rejection_reason == "query_rejected_by_validation"
     assert summary["critical_survival_recall"] == 0.0
 
@@ -658,3 +718,4 @@ def test_histogram_bucket_query_counts_as_observed_base_histogram_evidence():
 
     assert observations[0].survived is True
     assert observations[0].non_empty is True
+    assert observations[0].outcome == SUPPORTED_OBSERVATION
