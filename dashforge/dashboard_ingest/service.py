@@ -22,297 +22,31 @@ store's taxonomy, and optionally auto-generates an archetype YAML snippet.
 
 from __future__ import annotations
 
-import re
 import threading
-from collections import defaultdict
 from typing import Any
 
 import structlog
 import yaml
 
 from dashforge.config import settings
-from dashforge.query_parsing.promql import extract_aggregation_patterns, extract_metrics_from_promql
-from dashforge.signals import get_signal_store
+from dashforge.dashboard_ingest.archetype_generation import generate_archetype_yaml
+from dashforge.dashboard_ingest.features import (
+    features_to_dict as _features_to_dict,
+)
+from dashforge.signals import get_signal_store as _default_get_signal_store
 
 logger = structlog.get_logger()
 _ARCHETYPE_REGISTRATION_LOCK = threading.Lock()
 
-# ── Dashboard JSON parsing ───────────────────────────────────────────────────
 
+def get_signal_store():
+    """Resolve the signal store through the package façade for test isolation."""
+    import dashforge.dashboard_ingest as dashboard_ingest_pkg
 
-def _datasource_type_to_language(ds_type: str) -> str:
-    """Map a Grafana datasource type to its query language.
-
-    Defaults to ``promql`` when the type is unknown or empty, but recognizes the
-    common non-Prometheus backends so ingestion can preserve their queries
-    verbatim instead of mis-parsing them as PromQL.
-    """
-    t = (ds_type or "").lower()
-    if not t:
-        return "promql"
-    exact = {
-        "prometheus": "promql",
-        "mimir": "promql",
-        "cortex": "promql",
-        "thanos": "promql",
-        "loki": "logql",
-        "cloudwatch": "cloudwatch",
-        "signalfx": "signalflow",
-        "elasticsearch": "lucene",
-        "opensearch": "lucene",
-        "graphite": "graphite",
-        "influxdb": "influxql",
-    }
-    if t in exact:
-        return exact[t]
-    for needle, lang in (
-        ("prometheus", "promql"),
-        ("signalfx", "signalflow"),
-        ("loki", "logql"),
-        ("cloudwatch", "cloudwatch"),
-        ("elasticsearch", "lucene"),
-        ("opensearch", "lucene"),
-        ("graphite", "graphite"),
-        ("influx", "influxql"),
-    ):
-        if needle in t:
-            return lang
-    return "promql"
-
-
-def _language_to_datasource_type(language: str) -> str:
-    """Best-effort inverse of :func:`_datasource_type_to_language` for tagging."""
-    return {
-        "promql": "prometheus",
-        "logql": "loki",
-        "cloudwatch": "cloudwatch",
-        "signalflow": "signalfx",
-        "lucene": "elasticsearch",
-        "graphite": "graphite",
-        "influxql": "influxdb",
-    }.get(language, "prometheus")
-
-
-def _extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
-    """Extract relevant data from a single Grafana panel JSON.
-
-    Per-language aware: PromQL metric extraction and aggregation parsing only run
-    on Prometheus-family targets. Non-PromQL queries (LogQL, SignalFlow, etc.)
-    are preserved verbatim, and CloudWatch targets are captured as structured
-    templates (namespace / metric / stat / region / dimensions).
-    """
-    panel_type = panel.get("type", "")
-    title = panel.get("title", "")
-
-    # Skip row panels, text panels, etc.
-    if panel_type in ("row", "text", "news", "dashlist", ""):
-        return None
-
-    panel_ds = panel.get("datasource", {})
-    panel_ds_type = panel_ds.get("type", "") if isinstance(panel_ds, dict) else ""
-
-    queries = []
-    metrics = []
-    agg_patterns = []
-    cloudwatch_targets: list[dict[str, Any]] = []
-    datasource_type = ""
-
-    # Extract from targets (query definitions)
-    for target in panel.get("targets", []):
-        t_ds = target.get("datasource", {})
-        t_ds_type = t_ds.get("type", "") if isinstance(t_ds, dict) else ""
-        eff_ds = t_ds_type or panel_ds_type
-        language = _datasource_type_to_language(eff_ds)
-
-        expr = target.get("expr", "") or target.get("query", "") or ""
-        if expr:
-            queries.append(expr)
-            if language == "promql":
-                metrics.extend(extract_metrics_from_promql(expr))
-                agg_patterns.extend(extract_aggregation_patterns(expr))
-            elif language == "signalflow":
-                # SignalFlow has its own metric grammar; reuse the SignalFx
-                # extractor rather than the PromQL one.
-                try:
-                    from dashforge.backends.signalfx import _extract_metrics_from_signalflow
-
-                    metrics.extend(_extract_metrics_from_signalflow(expr))
-                except Exception:  # pragma: no cover - defensive
-                    pass
-            # Other languages (LogQL, etc.): preserve the query, no PromQL parse.
-            if eff_ds:
-                datasource_type = eff_ds
-        else:
-            # CloudWatch-style structured target (no expr/query string).
-            cw_metric = target.get("metricName", "")
-            if cw_metric:
-                cw_ns = target.get("namespace", "")
-                stat = target.get("statistic", "") or (target.get("statistics") or [""])[0] or ""
-                region = target.get("region", "")
-                dimensions = target.get("dimensions", {}) or {}
-                metric_name = f"{cw_ns}/{cw_metric}" if cw_ns else cw_metric
-                metrics.append(metric_name)
-                cloudwatch_targets.append(
-                    {
-                        "namespace": cw_ns,
-                        "metric_name": cw_metric,
-                        "stat": stat,
-                        "region": region,
-                        "dimensions": dimensions,
-                    }
-                )
-                datasource_type = eff_ds or "cloudwatch"
-
-    if not metrics and not queries and not cloudwatch_targets:
-        return None
-
-    if not datasource_type:
-        datasource_type = panel_ds_type
-    query_language = _datasource_type_to_language(datasource_type)
-
-    # Per-panel drilldown links (panel.links). These attach navigation paths
-    # at the panel level and are distinct from dashboard-level links.
-    panel_links = []
-    links = panel.get("links", [])
-    if not isinstance(links, list):
-        links = []
-    for link in links:
-        if not isinstance(link, dict):
-            continue
-        link_title = link.get("title", "")
-        link_url = link.get("url", "")
-        if link_title or link_url:
-            panel_links.append({"title": link_title, "url": link_url})
-
-    return {
-        "title": title,
-        "description": panel.get("description", ""),
-        "panel_type": panel_type,
-        "metrics": list(dict.fromkeys(metrics)),
-        "queries": queries,
-        "aggregation_patterns": agg_patterns,
-        "datasource_type": datasource_type,
-        "query_language": query_language,
-        "cloudwatch_targets": cloudwatch_targets,
-        "unit": panel.get("fieldConfig", {}).get("defaults", {}).get("unit", ""),
-        "links": panel_links,
-    }
-
-
-def parse_dashboard_json(dashboard_json: dict[str, Any]) -> dict[str, Any]:
-    """Parse a full Grafana dashboard JSON and extract operational features.
-
-    Returns a structured dict with all extracted features suitable for
-    signal inference and archetype generation.
-    """
-    dashboard = dashboard_json.get("dashboard", dashboard_json)
-
-    title = dashboard.get("title", "")
-    tags = dashboard.get("tags", [])
-    uid = dashboard.get("uid", "")
-
-    # Flatten panels (handle nested row panels + non-collapsed row context)
-    all_panels = []
-    current_row = ""
-    for panel in dashboard.get("panels", []):
-        if panel.get("type") == "row":
-            current_row = panel.get("title", "")
-            # Collapsed rows have their panels nested inside
-            for sub in panel.get("panels", []):
-                data = _extract_panel_data(sub)
-                if data:
-                    data["row"] = current_row
-                    all_panels.append(data)
-        else:
-            data = _extract_panel_data(panel)
-            if data:
-                data["row"] = current_row
-                all_panels.append(data)
-
-    # Collect all metrics
-    all_metrics = []
-    for p in all_panels:
-        all_metrics.extend(p["metrics"])
-    unique_metrics = list(dict.fromkeys(all_metrics))
-
-    # Row groups
-    row_groups = defaultdict(list)
-    for p in all_panels:
-        row = p.get("row", "") or "ungrouped"
-        row_groups[row].append(p["title"])
-    row_groups_list = [{"row": row, "panels": panels} for row, panels in row_groups.items()]
-
-    # Metric co-occurrence: for each metric, which other metrics appear in the same dashboard
-    cooccurrence: dict[str, list[str]] = {}
-    for metric in unique_metrics:
-        co = [m for m in unique_metrics if m != metric]
-        if co:
-            cooccurrence[metric] = co
-
-    # Aggregation patterns across all panels
-    all_agg_patterns = []
-    for p in all_panels:
-        for agg in p.get("aggregation_patterns", []):
-            agg["panel_title"] = p["title"]
-            # Find the metric this aggregation applies to
-            if p["metrics"]:
-                agg["metric"] = p["metrics"][0]
-            all_agg_patterns.append(agg)
-
-    # All query transformations
-    all_queries = []
-    for p in all_panels:
-        for q in p.get("queries", []):
-            all_queries.append(q)
-
-    # Panel titles
-    panel_titles = [p["title"] for p in all_panels if p["title"]]
-
-    # Alert links — look for alert annotations and panel alert rules
-    alert_links = []
-    annotations = dashboard.get("annotations", {}).get("list", [])
-    for ann in annotations:
-        if "alert" in ann.get("name", "").lower():
-            alert_links.append(ann.get("name", ""))
-
-    # Drilldown links — look for panel links and dashboard links
-    drilldown_links = []
-    dashboard_links = dashboard.get("links", [])
-    if not isinstance(dashboard_links, list):
-        dashboard_links = []
-    for link in dashboard_links:
-        if not isinstance(link, dict):
-            continue
-        if link.get("type") == "dashboards":
-            drilldown_links.extend(link.get("tags", []))
-        elif link.get("type") == "link":
-            url = link.get("url", "")
-            if url:
-                drilldown_links.append(url)
-
-    # Per-panel drilldown links (panel.links) captured in _extract_panel_data.
-    # Fold them into the aggregate so navigation paths aren't discarded.
-    for p in all_panels:
-        for link in p.get("links", []):
-            target = link.get("url") or link.get("title")
-            if target and target not in drilldown_links:
-                drilldown_links.append(target)
-
-    return {
-        "dashboard_uid": uid,
-        "dashboard_title": title,
-        "dashboard_tags": tags,
-        "metrics_found": unique_metrics,
-        "panel_count": len(all_panels),
-        "row_groups": row_groups_list,
-        "metric_cooccurrence": cooccurrence,
-        "aggregation_patterns": all_agg_patterns,
-        "query_transformations": all_queries,
-        "panel_titles": panel_titles,
-        "alert_links": alert_links,
-        "drilldown_links": drilldown_links,
-        "panels": all_panels,
-    }
+    package_getter = getattr(dashboard_ingest_pkg, "get_signal_store", _default_get_signal_store)
+    if package_getter is get_signal_store:
+        return _default_get_signal_store()
+    return package_getter()
 
 
 # ── Signal inference ─────────────────────────────────────────────────────────
@@ -431,167 +165,7 @@ def _canonical_signal_type_for_heuristic(sig: Any) -> str:
     return sig.signal_name
 
 
-# ── Archetype generation ─────────────────────────────────────────────────────
-
-_TEMPLATE_PLACEHOLDER_NAMES = ("service_filter", "container_filter", "rate_interval")
-
-
-def _escape_literal_braces(expr: str) -> str:
-    """Escape literal ``{``/``}`` in a concrete query for later ``str.format``.
-
-    Generated archetype YAML can contain two different kinds of braces:
-
-    * concrete query label selectors, e.g. ``{service="api"}``, which must be
-      escaped so ``str.format(**params)`` treats them as literal braces; and
-    * DashForge template placeholders, e.g. ``{service_filter}`` and the
-      PromQL label-selector form ``{{{service_filter}}}``, which must remain
-      format placeholders.
-    """
-    protected: dict[str, str] = {}
-
-    def protect(value: str) -> str:
-        token = f"__DASHFORGE_FMT_TOKEN_{len(protected)}__"
-        protected[token] = value
-        return token
-
-    # Protect the triple-brace label-selector placeholders first so the inner
-    # ``{service_filter}`` match below cannot partially consume them.
-    for name in _TEMPLATE_PLACEHOLDER_NAMES:
-        expr = expr.replace(f"{{{{{{{name}}}}}}}", protect(f"{{{{{{{name}}}}}}}"))
-
-    # Protect simple placeholders such as ``{rate_interval}``.
-    for name in _TEMPLATE_PLACEHOLDER_NAMES:
-        expr = expr.replace(f"{{{name}}}", protect(f"{{{name}}}"))
-
-    escaped = expr.replace("{", "{{").replace("}", "}}")
-    for token, value in protected.items():
-        escaped = escaped.replace(token, value)
-    return escaped
-
-
-def generate_archetype_yaml(
-    extracted: dict[str, Any],
-    signals: list[dict[str, Any]],
-    archetype_id: str = "",
-) -> str:
-    """Generate an archetype YAML snippet from extracted dashboard features.
-
-    This is a suggestion — engineers should review and customize before
-    activating.
-    """
-    import yaml
-
-    title = extracted["dashboard_title"]
-    if not archetype_id:
-        # Generate ID from title
-        archetype_id = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
-
-    # Derive problem_types from tags + title
-    problem_types = [archetype_id]
-    for tag in extracted.get("dashboard_tags", []):
-        clean = re.sub(r"[^a-z0-9]+", "_", tag.lower()).strip("_")
-        if clean and clean != archetype_id:
-            problem_types.append(clean)
-
-    # Build signal bindings from inferred signals
-    signal_bindings = {}
-    required_signals = []
-    for sig in signals:
-        # Don't bake weak heuristic guesses into generated archetypes. The raw
-        # queries still remain in the panels for review, but signal bindings
-        # should only contain taxonomy matches or candidates approval would
-        # actually teach into the store.
-        if sig.get("source") == "heuristic" and not sig.get("auto_teach_eligible"):
-            continue
-        if sig["signal_type"] not in signal_bindings:
-            signal_bindings[sig["signal_type"]] = sig["metric"]
-            required_signals.append(sig["signal_type"])
-
-    # Dashboard-level language is only a fallback for panels that don't carry
-    # their own (e.g. SignalFx-direct ingestion where every panel is signalflow).
-    dashboard_language = extracted.get("query_language", "promql")
-
-    # Build panels from extracted panel data
-    panels = []
-    for p in extracted.get("panels", [])[:12]:  # cap at 12 panels
-        # Per-panel language: panel tag → datasource-type mapping → dashboard default.
-        panel_language = p.get("query_language")
-        if not panel_language:
-            ds_type = p.get("datasource_type", "")
-            panel_language = _datasource_type_to_language(ds_type) if ds_type else dashboard_language
-
-        queries = []
-        cloudwatch_targets = p.get("cloudwatch_targets") or []
-        if panel_language == "cloudwatch" and cloudwatch_targets:
-            # Preserve the structured CloudWatch query so the panel isn't dropped.
-            for ct in cloudwatch_targets:
-                queries.append(
-                    {
-                        "expr": ct.get("metric_name", ""),
-                        "query_language": "cloudwatch",
-                        "datasource_type": "cloudwatch",
-                        "cloudwatch_namespace": ct.get("namespace", ""),
-                        "cloudwatch_stat": ct.get("stat", ""),
-                        "cloudwatch_region": ct.get("region", ""),
-                        "cloudwatch_dimensions": ct.get("dimensions", {}),
-                        "legend_format": "",
-                    }
-                )
-        else:
-            for q in p.get("queries", []):
-                # Only PromQL needs brace-escaping (literal label selectors must
-                # survive str.format at compile time). Non-PromQL queries
-                # (SignalFlow, LogQL, …) are preserved verbatim.
-                query_def: dict[str, Any] = {
-                    "expr": _escape_literal_braces(q) if panel_language == "promql" else q,
-                    "legend_format": "",
-                    "query_language": panel_language,
-                }
-                if panel_language != "promql":
-                    query_def["datasource_type"] = _language_to_datasource_type(panel_language)
-                queries.append(query_def)
-        if queries:
-            panel_def: dict[str, Any] = {
-                "title": p["title"],
-                "queries": queries,
-            }
-            if p.get("row"):
-                panel_def["row"] = p["row"]
-            if p.get("unit"):
-                panel_def["unit"] = p["unit"]
-            if p.get("description"):
-                panel_def["description"] = p["description"]
-            panels.append(panel_def)
-
-    archetype = {
-        "id": archetype_id,
-        "name": title,
-        "description": f"Auto-generated from dashboard '{title}'",
-        "problem_types": problem_types,
-        "required_metrics": extracted["metrics_found"][:10],
-        "required_signals": required_signals[:10],
-        "signal_bindings": signal_bindings,
-        "tags": list(dict.fromkeys(extracted.get("dashboard_tags", []) + ["auto-generated", "learned"])),
-        "default_timerange": "1h",
-        "panels": panels,
-    }
-
-    return yaml.dump(
-        {"archetypes": [archetype]},
-        default_flow_style=False,
-        sort_keys=False,
-        width=120,
-    )
-
-
 # ── Full ingestion pipeline ─────────────────────────────────────────────────
-
-
-def _features_to_dict(features) -> dict[str, Any]:
-    """Convert a DashboardFeatures dataclass to a plain dict."""
-    from dataclasses import asdict
-
-    return asdict(features)
 
 
 def persist_inferred_signal_review(
@@ -646,6 +220,16 @@ def persist_inferred_signal_review(
 
 def register_generated_archetype_if_enabled(archetype_yaml: str, *, dashboard_uid: str = "") -> bool:
     """Auto-register a generated archetype when learning compounding is enabled."""
+    import dashforge.dashboard_ingest as dashboard_ingest_pkg
+
+    package_register = getattr(
+        dashboard_ingest_pkg,
+        "register_generated_archetype_if_enabled",
+        register_generated_archetype_if_enabled,
+    )
+    if package_register is not register_generated_archetype_if_enabled:
+        return package_register(archetype_yaml, dashboard_uid=dashboard_uid)
+
     if not settings.learning_auto_register_archetype or not archetype_yaml:
         return False
     from dashforge.archetypes.templates import append_archetype_to_yaml

@@ -36,14 +36,14 @@ from dashforge.models.schemas import (
     EvidenceRequirement,
     EvidenceResolution,
 )
-from dashforge.pipeline_discovery import (
+from dashforge.pipeline.discovery import (
     confirm_colloquial_keywords,
     discover_catalogs,
     discovery_keywords,
     discovery_stage_status,
     semantic_mapping_diagnostics,
 )
-from dashforge.pipeline_records import (
+from dashforge.pipeline.recording import (
     compiled_query_diagnostics,
     dashboard_summary,
     history_archetypes,
@@ -53,7 +53,7 @@ from dashforge.pipeline_records import (
     record_stage,
     surviving_datasource_names,
 )
-from dashforge.pipeline_validation import validate_dashboard_and_evidence
+from dashforge.pipeline.validation import validate_dashboard_and_evidence
 from dashforge.ranking import prerank_metrics
 
 logger = structlog.get_logger()
