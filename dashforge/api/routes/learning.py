@@ -1,0 +1,244 @@
+"""Dashboard learning routes."""
+
+from __future__ import annotations
+
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import Path as PathParam
+
+import dashforge.signals as signals_mod
+from dashforge.api.security import verify_api_key
+from dashforge.models.schemas import LearnDashboardRequest, LearnDashboardUploadRequest
+
+logger = structlog.get_logger()
+router = APIRouter(dependencies=[Depends(verify_api_key)])
+
+
+@router.post(
+    "/api/v1/learn/dashboard",
+    tags=["Learning"],
+    summary="Learn from an existing Grafana dashboard",
+    response_description="Extracted features, inferred signals, and generated archetype YAML",
+)
+async def learn_from_dashboard(request: LearnDashboardRequest):
+    """Ingest an existing dashboard to learn operational patterns."""
+    from dashforge.dashboard_ingest import ingest_dashboard
+
+    try:
+        return await ingest_dashboard(
+            dashboard_uid=request.dashboard_uid,
+            backend_name=request.backend,
+            auto_approve=request.auto_approve,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("dashboard_ingest_failed", uid=request.dashboard_uid, backend=request.backend)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to ingest dashboard '{request.dashboard_uid}'. "
+            "Check that the UID exists and the backend is accessible.",
+        )
+
+
+@router.post(
+    "/api/v1/learn/dashboard/json",
+    tags=["Learning"],
+    summary="Learn from uploaded dashboard JSON",
+    response_description="Extracted features, inferred signals, and generated archetype YAML",
+)
+async def learn_from_dashboard_json(request: LearnDashboardUploadRequest):
+    """Ingest an uploaded dashboard JSON export without contacting the vendor."""
+    from dashforge.dashboard_ingest import ingest_dashboard_features
+    from dashforge.dashboard_uploads import parse_uploaded_dashboard
+
+    try:
+        features = parse_uploaded_dashboard(
+            request.dashboard,
+            vendor=request.vendor,
+            source_name=request.source_name,
+        )
+        return await ingest_dashboard_features(features, auto_approve=request.auto_approve)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("dashboard_json_ingest_failed", vendor=request.vendor, source_name=request.source_name)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to ingest uploaded dashboard JSON. Check that the file is a supported dashboard export.",
+        )
+
+
+@router.post(
+    "/api/v1/learn/{backend_name}",
+    tags=["Learning"],
+    summary="Crawl and learn from all dashboards in a backend",
+    response_description="Bulk dashboard learning summary",
+)
+async def learn_backend(
+    backend_name: str = PathParam(description="Backend name: grafana or signalfx"),
+    auto_approve: bool = Query(False, description="Immediately approve eligible inferred mappings"),
+    limit: int = Query(500, ge=1, le=5000, description="Maximum dashboards to crawl"),
+):
+    """Crawl a connected backend and persist learned dashboard context."""
+    from dashforge.dashboard_ingest import learn_backend_dashboards
+
+    try:
+        return await learn_backend_dashboards(
+            backend_name=backend_name,
+            auto_approve=auto_approve,
+            limit=limit,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("backend_learning_failed", backend=backend_name)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to learn dashboards from backend '{backend_name}'. Check backend connectivity.",
+        )
+
+
+@router.get(
+    "/api/v1/learn/dashboards",
+    tags=["Learning"],
+    summary="List ingested dashboards",
+    response_description="Ingested dashboards with extracted features and status",
+)
+async def list_ingested_dashboards(
+    status: str | None = None,
+    limit: int = 50,
+):
+    """List dashboards that have been ingested for learning."""
+    from dashforge.dashboard_ingest import build_learning_impact_report, build_signal_quality_report
+
+    store = signals_mod.get_signal_store()
+    dashboards = store.list_ingested_dashboards(status=status, limit=limit)
+    for dashboard in dashboards:
+        metrics = dashboard.get("metrics_found", [])
+        signals = dashboard.get("signals_inferred", [])
+        if isinstance(metrics, list) and isinstance(signals, list):
+            dashboard["signal_quality"] = build_signal_quality_report(metrics=metrics, signals=signals)
+            dashboard["learning_impact"] = build_learning_impact_report(
+                metrics=metrics,
+                signals=signals,
+                approved=dashboard.get("status") == "approved",
+            )
+    return {"count": len(dashboards), "dashboards": dashboards}
+
+
+@router.get(
+    "/api/v1/learning/search",
+    tags=["Learning"],
+    summary="Search learned operational context",
+    response_description="FTS-ranked learned context rows",
+)
+async def search_learning_context(
+    q: str = Query(..., min_length=1),
+    service: str = "",
+    include_candidates: bool = True,
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Search learned dashboard/panel/metric context."""
+    store = signals_mod.get_signal_store()
+    try:
+        rows = store.search_learning_context(
+            q,
+            service=service,
+            include_candidates=include_candidates,
+            limit=limit,
+        )
+    except signals_mod.LearningIndexUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"query": q, "count": len(rows), "results": rows}
+
+
+@router.get(
+    "/api/v1/services/{service_name}",
+    tags=["Learning"],
+    summary="Describe a service from learned operational context",
+    response_description="Service-level learned dashboards, metrics, panels, and signals",
+)
+async def describe_service(
+    service_name: str = PathParam(description="Service/component name to describe"),
+    include_candidates: bool = True,
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Answer what is known about this service from learned context."""
+    store = signals_mod.get_signal_store()
+    try:
+        return store.describe_service(
+            service_name,
+            include_candidates=include_candidates,
+            limit=limit,
+        )
+    except signals_mod.LearningIndexUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.post(
+    "/api/v1/learn/dashboards/{dashboard_uid}/approve",
+    tags=["Learning"],
+    summary="Approve an ingested dashboard",
+    response_description="Approval status and signal mappings created",
+)
+async def approve_ingested_dashboard(dashboard_uid: str, backend: str | None = None):
+    """Approve a pending ingested dashboard, activating its signal mappings."""
+    from dashforge.dashboard_ingest import approve_ingested_dashboard_record
+
+    try:
+        return approve_ingested_dashboard_record(
+            dashboard_uid=dashboard_uid,
+            backend_name=backend,
+            store=signals_mod.get_signal_store(),
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Ingested dashboard not found")
+
+
+@router.post(
+    "/api/v1/learn/dashboards/{dashboard_uid}/reject",
+    tags=["Learning"],
+    summary="Reject an ingested dashboard",
+    response_description="Rejection status; no signal mappings are created",
+)
+async def reject_ingested_dashboard(dashboard_uid: str, backend: str | None = None):
+    """Reject a pending ingested dashboard."""
+    from dashforge.dashboard_ingest import reject_ingested_dashboard_record
+
+    try:
+        return reject_ingested_dashboard_record(
+            dashboard_uid=dashboard_uid,
+            backend_name=backend,
+            store=signals_mod.get_signal_store(),
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Ingested dashboard not found")
+    except RuntimeError:
+        raise HTTPException(status_code=409, detail="Dashboard is no longer pending")
+
+
+@router.post(
+    "/api/v1/learn/dashboards/{dashboard_uid}/ignore",
+    tags=["Learning"],
+    summary="Ignore an ingested dashboard",
+    response_description="Ignored status; no signal mappings or negative examples are created",
+)
+async def ignore_ingested_dashboard(dashboard_uid: str, backend: str | None = None):
+    """Ignore a pending ingested dashboard without creating mappings or negative examples."""
+    store = signals_mod.get_signal_store()
+    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend)
+    if ingested is None:
+        raise HTTPException(status_code=404, detail="Ingested dashboard not found")
+    if ingested["status"] != "pending":
+        return {"message": f"Dashboard already {ingested['status']}"}
+
+    if not store.ignore_ingested_dashboard(dashboard_uid, backend_name=backend):
+        raise HTTPException(status_code=409, detail="Dashboard is no longer pending")
+
+    return {
+        "dashboard_uid": dashboard_uid,
+        "backend_name": ingested.get("backend_name", ""),
+        "status": "ignored",
+        "message": "Dashboard ignored; no mappings created",
+    }

@@ -19,7 +19,6 @@ one signal can map to many metrics across environments.
 
 from __future__ import annotations
 
-import fnmatch
 import json
 import os
 import re
@@ -34,19 +33,54 @@ import structlog
 
 from dashforge.config import settings
 from dashforge.models.schemas import MetricEntry
+from dashforge.signals.resolution import (
+    context_matches as _context_matches,
+)
+from dashforge.signals.resolution import (
+    datasource_type_matches as _datasource_type_matches,
+)
+from dashforge.signals.resolution import (
+    effective_confidence as _effective_confidence,
+)
+from dashforge.signals.resolution import (
+    metric_matches_pattern as _metric_matches_pattern,
+)
+from dashforge.signals.resolution import (
+    metric_metadata_compatibility as _metric_metadata_compatibility,
+)
+from dashforge.signals.resolution import (
+    missing_context_multiplier as _missing_context_multiplier,
+)
+from dashforge.signals.resolution import (
+    unit_class as _unit_class,
+)
+from dashforge.signals.resolution import (
+    unit_compatibility as _unit_compatibility,
+)
+from dashforge.signals.schema import (
+    DEFAULT_DB_PATH,
+    FTS_SCHEMA_SQL,
+    SCHEMA_SQL,
+    SQLITE_BUSY_TIMEOUT_MS,
+)
 
 logger = structlog.get_logger()
 
-_DEFAULT_DB_PATH = Path("data/dashforge_signals.db")
+__all__ = [
+    "LearningIndexUnavailable",
+    "SignalStore",
+    "_effective_confidence",
+    "_metric_matches_pattern",
+    "_missing_context_multiplier",
+    "_unit_class",
+    "_unit_compatibility",
+    "get_signal_store",
+]
 
-# ── Confidence decay ────────────────────────────────────────────────────────
-# Mappings decay in confidence over time if not reinforced.
-_DECAY_HALF_LIFE_DAYS = 90  # confidence halves every 90 days without use
-_MIN_CONFIDENCE = 0.05  # floor — never fully forget
+_DEFAULT_DB_PATH = DEFAULT_DB_PATH
+
 _TRUST_THRESHOLD = 0.15  # below this, mapping is excluded from resolution
-_CONTEXT_MISSING_PENALTY = 0.7  # lower rank when mapping has context caller lacks
 _REVIEW_STATE_RANK = {"candidate": 0, "approved": 1, "trusted": 2}
-_SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 
 class LearningIndexUnavailable(RuntimeError):
@@ -67,119 +101,6 @@ def _db_path() -> Path:
     return path
 
 
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS signal_types (
-    signal_type     TEXT PRIMARY KEY,
-    description     TEXT NOT NULL DEFAULT '',
-    category        TEXT NOT NULL DEFAULT '',
-    unit            TEXT NOT NULL DEFAULT '',
-    created_at      REAL NOT NULL,
-    updated_at      REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS signal_metric_mappings (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    signal_type         TEXT NOT NULL,
-    metric_pattern      TEXT NOT NULL,
-    confidence          REAL NOT NULL DEFAULT 0.5,
-
-    -- Context filters (JSON arrays — empty = applies everywhere)
-    context_services        TEXT NOT NULL DEFAULT '[]',
-    context_datasource_types TEXT NOT NULL DEFAULT '[]',
-    context_environments    TEXT NOT NULL DEFAULT '[]',
-    context_archetypes      TEXT NOT NULL DEFAULT '[]',
-
-    -- Provenance
-    source_type         TEXT NOT NULL DEFAULT 'bootstrap',
-    source_refs         TEXT NOT NULL DEFAULT '[]',
-    -- Which inference ruleset produced this (for invalidate/replay).
-    inference_version   TEXT NOT NULL DEFAULT '',
-    -- Lifecycle: heuristic mappings start 'candidate' → 'approved' → 'trusted';
-    -- curated/bootstrap/teach mappings are 'trusted' from the start.
-    review_state        TEXT NOT NULL DEFAULT 'trusted',
-
-    -- Trust / decay
-    use_count           INTEGER NOT NULL DEFAULT 0,
-    positive_feedback   INTEGER NOT NULL DEFAULT 0,
-    negative_feedback   INTEGER NOT NULL DEFAULT 0,
-
-    -- Timestamps
-    created_at          REAL NOT NULL,
-    last_seen           REAL NOT NULL,
-
-    UNIQUE(signal_type, metric_pattern),
-    FOREIGN KEY (signal_type) REFERENCES signal_types(signal_type)
-);
-
--- Inferred candidates that were NOT auto-taught (negative training data).
-CREATE TABLE IF NOT EXISTS rejected_signal_candidates (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    dashboard_uid       TEXT NOT NULL DEFAULT '',
-    backend_name        TEXT NOT NULL DEFAULT '',
-    metric              TEXT NOT NULL,
-    signal_family       TEXT NOT NULL DEFAULT '',
-    signal_name         TEXT NOT NULL DEFAULT '',
-    score               REAL NOT NULL DEFAULT 0.0,
-    margin              REAL NOT NULL DEFAULT 0.0,
-    why_not             TEXT NOT NULL DEFAULT '',
-    evidence            TEXT NOT NULL DEFAULT '[]',
-    inference_version   TEXT NOT NULL DEFAULT '',
-    created_at          REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS ingested_dashboards (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    dashboard_uid       TEXT NOT NULL,
-    backend_name        TEXT NOT NULL DEFAULT '',
-    dashboard_title     TEXT NOT NULL DEFAULT '',
-    dashboard_tags      TEXT NOT NULL DEFAULT '[]',
-
-    -- Extracted features
-    metrics_found       TEXT NOT NULL DEFAULT '[]',
-    panel_count         INTEGER NOT NULL DEFAULT 0,
-    row_groups          TEXT NOT NULL DEFAULT '[]',
-    metric_cooccurrence TEXT NOT NULL DEFAULT '{}',
-    aggregation_patterns TEXT NOT NULL DEFAULT '[]',
-    query_transformations TEXT NOT NULL DEFAULT '[]',
-    panel_titles        TEXT NOT NULL DEFAULT '[]',
-    alert_links         TEXT NOT NULL DEFAULT '[]',
-    drilldown_links     TEXT NOT NULL DEFAULT '[]',
-
-    -- Status
-    status              TEXT NOT NULL DEFAULT 'pending',
-    signals_inferred    TEXT NOT NULL DEFAULT '[]',
-    archetype_generated TEXT NOT NULL DEFAULT '',
-
-    created_at          REAL NOT NULL,
-    reviewed_at         REAL,
-    UNIQUE(dashboard_uid, backend_name)
-);
-
-CREATE INDEX IF NOT EXISTS idx_smm_signal ON signal_metric_mappings(signal_type);
-CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern);
-"""
-
-_FTS_SCHEMA_SQL = """
-CREATE VIRTUAL TABLE IF NOT EXISTS learning_context_fts USING fts5(
-    source_kind,
-    source_id UNINDEXED,
-    backend_name UNINDEXED,
-    dashboard_uid UNINDEXED,
-    dashboard_title,
-    dashboard_tags,
-    panel_title,
-    metric_name,
-    query_text,
-    service,
-    signal_type,
-    review_state UNINDEXED,
-    reason,
-    provenance,
-    indexed_at UNINDEXED
-);
-"""
-
-
 class SignalStore:
     """SQLite-backed semantic signal mapping store."""
 
@@ -189,10 +110,10 @@ class SignalStore:
 
     @contextmanager
     def _conn(self):
-        conn = sqlite3.connect(str(self._db_path), timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000)
+        conn = sqlite3.connect(str(self._db_path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
         try:
             yield conn
             conn.commit()
@@ -204,7 +125,7 @@ class SignalStore:
 
     def _ensure_schema(self):
         with self._conn() as conn:
-            conn.executescript(_SCHEMA_SQL)
+            conn.executescript(SCHEMA_SQL)
             self._ensure_learning_index(conn)
             self._ensure_ingested_dashboard_backend_scope(conn)
             self._ensure_mapping_columns(conn)
@@ -213,7 +134,7 @@ class SignalStore:
     def _ensure_learning_index(self, conn: sqlite3.Connection) -> None:
         """Create the FTS5 operational knowledge index when available."""
         try:
-            conn.executescript(_FTS_SCHEMA_SQL)
+            conn.executescript(FTS_SCHEMA_SQL)
         except sqlite3.OperationalError as exc:
             logger.warning("learning_context_fts_unavailable", error=str(exc))
 
@@ -1468,230 +1389,6 @@ def _deserialize_ingested(row: sqlite3.Row) -> dict[str, Any]:
         if field in d and isinstance(d[field], str):
             d[field] = json.loads(d[field])
     return d
-
-
-def _context_matches(
-    mapping: dict[str, Any],
-    service: str,
-    datasource_type: str,
-    archetype: str,
-    environment: str,
-) -> bool:
-    """Check if a mapping's context filters match the given context.
-
-    Empty context list in the mapping = matches everything. If the caller omits
-    a context dimension that the mapping constrains, keep the mapping eligible
-    so ingestion-time signal inference can still find it; confidence ranking
-    applies a missing-context penalty separately.
-    """
-    if service and mapping.get("context_services"):
-        if service.lower() not in [s.lower() for s in mapping["context_services"]]:
-            return False
-    if datasource_type and mapping.get("context_datasource_types"):
-        if datasource_type.lower() not in [d.lower() for d in mapping["context_datasource_types"]]:
-            return False
-    if archetype and mapping.get("context_archetypes"):
-        if archetype.lower() not in [a.lower() for a in mapping["context_archetypes"]]:
-            return False
-    if environment and mapping.get("context_environments"):
-        if environment.lower() not in [e.lower() for e in mapping["context_environments"]]:
-            return False
-    return True
-
-
-_PROMETHEUS_DATASOURCE_TYPES = {"prometheus", "mimir", "cortex", "thanos"}
-_SIGNALFX_DATASOURCE_TYPES = {"signalfx", "grafana-signalfx-datasource"}
-
-
-def _datasource_type_matches(candidate: str, requested: str) -> bool:
-    candidate = (candidate or "").lower()
-    requested = (requested or "").lower()
-    if not requested:
-        return True
-    if candidate == requested:
-        return True
-    if candidate in _PROMETHEUS_DATASOURCE_TYPES and requested in _PROMETHEUS_DATASOURCE_TYPES:
-        return True
-    if candidate in _SIGNALFX_DATASOURCE_TYPES and requested in _SIGNALFX_DATASOURCE_TYPES:
-        return True
-    return False
-
-
-# Coarse unit classes for cross-checking a candidate metric's datasource unit
-# against the expected unit of the signal it would resolve.
-_UNIT_CLASSES: list[tuple[str, frozenset[str]]] = [
-    ("time", frozenset({"s", "ms", "ns", "us", "µs", "seconds", "milliseconds", "nanoseconds"})),
-    ("bytes", frozenset({"bytes", "decbytes", "bits", "kb", "mb", "gb", "kib", "mib", "gib"})),
-    ("percent", frozenset({"percent", "percentunit", "%"})),
-    ("rate", frozenset({"ops", "reqps", "rps", "cps", "wps", "/s", "persec"})),
-]
-
-
-def _unit_class(unit: str) -> str:
-    unit = (unit or "").strip().lower()
-    if not unit:
-        return ""
-    for name, members in _UNIT_CLASSES:
-        if unit in members:
-            return name
-    return ""
-
-
-def _unit_compatibility(expected_unit: str, metric_unit: str) -> float:
-    """Multiplier for a candidate's confidence based on unit agreement.
-
-    Conservative: only acts when *both* the signal's expected unit and the
-    candidate metric's datasource unit are known and classifiable. A clear
-    contradiction down-ranks the candidate; agreement gives a small boost;
-    anything unknown is left unchanged (multiplier 1.0) so callers without
-    metadata are unaffected.
-    """
-    exp = _unit_class(expected_unit)
-    got = _unit_class(metric_unit)
-    if not exp or not got:
-        return 1.0
-    if exp == got:
-        return 1.1
-    return 0.5
-
-
-def _metric_metadata_compatibility(
-    signal_type: str,
-    signal_definition: dict[str, Any],
-    entry: MetricEntry,
-) -> float:
-    """Score datasource metadata that supports or contradicts a name match.
-
-    Pattern matching remains mandatory. Metadata only reorders candidates that
-    already match a curated or learned pattern, which keeps this conservative
-    for providers that expose incomplete labels or OTel scope information.
-    """
-    score = _unit_compatibility(signal_definition.get("unit", ""), entry.unit)
-    category = str(signal_definition.get("category", "")).lower()
-    metric_type = (entry.metric_type or "").lower()
-
-    if category == "latency":
-        if metric_type in {"histogram", "summary", "gaugehistogram"}:
-            score *= 1.15
-        elif metric_type in {"gauge", "info"} and _unit_class(entry.unit) != "time":
-            score *= 0.8
-    elif category in {"throughput", "errors"} and metric_type in {"counter", "sum"}:
-        score *= 1.1
-    elif category in {"saturation", "resource", "resource_usage", "capacity"} and metric_type == "gauge":
-        score *= 1.05
-
-    context = " ".join([entry.namespace, *entry.dimensions]).lower()
-    semantic_hints: tuple[str, ...] = ()
-    if signal_type.startswith(("request_", "api_", "error_")):
-        semantic_hints = ("http", "rpc", "route", "method", "status_code")
-    elif signal_type.startswith("cache_"):
-        semantic_hints = ("cache", "redis", "memcached", "keyspace", "db")
-    elif signal_type in {"queue_depth", "consumer_lag", "message_rate"}:
-        semantic_hints = ("queue", "messaging", "kafka", "consumer", "destination")
-    elif signal_type in {"cpu_usage", "memory_usage", "disk_usage", "network_bytes"}:
-        semantic_hints = ("host", "container", "process", "pod", "device")
-    if context and semantic_hints and any(hint in context for hint in semantic_hints):
-        score *= 1.08
-
-    return score
-
-
-def _missing_context_multiplier(
-    mapping: dict[str, Any],
-    service: str = "",
-    datasource_type: str = "",
-    archetype: str = "",
-    environment: str = "",
-) -> float:
-    """Return a ranking penalty when constrained mapping context is absent.
-
-    Context-specific mappings are intentionally not filtered when the caller
-    has no context (notably ingestion-time inference). Penalizing them preserves
-    recall while keeping global mappings ahead when there is no evidence that
-    the service/datasource/archetype/environment constraint applies.
-    """
-    missing_context = (
-        (not service and bool(mapping.get("context_services")))
-        or (not datasource_type and bool(mapping.get("context_datasource_types")))
-        or (not archetype and bool(mapping.get("context_archetypes")))
-        or (not environment and bool(mapping.get("context_environments")))
-    )
-    return _CONTEXT_MISSING_PENALTY if missing_context else 1.0
-
-
-def _effective_confidence(
-    mapping: dict[str, Any],
-    now: float,
-    *,
-    context_service: str = "",
-    context_datasource_type: str = "",
-    context_archetype: str = "",
-    context_environment: str = "",
-    apply_context_penalty: bool = True,
-) -> float:
-    """Compute effective confidence with time decay, feedback, and context adjustment.
-
-    - Confidence decays with a half-life based on time since last_seen.
-    - Positive feedback boosts, negative feedback penalizes.
-    - Context-specific mappings get a ranking penalty when caller context is missing.
-    - Bootstrap mappings don't decay (they're canonical starting points).
-    """
-    base = mapping["confidence"]
-
-    context_multiplier = (
-        _missing_context_multiplier(
-            mapping,
-            context_service,
-            context_datasource_type,
-            context_archetype,
-            context_environment,
-        )
-        if apply_context_penalty
-        else 1.0
-    )
-
-    # Bootstrap mappings don't decay, but still receive context ranking penalties.
-    if mapping.get("source_type") == "bootstrap":
-        return max(base * context_multiplier, _MIN_CONFIDENCE)
-
-    # Time decay
-    last_seen = mapping.get("last_seen", now)
-    age_days = (now - last_seen) / 86400.0
-    if age_days > 0:
-        import math
-
-        decay = math.pow(0.5, age_days / _DECAY_HALF_LIFE_DAYS)
-        base *= decay
-
-    # Feedback adjustment
-    pos = mapping.get("positive_feedback", 0)
-    neg = mapping.get("negative_feedback", 0)
-    total_fb = pos + neg
-    if total_fb > 0:
-        fb_ratio = pos / total_fb  # 0.0 (all negative) to 1.0 (all positive)
-        # Scale: 0.7x at all-negative, 1.3x at all-positive, 1.0x at balanced
-        fb_multiplier = 0.7 + 0.6 * fb_ratio
-        base *= fb_multiplier
-
-    base *= context_multiplier
-
-    return max(base, _MIN_CONFIDENCE)
-
-
-def _metric_matches_pattern(metric_name: str, pattern: str) -> bool:
-    """Check if a metric name matches a pattern.
-
-    Supports:
-    - Exact match: "http_request_duration_seconds"
-    - Glob patterns: "*_latency_*", "sso_*_total"
-    - Suffix match: "*_duration_seconds"
-    """
-    if pattern == metric_name:
-        return True
-    if "*" in pattern or "?" in pattern:
-        return fnmatch.fnmatch(metric_name, pattern)
-    # Substring match as fallback
-    return pattern in metric_name
 
 
 # ── Singleton ────────────────────────────────────────────────────────────────
