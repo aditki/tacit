@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import time
 
-import structlog
-
 from dashforge.agents.providers.base import TokenUsage
 from dashforge.backends.base import DashboardBackend, PublishResult
 from dashforge.dependencies import PipelineDependencies
@@ -14,12 +12,10 @@ from dashforge.models.schemas import DashboardSpec, DashRequest, DashResponse, I
 from dashforge.pipeline.recording import (
     PipelineRecorder,
     dashboard_summary,
-    query_history_payload,
     surviving_datasource_names,
 )
+from dashforge.pipeline.side_effects import safe_record_provenance
 from dashforge.pipeline.stages.publish import publish_dashboard
-
-logger = structlog.get_logger()
 
 
 async def complete_pipeline(
@@ -85,23 +81,15 @@ async def complete_pipeline(
         total_time=total_s,
     )
 
-    try:
-        feedback_store = deps.feedback_store_factory()
-        _, metrics_used = query_history_payload(dashboard_spec)
-        feedback_store.record_provenance(
-            dashboard_uid=effective_uid,
-            prompt=request.prompt,
-            problem_type=intent.problem_type,
-            archetypes=[{"type": item.type, "confidence": item.confidence} for item in intent.archetypes],
-            metrics_used=metrics_used,
-            panel_count=len(dashboard_spec.panels),
-            path_used=path_used,
-            dashboard_url=effective_url,
-            user_id=request.user_id,
-            channel_id=request.channel_id,
-        )
-    except Exception:
-        logger.warning("provenance_record_failed", exc_info=True)
+    safe_record_provenance(
+        feedback_store_factory=deps.feedback_store_factory,
+        dashboard_uid=effective_uid,
+        dashboard_url=effective_url,
+        request=request,
+        intent=intent,
+        dashboard_spec=dashboard_spec,
+        path_used=path_used,
+    )
 
     return DashResponse(
         dashboard_url=grafana_result.url,

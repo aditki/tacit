@@ -9,6 +9,7 @@ from dashforge.backends.base import DashboardBackend
 from dashforge.config import Settings
 from dashforge.dependencies import PipelineDependencies
 from dashforge.models.schemas import DashRequest
+from dashforge.pipeline.recording import PipelineRecorder
 
 
 @dataclass
@@ -22,6 +23,7 @@ class PipelineRunContext:
     primary: DashboardBackend
     history: object
     investigation_id: str
+    recorder: PipelineRecorder
     started_at: float
     timings: dict[str, float] = field(default_factory=dict)
     token_usage: TokenUsage = field(default_factory=TokenUsage)

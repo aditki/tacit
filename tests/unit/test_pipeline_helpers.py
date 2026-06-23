@@ -1,0 +1,204 @@
+from __future__ import annotations
+
+from dashforge.agents.providers.base import TokenUsage
+from dashforge.dependencies import PipelineDependencies
+from dashforge.models.schemas import (
+    ArchetypeMatch,
+    DashboardSpec,
+    DashRequest,
+    Intent,
+    PanelQuery,
+    PanelSpec,
+    SignalType,
+)
+from dashforge.pipeline.failures import PipelineFailureFactory
+from dashforge.pipeline.runner import _get_semaphore
+from dashforge.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history, safe_record_provenance
+from dashforge.pipeline.stages.freeform import build_freeform_dashboard
+
+
+class FakeRecorder:
+    def __init__(self):
+        self.finished: list[dict] = []
+
+    def finish(self, **kwargs):
+        self.finished.append(kwargs)
+
+
+class FakeHistoryStore:
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.finished: list[tuple[str, dict]] = []
+
+    def start(self, prompt, user_id, channel_id):
+        if self.fail:
+            raise RuntimeError("history unavailable")
+        return "inv-1"
+
+    def finish(self, inv_id, **kwargs):
+        self.finished.append((inv_id, kwargs))
+
+
+class FakeFeedbackStore:
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.provenance: list[dict] = []
+
+    def record_provenance(self, **kwargs):
+        if self.fail:
+            raise RuntimeError("feedback unavailable")
+        self.provenance.append(kwargs)
+
+
+class FakeBackend:
+    name = "fake"
+    query_language = "promql"
+
+    def __init__(self, fail_close: bool = False):
+        self.fail_close = fail_close
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+        if self.fail_close:
+            raise RuntimeError("close failed")
+
+
+def _intent() -> Intent:
+    return Intent(
+        summary="checkout latency",
+        domain="application",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["latency"],
+        problem_type="general",
+        archetypes=[ArchetypeMatch(type="general", confidence=0.7)],
+    )
+
+
+def _request() -> DashRequest:
+    return DashRequest(prompt="checkout latency", user_id="u1", channel_id="c1")
+
+
+def _dashboard() -> DashboardSpec:
+    return DashboardSpec(
+        title="Test",
+        panels=[
+            PanelSpec(
+                title="Latency",
+                queries=[PanelQuery(expr="up", datasource_uid="prom")],
+            )
+        ],
+    )
+
+
+def test_pipeline_failure_factory_records_finish():
+    recorder = FakeRecorder()
+
+    response = PipelineFailureFactory.finish_failure(
+        recorder=recorder,
+        error="no data",
+        summary="No data",
+        timings={"intent": 0.1},
+        started_at=0.0,
+    )
+
+    assert response.panel_count == 0
+    assert response.summary == "No data"
+    assert recorder.finished[0]["status"] == "failed"
+    assert recorder.finished[0]["error"] == "no data"
+
+
+async def test_build_freeform_dashboard_no_metrics_returns_failure():
+    recorder = FakeRecorder()
+    deps = PipelineDependencies(
+        settings=object(),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: FakeHistoryStore(),
+        feedback_store_factory=lambda: FakeFeedbackStore(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    result = await build_freeform_dashboard(
+        intent=_intent(),
+        metric_catalog=[],
+        context_chunks=[],
+        deps=deps,
+        recorder=recorder,
+        timings={},
+        started_at=0.0,
+    )
+
+    assert result.dashboard_spec is None
+    assert result.failure is not None
+    assert result.token_usage == TokenUsage()
+    assert recorder.finished[0]["error"] == "No metrics found for freeform generation"
+
+
+def test_get_semaphore_recreates_when_limit_changes():
+    first = _get_semaphore(1)
+    second = _get_semaphore(2)
+    third = _get_semaphore(2)
+
+    assert first is not second
+    assert second is third
+
+
+def test_safe_finish_timeout_history_records_when_available():
+    store = FakeHistoryStore()
+
+    safe_finish_timeout_history(
+        history_store_factory=lambda: store,
+        request=_request(),
+        timeout_seconds=9,
+    )
+
+    assert store.finished == [("inv-1", {"status": "timeout", "error": "Timed out after 9s"})]
+
+
+def test_safe_finish_timeout_history_swallows_noncritical_errors():
+    safe_finish_timeout_history(
+        history_store_factory=lambda: FakeHistoryStore(fail=True),
+        request=_request(),
+        timeout_seconds=9,
+    )
+
+
+def test_safe_record_provenance_records_when_available():
+    store = FakeFeedbackStore()
+
+    safe_record_provenance(
+        feedback_store_factory=lambda: store,
+        dashboard_uid="dash-1",
+        dashboard_url="http://dash",
+        request=_request(),
+        intent=_intent(),
+        dashboard_spec=_dashboard(),
+        path_used="archetype",
+    )
+
+    assert store.provenance[0]["dashboard_uid"] == "dash-1"
+    assert store.provenance[0]["metrics_used"] == ["up"]
+
+
+def test_safe_record_provenance_swallows_noncritical_errors():
+    safe_record_provenance(
+        feedback_store_factory=lambda: FakeFeedbackStore(fail=True),
+        dashboard_uid="dash-1",
+        dashboard_url="http://dash",
+        request=_request(),
+        intent=_intent(),
+        dashboard_spec=_dashboard(),
+        path_used="archetype",
+    )
+
+
+async def test_safe_close_backends_closes_all_and_swallows_errors():
+    good = FakeBackend()
+    bad = FakeBackend(fail_close=True)
+
+    await safe_close_backends([bad, good])
+
+    assert bad.closed is True
+    assert good.closed is True

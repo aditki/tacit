@@ -8,7 +8,6 @@ import time
 import structlog
 
 from dashforge.agents.intent import classify_intent
-from dashforge.agents.providers.base import TokenUsage
 from dashforge.backends import get_active_backends
 from dashforge.cache import llm_cache, make_cache_key
 from dashforge.config import settings
@@ -21,6 +20,7 @@ from dashforge.models.schemas import (
     DashResponse,
 )
 from dashforge.pipeline.completion import complete_pipeline
+from dashforge.pipeline.context import PipelineRunContext
 from dashforge.pipeline.discovery import (
     discovery_keywords,
     semantic_mapping_diagnostics,
@@ -32,6 +32,7 @@ from dashforge.pipeline.recording import (
     history_archetypes,
     history_signals,
 )
+from dashforge.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history
 from dashforge.pipeline.stages.archetypes import compile_selected_archetypes, select_archetypes
 from dashforge.pipeline.stages.discovery import run_discovery_stage
 from dashforge.pipeline.stages.evidence import run_evidence_stage
@@ -98,16 +99,11 @@ async def run_pipeline(request: DashRequest, deps: PipelineDependencies | None =
                     user=request.user_id,
                     timeout=runtime_settings.pipeline_timeout_seconds,
                 )
-                try:
-                    store = deps.history_store_factory()
-                    inv_id = store.start(request.prompt, request.user_id, request.channel_id)
-                    store.finish(
-                        inv_id,
-                        status="timeout",
-                        error=f"Timed out after {runtime_settings.pipeline_timeout_seconds}s",
-                    )
-                except Exception:
-                    pass
+                safe_finish_timeout_history(
+                    history_store_factory=deps.history_store_factory,
+                    request=request,
+                    timeout_seconds=runtime_settings.pipeline_timeout_seconds,
+                )
                 return DashResponse(
                     dashboard_url="",
                     dashboard_uid="",
@@ -138,8 +134,18 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
     history = deps.history_store_factory()
     inv_id = history.start(request.prompt, request.user_id or "", request.channel_id or "")
     recorder = PipelineRecorder(history, inv_id)
-
-    cumulative_tokens = TokenUsage()
+    runtime = PipelineRunContext(
+        request=request,
+        deps=deps,
+        settings=runtime_settings,
+        backends=backends,
+        primary=primary,
+        history=history,
+        investigation_id=inv_id,
+        recorder=recorder,
+        started_at=t_start,
+        timings=timings,
+    )
 
     try:
         # ── 1. Intent Agent ──────────────────────────────────────────
@@ -148,20 +154,20 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             user_id=request.user_id,
             classify=classify_intent,
             enrich=enrich_context,
-            timings=timings,
+            timings=runtime.timings,
         )
         intent = intent_stage.intent
         context_chunks = intent_stage.context_chunks
-        cumulative_tokens = cumulative_tokens + intent_stage.token_usage
-        recorder.intent(intent)
+        runtime.add_tokens(intent_stage.token_usage)
+        runtime.recorder.intent(intent)
 
         # ── 3. Metric discovery — each backend contributes ───────────
         discovery_stage = await run_discovery_stage(
             backends=backends,
             primary=primary,
             intent=intent,
-            timings=timings,
-            recorder=recorder,
+            timings=runtime.timings,
+            recorder=runtime.recorder,
         )
         catalog_discovery = discovery_stage.discovery
         metric_catalog = catalog_discovery.metric_catalog
@@ -176,9 +182,9 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
                 intent=intent,
                 metric_catalog=metric_catalog,
                 backends=backends,
-                recorder=recorder,
-                timings=timings,
-                started_at=t_start,
+                recorder=runtime.recorder,
+                timings=runtime.timings,
+                started_at=runtime.started_at,
             )
 
         # ── 4. Multi-label archetype matching ────────────────────
@@ -188,18 +194,18 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             metric_catalog=metric_catalog,
             catalog_for_compile=catalog_for_compile,
             target_language=target_language,
-            settings=runtime_settings,
+            settings=runtime.settings,
         )
         ranked_archetypes = selection.ranked_archetypes
         learned_archetypes = selection.learned_archetypes
 
-        recorder.selected_intent(intent, ranked_archetypes, learned_archetypes)
+        runtime.recorder.selected_intent(intent, ranked_archetypes, learned_archetypes)
 
         compilation = compile_selected_archetypes(
             selection=selection,
             intent=intent,
             catalog_for_compile=catalog_for_compile,
-            timings=timings,
+            timings=runtime.timings,
         )
         if compilation is not None:
             dashboard_spec = compilation.dashboard_spec
@@ -208,12 +214,12 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
                 intent=intent,
                 metric_catalog=metric_catalog,
                 context_chunks=context_chunks,
-                deps=deps,
-                recorder=recorder,
-                timings=timings,
-                started_at=t_start,
+                deps=runtime.deps,
+                recorder=runtime.recorder,
+                timings=runtime.timings,
+                started_at=runtime.started_at,
             )
-            cumulative_tokens = cumulative_tokens + freeform.token_usage
+            runtime.add_tokens(freeform.token_usage)
             if freeform.failure is not None:
                 return freeform.failure
             assert freeform.dashboard_spec is not None
@@ -233,10 +239,10 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             dashboard_spec,
             catalog_for_compile,
         )
-        recorder.stage("binding", binding_status, binding_reason, **binding_details)
+        runtime.recorder.stage("binding", binding_status, binding_reason, **binding_details)
         compiled_query_count = sum(len(panel.queries) for panel in dashboard_spec.panels)
         if compiled_query_count:
-            recorder.stage(
+            runtime.recorder.stage(
                 "compilation",
                 "passed",
                 "queries_compiled",
@@ -245,7 +251,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
                 path="archetype" if ranked_archetypes else "freeform",
             )
         else:
-            recorder.stage(
+            runtime.recorder.stage(
                 "compilation",
                 "failed",
                 "no_queries_compiled",
@@ -257,7 +263,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
         t0 = time.monotonic()
 
         def record_validation_stage(stage: str, status: str, reason_code: str, **details) -> None:
-            recorder.stage(stage, status, reason_code, **details)
+            runtime.recorder.stage(stage, status, reason_code, **details)
 
         validation_result = await validate_dashboard_and_evidence(
             primary=primary,
@@ -273,7 +279,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
         dashboard_spec = validation_result.dashboard_spec
         validation_warnings = validation_result.validation_warnings
         panels_before = validation_result.panels_before
-        timings["query_validation"] = time.monotonic() - t0
+        runtime.timings["query_validation"] = time.monotonic() - t0
         stage_log(
             "query_validation",
             (time.monotonic() - t0) * 1000,
@@ -284,20 +290,20 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
         )
 
         # Record queries after validation
-        recorder.queries(dashboard_spec, path_used="archetype" if ranked_archetypes else "freeform")
+        runtime.recorder.queries(dashboard_spec, path_used="archetype" if ranked_archetypes else "freeform")
 
         if not dashboard_spec.panels:
             return PipelineFailureFactory.all_panels_empty(
-                recorder=recorder,
-                timings=timings,
-                started_at=t_start,
+                recorder=runtime.recorder,
+                timings=runtime.timings,
+                started_at=runtime.started_at,
                 validation_warnings=validation_warnings,
             )
 
         return await complete_pipeline(
-            request=request,
-            deps=deps,
-            backends=backends,
+            request=runtime.request,
+            deps=runtime.deps,
+            backends=runtime.backends,
             dashboard_spec=dashboard_spec,
             intent=intent,
             metric_catalog=metric_catalog,
@@ -305,15 +311,11 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             ranked_archetypes_present=bool(ranked_archetypes),
             validation_warnings=validation_warnings,
             panels_before=panels_before,
-            timings=timings,
-            recorder=recorder,
-            token_usage=cumulative_tokens,
-            started_at=t_start,
+            timings=runtime.timings,
+            recorder=runtime.recorder,
+            token_usage=runtime.token_usage,
+            started_at=runtime.started_at,
         )
 
     finally:
-        for backend in backends:
-            try:
-                await backend.close()
-            except Exception:
-                logger.warning("backend_close_failed", backend=backend.name, exc_info=True)
+        await safe_close_backends(backends)
