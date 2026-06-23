@@ -8,7 +8,7 @@ from typing import Any
 
 TOKEN_RE = re.compile(r"[a-zA-Z0-9_./:-]+")
 LABEL_SERVICE_RE = re.compile(
-    r"(?:service|service_name|app|application|component|container)\s*=~?\s*['\"]([^'\"]+)['\"]"
+    r"(?:service|service_name|app|application|component|container|job|pod)\s*=~?\s*['\"]([^'\"]+)['\"]"
 )
 GENERIC_METRIC_PREFIXES = {
     "http",
@@ -71,7 +71,7 @@ def infer_services_for_learning(
     for tag in tags:
         if ":" in tag:
             key, value = tag.split(":", 1)
-            if key.lower() in {"service", "app", "application", "component", "team"}:
+            if key.lower() in {"service", "app", "application", "component", "team", "job", "pod"}:
                 add(value)
 
     for match in LABEL_SERVICE_RE.findall(query_text):

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fastapi import Request
+
 import dashforge.pipeline as pipeline_mod
 from dashforge.cache import llm_cache, make_cache_key
 from dashforge.config import settings
@@ -14,7 +16,7 @@ def _get_feedback_store():
     return feedback.get_feedback_store()
 
 
-def get_pipeline_dependencies() -> PipelineDependencies:
+def get_pipeline_dependencies(request: Request) -> PipelineDependencies:
     """Return pipeline dependencies for API requests.
 
     Build through the pipeline package façade so tests and local harnesses that
@@ -24,8 +26,9 @@ def get_pipeline_dependencies() -> PipelineDependencies:
     sync = getattr(pipeline_mod, "_sync_patch_points", None)
     if sync is not None:
         sync()
+    runtime_settings = getattr(request.app.state, "settings", settings)
     return PipelineDependencies(
-        settings=settings,
+        settings=runtime_settings,
         backend_factory=pipeline_mod.get_active_backends,
         history_store_factory=pipeline_mod.get_investigation_store,
         feedback_store_factory=_get_feedback_store,
