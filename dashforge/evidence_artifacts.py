@@ -379,6 +379,14 @@ def build_evidence_gap_dashboard(
     gap_resolutions: list[EvidenceResolution] = []
     seen: set[tuple[str, str, str]] = set()
 
+    def mark_gap_resolution(resolution: EvidenceResolution) -> EvidenceResolution:
+        return resolution.model_copy(
+            update={
+                "status": EvidenceResolutionStatus.RESOLVED,
+                "reason_code": "evidence_gap_supported_observation",
+            }
+        )
+
     for requirement in requirements:
         resolution = resolutions_by_id.get(requirement.id)
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
@@ -414,12 +422,13 @@ def build_evidence_gap_dashboard(
         query_expr = _evidence_gap_query_expr(signal_type, resolution, intent, metric_entry)
         if not query_expr:
             continue
+        gap_resolution = mark_gap_resolution(resolution)
         key = (signal_type, resolution.metric, resolution.datasource_uid)
         if key in seen:
-            gap_resolutions.append(resolution)
+            gap_resolutions.append(gap_resolution)
             continue
         seen.add(key)
-        gap_resolutions.append(resolution)
+        gap_resolutions.append(gap_resolution)
         title, description, unit = _EVIDENCE_GAP_SIGNAL_PANELS[signal_type]
         panels.append(
             PanelSpec(

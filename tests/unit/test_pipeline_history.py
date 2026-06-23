@@ -1133,6 +1133,57 @@ def test_evidence_gap_dashboard_resolves_supported_resource_observation(monkeypa
     assert "caused by" not in panel_text
 
 
+def test_evidence_gap_dashboard_marks_reused_primary_resolution_as_gap():
+    archetype = _arch(
+        "resource_saturation",
+        required_signals=["cpu_usage"],
+        signal_bindings={"cpu_usage": "container_cpu_usage_seconds_total"},
+    )
+    intent = Intent(
+        summary="checkout resource pressure",
+        domain="infrastructure",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["cpu"],
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    primary = EvidenceResolution(
+        requirement_id=requirements[0].id,
+        status="resolved",
+        reason_code="live_signal_resolved",
+        metric="gamma_container_cpu_usage_seconds_total",
+        datasource_uid="gamma-telemetry",
+        datasource_type="prometheus",
+        query_language="promql",
+        semantic_score=0.91,
+        ownership_score=1.0,
+    )
+
+    dashboard, gap_resolutions = build_evidence_gap_dashboard(
+        requirements,
+        [primary],
+        intent,
+        catalog=[
+            _metric(
+                "gamma_container_cpu_usage_seconds_total",
+                dimensions=["service={checkout}"],
+                metric_type="counter",
+            )
+        ],
+        target_language="promql",
+        timerange="15m",
+    )
+
+    assert dashboard.panels
+    assert primary.reason_code == "live_signal_resolved"
+    assert gap_resolutions[0] is not primary
+    assert gap_resolutions[0].metric == primary.metric
+    assert gap_resolutions[0].datasource_uid == primary.datasource_uid
+    assert gap_resolutions[0].reason_code == "evidence_gap_supported_observation"
+
+
 def test_evidence_gap_dashboard_requires_requested_service_scope(monkeypatch, tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
