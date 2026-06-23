@@ -18,15 +18,38 @@ from dashforge.archetypes.schema import InvestigationArchetype
 from dashforge.catalog import catalog_for_services
 from dashforge.models.schemas import (
     DashboardSpec,
+    EvidenceLifecycleStatus,
     EvidenceObservation,
+    EvidenceObservationOutcome,
+    EvidenceRecord,
     EvidenceRequirement,
     EvidenceResolution,
+    EvidenceResolutionStatus,
     Intent,
     MetricEntry,
 )
 
 _METRIC_TOKEN_CHARS = r"A-Za-z0-9_:."
 _PROMETHEUS_HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
+SUPPORTED_OBSERVATION = EvidenceObservationOutcome.SUPPORTED_OBSERVATION
+MISSING_EVIDENCE = EvidenceObservationOutcome.MISSING_EVIDENCE
+AMBIGUOUS_EVIDENCE = EvidenceObservationOutcome.AMBIGUOUS_EVIDENCE
+NEGATIVE_EVIDENCE = EvidenceObservationOutcome.NEGATIVE_EVIDENCE
+UNSUPPORTED_CAUSE = EvidenceObservationOutcome.UNSUPPORTED_CAUSE
+_GAP_RESOLUTION_REASON_CODES = {
+    "direct_symptom_signal_resolved",
+    "evidence_gap_supported_observation",
+}
+
+
+def _gap_outcome(reason_code: str) -> EvidenceObservationOutcome:
+    if "ambiguous" in reason_code:
+        return AMBIGUOUS_EVIDENCE
+    return MISSING_EVIDENCE
+
+
+def _is_gap_resolution(resolution: EvidenceResolution) -> bool:
+    return resolution.reason_code in _GAP_RESOLUTION_REASON_CODES
 
 
 def _query_mentions_metric(expr: str, metric: str) -> bool:
@@ -163,7 +186,7 @@ def resolve_requirements_for_archetype(
     ) -> EvidenceResolution:
         return EvidenceResolution(
             requirement_id=requirement.id,
-            status="resolved",
+            status=EvidenceResolutionStatus.RESOLVED,
             reason_code=reason_code,
             metric=entry.name,
             datasource_uid=entry.datasource_uid,
@@ -181,7 +204,7 @@ def resolve_requirements_for_archetype(
                 resolutions.append(
                     EvidenceResolution(
                         requirement_id=requirement.id,
-                        status="unresolved",
+                        status=EvidenceResolutionStatus.UNRESOLVED,
                         reason_code="ambiguous_default_metric_owner",
                     )
                 )
@@ -199,7 +222,7 @@ def resolve_requirements_for_archetype(
             resolutions.append(
                 EvidenceResolution(
                     requirement_id=requirement.id,
-                    status="unknown",
+                    status=EvidenceResolutionStatus.UNKNOWN,
                     reason_code="signal_store_unavailable",
                 )
             )
@@ -218,7 +241,7 @@ def resolve_requirements_for_archetype(
             resolutions.append(
                 EvidenceResolution(
                     requirement_id=requirement.id,
-                    status="unresolved",
+                    status=EvidenceResolutionStatus.UNRESOLVED,
                     reason_code="no_semantic_signal_for_requirement",
                 )
             )
@@ -247,7 +270,7 @@ def resolve_requirements_for_archetype(
             resolutions.append(
                 EvidenceResolution(
                     requirement_id=requirement.id,
-                    status="unresolved",
+                    status=EvidenceResolutionStatus.UNRESOLVED,
                     reason_code="no_compatible_live_signal",
                 )
             )
@@ -263,7 +286,7 @@ def resolve_requirements_for_archetype(
                 resolutions.append(
                     EvidenceResolution(
                         requirement_id=requirement.id,
-                        status="unresolved",
+                        status=EvidenceResolutionStatus.UNRESOLVED,
                         reason_code="ambiguous_live_signal",
                         semantic_score=best_score,
                     )
@@ -334,10 +357,11 @@ def observe_evidence(
 
     for resolution in resolutions:
         requirement = requirements_by_id.get(resolution.requirement_id)
-        if resolution.status != "resolved" or requirement is None:
+        if resolution.status != EvidenceResolutionStatus.RESOLVED or requirement is None:
             observations.append(
                 EvidenceObservation(
                     requirement_id=resolution.requirement_id,
+                    outcome=_gap_outcome(resolution.reason_code),
                     resolution_metric=resolution.metric,
                     rejection_reason=resolution.reason_code,
                 )
@@ -365,6 +389,7 @@ def observe_evidence(
                         "error",
                     }
                     non_empty = bool(surviving_query and validation_status and surviving_query.validation_has_data)
+                    outcome = SUPPORTED_OBSERVATION if non_empty else _gap_outcome(validation_status)
                     rejection_reason = ""
                     if not non_empty:
                         if survived:
@@ -374,6 +399,7 @@ def observe_evidence(
                     matches.append(
                         EvidenceObservation(
                             requirement_id=requirement.id,
+                            outcome=outcome,
                             resolution_metric=resolution.metric,
                             panel_title=panel.title,
                             query=query.expr,
@@ -390,11 +416,94 @@ def observe_evidence(
             observations.append(
                 EvidenceObservation(
                     requirement_id=requirement.id,
+                    outcome=MISSING_EVIDENCE,
                     resolution_metric=resolution.metric,
                     rejection_reason="resolved_metric_not_observed_in_queries",
                 )
             )
     return observations
+
+
+def _is_supported_observation(observation: EvidenceObservation) -> bool:
+    if observation.outcome:
+        return observation.outcome == SUPPORTED_OBSERVATION
+    return observation.non_empty
+
+
+def _select_observation(observations: list[EvidenceObservation]) -> EvidenceObservation | None:
+    if not observations:
+        return None
+    supported = [observation for observation in observations if _is_supported_observation(observation)]
+    if supported:
+        return supported[0]
+    ambiguous = [observation for observation in observations if observation.outcome == AMBIGUOUS_EVIDENCE]
+    if ambiguous:
+        return ambiguous[0]
+    return observations[0]
+
+
+def _record_final_status(
+    primary: EvidenceResolution | None,
+    gap: EvidenceResolution | None,
+    observation: EvidenceObservation | None,
+) -> EvidenceLifecycleStatus:
+    if observation is not None:
+        if observation.outcome == EvidenceObservationOutcome.SUPPORTED_OBSERVATION:
+            return EvidenceLifecycleStatus.SUPPORTED_OBSERVATION
+        if observation.outcome == EvidenceObservationOutcome.AMBIGUOUS_EVIDENCE:
+            return EvidenceLifecycleStatus.AMBIGUOUS_EVIDENCE
+        if observation.outcome == EvidenceObservationOutcome.NEGATIVE_EVIDENCE:
+            return EvidenceLifecycleStatus.NEGATIVE_EVIDENCE
+        if observation.outcome == EvidenceObservationOutcome.UNSUPPORTED_CAUSE:
+            return EvidenceLifecycleStatus.UNSUPPORTED_CAUSE
+        return EvidenceLifecycleStatus.MISSING_EVIDENCE
+    if gap is not None:
+        if gap.status == EvidenceResolutionStatus.RESOLVED:
+            return EvidenceLifecycleStatus.GAP_RESOLVED
+        if "ambiguous" in gap.reason_code:
+            return EvidenceLifecycleStatus.AMBIGUOUS_EVIDENCE
+        return EvidenceLifecycleStatus.GAP_UNRESOLVED
+    if primary is not None:
+        if primary.status == EvidenceResolutionStatus.RESOLVED:
+            return EvidenceLifecycleStatus.PRIMARY_RESOLVED
+        if "ambiguous" in primary.reason_code:
+            return EvidenceLifecycleStatus.AMBIGUOUS_EVIDENCE
+        return EvidenceLifecycleStatus.PRIMARY_UNRESOLVED
+    return EvidenceLifecycleStatus.REQUIRED
+
+
+def build_evidence_records(
+    requirements: list[EvidenceRequirement],
+    resolutions: list[EvidenceResolution],
+    observations: list[EvidenceObservation],
+) -> list[EvidenceRecord]:
+    """Bind requirement, primary/gap resolutions, observation, and final state."""
+    resolutions_by_requirement: dict[str, list[EvidenceResolution]] = defaultdict(list)
+    observations_by_requirement: dict[str, list[EvidenceObservation]] = defaultdict(list)
+    for resolution in resolutions:
+        resolutions_by_requirement[resolution.requirement_id].append(resolution)
+    for observation in observations:
+        observations_by_requirement[observation.requirement_id].append(observation)
+
+    records: list[EvidenceRecord] = []
+    for requirement in requirements:
+        requirement_resolutions = resolutions_by_requirement.get(requirement.id, [])
+        primary = next(
+            (resolution for resolution in requirement_resolutions if not _is_gap_resolution(resolution)),
+            None,
+        )
+        gap = next((resolution for resolution in requirement_resolutions if _is_gap_resolution(resolution)), None)
+        selected_observation = _select_observation(observations_by_requirement.get(requirement.id, []))
+        records.append(
+            EvidenceRecord(
+                requirement=requirement,
+                primary_resolution=primary,
+                gap_resolution=gap,
+                observation=selected_observation,
+                final_status=_record_final_status(primary, gap, selected_observation),
+            )
+        )
+    return records
 
 
 def summarize_evidence(
@@ -403,16 +512,35 @@ def summarize_evidence(
     observations: list[EvidenceObservation],
 ) -> dict[str, object]:
     """Return compact counts suitable for stage history and benchmark gates."""
-    resolved_ids = {resolution.requirement_id for resolution in resolutions if resolution.status == "resolved"}
-    surviving_ids = {observation.requirement_id for observation in observations if observation.non_empty}
+    records = build_evidence_records(requirements, resolutions, observations)
+    resolved_ids = {
+        record.requirement.id
+        for record in records
+        if (record.gap_resolution and record.gap_resolution.status == EvidenceResolutionStatus.RESOLVED)
+        or (record.primary_resolution and record.primary_resolution.status == EvidenceResolutionStatus.RESOLVED)
+    }
+    surviving_ids = {
+        record.requirement.id
+        for record in records
+        if record.final_status == EvidenceLifecycleStatus.SUPPORTED_OBSERVATION
+    }
     critical_ids = {requirement.id for requirement in requirements if requirement.priority == "critical"}
     critical_resolved = critical_ids & resolved_ids
     critical_survived = critical_ids & surviving_ids
     unresolved_reasons: dict[str, int] = {}
-    for resolution in resolutions:
-        if resolution.status == "resolved":
+    observation_outcomes: dict[str, int] = {}
+    lifecycle_statuses: dict[str, int] = {}
+    for record in records:
+        resolution = record.gap_resolution or record.primary_resolution
+        if resolution is None or resolution.status == EvidenceResolutionStatus.RESOLVED:
             continue
         unresolved_reasons[resolution.reason_code] = unresolved_reasons.get(resolution.reason_code, 0) + 1
+    for observation in observations:
+        outcome = observation.outcome or (SUPPORTED_OBSERVATION if observation.non_empty else MISSING_EVIDENCE)
+        outcome_key = outcome.value if isinstance(outcome, EvidenceObservationOutcome) else str(outcome)
+        observation_outcomes[outcome_key] = observation_outcomes.get(outcome_key, 0) + 1
+    for record in records:
+        lifecycle_statuses[record.final_status.value] = lifecycle_statuses.get(record.final_status.value, 0) + 1
 
     def ratio(numerator: int, denominator: int) -> float:
         return round(numerator / denominator, 4) if denominator else 0.0
@@ -429,6 +557,9 @@ def summarize_evidence(
         "survival_recall": ratio(len(surviving_ids), len(requirements)),
         "critical_survival_recall": ratio(len(critical_survived), len(critical_ids)),
         "unresolved_reasons": unresolved_reasons,
+        "observation_outcomes": observation_outcomes,
+        "lifecycle_statuses": lifecycle_statuses,
+        "records": [record.model_dump() for record in records],
         "requirements": [requirement.model_dump() for requirement in requirements],
         "resolutions": [resolution.model_dump() for resolution in resolutions],
         "observations": [observation.model_dump() for observation in observations],

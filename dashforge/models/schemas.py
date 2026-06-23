@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ── Intent ───────────────────────────────────────────────────────────────────
 
@@ -214,6 +214,33 @@ class DashboardSpec(BaseModel):
 # ── Evidence model ───────────────────────────────────────────────────────────
 
 
+class EvidenceResolutionStatus(StrEnum):
+    RESOLVED = "resolved"
+    UNRESOLVED = "unresolved"
+    UNKNOWN = "unknown"
+
+
+class EvidenceObservationOutcome(StrEnum):
+    SUPPORTED_OBSERVATION = "SUPPORTED_OBSERVATION"
+    MISSING_EVIDENCE = "MISSING_EVIDENCE"
+    AMBIGUOUS_EVIDENCE = "AMBIGUOUS_EVIDENCE"
+    NEGATIVE_EVIDENCE = "NEGATIVE_EVIDENCE"
+    UNSUPPORTED_CAUSE = "UNSUPPORTED_CAUSE"
+
+
+class EvidenceLifecycleStatus(StrEnum):
+    REQUIRED = "required"
+    PRIMARY_RESOLVED = "primary_resolved"
+    PRIMARY_UNRESOLVED = "primary_unresolved"
+    GAP_RESOLVED = "gap_resolved"
+    GAP_UNRESOLVED = "gap_unresolved"
+    SUPPORTED_OBSERVATION = "supported_observation"
+    MISSING_EVIDENCE = "missing_evidence"
+    AMBIGUOUS_EVIDENCE = "ambiguous_evidence"
+    NEGATIVE_EVIDENCE = "negative_evidence"
+    UNSUPPORTED_CAUSE = "unsupported_cause"
+
+
 class EvidenceRequirement(BaseModel):
     """A signal or metric the investigation needs before it can claim support."""
 
@@ -230,7 +257,7 @@ class EvidenceResolution(BaseModel):
     """How a requirement resolved, or why it abstained."""
 
     requirement_id: str
-    status: str = Field(description="resolved, unresolved, or unknown")
+    status: EvidenceResolutionStatus = Field(description="resolved, unresolved, or unknown")
     reason_code: str
     metric: str = ""
     datasource_uid: str = ""
@@ -244,6 +271,10 @@ class EvidenceObservation(BaseModel):
     """Whether resolved evidence survived into a validated query/panel."""
 
     requirement_id: str
+    outcome: EvidenceObservationOutcome = Field(
+        default=EvidenceObservationOutcome.MISSING_EVIDENCE,
+        description="Explicit evidence-state outcome for this observation.",
+    )
     resolution_metric: str = ""
     panel_title: str = ""
     query: str = ""
@@ -252,6 +283,24 @@ class EvidenceObservation(BaseModel):
     non_empty: bool = False
     survived: bool = False
     rejection_reason: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_legacy_outcome(cls, data: Any) -> Any:
+        """Preserve pre-outcome callers that used non_empty as the support bit."""
+        if isinstance(data, dict) and "outcome" not in data and data.get("non_empty"):
+            data = {**data, "outcome": EvidenceObservationOutcome.SUPPORTED_OBSERVATION}
+        return data
+
+
+class EvidenceRecord(BaseModel):
+    """One requirement's full lifecycle through resolution and observation."""
+
+    requirement: EvidenceRequirement
+    primary_resolution: EvidenceResolution | None = None
+    gap_resolution: EvidenceResolution | None = None
+    observation: EvidenceObservation | None = None
+    final_status: EvidenceLifecycleStatus = EvidenceLifecycleStatus.REQUIRED
 
 
 # ── Pipeline request / response ──────────────────────────────────────────────
