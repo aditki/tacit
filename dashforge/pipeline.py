@@ -824,6 +824,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     "skipped",
                     "no_resolved_symptom_evidence",
                 )
+        if evidence_requirements:
             gap_observations = observe_evidence(
                 evidence_requirements,
                 evidence_resolutions,

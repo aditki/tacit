@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # ── Intent ───────────────────────────────────────────────────────────────────
 
@@ -283,6 +283,14 @@ class EvidenceObservation(BaseModel):
     non_empty: bool = False
     survived: bool = False
     rejection_reason: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_legacy_outcome(cls, data: Any) -> Any:
+        """Preserve pre-outcome callers that used non_empty as the support bit."""
+        if isinstance(data, dict) and "outcome" not in data and data.get("non_empty"):
+            data = {**data, "outcome": EvidenceObservationOutcome.SUPPORTED_OBSERVATION}
+        return data
 
 
 class EvidenceRecord(BaseModel):

@@ -979,6 +979,53 @@ def testmissing_critical_symptom_requirements_detects_partial_dashboard_gap():
     assert [requirement.signal_type for requirement in missing] == ["request_latency"]
 
 
+def test_non_symptom_evidence_gaps_are_detected_without_symptom_rescue():
+    archetype = InvestigationArchetype(
+        id="resource_saturation",
+        name="Resource Saturation",
+        problem_types=["resource_saturation"],
+        required_signals=["cpu_usage", "memory_usage"],
+        signal_bindings={
+            "cpu_usage": "container_cpu_usage_seconds_total",
+            "memory_usage": "container_memory_working_set_bytes",
+        },
+        panels=[PanelTemplate(title="Resources", queries=[QueryTemplate(expr="up")])],
+    )
+    intent = Intent(
+        summary="checkout resource pressure",
+        domain="infrastructure",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["cpu", "memory"],
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=0.9)],
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirement.id,
+            status="unresolved",
+            reason_code="no_compatible_live_signal",
+        )
+        for requirement in requirements
+    ]
+    observations = [
+        EvidenceObservation(
+            requirement_id=requirement.id,
+            resolution_metric=requirement.default_metric,
+            survived=False,
+            non_empty=False,
+        )
+        for requirement in requirements
+    ]
+
+    symptom_missing = missing_critical_symptom_requirements(requirements, resolutions, observations)
+    gap_missing = missing_critical_evidence_gap_requirements(requirements, resolutions, observations)
+
+    assert symptom_missing == []
+    assert [requirement.signal_type for requirement in gap_missing] == ["cpu_usage", "memory_usage"]
+
+
 def testmissing_critical_symptom_requirements_treats_signalfx_exists_as_surfaced():
     archetype = InvestigationArchetype(
         id="latency_investigation",

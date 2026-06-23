@@ -148,6 +148,29 @@ def test_evidence_record_preserves_primary_failure_and_gap_observation():
     assert summary["records"][0]["final_status"] == EvidenceLifecycleStatus.SUPPORTED_OBSERVATION
 
 
+def test_legacy_non_empty_observation_defaults_to_supported():
+    requirements = requirements_for_archetype(_resource_archetype(), _intent())
+    resolution = EvidenceResolution(
+        requirement_id=requirements[0].id,
+        status=EvidenceResolutionStatus.RESOLVED,
+        reason_code="live_signal_resolved",
+        metric="gamma_container_cpu_usage_seconds_total",
+    )
+    observation = EvidenceObservation(
+        requirement_id=requirements[0].id,
+        resolution_metric="gamma_container_cpu_usage_seconds_total",
+        valid_query=True,
+        non_empty=True,
+        survived=True,
+    )
+
+    summary = summarize_evidence(requirements[:1], [resolution], [observation])
+
+    assert observation.outcome == SUPPORTED_OBSERVATION
+    assert summary["critical_observed"] == 1
+    assert summary["observation_outcomes"] == {"SUPPORTED_OBSERVATION": 1}
+
+
 def test_evidence_resolution_includes_native_query_languages():
     archetype = InvestigationArchetype(
         id="learned-cloudwatch",
