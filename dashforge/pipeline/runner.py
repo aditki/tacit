@@ -8,15 +8,8 @@ import time
 import structlog
 
 from dashforge.agents.intent import classify_intent
-from dashforge.agents.metrics_discovery import discover_metrics
 from dashforge.agents.providers.base import TokenUsage
-from dashforge.agents.query_builder import build_dashboard
-from dashforge.archetypes.templates import (
-    get_archetypes_by_confidence,
-    get_archetypes_by_learning_context,
-)
 from dashforge.backends import get_active_backends
-from dashforge.backends.base import PublishResult
 from dashforge.cache import llm_cache, make_cache_key
 from dashforge.config import settings
 from dashforge.context.enrichment import enrich_context
@@ -27,26 +20,24 @@ from dashforge.models.schemas import (
     DashRequest,
     DashResponse,
 )
+from dashforge.pipeline.completion import complete_pipeline
 from dashforge.pipeline.discovery import (
     discovery_keywords,
     semantic_mapping_diagnostics,
 )
+from dashforge.pipeline.failures import PipelineFailureFactory, handle_empty_catalog
 from dashforge.pipeline.recording import (
     PipelineRecorder,
     compiled_query_diagnostics,
-    dashboard_summary,
     history_archetypes,
     history_signals,
-    query_history_payload,
-    surviving_datasource_names,
 )
 from dashforge.pipeline.stages.archetypes import compile_selected_archetypes, select_archetypes
 from dashforge.pipeline.stages.discovery import run_discovery_stage
 from dashforge.pipeline.stages.evidence import run_evidence_stage
+from dashforge.pipeline.stages.freeform import build_freeform_dashboard
 from dashforge.pipeline.stages.intent import run_intent_stage
-from dashforge.pipeline.stages.publish import publish_dashboard
 from dashforge.pipeline.validation import validate_dashboard_and_evidence
-from dashforge.ranking import prerank_metrics
 
 logger = structlog.get_logger()
 
@@ -60,6 +51,7 @@ _semantic_mapping_diagnostics = semantic_mapping_diagnostics
 
 # Concurrency gate — prevents thundering-herd on LLM + Grafana APIs
 _pipeline_semaphore: asyncio.Semaphore | None = None
+_pipeline_semaphore_limit: int | None = None
 
 
 def _default_dependencies() -> PipelineDependencies:
@@ -80,9 +72,10 @@ def _default_dependencies() -> PipelineDependencies:
 
 
 def _get_semaphore(max_concurrent: int) -> asyncio.Semaphore:
-    global _pipeline_semaphore
-    if _pipeline_semaphore is None:
+    global _pipeline_semaphore, _pipeline_semaphore_limit
+    if _pipeline_semaphore is None or _pipeline_semaphore_limit != max_concurrent:
         _pipeline_semaphore = asyncio.Semaphore(max_concurrent)
+        _pipeline_semaphore_limit = max_concurrent
     return _pipeline_semaphore
 
 
@@ -136,12 +129,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
     runtime_settings = deps.settings
     backends = deps.backend_factory()
     if not backends:
-        return DashResponse(
-            dashboard_url="",
-            dashboard_uid="",
-            panel_count=0,
-            summary="No dashboard backends are enabled. " "Enable at least one of: grafana, signalfx.",
-        )
+        return PipelineFailureFactory.no_backends()
 
     primary = backends[0]  # determines query language for compilation
 
@@ -184,47 +172,13 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             logger.info("colloquial_evidence_confirmed", keywords=confirmed_keywords)
 
         if not catalog_for_compile:
-            ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
-            ranked_ids = {arch.id for arch, _ in ranked_archetypes}
-            learned_archetypes = get_archetypes_by_learning_context(
-                intent,
-                metric_catalog,
-                min_confidence=0.35,
-                exclude_ids=ranked_ids,
-            )
-            if learned_archetypes:
-                ranked_archetypes.extend(learned_archetypes)
-                ranked_archetypes.sort(key=lambda item: item[1], reverse=True)
-            recorder.selected_intent(intent, ranked_archetypes, learned_archetypes)
-
-            unavailable = [
-                backend.name
-                for backend in backends
-                if not getattr(getattr(backend, "last_discovery_status", None), "available", True)
-            ]
-            if unavailable:
-                names = ", ".join(unavailable)
-                error = f"Datasource discovery failed for: {names}"
-                summary = (
-                    f"Could not connect to {names} during datasource discovery. "
-                    "Verify the backend is running and reachable, then retry."
-                )
-            else:
-                error = "No metrics or datasource targets found"
-                summary = (
-                    "No metrics found across any datasource. " "Verify your datasources are configured and have data."
-                )
-            recorder.finish(
-                status="failed",
-                error=error,
+            return handle_empty_catalog(
+                intent=intent,
+                metric_catalog=metric_catalog,
+                backends=backends,
+                recorder=recorder,
                 timings=timings,
-                total_time=time.monotonic() - t_start,
-            )
-            return DashResponse(
-                dashboard_url="",
-                dashboard_uid="",
-                panel_count=0,
-                summary=summary,
+                started_at=t_start,
             )
 
         # ── 4. Multi-label archetype matching ────────────────────
@@ -250,113 +204,20 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
         if compilation is not None:
             dashboard_spec = compilation.dashboard_spec
         else:
-            # ── FREEFORM PATH: LLM-driven discovery + query generation ─
-            if not metric_catalog:
-                recorder.finish(
-                    status="failed",
-                    error="No metrics found for freeform generation",
-                    timings=timings,
-                    total_time=time.monotonic() - t_start,
-                )
-                return DashResponse(
-                    dashboard_url="",
-                    dashboard_uid="",
-                    panel_count=0,
-                    summary=(
-                        "Datasource metadata was available, but no metrics matched your query. "
-                        "Approve or teach a dashboard pattern for this service, or connect a "
-                        "datasource with matching series."
-                    ),
-                )
-
-            # Pre-rank to reduce LLM token cost
-            t_prerank = time.monotonic()
-            ranked_catalog = prerank_metrics(intent, metric_catalog)
-            stage_log(
-                "metric_ranking",
-                (time.monotonic() - t_prerank) * 1000,
-                metrics_considered=len(metric_catalog),
-                metrics_selected=len(ranked_catalog),
+            freeform = await build_freeform_dashboard(
+                intent=intent,
+                metric_catalog=metric_catalog,
+                context_chunks=context_chunks,
+                deps=deps,
+                recorder=recorder,
+                timings=timings,
+                started_at=t_start,
             )
-
-            # Metrics Discovery LLM (cached)
-            discovery_cache_key = deps.cache_key_factory(
-                "discovery",
-                intent.summary,
-                ",".join(intent.keywords),
-                ",".join(e.name for e in ranked_catalog[:20]),
-            )
-            cached_discovery = deps.llm_cache.get(discovery_cache_key)
-            discovery_usage = TokenUsage()
-            t_disc = time.monotonic()
-            if cached_discovery is not None:
-                discovery = cached_discovery
-                discovery_cached = True
-            else:
-                discovery, discovery_usage = await discover_metrics(intent, ranked_catalog, context_chunks)
-                cumulative_tokens = cumulative_tokens + discovery_usage
-                if discovery.metrics:
-                    deps.llm_cache.set(discovery_cache_key, discovery)
-                discovery_cached = False
-
-            stage_log(
-                "metrics_discovery",
-                (time.monotonic() - t_disc) * 1000,
-                token_usage=discovery_usage if not discovery_cached else None,
-                catalog_size=len(ranked_catalog),
-                metrics_selected=len(discovery.metrics),
-                cached=discovery_cached,
-            )
-
-            if not discovery.metrics:
-                recorder.finish(
-                    status="failed",
-                    error="No relevant metrics found by LLM",
-                    timings=timings,
-                    total_time=time.monotonic() - t_start,
-                )
-                return DashResponse(
-                    dashboard_url="",
-                    dashboard_uid="",
-                    panel_count=0,
-                    summary="Could not find relevant metrics for your query. "
-                    "Try rephrasing with more specific service or metric names.",
-                )
-
-            # Post-validate LLM output
-            valid_uids = {e.datasource_uid for e in metric_catalog}
-            original_count = len(discovery.metrics)
-            discovery.metrics = [m for m in discovery.metrics if m.datasource_uid in valid_uids]
-            dropped = original_count - len(discovery.metrics)
-            if dropped:
-                logger.warning("llm_hallucinated_uids_dropped", dropped=dropped)
-
-            if not discovery.metrics:
-                recorder.finish(
-                    status="failed",
-                    error="All LLM-selected metrics had invalid datasource UIDs",
-                    timings=timings,
-                    total_time=time.monotonic() - t_start,
-                )
-                return DashResponse(
-                    dashboard_url="",
-                    dashboard_uid="",
-                    panel_count=0,
-                    summary="LLM selected metrics with invalid datasource references. " "Try rephrasing your query.",
-                )
-
-            # Query Builder Agent
-            t0 = time.monotonic()
-            dashboard_spec, qb_usage = await build_dashboard(intent, discovery, ranked_catalog)
-            timings["query_builder"] = time.monotonic() - t0
-            cumulative_tokens = cumulative_tokens + qb_usage
-            stage_log(
-                "query_builder",
-                (time.monotonic() - t0) * 1000,
-                token_usage=qb_usage,
-                metrics_input=len(discovery.metrics),
-                panels_generated=len(dashboard_spec.panels),
-            )
+            cumulative_tokens = cumulative_tokens + freeform.token_usage
+            if freeform.failure is not None:
+                return freeform.failure
+            assert freeform.dashboard_spec is not None
+            dashboard_spec = freeform.dashboard_spec
 
         evidence_stage = run_evidence_stage(
             ranked_archetypes=ranked_archetypes,
@@ -426,96 +287,28 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
         recorder.queries(dashboard_spec, path_used="archetype" if ranked_archetypes else "freeform")
 
         if not dashboard_spec.panels:
-            recorder.finish(
-                status="failed",
-                error="All panels empty after validation",
+            return PipelineFailureFactory.all_panels_empty(
+                recorder=recorder,
                 timings=timings,
-                total_time=time.monotonic() - t_start,
-            )
-            return DashResponse(
-                dashboard_url="",
-                dashboard_uid="",
-                panel_count=0,
-                summary="No panels returned data for your query. "
-                "The service or metrics you asked about may not exist "
-                "in the connected datasources.\n" + "\n".join(validation_warnings),
+                started_at=t_start,
+                validation_warnings=validation_warnings,
             )
 
-        # ── 6. Publish — each backend publishes independently ────────
-        publish_results = await publish_dashboard(backends=backends, dashboard_spec=dashboard_spec, timings=timings)
-
-        # Effective identifiers — first successful backend wins
-        grafana_result = publish_results.get("grafana", PublishResult())
-        sfx_result = publish_results.get("signalfx", PublishResult())
-        effective_uid = grafana_result.uid or sfx_result.uid or ""
-        effective_url = grafana_result.url or sfx_result.url or ""
-
-        path_used = "archetype" if ranked_archetypes else "freeform"
-        summary = dashboard_summary(
-            dashboard_spec,
-            path_used,
-            surviving_datasource_names(dashboard_spec, metric_catalog, datasource_catalog),
-            publish_results,
-        )
-
-        total_s = time.monotonic() - t_start
-        timings["total"] = total_s
-        timings_rounded = {k: round(v, 2) for k, v in timings.items()}
-
-        # Record validation results
-        recorder.validation(
-            validation_warnings,
+        return await complete_pipeline(
+            request=request,
+            deps=deps,
+            backends=backends,
+            dashboard_spec=dashboard_spec,
+            intent=intent,
+            metric_catalog=metric_catalog,
+            datasource_catalog=datasource_catalog,
+            ranked_archetypes_present=bool(ranked_archetypes),
+            validation_warnings=validation_warnings,
             panels_before=panels_before,
-            final_panel_count=len(dashboard_spec.panels),
-        )
-
-        stage_log(
-            "pipeline_complete",
-            total_s * 1000,
+            timings=timings,
+            recorder=recorder,
             token_usage=cumulative_tokens,
-            user_id=request.user_id,
-            channel_id=request.channel_id,
-            dashboard_uid=effective_uid,
-            panel_count=len(dashboard_spec.panels),
-            path=path_used,
-            timings=timings_rounded,
-        )
-
-        # Record final result
-        recorder.finish(
-            status="success",
-            dashboard_uid=effective_uid,
-            dashboard_url=effective_url,
-            timings=timings_rounded,
-            total_time=total_s,
-        )
-
-        # ── 7. Record provenance for feedback system ──────────────────
-        try:
-            feedback_store = deps.feedback_store_factory()
-            _, metrics_used = query_history_payload(dashboard_spec)
-            feedback_store.record_provenance(
-                dashboard_uid=effective_uid,
-                prompt=request.prompt,
-                problem_type=intent.problem_type,
-                archetypes=[{"type": a.type, "confidence": a.confidence} for a in intent.archetypes],
-                metrics_used=metrics_used,
-                panel_count=len(dashboard_spec.panels),
-                path_used=path_used,
-                dashboard_url=effective_url,
-                user_id=request.user_id,
-                channel_id=request.channel_id,
-            )
-        except Exception:
-            logger.warning("provenance_record_failed", exc_info=True)
-
-        return DashResponse(
-            dashboard_url=grafana_result.url,
-            dashboard_uid=effective_uid,
-            panel_count=len(dashboard_spec.panels),
-            summary=summary,
-            signalfx_url=sfx_result.url,
-            signalfx_dashboard_id=sfx_result.uid,
+            started_at=t_start,
         )
 
     finally:
