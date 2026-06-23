@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, cast
 
 import structlog
 
@@ -21,20 +20,13 @@ from dashforge.archetypes.templates import (
 from dashforge.backends import get_active_backends
 from dashforge.backends.base import PublishResult
 from dashforge.cache import llm_cache, make_cache_key
-from dashforge.catalog import catalog_for_services
 from dashforge.config import settings
 from dashforge.context.enrichment import enrich_context
+from dashforge.dependencies import PipelineDependencies
+from dashforge.errors import EvidenceResolutionError
 from dashforge.evidence import (
     contributing_archetypes,
-    observe_evidence,
     resolve_requirements_for_archetypes,
-    summarize_evidence,
-)
-from dashforge.evidence_artifacts import (
-    build_evidence_gap_dashboard,
-    build_symptom_evidence_dashboard,
-    missing_critical_evidence_gap_requirements,
-    missing_critical_symptom_requirements,
 )
 from dashforge.history import get_investigation_store
 from dashforge.logging import bind_request_id, stage_log, unbind_request_id
@@ -44,198 +36,89 @@ from dashforge.models.schemas import (
     EvidenceRequirement,
     EvidenceResolution,
 )
+from dashforge.pipeline_discovery import (
+    confirm_colloquial_keywords,
+    discover_catalogs,
+    discovery_keywords,
+    discovery_stage_status,
+    semantic_mapping_diagnostics,
+)
+from dashforge.pipeline_records import (
+    compiled_query_diagnostics,
+    dashboard_summary,
+    history_archetypes,
+    history_signals,
+    query_history_payload,
+    record_selected_intent,
+    record_stage,
+    surviving_datasource_names,
+)
+from dashforge.pipeline_validation import validate_dashboard_and_evidence
 from dashforge.ranking import prerank_metrics
 
 logger = structlog.get_logger()
 
-
-def _record_stage(history, inv_id: str, stage: str, status: str, reason_code: str, **details) -> None:
-    """Best-effort persistence for diagnostic stage outcomes."""
-    try:
-        history.record_stage(
-            inv_id,
-            stage,
-            status=status,
-            reason_code=reason_code,
-            details=details,
-        )
-    except Exception:
-        logger.warning("history_record_stage_failed", stage=stage, exc_info=True)
-
-
-def _semantic_mapping_diagnostics(metric_catalog) -> tuple[str, str, dict]:
-    """Measure deterministic name-level semantic mapping independently of binding."""
-    from dashforge.signal_inference import infer_signals
-
-    names = list(dict.fromkeys(entry.name for entry in metric_catalog if entry.name))
-    inferred = infer_signals(names)
-    mapped = {item.metric: item.signal_family for item in inferred}
-    unmapped = [name for name in names if name not in mapped]
-    if not names:
-        return "skipped", "no_named_metrics", {"metrics_total": 0}
-    if not mapped:
-        status, reason = "failed", "no_metrics_semantically_mapped"
-    elif unmapped:
-        status, reason = "partial", "some_metrics_unmapped"
-    else:
-        status, reason = "passed", "all_metrics_semantically_mapped"
-    return (
-        status,
-        reason,
-        {
-            "metrics_total": len(names),
-            "metrics_mapped": len(mapped),
-            "coverage": round(len(mapped) / len(names), 4),
-            "mapped": mapped,
-            "unmapped": unmapped,
-        },
-    )
-
-
-def _compiled_query_diagnostics(dashboard_spec, catalog) -> tuple[str, str, dict]:
-    """Compare compiled PromQL references with the live catalog before probing."""
-    from dashforge.dashboard_ingest import extract_metrics_from_promql
-
-    catalog_names = {entry.name for entry in catalog if entry.name}
-    references: set[str] = set()
-    query_count = 0
-    for panel in dashboard_spec.panels:
-        for query in panel.queries:
-            if not query.expr:
-                continue
-            query_count += 1
-            if (query.query_language or "promql").lower() in {"", "promql"}:
-                references.update(extract_metrics_from_promql(query.expr))
-    present = sorted(references & catalog_names)
-    missing = sorted(references - catalog_names)
-    if not references:
-        status, reason = "skipped", "no_promql_metric_references"
-    elif missing and present:
-        status, reason = "partial", "some_compiled_metrics_absent_from_catalog"
-    elif missing:
-        status, reason = "failed", "compiled_metrics_absent_from_catalog"
-    else:
-        status, reason = "passed", "all_compiled_metrics_present"
-    return (
-        status,
-        reason,
-        {
-            "query_count": query_count,
-            "referenced_metrics": sorted(references),
-            "present_metrics": present,
-            "missing_metrics": missing,
-        },
-    )
+# Backward-compatible test/import aliases for helpers that now live in smaller modules.
+_compiled_query_diagnostics = compiled_query_diagnostics
+_discovery_keywords = discovery_keywords
+_history_archetypes = history_archetypes
+_history_signals = history_signals
+_semantic_mapping_diagnostics = semantic_mapping_diagnostics
 
 
 # Concurrency gate — prevents thundering-herd on LLM + Grafana APIs
 _pipeline_semaphore: asyncio.Semaphore | None = None
 
 
-def _get_semaphore() -> asyncio.Semaphore:
+def _default_dependencies() -> PipelineDependencies:
+    """Build default dependencies through pipeline-level patch points.
+
+    Several harnesses patch these names on ``dashforge.pipeline`` to create a
+    cold isolated runtime. Keeping the default lookup here preserves that
+    behavior while the core runner still accepts explicit dependencies.
+    """
+    return PipelineDependencies(
+        settings=settings,
+        backend_factory=get_active_backends,
+        history_store_factory=get_investigation_store,
+        llm_cache=llm_cache,
+        cache_key_factory=make_cache_key,
+    )
+
+
+def _get_semaphore(max_concurrent: int) -> asyncio.Semaphore:
     global _pipeline_semaphore
     if _pipeline_semaphore is None:
-        _pipeline_semaphore = asyncio.Semaphore(settings.pipeline_max_concurrent)
+        _pipeline_semaphore = asyncio.Semaphore(max_concurrent)
     return _pipeline_semaphore
 
 
-def _history_archetypes(
-    classifier_archetypes: list,
-    selected_archetypes: list[tuple[Any, float]],
-    learned_archetypes: list[tuple[Any, float]],
-) -> list[dict[str, object]]:
-    """Return history archetype records with selected learned matches included."""
-    learned_ids = {arch.id for arch, _ in learned_archetypes}
-    selected_ids = {arch.id for arch, _ in selected_archetypes}
-    records: list[dict[str, object]] = []
-    seen: set[str] = set()
-
-    for arch, confidence in selected_archetypes:
-        if arch.id in seen:
-            continue
-        seen.add(arch.id)
-        records.append(
-            {
-                "type": arch.id,
-                "name": arch.name,
-                "confidence": confidence,
-                "source": "learned" if arch.id in learned_ids else "classifier",
-                "selected": True,
-                "signals": sorted(set(arch.required_signals) | set(arch.signal_bindings.keys())),
-            }
-        )
-
-    for match in classifier_archetypes:
-        if match.type in seen or match.type in selected_ids:
-            continue
-        seen.add(match.type)
-        records.append(
-            {
-                "type": match.type,
-                "confidence": match.confidence,
-                "source": "classifier",
-                "selected": False,
-                "signals": [],
-            }
-        )
-
-    return records
-
-
-def _history_signals(intent_signals: list, selected_archetypes: list[tuple[Any, float]]) -> list[str]:
-    """Return intent signal types plus semantic signals from selected archetypes."""
-    values: list[str] = []
-    seen: set[str] = set()
-    for signal in intent_signals:
-        value = getattr(signal, "value", str(signal))
-        if value and value not in seen:
-            seen.add(value)
-            values.append(value)
-    for arch, _ in selected_archetypes:
-        for signal in [*arch.required_signals, *arch.signal_bindings.keys()]:
-            if signal and signal not in seen:
-                seen.add(signal)
-                values.append(signal)
-    return values
-
-
-def _discovery_keywords(intent: Any) -> list[str]:
-    """Include advisory evidence when searching provider-scoped catalogs.
-
-    Colloquial evidence may broaden discovery so providers such as CloudWatch
-    can inspect the relevant namespace. It does not become trusted intent until
-    post-discovery semantic-signal confirmation succeeds.
-    """
-    keywords = list(intent.keywords)
-    seen = {str(keyword).lower() for keyword in keywords}
-    for item in intent.keyword_evidence:
-        keyword = str(item.get("keyword", ""))
-        if keyword and keyword.lower() not in seen:
-            seen.add(keyword.lower())
-            keywords.append(keyword)
-    return keywords
-
-
-async def run_pipeline(request: DashRequest) -> DashResponse:
+async def run_pipeline(request: DashRequest, deps: PipelineDependencies | None = None) -> DashResponse:
     """End-to-end: natural language → Grafana dashboard URL."""
+    deps = deps or _default_dependencies()
+    runtime_settings = deps.settings
     bind_request_id()
-    sem = _get_semaphore()
+    sem = _get_semaphore(runtime_settings.pipeline_max_concurrent)
     try:
         async with sem:
             try:
                 return await asyncio.wait_for(
-                    _run_pipeline_inner(request),
-                    timeout=settings.pipeline_timeout_seconds,
+                    _run_pipeline_inner(request, deps),
+                    timeout=runtime_settings.pipeline_timeout_seconds,
                 )
             except TimeoutError:
-                logger.error("pipeline_timeout", user=request.user_id, timeout=settings.pipeline_timeout_seconds)
+                logger.error(
+                    "pipeline_timeout",
+                    user=request.user_id,
+                    timeout=runtime_settings.pipeline_timeout_seconds,
+                )
                 try:
-                    store = get_investigation_store()
+                    store = deps.history_store_factory()
                     inv_id = store.start(request.prompt, request.user_id, request.channel_id)
                     store.finish(
                         inv_id,
                         status="timeout",
-                        error=f"Timed out after {settings.pipeline_timeout_seconds}s",
+                        error=f"Timed out after {runtime_settings.pipeline_timeout_seconds}s",
                     )
                 except Exception:
                     pass
@@ -243,21 +126,22 @@ async def run_pipeline(request: DashRequest) -> DashResponse:
                     dashboard_url="",
                     dashboard_uid="",
                     panel_count=0,
-                    summary=f"Pipeline timed out after {settings.pipeline_timeout_seconds}s. "
+                    summary=f"Pipeline timed out after {runtime_settings.pipeline_timeout_seconds}s. "
                     "Try a more specific query or check datasource connectivity.",
                 )
     finally:
         unbind_request_id()
 
 
-async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
+async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) -> DashResponse:
     """Inner pipeline logic (wrapped with timeout + semaphore above).
 
     Uses the backend adapter pattern: each enabled vendor (Grafana, SignalFx,
     etc.) is a DashboardBackend instance.  The pipeline iterates over backends
     for discovery, validation, and publishing — zero vendor-specific if/else.
     """
-    backends = get_active_backends()
+    runtime_settings = deps.settings
+    backends = deps.backend_factory()
     if not backends:
         return DashResponse(
             dashboard_url="",
@@ -270,7 +154,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
 
     t_start = time.monotonic()
     timings: dict[str, float] = {}
-    history = get_investigation_store()
+    history = deps.history_store_factory()
     inv_id = history.start(request.prompt, request.user_id or "", request.channel_id or "")
 
     cumulative_tokens = TokenUsage()
@@ -318,30 +202,16 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
 
         # ── 3. Metric discovery — each backend contributes ───────────
         t0 = time.monotonic()
-        discovery_keywords = _discovery_keywords(intent)
-        metric_catalog = []
-        datasource_catalog = []
-        ds_types: list[str] = []
-        for backend in backends:
-            entries = await backend.discover_metrics(discovery_keywords, intent)
-            metric_catalog.extend(entries)
-            if entries:
-                ds_types.append(backend.name)
-            else:
-                if not getattr(getattr(backend, "last_discovery_status", None), "available", True):
-                    continue
-                target_discovery = getattr(backend, "discover_datasource_targets", None)
-                if target_discovery is not None:
-                    targets = await target_discovery(discovery_keywords, intent)
-                    datasource_catalog.extend(targets)
-                    if targets and backend.name not in ds_types:
-                        ds_types.append(backend.name)
+        catalog_discovery = await discover_catalogs(backends, intent)
+        metric_catalog = catalog_discovery.metric_catalog
+        datasource_catalog = catalog_discovery.datasource_catalog
+        catalog_for_compile = catalog_discovery.catalog_for_compile
         timings["metrics_fetch"] = time.monotonic() - t0
         stage_log(
             "metrics_fetch",
             (time.monotonic() - t0) * 1000,
             backends_queried=len(backends),
-            datasource_types=ds_types,
+            datasource_types=catalog_discovery.datasource_types,
             metrics_found=len(metric_catalog),
             datasource_targets_found=len(datasource_catalog),
         )
@@ -349,47 +219,18 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         try:
             history.record_discovery(
                 inv_id,
-                datasources_found=len(ds_types),
-                datasource_types=ds_types,
+                datasources_found=len(catalog_discovery.datasource_types),
+                datasource_types=catalog_discovery.datasource_types,
                 metrics_catalog_size=len(metric_catalog),
             )
         except Exception:
             logger.warning("history_record_discovery_failed", exc_info=True)
 
-        catalog_for_compile = metric_catalog or datasource_catalog
-        if metric_catalog:
-            _record_stage(
-                history,
-                inv_id,
-                "discovery",
-                "passed",
-                "named_metrics_discovered",
-                metric_count=len(metric_catalog),
-                datasource_count=len(ds_types),
-                datasource_uids=sorted({entry.datasource_uid for entry in metric_catalog}),
-            )
-        elif datasource_catalog:
-            _record_stage(
-                history,
-                inv_id,
-                "discovery",
-                "partial",
-                "datasource_targets_without_metric_names",
-                target_count=len(datasource_catalog),
-                datasource_count=len(ds_types),
-            )
-        else:
-            _record_stage(
-                history,
-                inv_id,
-                "discovery",
-                "failed",
-                "no_metrics_or_datasource_targets",
-                datasource_count=len(ds_types),
-            )
+        discovery_status, discovery_reason, discovery_details = discovery_stage_status(catalog_discovery)
+        record_stage(history, inv_id, "discovery", discovery_status, discovery_reason, **discovery_details)
 
-        mapping_status, mapping_reason, mapping_details = _semantic_mapping_diagnostics(metric_catalog)
-        _record_stage(
+        mapping_status, mapping_reason, mapping_details = semantic_mapping_diagnostics(metric_catalog)
+        record_stage(
             history,
             inv_id,
             "semantic_mapping",
@@ -398,52 +239,9 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             **mapping_details,
         )
 
-        # Confirm advisory (colloquial) synonym evidence via SCOPED signal
-        # coverage: a metaphor implying "cache" becomes a real keyword only if a
-        # cache signal actually resolves against the discovered metrics, using
-        # the signal store — not a global substring match. Keeps ambiguous
-        # evidence from steering the investigation on its own.
-        try:
-            if intent.keyword_evidence and metric_catalog:
-                from dashforge.agents.synonyms import SynonymEvidence, confirm_colloquial
-                from dashforge.signals import get_signal_store
-
-                signal_store = get_signal_store()
-                _resolve_cache: dict[str, bool] = {}
-                confirmation_catalog = catalog_for_services(metric_catalog, intent.services)
-                context_service = intent.services[0] if intent.services else ""
-
-                def _signal_resolves(sig: str) -> bool:
-                    if sig not in _resolve_cache:
-                        try:
-                            hits = signal_store.resolve_signal(
-                                sig,
-                                confirmation_catalog,
-                                context_service=context_service,
-                                target_query_language=primary.query_language,
-                            )
-                            _resolve_cache[sig] = bool(hits)
-                        except Exception:
-                            _resolve_cache[sig] = False
-                    return _resolve_cache[sig]
-
-                evidence = [
-                    SynonymEvidence(
-                        keyword=str(e.get("keyword", "")),
-                        score=float(e.get("score", 0.0)),
-                        tier=str(e.get("tier", "")),
-                        source=str(e.get("source", "")),
-                    )
-                    for e in intent.keyword_evidence
-                ]
-                confirmed = confirm_colloquial(evidence, _signal_resolves)
-                for kw in confirmed:
-                    if kw not in intent.keywords:
-                        intent.keywords.append(kw)
-                if confirmed:
-                    logger.info("colloquial_evidence_confirmed", keywords=confirmed)
-        except Exception:
-            logger.warning("colloquial_confirmation_failed", exc_info=True)
+        confirmed_keywords = confirm_colloquial_keywords(intent, metric_catalog, primary.query_language)
+        if confirmed_keywords:
+            logger.info("colloquial_evidence_confirmed", keywords=confirmed_keywords)
 
         if not catalog_for_compile:
             ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
@@ -457,20 +255,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             if learned_archetypes:
                 ranked_archetypes.extend(learned_archetypes)
                 ranked_archetypes.sort(key=lambda item: item[1], reverse=True)
-            try:
-                history.record_intent(
-                    inv_id,
-                    summary=intent.summary,
-                    domain=intent.domain,
-                    services=intent.services,
-                    keywords=intent.keywords,
-                    signals=_history_signals(intent.signals, ranked_archetypes),
-                    problem_type=intent.problem_type,
-                    archetypes=_history_archetypes(intent.archetypes, ranked_archetypes, learned_archetypes),
-                    timerange=intent.timerange,
-                )
-            except Exception:
-                logger.warning("history_record_selected_archetypes_failed", exc_info=True)
+            record_selected_intent(history, inv_id, intent, ranked_archetypes, learned_archetypes)
 
             unavailable = [
                 backend.name
@@ -523,20 +308,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             if legacy is not None:
                 ranked_archetypes = [(legacy, 0.9)]
 
-        try:
-            history.record_intent(
-                inv_id,
-                summary=intent.summary,
-                domain=intent.domain,
-                services=intent.services,
-                keywords=intent.keywords,
-                signals=_history_signals(intent.signals, ranked_archetypes),
-                problem_type=intent.problem_type,
-                archetypes=_history_archetypes(intent.archetypes, ranked_archetypes, learned_archetypes),
-                timerange=intent.timerange,
-            )
-        except Exception:
-            logger.warning("history_record_selected_archetypes_failed", exc_info=True)
+        record_selected_intent(history, inv_id, intent, ranked_archetypes, learned_archetypes)
 
         # Target query language comes from the primary backend
         target_language = primary.query_language
@@ -550,8 +322,8 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 catalog_for_compile,
                 target_language=target_language,
                 services=intent.services,
-                max_archetypes=settings.max_blended_archetypes,
-                min_secondary_coverage=settings.min_secondary_coverage,
+                max_archetypes=runtime_settings.max_blended_archetypes,
+                min_secondary_coverage=runtime_settings.min_secondary_coverage,
             )
 
         if ranked_archetypes:
@@ -620,13 +392,13 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             )
 
             # Metrics Discovery LLM (cached)
-            discovery_cache_key = make_cache_key(
+            discovery_cache_key = deps.cache_key_factory(
                 "discovery",
                 intent.summary,
                 ",".join(intent.keywords),
                 ",".join(e.name for e in ranked_catalog[:20]),
             )
-            cached_discovery = llm_cache.get(discovery_cache_key)
+            cached_discovery = deps.llm_cache.get(discovery_cache_key)
             discovery_usage = TokenUsage()
             t_disc = time.monotonic()
             if cached_discovery is not None:
@@ -636,7 +408,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 discovery, discovery_usage = await discover_metrics(intent, ranked_catalog, context_chunks)
                 cumulative_tokens = cumulative_tokens + discovery_usage
                 if discovery.metrics:
-                    llm_cache.set(discovery_cache_key, discovery)
+                    deps.llm_cache.set(discovery_cache_key, discovery)
                 discovery_cached = False
 
             stage_log(
@@ -712,13 +484,17 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                     target_language=target_language,
                 )
             except Exception:
-                logger.warning("evidence_resolution_failed", exc_info=True)
+                logger.warning(
+                    "evidence_resolution_failed",
+                    error_type=EvidenceResolutionError.__name__,
+                    exc_info=True,
+                )
 
-        binding_status, binding_reason, binding_details = _compiled_query_diagnostics(
+        binding_status, binding_reason, binding_details = compiled_query_diagnostics(
             dashboard_spec,
             catalog_for_compile,
         )
-        _record_stage(
+        record_stage(
             history,
             inv_id,
             "binding",
@@ -728,7 +504,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         )
         compiled_query_count = sum(len(panel.queries) for panel in dashboard_spec.panels)
         if compiled_query_count:
-            _record_stage(
+            record_stage(
                 history,
                 inv_id,
                 "compilation",
@@ -739,7 +515,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
                 path="archetype" if ranked_archetypes else "freeform",
             )
         else:
-            _record_stage(
+            record_stage(
                 history,
                 inv_id,
                 "compilation",
@@ -751,147 +527,31 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
 
         # ── 5. Validate queries — primary backend validates ──────────
         t0 = time.monotonic()
-        panels_before = len(dashboard_spec.panels)
-        pre_validation_spec = dashboard_spec.model_copy(deep=True)
-        dashboard_spec, validation_warnings = await primary.validate_queries(dashboard_spec, catalog_for_compile)
-        rescue_requirements: list[EvidenceRequirement] = []
-        if evidence_requirements:
-            initial_evidence_observations = observe_evidence(
-                evidence_requirements,
-                evidence_resolutions,
-                pre_validation_spec,
-                dashboard_spec,
+
+        def record_validation_stage(stage: str, status: str, reason_code: str, **details) -> None:
+            record_stage(
+                history,
+                inv_id,
+                stage,
+                status,
+                reason_code,
+                **details,
             )
-            rescue_requirements = missing_critical_symptom_requirements(
-                evidence_requirements,
-                evidence_resolutions,
-                initial_evidence_observations,
-            )
-        if rescue_requirements:
-            original_validation_warnings = list(validation_warnings)
-            original_panels_before = panels_before
-            original_panels_after = len(dashboard_spec.panels)
-            symptom_pre_validation_spec, symptom_resolutions = build_symptom_evidence_dashboard(
-                rescue_requirements,
-                evidence_resolutions,
-                intent,
-                catalog=catalog_for_compile,
-                target_language=target_language,
-                timerange=pre_validation_spec.timerange,
-            )
-            if symptom_pre_validation_spec.panels:
-                symptom_spec, symptom_warnings = await primary.validate_queries(
-                    symptom_pre_validation_spec,
-                    catalog_for_compile,
-                )
-                validation_warnings.extend(symptom_warnings)
-                _record_stage(
-                    history,
-                    inv_id,
-                    "symptom_evidence_rescue",
-                    "passed" if symptom_spec.panels else "failed",
-                    "symptom_panels_validated" if symptom_spec.panels else "symptom_panels_rejected",
-                    original_panels_before=original_panels_before,
-                    original_panels_after=original_panels_after,
-                    original_warnings=original_validation_warnings,
-                    panels_before=len(symptom_pre_validation_spec.panels),
-                    panels_after=len(symptom_spec.panels),
-                )
-                if symptom_spec.panels:
-                    evidence_resolutions.extend(symptom_resolutions)
-                    if original_panels_after:
-                        pre_validation_spec = pre_validation_spec.model_copy(
-                            update={
-                                "panels": [
-                                    *pre_validation_spec.panels,
-                                    *symptom_pre_validation_spec.panels,
-                                ]
-                            }
-                        )
-                        dashboard_spec = dashboard_spec.model_copy(
-                            update={"panels": [*dashboard_spec.panels, *symptom_spec.panels]}
-                        )
-                        panels_before = original_panels_before + len(symptom_pre_validation_spec.panels)
-                    else:
-                        pre_validation_spec = symptom_pre_validation_spec
-                        dashboard_spec = symptom_spec
-                        panels_before = original_panels_before + len(symptom_pre_validation_spec.panels)
-            else:
-                _record_stage(
-                    history,
-                    inv_id,
-                    "symptom_evidence_rescue",
-                    "skipped",
-                    "no_resolved_symptom_evidence",
-                )
-        if evidence_requirements:
-            gap_observations = observe_evidence(
-                evidence_requirements,
-                evidence_resolutions,
-                pre_validation_spec,
-                dashboard_spec,
-            )
-            gap_requirements = missing_critical_evidence_gap_requirements(
-                evidence_requirements,
-                evidence_resolutions,
-                gap_observations,
-            )
-            if gap_requirements:
-                gap_pre_validation_spec, gap_resolutions = build_evidence_gap_dashboard(
-                    gap_requirements,
-                    evidence_resolutions,
-                    intent,
-                    catalog=catalog_for_compile,
-                    target_language=target_language,
-                    timerange=pre_validation_spec.timerange,
-                )
-                if gap_pre_validation_spec.panels:
-                    gap_spec, gap_warnings = await primary.validate_queries(
-                        gap_pre_validation_spec,
-                        catalog_for_compile,
-                    )
-                    validation_warnings.extend(gap_warnings)
-                    _record_stage(
-                        history,
-                        inv_id,
-                        "evidence_gap_resolution",
-                        "passed" if gap_spec.panels else "failed",
-                        "supported_observations_validated" if gap_spec.panels else "gap_observations_rejected",
-                        requirements=len(gap_requirements),
-                        panels_before=len(gap_pre_validation_spec.panels),
-                        panels_after=len(gap_spec.panels),
-                    )
-                    if gap_spec.panels:
-                        evidence_resolutions.extend(gap_resolutions)
-                        pre_validation_spec = pre_validation_spec.model_copy(
-                            update={
-                                "panels": [
-                                    *pre_validation_spec.panels,
-                                    *gap_pre_validation_spec.panels,
-                                ]
-                            }
-                        )
-                        dashboard_spec = dashboard_spec.model_copy(
-                            update={"panels": [*dashboard_spec.panels, *gap_spec.panels]}
-                        )
-                        panels_before += len(gap_pre_validation_spec.panels)
-                else:
-                    _record_stage(
-                        history,
-                        inv_id,
-                        "evidence_gap_resolution",
-                        "skipped",
-                        "no_supported_gap_observation",
-                        requirements=len(gap_requirements),
-                    )
-            else:
-                _record_stage(
-                    history,
-                    inv_id,
-                    "evidence_gap_resolution",
-                    "skipped",
-                    "no_missing_gap_evidence",
-                )
+
+        validation_result = await validate_dashboard_and_evidence(
+            primary=primary,
+            dashboard_spec=dashboard_spec,
+            catalog=catalog_for_compile,
+            evidence_requirements=evidence_requirements,
+            evidence_resolutions=evidence_resolutions,
+            intent=intent,
+            target_language=target_language,
+            ranked_archetypes_present=bool(ranked_archetypes),
+            record_stage=record_validation_stage,
+        )
+        dashboard_spec = validation_result.dashboard_spec
+        validation_warnings = validation_result.validation_warnings
+        panels_before = validation_result.panels_before
         timings["query_validation"] = time.monotonic() - t0
         stage_log(
             "query_validation",
@@ -901,77 +561,10 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             panels_after=len(dashboard_spec.panels),
             warnings=len(validation_warnings),
         )
-        panels_after = len(dashboard_spec.panels)
-        if panels_after == 0:
-            validation_status, validation_reason = "failed", "all_panels_rejected"
-        elif panels_after < panels_before:
-            validation_status, validation_reason = "partial", "some_panels_rejected"
-        else:
-            validation_status, validation_reason = "passed", "all_panels_survived"
-        _record_stage(
-            history,
-            inv_id,
-            "validation",
-            validation_status,
-            validation_reason,
-            panels_before=panels_before,
-            panels_after=panels_after,
-            warnings=validation_warnings,
-        )
-        try:
-            if evidence_requirements:
-                evidence_observations = observe_evidence(
-                    evidence_requirements,
-                    evidence_resolutions,
-                    pre_validation_spec,
-                    dashboard_spec,
-                )
-                evidence_summary = summarize_evidence(
-                    evidence_requirements,
-                    evidence_resolutions,
-                    evidence_observations,
-                )
-                critical_total = cast(int, evidence_summary["critical_total"])
-                critical_observed = cast(int, evidence_summary["critical_observed"])
-                if critical_total and critical_observed == critical_total:
-                    evidence_status, evidence_reason = "passed", "all_critical_evidence_observed"
-                elif critical_observed:
-                    evidence_status, evidence_reason = "partial", "some_critical_evidence_observed"
-                else:
-                    evidence_status, evidence_reason = "failed", "no_critical_evidence_observed"
-                _record_stage(
-                    history,
-                    inv_id,
-                    "evidence",
-                    evidence_status,
-                    evidence_reason,
-                    **evidence_summary,
-                )
-            else:
-                _record_stage(
-                    history,
-                    inv_id,
-                    "evidence",
-                    "skipped",
-                    "no_declared_evidence_requirements",
-                    path="archetype" if ranked_archetypes else "freeform",
-                )
-        except Exception:
-            logger.warning("history_record_evidence_failed", exc_info=True)
 
         # Record queries after validation
         try:
-            queries_for_history = [
-                {"expr": q.expr, "panel_title": p.title} for p in dashboard_spec.panels for q in p.queries if q.expr
-            ]
-            metrics_for_history = list(
-                {
-                    q.expr.split("{")[0].split("(")[-1].strip()
-                    for p in dashboard_spec.panels
-                    for q in p.queries
-                    if q.expr
-                }
-            )
+            queries_for_history, metrics_for_history = query_history_payload(dashboard_spec)
             history.record_queries(
                 inv_id,
                 metrics_selected=metrics_for_history,
@@ -1023,32 +616,12 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
         effective_url = grafana_result.url or sfx_result.url or ""
 
         path_used = "archetype" if ranked_archetypes else "freeform"
-        # Report only the datasources that actually back a *surviving* panel,
-        # never the full discovery catalog. Map each surviving query's UID back
-        # to a human name via the discovered catalogs, falling back to type.
-        uid_to_name: dict[str, str] = {}
-        for entry in [*metric_catalog, *datasource_catalog]:
-            if entry.datasource_uid and entry.datasource_name:
-                uid_to_name.setdefault(entry.datasource_uid, entry.datasource_name)
-        surviving_ds: list[str] = []
-        seen_ds: set[str] = set()
-        for panel in dashboard_spec.panels:
-            for q in panel.queries:
-                name = uid_to_name.get(q.datasource_uid) or q.datasource_type or q.datasource_uid
-                if name and name not in seen_ds:
-                    seen_ds.add(name)
-                    surviving_ds.append(name)
-        ds_info = ", ".join(surviving_ds) if surviving_ds else "none"
-        summary_parts = [
-            f"Created dashboard **{dashboard_spec.title}** with " f"{len(dashboard_spec.panels)} panels.",
-            f"Timerange: last {dashboard_spec.timerange}",
-            f"Datasources used: {ds_info}",
-            f"Path: {path_used}",
-        ]
-        for name, result in publish_results.items():
-            if result.url:
-                summary_parts.append(f"{name.title()}: {result.url}")
-        summary = "\n".join(summary_parts)
+        summary = dashboard_summary(
+            dashboard_spec,
+            path_used,
+            surviving_datasource_names(dashboard_spec, metric_catalog, datasource_catalog),
+            publish_results,
+        )
 
         total_s = time.monotonic() - t_start
         timings["total"] = total_s
@@ -1095,14 +668,7 @@ async def _run_pipeline_inner(request: DashRequest) -> DashResponse:
             from dashforge.feedback import get_feedback_store
 
             feedback_store = get_feedback_store()
-            metrics_used = list(
-                {
-                    q.expr.split("{")[0].split("(")[-1].strip()
-                    for p in dashboard_spec.panels
-                    for q in p.queries
-                    if q.expr
-                }
-            )
+            _, metrics_used = query_history_payload(dashboard_spec)
             feedback_store.record_provenance(
                 dashboard_uid=effective_uid,
                 prompt=request.prompt,

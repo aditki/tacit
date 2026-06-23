@@ -97,7 +97,7 @@ def _referenced_metrics(expr: str, query_language: str) -> set[str]:
     if query_language and query_language.lower() not in ("", "promql"):
         return set()
     try:
-        from dashforge.dashboard_ingest import extract_metrics_from_promql
+        from dashforge.query_parsing.promql import extract_metrics_from_promql
 
         return set(extract_metrics_from_promql(expr))
     except Exception:

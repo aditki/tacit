@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import structlog
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Query, Security
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi import Path as PathParam
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from fastapi.security import APIKeyHeader
 
-from dashforge import __version__
+from dashforge.api.app import create_app
+from dashforge.api.security import MAX_PROMPT_LENGTH as _MAX_PROMPT_LENGTH
+from dashforge.api.security import sanitize_prompt, verify_api_key
 from dashforge.config import settings
 from dashforge.feedback import get_feedback_store
 from dashforge.models.schemas import (
@@ -40,6 +39,10 @@ logger = structlog.get_logger()
 
 _slack_task: asyncio.Task | None = None
 
+# Backward-compatible aliases for tests/importers that used the old entrypoint-local helpers.
+MAX_PROMPT_LENGTH = _MAX_PROMPT_LENGTH
+_sanitize_prompt = sanitize_prompt
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,99 +64,7 @@ async def lifespan(app: FastAPI):
         _slack_task.cancel()
 
 
-app = FastAPI(
-    title="DashForge",
-    description=(
-        "## Natural Language → Grafana Dashboards\n\n"
-        "DashForge is a multi-agent pipeline that converts plain-English incident descriptions "
-        "into ready-to-use Grafana dashboards. It supports 10+ datasource types (Prometheus, "
-        "CloudWatch, Loki, Elasticsearch, Graphite, InfluxDB, etc.) and uses LLM-powered "
-        "intent classification, cross-datasource metric discovery, and deterministic query building.\n\n"
-        "### Key capabilities\n"
-        "- **Dashboard generation** — describe what you need, get a published Grafana dashboard\n"
-        "- **Feedback loop** — rate dashboards, and the system automatically improves metric selection\n"
-        "- **Archetype management** — edit investigation templates via YAML, hot-reload without restart\n\n"
-        "### Authentication\n"
-        "When `API_AUTH_ENABLED=true`, pass your key via the `X-API-Key` header. "
-        "When disabled (default for development), all endpoints are open.\n\n"
-        "### Interactive docs\n"
-        "- **Swagger UI** — you are here (`/docs`)\n"
-        "- **ReDoc** — alternative view at [`/redoc`](/redoc)\n"
-        "- **Web UI** — interactive dashboard generator at [`/`](/)\n"
-    ),
-    version=__version__,
-    lifespan=lifespan,
-    openapi_tags=[
-        {
-            "name": "Dashboard Generation",
-            "description": "Generate Grafana dashboards from natural-language prompts. "
-            "The pipeline: Intent Classification → Metric Discovery → Query Building → Dashboard Publishing.",
-        },
-        {
-            "name": "Feedback",
-            "description": "Submit and retrieve human evaluation feedback for generated dashboards. "
-            "Feedback drives the closed-loop improvement system — rated metrics influence future ranking.",
-        },
-        {
-            "name": "Insights",
-            "description": "Analyze collected feedback to surface actionable improvement signals: "
-            "per-archetype quality, noisy dashboards, metric quality, archetype gaps, and recommendations.",
-        },
-        {
-            "name": "Archetypes",
-            "description": "View and manage investigation archetype templates. "
-            "Archetypes are loaded from packaged data or `DASHFORGE_ARCHETYPES_PATH` "
-            "and can be hot-reloaded without restart.",
-        },
-        {
-            "name": "Signals",
-            "description": "Semantic signal taxonomy — maps canonical observability concepts "
-            "(e.g. 'request_latency', 'error_rate') to environment-specific metrics. "
-            "Signals decouple archetypes from raw metric names for portability.",
-        },
-        {
-            "name": "Learning",
-            "description": "Learn operational patterns from existing Grafana dashboards. "
-            "Ingests dashboards, extracts metric co-occurrence, panel groupings, "
-            "and aggregation patterns, then infers signal mappings.",
-        },
-        {
-            "name": "System",
-            "description": "Health checks and system status.",
-        },
-    ],
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── API key auth ─────────────────────────────────────────────────────────
-
-_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-
-async def verify_api_key(api_key: str | None = Security(_api_key_header)):
-    """Verify API key if auth is enabled. No-op when disabled."""
-    if not settings.api_auth_enabled:
-        return
-    if not api_key or not secrets.compare_digest(api_key, settings.api_auth_key):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
-
-# ── Input sanitization ───────────────────────────────────────────────────
-
-MAX_PROMPT_LENGTH = 2000
-
-
-def _sanitize_prompt(prompt: str) -> str:
-    """Basic prompt sanitization — length cap and control char removal."""
-    # Strip control characters (except newlines)
-    cleaned = "".join(c for c in prompt if c == "\n" or (c.isprintable() and ord(c) < 0x10000))
-    return cleaned[:MAX_PROMPT_LENGTH].strip()
+app = create_app(lifespan=lifespan)
 
 
 @app.get(
@@ -192,7 +103,7 @@ async def create_chart(request: DashRequest):
     5. **Dashboard publishing** — creates the dashboard in Grafana via API
     6. **Provenance recording** — stores prompt → dashboard mapping for feedback loop
     """
-    request.prompt = _sanitize_prompt(request.prompt)
+    request = request.model_copy(update={"prompt": sanitize_prompt(request.prompt)})
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
     try:
