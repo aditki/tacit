@@ -21,6 +21,7 @@ from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
 from tacit.validation import validate_dashboard_queries
 
 logger = structlog.get_logger()
+PROMQL_DATASOURCE_TYPES = {"prometheus", "promql", "mimir", "cortex", "thanos"}
 
 
 class GrafanaBackend:
@@ -192,7 +193,13 @@ class GrafanaBackend:
         """Fetch a Grafana alert rule and extract operational features."""
         try:
             rule = cast(dict[str, Any], await self._client._get(f"/api/v1/provisioning/alert-rules/{uid}"))
-            return _parse_grafana_alert_rule(rule, backend_name=self.name, base_url=self._client.base_url)
+            datasource_types_by_uid = await self._datasource_types_by_uid()
+            return _parse_grafana_alert_rule(
+                rule,
+                backend_name=self.name,
+                base_url=self._client.base_url,
+                datasource_types_by_uid=datasource_types_by_uid,
+            )
         except Exception:
             legacy = cast(dict[str, Any], await self._client._get(f"/api/alerts/{uid}"))
             return _parse_legacy_grafana_alert(legacy, backend_name=self.name, base_url=self._client.base_url)
@@ -248,6 +255,14 @@ class GrafanaBackend:
     async def close(self) -> None:
         await self._client.close()
 
+    async def _datasource_types_by_uid(self) -> dict[str, str]:
+        try:
+            datasources = await list_datasources(self._client)
+        except Exception as exc:
+            logger.warning("grafana_alert_datasource_resolution_failed", error=str(exc))
+            return {}
+        return {ds.uid.lower(): ds.type.lower() for ds in datasources if ds.uid and ds.type}
+
 
 def _string_dict(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
@@ -280,7 +295,11 @@ def _datasource_type(value: Any) -> str:
     return ""
 
 
-def _is_prometheus_alert_query_item(item: dict[str, Any], model: dict[str, Any]) -> bool:
+def _is_prometheus_alert_query_item(
+    item: dict[str, Any],
+    model: dict[str, Any],
+    datasource_types_by_uid: dict[str, str] | None = None,
+) -> bool:
     datasource_uids = [
         str(item.get("datasourceUid", "") or "").lower(),
         str(model.get("datasourceUid", "") or "").lower(),
@@ -302,11 +321,21 @@ def _is_prometheus_alert_query_item(item: dict[str, Any], model: dict[str, Any])
     ]
     explicit_types = [value for value in datasource_types if value]
     if explicit_types:
-        return any(value in {"prometheus", "promql"} for value in explicit_types)
+        return any(value in PROMQL_DATASOURCE_TYPES for value in explicit_types)
+    resolved_types = [
+        (datasource_types_by_uid or {}).get(uid, "")
+        for uid in datasource_uids
+        if uid and uid not in {"__expr__", "-100"}
+    ]
+    if resolved_types:
+        return any(value in PROMQL_DATASOURCE_TYPES for value in resolved_types)
     return False
 
 
-def _extract_grafana_rule_queries(rule: dict[str, Any]) -> list[str]:
+def _extract_grafana_rule_queries(
+    rule: dict[str, Any],
+    datasource_types_by_uid: dict[str, str] | None = None,
+) -> list[str]:
     queries: list[str] = []
     for item in rule.get("data", []) or []:
         if not isinstance(item, dict):
@@ -314,7 +343,7 @@ def _extract_grafana_rule_queries(rule: dict[str, Any]) -> list[str]:
         model = item.get("model", {})
         if not isinstance(model, dict):
             continue
-        if not _is_prometheus_alert_query_item(item, model):
+        if not _is_prometheus_alert_query_item(item, model, datasource_types_by_uid):
             continue
         for key in ("expr", "query"):
             value = model.get(key, "")
@@ -335,12 +364,18 @@ def _extract_promql_metrics(queries: list[str]) -> list[str]:
     return list(dict.fromkeys(metrics))
 
 
-def _parse_grafana_alert_rule(rule: dict[str, Any], *, backend_name: str, base_url: str) -> AlertFeatures:
+def _parse_grafana_alert_rule(
+    rule: dict[str, Any],
+    *,
+    backend_name: str,
+    base_url: str,
+    datasource_types_by_uid: dict[str, str] | None = None,
+) -> AlertFeatures:
     labels = _string_dict(rule.get("labels", {}))
     annotations = _string_dict(rule.get("annotations", {}))
     title = str(rule.get("title", ""))
     uid = str(rule.get("uid", ""))
-    queries = _extract_grafana_rule_queries(rule)
+    queries = _extract_grafana_rule_queries(rule, datasource_types_by_uid)
     tags = [f"{key}:{value}" for key, value in labels.items() if key.lower() in {"service", "team", "severity"}]
     dashboard_uid = annotations.get("__dashboardUid__", "") or annotations.get("dashboardUid", "")
     panel_title = annotations.get("__panelTitle__", "") or annotations.get("panelTitle", "")

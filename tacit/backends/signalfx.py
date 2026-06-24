@@ -139,6 +139,8 @@ class SignalFxBackend:
         self.last_alert_list_complete = False
         data = await self._client._get("/v2/detector", params={"limit": limit})
         detectors = data.get("results", []) if isinstance(data, dict) else data
+        detector_count = len(detectors) if isinstance(detectors, list) else 0
+        self.last_alert_list_complete = _signalfx_detector_page_complete(data, detector_count, limit)
         out: list[dict] = []
         for item in detectors if isinstance(detectors, list) else []:
             if not isinstance(item, dict):
@@ -343,6 +345,20 @@ def _detector_condition(detector: dict[str, Any]) -> str:
             if label:
                 labels.append(str(label))
     return "; ".join(dict.fromkeys(labels))
+
+
+def _signalfx_detector_page_complete(data: Any, detector_count: int, limit: int) -> bool:
+    """Return true when the detector response is known to be a complete snapshot."""
+    if not isinstance(data, dict):
+        return detector_count < limit
+    if data.get("next") or data.get("nextPage") or data.get("nextPageLink"):
+        return False
+    if data.get("more") is True or data.get("hasMore") is True:
+        return False
+    total = data.get("count", data.get("total", data.get("totalCount")))
+    if isinstance(total, int):
+        return detector_count >= total
+    return detector_count < limit
 
 
 def _parse_signalfx_detector(detector: dict[str, Any], *, backend_name: str, realm: str) -> AlertFeatures:

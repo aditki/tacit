@@ -2,8 +2,8 @@ import pytest
 
 from tacit.alert_ingest import ingest_alert, learn_backend_alerts
 from tacit.backends.base import AlertFeatures
-from tacit.backends.grafana import _parse_grafana_alert_rule
-from tacit.backends.signalfx import _parse_signalfx_detector
+from tacit.backends.grafana import GrafanaBackend, _parse_grafana_alert_rule
+from tacit.backends.signalfx import SignalFxBackend, _parse_signalfx_detector
 
 
 def test_grafana_alert_rule_parses_to_common_alert_features():
@@ -98,6 +98,63 @@ def test_grafana_alert_rule_skips_unknown_datasource_uid_queries():
     assert features.query_transformations == []
 
 
+def test_grafana_alert_rule_resolves_datasource_uid_only_prometheus_queries():
+    features = _parse_grafana_alert_rule(
+        {
+            "uid": "checkout-latency",
+            "title": "Checkout latency high",
+            "condition": "A",
+            "labels": {"service": "checkout"},
+            "data": [
+                {
+                    "refId": "A",
+                    "datasourceUid": "prom-prod",
+                    "model": {"expr": 'rate(checkout_latency_seconds_count{service="checkout"}[5m])'},
+                }
+            ],
+        },
+        backend_name="grafana",
+        base_url="http://grafana.example",
+        datasource_types_by_uid={"prom-prod": "prometheus"},
+    )
+
+    assert features.metrics_found == ["checkout_latency_seconds_count"]
+    assert features.query_transformations == ['rate(checkout_latency_seconds_count{service="checkout"}[5m])']
+
+
+@pytest.mark.asyncio
+async def test_grafana_backend_resolves_datasource_uid_for_managed_alerts():
+    class FakeGrafanaClient:
+        base_url = "http://grafana.example"
+
+        async def _get(self, path: str, **_kwargs):
+            assert path == "/api/v1/provisioning/alert-rules/checkout-latency"
+            return {
+                "uid": "checkout-latency",
+                "title": "Checkout latency high",
+                "condition": "A",
+                "data": [
+                    {
+                        "refId": "A",
+                        "datasourceUid": "prom-prod",
+                        "model": {"expr": 'rate(checkout_latency_seconds_count{service="checkout"}[5m])'},
+                    }
+                ],
+            }
+
+        async def list_datasources(self):
+            return [{"uid": "prom-prod", "name": "Prometheus", "type": "prometheus"}]
+
+        async def close(self):
+            return None
+
+    backend = GrafanaBackend(client=FakeGrafanaClient())
+
+    features = await backend.ingest_alert("checkout-latency")
+
+    assert features.metrics_found == ["checkout_latency_seconds_count"]
+
+
 def test_signalfx_detector_parses_to_common_alert_features():
     features = _parse_signalfx_detector(
         {
@@ -185,3 +242,44 @@ async def test_limited_alert_crawl_does_not_mark_unseen_alerts_stale(tmp_path, m
     assert result["summary"]["warnings"] == ["stale_reconciliation_skipped_partial_crawl"]
     assert stale_row is not None
     assert stale_row["stale"] is False
+
+
+@pytest.mark.asyncio
+async def test_signalfx_detector_crawl_marks_short_page_complete():
+    class FakeSignalFxClient:
+        realm = "us1"
+
+        async def _get(self, path: str, params=None):
+            assert path == "/v2/detector"
+            assert params == {"limit": 10}
+            return {"results": [{"id": "detector-1", "name": "Checkout"}]}
+
+        async def close(self):
+            return None
+
+    backend = SignalFxBackend(client=FakeSignalFxClient())
+
+    alerts = await backend.list_alerts(limit=10)
+
+    assert alerts == [{"uid": "detector-1", "title": "Checkout", "backend": "signalfx"}]
+    assert backend.last_alert_list_complete is True
+
+
+@pytest.mark.asyncio
+async def test_signalfx_detector_crawl_keeps_paged_response_incomplete():
+    class FakeSignalFxClient:
+        realm = "us1"
+
+        async def _get(self, path: str, params=None):
+            assert path == "/v2/detector"
+            assert params == {"limit": 10}
+            return {"results": [{"id": "detector-1", "name": "Checkout"}], "nextPageLink": "/v2/detector?offset=1"}
+
+        async def close(self):
+            return None
+
+    backend = SignalFxBackend(client=FakeSignalFxClient())
+
+    await backend.list_alerts(limit=10)
+
+    assert backend.last_alert_list_complete is False
