@@ -388,7 +388,7 @@ async def learn_backend_alerts(
                 failures.append(failure)
                 totals["alerts_failed"] += 1
 
-        stale_reconciliation_complete = len(alerts) < limit
+        stale_reconciliation_complete = bool(getattr(backend, "last_alert_list_complete", False))
         if not dry_run and stale_reconciliation_complete:
             store = get_signal_store()
             seen_alert_uids = {str(item.get("uid", "")) for item in alerts if item.get("uid")}

@@ -30,6 +30,7 @@ class GrafanaBackend:
         self._settings = runtime_settings
         self._client = client or GrafanaClient(runtime_settings=runtime_settings)
         self.last_discovery_status = DiscoveryStatus()
+        self.last_alert_list_complete = False
 
     # ── Protocol properties ───────────────────────────────────────────
 
@@ -198,9 +199,11 @@ class GrafanaBackend:
 
     async def list_alerts(self, limit: int = 500) -> list[dict]:
         """List Grafana alert rules discoverable by the configured token."""
+        self.last_alert_list_complete = False
         try:
             raw = await self._client._get("/api/v1/provisioning/alert-rules")
             rules = raw if isinstance(raw, list) else []
+            self.last_alert_list_complete = len(rules) <= limit
             out = []
             for item in rules:
                 if not isinstance(item, dict):
@@ -221,6 +224,7 @@ class GrafanaBackend:
             logger.warning("grafana_unified_alert_list_failed", error=str(exc))
 
         raw = await self._client._get("/api/alerts", params={"limit": limit})
+        self.last_alert_list_complete = False
         alerts = raw if isinstance(raw, list) else []
         out = []
         for item in alerts:
@@ -299,7 +303,7 @@ def _is_prometheus_alert_query_item(item: dict[str, Any], model: dict[str, Any])
     explicit_types = [value for value in datasource_types if value]
     if explicit_types:
         return any(value in {"prometheus", "promql"} for value in explicit_types)
-    return True
+    return False
 
 
 def _extract_grafana_rule_queries(rule: dict[str, Any]) -> list[str]:

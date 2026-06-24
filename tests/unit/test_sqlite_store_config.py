@@ -191,6 +191,35 @@ async def test_unchanged_alert_recrawl_preserves_approved_status(tmp_path, monke
         assert rows[0]["review_state"] != "candidate"
 
 
+async def test_unchanged_pending_alert_can_upgrade_to_approved(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    features = AlertFeatures(
+        alert_uid="checkout-latency",
+        alert_title="Checkout latency high",
+        alert_tags=["service:checkout"],
+        backend_name="grafana",
+        query_language="promql",
+        condition="A > 1",
+        labels={"service": "checkout"},
+        metrics_found=["checkout_request_duration_seconds"],
+        query_transformations=['histogram_quantile(0.95, checkout_request_duration_seconds{service="checkout"})'],
+    )
+
+    await ingest_alert_features(features, auto_approve=False)
+    result = await ingest_alert_features(features, auto_approve=True)
+    row = store.get_ingested_alert("checkout-latency", "grafana")
+
+    assert result["change_state"] == "skipped"
+    assert result["status"] == "approved"
+    assert row is not None
+    assert row["status"] == "approved"
+    if store._learning_index_available():
+        rows = store.search_learning_context("checkout latency", service="checkout")
+        assert rows
+        assert rows[0]["review_state"] != "candidate"
+
+
 def test_missing_alerts_are_marked_stale_not_deleted(tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.record_ingested_alert(
@@ -223,6 +252,25 @@ def test_missing_alerts_are_marked_stale_not_deleted(tmp_path):
     assert refreshed["stale"] is False
     assert refreshed["missing_since"] is None
     assert refreshed["status"] == "pending"
+
+
+def test_missing_alerts_are_marked_stale_when_fts_unavailable(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.record_ingested_alert(
+        "checkout-latency",
+        backend_name="grafana",
+        alert_title="Checkout latency high",
+        fingerprint="abc",
+        metrics_found=["checkout_request_duration_seconds"],
+    )
+    monkeypatch.setattr(store, "_learning_index_available", lambda: False)
+
+    stale_count = store.mark_missing_alerts_stale(backend_name="grafana", seen_alert_uids=set())
+    row = store.get_ingested_alert("checkout-latency", "grafana")
+
+    assert stale_count == 1
+    assert row is not None
+    assert row["stale"] is True
 
 
 def test_stale_alert_context_is_removed_from_active_search(tmp_path):

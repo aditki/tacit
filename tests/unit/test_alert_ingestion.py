@@ -19,9 +19,10 @@ def test_grafana_alert_rule_parses_to_common_alert_features():
                 {
                     "refId": "A",
                     "model": {
+                        "datasource": {"type": "prometheus", "uid": "prom"},
                         "expr": (
                             "histogram_quantile(0.95, " 'rate(checkout_latency_seconds_bucket{service="checkout"}[5m]))'
-                        )
+                        ),
                     },
                 }
             ],
@@ -72,6 +73,29 @@ def test_grafana_alert_rule_skips_expression_ref_ids_and_non_prometheus_queries(
 
     assert features.metrics_found == ["checkout_latency_seconds_count"]
     assert features.query_transformations == ['rate(checkout_latency_seconds_count{service="checkout"}[5m])']
+
+
+def test_grafana_alert_rule_skips_unknown_datasource_uid_queries():
+    features = _parse_grafana_alert_rule(
+        {
+            "uid": "checkout-logs",
+            "title": "Checkout logs high",
+            "condition": "A",
+            "labels": {"service": "checkout"},
+            "data": [
+                {
+                    "refId": "A",
+                    "datasourceUid": "loki-prod",
+                    "model": {"expr": '{app="checkout"} |= "error"'},
+                }
+            ],
+        },
+        backend_name="grafana",
+        base_url="http://grafana.example",
+    )
+
+    assert features.metrics_found == []
+    assert features.query_transformations == []
 
 
 def test_signalfx_detector_parses_to_common_alert_features():
@@ -131,6 +155,7 @@ async def test_limited_alert_crawl_does_not_mark_unseen_alerts_stale(tmp_path, m
 
     class FakeBackend:
         name = "grafana"
+        last_alert_list_complete = False
 
         async def list_alerts(self, limit: int = 500):
             assert limit == 1

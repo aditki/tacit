@@ -869,7 +869,8 @@ class SignalStore:
                        missing_since = NULL,
                        status = CASE
                            WHEN ingested_alerts.fingerprint = excluded.fingerprint
-                                AND ingested_alerts.stale = 0 THEN ingested_alerts.status
+                                AND ingested_alerts.stale = 0
+                                AND excluded.status != 'approved' THEN ingested_alerts.status
                            ELSE excluded.status
                        END,
                        signals_inferred = excluded.signals_inferred,
@@ -941,16 +942,20 @@ class SignalStore:
                     WHERE backend_name = ? AND alert_uid IN ({placeholders})""",
                 (now, now, backend_name, *missing),
             )
-            alert_context_ids = [f"alert:{uid}" for uid in missing]
-            fts_placeholders = ", ".join("?" for _ in alert_context_ids)
-            conn.execute(
-                f"""UPDATE learning_context_fts
-                    SET review_state = 'stale'
-                    WHERE source_kind = 'alert_rule'
-                      AND backend_name = ?
-                      AND dashboard_uid IN ({fts_placeholders})""",
-                (backend_name, *alert_context_ids),
-            )
+            if self._learning_index_available():
+                try:
+                    alert_context_ids = [f"alert:{uid}" for uid in missing]
+                    fts_placeholders = ", ".join("?" for _ in alert_context_ids)
+                    conn.execute(
+                        f"""UPDATE learning_context_fts
+                            SET review_state = 'stale'
+                            WHERE source_kind = 'alert_rule'
+                              AND backend_name = ?
+                              AND dashboard_uid IN ({fts_placeholders})""",
+                        (backend_name, *alert_context_ids),
+                    )
+                except sqlite3.OperationalError as exc:
+                    logger.warning("stale_alert_context_update_failed", error=str(exc))
             return cursor.rowcount
 
     def index_alert_context(

@@ -25,6 +25,7 @@ class SignalFxBackend:
         self._settings = runtime_settings
         self._client = client or SignalFxClient(runtime_settings=runtime_settings)
         self.last_discovery_status = DiscoveryStatus()
+        self.last_alert_list_complete = False
 
     # ── Protocol properties ───────────────────────────────────────────
 
@@ -135,6 +136,7 @@ class SignalFxBackend:
 
     async def list_alerts(self, limit: int = 500) -> list[dict]:
         """List SignalFx detectors discoverable by the configured token."""
+        self.last_alert_list_complete = False
         data = await self._client._get("/v2/detector", params={"limit": limit})
         detectors = data.get("results", []) if isinstance(data, dict) else data
         out: list[dict] = []
