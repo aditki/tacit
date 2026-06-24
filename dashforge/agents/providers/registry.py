@@ -2,44 +2,46 @@
 
 from __future__ import annotations
 
+import inspect
+
 import structlog
 
 from dashforge.agents.providers.base import LLMProvider
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 
 logger = structlog.get_logger()
 
 _provider: LLMProvider | None = None
 
 
-def _anthropic_provider() -> LLMProvider:
+def _anthropic_provider(runtime_settings: Settings | None = None) -> LLMProvider:
     from dashforge.agents.providers.anthropic import AnthropicProvider
 
-    return AnthropicProvider()
+    return AnthropicProvider(runtime_settings=runtime_settings)
 
 
-def _openai_provider() -> LLMProvider:
+def _openai_provider(runtime_settings: Settings | None = None) -> LLMProvider:
     from dashforge.agents.providers.openai_provider import OpenAIProvider
 
-    return OpenAIProvider()
+    return OpenAIProvider(runtime_settings=runtime_settings)
 
 
-def _azure_provider() -> LLMProvider:
+def _azure_provider(runtime_settings: Settings | None = None) -> LLMProvider:
     from dashforge.agents.providers.openai_provider import AzureOpenAIProvider
 
-    return AzureOpenAIProvider()
+    return AzureOpenAIProvider(runtime_settings=runtime_settings)
 
 
-def _bedrock_provider() -> LLMProvider:
+def _bedrock_provider(runtime_settings: Settings | None = None) -> LLMProvider:
     from dashforge.agents.providers.bedrock import BedrockProvider
 
-    return BedrockProvider()
+    return BedrockProvider(runtime_settings=runtime_settings)
 
 
-def _ollama_provider() -> LLMProvider:
+def _ollama_provider(runtime_settings: Settings | None = None) -> LLMProvider:
     from dashforge.agents.providers.ollama import OllamaProvider
 
-    return OllamaProvider()
+    return OllamaProvider(runtime_settings=runtime_settings)
 
 
 _PROVIDER_FACTORIES = {
@@ -63,18 +65,34 @@ def reset_provider_for_tests() -> None:
     _provider = None
 
 
+def _call_factory(factory, runtime_settings: Settings) -> LLMProvider:
+    try:
+        accepts_settings = bool(inspect.signature(factory).parameters)
+    except (TypeError, ValueError):
+        accepts_settings = False
+    if accepts_settings:
+        return factory(runtime_settings)
+    return factory()
+
+
+def create_provider(runtime_settings: Settings | None = None) -> LLMProvider:
+    """Create an LLMProvider from an explicit settings object."""
+    runtime_settings = runtime_settings or settings
+    name = runtime_settings.llm_provider.lower()
+    factory = _PROVIDER_FACTORIES.get(name)
+    if factory is None:
+        supported = ", ".join(sorted(_PROVIDER_FACTORIES))
+        raise ValueError(f"Unknown LLM_PROVIDER={name!r}. Supported: {supported}")
+    provider = _call_factory(factory, runtime_settings)
+    logger.info("llm_provider_init", provider=name, model=runtime_settings.llm_model)
+    return provider
+
+
 def get_provider() -> LLMProvider:
     """Return the singleton LLMProvider based on settings.llm_provider."""
     global _provider
     if _provider is not None:
         return _provider
 
-    name = settings.llm_provider.lower()
-    factory = _PROVIDER_FACTORIES.get(name)
-    if factory is None:
-        supported = ", ".join(sorted(_PROVIDER_FACTORIES))
-        raise ValueError(f"Unknown LLM_PROVIDER={name!r}. Supported: {supported}")
-
-    _provider = factory()
-    logger.info("llm_provider_init", provider=name, model=settings.llm_model)
+    _provider = create_provider(settings)
     return _provider

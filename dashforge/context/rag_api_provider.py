@@ -16,7 +16,7 @@ from __future__ import annotations
 import httpx
 import structlog
 
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 from dashforge.context.base import ContextProvider
 from dashforge.models.schemas import ContextChunk, Intent
 
@@ -29,11 +29,12 @@ class RAGAPIProvider(ContextProvider):
     def name(self) -> str:
         return "rag_api"
 
-    def __init__(self):
-        self._base_url = settings.context_rag_api_url.rstrip("/")
+    def __init__(self, runtime_settings: Settings | None = None):
+        runtime_settings = runtime_settings or settings
+        self._base_url = runtime_settings.context_rag_api_url.rstrip("/")
         headers: dict[str, str] = {"Content-Type": "application/json"}
-        if settings.context_api_key:
-            headers["Authorization"] = f"Bearer {settings.context_api_key}"
+        if runtime_settings.context_api_key:
+            headers["Authorization"] = f"Bearer {runtime_settings.context_api_key}"
         self._client = httpx.AsyncClient(
             headers=headers,
             timeout=30.0,

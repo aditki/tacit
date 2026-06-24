@@ -9,10 +9,9 @@ import structlog
 
 from dashforge.agents.intent import classify_intent
 from dashforge.backends import get_active_backends
-from dashforge.cache import llm_cache, make_cache_key
 from dashforge.config import settings
 from dashforge.context.enrichment import enrich_context
-from dashforge.dependencies import PipelineDependencies, _get_feedback_store
+from dashforge.dependencies import PipelineDependencies, _get_feedback_store, build_pipeline_dependencies
 from dashforge.history import get_investigation_store
 from dashforge.logging import bind_request_id, stage_log, unbind_request_id
 from dashforge.models.schemas import (
@@ -62,13 +61,11 @@ def _default_dependencies() -> PipelineDependencies:
     cold isolated runtime. Keeping the default lookup here preserves that
     behavior while the core runner still accepts explicit dependencies.
     """
-    return PipelineDependencies(
-        settings=settings,
+    return build_pipeline_dependencies(
+        settings,
         backend_factory=get_active_backends,
         history_store_factory=get_investigation_store,
         feedback_store_factory=_get_feedback_store,
-        llm_cache=llm_cache,
-        cache_key_factory=make_cache_key,
     )
 
 
@@ -149,11 +146,16 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
 
     try:
         # ── 1. Intent Agent ──────────────────────────────────────────
+        llm_provider_factory = runtime.deps.llm_provider_factory
+        context_provider_factory = runtime.deps.context_provider_factory
         intent_stage = await run_intent_stage(
             prompt=request.prompt,
             user_id=request.user_id,
+            deps=runtime.deps,
             classify=classify_intent,
             enrich=enrich_context,
+            classify_provider=llm_provider_factory() if llm_provider_factory else None,
+            context_provider=context_provider_factory() if context_provider_factory else None,
             timings=runtime.timings,
         )
         intent = intent_stage.intent

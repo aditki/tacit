@@ -12,6 +12,7 @@ import asyncio
 
 import structlog
 
+from dashforge.context.base import ContextProvider
 from dashforge.context.registry import get_context_provider
 from dashforge.models.schemas import ContextChunk, Intent
 
@@ -23,13 +24,15 @@ CONTEXT_TIMEOUT = 15  # seconds — context is optional, don't block the pipelin
 async def enrich_context(
     intent: Intent,
     max_chunks: int = 10,
+    *,
+    provider: ContextProvider | None = None,
 ) -> list[ContextChunk]:
     """Query the configured knowledge base for context relevant to the intent.
 
     Returns an empty list if no context provider is configured (graceful no-op).
     Failures are logged as warnings and never block the pipeline.
     """
-    provider = get_context_provider()
+    provider = provider or get_context_provider()
     if provider is None:
         return []
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import httpx
 import structlog
 
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 from dashforge.context.base import ContextProvider
 from dashforge.models.schemas import ContextChunk, Intent
 
@@ -25,11 +25,13 @@ class MCPProvider(ContextProvider):
     def name(self) -> str:
         return "mcp"
 
-    def __init__(self):
-        self._server_url = settings.context_mcp_server_url.rstrip("/")
+    def __init__(self, runtime_settings: Settings | None = None):
+        self._settings = runtime_settings or settings
+        runtime_settings = self._settings
+        self._server_url = runtime_settings.context_mcp_server_url.rstrip("/")
         headers: dict[str, str] = {"Content-Type": "application/json"}
-        if settings.context_api_key:
-            headers["Authorization"] = f"Bearer {settings.context_api_key}"
+        if runtime_settings.context_api_key:
+            headers["Authorization"] = f"Bearer {runtime_settings.context_api_key}"
         self._client = httpx.AsyncClient(
             base_url=self._server_url,
             headers=headers,
@@ -52,7 +54,7 @@ class MCPProvider(ContextProvider):
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": settings.context_mcp_tool_name,
+                    "name": self._settings.context_mcp_tool_name,
                     "arguments": {
                         "query": search_query,
                         "max_results": max_chunks,
@@ -73,7 +75,7 @@ class MCPProvider(ContextProvider):
                     chunks.append(
                         ContextChunk(
                             content=item["text"],
-                            source=f"mcp:{settings.context_mcp_tool_name}",
+                            source=f"mcp:{self._settings.context_mcp_tool_name}",
                             relevance_score=item.get("score", 0.0),
                             metadata={"mcp_server": self._server_url},
                         )

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from dashforge.agents.providers.base import LLMProvider, LLMResult
-from dashforge.agents.providers.registry import get_provider, register_provider_factory, reset_provider_for_tests
-from dashforge.config import settings
+from dashforge.agents.providers.registry import (
+    create_provider,
+    get_provider,
+    register_provider_factory,
+    reset_provider_for_tests,
+)
+from dashforge.config import Settings, settings
 
 
 class DummyProvider(LLMProvider):
@@ -53,5 +58,23 @@ def test_register_provider_factory_invalidates_cached_provider(monkeypatch):
         assert isinstance(first, DummyProvider)
         assert isinstance(second, OtherDummyProvider)
         assert second is not first
+    finally:
+        reset_provider_for_tests()
+
+
+def test_create_provider_passes_runtime_settings(monkeypatch):
+    seen: list[Settings] = []
+
+    def factory(runtime_settings: Settings):
+        seen.append(runtime_settings)
+        return DummyProvider()
+
+    runtime_settings = Settings(llm_provider="runtime-provider", llm_model="runtime-model")
+    register_provider_factory("runtime-provider", factory)
+
+    try:
+        provider = create_provider(runtime_settings)
+        assert isinstance(provider, DummyProvider)
+        assert seen == [runtime_settings]
     finally:
         reset_provider_for_tests()

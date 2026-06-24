@@ -5,7 +5,7 @@ from __future__ import annotations
 import structlog
 
 from dashforge.agents.llm import call_llm
-from dashforge.agents.providers.base import TokenUsage
+from dashforge.agents.providers.base import LLMProvider, TokenUsage
 from dashforge.agents.synonyms import expand_operational_terms, operational_evidence
 from dashforge.models.schemas import Intent
 
@@ -102,13 +102,14 @@ SECURITY RULES (never violate these):
 """
 
 
-async def classify_intent(prompt: str) -> tuple[Intent, TokenUsage]:
+async def classify_intent(prompt: str, *, provider: LLMProvider | None = None) -> tuple[Intent, TokenUsage]:
     logger.info("intent_agent_start", prompt=prompt[:120])
     intent, usage = await call_llm(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=prompt,
         response_model=Intent,
         temperature=0.1,
+        provider=provider,
     )
 
     # Operational-vocabulary normalization, two tiers:

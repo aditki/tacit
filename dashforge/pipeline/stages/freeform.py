@@ -68,6 +68,7 @@ async def build_freeform_dashboard(
         ",".join(intent.keywords),
         ",".join(e.name for e in ranked_catalog[:20]),
     )
+    provider = deps.llm_provider_factory() if deps.llm_provider_factory else None
     cached_discovery = deps.llm_cache.get(discovery_cache_key)
     discovery_usage = TokenUsage()
     total_usage = TokenUsage()
@@ -76,7 +77,7 @@ async def build_freeform_dashboard(
         discovery = cached_discovery
         discovery_cached = True
     else:
-        discovery, discovery_usage = await discover_metrics(intent, ranked_catalog, context_chunks)
+        discovery, discovery_usage = await discover_metrics(intent, ranked_catalog, context_chunks, provider=provider)
         total_usage = total_usage + discovery_usage
         if discovery.metrics:
             deps.llm_cache.set(discovery_cache_key, discovery)
@@ -122,7 +123,7 @@ async def build_freeform_dashboard(
         return FreeformBuildResult(dashboard_spec=None, token_usage=total_usage, failure=failure)
 
     t0 = time.monotonic()
-    dashboard_spec, qb_usage = await build_dashboard(intent, discovery, ranked_catalog)
+    dashboard_spec, qb_usage = await build_dashboard(intent, discovery, ranked_catalog, provider=provider)
     timings["query_builder"] = time.monotonic() - t0
     total_usage = total_usage + qb_usage
     stage_log(

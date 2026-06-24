@@ -6,14 +6,15 @@ import httpx
 import structlog
 
 from dashforge.agents.providers.base import LLMProvider, LLMResult, TokenUsage
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 
 logger = structlog.get_logger()
 
 
 class OllamaProvider(LLMProvider):
-    def __init__(self):
-        base = settings.llm_api_base or "http://localhost:11434"
+    def __init__(self, runtime_settings: Settings | None = None):
+        self._settings = runtime_settings or settings
+        base = self._settings.llm_api_base or "http://localhost:11434"
         self._base_url = base.rstrip("/")
         self._client = httpx.AsyncClient(timeout=120.0)
 
@@ -30,7 +31,7 @@ class OllamaProvider(LLMProvider):
         temperature: float = 0.2,
     ) -> LLMResult:
         payload = {
-            "model": settings.llm_model,
+            "model": self._settings.llm_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -53,7 +54,7 @@ class OllamaProvider(LLMProvider):
         temperature: float = 0.3,
     ) -> LLMResult:
         payload = {
-            "model": settings.llm_model,
+            "model": self._settings.llm_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

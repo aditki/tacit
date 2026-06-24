@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import inspect
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from dashforge.agents.providers.base import TokenUsage
+from dashforge.agents.providers.base import LLMProvider, TokenUsage
+from dashforge.context.base import ContextProvider
+from dashforge.dependencies import PipelineDependencies
 from dashforge.logging import stage_log
 from dashforge.models.schemas import Intent
 
@@ -23,13 +26,19 @@ async def run_intent_stage(
     *,
     prompt: str,
     user_id: str | None,
-    classify: Callable[[str], Awaitable[tuple[Intent, TokenUsage]]],
-    enrich: Callable[[Intent], Awaitable[list[Any]]],
+    deps: PipelineDependencies,
+    classify: Callable[..., Awaitable[tuple[Intent, TokenUsage]]],
+    enrich: Callable[..., Awaitable[list[Any]]],
+    classify_provider: LLMProvider | None,
+    context_provider: ContextProvider | None,
     timings: dict[str, float],
 ) -> IntentStageResult:
     """Classify the prompt and fetch optional context chunks."""
     t0 = time.monotonic()
-    intent, intent_usage = await classify(prompt)
+    if "provider" in inspect.signature(classify).parameters:
+        intent, intent_usage = await classify(prompt, provider=classify_provider)
+    else:
+        intent, intent_usage = await classify(prompt)
     timings["intent"] = time.monotonic() - t0
     stage_log(
         "intent",
@@ -42,7 +51,13 @@ async def run_intent_stage(
     )
 
     t0 = time.monotonic()
-    context_chunks = await enrich(intent)
+    enrich_parameters = inspect.signature(enrich).parameters
+    enrich_kwargs: dict[str, Any] = {}
+    if "max_chunks" in enrich_parameters:
+        enrich_kwargs["max_chunks"] = deps.settings.context_max_chunks
+    if "provider" in enrich_parameters:
+        enrich_kwargs["provider"] = context_provider
+    context_chunks = await enrich(intent, **enrich_kwargs)
     timings["context"] = time.monotonic() - t0
     stage_log(
         "context_enrichment",

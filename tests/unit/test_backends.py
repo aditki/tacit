@@ -207,9 +207,11 @@ def test_grafana_backend_validate_queries():
 def test_grafana_backend_publish():
     from dashforge.backends.base import PublishResult
     from dashforge.backends.grafana import GrafanaBackend
+    from dashforge.config import Settings
 
     mock_client = AsyncMock()
-    backend = GrafanaBackend(client=mock_client)
+    runtime_settings = Settings(grafana_url="http://runtime-grafana.test", dashforge_dashboard_folder="Runtime")
+    backend = GrafanaBackend(client=mock_client, runtime_settings=runtime_settings)
 
     spec = _make_spec()
 
@@ -220,6 +222,7 @@ def test_grafana_backend_publish():
         assert result.url == "http://grafana/d/abc"
         assert result.uid == "abc"
         assert result.backend_name == "grafana"
+        mock_pub.assert_called_once_with(mock_client, spec, runtime_settings=runtime_settings)
 
     print("[PASS] test_grafana_backend_publish")
 
@@ -301,9 +304,11 @@ def test_signalfx_backend_validate_queries():
 def test_signalfx_backend_publish():
     from dashforge.backends.base import PublishResult
     from dashforge.backends.signalfx import SignalFxBackend
+    from dashforge.config import Settings
 
     mock_client = AsyncMock()
-    backend = SignalFxBackend(client=mock_client)
+    runtime_settings = Settings(signalfx_dashboard_group="Runtime Group")
+    backend = SignalFxBackend(client=mock_client, runtime_settings=runtime_settings)
 
     spec = _make_spec(query_lang="signalflow", ds_type="signalfx")
 
@@ -314,6 +319,7 @@ def test_signalfx_backend_publish():
         assert "signalfx.com" in result.url
         assert result.uid == "D123"
         assert result.backend_name == "signalfx"
+        mock_pub.assert_called_once_with(mock_client, spec, group_name="Runtime Group")
 
     print("[PASS] test_signalfx_backend_publish")
 

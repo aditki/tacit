@@ -27,6 +27,7 @@ class GrafanaBackend:
     """Dashboard backend that talks to Grafana."""
 
     def __init__(self, client: GrafanaClient | None = None, runtime_settings: Settings | None = None):
+        self._settings = runtime_settings
         self._client = client or GrafanaClient(runtime_settings=runtime_settings)
         self.last_discovery_status = DiscoveryStatus()
 
@@ -135,7 +136,7 @@ class GrafanaBackend:
         self,
         spec: DashboardSpec,
     ) -> PublishResult:
-        url, uid = await publish_dashboard_fn(self._client, spec)
+        url, uid = await publish_dashboard_fn(self._client, spec, runtime_settings=self._settings)
         return PublishResult(url=url, uid=uid, backend_name="grafana")
 
     # ── Ingestion ─────────────────────────────────────────────────────

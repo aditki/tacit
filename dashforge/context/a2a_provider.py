@@ -14,7 +14,7 @@ import uuid
 import httpx
 import structlog
 
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 from dashforge.context.base import ContextProvider
 from dashforge.models.schemas import ContextChunk, Intent
 
@@ -27,11 +27,12 @@ class A2AProvider(ContextProvider):
     def name(self) -> str:
         return "a2a"
 
-    def __init__(self):
-        self._agent_url = settings.context_a2a_agent_url.rstrip("/")
+    def __init__(self, runtime_settings: Settings | None = None):
+        runtime_settings = runtime_settings or settings
+        self._agent_url = runtime_settings.context_a2a_agent_url.rstrip("/")
         headers: dict[str, str] = {"Content-Type": "application/json"}
-        if settings.context_api_key:
-            headers["Authorization"] = f"Bearer {settings.context_api_key}"
+        if runtime_settings.context_api_key:
+            headers["Authorization"] = f"Bearer {runtime_settings.context_api_key}"
         self._client = httpx.AsyncClient(
             headers=headers,
             timeout=30.0,

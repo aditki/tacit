@@ -5,7 +5,7 @@ from __future__ import annotations
 import structlog
 
 from dashforge.agents.llm import call_llm
-from dashforge.agents.providers.base import TokenUsage
+from dashforge.agents.providers.base import LLMProvider, TokenUsage
 from dashforge.context.enrichment import format_context_for_prompt
 from dashforge.models.schemas import (
     ContextChunk,
@@ -133,6 +133,8 @@ async def discover_metrics(
     intent: Intent,
     metric_catalog: list[MetricEntry],
     context_chunks: list[ContextChunk] | None = None,
+    *,
+    provider: LLMProvider | None = None,
 ) -> tuple[MetricsDiscoveryResult, TokenUsage]:
     user_prompt = _build_user_prompt(intent, metric_catalog)
 
@@ -154,6 +156,7 @@ async def discover_metrics(
         user_prompt=user_prompt,
         response_model=MetricsDiscoveryResult,
         temperature=0.1,
+        provider=provider,
     )
     logger.info("metrics_discovery_done", metric_count=len(result.metrics))
     return result, usage

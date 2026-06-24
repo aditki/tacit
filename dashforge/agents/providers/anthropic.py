@@ -6,7 +6,7 @@ import anthropic
 import structlog
 
 from dashforge.agents.providers.base import LLMProvider, LLMResult, TokenUsage
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 
 logger = structlog.get_logger()
 
@@ -32,8 +32,9 @@ def _is_temperature_unsupported(exc: Exception) -> bool:
 
 
 class AnthropicProvider(LLMProvider):
-    def __init__(self):
-        self._client = anthropic.AsyncAnthropic(api_key=settings.llm_api_key)
+    def __init__(self, runtime_settings: Settings | None = None):
+        self._settings = runtime_settings or settings
+        self._client = anthropic.AsyncAnthropic(api_key=self._settings.llm_api_key)
 
     def _extract_usage(self, response) -> TokenUsage:
         usage = getattr(response, "usage", None)
@@ -49,7 +50,7 @@ class AnthropicProvider(LLMProvider):
         Uses two explicit call shapes (rather than a dynamic kwargs dict) so the
         SDK's typed overloads still apply.
         """
-        model = settings.llm_model
+        model = self._settings.llm_model
 
         async def _without_temperature():
             return await self._client.messages.create(

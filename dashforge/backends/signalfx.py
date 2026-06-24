@@ -22,6 +22,7 @@ class SignalFxBackend:
     """Dashboard backend that talks to Splunk Observability Cloud (SignalFx)."""
 
     def __init__(self, client: SignalFxClient | None = None, runtime_settings: Settings | None = None):
+        self._settings = runtime_settings
         self._client = client or SignalFxClient(runtime_settings=runtime_settings)
         self.last_discovery_status = DiscoveryStatus()
 
@@ -85,7 +86,8 @@ class SignalFxBackend:
         self,
         spec: DashboardSpec,
     ) -> PublishResult:
-        url, uid = await sfx_publish(self._client, spec)
+        group_name = self._settings.signalfx_dashboard_group if self._settings else None
+        url, uid = await sfx_publish(self._client, spec, group_name=group_name)
         return PublishResult(url=url, uid=uid, backend_name="signalfx")
 
     # ── Ingestion ─────────────────────────────────────────────────────

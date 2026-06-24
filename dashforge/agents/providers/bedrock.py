@@ -13,7 +13,7 @@ from __future__ import annotations
 import structlog
 
 from dashforge.agents.providers.base import LLMProvider, LLMResult, TokenUsage
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 
 logger = structlog.get_logger()
 
@@ -130,32 +130,33 @@ def _resolve_bedrock_model_id(anthropic_model_name: str, bedrock_client) -> str:
     return resolved
 
 
-def _build_boto3_session():
+def _build_boto3_session(runtime_settings: Settings | None = None):
     """Build a boto3.Session with the appropriate credentials."""
+    runtime_settings = runtime_settings or settings
     try:
         import boto3
     except ImportError as exc:
         raise ImportError("AWS Bedrock provider requires boto3. " "Install it with: pip install boto3") from exc
 
     session_kwargs: dict = {
-        "region_name": settings.llm_bedrock_region,
+        "region_name": runtime_settings.llm_bedrock_region,
     }
 
     # Strategy 1: explicit key pair
-    if settings.llm_aws_access_key_id and settings.llm_aws_secret_access_key:
-        session_kwargs["aws_access_key_id"] = settings.llm_aws_access_key_id
-        session_kwargs["aws_secret_access_key"] = settings.llm_aws_secret_access_key
-        logger.info("bedrock_auth", method="explicit_keys", region=settings.llm_bedrock_region)
+    if runtime_settings.llm_aws_access_key_id and runtime_settings.llm_aws_secret_access_key:
+        session_kwargs["aws_access_key_id"] = runtime_settings.llm_aws_access_key_id
+        session_kwargs["aws_secret_access_key"] = runtime_settings.llm_aws_secret_access_key
+        logger.info("bedrock_auth", method="explicit_keys", region=runtime_settings.llm_bedrock_region)
         session = boto3.Session(**session_kwargs)
     else:
         # Strategy 3 (default chain): boto3 resolves from env/config/instance profile
         session = boto3.Session(**session_kwargs)
-        logger.info("bedrock_auth", method="default_chain", region=settings.llm_bedrock_region)
+        logger.info("bedrock_auth", method="default_chain", region=runtime_settings.llm_bedrock_region)
 
     # Strategy 2: assume-role with auto-refreshable credentials
     # Uses botocore RefreshableCredentials so the singleton provider
     # doesn't expire after DurationSeconds in long-running processes.
-    if settings.llm_bedrock_role_arn:
+    if runtime_settings.llm_bedrock_role_arn:
         import botocore.session
         from botocore.credentials import RefreshableCredentials
 
@@ -163,7 +164,7 @@ def _build_boto3_session():
 
         def _refresh_credentials():
             assumed = sts.assume_role(
-                RoleArn=settings.llm_bedrock_role_arn,
+                RoleArn=runtime_settings.llm_bedrock_role_arn,
                 RoleSessionName="dashforge-bedrock",
                 DurationSeconds=3600,
             )
@@ -183,10 +184,10 @@ def _build_boto3_session():
 
         botocore_sess = botocore.session.get_session()
         botocore_sess._credentials = refreshable_creds
-        botocore_sess.set_config_variable("region", settings.llm_bedrock_region)
+        botocore_sess.set_config_variable("region", runtime_settings.llm_bedrock_region)
         session = boto3.Session(botocore_session=botocore_sess)
 
-        logger.info("bedrock_auth", method="assume_role_refreshable", role_arn=settings.llm_bedrock_role_arn)
+        logger.info("bedrock_auth", method="assume_role_refreshable", role_arn=runtime_settings.llm_bedrock_role_arn)
 
     return session
 
@@ -198,21 +199,22 @@ class BedrockProvider(LLMProvider):
     interface across all Bedrock foundation models (Claude, Llama, Mistral, etc.).
     """
 
-    def __init__(self):
-        session = _build_boto3_session()
+    def __init__(self, runtime_settings: Settings | None = None):
+        self._settings = runtime_settings or settings
+        session = _build_boto3_session(self._settings)
         self._client = session.client("bedrock-runtime")
-        if settings.llm_bedrock_model_id:
-            self._model_id = settings.llm_bedrock_model_id
+        if self._settings.llm_bedrock_model_id:
+            self._model_id = self._settings.llm_bedrock_model_id
         else:
             # Resolve Anthropic API model name to Bedrock model ID.
             # Returns a bare foundation model ID; _converse() auto-retries
             # with an inference profile prefix if on-demand invocation fails.
             bedrock_ctrl = session.client("bedrock")
-            self._model_id = _resolve_bedrock_model_id(settings.llm_model, bedrock_ctrl)
+            self._model_id = _resolve_bedrock_model_id(self._settings.llm_model, bedrock_ctrl)
         logger.info(
             "bedrock_init",
             model_id=self._model_id,
-            region=settings.llm_bedrock_region,
+            region=self._settings.llm_bedrock_region,
         )
 
     # Model families that do NOT support the Converse ``system`` parameter.
@@ -277,7 +279,7 @@ class BedrockProvider(LLMProvider):
             if not self._should_retry_with_profile(exc):
                 raise
             # Retry with inference profile
-            profile_id = _inference_profile_id(self._model_id, settings.llm_bedrock_region)
+            profile_id = _inference_profile_id(self._model_id, self._settings.llm_bedrock_region)
             logger.warning("bedrock_model_retry_with_profile", bare=self._model_id, profile=profile_id)
             kwargs["modelId"] = profile_id
             response = self._client.converse(**kwargs)
