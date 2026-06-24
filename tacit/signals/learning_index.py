@@ -255,6 +255,7 @@ def build_alert_context_rows(
     activated_pairs: set[tuple[str, str]] | None,
 ) -> list[tuple[str, str, str, str, str, str, str, str, str, str, str, str, str, str, float]]:
     """Build FTS rows for learned alert-rule context."""
+    alert_context_id = f"alert:{alert_uid}"
     tags = alert_tags or []
     metrics = list(dict.fromkeys(metrics_found or []))
     query_text = "\n".join(str(q) for q in query_transformations or [] if q)
@@ -305,7 +306,7 @@ def build_alert_context_rows(
                     "alert_rule",
                     f"{backend_name}:alert:{alert_uid}:{metric}:{sig_index}",
                     backend_name,
-                    alert_uid,
+                    alert_context_id,
                     alert_title,
                     " ".join(tags),
                     condition,

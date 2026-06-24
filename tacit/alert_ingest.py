@@ -183,6 +183,7 @@ async def ingest_alert_features(
 
     change_state = "dry_run"
     indexed_context_rows = 0
+    effective_status = status
     if not dry_run:
         change_state = store.record_ingested_alert(
             alert_uid=features.alert_uid,
@@ -209,6 +210,9 @@ async def ingest_alert_features(
             signals_inferred=signals,
             status=status,
         )
+        stored_alert = store.get_ingested_alert(features.alert_uid, features.backend_name)
+        if stored_alert is not None:
+            effective_status = str(stored_alert.get("status") or status)
         indexed_context_rows = store.index_alert_context(
             alert_uid=features.alert_uid,
             backend_name=features.backend_name,
@@ -219,7 +223,7 @@ async def ingest_alert_features(
             query_transformations=features.query_transformations,
             service_hints=service_hints,
             signals_inferred=signals,
-            status=status,
+            status=effective_status,
             activated_pairs=activated_pairs if auto_approve else None,
         )
 
@@ -228,7 +232,7 @@ async def ingest_alert_features(
         "service_hints": service_hints,
         "fingerprint": fingerprint,
         "confidence": confidence,
-        "status": status,
+        "status": effective_status,
         "change_state": change_state,
         "dry_run": dry_run,
         "signals_inferred": signals,
@@ -274,21 +278,24 @@ async def ingest_alert(
 
     all_backends: list[Any] = []
     own_backends = False
-    if backend is None:
-        all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
-        own_backends = True
-        if not all_backends:
-            raise RuntimeError("No active backends configured for alert ingestion")
-        if backend_name:
-            matched = [b for b in all_backends if b.name == backend_name]
-            if not matched:
-                available = [b.name for b in all_backends]
-                raise ValueError(f"Backend '{backend_name}' not found. Available: {available}")
-            backend = matched[0]
-        else:
-            backend = all_backends[0]
-
     try:
+        if backend is None:
+            all_backends = (
+                get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
+            )
+            own_backends = True
+            if not all_backends:
+                raise RuntimeError("No active backends configured for alert ingestion")
+            if backend_name:
+                matched = [b for b in all_backends if b.name == backend_name]
+                if not matched:
+                    available = [b.name for b in all_backends]
+                    raise ValueError(f"Backend '{backend_name}' not found. Available: {available}")
+                backend = matched[0]
+            else:
+                backend = all_backends[0]
+        if backend is None:
+            raise RuntimeError("No backend selected for alert ingestion")
         features = await backend.ingest_alert(alert_uid)
         return await ingest_alert_features(features, auto_approve=auto_approve, dry_run=dry_run)
     finally:
@@ -381,13 +388,16 @@ async def learn_backend_alerts(
                 failures.append(failure)
                 totals["alerts_failed"] += 1
 
-        if not dry_run:
+        stale_reconciliation_complete = len(alerts) < limit
+        if not dry_run and stale_reconciliation_complete:
             store = get_signal_store()
             seen_alert_uids = {str(item.get("uid", "")) for item in alerts if item.get("uid")}
             totals["stale_marked"] = store.mark_missing_alerts_stale(
                 backend_name=backend_name,
                 seen_alert_uids=seen_alert_uids,
             )
+        elif not dry_run:
+            totals["stale_reconciliation_skipped"] = True
 
         return {
             "backend": backend_name,
@@ -405,7 +415,9 @@ async def learn_backend_alerts(
                 ownership_hints=sum(
                     int((item.get("summary") or {}).get("ownership_hints", 0) or 0) for item in learned
                 ),
-                warnings=[],
+                warnings=(
+                    ["stale_reconciliation_skipped_partial_crawl"] if totals.get("stale_reconciliation_skipped") else []
+                ),
             ),
             "learned": learned,
             "failures": failures,

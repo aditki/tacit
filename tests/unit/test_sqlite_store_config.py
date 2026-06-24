@@ -162,6 +162,35 @@ async def test_alert_ingestion_is_idempotent_and_tracks_content_changes(tmp_path
     assert changed["change_state"] == "updated"
 
 
+async def test_unchanged_alert_recrawl_preserves_approved_status(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    features = AlertFeatures(
+        alert_uid="checkout-latency",
+        alert_title="Checkout latency high",
+        alert_tags=["service:checkout"],
+        backend_name="grafana",
+        query_language="promql",
+        condition="A > 1",
+        labels={"service": "checkout"},
+        metrics_found=["checkout_request_duration_seconds"],
+        query_transformations=['histogram_quantile(0.95, checkout_request_duration_seconds{service="checkout"})'],
+    )
+
+    await ingest_alert_features(features, auto_approve=True)
+    result = await ingest_alert_features(features, auto_approve=False)
+    row = store.get_ingested_alert("checkout-latency", "grafana")
+
+    assert result["change_state"] == "skipped"
+    assert result["status"] == "approved"
+    assert row is not None
+    assert row["status"] == "approved"
+    if store._learning_index_available():
+        rows = store.search_learning_context("checkout latency", service="checkout")
+        assert rows
+        assert rows[0]["review_state"] != "candidate"
+
+
 def test_missing_alerts_are_marked_stale_not_deleted(tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.record_ingested_alert(
@@ -194,3 +223,77 @@ def test_missing_alerts_are_marked_stale_not_deleted(tmp_path):
     assert refreshed["stale"] is False
     assert refreshed["missing_since"] is None
     assert refreshed["status"] == "pending"
+
+
+def test_stale_alert_context_is_removed_from_active_search(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        return
+    store.record_ingested_alert(
+        "checkout-latency",
+        backend_name="grafana",
+        alert_title="Checkout latency high",
+        fingerprint="abc",
+        metrics_found=["checkout_request_duration_seconds"],
+    )
+    store.index_alert_context(
+        alert_uid="checkout-latency",
+        backend_name="grafana",
+        alert_title="Checkout latency high",
+        alert_tags=["service:checkout"],
+        condition="A > 1",
+        metrics_found=["checkout_request_duration_seconds"],
+        query_transformations=['checkout_request_duration_seconds{service="checkout"}'],
+        service_hints=["checkout"],
+        signals_inferred=[
+            {"metric": "checkout_request_duration_seconds", "signal_type": "request_latency", "confidence": 0.8}
+        ],
+    )
+
+    assert store.search_learning_context("checkout latency", service="checkout")
+
+    store.mark_missing_alerts_stale(backend_name="grafana", seen_alert_uids=set())
+
+    assert store.search_learning_context("checkout latency", service="checkout") == []
+
+
+def test_alert_context_namespace_does_not_collide_with_dashboard_uid(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        return
+    store.index_alert_context(
+        alert_uid="shared-id",
+        backend_name="grafana",
+        alert_title="Checkout latency alert",
+        alert_tags=["service:checkout"],
+        condition="A > 1",
+        metrics_found=["checkout_request_duration_seconds"],
+        query_transformations=['checkout_request_duration_seconds{service="checkout"}'],
+        service_hints=["checkout"],
+        signals_inferred=[
+            {"metric": "checkout_request_duration_seconds", "signal_type": "request_latency", "confidence": 0.8}
+        ],
+    )
+    store.index_dashboard_context(
+        dashboard_uid="shared-id",
+        backend_name="grafana",
+        dashboard_title="Checkout dashboard",
+        dashboard_tags=["service:checkout"],
+        panels=[
+            {
+                "title": "Checkout traffic",
+                "queries": ['rate(checkout_requests_total{service="checkout"}[5m])'],
+                "metrics": ["checkout_requests_total"],
+            }
+        ],
+        metrics_found=["checkout_requests_total"],
+        signals_inferred=[
+            {"metric": "checkout_requests_total", "signal_type": "request_throughput", "confidence": 0.8}
+        ],
+    )
+
+    rows = store.search_learning_context("checkout", service="checkout")
+    source_kinds = {row["source_kind"] for row in rows}
+
+    assert "alert_rule" in source_kinds
+    assert "dashboard_panel" in source_kinds

@@ -774,7 +774,9 @@ class SignalStore:
         try:
             with self._conn() as conn:
                 conn.execute(
-                    "DELETE FROM learning_context_fts WHERE dashboard_uid = ? AND backend_name = ?",
+                    """DELETE FROM learning_context_fts
+                       WHERE source_kind = 'dashboard_panel'
+                         AND dashboard_uid = ? AND backend_name = ?""",
                     (dashboard_uid, backend_name),
                 )
                 conn.executemany(
@@ -825,7 +827,7 @@ class SignalStore:
         now = time.time()
         with self._conn() as conn:
             existing = conn.execute(
-                """SELECT id, fingerprint, first_seen_at FROM ingested_alerts
+                """SELECT id, fingerprint, first_seen_at, status, stale FROM ingested_alerts
                    WHERE alert_uid = ? AND backend_name = ?""",
                 (alert_uid, backend_name),
             ).fetchone()
@@ -865,7 +867,11 @@ class SignalStore:
                        confidence = excluded.confidence,
                        stale = 0,
                        missing_since = NULL,
-                       status = excluded.status,
+                       status = CASE
+                           WHEN ingested_alerts.fingerprint = excluded.fingerprint
+                                AND ingested_alerts.stale = 0 THEN ingested_alerts.status
+                           ELSE excluded.status
+                       END,
                        signals_inferred = excluded.signals_inferred,
                        first_seen_at = ingested_alerts.first_seen_at,
                        last_seen_at = excluded.last_seen_at,
@@ -935,6 +941,16 @@ class SignalStore:
                     WHERE backend_name = ? AND alert_uid IN ({placeholders})""",
                 (now, now, backend_name, *missing),
             )
+            alert_context_ids = [f"alert:{uid}" for uid in missing]
+            fts_placeholders = ", ".join("?" for _ in alert_context_ids)
+            conn.execute(
+                f"""UPDATE learning_context_fts
+                    SET review_state = 'stale'
+                    WHERE source_kind = 'alert_rule'
+                      AND backend_name = ?
+                      AND dashboard_uid IN ({fts_placeholders})""",
+                (backend_name, *alert_context_ids),
+            )
             return cursor.rowcount
 
     def index_alert_context(
@@ -975,7 +991,7 @@ class SignalStore:
                 conn.execute(
                     """DELETE FROM learning_context_fts
                        WHERE source_kind = 'alert_rule' AND dashboard_uid = ? AND backend_name = ?""",
-                    (alert_uid, backend_name),
+                    (f"alert:{alert_uid}", backend_name),
                 )
                 conn.executemany(
                     """INSERT INTO learning_context_fts
@@ -1007,13 +1023,15 @@ class SignalStore:
                 if review_state == "approved" and activated_pairs is not None:
                     if backend_name is None:
                         cursor = conn.execute(
-                            "UPDATE learning_context_fts SET review_state = 'candidate' WHERE dashboard_uid = ?",
+                            """UPDATE learning_context_fts SET review_state = 'candidate'
+                               WHERE source_kind = 'dashboard_panel' AND dashboard_uid = ?""",
                             (dashboard_uid,),
                         )
                     else:
                         cursor = conn.execute(
                             """UPDATE learning_context_fts SET review_state = 'candidate'
-                               WHERE dashboard_uid = ? AND backend_name = ?""",
+                               WHERE source_kind = 'dashboard_panel'
+                                 AND dashboard_uid = ? AND backend_name = ?""",
                             (dashboard_uid, backend),
                         )
                     rows_updated = cursor.rowcount
@@ -1021,13 +1039,15 @@ class SignalStore:
                         if backend_name is None:
                             cursor = conn.execute(
                                 """UPDATE learning_context_fts SET review_state = 'approved'
-                                   WHERE dashboard_uid = ? AND metric_name = ? AND signal_type = ?""",
+                                   WHERE source_kind = 'dashboard_panel'
+                                     AND dashboard_uid = ? AND metric_name = ? AND signal_type = ?""",
                                 (dashboard_uid, metric, signal_type),
                             )
                         else:
                             cursor = conn.execute(
                                 """UPDATE learning_context_fts SET review_state = 'approved'
-                                   WHERE dashboard_uid = ? AND backend_name = ?
+                                   WHERE source_kind = 'dashboard_panel'
+                                     AND dashboard_uid = ? AND backend_name = ?
                                      AND metric_name = ? AND signal_type = ?""",
                                 (dashboard_uid, backend, metric, signal_type),
                             )
@@ -1035,13 +1055,15 @@ class SignalStore:
                     return rows_updated
                 if backend_name is None:
                     cursor = conn.execute(
-                        "UPDATE learning_context_fts SET review_state = ? WHERE dashboard_uid = ?",
+                        """UPDATE learning_context_fts SET review_state = ?
+                           WHERE source_kind = 'dashboard_panel' AND dashboard_uid = ?""",
                         (review_state, dashboard_uid),
                     )
                 else:
                     cursor = conn.execute(
                         """UPDATE learning_context_fts SET review_state = ?
-                           WHERE dashboard_uid = ? AND backend_name = ?""",
+                           WHERE source_kind = 'dashboard_panel'
+                             AND dashboard_uid = ? AND backend_name = ?""",
                         (review_state, dashboard_uid, backend),
                     )
                 return cursor.rowcount
@@ -1075,7 +1097,7 @@ class SignalStore:
         if not include_candidates:
             clauses.append("review_state IN ('approved', 'trusted')")
         else:
-            clauses.append("review_state NOT IN ('rejected', 'ignored')")
+            clauses.append("review_state NOT IN ('rejected', 'ignored', 'stale')")
         params.append(limit)
 
         sql = f"""SELECT rowid, *, bm25(learning_context_fts) AS rank
@@ -1232,6 +1254,18 @@ class SignalStore:
                     (limit,),
                 ).fetchall()
         return [_deserialize_ingested_alert(r) for r in rows]
+
+    def get_ingested_alert(self, alert_uid: str, backend_name: str = "") -> dict[str, Any] | None:
+        """Return one ingested alert row by backend-scoped alert UID."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """SELECT * FROM ingested_alerts
+                   WHERE alert_uid = ? AND backend_name = ?""",
+                (alert_uid, backend_name),
+            ).fetchone()
+        if row is None:
+            return None
+        return _deserialize_ingested_alert(row)
 
     def update_ingested_dashboard_status(
         self,

@@ -270,6 +270,38 @@ def _service_hints_from_labels(labels: dict[str, str], tags: list[str]) -> list[
     return hints
 
 
+def _datasource_type(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("type", "") or value.get("name", "")).lower()
+    return ""
+
+
+def _is_prometheus_alert_query_item(item: dict[str, Any], model: dict[str, Any]) -> bool:
+    datasource_uids = [
+        str(item.get("datasourceUid", "") or "").lower(),
+        str(model.get("datasourceUid", "") or "").lower(),
+    ]
+    item_datasource = item.get("datasource")
+    if isinstance(item_datasource, dict):
+        datasource_uids.append(str(item_datasource.get("uid", "") or "").lower())
+    model_datasource = model.get("datasource")
+    if isinstance(model_datasource, dict):
+        datasource_uids.append(str(model_datasource.get("uid", "") or "").lower())
+    if "__expr__" in datasource_uids:
+        return False
+    if str(model.get("type", "") or "").lower() in {"math", "reduce", "classic_conditions"}:
+        return False
+
+    datasource_types = [
+        _datasource_type(item.get("datasource")),
+        _datasource_type(model.get("datasource")),
+    ]
+    explicit_types = [value for value in datasource_types if value]
+    if explicit_types:
+        return any(value in {"prometheus", "promql"} for value in explicit_types)
+    return True
+
+
 def _extract_grafana_rule_queries(rule: dict[str, Any]) -> list[str]:
     queries: list[str] = []
     for item in rule.get("data", []) or []:
@@ -278,7 +310,9 @@ def _extract_grafana_rule_queries(rule: dict[str, Any]) -> list[str]:
         model = item.get("model", {})
         if not isinstance(model, dict):
             continue
-        for key in ("expr", "query", "expression"):
+        if not _is_prometheus_alert_query_item(item, model):
+            continue
+        for key in ("expr", "query"):
             value = model.get(key, "")
             if isinstance(value, str) and value:
                 queries.append(value)
