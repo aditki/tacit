@@ -8,7 +8,7 @@ from tacit.agents.providers.base import TokenUsage
 from tacit.backends.base import DashboardBackend, PublishResult
 from tacit.dependencies import PipelineDependencies
 from tacit.logging import stage_log
-from tacit.models.schemas import DashboardSpec, DashRequest, DashResponse, Intent, MetricEntry
+from tacit.models.schemas import CulpritRanking, DashboardSpec, DashRequest, DashResponse, Intent, MetricEntry
 from tacit.pipeline.recording import (
     PipelineRecorder,
     dashboard_summary,
@@ -30,6 +30,7 @@ async def complete_pipeline(
     ranked_archetypes_present: bool,
     validation_warnings: list[str],
     panels_before: int,
+    culprit_ranking: CulpritRanking,
     timings: dict[str, float],
     recorder: PipelineRecorder,
     token_usage: TokenUsage,
@@ -98,4 +99,5 @@ async def complete_pipeline(
         summary=summary,
         signalfx_url=sfx_result.url,
         signalfx_dashboard_id=sfx_result.uid,
+        culprit_ranking=culprit_ranking,
     )

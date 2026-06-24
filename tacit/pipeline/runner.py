@@ -11,6 +11,7 @@ from tacit.agents.intent import classify_intent
 from tacit.backends import get_active_backends
 from tacit.config import settings
 from tacit.context.enrichment import enrich_context
+from tacit.culprit_ranking import rank_culprits
 from tacit.dependencies import PipelineDependencies, _get_feedback_store, build_pipeline_dependencies
 from tacit.history import get_investigation_store
 from tacit.logging import bind_request_id, stage_log, unbind_request_id
@@ -281,6 +282,26 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
         dashboard_spec = validation_result.dashboard_spec
         validation_warnings = validation_result.validation_warnings
         panels_before = validation_result.panels_before
+        culprit_ranking = rank_culprits(
+            intent=intent,
+            dashboard_spec=dashboard_spec,
+            ranked_archetypes=ranked_archetypes,
+            evidence_requirements=evidence_requirements,
+            evidence_resolutions=evidence_resolutions,
+            evidence_observations=validation_result.evidence_observations,
+        )
+        ranking_status = "passed" if culprit_ranking.candidates else "skipped"
+        ranking_reason = (
+            culprit_ranking.abstention_reason
+            if culprit_ranking.abstained
+            else f"{culprit_ranking.mode.value}_suspects_ranked"
+        )
+        runtime.recorder.stage(
+            "ranking",
+            ranking_status,
+            ranking_reason,
+            **culprit_ranking.model_dump(mode="json"),
+        )
         runtime.timings["query_validation"] = time.monotonic() - t0
         stage_log(
             "query_validation",
@@ -300,6 +321,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
                 timings=runtime.timings,
                 started_at=runtime.started_at,
                 validation_warnings=validation_warnings,
+                culprit_ranking=culprit_ranking,
             )
 
         return await complete_pipeline(
@@ -313,6 +335,7 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             ranked_archetypes_present=bool(ranked_archetypes),
             validation_warnings=validation_warnings,
             panels_before=panels_before,
+            culprit_ranking=culprit_ranking,
             timings=runtime.timings,
             recorder=runtime.recorder,
             token_usage=runtime.token_usage,
