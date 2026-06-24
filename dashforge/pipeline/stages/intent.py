@@ -56,8 +56,8 @@ async def run_intent_stage(
     enrich_kwargs: dict[str, Any] = {}
     if "max_chunks" in enrich_parameters:
         enrich_kwargs["max_chunks"] = deps.settings.context_max_chunks
-    if "provider" in enrich_parameters:
-        enrich_kwargs["provider"] = context_provider_factory() if context_provider_factory else None
+    if "provider" in enrich_parameters and context_provider_factory is not None:
+        enrich_kwargs["provider"] = context_provider_factory()
     context_chunks = await enrich(intent, **enrich_kwargs)
     timings["context"] = time.monotonic() - t0
     stage_log(

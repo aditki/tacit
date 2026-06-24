@@ -9,6 +9,7 @@ no-op — the pipeline works exactly as before.
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 import structlog
 
@@ -19,22 +20,25 @@ from dashforge.models.schemas import ContextChunk, Intent
 logger = structlog.get_logger()
 
 CONTEXT_TIMEOUT = 15  # seconds — context is optional, don't block the pipeline
+_PROVIDER_UNSET = object()
 
 
 async def enrich_context(
     intent: Intent,
     max_chunks: int = 10,
     *,
-    provider: ContextProvider | None = None,
+    provider: ContextProvider | None | object = _PROVIDER_UNSET,
 ) -> list[ContextChunk]:
     """Query the configured knowledge base for context relevant to the intent.
 
     Returns an empty list if no context provider is configured (graceful no-op).
     Failures are logged as warnings and never block the pipeline.
     """
-    provider = provider or get_context_provider()
+    if provider is _PROVIDER_UNSET:
+        provider = get_context_provider()
     if provider is None:
         return []
+    provider = cast(ContextProvider, provider)
 
     logger.info(
         "context_enrichment_start",

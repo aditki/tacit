@@ -3,6 +3,7 @@ from __future__ import annotations
 from dashforge.agents.providers.base import LLMProvider, LLMResult, TokenUsage
 from dashforge.config import Settings
 from dashforge.context.base import ContextProvider
+from dashforge.context.enrichment import enrich_context
 from dashforge.dependencies import PipelineDependencies, build_pipeline_dependencies
 from dashforge.models.schemas import (
     ArchetypeMatch,
@@ -206,25 +207,67 @@ async def test_intent_stage_defers_provider_construction_for_legacy_hooks():
 
 
 async def test_pipeline_dependencies_cache_and_close_runtime_providers(monkeypatch):
-    provider = FakeProvider()
-    context_provider = FakeContextProvider()
+    providers = [FakeProvider(), FakeProvider()]
+    context_providers = [FakeContextProvider(), FakeContextProvider()]
 
-    monkeypatch.setattr("dashforge.agents.providers.registry.create_provider", lambda settings: provider)
-    monkeypatch.setattr("dashforge.context.registry.create_context_provider", lambda settings: context_provider)
+    monkeypatch.setattr("dashforge.agents.providers.registry.create_provider", lambda settings: providers.pop(0))
+    monkeypatch.setattr(
+        "dashforge.context.registry.create_context_provider",
+        lambda settings: context_providers.pop(0),
+    )
 
     deps = build_pipeline_dependencies(Settings())
 
     assert deps.llm_provider_factory is not None
     assert deps.context_provider_factory is not None
-    assert deps.llm_provider_factory() is provider
-    assert deps.llm_provider_factory() is provider
-    assert deps.context_provider_factory() is context_provider
-    assert deps.context_provider_factory() is context_provider
+    first_provider = deps.llm_provider_factory()
+    first_context_provider = deps.context_provider_factory()
+    assert deps.llm_provider_factory() is first_provider
+    assert deps.context_provider_factory() is first_context_provider
 
     await deps.close_resources()
 
-    assert provider.closed is True
-    assert context_provider.closed is True
+    assert first_provider.closed is True
+    assert first_context_provider is not None
+    assert first_context_provider.closed is True
+
+    second_provider = deps.llm_provider_factory()
+    second_context_provider = deps.context_provider_factory()
+    assert second_provider is not first_provider
+    assert second_context_provider is not first_context_provider
+    assert second_provider.closed is False
+    assert second_context_provider is not None
+    assert second_context_provider.closed is False
+
+
+async def test_intent_stage_honors_explicit_disabled_context_provider(monkeypatch):
+    async def classify(prompt: str):
+        return _intent(), TokenUsage()
+
+    def global_context_provider():
+        raise AssertionError("global context provider should not be used")
+
+    monkeypatch.setattr("dashforge.context.enrichment.get_context_provider", global_context_provider)
+
+    result = await run_intent_stage(
+        prompt="checkout latency",
+        user_id="u1",
+        deps=PipelineDependencies(
+            settings=Settings(context_provider="none"),
+            backend_factory=lambda: [],
+            history_store_factory=lambda: FakeHistoryStore(),
+            feedback_store_factory=lambda: FakeFeedbackStore(),
+            llm_cache={},
+            cache_key_factory=lambda *parts: ":".join(parts),
+        ),
+        classify=classify,
+        enrich=enrich_context,
+        classify_provider_factory=None,
+        context_provider_factory=lambda: None,
+        timings={},
+    )
+
+    assert result.context_chunks == []
 
 
 def test_get_semaphore_recreates_when_limit_changes():

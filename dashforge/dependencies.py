@@ -77,10 +77,13 @@ def build_pipeline_dependencies(
         return context_provider
 
     async def close_runtime_resources() -> None:
+        nonlocal context_provider, llm_provider
         if context_provider is not None:
             await context_provider.close()
+            context_provider = None
         if llm_provider is not None:
             await llm_provider.close()
+            llm_provider = None
 
     return PipelineDependencies(
         settings=runtime_settings,
