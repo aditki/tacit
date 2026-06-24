@@ -1,7 +1,7 @@
-from dashforge.archetypes.engine import compile_archetype
-from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
-from dashforge.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
-from dashforge.signals import SignalStore
+from tacit.archetypes.engine import compile_archetype
+from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from tacit.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
+from tacit.signals import SignalStore
 
 
 def test_promql_query_routes_to_datasource_that_owns_metric():
@@ -244,7 +244,7 @@ def test_single_discovered_operand_does_not_reroute_multi_metric_query():
 def test_legacy_required_metrics_bind_through_live_semantic_signals(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = InvestigationArchetype(
         id="resource-saturation",
         name="Resource saturation",
@@ -300,7 +300,7 @@ def test_legacy_required_metrics_bind_through_live_semantic_signals(tmp_path, mo
 def test_legacy_metric_existence_is_scoped_to_target_backend(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = InvestigationArchetype(
         id="resource-saturation",
         name="Resource saturation",
@@ -352,7 +352,7 @@ def test_legacy_metric_existence_is_scoped_to_target_backend(tmp_path, monkeypat
 def test_legacy_binding_uses_requested_service_before_tie_abstention(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = InvestigationArchetype(
         id="resource-saturation",
         name="Resource saturation",
@@ -396,7 +396,7 @@ def test_legacy_binding_uses_requested_service_before_tie_abstention(tmp_path, m
 def test_legacy_binding_abstains_when_multiple_services_are_equally_plausible(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = InvestigationArchetype(
         id="resource-saturation",
         name="Resource saturation",
@@ -439,7 +439,7 @@ def test_legacy_binding_abstains_when_multiple_services_are_equally_plausible(tm
 def test_legacy_binding_rejects_gauge_for_histogram_template(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = InvestigationArchetype(
         id="latency",
         name="Latency",

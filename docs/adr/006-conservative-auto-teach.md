@@ -29,10 +29,10 @@ Implementation status: implemented.
 
 Validated against:
 
-- `dashforge/signal_inference.py`: computes score, confidence, margin, evidence, and `auto_teach_eligible`.
-- `dashforge/dashboard_ingest.py`: `persist_inferred_signal_review` only teaches eligible heuristic candidates.
-- `dashforge/signals.py`: stores `review_state`, rejected candidates, feedback counters, and confidence decay.
-- `dashforge/main.py`: exposes approve/reject/ignore endpoints.
+- `tacit/signal_inference.py`: computes score, confidence, margin, evidence, and `auto_teach_eligible`.
+- `tacit/dashboard_ingest.py`: `persist_inferred_signal_review` only teaches eligible heuristic candidates.
+- `tacit/signals.py`: stores `review_state`, rejected candidates, feedback counters, and confidence decay.
+- `tacit/main.py`: exposes approve/reject/ignore endpoints.
 - Tests cover auto-teach gates, rejection, and review-state behavior.
 
 TODO:

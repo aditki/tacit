@@ -9,16 +9,16 @@ from __future__ import annotations
 import pytest
 import yaml as _yaml
 
-from dashforge.archetypes.templates import (
+from tacit.archetypes.templates import (
     append_archetype_to_yaml,
     get_archetype,
     get_archetypes_by_learning_context,
     reload_archetypes,
 )
-from dashforge.dashboard_ingest import generate_archetype_yaml, infer_signals_from_metrics
-from dashforge.models.schemas import ArchetypeMatch, Intent, MetricEntry
-from dashforge.signal_inference import INFERENCE_VERSION, coverage, infer_signal, infer_signals
-from dashforge.signals import SignalStore
+from tacit.dashboard_ingest import generate_archetype_yaml, infer_signals_from_metrics
+from tacit.models.schemas import ArchetypeMatch, Intent, MetricEntry
+from tacit.signal_inference import INFERENCE_VERSION, coverage, infer_signal, infer_signals
+from tacit.signals import SignalStore
 
 
 @pytest.fixture
@@ -346,7 +346,7 @@ class TestProvenanceAndReview:
 
 class TestArchetypeAutoRegister:
     def test_no_path_returns_none(self, monkeypatch):
-        monkeypatch.delenv("DASHFORGE_ARCHETYPES_PATH", raising=False)
+        monkeypatch.delenv("TACIT_ARCHETYPES_PATH", raising=False)
         assert append_archetype_to_yaml("archetypes:\n- id: x\n  name: X\n") is None
 
     def test_merge_dedupes_by_id(self, tmp_path):
@@ -359,7 +359,7 @@ class TestArchetypeAutoRegister:
 
     def test_new_override_file_is_seeded_with_existing_archetypes(self, tmp_path, monkeypatch):
         target = tmp_path / "archetypes.yaml"
-        monkeypatch.setenv("DASHFORGE_ARCHETYPES_PATH", str(target))
+        monkeypatch.setenv("TACIT_ARCHETYPES_PATH", str(target))
         try:
             append_archetype_to_yaml("archetypes:\n- id: felix\n  name: Felix\n  problem_types: [felix]\n")
             doc = _yaml.safe_load(target.read_text())
@@ -371,24 +371,24 @@ class TestArchetypeAutoRegister:
             assert get_archetype("resource_saturation") is not None
             assert get_archetype("felix") is not None
         finally:
-            monkeypatch.delenv("DASHFORGE_ARCHETYPES_PATH", raising=False)
+            monkeypatch.delenv("TACIT_ARCHETYPES_PATH", raising=False)
             reload_archetypes()
 
     def test_register_and_reload_makes_it_routable(self, tmp_path, monkeypatch):
         target = tmp_path / "archetypes.yaml"
-        monkeypatch.setenv("DASHFORGE_ARCHETYPES_PATH", str(target))
+        monkeypatch.setenv("TACIT_ARCHETYPES_PATH", str(target))
         try:
             append_archetype_to_yaml(
                 "archetypes:\n- id: felix\n  name: Felix\n  problem_types: [felix]\n  panels: []\n"
             )
             assert get_archetype("felix") is not None
         finally:
-            monkeypatch.delenv("DASHFORGE_ARCHETYPES_PATH", raising=False)
+            monkeypatch.delenv("TACIT_ARCHETYPES_PATH", raising=False)
             reload_archetypes()  # restore default registry for other tests
 
     def test_learning_context_retrieves_generated_archetype_by_catalog_overlap(self, tmp_path, monkeypatch):
         target = tmp_path / "archetypes.yaml"
-        monkeypatch.setenv("DASHFORGE_ARCHETYPES_PATH", str(target))
+        monkeypatch.setenv("TACIT_ARCHETYPES_PATH", str(target))
         try:
             append_archetype_to_yaml("""
 archetypes:
@@ -428,5 +428,5 @@ archetypes:
             assert ranked
             assert ranked[0][0].id == "felix_dataplane"
         finally:
-            monkeypatch.delenv("DASHFORGE_ARCHETYPES_PATH", raising=False)
+            monkeypatch.delenv("TACIT_ARCHETYPES_PATH", raising=False)
             reload_archetypes()

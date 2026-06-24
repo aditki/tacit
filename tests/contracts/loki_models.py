@@ -1,6 +1,6 @@
 """Pydantic contract models for the Loki HTTP API (via Grafana proxy).
 
-DashForge reads:
+Tacit reads:
   GET .../loki/api/v1/labels -> {status, data: [label names]}
 """
 

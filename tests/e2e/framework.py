@@ -2,7 +2,7 @@
 
 The framework is intentionally hermetic: it drives the real ingestion and
 pipeline code, but swaps Grafana/LLM calls for deterministic fakes so the score
-means "did DashForge preserve the incident investigation path?" rather than
+means "did Tacit preserve the incident investigation path?" rather than
 "was a dev stack available today?"
 """
 
@@ -16,9 +16,9 @@ from typing import Any
 
 import yaml
 
-from dashforge.backends.base import DashboardFeatures, DiscoveryStatus, PublishResult
-from dashforge.dashboard_ingest import extract_metrics_from_promql
-from dashforge.models.schemas import DashboardSpec, Intent, MetricEntry
+from tacit.backends.base import DashboardFeatures, DiscoveryStatus, PublishResult
+from tacit.dashboard_ingest import extract_metrics_from_promql
+from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
 
 
 @dataclass(frozen=True)

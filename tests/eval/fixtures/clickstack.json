@@ -4,7 +4,7 @@
   "datasource_uid": "real-telemetry",
   "datasource_type": "prometheus",
   "query_language": "promql",
-  "source": "Curated 34-metric morphology slice derived from the ClickStack OTLP sample (data/demo/clickstack/sample.tar.gz). Critical metrics use the Prometheus-exported names observed by DashForge; this is not the complete 321/368-metric catalog.",
+  "source": "Curated 34-metric morphology slice derived from the ClickStack OTLP sample (data/demo/clickstack/sample.tar.gz). Critical metrics use the Prometheus-exported names observed by Tacit; this is not the complete 321/368-metric catalog.",
   "prompt": "Investigate the ClickStack payment cache saturation incident: Visa validation cache size, payment transaction rate, Redis memory, cache hit ratio, evictions, and client pressure.",
   "critical_signals": [
     {"signal_type": "cache_size", "expected_metric": "visa_validation_cache_size_entries"},

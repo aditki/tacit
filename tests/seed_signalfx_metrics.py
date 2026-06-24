@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Seed SignalFx with all metrics used in DashForge archetypes + keyword map.
+"""Seed SignalFx with all metrics used in Tacit archetypes + keyword map.
 
 Extracts every metric name from archetypes.yaml PromQL expressions and the
 KEYWORD_METRIC_MAP, then ingests realistic dummy datapoints so you can test
-the full DashForge → SignalFx pipeline with real prompts.
+the full Tacit → SignalFx pipeline with real prompts.
 
 Usage:
     SIGNALFX_INGEST_TOKEN=<token> python tests/seed_signalfx_metrics.py
@@ -29,8 +29,8 @@ import yaml
 
 sys.path.insert(0, ".")
 
-from dashforge.config import settings
-from dashforge.grafana.adapters.signalfx import KEYWORD_METRIC_MAP
+from tacit.config import settings
+from tacit.grafana.adapters.signalfx import KEYWORD_METRIC_MAP
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -115,12 +115,12 @@ def _resolve_archetypes_yaml(path: str | None = None):
             return candidate
         raise FileNotFoundError(f"archetypes YAML not found: {path}")
 
-    env_path = os.environ.get("DASHFORGE_ARCHETYPES_PATH", "").strip()
+    env_path = os.environ.get("TACIT_ARCHETYPES_PATH", "").strip()
     if env_path:
         candidate = Path(env_path)
         if candidate.is_file():
             return candidate
-        raise FileNotFoundError(f"DASHFORGE_ARCHETYPES_PATH not found: {env_path}")
+        raise FileNotFoundError(f"TACIT_ARCHETYPES_PATH not found: {env_path}")
 
     for candidate in (
         Path("archetypes.yaml"),
@@ -129,7 +129,7 @@ def _resolve_archetypes_yaml(path: str | None = None):
         if candidate.is_file():
             return candidate
 
-    return files("dashforge.data").joinpath("archetypes.yaml")
+    return files("tacit.data").joinpath("archetypes.yaml")
 
 
 def extract_metrics_from_archetypes(path: str | None = None) -> set[str]:
@@ -314,7 +314,7 @@ def main():
         _info("Create an ingest token: Splunk Observability → Settings → Access Tokens")
         sys.exit(1)
 
-    _header("DashForge → SignalFx Metric Seeder")
+    _header("Tacit → SignalFx Metric Seeder")
     _info(f"Realm: {realm}")
     _info(f"Ingest token: {ingest_token[:8]}...{ingest_token[-4:]}")
 

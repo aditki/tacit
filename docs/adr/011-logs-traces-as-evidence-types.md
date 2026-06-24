@@ -28,9 +28,9 @@ Implementation status: future/deferred.
 
 Validated against:
 
-- `dashforge/models/schemas.py`: `SignalType` includes `LOGS` and `TRACES`.
-- `dashforge/grafana/datasource.py`: can filter log/trace datasource types.
-- `dashforge/grafana/adapters/loki.py` and `dashforge/grafana/adapters/elasticsearch.py`: discovery adapters exist.
+- `tacit/models/schemas.py`: `SignalType` includes `LOGS` and `TRACES`.
+- `tacit/grafana/datasource.py`: can filter log/trace datasource types.
+- `tacit/grafana/adapters/loki.py` and `tacit/grafana/adapters/elasticsearch.py`: discovery adapters exist.
 - `README.md`: marks Loki and Tempo as future/current-focus work.
 
 TODO:

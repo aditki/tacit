@@ -13,23 +13,23 @@ WORKDIR /app
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
-RUN groupadd --system dashforge \
-    && useradd --system --gid dashforge --home-dir /app --shell /usr/sbin/nologin dashforge \
+RUN groupadd --system tacit \
+    && useradd --system --gid tacit --home-dir /app --shell /usr/sbin/nologin tacit \
     && mkdir -p /app/data \
-    && chown -R dashforge:dashforge /app
+    && chown -R tacit:tacit /app
 
-COPY --chown=dashforge:dashforge pyproject.toml uv.lock* ./
+COPY --chown=tacit:tacit pyproject.toml uv.lock* ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY --chown=dashforge:dashforge . .
+COPY --chown=tacit:tacit . .
 RUN uv sync --frozen --no-dev \
     && find /app -type d -name __pycache__ -prune -exec rm -rf {} +
 
-USER dashforge
+USER tacit
 
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).read()"
 
-CMD ["dashforge", "serve", "--host", "0.0.0.0", "--port", "8000", "--no-slack"]
+CMD ["tacit", "serve", "--host", "0.0.0.0", "--port", "8000", "--no-slack"]

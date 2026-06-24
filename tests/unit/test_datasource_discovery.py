@@ -1,5 +1,5 @@
-from dashforge.grafana.datasource import _cap_metric_results
-from dashforge.models.schemas import MetricEntry
+from tacit.grafana.datasource import _cap_metric_results
+from tacit.models.schemas import MetricEntry
 
 
 def _metric(name: str, datasource_uid: str) -> MetricEntry:

@@ -53,13 +53,13 @@ def grafana_dashboard_envelope(
     return model.model_dump(by_alias=True)
 
 
-def grafana_folder(uid: str = "folder-1", title: str = "DashForge") -> dict[str, Any]:
+def grafana_folder(uid: str = "folder-1", title: str = "Tacit") -> dict[str, Any]:
     return gf.GrafanaFolder(uid=uid, title=title, url=f"/dashboards/f/{uid}").model_dump(by_alias=True)
 
 
 def grafana_save_response(uid: str = "abc123", *, dash_id: int = 42) -> dict[str, Any]:
     return gf.GrafanaDashboardSaveResponse(
-        id=dash_id, uid=uid, url=f"/d/{uid}/dashforge", slug="dashforge", version=1
+        id=dash_id, uid=uid, url=f"/d/{uid}/tacit", slug="tacit", version=1
     ).model_dump(by_alias=True)
 
 
@@ -134,5 +134,5 @@ def signalfx_chart_response(chart_id: str = "CHART1", name: str = "CPU") -> dict
     return sfx.SignalFxChartResponse(id=chart_id, name=name).model_dump()
 
 
-def signalfx_dashboard_response(dash_id: str = "DASH1", name: str = "DashForge") -> dict[str, Any]:
+def signalfx_dashboard_response(dash_id: str = "DASH1", name: str = "Tacit") -> dict[str, Any]:
     return sfx.SignalFxDashboardResponse(id=dash_id, name=name).model_dump()

@@ -32,7 +32,7 @@ def _make_bedrock_provider(mock_client, mock_settings_overrides=None):
 
     with (
         patch.dict("sys.modules", {"boto3": mock_boto3}),
-        patch("dashforge.agents.providers.bedrock.settings") as mock_settings,
+        patch("tacit.agents.providers.bedrock.settings") as mock_settings,
     ):
         mock_settings.llm_bedrock_region = "us-east-1"
         mock_settings.llm_aws_access_key_id = ""
@@ -43,7 +43,7 @@ def _make_bedrock_provider(mock_client, mock_settings_overrides=None):
         if mock_settings_overrides:
             for k, v in mock_settings_overrides.items():
                 setattr(mock_settings, k, v)
-        from dashforge.agents.providers.bedrock import BedrockProvider
+        from tacit.agents.providers.bedrock import BedrockProvider
 
         return BedrockProvider(), mock_settings
 
@@ -59,14 +59,14 @@ def test_bedrock_session_explicit_keys():
 
     with (
         patch.dict("sys.modules", {"boto3": mock_boto3}),
-        patch("dashforge.agents.providers.bedrock.settings") as mock_settings,
+        patch("tacit.agents.providers.bedrock.settings") as mock_settings,
     ):
         mock_settings.llm_bedrock_region = "us-west-2"
         mock_settings.llm_aws_access_key_id = "AKIAIOSFODNN7EXAMPLE"
         mock_settings.llm_aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
         mock_settings.llm_bedrock_role_arn = ""
 
-        from dashforge.agents.providers.bedrock import _build_boto3_session
+        from tacit.agents.providers.bedrock import _build_boto3_session
 
         session = _build_boto3_session()
 
@@ -88,14 +88,14 @@ def test_bedrock_session_default_chain():
 
     with (
         patch.dict("sys.modules", {"boto3": mock_boto3}),
-        patch("dashforge.agents.providers.bedrock.settings") as mock_settings,
+        patch("tacit.agents.providers.bedrock.settings") as mock_settings,
     ):
         mock_settings.llm_bedrock_region = "eu-west-1"
         mock_settings.llm_aws_access_key_id = ""
         mock_settings.llm_aws_secret_access_key = ""
         mock_settings.llm_bedrock_role_arn = ""
 
-        from dashforge.agents.providers.bedrock import _build_boto3_session
+        from tacit.agents.providers.bedrock import _build_boto3_session
 
         session = _build_boto3_session()
 
@@ -144,20 +144,20 @@ def test_bedrock_session_assume_role():
                 "botocore.session": mock_botocore_sess_mod,
             },
         ),
-        patch("dashforge.agents.providers.bedrock.settings") as mock_settings,
+        patch("tacit.agents.providers.bedrock.settings") as mock_settings,
     ):
         mock_settings.llm_bedrock_region = "us-east-1"
         mock_settings.llm_aws_access_key_id = ""
         mock_settings.llm_aws_secret_access_key = ""
         mock_settings.llm_bedrock_role_arn = "arn:aws:iam::123456789012:role/TestRole"
 
-        from dashforge.agents.providers.bedrock import _build_boto3_session
+        from tacit.agents.providers.bedrock import _build_boto3_session
 
         _build_boto3_session()
 
         mock_sts_client.assume_role.assert_called_once_with(
             RoleArn="arn:aws:iam::123456789012:role/TestRole",
-            RoleSessionName="dashforge-bedrock",
+            RoleSessionName="tacit-bedrock",
             DurationSeconds=3600,
         )
         rc_cls = mock_botocore_creds_mod.RefreshableCredentials
@@ -173,7 +173,7 @@ def test_bedrock_session_assume_role():
 
 def test_bedrock_session_no_boto3_raises():
     """Missing boto3 should raise a helpful ImportError."""
-    from dashforge.agents.providers.bedrock import _build_boto3_session
+    from tacit.agents.providers.bedrock import _build_boto3_session
 
     original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
 
@@ -230,14 +230,14 @@ def test_bedrock_assume_role_uses_refreshable_credentials():
                 "botocore.session": mock_botocore_sess_mod,
             },
         ),
-        patch("dashforge.agents.providers.bedrock.settings") as mock_settings,
+        patch("tacit.agents.providers.bedrock.settings") as mock_settings,
     ):
         mock_settings.llm_bedrock_region = "us-east-1"
         mock_settings.llm_aws_access_key_id = ""
         mock_settings.llm_aws_secret_access_key = ""
         mock_settings.llm_bedrock_role_arn = "arn:aws:iam::123456789012:role/TestRole"
 
-        from dashforge.agents.providers.bedrock import _build_boto3_session
+        from tacit.agents.providers.bedrock import _build_boto3_session
 
         _build_boto3_session()
 
@@ -336,7 +336,7 @@ def test_bedrock_model_id_fallback():
         {"llm_model": "unknown-model-id"},
     )
 
-    from dashforge.agents.providers.bedrock import _BEDROCK_DEFAULT_MODEL
+    from tacit.agents.providers.bedrock import _BEDROCK_DEFAULT_MODEL
 
     assert provider._model_id == _BEDROCK_DEFAULT_MODEL
 
@@ -361,7 +361,7 @@ def test_bedrock_model_id_fallback_uses_bedrock_default():
 
 def test_bedrock_resolve_model_id_uses_list_foundation_models():
     """_resolve_bedrock_model_id should call ListFoundationModels API."""
-    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
+    from tacit.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
 
     _resolve_cache.clear()
 
@@ -384,7 +384,7 @@ def test_bedrock_resolve_model_id_uses_list_foundation_models():
 
 def test_bedrock_resolve_model_id_api_failure_falls_back_to_static_map():
     """When ListFoundationModels fails, should fall back to bare static map entry."""
-    from dashforge.agents.providers.bedrock import (
+    from tacit.agents.providers.bedrock import (
         _ANTHROPIC_TO_BEDROCK,
         _resolve_bedrock_model_id,
         _resolve_cache,
@@ -405,7 +405,7 @@ def test_bedrock_resolve_model_id_api_failure_falls_back_to_static_map():
 
 def test_bedrock_resolve_model_id_caches_result():
     """Repeated calls should not repeat the API call."""
-    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
+    from tacit.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
 
     _resolve_cache.clear()
 
@@ -427,7 +427,7 @@ def test_bedrock_resolve_model_id_caches_result():
 
 def test_bedrock_resolve_model_id_unknown_model_returns_default():
     """Unknown model falls back to bare Bedrock default."""
-    from dashforge.agents.providers.bedrock import (
+    from tacit.agents.providers.bedrock import (
         _BEDROCK_DEFAULT_MODEL,
         _resolve_bedrock_model_id,
         _resolve_cache,
@@ -451,7 +451,7 @@ def test_bedrock_resolve_model_id_unknown_model_returns_default():
 
 def test_bedrock_provider_prefixed_model_id_preserved():
     """Provider-prefixed IDs should pass through without resolution."""
-    from dashforge.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
+    from tacit.agents.providers.bedrock import _resolve_bedrock_model_id, _resolve_cache
 
     _resolve_cache.clear()
 
@@ -668,7 +668,7 @@ def test_non_mistral_model_uses_system_field():
 
 
 def test_inference_profile_id_us_region():
-    from dashforge.agents.providers.bedrock import _inference_profile_id
+    from tacit.agents.providers.bedrock import _inference_profile_id
 
     result = _inference_profile_id("anthropic.claude-sonnet-4-20250514-v1:0", "us-east-1")
     assert result == "us.anthropic.claude-sonnet-4-20250514-v1:0"
@@ -676,7 +676,7 @@ def test_inference_profile_id_us_region():
 
 
 def test_inference_profile_id_eu_region():
-    from dashforge.agents.providers.bedrock import _inference_profile_id
+    from tacit.agents.providers.bedrock import _inference_profile_id
 
     result = _inference_profile_id("anthropic.claude-sonnet-4-20250514-v1:0", "eu-west-1")
     assert result == "eu.anthropic.claude-sonnet-4-20250514-v1:0"
@@ -685,7 +685,7 @@ def test_inference_profile_id_eu_region():
 
 def test_inference_profile_id_apac_uses_global():
     """APAC regions should use global. prefix, not ap."""
-    from dashforge.agents.providers.bedrock import _inference_profile_id
+    from tacit.agents.providers.bedrock import _inference_profile_id
 
     result = _inference_profile_id("anthropic.claude-sonnet-4-20250514-v1:0", "ap-northeast-1")
     assert result == "global.anthropic.claude-sonnet-4-20250514-v1:0"
@@ -694,7 +694,7 @@ def test_inference_profile_id_apac_uses_global():
 
 def test_inference_profile_id_other_regions_use_global():
     """sa-*, me-*, ca-*, af-* regions should all use global. prefix."""
-    from dashforge.agents.providers.bedrock import _inference_profile_id
+    from tacit.agents.providers.bedrock import _inference_profile_id
 
     for region in ["sa-east-1", "me-south-1", "ca-central-1", "af-south-1"]:
         result = _inference_profile_id("anthropic.claude-sonnet-4-20250514-v1:0", region)
@@ -709,7 +709,7 @@ def test_bedrock_converse_wraps_throttling_for_retry():
     """Bedrock ThrottlingException → LLMTransientError so tenacity retries."""
     from pydantic import BaseModel
 
-    from dashforge.agents.llm import LLMTransientError, call_llm
+    from tacit.agents.llm import LLMTransientError, call_llm
 
     class SimpleModel(BaseModel):
         value: int
@@ -724,12 +724,12 @@ def test_bedrock_converse_wraps_throttling_for_retry():
         {"Error": {"Code": "ThrottlingException"}},
     )
 
-    from dashforge.agents.providers.base import LLMResult
+    from tacit.agents.providers.base import LLMResult
 
     mock_provider = MagicMock()
     mock_provider.chat_json = AsyncMock(side_effect=[throttle_exc, LLMResult(text='{"value": 99}')])
 
-    with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+    with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
         try:
             model, usage = asyncio.run(call_llm("sys", "user", SimpleModel))
             assert model.value == 99
@@ -745,7 +745,7 @@ def test_bedrock_service_specific_exception_retried():
     from pydantic import BaseModel
     from tenacity import wait_none
 
-    from dashforge.agents.llm import call_llm
+    from tacit.agents.llm import call_llm
 
     class Simple(BaseModel):
         v: int
@@ -755,7 +755,7 @@ def test_bedrock_service_specific_exception_retried():
             super().__init__(msg)
             self.response = {"Error": {"Code": "ThrottlingException"}}
 
-    from dashforge.agents.providers.base import LLMResult
+    from tacit.agents.providers.base import LLMResult
 
     mock_provider = MagicMock()
     mock_provider.chat_json = AsyncMock(side_effect=[ThrottlingException("Rate exceeded"), LLMResult(text='{"v": 42}')])
@@ -764,7 +764,7 @@ def test_bedrock_service_specific_exception_retried():
     call_llm.retry.wait = wait_none()
 
     try:
-        with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+        with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
             model, usage = asyncio.run(call_llm("sys", "user", Simple))
             assert model.v == 42
             assert mock_provider.chat_json.call_count == 2

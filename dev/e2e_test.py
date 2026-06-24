@@ -8,15 +8,15 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(os.path.join(os.path.dirname(__file__), ".."))
 
-from dashforge.models.schemas import DashRequest  # noqa: E402
-from dashforge.pipeline import run_pipeline  # noqa: E402
+from tacit.models.schemas import DashRequest  # noqa: E402
+from tacit.pipeline import run_pipeline  # noqa: E402
 
 PROMPT = "High 5xx error rate on the checkout service in the last 30 minutes. " "Users are reporting failed payments."
 
 
 async def main():
     print(f"\n{'='*70}")
-    print("DashForge E2E Test")
+    print("Tacit E2E Test")
     print(f"{'='*70}")
     print(f"Prompt: {PROMPT}\n")
 

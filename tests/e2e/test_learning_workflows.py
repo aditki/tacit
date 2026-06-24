@@ -4,11 +4,11 @@ import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
-import dashforge.backends as backends_mod
-import dashforge.signals as signals_mod
-from dashforge.backends.base import DashboardFeatures
-from dashforge.cli import cli
-from dashforge.main import app
+import tacit.backends as backends_mod
+import tacit.signals as signals_mod
+from tacit.backends.base import DashboardFeatures
+from tacit.cli import cli
+from tacit.main import app
 
 
 @pytest.fixture

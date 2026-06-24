@@ -6,9 +6,9 @@ Accepted
 
 ## Context
 
-DashForge has investigation archetypes, intent classification, panel templates, selected metrics, history, validation,
+Tacit has investigation archetypes, intent classification, panel templates, selected metrics, history, validation,
 and dashboard provenance. It does not currently expose a standalone `InvestigationPlan`, `EvidenceItem`, hypothesis
-state, coverage model, or mutable investigation session object in `dashforge/models/schemas.py`.
+state, coverage model, or mutable investigation session object in `tacit/models/schemas.py`.
 
 ## Decision
 
@@ -27,11 +27,11 @@ Implementation status: partially implemented.
 
 Validated against:
 
-- `dashforge/archetypes/schema.py`: reusable investigation archetypes and panels.
-- `dashforge/archetypes/engine.py`: deterministic compilation of archetypes into dashboard specs.
-- `dashforge/pipeline.py`: selected archetypes and path information guide generated dashboards.
-- `dashforge/history.py`: persists investigation lifecycle details.
-- No first-class `InvestigationPlan` model exists in `dashforge/models/schemas.py`.
+- `tacit/archetypes/schema.py`: reusable investigation archetypes and panels.
+- `tacit/archetypes/engine.py`: deterministic compilation of archetypes into dashboard specs.
+- `tacit/pipeline.py`: selected archetypes and path information guide generated dashboards.
+- `tacit/history.py`: persists investigation lifecycle details.
+- No first-class `InvestigationPlan` model exists in `tacit/models/schemas.py`.
 
 TODO:
 

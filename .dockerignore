@@ -10,8 +10,8 @@ __pycache__
 
 .env
 .env.*
-dashforge.yaml
-dashforge.yml
+tacit.yaml
+tacit.yml
 config/
 data/
 grafana_data/

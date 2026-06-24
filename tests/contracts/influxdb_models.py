@@ -1,6 +1,6 @@
 """Pydantic contract models for the InfluxDB v1 query API (via Grafana proxy).
 
-DashForge reads:
+Tacit reads:
   GET .../query?q=SHOW+MEASUREMENTS&db=...
     -> {results: [{series: [{name, columns: ["name"], values: [["cpu"], ...]}]}]}
 """

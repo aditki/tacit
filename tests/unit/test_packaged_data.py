@@ -6,8 +6,8 @@ import importlib.util
 from importlib.resources import files
 from pathlib import Path
 
-from dashforge.archetypes.templates import _load_packaged_archetypes
-from dashforge.signals import SignalStore
+from tacit.archetypes.templates import _load_packaged_archetypes
+from tacit.signals import SignalStore
 
 
 def test_packaged_archetypes_are_loadable():
@@ -29,7 +29,7 @@ def test_packaged_yaml_matches_source_compatibility_files():
     for name in ("archetypes.yaml", "signals.yaml"):
         source_path = repo_root / name
         if source_path.exists():
-            packaged_text = files("dashforge.data").joinpath(name).read_text()
+            packaged_text = files("tacit.data").joinpath(name).read_text()
             assert packaged_text == source_path.read_text()
 
 

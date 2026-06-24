@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dashforge.agents.providers.base import LLMProvider, LLMResult, TokenUsage
-from dashforge.config import Settings
-from dashforge.context.base import ContextProvider
-from dashforge.context.enrichment import enrich_context
-from dashforge.dependencies import PipelineDependencies, build_pipeline_dependencies
-from dashforge.models.schemas import (
+from tacit.agents.providers.base import LLMProvider, LLMResult, TokenUsage
+from tacit.config import Settings
+from tacit.context.base import ContextProvider
+from tacit.context.enrichment import enrich_context
+from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies
+from tacit.models.schemas import (
     ArchetypeMatch,
     ContextChunk,
     DashboardSpec,
@@ -15,11 +15,11 @@ from dashforge.models.schemas import (
     PanelSpec,
     SignalType,
 )
-from dashforge.pipeline.failures import PipelineFailureFactory
-from dashforge.pipeline.runner import _get_semaphore
-from dashforge.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history, safe_record_provenance
-from dashforge.pipeline.stages.freeform import build_freeform_dashboard
-from dashforge.pipeline.stages.intent import run_intent_stage
+from tacit.pipeline.failures import PipelineFailureFactory
+from tacit.pipeline.runner import _get_semaphore
+from tacit.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history, safe_record_provenance
+from tacit.pipeline.stages.freeform import build_freeform_dashboard
+from tacit.pipeline.stages.intent import run_intent_stage
 
 
 class FakeRecorder:
@@ -222,9 +222,9 @@ async def test_pipeline_dependencies_cache_and_close_runtime_providers(monkeypat
     providers = [FakeProvider(), FakeProvider()]
     context_providers = [FakeContextProvider(), FakeContextProvider()]
 
-    monkeypatch.setattr("dashforge.agents.providers.registry.create_provider", lambda settings: providers.pop(0))
+    monkeypatch.setattr("tacit.agents.providers.registry.create_provider", lambda settings: providers.pop(0))
     monkeypatch.setattr(
-        "dashforge.context.registry.create_context_provider",
+        "tacit.context.registry.create_context_provider",
         lambda settings: context_providers.pop(0),
     )
 
@@ -256,9 +256,9 @@ async def test_pipeline_dependencies_cleanup_is_best_effort_and_resets_cache(mon
     providers = [FailingCloseProvider(), FakeProvider()]
     context_providers = [FailingCloseContextProvider(), FakeContextProvider()]
 
-    monkeypatch.setattr("dashforge.agents.providers.registry.create_provider", lambda settings: providers.pop(0))
+    monkeypatch.setattr("tacit.agents.providers.registry.create_provider", lambda settings: providers.pop(0))
     monkeypatch.setattr(
-        "dashforge.context.registry.create_context_provider",
+        "tacit.context.registry.create_context_provider",
         lambda settings: context_providers.pop(0),
     )
 
@@ -285,7 +285,7 @@ async def test_intent_stage_honors_explicit_disabled_context_provider(monkeypatc
     def global_context_provider():
         raise AssertionError("global context provider should not be used")
 
-    monkeypatch.setattr("dashforge.context.enrichment.get_context_provider", global_context_provider)
+    monkeypatch.setattr("tacit.context.enrichment.get_context_provider", global_context_provider)
 
     result = await run_intent_stage(
         prompt="checkout latency",

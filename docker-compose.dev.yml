@@ -82,7 +82,7 @@ services:
     depends_on:
       - victoriametrics
 
-  gamma-dashforge:
+  gamma-tacit:
     profiles: ["gamma"]
     build: .
     ports:
@@ -94,15 +94,15 @@ services:
       GRAFANA_URL: http://gamma-grafana:3000
       SSL_CERT_FILE: ""
       LEARNING_AUTO_REGISTER_ARCHETYPE: "true"
-      DASHFORGE_ARCHETYPES_PATH: /app/data/gamma-archetypes.yaml
+      TACIT_ARCHETYPES_PATH: /app/data/gamma-archetypes.yaml
     volumes:
-      - gamma_dashforge_data:/app/data
+      - gamma_tacit_data:/app/data
     depends_on:
       - gamma-grafana
       - victoriametrics
 
-  # ── DashForge ─────────────────────────────────────────────────────────
-  dashforge:
+  # ── Tacit ─────────────────────────────────────────────────────────
+  tacit:
     build: .
     ports:
       - "8000:8000"
@@ -114,9 +114,9 @@ services:
       SSL_CERT_FILE: ""
       # The demo intentionally proves the review -> reuse loop in one session.
       LEARNING_AUTO_REGISTER_ARCHETYPE: "true"
-      DASHFORGE_ARCHETYPES_PATH: /app/data/demo-archetypes.yaml
+      TACIT_ARCHETYPES_PATH: /app/data/demo-archetypes.yaml
     volumes:
-      - dashforge_data:/app/data
+      - tacit_data:/app/data
     depends_on:
       - grafana
       - prometheus
@@ -126,8 +126,8 @@ services:
     #  - "host.docker.internal:host-gateway" # use "http://host.docker.internal:11434" in .env for LLM_API_BASE
 
 volumes:
-  dashforge_data:
+  tacit_data:
   grafana_data:
   victoriametrics_data:
-  gamma_dashforge_data:
+  gamma_tacit_data:
   gamma_grafana_data:

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dashforge.agents.providers.base import LLMProvider, LLMResult
-from dashforge.agents.providers.registry import (
+from tacit.agents.providers.base import LLMProvider, LLMResult
+from tacit.agents.providers.registry import (
     create_provider,
     get_provider,
     register_provider_factory,
     reset_provider_for_tests,
 )
-from dashforge.config import Settings, settings
+from tacit.config import Settings, settings
 
 
 class DummyProvider(LLMProvider):

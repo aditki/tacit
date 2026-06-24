@@ -1,8 +1,8 @@
 # Evaluation
 
-DashForge includes a public validation suite for measuring whether generated investigations are directionally useful, not just whether the code runs.
+Tacit includes a public validation suite for measuring whether generated investigations are directionally useful, not just whether the code runs.
 
-The benchmark lives in [`tests/dashforge_validation_prompts.csv`](../tests/dashforge_validation_prompts.csv). The runner is [`tests/validate.py`](../tests/validate.py), with usage notes in [`tests/README.md`](../tests/README.md).
+The benchmark lives in [`tests/tacit_validation_prompts.csv`](../tests/tacit_validation_prompts.csv). The runner is [`tests/validate.py`](../tests/validate.py), with usage notes in [`tests/README.md`](../tests/README.md).
 
 ## 100 Prompt Benchmark
 
@@ -61,7 +61,7 @@ These results should be read as a public-beta benchmark, not as a production gua
 
 ## Archetype Accuracy
 
-Archetype accuracy measures whether DashForge chooses the right investigation path.
+Archetype accuracy measures whether Tacit chooses the right investigation path.
 
 The suite reports two scores:
 
@@ -83,15 +83,15 @@ The validation suite reports:
 - **Weighted recall**: critical metrics count more than supporting metrics.
 - **Signal-to-noise ratio**: relevant metrics divided by total metrics found.
 
-This tier is the strongest public signal because it tests whether DashForge retrieves operationally meaningful telemetry, not only whether the prompt classification sounds right.
+This tier is the strongest public signal because it tests whether Tacit retrieves operationally meaningful telemetry, not only whether the prompt classification sounds right.
 
-The current results show good critical recall, but lower overall metric recall and SNR. That is the right failure mode for the current beta: DashForge often finds the most important signal, but still needs work on reducing noisy supporting panels and improving secondary metric selection.
+The current results show good critical recall, but lower overall metric recall and SNR. That is the right failure mode for the current beta: Tacit often finds the most important signal, but still needs work on reducing noisy supporting panels and improving secondary metric selection.
 
 ## Lessons Learned
 
 Evaluation changed the architecture.
 
-The benchmark pushed DashForge away from a pure "LLM generates a dashboard" approach and toward a more constrained system:
+The benchmark pushed Tacit away from a pure "LLM generates a dashboard" approach and toward a more constrained system:
 
 - deterministic archetypes for common investigations
 - multi-label archetype blending for overlapping incidents
@@ -127,8 +127,8 @@ Near-term evaluation work:
 - add more adversarial and ambiguous prompts
 - separate demo-service results from external-vendor contract results
 
-The evaluation goal is not to prove DashForge is done. It is to make progress measurable.
+The evaluation goal is not to prove Tacit is done. It is to make progress measurable.
 
 ## Real Telemetry Roadmap
 
-The synthetic benchmark remains the fast regression layer. The staged plan for evaluating DashForge with public metrics, logs, and traces is documented in [Real Telemetry Dataset Testing Roadmap](telemetry-dataset-testing-roadmap.md). Its first milestone is attached to the checkout demo; later datasets are isolated in separate branches and evaluated against source-specific ground truth.
+The synthetic benchmark remains the fast regression layer. The staged plan for evaluating Tacit with public metrics, logs, and traces is documented in [Real Telemetry Dataset Testing Roadmap](telemetry-dataset-testing-roadmap.md). Its first milestone is attached to the checkout demo; later datasets are isolated in separate branches and evaluated against source-specific ground truth.

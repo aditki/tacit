@@ -1,14 +1,14 @@
 # Architecture Decision Records
 
-DashForge ADRs capture the architecture and product decisions that should guide near-term work.
+Tacit ADRs capture the architecture and product decisions that should guide near-term work.
 They are intentionally lightweight and validated against the current repository state.
 
-DashForge is an experimental, public-beta infrastructure project. These records should not be read as
+Tacit is an experimental, public-beta infrastructure project. These records should not be read as
 production-readiness claims.
 
 | ADR | Title | Status | Implementation Status |
 |---|---|---|---|
-| [ADR-001](001-investigation-first.md) | DashForge is investigation-first, not dashboard-only | Accepted | Partially implemented |
+| [ADR-001](001-investigation-first.md) | Tacit is investigation-first, not dashboard-only | Accepted | Partially implemented |
 | [ADR-002](002-operational-intelligence-before-stateful-sessions.md) | Operational intelligence before stateful investigation sessions | Accepted | Implemented as a guardrail |
 | [ADR-003](003-emergent-signals-over-fixed-taxonomy.md) | Signals should emerge from observed usage, not a fixed vendor taxonomy | Accepted | Partially implemented |
 | [ADR-004](004-dashboard-ingestion-onboarding.md) | Dashboard ingestion is the primary onboarding path for custom telemetry | Accepted | Partially implemented |
@@ -21,5 +21,5 @@ production-readiness claims.
 | [ADR-011](011-logs-traces-as-evidence-types.md) | Logs and traces should be introduced as evidence types | Deferred | Future work |
 | [ADR-012](012-lightweight-service-context.md) | Service context is a lightweight bridge toward operational memory | Proposed | Not implemented |
 | [ADR-013](013-adoption-time-to-value-and-trust.md) | Adoption depends on time-to-value and trust, not more agents | Accepted | Partially implemented |
-| [ADR-014](014-dashforge-is-not-a-system-of-record.md) | DashForge Is Not a System of Record | Accepted | Partially implemented |
+| [ADR-014](014-tacit-is-not-a-system-of-record.md) | Tacit Is Not a System of Record | Accepted | Partially implemented |
 | [ADR-015](015-evidence-lifecycle.md) | Evidence has a lightweight lifecycle | Accepted | Partially implemented |

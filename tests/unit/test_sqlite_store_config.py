@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dashforge.feedback import FeedbackStore
-from dashforge.history import InvestigationStore
-from dashforge.signals import SignalStore
+from tacit.feedback import FeedbackStore
+from tacit.history import InvestigationStore
+from tacit.signals import SignalStore
 
 
 def test_signal_store_sets_busy_timeout(tmp_path):

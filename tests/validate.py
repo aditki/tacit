@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""DashForge Validation Suite
+"""Tacit Validation Suite
 
 Validates archetype classification accuracy and metric selection against a test
 dataset. Produces per-category and overall accuracy scores.
@@ -10,11 +10,11 @@ Modes:
   all        — Runs both
 
 Usage:
-  python tests/validate.py tests/dashforge_validation_prompts.csv --mode archetype
-  python tests/validate.py tests/dashforge_validation_prompts.csv --mode pipeline
-  python tests/validate.py tests/dashforge_validation_prompts.csv --mode all
-  python tests/validate.py tests/dashforge_validation_prompts.csv --mode archetype --limit 10
-  python tests/validate.py tests/dashforge_validation_prompts.csv --mode all --output results.json
+  python tests/validate.py tests/tacit_validation_prompts.csv --mode archetype
+  python tests/validate.py tests/tacit_validation_prompts.csv --mode pipeline
+  python tests/validate.py tests/tacit_validation_prompts.csv --mode all
+  python tests/validate.py tests/tacit_validation_prompts.csv --mode archetype --limit 10
+  python tests/validate.py tests/tacit_validation_prompts.csv --mode all --output results.json
 """
 
 from __future__ import annotations
@@ -288,7 +288,7 @@ async def run_archetype_validation(cases: list[TestCase]) -> list[ArchetypeResul
     Evaluates both strict (top-1) and soft (any-match) accuracy using
     the multi-label archetypes returned by the intent agent.
     """
-    from dashforge.agents.intent import classify_intent
+    from tacit.agents.intent import classify_intent
 
     results: list[ArchetypeResult] = []
     total = len(cases)
@@ -355,7 +355,7 @@ async def run_pipeline_validation(
     """Test full pipeline: metric selection + archetype via the running API."""
     import httpx
 
-    from dashforge.config import settings
+    from tacit.config import settings
 
     results: list[PipelineResult] = []
     total = len(cases)
@@ -823,11 +823,11 @@ def print_review_report(reviews: list[dict]) -> None:
 
 async def main() -> None:
     parser = argparse.ArgumentParser(
-        description="DashForge Validation Suite — test archetype and metric accuracy",
+        description="Tacit Validation Suite — test archetype and metric accuracy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  python tests/validate.py tests/dashforge_validation_prompts.csv --mode archetype
-  python tests/validate.py tests/dashforge_validation_prompts.csv --mode pipeline --limit 5
+  python tests/validate.py tests/tacit_validation_prompts.csv --mode archetype
+  python tests/validate.py tests/tacit_validation_prompts.csv --mode pipeline --limit 5
   python tests/validate.py my_custom_dataset.csv --mode all --output results.json
 """,
     )
@@ -841,7 +841,7 @@ async def main() -> None:
     parser.add_argument(
         "--api-url",
         default="http://localhost:8000",
-        help="DashForge API base URL (default: http://localhost:8000)",
+        help="Tacit API base URL (default: http://localhost:8000)",
     )
     parser.add_argument(
         "--grafana-url",
@@ -871,7 +871,7 @@ async def main() -> None:
     if args.limit > 0:
         cases = cases[: args.limit]
 
-    print("\nDashForge Validation Suite")
+    print("\nTacit Validation Suite")
     print(f"Dataset  : {args.csv}")
     print(f"Prompts  : {len(cases)}")
     print(f"Mode     : {args.mode}")

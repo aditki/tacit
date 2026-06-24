@@ -1,24 +1,24 @@
-# DashForge Validation Suite
+# Tacit Validation Suite
 
-Automated evaluation of DashForge's archetype classification and pipeline metric retrieval accuracy.
+Automated evaluation of Tacit's archetype classification and pipeline metric retrieval accuracy.
 
 ## Quick Start
 
 ```bash
 # Archetype classification only (needs LLM, no running stack)
-uv run python tests/validate.py tests/dashforge_validation_prompts.csv --mode archetype
+uv run python tests/validate.py tests/tacit_validation_prompts.csv --mode archetype
 
-# Full pipeline (requires running DashForge + Grafana + Prometheus stack)
-uv run python tests/validate.py tests/dashforge_validation_prompts.csv --mode pipeline
+# Full pipeline (requires running Tacit + Grafana + Prometheus stack)
+uv run python tests/validate.py tests/tacit_validation_prompts.csv --mode pipeline
 
 # Upload-learning E2E framework (hermetic: fake backend + fake intent)
 uv run pytest tests/e2e -m e2e -q
 
 # Both
-uv run python tests/validate.py tests/dashforge_validation_prompts.csv --mode all --output results.json
+uv run python tests/validate.py tests/tacit_validation_prompts.csv --mode all --output results.json
 
 # Limit to first N prompts (useful for quick iteration)
-uv run python tests/validate.py tests/dashforge_validation_prompts.csv --mode archetype --limit 10
+uv run python tests/validate.py tests/tacit_validation_prompts.csv --mode archetype --limit 10
 ```
 
 ## Evaluation Philosophy
@@ -76,7 +76,7 @@ If the expected archetype is `resource_saturation`, the strict check fails (top-
 
 Tests the complete pipeline: prompt → API → dashboard → metric extraction from Grafana.
 
-**Requires:** Running DashForge API + Grafana + Prometheus (via `docker compose -f docker-compose.dev.yml up -d`)
+**Requires:** Running Tacit API + Grafana + Prometheus (via `docker compose -f docker-compose.dev.yml up -d`)
 
 **Metrics reported:**
 
@@ -88,12 +88,12 @@ Tests the complete pipeline: prompt → API → dashboard → metric extraction 
 
 ## CSV Format
 
-The test dataset (`dashforge_validation_prompts.csv`) has these columns:
+The test dataset (`tacit_validation_prompts.csv`) has these columns:
 
 | Column | Required | Description |
 |--------|----------|-------------|
 | `prompt_id` | Yes | Unique ID (e.g. `DF-001`) |
-| `prompt` | Yes | Natural language prompt sent to DashForge |
+| `prompt` | Yes | Natural language prompt sent to Tacit |
 | `expected_archetype` | Yes | Expected investigation type (e.g. `latency_investigation`, `error_spike`, `resource_saturation`, `golden_signals`, `general`) |
 | `expected_metrics` | Yes | Comma-separated list of metric names that should appear in the dashboard |
 | `expected_datasources` | Yes | Comma-separated datasource types (e.g. `Prometheus`) |
@@ -203,7 +203,7 @@ validate.py
 | File | Description |
 |------|-------------|
 | `validate.py` | Validation suite (run with `uv run python tests/validate.py`) |
-| `dashforge_validation_prompts.csv` | 100-prompt test dataset across 3 fake services |
+| `tacit_validation_prompts.csv` | 100-prompt test dataset across 3 fake services |
 | `test_unit.py` | Core unit tests: schemas, LLM JSON repair, SignalFx cache |
 | `test_bedrock.py` | Bedrock provider: session auth, converse, model resolution, inference profile retry, Mistral |
 | `test_azure.py` | Azure OpenAI provider: init validation, deployment resolution |

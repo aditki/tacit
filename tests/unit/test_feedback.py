@@ -1,4 +1,4 @@
-from dashforge.feedback import FeedbackStore
+from tacit.feedback import FeedbackStore
 
 
 def test_empty_feedback_stats_match_api_response_model(tmp_path):

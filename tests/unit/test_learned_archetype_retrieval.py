@@ -1,6 +1,6 @@
-from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
-from dashforge.archetypes.templates import get_archetypes_by_learning_context
-from dashforge.models.schemas import ArchetypeMatch, Intent, SignalType
+from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from tacit.archetypes.templates import get_archetypes_by_learning_context
+from tacit.models.schemas import ArchetypeMatch, Intent, SignalType
 
 
 def test_learned_archetype_can_match_service_without_live_metric_catalog(monkeypatch):
@@ -25,7 +25,7 @@ def test_learned_archetype_can_match_service_without_live_metric_catalog(monkeyp
             )
         ],
     )
-    monkeypatch.setattr("dashforge.archetypes.templates.ALL_ARCHETYPES", [falco_arch])
+    monkeypatch.setattr("tacit.archetypes.templates.ALL_ARCHETYPES", [falco_arch])
 
     intent = Intent(
         summary="falco pods running high on memory",

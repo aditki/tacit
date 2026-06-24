@@ -1,5 +1,5 @@
-from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
-from dashforge.evidence import (
+from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from tacit.evidence import (
     AMBIGUOUS_EVIDENCE,
     MISSING_EVIDENCE,
     SUPPORTED_OBSERVATION,
@@ -10,7 +10,7 @@ from dashforge.evidence import (
     resolve_requirements_for_archetype,
     summarize_evidence,
 )
-from dashforge.models.schemas import (
+from tacit.models.schemas import (
     ArchetypeMatch,
     DashboardSpec,
     EvidenceLifecycleStatus,
@@ -23,7 +23,7 @@ from dashforge.models.schemas import (
     PanelSpec,
     SignalType,
 )
-from dashforge.signals import SignalStore
+from tacit.signals import SignalStore
 
 
 def _intent() -> Intent:
@@ -88,7 +88,7 @@ def test_evidence_requirements_are_declared_once_per_archetype_signal():
 def test_evidence_resolves_prefixed_live_metrics(monkeypatch, tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     requirements, resolutions = resolve_requirements_for_archetype(
         _resource_archetype(),
         _intent(),
@@ -211,7 +211,7 @@ def test_signal_bound_evidence_mirrors_binder_top_match_on_tie(monkeypatch, tmp_
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.register_signal_type("custom_latency", category="latency")
     store.add_mapping("custom_latency", "*latency*", confidence=0.9)
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = InvestigationArchetype(
         id="learned-latency",
         name="Learned Latency",
@@ -274,7 +274,7 @@ def test_live_signal_required_metric_with_multiple_owners_abstains(monkeypatch, 
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.register_signal_type("custom_latency", category="latency")
     store.add_mapping("custom_latency", "*latency*", confidence=0.9)
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = InvestigationArchetype(
         id="latency",
         name="Latency",

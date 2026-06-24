@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from dashforge.agents.llm_errors import LLMTransientError, is_transient_llm_error, wrap_transient_llm_error
+from tacit.agents.llm_errors import LLMTransientError, is_transient_llm_error, wrap_transient_llm_error
 
 
 def test_wrap_transient_llm_error_for_named_provider_error():

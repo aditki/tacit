@@ -10,7 +10,7 @@ PROMPT="${PROMPT:-Investigate the ClickStack payment cache saturation incident. 
 "$DEMO_DIR/load_clickstack_metrics.sh"
 
 echo
-echo "Teaching DashForge the known-good real-telemetry investigation..."
+echo "Teaching Tacit the known-good real-telemetry investigation..."
 python3 - "$API_URL" "$GRAFANA_URL" "$PROMPT" "$LEARNING_DASHBOARD" <<'PY'
 import json
 import sys
@@ -60,7 +60,7 @@ print(
     )
 )
 
-print("\nAsking DashForge to investigate the ClickStack checkout incident...")
+print("\nAsking Tacit to investigate the ClickStack checkout incident...")
 body = {
     "prompt": prompt,
     "user_id": "demo-real-telemetry",
@@ -71,7 +71,7 @@ print(json.dumps(chart, indent=2))
 
 dashboard_uid = chart.get("dashboard_uid", "")
 if not dashboard_uid:
-    raise SystemExit("DashForge did not publish a dashboard")
+    raise SystemExit("Tacit did not publish a dashboard")
 
 with urlopen(f"{grafana_url}/api/dashboards/uid/{dashboard_uid}", timeout=30) as response:
     generated = json.load(response)["dashboard"]

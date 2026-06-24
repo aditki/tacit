@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import pytest
 
-from dashforge.dashboard_ingest import parse_dashboard_json
-from dashforge.signals import SignalStore
+from tacit.dashboard_ingest import parse_dashboard_json
+from tacit.signals import SignalStore
 
 
 @pytest.fixture
@@ -117,26 +117,26 @@ class TestPanelDrilldownLinks:
 class TestLearnDashboardRequest:
     def test_string_false_is_falsy(self):
         # The original footgun: the *string* "false" must not be truthy.
-        from dashforge.models.schemas import LearnDashboardRequest
+        from tacit.models.schemas import LearnDashboardRequest
 
         req = LearnDashboardRequest(dashboard_uid="abc", auto_approve="false")
         assert req.auto_approve is False
 
     def test_native_bools(self):
-        from dashforge.models.schemas import LearnDashboardRequest
+        from tacit.models.schemas import LearnDashboardRequest
 
         assert LearnDashboardRequest(dashboard_uid="abc", auto_approve=True).auto_approve is True
         assert LearnDashboardRequest(dashboard_uid="abc", auto_approve=False).auto_approve is False
 
     def test_string_true_is_explicitly_accepted(self):
-        from dashforge.models.schemas import LearnDashboardRequest
+        from tacit.models.schemas import LearnDashboardRequest
 
         assert LearnDashboardRequest(dashboard_uid="abc", auto_approve="true").auto_approve is True
 
     def test_ambiguous_value_rejected(self):
         from pydantic import ValidationError
 
-        from dashforge.models.schemas import LearnDashboardRequest
+        from tacit.models.schemas import LearnDashboardRequest
 
         with pytest.raises(ValidationError):
             LearnDashboardRequest(dashboard_uid="abc", auto_approve="maybe")
@@ -150,7 +150,7 @@ class TestLearnDashboardRequest:
     def test_empty_uid_rejected(self):
         from pydantic import ValidationError
 
-        from dashforge.models.schemas import LearnDashboardRequest
+        from tacit.models.schemas import LearnDashboardRequest
 
         with pytest.raises(ValidationError):
             LearnDashboardRequest(dashboard_uid="   ")
@@ -158,7 +158,7 @@ class TestLearnDashboardRequest:
     def test_unknown_field_rejected(self):
         from pydantic import ValidationError
 
-        from dashforge.models.schemas import LearnDashboardRequest
+        from tacit.models.schemas import LearnDashboardRequest
 
         # Catches typos like "auto_aprove" that would otherwise silently default.
         with pytest.raises(ValidationError):
@@ -167,7 +167,7 @@ class TestLearnDashboardRequest:
 
 class TestTeachSignalRequest:
     def test_valid_request_parses(self):
-        from dashforge.models.schemas import TeachSignalRequest
+        from tacit.models.schemas import TeachSignalRequest
 
         req = TeachSignalRequest(
             signal_type="queue_depth",
@@ -178,7 +178,7 @@ class TestTeachSignalRequest:
     def test_out_of_range_confidence_rejected(self):
         from pydantic import ValidationError
 
-        from dashforge.models.schemas import TeachSignalRequest
+        from tacit.models.schemas import TeachSignalRequest
 
         # 90 instead of 0.9 must be rejected at the schema boundary.
         with pytest.raises(ValidationError):
@@ -190,7 +190,7 @@ class TestTeachSignalRequest:
     def test_empty_pattern_rejected(self):
         from pydantic import ValidationError
 
-        from dashforge.models.schemas import TeachSignalRequest
+        from tacit.models.schemas import TeachSignalRequest
 
         with pytest.raises(ValidationError):
             TeachSignalRequest(
@@ -201,7 +201,7 @@ class TestTeachSignalRequest:
     def test_empty_signal_type_rejected(self):
         from pydantic import ValidationError
 
-        from dashforge.models.schemas import TeachSignalRequest
+        from tacit.models.schemas import TeachSignalRequest
 
         with pytest.raises(ValidationError):
             TeachSignalRequest(signal_type="  ")

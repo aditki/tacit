@@ -6,10 +6,10 @@ from types import SimpleNamespace
 
 from fastapi import FastAPI
 
-from dashforge.api.lifespan import create_lifespan
-from dashforge.config import Settings
-from dashforge.integrations.slack import handle_mention
-from dashforge.models.schemas import DashResponse
+from tacit.api.lifespan import create_lifespan
+from tacit.config import Settings
+from tacit.integrations.slack import handle_mention
+from tacit.models.schemas import DashResponse
 
 
 async def test_lifespan_starts_slack_with_runtime_settings(monkeypatch):
@@ -28,7 +28,7 @@ async def test_lifespan_starts_slack_with_runtime_settings(monkeypatch):
 
     monkeypatch.setitem(
         sys.modules,
-        "dashforge.integrations.slack",
+        "tacit.integrations.slack",
         SimpleNamespace(start_slack_bot=fake_start_slack_bot),
     )
 
@@ -55,7 +55,7 @@ async def test_slack_mention_handler_passes_runtime_dependencies(monkeypatch):
     async def fake_say(**kwargs):
         messages.append(kwargs)
 
-    monkeypatch.setattr("dashforge.integrations.slack.run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr("tacit.integrations.slack.run_pipeline", fake_run_pipeline)
 
     await handle_mention(
         {"text": "<@BOT> checkout latency", "channel": "C1", "user": "U1", "ts": "1.0"},

@@ -4,7 +4,7 @@
 
 ## Project Status
 
-DashForge is an experimental infrastructure engineering and observability tooling project.
+Tacit is an experimental infrastructure engineering and observability tooling project.
 
 It is currently:
 
@@ -51,7 +51,7 @@ Reasonable disclosure efforts are appreciated.
 
 ## Security Expectations
 
-DashForge integrates with:
+Tacit integrates with:
 
 * Grafana
 * observability datasources
@@ -66,7 +66,7 @@ Users should assume generated queries, dashboards, and integrations require care
 * Use least-privilege Grafana service accounts
 * Avoid Administrator-level API tokens
 * Run only in isolated development/testing environments
-* Do not expose DashForge publicly to the internet
+* Do not expose Tacit publicly to the internet
 * Restrict outbound network access where practical
 * Review generated dashboards and queries before sharing internally
 * Avoid storing secrets directly in repository files
@@ -74,7 +74,7 @@ Users should assume generated queries, dashboards, and integrations require care
 
 ## AI / LLM Caveats
 
-DashForge uses LLMs for:
+Tacit uses LLMs for:
 
 * intent classification
 * metric selection
@@ -91,7 +91,7 @@ LLM-generated output may:
 
 Human review is required.
 
-DashForge should currently be treated as:
+Tacit should currently be treated as:
 
 * an investigation assistant
 * not an autonomous operational system
@@ -113,7 +113,7 @@ Some mitigations exist, but the system has not undergone formal security review.
 
 ## Responsible Usage
 
-If you experiment with DashForge:
+If you experiment with Tacit:
 
 * avoid connecting sensitive production environments
 * avoid exposing internal telemetry publicly

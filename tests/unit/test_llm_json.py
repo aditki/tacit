@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dashforge.agents.llm_json import attempt_json_repair, parse_json_with_repair
-from dashforge.agents.providers.base import LLMProvider, LLMResult, TokenUsage
+from tacit.agents.llm_json import attempt_json_repair, parse_json_with_repair
+from tacit.agents.providers.base import LLMProvider, LLMResult, TokenUsage
 
 
 class RepairProvider(LLMProvider):

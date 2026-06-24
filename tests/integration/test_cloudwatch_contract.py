@@ -5,7 +5,7 @@ from __future__ import annotations
 import respx
 from httpx import ConnectError, Response
 
-from dashforge.grafana.adapters.cloudwatch import CloudWatchAdapter
+from tacit.grafana.adapters.cloudwatch import CloudWatchAdapter
 from tests.contracts import factories as f
 from tests.integration.conftest import datasource, make_grafana_client, resource_url
 

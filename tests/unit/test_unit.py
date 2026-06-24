@@ -1,4 +1,4 @@
-"""Unit tests for DashForge core modules."""
+"""Unit tests for Tacit core modules."""
 
 import os
 import sys
@@ -7,17 +7,17 @@ import httpx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from dashforge.agents.metrics_discovery import _keyword_filter as md_keyword_filter
-from dashforge.context.enrichment import enrich_context, format_context_for_prompt
-from dashforge.context.registry import get_context_provider
-from dashforge.grafana.adapters.cloudwatch import _select_namespaces
-from dashforge.grafana.adapters.registry import get_adapter, get_adapter_for_type, supported_datasource_types
-from dashforge.grafana.dashboard import TIMERANGE_MAP, _build_panel_json, build_dashboard_json
-from dashforge.grafana.datasource import (
+from tacit.agents.metrics_discovery import _keyword_filter as md_keyword_filter
+from tacit.context.enrichment import enrich_context, format_context_for_prompt
+from tacit.context.registry import get_context_provider
+from tacit.grafana.adapters.cloudwatch import _select_namespaces
+from tacit.grafana.adapters.registry import get_adapter, get_adapter_for_type, supported_datasource_types
+from tacit.grafana.dashboard import TIMERANGE_MAP, _build_panel_json, build_dashboard_json
+from tacit.grafana.datasource import (
     filter_datasources_by_signal,
     filter_searchable_datasources,
 )
-from dashforge.models.schemas import (
+from tacit.models.schemas import (
     ContextChunk,
     DashboardSpec,
     DashRequest,
@@ -112,7 +112,7 @@ def test_build_dashboard_json():
     result = build_dashboard_json(spec)
 
     assert result["title"] == "Test Dashboard"
-    assert "dashforge" in result["tags"]
+    assert "tacit" in result["tags"]
     assert result["time"]["from"] == "now-1h"
     assert len(result["panels"]) == 2
 
@@ -421,7 +421,7 @@ def test_enrich_context_noop_when_disabled():
 
 
 def test_prompt_sanitization():
-    from dashforge.main import MAX_PROMPT_LENGTH, _sanitize_prompt
+    from tacit.main import MAX_PROMPT_LENGTH, _sanitize_prompt
 
     # Normal prompt passes through
     assert _sanitize_prompt("high latency on checkout") == "high latency on checkout"
@@ -444,7 +444,7 @@ def test_prompt_sanitization():
 
 
 def test_secrets_not_in_repr():
-    from dashforge.config import Settings
+    from tacit.config import Settings
 
     s = Settings(
         llm_api_key="sentinel-llm-secret",
@@ -463,7 +463,7 @@ def test_secrets_not_in_repr():
 
 
 def test_llm_error_classes():
-    from dashforge.agents.llm import LLMParseError, LLMTransientError
+    from tacit.agents.llm import LLMParseError, LLMTransientError
 
     # LLMTransientError is retryable
     try:
@@ -489,7 +489,7 @@ def test_llm_error_classes():
 
 
 def test_intent_prompt_has_security_rules():
-    from dashforge.agents.intent import SYSTEM_PROMPT
+    from tacit.agents.intent import SYSTEM_PROMPT
 
     assert "SECURITY RULES" in SYSTEM_PROMPT
     assert "UNTRUSTED DATA" in SYSTEM_PROMPT
@@ -498,7 +498,7 @@ def test_intent_prompt_has_security_rules():
 
 
 def test_metrics_discovery_prompt_has_security():
-    from dashforge.agents.metrics_discovery import SYSTEM_PROMPT
+    from tacit.agents.metrics_discovery import SYSTEM_PROMPT
 
     assert "SECURITY" in SYSTEM_PROMPT
     assert "never invent metric names" in SYSTEM_PROMPT.lower() or "never invent" in SYSTEM_PROMPT.lower()
@@ -506,7 +506,7 @@ def test_metrics_discovery_prompt_has_security():
 
 
 def test_query_builder_prompt_has_security():
-    from dashforge.agents.query_builder import SYSTEM_PROMPT
+    from tacit.agents.query_builder import SYSTEM_PROMPT
 
     assert "SECURITY" in SYSTEM_PROMPT
     assert "Never invent UIDs" in SYSTEM_PROMPT
@@ -514,7 +514,7 @@ def test_query_builder_prompt_has_security():
 
 
 def test_config_concurrency_defaults():
-    from dashforge.config import settings
+    from tacit.config import settings
 
     assert settings.pipeline_max_concurrent >= 1
     assert settings.pipeline_timeout_seconds >= 30
@@ -576,12 +576,12 @@ def test_json_repair_path_reraises_transient_errors():
 
     from pydantic import BaseModel
 
-    from dashforge.agents.llm import LLMTransientError, call_llm
+    from tacit.agents.llm import LLMTransientError, call_llm
 
     class Simple(BaseModel):
         v: int
 
-    from dashforge.agents.providers.base import LLMResult
+    from tacit.agents.providers.base import LLMResult
 
     mock_provider = MagicMock()
     # Each tenacity attempt: primary returns bad JSON, repair hits timeout.
@@ -604,7 +604,7 @@ def test_json_repair_path_reraises_transient_errors():
     call_llm.retry.wait = wait_none()
 
     try:
-        with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+        with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
             try:
                 asyncio.run(call_llm("sys", "user", Simple))
                 assert False, "Should have raised"
@@ -657,7 +657,7 @@ def test_cloudwatch_region_defaults_to_datasource_default():
 def test_query_builder_prompt_does_not_instruct_region_guessing():
     """The query builder prompt must NOT tell the LLM to set cloudwatch_region,
     because the metric context doesn't include region info and the LLM would guess."""
-    from dashforge.agents.query_builder import SYSTEM_PROMPT
+    from tacit.agents.query_builder import SYSTEM_PROMPT
 
     assert "cloudwatch_region" not in SYSTEM_PROMPT, (
         "SYSTEM_PROMPT should not instruct LLM to set cloudwatch_region — "
@@ -692,7 +692,7 @@ def test_cloudwatch_validation_is_skipped_for_prometheus_probe():
     import asyncio
     from unittest.mock import AsyncMock
 
-    from dashforge.validation import validate_dashboard_queries
+    from tacit.validation import validate_dashboard_queries
 
     client = type("Client", (), {})()
     client.datasource_proxy_get = AsyncMock(return_value={"data": {"result": []}})
@@ -727,7 +727,7 @@ def test_prometheus_validation_still_uses_proxy_query():
     import asyncio
     from unittest.mock import AsyncMock
 
-    from dashforge.validation import validate_dashboard_queries
+    from tacit.validation import validate_dashboard_queries
 
     client = type("Client", (), {})()
     client.datasource_proxy_get = AsyncMock(return_value={"data": {"result": [{"metric": {}}]}})
@@ -766,7 +766,7 @@ def test_provider_sdk_transient_error_in_repair_retried():
     from pydantic import BaseModel
     from tenacity import RetryError, wait_none
 
-    from dashforge.agents.llm import LLMTransientError, call_llm
+    from tacit.agents.llm import LLMTransientError, call_llm
 
     class Simple(BaseModel):
         v: int
@@ -779,7 +779,7 @@ def test_provider_sdk_transient_error_in_repair_retried():
             super().__init__("Rate limit exceeded")
             self.status_code = 429
 
-    from dashforge.agents.providers.base import LLMResult
+    from tacit.agents.providers.base import LLMResult
 
     mock_provider = MagicMock()
     mock_provider.chat_json = AsyncMock(
@@ -797,7 +797,7 @@ def test_provider_sdk_transient_error_in_repair_retried():
     call_llm.retry.wait = wait_none()
 
     try:
-        with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+        with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
             try:
                 asyncio.run(call_llm("sys", "user", Simple))
                 assert False, "Should have raised"
@@ -903,7 +903,7 @@ def test_cloudwatch_dimensions_accept_str_and_list():
 def test_signalfx_discovery_normalized_keywords_match_cache():
     """SignalFx discovery must use normalized keywords for both the cache key
     and the API search, so whitespace-containing keywords don't poison the cache."""
-    from dashforge.signalfx.discovery import _normalize_keywords
+    from tacit.signalfx.discovery import _normalize_keywords
 
     raw = [" CPU ", "High", "cpu"]
     norm = _normalize_keywords(raw)
@@ -918,7 +918,7 @@ def test_signalfx_discovery_normalized_keywords_match_cache():
 
 def test_strip_trailing_commas_preserves_string_content():
     """Trailing-comma repair must not mutate commas inside JSON string values."""
-    from dashforge.agents.llm import _strip_trailing_commas
+    from tacit.agents.llm import _strip_trailing_commas
 
     # Comma inside a string value followed by } — must NOT be stripped
     raw = '{"desc": "Check errors,}", "v": 1,}'

@@ -6,11 +6,11 @@ Accepted
 
 ## Context
 
-The highest-leverage adoption story is: point DashForge at existing dashboards and let it learn how the organization
+The highest-leverage adoption story is: point Tacit at existing dashboards and let it learn how the organization
 already investigates. The repo supports dashboard ingestion through backend adapters and uploaded JSON parsing, and the
 Web UI includes a Learning tab.
 
-The CLI in the current `main` branch does not yet expose `dashforge learn dashboard <uid>` or bulk `dashforge learn
+The CLI in the current `main` branch does not yet expose `tacit learn dashboard <uid>` or bulk `tacit learn
 grafana/signalfx`; ingestion is available through API and UI.
 
 ## Decision
@@ -31,18 +31,18 @@ Implementation status: partially implemented.
 
 Validated against:
 
-- `dashforge/backends/base.py`: `DashboardFeatures` normalizes dashboard ingestion features.
-- `dashforge/backends/grafana.py` and `dashforge/backends/signalfx.py`: implement `ingest_dashboard`.
-- `dashforge/dashboard_uploads.py`: parses uploaded dashboard JSON exports.
-- `dashforge/dashboard_ingest.py`: performs extraction, signal inference, YAML generation, persistence, and approval
+- `tacit/backends/base.py`: `DashboardFeatures` normalizes dashboard ingestion features.
+- `tacit/backends/grafana.py` and `tacit/backends/signalfx.py`: implement `ingest_dashboard`.
+- `tacit/dashboard_uploads.py`: parses uploaded dashboard JSON exports.
+- `tacit/dashboard_ingest.py`: performs extraction, signal inference, YAML generation, persistence, and approval
   support.
-- `dashforge/main.py`: exposes `/api/v1/learn/dashboard` and `/api/v1/learn/dashboard/json`.
-- `dashforge/static/index.html`: includes a Learning tab.
+- `tacit/main.py`: exposes `/api/v1/learn/dashboard` and `/api/v1/learn/dashboard/json`.
+- `tacit/static/index.html`: includes a Learning tab.
 - `README.md`: documents API/UI ingestion.
 
 TODO:
 
-- Add and document first-class CLI commands such as `dashforge learn dashboard <uid>` and bulk backend learning if this
+- Add and document first-class CLI commands such as `tacit learn dashboard <uid>` and bulk backend learning if this
   branch is intended to support the "connect Grafana, learn everything" demo.
 - Add pagination/concurrency/backoff considerations before claiming large-enterprise crawl readiness.
 

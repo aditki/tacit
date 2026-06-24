@@ -22,7 +22,7 @@ jobs:
       - name: Black
         run: uv run black --check .
       - name: Mypy
-        run: uv run mypy dashforge
+        run: uv run mypy tacit
 
   test:
     runs-on: ubuntu-latest
@@ -63,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build Docker image
-        run: docker build -t dashforge:ci .
+        run: docker build -t tacit:ci .
 
   secret-scan:
     runs-on: ubuntu-latest
@@ -89,4 +89,4 @@ jobs:
         run: |
           uv venv .fresh-venv
           uv pip install --python .fresh-venv/bin/python .
-          .fresh-venv/bin/dashforge --version
+          .fresh-venv/bin/tacit --version

@@ -1,7 +1,7 @@
 {
-    "uid": "dashforge-signal-coverage",
-    "title": "DashForge Signal Coverage",
-    "tags": ["dashforge", "signals", "coverage"],
+    "uid": "tacit-signal-coverage",
+    "title": "Tacit Signal Coverage",
+    "tags": ["tacit", "signals", "coverage"],
     "timezone": "browser",
     "refresh": "30s",
     "time": { "from": "now-1h", "to": "now" },

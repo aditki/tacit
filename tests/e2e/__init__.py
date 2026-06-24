@@ -1,1 +1,1 @@
-"""End-to-end workflow tests for DashForge."""
+"""End-to-end workflow tests for Tacit."""

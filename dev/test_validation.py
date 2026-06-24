@@ -10,7 +10,7 @@ import httpx
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(os.path.join(os.path.dirname(__file__), ".."))
 
-from dashforge.config import settings  # noqa: E402
+from tacit.config import settings  # noqa: E402
 
 
 async def main():

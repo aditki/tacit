@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-DashForge's current moat is learning operational language: dashboard ingestion, signal inference, signal mappings,
+Tacit's current moat is learning operational language: dashboard ingestion, signal inference, signal mappings,
 approval/teaching, archetypes, validation, and feedback. The repository does not contain an `InvestigationSession`,
 mutable investigation graph, persistent hypothesis state machine, or evidence graph runtime.
 
@@ -31,9 +31,9 @@ Implementation status: implemented as a near-term guardrail.
 
 Validated against:
 
-- `dashforge/history.py`: stores request lifecycle and generated dashboard metadata, not mutable investigation sessions.
-- `dashforge/archetypes/schema.py`: defines reusable investigation archetypes and panel templates.
-- `dashforge/pipeline.py`: has archetype/freeform paths but no stateful investigation graph.
+- `tacit/history.py`: stores request lifecycle and generated dashboard metadata, not mutable investigation sessions.
+- `tacit/archetypes/schema.py`: defines reusable investigation archetypes and panel templates.
+- `tacit/pipeline.py`: has archetype/freeform paths but no stateful investigation graph.
 - Repository search finds no `InvestigationSession`, `InvestigationNode`, `HypothesisState`, or persistent evidence graph.
 
 TODO:

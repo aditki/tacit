@@ -5,13 +5,13 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from dashforge.archetypes.engine import _panel_signature, blend_archetypes, rank_archetypes_by_coverage
-from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
-from dashforge.cache import metric_cache
-from dashforge.catalog import catalog_for_services
-from dashforge.config import settings
-from dashforge.grafana.adapters.prometheus import PrometheusAdapter
-from dashforge.models.schemas import (
+from tacit.archetypes.engine import _panel_signature, blend_archetypes, rank_archetypes_by_coverage
+from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from tacit.cache import metric_cache
+from tacit.catalog import catalog_for_services
+from tacit.config import settings
+from tacit.grafana.adapters.prometheus import PrometheusAdapter
+from tacit.models.schemas import (
     ArchetypeMatch,
     DashboardSpec,
     DatasourceInfo,
@@ -21,9 +21,9 @@ from dashforge.models.schemas import (
     PanelSpec,
     SignalType,
 )
-from dashforge.pipeline import _discovery_keywords
-from dashforge.signals import SignalStore, _unit_compatibility
-from dashforge.validation import validate_dashboard_queries
+from tacit.pipeline import _discovery_keywords
+from tacit.signals import SignalStore, _unit_compatibility
+from tacit.validation import validate_dashboard_queries
 from tests.eval.gate_harness import gate_failures
 
 
@@ -477,7 +477,7 @@ def test_archetype_coverage_resolves_signals_only_for_requested_service(monkeypa
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.register_signal_type("cache_evictions", category="caching")
     store.add_mapping("cache_evictions", "*cache_evictions*", confidence=0.9)
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
 
     learned_cache = InvestigationArchetype(
         id="learned-cache",

@@ -33,7 +33,7 @@ update the model once and every dependent test fails loudly.
 
 Integration tests mount [respx](https://lundberg.github.io/respx/) over httpx,
 feed factory-built responses, drive the real client/adapter code, and — for
-writes — validate DashForge's *outgoing* request body against the vendor's
+writes — validate Tacit's *outgoing* request body against the vendor's
 request-contract model (e.g. `GrafanaDashboardSaveCommand`,
 `SignalFxChartCreate`). This is what catches "we send the wrong shape" and
 "we mis-parse their response" without a live service.
@@ -50,11 +50,11 @@ request-contract model (e.g. `GrafanaDashboardSaveCommand`,
 | Elasticsearch/OpenSearch | `_mapping` | — |
 | Graphite | `metrics/find` | — |
 | InfluxDB | `SHOW MEASUREMENTS` | — |
-| DashForge API | `/healthz`, `/api/v1/signals` | `/signals/teach`, `/learn/dashboard` |
+| Tacit API | `/healthz`, `/api/v1/signals` | `/signals/teach`, `/learn/dashboard` |
 
 ## E2E Workflow Tests
 
 `tests/e2e` covers upload -> signal learning -> prompt -> dashboard-spec, manual signal teaching, reject/ignore-style learning control, empty telemetry outcomes, and the broader API surface: system, auth, archetypes, signals, chart generation, history, feedback, insights, and learning validation. These tests are opt-in via `-m e2e` and are intended for release gates or nightly runs where usefulness metrics matter as much as technical success.
 
-> The DashForge API contract test requires Python 3.12 (the app imports
+> The Tacit API contract test requires Python 3.12 (the app imports
 > `agents.llm`, which uses 3.12 generic syntax); it auto-skips on older runtimes.

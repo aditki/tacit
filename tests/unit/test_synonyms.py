@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from dashforge.agents.synonyms import (
+from tacit.agents.synonyms import (
     confirm_colloquial,
     expand_operational_terms,
     high_confidence_keywords,

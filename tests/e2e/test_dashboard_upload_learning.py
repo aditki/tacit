@@ -5,11 +5,11 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-import dashforge.archetypes.templates as templates
-import dashforge.pipeline as pipeline_mod
-from dashforge.agents.providers.base import TokenUsage
-from dashforge.main import app
-from dashforge.models.schemas import ArchetypeMatch, DashRequest, Intent, MetricEntry, SignalType
+import tacit.archetypes.templates as templates
+import tacit.pipeline as pipeline_mod
+from tacit.agents.providers.base import TokenUsage
+from tacit.main import app
+from tacit.models.schemas import ArchetypeMatch, DashRequest, Intent, MetricEntry, SignalType
 from tests.e2e.framework import (
     CapturingBackend,
     build_grafana_dashboard,
