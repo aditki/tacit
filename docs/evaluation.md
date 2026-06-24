@@ -117,6 +117,21 @@ Current limitations:
 - The pipeline still depends on live datasource shape, label quality, and metric naming conventions.
 - The benchmark does not yet evaluate RBAC, tenant boundaries, or production deployment safety.
 
+The contextual culprit-ranking benchmark evaluates suspect quality from normalized operational context. It should remain
+separate from future telemetry-backed ranking evaluation:
+
+- **Contextual suspect quality**: whether Tacit ranks plausible suspects from operational artifacts such as service
+  context, runbooks, dashboards, incidents, deployments, pull requests, and historical investigations without querying
+  live production telemetry.
+- **Telemetry-evidenced ranking accuracy**: whether runtime metrics, logs, or traces corroborate, demote, or reorder the
+  contextual suspects correctly.
+
+These are different products and should not share one headline accuracy number. Contextual ranking measures operational
+knowledge retrieval and reasoning. Telemetry-evidenced ranking measures runtime evidence verification.
+
+Phase 1 contextual culprit ranking is implemented as a deterministic, provenance-preserving suspect ranking surface. It
+ranks plausible suspects from operational context without asserting causality or requiring live telemetry access.
+
 Near-term evaluation work:
 
 - expand datasource-specific benchmarks
@@ -124,6 +139,7 @@ Near-term evaluation work:
 - add query cost and cardinality scoring
 - track dashboard usefulness feedback by archetype
 - add regression tests for learned signal mappings
+- expand contextual culprit-ranking fixtures before telemetry-backed ranking fixtures
 - add more adversarial and ambiguous prompts
 - separate demo-service results from external-vendor contract results
 

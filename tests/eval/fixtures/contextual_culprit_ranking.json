@@ -1,0 +1,1864 @@
+{
+  "benchmark": "contextual_culprit_ranking",
+  "version": 2,
+  "target_matrix_size": 110,
+  "cases": [
+    {
+      "id": "direct_dependency_db",
+      "family": "direct_dependency",
+      "expected_culprit": "checkout-db",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout latency increased",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "depends_on": [
+                "checkout-db",
+                "redis-cart"
+              ],
+              "owner": "payments"
+            },
+            {
+              "name": "checkout-db",
+              "owner": "database-platform"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database p95 latency",
+              "status": "abnormal",
+              "related_entity": "checkout-db"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "recent_deploy_checkout_api",
+      "family": "recent_deploy",
+      "expected_culprit": "checkout-api",
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout errors increased",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "owner": "payments"
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "checkout-api",
+              "time_delta_minutes": 5,
+              "summary": "Vault key schema change"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "runbook_guided_redis",
+      "family": "runbook_guided",
+      "expected_culprit": "redis-cart",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout latency increased",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "depends_on": [
+                "checkout-db",
+                "redis-cart"
+              ],
+              "owner": "payments"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "checkout latency",
+              "suspects": [
+                "redis-cart",
+                "checkout-db"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "cache misses",
+              "status": "abnormal",
+              "related_entity": "redis-cart"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "historical_match_db",
+      "family": "historical_match",
+      "expected_culprit": "checkout-db",
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout latency regression",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "depends_on": [
+                "checkout-db",
+                "redis-cart"
+              ],
+              "owner": "payments"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "checkout latency",
+              "culprit": "checkout-db",
+              "evidence": [
+                "db p95 latency",
+                "connection saturation"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "ambiguous_context",
+      "family": "ambiguous",
+      "expected_culprit": null,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout latency increased",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "depends_on": [
+                "checkout-db",
+                "redis-cart"
+              ],
+              "owner": "payments"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "negative_no_context",
+      "family": "negative_control",
+      "expected_culprit": null,
+      "negative_control": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout support tickets increased",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "owner": "payments"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "distractor_unconnected_redis",
+      "family": "distractor_service",
+      "expected_culprit": "checkout-db",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout latency increased",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "depends_on": [
+                "checkout-db"
+              ],
+              "owner": "payments"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "checkout latency",
+              "suspects": [
+                "redis-cart"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database latency",
+              "status": "abnormal",
+              "related_entity": "checkout-db"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "stale_runbook_mysql",
+      "family": "stale_runbook",
+      "expected_culprit": "checkout-postgres",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout latency increased",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "depends_on": [
+                "checkout-postgres"
+              ],
+              "owner": "payments"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "checkout latency",
+              "suspects": [
+                "checkout-mysql"
+              ],
+              "stale": true
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database latency",
+              "status": "abnormal"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "conflicting_sources",
+      "family": "conflicting_sources",
+      "expected_culprit": "checkout-db",
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout latency increased",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "depends_on": [
+                "checkout-db",
+                "redis-cart"
+              ],
+              "owner": "payments"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "checkout latency",
+              "suspects": [
+                "redis-cart"
+              ]
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "checkout latency",
+              "culprit": "checkout-db",
+              "evidence": [
+                "connection saturation"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "checkout-api",
+              "time_delta_minutes": 8,
+              "summary": "checkout rollout"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "ownership_only",
+      "family": "ownership_only",
+      "expected_culprit": null,
+      "negative_control": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout latency increased",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "owner": "payments"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "dashboard_weight_support",
+      "family": "dashboard_association",
+      "expected_culprit": "checkout-db",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout latency increased",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "depends_on": [
+                "checkout-db"
+              ],
+              "owner": "payments"
+            }
+          ],
+          "dashboards": [
+            {
+              "service": "checkout-db",
+              "signals": [
+                "db p95 latency"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database latency",
+              "status": "abnormal",
+              "related_entity": "checkout-db"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "counterfactual_remove_dependency_edge",
+      "family": "counterfactual_sensitivity",
+      "counterfactual_of": "direct_dependency_db",
+      "expect_top1_changes": true,
+      "expected_culprit": null,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "checkout latency increased",
+          "affected_service": "checkout-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "checkout-api",
+              "owner": "payments"
+            },
+            {
+              "name": "checkout-db",
+              "owner": "database-platform"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database p95 latency",
+              "status": "abnormal",
+              "related_entity": "checkout-db"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "contextual_top3_only_payments",
+      "family": "contextual_top3_only",
+      "expected_culprit": "payments-api",
+      "contextual_top3_only": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "payment confirmation latency increased",
+          "affected_service": "payments-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "payments-api",
+              "depends_on": [
+                "payments-db",
+                "payments-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "payment confirmation latency",
+              "culprit": "payments-db",
+              "evidence": [
+                "database p95 latency",
+                "connection saturation"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "payments-api",
+              "time_delta_minutes": 7,
+              "summary": "wallet schema deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "contextual_top3_only_orders",
+      "family": "contextual_top3_only",
+      "expected_culprit": "orders-api",
+      "contextual_top3_only": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "order creation latency increased",
+          "affected_service": "orders-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "orders-api",
+              "depends_on": [
+                "orders-db",
+                "orders-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "order creation latency",
+              "culprit": "orders-db",
+              "evidence": [
+                "database p95 latency",
+                "connection saturation"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "orders-api",
+              "time_delta_minutes": 7,
+              "summary": "order validation deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "contextual_top3_only_inventory",
+      "family": "contextual_top3_only",
+      "expected_culprit": "inventory-api",
+      "contextual_top3_only": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "inventory reservation latency increased",
+          "affected_service": "inventory-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "inventory-api",
+              "depends_on": [
+                "inventory-db",
+                "inventory-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "inventory reservation latency",
+              "culprit": "inventory-db",
+              "evidence": [
+                "database p95 latency",
+                "connection saturation"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "inventory-api",
+              "time_delta_minutes": 7,
+              "summary": "stock lock deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "contextual_top3_only_pricing",
+      "family": "contextual_top3_only",
+      "expected_culprit": "pricing-api",
+      "contextual_top3_only": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "price quote latency increased",
+          "affected_service": "pricing-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "pricing-api",
+              "depends_on": [
+                "pricing-db",
+                "pricing-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "price quote latency",
+              "culprit": "pricing-db",
+              "evidence": [
+                "database p95 latency",
+                "connection saturation"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "pricing-api",
+              "time_delta_minutes": 7,
+              "summary": "discount rules deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "contextual_top3_only_shipping",
+      "family": "contextual_top3_only",
+      "expected_culprit": "shipping-api",
+      "contextual_top3_only": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "shipping quote latency increased",
+          "affected_service": "shipping-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "shipping-api",
+              "depends_on": [
+                "shipping-db",
+                "shipping-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "shipping quote latency",
+              "culprit": "shipping-db",
+              "evidence": [
+                "database p95 latency",
+                "connection saturation"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "shipping-api",
+              "time_delta_minutes": 7,
+              "summary": "carrier rules deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "contextual_top3_only_accounts",
+      "family": "contextual_top3_only",
+      "expected_culprit": "accounts-api",
+      "contextual_top3_only": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "account lookup latency increased",
+          "affected_service": "accounts-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "accounts-api",
+              "depends_on": [
+                "accounts-db",
+                "accounts-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "account lookup latency",
+              "culprit": "accounts-db",
+              "evidence": [
+                "database p95 latency",
+                "connection saturation"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "accounts-api",
+              "time_delta_minutes": 7,
+              "summary": "identity claims deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "contextual_top3_only_refunds",
+      "family": "contextual_top3_only",
+      "expected_culprit": "refunds-api",
+      "contextual_top3_only": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "refund submission latency increased",
+          "affected_service": "refunds-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "refunds-api",
+              "depends_on": [
+                "refunds-db",
+                "refunds-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "refund submission latency",
+              "culprit": "refunds-db",
+              "evidence": [
+                "database p95 latency",
+                "connection saturation"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "refunds-api",
+              "time_delta_minutes": 7,
+              "summary": "refund workflow deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "contextual_top3_only_ledger",
+      "family": "contextual_top3_only",
+      "expected_culprit": "ledger-api",
+      "contextual_top3_only": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "ledger write latency increased",
+          "affected_service": "ledger-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "ledger-api",
+              "depends_on": [
+                "ledger-db",
+                "ledger-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "ledger write latency",
+              "culprit": "ledger-db",
+              "evidence": [
+                "database p95 latency",
+                "connection saturation"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "ledger-api",
+              "time_delta_minutes": 7,
+              "summary": "posting rules deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "plausible_redis_db_cart",
+      "family": "plausible_multiple_suspects",
+      "expected_culprit": "redis-cart",
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "cart latency increased",
+          "affected_service": "cart-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "cart-api",
+              "depends_on": [
+                "cart-db",
+                "redis-cart"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "cart latency",
+              "suspects": [
+                "redis-cart"
+              ]
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "cart latency",
+              "culprit": "redis-cart",
+              "evidence": [
+                "elevated cache misses"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "plausible_redis_db_profile",
+      "family": "plausible_multiple_suspects",
+      "expected_culprit": "redis-profile",
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "profile latency increased",
+          "affected_service": "profile-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "profile-api",
+              "depends_on": [
+                "profile-db",
+                "redis-profile"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "profile latency",
+              "suspects": [
+                "redis-profile"
+              ]
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "profile latency",
+              "culprit": "redis-profile",
+              "evidence": [
+                "elevated cache misses"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "plausible_redis_db_search",
+      "family": "plausible_multiple_suspects",
+      "expected_culprit": "redis-search",
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "search latency increased",
+          "affected_service": "search-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "search-api",
+              "depends_on": [
+                "search-db",
+                "redis-search"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "search latency",
+              "suspects": [
+                "redis-search"
+              ]
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "search latency",
+              "culprit": "redis-search",
+              "evidence": [
+                "elevated cache misses"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "plausible_redis_db_catalog",
+      "family": "plausible_multiple_suspects",
+      "expected_culprit": "redis-catalog",
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "catalog latency increased",
+          "affected_service": "catalog-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "catalog-api",
+              "depends_on": [
+                "catalog-db",
+                "redis-catalog"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "catalog latency",
+              "suspects": [
+                "redis-catalog"
+              ]
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "catalog latency",
+              "culprit": "redis-catalog",
+              "evidence": [
+                "elevated cache misses"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "plausible_redis_db_coupons",
+      "family": "plausible_multiple_suspects",
+      "expected_culprit": "redis-coupons",
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "coupon latency increased",
+          "affected_service": "coupons-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "coupons-api",
+              "depends_on": [
+                "coupons-db",
+                "redis-coupons"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "coupon latency",
+              "suspects": [
+                "redis-coupons"
+              ]
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "coupon latency",
+              "culprit": "redis-coupons",
+              "evidence": [
+                "elevated cache misses"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "plausible_redis_db_sessions",
+      "family": "plausible_multiple_suspects",
+      "expected_culprit": "redis-sessions",
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "session latency increased",
+          "affected_service": "sessions-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "sessions-api",
+              "depends_on": [
+                "sessions-db",
+                "redis-sessions"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "session latency",
+              "suspects": [
+                "redis-sessions"
+              ]
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "session latency",
+              "culprit": "redis-sessions",
+              "evidence": [
+                "elevated cache misses"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "runtime_breaks_tie_payments",
+      "family": "runtime_breaks_contextual_tie",
+      "expected_culprit": "payments-api",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "payment confirmation latency increased",
+          "affected_service": "payments-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "payments-api",
+              "depends_on": [
+                "payments-db",
+                "payments-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "payment confirmation latency",
+              "culprit": "payments-db",
+              "evidence": [
+                "database p95 latency"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "payments-api",
+              "time_delta_minutes": 6,
+              "summary": "application deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "application error rate",
+              "status": "abnormal",
+              "related_entity": "payments-api"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "runtime_breaks_tie_orders",
+      "family": "runtime_breaks_contextual_tie",
+      "expected_culprit": "orders-api",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "order creation latency increased",
+          "affected_service": "orders-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "orders-api",
+              "depends_on": [
+                "orders-db",
+                "orders-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "order creation latency",
+              "culprit": "orders-db",
+              "evidence": [
+                "database p95 latency"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "orders-api",
+              "time_delta_minutes": 6,
+              "summary": "application deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "application latency",
+              "status": "abnormal",
+              "related_entity": "orders-api"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "runtime_breaks_tie_inventory",
+      "family": "runtime_breaks_contextual_tie",
+      "expected_culprit": "inventory-api",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "inventory reservation latency increased",
+          "affected_service": "inventory-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "inventory-api",
+              "depends_on": [
+                "inventory-db",
+                "inventory-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "inventory reservation latency",
+              "culprit": "inventory-db",
+              "evidence": [
+                "database p95 latency"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "inventory-api",
+              "time_delta_minutes": 6,
+              "summary": "application deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "application saturation",
+              "status": "abnormal",
+              "related_entity": "inventory-api"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "runtime_breaks_tie_pricing",
+      "family": "runtime_breaks_contextual_tie",
+      "expected_culprit": "pricing-api",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "price quote latency increased",
+          "affected_service": "pricing-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "pricing-api",
+              "depends_on": [
+                "pricing-db",
+                "pricing-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "price quote latency",
+              "culprit": "pricing-db",
+              "evidence": [
+                "database p95 latency"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "pricing-api",
+              "time_delta_minutes": 6,
+              "summary": "application deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "application latency",
+              "status": "abnormal",
+              "related_entity": "pricing-api"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "runtime_breaks_tie_shipping",
+      "family": "runtime_breaks_contextual_tie",
+      "expected_culprit": "shipping-api",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "shipping quote latency increased",
+          "affected_service": "shipping-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "shipping-api",
+              "depends_on": [
+                "shipping-db",
+                "shipping-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "shipping quote latency",
+              "culprit": "shipping-db",
+              "evidence": [
+                "database p95 latency"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "shipping-api",
+              "time_delta_minutes": 6,
+              "summary": "application deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "application error rate",
+              "status": "abnormal",
+              "related_entity": "shipping-api"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "runtime_breaks_tie_accounts",
+      "family": "runtime_breaks_contextual_tie",
+      "expected_culprit": "accounts-api",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "account lookup latency increased",
+          "affected_service": "accounts-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "accounts-api",
+              "depends_on": [
+                "accounts-db",
+                "accounts-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "historical_incidents": [
+            {
+              "symptom": "account lookup latency",
+              "culprit": "accounts-db",
+              "evidence": [
+                "database p95 latency"
+              ]
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "accounts-api",
+              "time_delta_minutes": 6,
+              "summary": "application deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "application latency",
+              "status": "abnormal",
+              "related_entity": "accounts-api"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "negative_business_signal_reviews",
+      "family": "negative_control",
+      "expected_culprit": null,
+      "negative_control": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "reviews-api business KPI changed",
+          "affected_service": "reviews-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "reviews-api",
+              "owner": "commerce"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "negative_business_signal_notifications",
+      "family": "negative_control",
+      "expected_culprit": null,
+      "negative_control": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "notifications-api business KPI changed",
+          "affected_service": "notifications-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "notifications-api",
+              "owner": "commerce"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "negative_business_signal_recommendations",
+      "family": "negative_control",
+      "expected_culprit": null,
+      "negative_control": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "recommendations-api business KPI changed",
+          "affected_service": "recommendations-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "recommendations-api",
+              "owner": "commerce"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "negative_business_signal_loyalty",
+      "family": "negative_control",
+      "expected_culprit": null,
+      "negative_control": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "loyalty-api business KPI changed",
+          "affected_service": "loyalty-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "loyalty-api",
+              "owner": "commerce"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "negative_business_signal_tax",
+      "family": "negative_control",
+      "expected_culprit": null,
+      "negative_control": true,
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "tax-api business KPI changed",
+          "affected_service": "tax-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "tax-api",
+              "owner": "commerce"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "stale_runbook_risk",
+      "family": "stale_runbook",
+      "expected_culprit": "risk-postgres",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "risk scoring latency increased",
+          "affected_service": "risk-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "risk-api",
+              "depends_on": [
+                "risk-postgres"
+              ],
+              "owner": "platform"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "risk scoring latency",
+              "suspects": [
+                "risk-mysql"
+              ],
+              "stale": true
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database latency",
+              "status": "abnormal"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "stale_runbook_auth",
+      "family": "stale_runbook",
+      "expected_culprit": "auth-postgres",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "authentication latency increased",
+          "affected_service": "auth-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "auth-api",
+              "depends_on": [
+                "auth-postgres"
+              ],
+              "owner": "platform"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "authentication latency",
+              "suspects": [
+                "auth-mysql"
+              ],
+              "stale": true
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database latency",
+              "status": "abnormal"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "stale_runbook_billing",
+      "family": "stale_runbook",
+      "expected_culprit": "billing-postgres",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "billing latency increased",
+          "affected_service": "billing-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "billing-api",
+              "depends_on": [
+                "billing-postgres"
+              ],
+              "owner": "platform"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "billing latency",
+              "suspects": [
+                "billing-mysql"
+              ],
+              "stale": true
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database latency",
+              "status": "abnormal"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "stale_runbook_fulfillment",
+      "family": "stale_runbook",
+      "expected_culprit": "fulfillment-postgres",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "fulfillment latency increased",
+          "affected_service": "fulfillment-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "fulfillment-api",
+              "depends_on": [
+                "fulfillment-postgres"
+              ],
+              "owner": "platform"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "fulfillment latency",
+              "suspects": [
+                "fulfillment-mysql"
+              ],
+              "stale": true
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database latency",
+              "status": "abnormal"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "distractor_unconnected_quotes",
+      "family": "distractor_service",
+      "expected_culprit": "quotes-db",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "quote latency increased",
+          "affected_service": "quotes-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "quotes-api",
+              "depends_on": [
+                "quotes-db"
+              ],
+              "owner": "platform"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "quote latency",
+              "suspects": [
+                "redis-quotes-legacy"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database latency",
+              "status": "abnormal",
+              "related_entity": "quotes-db"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "distractor_unconnected_fraud",
+      "family": "distractor_service",
+      "expected_culprit": "fraud-db",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "fraud check latency increased",
+          "affected_service": "fraud-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "fraud-api",
+              "depends_on": [
+                "fraud-db"
+              ],
+              "owner": "platform"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "fraud check latency",
+              "suspects": [
+                "redis-fraud-legacy"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database latency",
+              "status": "abnormal",
+              "related_entity": "fraud-db"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "distractor_unconnected_email",
+      "family": "distractor_service",
+      "expected_culprit": "email-db",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "email send latency increased",
+          "affected_service": "email-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "email-api",
+              "depends_on": [
+                "email-db"
+              ],
+              "owner": "platform"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "email send latency",
+              "suspects": [
+                "redis-email-legacy"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database latency",
+              "status": "abnormal",
+              "related_entity": "email-db"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "distractor_unconnected_payouts",
+      "family": "distractor_service",
+      "expected_culprit": "payouts-db",
+      "insufficient_evidence": false,
+      "bundle": {
+        "incident": {
+          "symptom": "payout latency increased",
+          "affected_service": "payouts-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "payouts-api",
+              "depends_on": [
+                "payouts-db"
+              ],
+              "owner": "platform"
+            }
+          ],
+          "runbook_hints": [
+            {
+              "symptom": "payout latency",
+              "suspects": [
+                "redis-payouts-legacy"
+              ]
+            }
+          ]
+        },
+        "evidence": {
+          "observations": [
+            {
+              "signal": "database latency",
+              "status": "abnormal",
+              "related_entity": "payouts-db"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "counterfactual_remove_history_payments",
+      "family": "counterfactual_sensitivity",
+      "counterfactual_of": "contextual_top3_only_payments",
+      "expect_top1_changes": true,
+      "expected_culprit": "payments-api",
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "payment confirmation latency increased",
+          "affected_service": "payments-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "payments-api",
+              "depends_on": [
+                "payments-db",
+                "payments-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "payments-api",
+              "time_delta_minutes": 7,
+              "summary": "application deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    },
+    {
+      "id": "counterfactual_unrelated_deploy_orders",
+      "family": "counterfactual_sensitivity",
+      "counterfactual_of": "contextual_top3_only_orders",
+      "expect_top1_changes": true,
+      "expected_culprit": "orders-api",
+      "insufficient_evidence": true,
+      "bundle": {
+        "incident": {
+          "symptom": "order creation latency increased",
+          "affected_service": "orders-api"
+        },
+        "context": {
+          "services": [
+            {
+              "name": "orders-api",
+              "depends_on": [
+                "orders-db",
+                "orders-cache"
+              ],
+              "owner": "commerce"
+            }
+          ],
+          "recent_changes": [
+            {
+              "service": "orders-api",
+              "time_delta_minutes": 7,
+              "summary": "application deploy"
+            }
+          ]
+        },
+        "evidence": {
+          "observations": []
+        }
+      }
+    }
+  ]
+}

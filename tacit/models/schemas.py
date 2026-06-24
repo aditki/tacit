@@ -303,6 +303,43 @@ class EvidenceRecord(BaseModel):
     final_status: EvidenceLifecycleStatus = EvidenceLifecycleStatus.REQUIRED
 
 
+# ── Culprit ranking ──────────────────────────────────────────────────────────
+
+
+class CulpritRankingMode(StrEnum):
+    CONTEXTUAL = "contextual"
+    TELEMETRY_EVIDENCED = "telemetry_evidenced"
+
+
+class CulpritCandidate(BaseModel):
+    """One ranked suspect.
+
+    This is a suspect ranking, not a root-cause assertion. Runtime evidence is
+    kept separate from contextual reasons so callers can see whether the
+    ranking crossed from operational context into validated telemetry.
+    """
+
+    rank: int
+    suspect: str
+    suspect_type: str = Field(default="unknown", description="service, datastore, cache, queue, resource, or unknown")
+    score: float = Field(ge=0.0, le=1.0)
+    confidence: str = Field(default="low", description="low, medium, or high")
+    contextual_reasons: list[str] = Field(default_factory=list)
+    runtime_evidence: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+
+
+class CulpritRanking(BaseModel):
+    """Reason-coded suspect ranking for an investigation."""
+
+    mode: CulpritRankingMode = CulpritRankingMode.CONTEXTUAL
+    abstained: bool = True
+    abstention_reason: str = ""
+    candidates: list[CulpritCandidate] = Field(default_factory=list)
+    evidence_sources: list[str] = Field(default_factory=list)
+    telemetry_status: str = Field(default="not_evidenced")
+
+
 # ── Pipeline request / response ──────────────────────────────────────────────
 
 
@@ -335,6 +372,10 @@ class DashResponse(BaseModel):
     summary: str = Field(description="Human-readable summary of what was generated")
     signalfx_url: str = Field(default="", description="SignalFx dashboard URL (when signalfx_enabled)")
     signalfx_dashboard_id: str = Field(default="", description="SignalFx dashboard ID (when signalfx_enabled)")
+    culprit_ranking: CulpritRanking | None = Field(
+        default=None,
+        description="Reason-coded suspect ranking, when enough investigation context exists.",
+    )
 
 
 # ── Feedback ────────────────────────────────────────────────────────────────

@@ -19,6 +19,7 @@ from tacit.evidence_artifacts import (
 )
 from tacit.models.schemas import (
     DashboardSpec,
+    EvidenceObservation,
     EvidenceRequirement,
     EvidenceResolution,
     Intent,
@@ -35,6 +36,8 @@ class ValidationEvidenceResult:
     dashboard_spec: DashboardSpec
     validation_warnings: list[str]
     panels_before: int
+    evidence_observations: list[EvidenceObservation]
+    evidence_summary: dict[str, object]
 
 
 def _append_validated_panels(
@@ -228,42 +231,50 @@ async def _preserve_gap_evidence(
     return pre_validation_spec, dashboard_spec, panels_before + len(gap_pre_validation_spec.panels)
 
 
-def _record_evidence_stage(
+def _evidence_stage_payload(
     *,
     evidence_requirements: list[EvidenceRequirement],
     evidence_resolutions: list[EvidenceResolution],
     pre_validation_spec: DashboardSpec,
     dashboard_spec: DashboardSpec,
     ranked_archetypes_present: bool,
+) -> tuple[list[EvidenceObservation], dict[str, object], str, str]:
+    if evidence_requirements:
+        evidence_observations = observe_evidence(
+            evidence_requirements,
+            evidence_resolutions,
+            pre_validation_spec,
+            dashboard_spec,
+        )
+        evidence_summary = summarize_evidence(
+            evidence_requirements,
+            evidence_resolutions,
+            evidence_observations,
+        )
+        evidence_status, evidence_reason = _evidence_status(evidence_summary)
+        return evidence_observations, evidence_summary, evidence_status, evidence_reason
+    return (
+        [],
+        {"path": "archetype" if ranked_archetypes_present else "freeform"},
+        "skipped",
+        "no_declared_evidence_requirements",
+    )
+
+
+def _record_evidence_stage(
+    *,
+    evidence_summary: dict[str, object],
+    evidence_status: str,
+    evidence_reason: str,
     record_stage: Callable[..., None],
 ) -> None:
     try:
-        if evidence_requirements:
-            evidence_observations = observe_evidence(
-                evidence_requirements,
-                evidence_resolutions,
-                pre_validation_spec,
-                dashboard_spec,
-            )
-            evidence_summary = summarize_evidence(
-                evidence_requirements,
-                evidence_resolutions,
-                evidence_observations,
-            )
-            evidence_status, evidence_reason = _evidence_status(evidence_summary)
-            record_stage(
-                "evidence",
-                evidence_status,
-                evidence_reason,
-                **evidence_summary,
-            )
-        else:
-            record_stage(
-                "evidence",
-                "skipped",
-                "no_declared_evidence_requirements",
-                path="archetype" if ranked_archetypes_present else "freeform",
-            )
+        record_stage(
+            "evidence",
+            evidence_status,
+            evidence_reason,
+            **evidence_summary,
+        )
     except Exception:
         logger.warning(
             "history_record_evidence_failed",
@@ -326,16 +337,23 @@ async def validate_dashboard_and_evidence(
         panels_after=len(dashboard_spec.panels),
         warnings=validation_warnings,
     )
-    _record_evidence_stage(
+    evidence_observations, evidence_summary, evidence_status, evidence_reason = _evidence_stage_payload(
         evidence_requirements=evidence_requirements,
         evidence_resolutions=evidence_resolutions,
         pre_validation_spec=pre_validation_spec,
         dashboard_spec=dashboard_spec,
         ranked_archetypes_present=ranked_archetypes_present,
+    )
+    _record_evidence_stage(
+        evidence_summary=evidence_summary,
+        evidence_status=evidence_status,
+        evidence_reason=evidence_reason,
         record_stage=record_stage,
     )
     return ValidationEvidenceResult(
         dashboard_spec=dashboard_spec,
         validation_warnings=validation_warnings,
         panels_before=panels_before,
+        evidence_observations=evidence_observations,
+        evidence_summary=evidence_summary,
     )

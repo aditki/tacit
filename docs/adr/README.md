@@ -23,3 +23,4 @@ production-readiness claims.
 | [ADR-013](013-adoption-time-to-value-and-trust.md) | Adoption depends on time-to-value and trust, not more agents | Accepted | Partially implemented |
 | [ADR-014](014-tacit-is-not-a-system-of-record.md) | Tacit Is Not a System of Record | Accepted | Partially implemented |
 | [ADR-015](015-evidence-lifecycle.md) | Evidence has a lightweight lifecycle | Accepted | Partially implemented |
+| [ADR-016](016-contextual-vs-telemetry-evidenced-ranking.md) | Culprit ranking has contextual and telemetry-evidenced tiers | Accepted | Partially implemented |

@@ -6,7 +6,7 @@ import time
 
 from tacit.archetypes.templates import get_archetypes_by_confidence, get_archetypes_by_learning_context
 from tacit.backends.base import DashboardBackend
-from tacit.models.schemas import DashResponse, Intent, MetricEntry
+from tacit.models.schemas import CulpritRanking, DashResponse, Intent, MetricEntry
 from tacit.pipeline.recording import PipelineRecorder
 
 
@@ -30,6 +30,7 @@ class PipelineFailureFactory:
         summary: str,
         timings: dict[str, float],
         started_at: float,
+        culprit_ranking: CulpritRanking | None = None,
     ) -> DashResponse:
         recorder.finish(
             status="failed",
@@ -42,6 +43,7 @@ class PipelineFailureFactory:
             dashboard_uid="",
             panel_count=0,
             summary=summary,
+            culprit_ranking=culprit_ranking,
         )
 
     @staticmethod
@@ -51,6 +53,7 @@ class PipelineFailureFactory:
         timings: dict[str, float],
         started_at: float,
         validation_warnings: list[str],
+        culprit_ranking: CulpritRanking | None = None,
     ) -> DashResponse:
         return PipelineFailureFactory.finish_failure(
             recorder=recorder,
@@ -62,6 +65,7 @@ class PipelineFailureFactory:
             ),
             timings=timings,
             started_at=started_at,
+            culprit_ranking=culprit_ranking,
         )
 
 
