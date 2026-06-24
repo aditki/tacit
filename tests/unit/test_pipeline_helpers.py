@@ -98,6 +98,18 @@ class FakeContextProvider(ContextProvider):
         self.closed = True
 
 
+class FailingCloseProvider(FakeProvider):
+    async def close(self) -> None:
+        self.closed = True
+        raise RuntimeError("close failed")
+
+
+class FailingCloseContextProvider(FakeContextProvider):
+    async def close(self) -> None:
+        self.closed = True
+        raise RuntimeError("context close failed")
+
+
 def _intent() -> Intent:
     return Intent(
         summary="checkout latency",
@@ -238,6 +250,32 @@ async def test_pipeline_dependencies_cache_and_close_runtime_providers(monkeypat
     assert second_provider.closed is False
     assert second_context_provider is not None
     assert second_context_provider.closed is False
+
+
+async def test_pipeline_dependencies_cleanup_is_best_effort_and_resets_cache(monkeypatch):
+    providers = [FailingCloseProvider(), FakeProvider()]
+    context_providers = [FailingCloseContextProvider(), FakeContextProvider()]
+
+    monkeypatch.setattr("dashforge.agents.providers.registry.create_provider", lambda settings: providers.pop(0))
+    monkeypatch.setattr(
+        "dashforge.context.registry.create_context_provider",
+        lambda settings: context_providers.pop(0),
+    )
+
+    deps = build_pipeline_dependencies(Settings())
+
+    assert deps.llm_provider_factory is not None
+    assert deps.context_provider_factory is not None
+    first_provider = deps.llm_provider_factory()
+    first_context_provider = deps.context_provider_factory()
+
+    await deps.close_resources()
+
+    assert first_provider.closed is True
+    assert first_context_provider is not None
+    assert first_context_provider.closed is True
+    assert deps.llm_provider_factory() is not first_provider
+    assert deps.context_provider_factory() is not first_context_provider
 
 
 async def test_intent_stage_honors_explicit_disabled_context_provider(monkeypatch):

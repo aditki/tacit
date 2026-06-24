@@ -28,7 +28,7 @@ from typing import Any
 import structlog
 import yaml
 
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 from dashforge.dashboard_ingest.archetype_generation import generate_archetype_yaml
 from dashforge.dashboard_ingest.features import (
     features_to_dict as _features_to_dict,
@@ -527,6 +527,7 @@ async def ingest_dashboard(
     backend_name: str = "",
     auto_approve: bool = False,
     register_archetype: bool = True,
+    runtime_settings: Settings | None = None,
 ) -> dict[str, Any]:
     """Full ingestion pipeline: fetch → extract → infer signals → store.
 
@@ -561,7 +562,7 @@ async def ingest_dashboard(
     all_backends: list[Any] = []
     own_backends = False
     if backend is None:
-        all_backends = get_active_backends()
+        all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
         own_backends = True
         if not all_backends:
             raise RuntimeError("No active backends configured for dashboard ingestion")
@@ -599,13 +600,15 @@ async def learn_backend_dashboards(
     *,
     auto_approve: bool = False,
     limit: int = 500,
+    runtime_settings: Settings | None = None,
 ) -> dict[str, Any]:
     """Crawl a backend and learn from every discoverable dashboard."""
     import asyncio
 
     from dashforge.backends import get_active_backends
 
-    all_backends = get_active_backends()
+    active_settings = runtime_settings or settings
+    all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
     if not all_backends:
         raise RuntimeError("No active backends configured for dashboard learning")
 
@@ -629,7 +632,7 @@ async def learn_backend_dashboards(
             "mappings_created": 0,
         }
 
-        sem = asyncio.Semaphore(max(1, settings.adapter_max_concurrent))
+        sem = asyncio.Semaphore(max(1, active_settings.adapter_max_concurrent))
 
         async def learn_one(item: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
             uid = item.get("uid", "")

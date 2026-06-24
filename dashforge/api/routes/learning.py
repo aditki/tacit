@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
+
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi import Path as PathParam
 
 import dashforge.signals as signals_mod
@@ -14,29 +16,44 @@ logger = structlog.get_logger()
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 
 
+async def _call_ingest_dashboard(ingest_dashboard, **kwargs):
+    if "runtime_settings" not in inspect.signature(ingest_dashboard).parameters:
+        kwargs.pop("runtime_settings", None)
+    return await ingest_dashboard(**kwargs)
+
+
+async def _call_learn_backend_dashboards(learn_backend_dashboards, **kwargs):
+    if "runtime_settings" not in inspect.signature(learn_backend_dashboards).parameters:
+        kwargs.pop("runtime_settings", None)
+    return await learn_backend_dashboards(**kwargs)
+
+
 @router.post(
     "/api/v1/learn/dashboard",
     tags=["Learning"],
     summary="Learn from an existing Grafana dashboard",
     response_description="Extracted features, inferred signals, and generated archetype YAML",
 )
-async def learn_from_dashboard(request: LearnDashboardRequest):
+async def learn_from_dashboard(request: Request, payload: LearnDashboardRequest):
     """Ingest an existing dashboard to learn operational patterns."""
+    from dashforge.config import settings
     from dashforge.dashboard_ingest import ingest_dashboard
 
     try:
-        return await ingest_dashboard(
-            dashboard_uid=request.dashboard_uid,
-            backend_name=request.backend,
-            auto_approve=request.auto_approve,
+        return await _call_ingest_dashboard(
+            ingest_dashboard,
+            dashboard_uid=payload.dashboard_uid,
+            backend_name=payload.backend,
+            auto_approve=payload.auto_approve,
+            runtime_settings=getattr(request.app.state, "settings", settings),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
-        logger.exception("dashboard_ingest_failed", uid=request.dashboard_uid, backend=request.backend)
+        logger.exception("dashboard_ingest_failed", uid=payload.dashboard_uid, backend=payload.backend)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to ingest dashboard '{request.dashboard_uid}'. "
+            detail=f"Failed to ingest dashboard '{payload.dashboard_uid}'. "
             "Check that the UID exists and the backend is accessible.",
         )
 
@@ -76,18 +93,22 @@ async def learn_from_dashboard_json(request: LearnDashboardUploadRequest):
     response_description="Bulk dashboard learning summary",
 )
 async def learn_backend(
+    request: Request,
     backend_name: str = PathParam(description="Backend name: grafana or signalfx"),
     auto_approve: bool = Query(False, description="Immediately approve eligible inferred mappings"),
     limit: int = Query(500, ge=1, le=5000, description="Maximum dashboards to crawl"),
 ):
     """Crawl a connected backend and persist learned dashboard context."""
+    from dashforge.config import settings
     from dashforge.dashboard_ingest import learn_backend_dashboards
 
     try:
-        return await learn_backend_dashboards(
+        return await _call_learn_backend_dashboards(
+            learn_backend_dashboards,
             backend_name=backend_name,
             auto_approve=auto_approve,
             limit=limit,
+            runtime_settings=getattr(request.app.state, "settings", settings),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

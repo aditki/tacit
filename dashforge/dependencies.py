@@ -12,6 +12,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+import structlog
+
 from dashforge.agents.providers.base import LLMProvider
 from dashforge.backends import get_active_backends
 from dashforge.backends.base import DashboardBackend
@@ -19,6 +21,8 @@ from dashforge.cache import llm_cache, make_cache_key
 from dashforge.config import Settings, settings
 from dashforge.context.base import ContextProvider
 from dashforge.history import get_investigation_store
+
+logger = structlog.get_logger()
 
 
 @dataclass(frozen=True)
@@ -79,11 +83,19 @@ def build_pipeline_dependencies(
     async def close_runtime_resources() -> None:
         nonlocal context_provider, llm_provider
         if context_provider is not None:
-            await context_provider.close()
-            context_provider = None
+            try:
+                await context_provider.close()
+            except Exception:
+                logger.warning("context_provider_close_failed", exc_info=True)
+            finally:
+                context_provider = None
         if llm_provider is not None:
-            await llm_provider.close()
-            llm_provider = None
+            try:
+                await llm_provider.close()
+            except Exception:
+                logger.warning("llm_provider_close_failed", exc_info=True)
+            finally:
+                llm_provider = None
 
     return PipelineDependencies(
         settings=runtime_settings,
