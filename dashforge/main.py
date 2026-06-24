@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
-from contextlib import asynccontextmanager
-
-import structlog
 import uvicorn
-from fastapi import FastAPI
 
 from dashforge.api.app import create_app
-from dashforge.api.routes import include_routes
+from dashforge.api.lifespan import create_lifespan
 from dashforge.api.routes.archetypes import list_archetypes, reload_archetypes_endpoint
 from dashforge.api.routes.dashboard import create_chart
 from dashforge.api.routes.feedback import get_feedback, get_feedback_analysis, get_feedback_stats, submit_feedback
@@ -32,10 +27,6 @@ from dashforge.api.security import MAX_PROMPT_LENGTH as _MAX_PROMPT_LENGTH
 from dashforge.api.security import sanitize_prompt
 from dashforge.config import settings
 from dashforge.feedback import get_feedback_store
-
-logger = structlog.get_logger()
-
-_slack_task: asyncio.Task | None = None
 
 # Backward-compatible aliases for tests/importers that used the old entrypoint-local helpers.
 MAX_PROMPT_LENGTH = _MAX_PROMPT_LENGTH
@@ -75,28 +66,8 @@ __all__ = [
 ]
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Configure logging and start the Slack bot alongside the API server."""
-    from dashforge.logging import configure_logging
-
-    configure_logging(settings.log_level)
-
-    global _slack_task
-    if settings.slack_bot_token and settings.slack_app_token:
-        from dashforge.integrations.slack import start_slack_bot
-
-        _slack_task = asyncio.create_task(start_slack_bot())
-        logger.info("slack_bot_scheduled")
-    else:
-        logger.warning("slack_not_configured", hint="Set SLACK_BOT_TOKEN and SLACK_APP_TOKEN to enable Slack")
-    yield
-    if _slack_task and not _slack_task.done():
-        _slack_task.cancel()
-
-
-app = create_app(lifespan=lifespan)
-include_routes(app)
+lifespan = create_lifespan(settings)
+app = create_app(runtime_settings=settings, lifespan=lifespan)
 
 
 def main():

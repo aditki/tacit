@@ -5,7 +5,7 @@ from __future__ import annotations
 import structlog
 
 from dashforge.agents.llm import call_llm
-from dashforge.agents.providers.base import TokenUsage
+from dashforge.agents.providers.base import LLMProvider, TokenUsage
 from dashforge.models.schemas import (
     DashboardSpec,
     Intent,
@@ -176,6 +176,8 @@ async def build_dashboard(
     intent: Intent,
     discovery: MetricsDiscoveryResult,
     metric_catalog: list[MetricEntry] | None = None,
+    *,
+    provider: LLMProvider | None = None,
 ) -> tuple[DashboardSpec, TokenUsage]:
     user_prompt = _build_user_prompt(intent, discovery, metric_catalog)
 
@@ -186,6 +188,7 @@ async def build_dashboard(
         user_prompt=user_prompt,
         response_model=DashboardSpec,
         temperature=0.2,
+        provider=provider,
     )
     logger.info("query_builder_done", panel_count=len(spec.panels))
     return spec, usage

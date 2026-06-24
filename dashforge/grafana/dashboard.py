@@ -4,7 +4,7 @@ from typing import Any
 
 import structlog
 
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 from dashforge.grafana.client import GrafanaClient
 from dashforge.models.schemas import DashboardSpec, PanelSpec
 
@@ -162,16 +162,18 @@ def build_dashboard_json(spec: DashboardSpec) -> dict[str, Any]:
 async def publish_dashboard(
     client: GrafanaClient,
     spec: DashboardSpec,
+    runtime_settings: Settings | None = None,
 ) -> tuple[str, str]:
     """Create / update a Grafana dashboard. Returns (dashboard_url, dashboard_uid)."""
-    folder = await client.get_or_create_folder(settings.dashforge_dashboard_folder)
+    config = runtime_settings or settings
+    folder = await client.get_or_create_folder(config.dashforge_dashboard_folder)
     folder_uid = folder.get("uid", "")
 
     dashboard_json = build_dashboard_json(spec)
     result = await client.create_dashboard(dashboard_json, folder_uid)
 
     uid = result.get("uid", "")
-    url = f"{settings.grafana_url}{result.get('url', f'/d/{uid}')}"
+    url = f"{config.grafana_url.rstrip('/')}{result.get('url', f'/d/{uid}')}"
 
     logger.info("dashboard_published", uid=uid, url=url, panels=len(spec.panels))
     return url, uid

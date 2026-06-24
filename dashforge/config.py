@@ -162,7 +162,7 @@ class Settings(BaseSettings):
         return merged
 
 
-def _load_settings() -> Settings:
+def create_settings() -> Settings:
     """Load settings with YAML + env layering."""
     config_path = _find_config_file()
     if config_path:
@@ -172,4 +172,6 @@ def _load_settings() -> Settings:
     return Settings()
 
 
-settings = _load_settings()
+_load_settings = create_settings
+
+settings = create_settings()

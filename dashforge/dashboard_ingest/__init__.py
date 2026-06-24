@@ -24,6 +24,12 @@ from dashforge.dashboard_ingest.promql import (
 from dashforge.dashboard_ingest.promql import (
     extract_metrics_from_promql as extract_metrics_from_promql,
 )
+from dashforge.dashboard_ingest.reports import (
+    build_learning_impact_report as build_learning_impact_report,
+)
+from dashforge.dashboard_ingest.reports import (
+    build_signal_quality_report as build_signal_quality_report,
+)
 from dashforge.dashboard_ingest.service import *  # noqa: F403
 from dashforge.signals import get_signal_store as get_signal_store
 

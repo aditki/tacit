@@ -13,7 +13,7 @@ from typing import Any, cast
 import httpx
 import structlog
 
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 
 logger = structlog.get_logger()
 
@@ -25,9 +25,11 @@ class SignalFxClient:
         self,
         api_token: str | None = None,
         realm: str | None = None,
+        runtime_settings: Settings | None = None,
     ):
-        self.api_token = api_token or settings.signalfx_api_token
-        self.realm = realm or settings.signalfx_realm
+        config = runtime_settings or settings
+        self.api_token = api_token if api_token is not None else config.signalfx_api_token
+        self.realm = realm or config.signalfx_realm
         base_url = f"https://api.{self.realm}.signalfx.com"
 
         self._client = httpx.AsyncClient(

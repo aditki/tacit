@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import secrets
 
-from fastapi import HTTPException, Security
+from fastapi import HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 
 from dashforge.config import settings
@@ -14,11 +14,12 @@ MAX_PROMPT_LENGTH = 2000
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-async def verify_api_key(api_key: str | None = Security(api_key_header)) -> None:
+async def verify_api_key(request: Request, api_key: str | None = Security(api_key_header)) -> None:
     """Verify API key if auth is enabled. No-op when disabled."""
-    if not settings.api_auth_enabled:
+    runtime_settings = getattr(request.app.state, "settings", settings)
+    if not runtime_settings.api_auth_enabled:
         return
-    if not api_key or not secrets.compare_digest(api_key, settings.api_auth_key):
+    if not api_key or not secrets.compare_digest(api_key, runtime_settings.api_auth_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 

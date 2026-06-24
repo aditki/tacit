@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -33,6 +32,23 @@ import structlog
 
 from dashforge.config import settings
 from dashforge.models.schemas import MetricEntry
+from dashforge.signals.confidence import TRUST_THRESHOLD, stronger_review_state
+from dashforge.signals.learning_index import (
+    build_learning_context_rows,
+)
+from dashforge.signals.learning_index import (
+    eligible_pairs_from_ingested_signals as _eligible_pairs_from_ingested_signals,
+)
+from dashforge.signals.learning_index import (
+    fts_query as _fts_query,
+)
+from dashforge.signals.migrations import (
+    ensure_ingested_dashboard_backend_scope,
+    ensure_learning_index,
+    ensure_mapping_columns,
+    ensure_schema,
+    rebuild_ingested_dashboards_table,
+)
 from dashforge.signals.resolution import (
     context_matches as _context_matches,
 )
@@ -59,8 +75,6 @@ from dashforge.signals.resolution import (
 )
 from dashforge.signals.schema import (
     DEFAULT_DB_PATH,
-    FTS_SCHEMA_SQL,
-    SCHEMA_SQL,
     SQLITE_BUSY_TIMEOUT_MS,
 )
 
@@ -79,9 +93,6 @@ __all__ = [
 
 _DEFAULT_DB_PATH = DEFAULT_DB_PATH
 
-_TRUST_THRESHOLD = 0.15  # below this, mapping is excluded from resolution
-_REVIEW_STATE_RANK = {"candidate": 0, "approved": 1, "trusted": 2}
-
 
 class LearningIndexUnavailable(RuntimeError):
     """Raised when SQLite FTS5-backed learning retrieval is unavailable."""
@@ -89,9 +100,7 @@ class LearningIndexUnavailable(RuntimeError):
 
 def _stronger_review_state(existing: str, incoming: str) -> str:
     """Return the higher-trust review state without allowing downgrades."""
-    existing_rank = _REVIEW_STATE_RANK.get(existing, 0)
-    incoming_rank = _REVIEW_STATE_RANK.get(incoming, 0)
-    return incoming if incoming_rank > existing_rank else existing
+    return stronger_review_state(existing, incoming)
 
 
 def _db_path() -> Path:
@@ -125,87 +134,22 @@ class SignalStore:
 
     def _ensure_schema(self):
         with self._conn() as conn:
-            conn.executescript(SCHEMA_SQL)
-            self._ensure_learning_index(conn)
-            self._ensure_ingested_dashboard_backend_scope(conn)
-            self._ensure_mapping_columns(conn)
+            ensure_schema(conn)
         logger.info("signal_store_init", db_path=str(self._db_path))
 
     def _ensure_learning_index(self, conn: sqlite3.Connection) -> None:
         """Create the FTS5 operational knowledge index when available."""
-        try:
-            conn.executescript(FTS_SCHEMA_SQL)
-        except sqlite3.OperationalError as exc:
-            logger.warning("learning_context_fts_unavailable", error=str(exc))
+        ensure_learning_index(conn)
 
     def _ensure_mapping_columns(self, conn: sqlite3.Connection) -> None:
         """Add newer columns to signal_metric_mappings on pre-existing DBs."""
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
-        if "inference_version" not in columns:
-            conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN inference_version TEXT NOT NULL DEFAULT ''")
-        if "review_state" not in columns:
-            conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN review_state TEXT NOT NULL DEFAULT 'trusted'")
+        ensure_mapping_columns(conn)
 
     def _ensure_ingested_dashboard_backend_scope(self, conn: sqlite3.Connection) -> None:
-        columns = [row["name"] for row in conn.execute("PRAGMA table_info(ingested_dashboards)").fetchall()]
-        if "backend_name" not in columns:
-            conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN backend_name TEXT NOT NULL DEFAULT ''")
-            columns.append("backend_name")
-
-        for index in conn.execute("PRAGMA index_list(ingested_dashboards)").fetchall():
-            if not index["unique"]:
-                continue
-            indexed_cols = [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
-            if indexed_cols == ["dashboard_uid"]:
-                self._rebuild_ingested_dashboards_table(conn)
-                return
-
-        conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_uid_backend
-               ON ingested_dashboards(dashboard_uid, backend_name)""")
+        ensure_ingested_dashboard_backend_scope(conn)
 
     def _rebuild_ingested_dashboards_table(self, conn: sqlite3.Connection) -> None:
-        conn.execute("ALTER TABLE ingested_dashboards RENAME TO ingested_dashboards_old")
-        conn.executescript("""
-            CREATE TABLE ingested_dashboards (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                dashboard_uid       TEXT NOT NULL,
-                backend_name        TEXT NOT NULL DEFAULT '',
-                dashboard_title     TEXT NOT NULL DEFAULT '',
-                dashboard_tags      TEXT NOT NULL DEFAULT '[]',
-                metrics_found       TEXT NOT NULL DEFAULT '[]',
-                panel_count         INTEGER NOT NULL DEFAULT 0,
-                row_groups          TEXT NOT NULL DEFAULT '[]',
-                metric_cooccurrence TEXT NOT NULL DEFAULT '{}',
-                aggregation_patterns TEXT NOT NULL DEFAULT '[]',
-                query_transformations TEXT NOT NULL DEFAULT '[]',
-                panel_titles        TEXT NOT NULL DEFAULT '[]',
-                alert_links         TEXT NOT NULL DEFAULT '[]',
-                drilldown_links     TEXT NOT NULL DEFAULT '[]',
-                status              TEXT NOT NULL DEFAULT 'pending',
-                signals_inferred    TEXT NOT NULL DEFAULT '[]',
-                archetype_generated TEXT NOT NULL DEFAULT '',
-                created_at          REAL NOT NULL,
-                reviewed_at         REAL,
-                UNIQUE(dashboard_uid, backend_name)
-            );
-        """)
-        conn.execute("""INSERT INTO ingested_dashboards
-               (id, dashboard_uid, backend_name, dashboard_title, dashboard_tags,
-                metrics_found, panel_count, row_groups, metric_cooccurrence,
-                aggregation_patterns, query_transformations, panel_titles,
-                alert_links, drilldown_links, status, signals_inferred,
-                archetype_generated, created_at, reviewed_at)
-               SELECT id, dashboard_uid, COALESCE(backend_name, ''), dashboard_title, dashboard_tags,
-                      metrics_found, panel_count, row_groups, metric_cooccurrence,
-                      aggregation_patterns, query_transformations, panel_titles,
-                      alert_links, drilldown_links, status, signals_inferred,
-                      archetype_generated, created_at, reviewed_at
-               FROM ingested_dashboards_old""")
-        conn.execute("DROP TABLE ingested_dashboards_old")
-        conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_uid_backend
-               ON ingested_dashboards(dashboard_uid, backend_name)""")
-        conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_uid_backend
-               ON ingested_dashboards(dashboard_uid, backend_name)""")
+        rebuild_ingested_dashboards_table(conn)
 
     # ── Signal type CRUD ─────────────────────────────────────────────────
 
@@ -520,7 +464,7 @@ class SignalStore:
                 context_environment=context_environment,
                 apply_context_penalty=False,
             )
-            if not include_decayed and trust_effective < _TRUST_THRESHOLD:
+            if not include_decayed and trust_effective < TRUST_THRESHOLD:
                 continue
 
             m["effective_confidence"] = round(effective, 4)
@@ -810,82 +754,17 @@ class SignalStore:
         if not self._learning_index_available():
             return 0
 
-        tags = dashboard_tags or []
-        metrics = list(dict.fromkeys(metrics_found or []))
-        signal_by_metric: dict[str, list[dict[str, Any]]] = {}
-        for sig in signals_inferred or []:
-            if not isinstance(sig, dict):
-                continue
-            metric = sig.get("metric", "")
-            if metric:
-                signal_by_metric.setdefault(metric, []).append(sig)
-
-        rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str, str, str, str, float]] = []
-        indexed_at = time.time()
-        panel_items = panels or []
-        if not panel_items and metrics:
-            panel_items = [{"title": "", "queries": [], "metrics": metrics}]
-
-        for panel_index, panel in enumerate(panel_items):
-            panel_title = str(panel.get("title", "") or "")
-            query_values = panel.get("queries", [])
-            if not isinstance(query_values, list):
-                query_values = [str(query_values)]
-            query_text = "\n".join(str(q) for q in query_values if q)
-            panel_metrics = _panel_metrics(panel, metrics)
-            if not panel_metrics and metrics:
-                panel_metrics = metrics
-
-            for metric in panel_metrics:
-                related_signals = signal_by_metric.get(metric) or [{}]
-                for sig_index, sig in enumerate(related_signals):
-                    if not isinstance(sig, dict):
-                        sig = {}
-                    services = _infer_services_for_learning(
-                        metric=metric,
-                        query_text=query_text,
-                        dashboard_title=dashboard_title,
-                        panel_title=panel_title,
-                        tags=tags,
-                    )
-                    service_text = " ".join(services)
-                    signal_type = str(sig.get("signal_type", ""))
-                    review_state = _learning_row_review_state(
-                        status=status,
-                        metric=metric,
-                        signal_type=signal_type,
-                        sig=sig,
-                        activated_pairs=activated_pairs,
-                    )
-                    reason = str(sig.get("reason", ""))
-                    provenance = " ".join(
-                        part
-                        for part in (
-                            f"source:{sig.get('source', '')}" if sig.get("source") else "",
-                            f"family:{sig.get('signal_family', '')}" if sig.get("signal_family") else "",
-                            f"confidence:{sig.get('confidence', '')}" if sig.get("confidence") else "",
-                        )
-                        if part
-                    )
-                    rows.append(
-                        (
-                            "dashboard_panel",
-                            f"{backend_name}:{dashboard_uid}:{panel_index}:{metric}:{sig_index}",
-                            backend_name,
-                            dashboard_uid,
-                            dashboard_title,
-                            " ".join(tags),
-                            panel_title,
-                            metric,
-                            query_text,
-                            service_text,
-                            signal_type,
-                            review_state,
-                            reason,
-                            provenance,
-                            indexed_at,
-                        )
-                    )
+        rows = build_learning_context_rows(
+            dashboard_uid=dashboard_uid,
+            backend_name=backend_name,
+            dashboard_title=dashboard_title,
+            dashboard_tags=dashboard_tags or [],
+            panels=panels or [],
+            metrics_found=metrics_found or [],
+            signals_inferred=signals_inferred or [],
+            status=status,
+            activated_pairs=activated_pairs,
+        )
 
         try:
             with self._conn() as conn:
@@ -1213,147 +1092,6 @@ class SignalStore:
             "mappings_by_source": {r["source_type"]: r["n"] for r in by_source},
             "signals_by_category": {r["category"]: r["n"] for r in by_category},
         }
-
-
-# ── Helper functions ─────────────────────────────────────────────────────────
-
-
-_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:/-]+")
-_LABEL_SERVICE_RE = re.compile(
-    r"(?:^|[,{\s])(?:service|app|application|container|pod|job)\s*(?:=|=~)\s*['\"]([^'\"]+)['\"]"
-)
-_GENERIC_METRIC_PREFIXES = {
-    "http",
-    "grpc",
-    "request",
-    "requests",
-    "response",
-    "duration",
-    "latency",
-    "error",
-    "errors",
-    "cpu",
-    "memory",
-    "container",
-    "pod",
-    "node",
-    "kube",
-    "jvm",
-    "process",
-    "redis",
-    "kafka",
-    "envoy",
-    "nginx",
-    "prometheus",
-}
-
-
-def _panel_metrics(panel: dict[str, Any], fallback_metrics: list[str]) -> list[str]:
-    raw = panel.get("metrics", [])
-    metrics: list[str] = []
-    if isinstance(raw, list):
-        metrics.extend(str(m) for m in raw if m)
-    elif raw:
-        metrics.append(str(raw))
-
-    if metrics:
-        return list(dict.fromkeys(metrics))
-
-    queries = panel.get("queries", [])
-    if not isinstance(queries, list):
-        queries = [queries]
-    query_text = "\n".join(str(q) for q in queries if q)
-    if not query_text:
-        return []
-    return [metric for metric in fallback_metrics if metric and metric in query_text]
-
-
-def _infer_services_for_learning(
-    *,
-    metric: str,
-    query_text: str,
-    dashboard_title: str,
-    panel_title: str,
-    tags: list[str],
-) -> list[str]:
-    candidates: list[str] = []
-
-    def add(value: str) -> None:
-        cleaned = value.strip().strip("*").strip()
-        cleaned = re.sub(r"^\.\*", "", cleaned)
-        cleaned = re.sub(r"\.\*$", "", cleaned)
-        if cleaned and cleaned not in candidates:
-            candidates.append(cleaned)
-
-    for tag in tags:
-        if ":" in tag:
-            key, value = tag.split(":", 1)
-            if key.lower() in {"service", "app", "application", "component", "team"}:
-                add(value)
-
-    for match in _LABEL_SERVICE_RE.findall(query_text):
-        add(match)
-
-    first = re.split(r"[_.:-]+", metric, maxsplit=1)[0].lower() if metric else ""
-    if first and first not in _GENERIC_METRIC_PREFIXES and len(first) > 2:
-        add(first)
-
-    text = f"{dashboard_title} {panel_title}".lower()
-    for suffix in ("service", "api", "worker", "gateway"):
-        for match in re.findall(rf"\b([a-z0-9][a-z0-9_-]+)[\s_-]+{suffix}\b", text):
-            if match not in _GENERIC_METRIC_PREFIXES:
-                add(match)
-
-    return candidates
-
-
-def _fts_query(text: str) -> str:
-    terms = []
-    for token in _TOKEN_RE.findall(text.lower()):
-        token = token.strip("-_.:/")
-        if len(token) < 2:
-            continue
-        escaped = token.replace('"', '""')
-        terms.append(f'"{escaped}"')
-    return " OR ".join(dict.fromkeys(terms))
-
-
-def _learning_row_review_state(
-    *,
-    status: str,
-    metric: str,
-    signal_type: str,
-    sig: dict[str, Any],
-    activated_pairs: set[tuple[str, str]] | None = None,
-) -> str:
-    if status in {"rejected", "ignored"}:
-        return status
-    if status != "approved":
-        return "candidate"
-    if activated_pairs is not None:
-        return "approved" if (metric, signal_type) in activated_pairs else "candidate"
-    if not metric or not signal_type:
-        return "candidate"
-    if sig.get("source") == "heuristic":
-        return "approved" if sig.get("auto_teach_eligible") else "candidate"
-    return "trusted" if sig.get("confidence", 0.0) >= 0.5 else "candidate"
-
-
-def _eligible_pairs_from_ingested_signals(signals: list[Any]) -> set[tuple[str, str]]:
-    pairs: set[tuple[str, str]] = set()
-    for sig in signals:
-        if not isinstance(sig, dict):
-            continue
-        metric = sig.get("metric", "")
-        signal_type = sig.get("signal_type", "")
-        if not metric or not signal_type:
-            continue
-        if sig.get("source") == "heuristic":
-            if sig.get("auto_teach_eligible"):
-                pairs.add((metric, signal_type))
-        elif sig.get("confidence", 0.0) >= 0.5:
-            pairs.add((metric, signal_type))
-    return pairs
 
 
 def _deserialize_mapping(row: sqlite3.Row) -> dict[str, Any]:

@@ -54,3 +54,6 @@ class LLMProvider(ABC):
         temperature: float = 0.3,
     ) -> LLMResult:
         """Return plain text from the model."""
+
+    async def close(self) -> None:
+        """Release any underlying network clients."""

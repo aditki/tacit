@@ -8,6 +8,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from dashforge import __version__
+from dashforge.config import Settings
+from dashforge.config import settings as default_settings
 
 LifespanFactory = Any
 
@@ -71,7 +73,12 @@ DESCRIPTION = (
 )
 
 
-def create_app(lifespan: LifespanFactory | None = None) -> FastAPI:
+def create_app(
+    *,
+    runtime_settings: Settings = default_settings,
+    lifespan: LifespanFactory | None = None,
+    include_default_routes: bool = True,
+) -> FastAPI:
     """Create the FastAPI app shell.
 
     Route modules can attach handlers to the returned app. Keeping app
@@ -85,10 +92,15 @@ def create_app(lifespan: LifespanFactory | None = None) -> FastAPI:
         lifespan=lifespan,
         openapi_tags=OPENAPI_TAGS,
     )
+    app.state.settings = runtime_settings
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    if include_default_routes:
+        from dashforge.api.routes import include_routes
+
+        include_routes(app)
     return app

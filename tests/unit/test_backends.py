@@ -65,6 +65,16 @@ def _make_spec(query_lang="promql", ds_type="prometheus") -> DashboardSpec:
     )
 
 
+def _configure_backend_settings(mock_settings, *, grafana: bool, signalfx: bool, token: str = "") -> None:
+    mock_settings.grafana_enabled = grafana
+    mock_settings.grafana_url = "http://grafana.test"
+    mock_settings.grafana_api_key = ""
+    mock_settings.grafana_org_id = 1
+    mock_settings.signalfx_enabled = signalfx
+    mock_settings.signalfx_api_token = token
+    mock_settings.signalfx_realm = "us1"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. base.py — PublishResult dataclass
 # ═══════════════════════════════════════════════════════════════════════════
@@ -197,9 +207,11 @@ def test_grafana_backend_validate_queries():
 def test_grafana_backend_publish():
     from dashforge.backends.base import PublishResult
     from dashforge.backends.grafana import GrafanaBackend
+    from dashforge.config import Settings
 
     mock_client = AsyncMock()
-    backend = GrafanaBackend(client=mock_client)
+    runtime_settings = Settings(grafana_url="http://runtime-grafana.test", dashforge_dashboard_folder="Runtime")
+    backend = GrafanaBackend(client=mock_client, runtime_settings=runtime_settings)
 
     spec = _make_spec()
 
@@ -210,6 +222,7 @@ def test_grafana_backend_publish():
         assert result.url == "http://grafana/d/abc"
         assert result.uid == "abc"
         assert result.backend_name == "grafana"
+        mock_pub.assert_called_once_with(mock_client, spec, runtime_settings=runtime_settings)
 
     print("[PASS] test_grafana_backend_publish")
 
@@ -291,9 +304,11 @@ def test_signalfx_backend_validate_queries():
 def test_signalfx_backend_publish():
     from dashforge.backends.base import PublishResult
     from dashforge.backends.signalfx import SignalFxBackend
+    from dashforge.config import Settings
 
     mock_client = AsyncMock()
-    backend = SignalFxBackend(client=mock_client)
+    runtime_settings = Settings(signalfx_dashboard_group="Runtime Group")
+    backend = SignalFxBackend(client=mock_client, runtime_settings=runtime_settings)
 
     spec = _make_spec(query_lang="signalflow", ds_type="signalfx")
 
@@ -304,6 +319,7 @@ def test_signalfx_backend_publish():
         assert "signalfx.com" in result.url
         assert result.uid == "D123"
         assert result.backend_name == "signalfx"
+        mock_pub.assert_called_once_with(mock_client, spec, group_name="Runtime Group")
 
     print("[PASS] test_signalfx_backend_publish")
 
@@ -317,12 +333,14 @@ def test_registry_grafana_only():
     from dashforge.backends import get_active_backends
 
     with patch("dashforge.backends.settings") as mock_settings:
-        mock_settings.grafana_enabled = True
-        mock_settings.signalfx_enabled = False
-        mock_settings.signalfx_api_token = ""
+        _configure_backend_settings(mock_settings, grafana=True, signalfx=False)
         backends = get_active_backends()
-        assert len(backends) == 1
-        assert backends[0].name == "grafana"
+        try:
+            assert len(backends) == 1
+            assert backends[0].name == "grafana"
+        finally:
+            for backend in backends:
+                asyncio.run(backend.close())
 
     print("[PASS] test_registry_grafana_only")
 
@@ -331,12 +349,14 @@ def test_registry_signalfx_only():
     from dashforge.backends import get_active_backends
 
     with patch("dashforge.backends.settings") as mock_settings:
-        mock_settings.grafana_enabled = False
-        mock_settings.signalfx_enabled = True
-        mock_settings.signalfx_api_token = "test-token"
+        _configure_backend_settings(mock_settings, grafana=False, signalfx=True, token="test-token")
         backends = get_active_backends()
-        assert len(backends) == 1
-        assert backends[0].name == "signalfx"
+        try:
+            assert len(backends) == 1
+            assert backends[0].name == "signalfx"
+        finally:
+            for backend in backends:
+                asyncio.run(backend.close())
 
     print("[PASS] test_registry_signalfx_only")
 
@@ -345,13 +365,15 @@ def test_registry_both_enabled():
     from dashforge.backends import get_active_backends
 
     with patch("dashforge.backends.settings") as mock_settings:
-        mock_settings.grafana_enabled = True
-        mock_settings.signalfx_enabled = True
-        mock_settings.signalfx_api_token = "test-token"
+        _configure_backend_settings(mock_settings, grafana=True, signalfx=True, token="test-token")
         backends = get_active_backends()
-        assert len(backends) == 2
-        names = {b.name for b in backends}
-        assert names == {"grafana", "signalfx"}
+        try:
+            assert len(backends) == 2
+            names = {b.name for b in backends}
+            assert names == {"grafana", "signalfx"}
+        finally:
+            for backend in backends:
+                asyncio.run(backend.close())
 
     print("[PASS] test_registry_both_enabled")
 
@@ -360,13 +382,34 @@ def test_registry_none_enabled():
     from dashforge.backends import get_active_backends
 
     with patch("dashforge.backends.settings") as mock_settings:
-        mock_settings.grafana_enabled = False
-        mock_settings.signalfx_enabled = False
-        mock_settings.signalfx_api_token = ""
+        _configure_backend_settings(mock_settings, grafana=False, signalfx=False)
         backends = get_active_backends()
         assert len(backends) == 0
 
     print("[PASS] test_registry_none_enabled")
+
+
+def test_registry_uses_explicit_runtime_settings():
+    from dashforge.backends import get_active_backends
+    from dashforge.config import Settings
+
+    runtime_settings = Settings(
+        grafana_enabled=False,
+        signalfx_enabled=True,
+        signalfx_api_token="runtime-token",
+        signalfx_realm="eu0",
+    )
+
+    backends = get_active_backends(runtime_settings)
+
+    try:
+        assert len(backends) == 1
+        assert backends[0].name == "signalfx"
+        assert backends[0]._client.api_token == "runtime-token"
+        assert backends[0]._client.realm == "eu0"
+    finally:
+        for backend in backends:
+            asyncio.run(backend.close())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -379,14 +422,16 @@ def test_registry_primary_is_first():
     from dashforge.backends import get_active_backends
 
     with patch("dashforge.backends.settings") as mock_settings:
-        mock_settings.grafana_enabled = True
-        mock_settings.signalfx_enabled = True
-        mock_settings.signalfx_api_token = "tok"
+        _configure_backend_settings(mock_settings, grafana=True, signalfx=True, token="tok")
         backends = get_active_backends()
-        primary = backends[0]
-        # When Grafana is enabled, it should be primary (PromQL is the standard)
-        assert primary.name == "grafana"
-        assert primary.query_language == "promql"
+        try:
+            primary = backends[0]
+            # When Grafana is enabled, it should be primary (PromQL is the standard)
+            assert primary.name == "grafana"
+            assert primary.query_language == "promql"
+        finally:
+            for backend in backends:
+                asyncio.run(backend.close())
 
     print("[PASS] test_registry_primary_is_first")
 

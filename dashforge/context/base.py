@@ -36,3 +36,6 @@ class ContextProvider(ABC):
         Returns:
             List of ContextChunk objects, sorted by relevance (best first).
         """
+
+    async def close(self) -> None:
+        """Release any underlying network clients."""
