@@ -87,6 +87,9 @@ class RAGAPIProvider(ContextProvider):
             logger.exception("rag_api_query_failed", url=self._base_url)
             return []
 
+    async def close(self) -> None:
+        await self._client.aclose()
+
 
 def _build_search_query(intent: Intent) -> str:
     """Build a search query from the intent."""

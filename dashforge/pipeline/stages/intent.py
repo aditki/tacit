@@ -29,13 +29,14 @@ async def run_intent_stage(
     deps: PipelineDependencies,
     classify: Callable[..., Awaitable[tuple[Intent, TokenUsage]]],
     enrich: Callable[..., Awaitable[list[Any]]],
-    classify_provider: LLMProvider | None,
-    context_provider: ContextProvider | None,
+    classify_provider_factory: Callable[[], LLMProvider] | None,
+    context_provider_factory: Callable[[], ContextProvider | None] | None,
     timings: dict[str, float],
 ) -> IntentStageResult:
     """Classify the prompt and fetch optional context chunks."""
     t0 = time.monotonic()
     if "provider" in inspect.signature(classify).parameters:
+        classify_provider = classify_provider_factory() if classify_provider_factory else None
         intent, intent_usage = await classify(prompt, provider=classify_provider)
     else:
         intent, intent_usage = await classify(prompt)
@@ -56,7 +57,7 @@ async def run_intent_stage(
     if "max_chunks" in enrich_parameters:
         enrich_kwargs["max_chunks"] = deps.settings.context_max_chunks
     if "provider" in enrich_parameters:
-        enrich_kwargs["provider"] = context_provider
+        enrich_kwargs["provider"] = context_provider_factory() if context_provider_factory else None
     context_chunks = await enrich(intent, **enrich_kwargs)
     timings["context"] = time.monotonic() - t0
     stage_log(

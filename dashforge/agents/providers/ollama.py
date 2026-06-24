@@ -66,3 +66,6 @@ class OllamaProvider(LLMProvider):
         resp.raise_for_status()
         data = resp.json()
         return LLMResult(text=data["message"]["content"], usage=self._extract_usage(data))
+
+    async def close(self) -> None:
+        await self._client.aclose()

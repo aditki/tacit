@@ -326,3 +326,8 @@ class BedrockProvider(LLMProvider):
         import asyncio
 
         return await asyncio.to_thread(self._converse, system_prompt, user_prompt, temperature)
+
+    async def close(self) -> None:
+        close = getattr(self._client, "close", None)
+        if close is not None:
+            close()

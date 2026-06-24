@@ -88,6 +88,9 @@ class MCPProvider(ContextProvider):
             logger.exception("mcp_query_failed", server=self._server_url)
             return []
 
+    async def close(self) -> None:
+        await self._client.aclose()
+
 
 def _build_search_query(intent: Intent) -> str:
     """Build a natural-language search query from the intent."""

@@ -111,6 +111,9 @@ class A2AProvider(ContextProvider):
             logger.exception("a2a_query_failed", agent_url=self._agent_url)
             return []
 
+    async def close(self) -> None:
+        await self._client.aclose()
+
 
 def _build_search_query(intent: Intent) -> str:
     """Build a query for the A2A knowledge agent."""

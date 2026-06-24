@@ -97,3 +97,6 @@ class AnthropicProvider(LLMProvider):
     ) -> LLMResult:
         response = await self._create(system_prompt, user_prompt, temperature)
         return LLMResult(text=_response_text(response), usage=self._extract_usage(response))
+
+    async def close(self) -> None:
+        await self._client.close()

@@ -74,7 +74,7 @@ def stage_log(
         event_data["token_count"] = token_usage.total_tokens
 
     event_data.update(extra)
-    logger.info("stage_complete", **event_data)
+    structlog.get_logger().info("stage_complete", **event_data)
 
 
 def configure_logging(log_level: str = "INFO") -> None:

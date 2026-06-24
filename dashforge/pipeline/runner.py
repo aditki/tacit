@@ -154,8 +154,8 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             deps=runtime.deps,
             classify=classify_intent,
             enrich=enrich_context,
-            classify_provider=llm_provider_factory() if llm_provider_factory else None,
-            context_provider=context_provider_factory() if context_provider_factory else None,
+            classify_provider_factory=llm_provider_factory,
+            context_provider_factory=context_provider_factory,
             timings=runtime.timings,
         )
         intent = intent_stage.intent
@@ -321,3 +321,4 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
 
     finally:
         await safe_close_backends(backends)
+        await deps.close_resources()

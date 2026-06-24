@@ -8,7 +8,7 @@ without forcing a broad rewrite of every store/backend today.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +31,12 @@ class PipelineDependencies:
     cache_key_factory: Callable[..., str]
     llm_provider_factory: Callable[[], LLMProvider] | None = None
     context_provider_factory: Callable[[], ContextProvider | None] | None = None
+    resource_cleanup: Callable[[], Awaitable[None]] | None = None
+
+    async def close_resources(self) -> None:
+        """Close resources owned by this dependency bundle."""
+        if self.resource_cleanup is not None:
+            await self.resource_cleanup()
 
     @classmethod
     def defaults(cls) -> PipelineDependencies:
@@ -49,15 +55,32 @@ def build_pipeline_dependencies(
     def runtime_backends() -> list[DashboardBackend]:
         return get_active_backends(runtime_settings)
 
+    llm_provider: LLMProvider | None = None
+    context_provider: ContextProvider | None = None
+
     def runtime_llm_provider() -> LLMProvider:
+        nonlocal llm_provider
+        if llm_provider is not None:
+            return llm_provider
         from dashforge.agents.providers.registry import create_provider
 
-        return create_provider(runtime_settings)
+        llm_provider = create_provider(runtime_settings)
+        return llm_provider
 
     def runtime_context_provider() -> ContextProvider | None:
+        nonlocal context_provider
+        if context_provider is not None:
+            return context_provider
         from dashforge.context.registry import create_context_provider
 
-        return create_context_provider(runtime_settings)
+        context_provider = create_context_provider(runtime_settings)
+        return context_provider
+
+    async def close_runtime_resources() -> None:
+        if context_provider is not None:
+            await context_provider.close()
+        if llm_provider is not None:
+            await llm_provider.close()
 
     return PipelineDependencies(
         settings=runtime_settings,
@@ -68,6 +91,7 @@ def build_pipeline_dependencies(
         cache_key_factory=make_cache_key,
         llm_provider_factory=runtime_llm_provider,
         context_provider_factory=runtime_context_provider,
+        resource_cleanup=close_runtime_resources,
     )
 
 

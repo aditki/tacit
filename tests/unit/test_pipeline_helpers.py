@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from dashforge.agents.providers.base import TokenUsage
-from dashforge.dependencies import PipelineDependencies
+from dashforge.agents.providers.base import LLMProvider, LLMResult, TokenUsage
+from dashforge.config import Settings
+from dashforge.context.base import ContextProvider
+from dashforge.dependencies import PipelineDependencies, build_pipeline_dependencies
 from dashforge.models.schemas import (
     ArchetypeMatch,
+    ContextChunk,
     DashboardSpec,
     DashRequest,
     Intent,
@@ -15,6 +18,7 @@ from dashforge.pipeline.failures import PipelineFailureFactory
 from dashforge.pipeline.runner import _get_semaphore
 from dashforge.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history, safe_record_provenance
 from dashforge.pipeline.stages.freeform import build_freeform_dashboard
+from dashforge.pipeline.stages.intent import run_intent_stage
 
 
 class FakeRecorder:
@@ -62,6 +66,35 @@ class FakeBackend:
         self.closed = True
         if self.fail_close:
             raise RuntimeError("close failed")
+
+
+class FakeProvider(LLMProvider):
+    def __init__(self):
+        self.closed = False
+
+    async def chat_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> LLMResult:
+        return LLMResult("{}")
+
+    async def chat_text(self, system_prompt: str, user_prompt: str, temperature: float = 0.3) -> LLMResult:
+        return LLMResult("")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakeContextProvider(ContextProvider):
+    def __init__(self):
+        self.closed = False
+
+    @property
+    def name(self) -> str:
+        return "fake"
+
+    async def query(self, intent: Intent, max_chunks: int = 10) -> list[ContextChunk]:
+        return []
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 def _intent() -> Intent:
@@ -134,6 +167,64 @@ async def test_build_freeform_dashboard_no_metrics_returns_failure():
     assert result.failure is not None
     assert result.token_usage == TokenUsage()
     assert recorder.finished[0]["error"] == "No metrics found for freeform generation"
+
+
+async def test_intent_stage_defers_provider_construction_for_legacy_hooks():
+    calls = 0
+
+    async def classify(prompt: str):
+        return _intent(), TokenUsage()
+
+    async def enrich(intent: Intent):
+        return []
+
+    def provider_factory():
+        nonlocal calls
+        calls += 1
+        raise AssertionError("provider should not be constructed")
+
+    result = await run_intent_stage(
+        prompt="checkout latency",
+        user_id="u1",
+        deps=PipelineDependencies(
+            settings=Settings(),
+            backend_factory=lambda: [],
+            history_store_factory=lambda: FakeHistoryStore(),
+            feedback_store_factory=lambda: FakeFeedbackStore(),
+            llm_cache={},
+            cache_key_factory=lambda *parts: ":".join(parts),
+        ),
+        classify=classify,
+        enrich=enrich,
+        classify_provider_factory=provider_factory,
+        context_provider_factory=provider_factory,
+        timings={},
+    )
+
+    assert result.intent.summary == "checkout latency"
+    assert calls == 0
+
+
+async def test_pipeline_dependencies_cache_and_close_runtime_providers(monkeypatch):
+    provider = FakeProvider()
+    context_provider = FakeContextProvider()
+
+    monkeypatch.setattr("dashforge.agents.providers.registry.create_provider", lambda settings: provider)
+    monkeypatch.setattr("dashforge.context.registry.create_context_provider", lambda settings: context_provider)
+
+    deps = build_pipeline_dependencies(Settings())
+
+    assert deps.llm_provider_factory is not None
+    assert deps.context_provider_factory is not None
+    assert deps.llm_provider_factory() is provider
+    assert deps.llm_provider_factory() is provider
+    assert deps.context_provider_factory() is context_provider
+    assert deps.context_provider_factory() is context_provider
+
+    await deps.close_resources()
+
+    assert provider.closed is True
+    assert context_provider.closed is True
 
 
 def test_get_semaphore_recreates_when_limit_changes():

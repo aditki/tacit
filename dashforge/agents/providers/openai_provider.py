@@ -64,6 +64,9 @@ class OpenAIProvider(LLMProvider):
         )
         return LLMResult(text=response.choices[0].message.content or "", usage=_extract_openai_usage(response))
 
+    async def close(self) -> None:
+        await self._client.close()
+
 
 class AzureOpenAIProvider(LLMProvider):
     """First-class Azure OpenAI provider.
@@ -131,3 +134,6 @@ class AzureOpenAIProvider(LLMProvider):
             temperature=temperature,
         )
         return LLMResult(text=response.choices[0].message.content or "", usage=_extract_openai_usage(response))
+
+    async def close(self) -> None:
+        await self._client.close()
