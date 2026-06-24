@@ -6,17 +6,17 @@ Accepted
 
 ## Context
 
-The repository currently ships `dashforge/data/signals.yaml` with canonical signal categories and bootstrap metric
+The repository currently ships `tacit/data/signals.yaml` with canonical signal categories and bootstrap metric
 patterns. That is useful for demos and common Prometheus-style telemetry, but it is not enough for organization-specific
 metrics such as custom checkout latency, Envoy, JVM, Redis, Kafka, or vendor-specific naming conventions.
 
-DashForge also has a SQLite signal store, dashboard ingestion, manual teach APIs, feedback adjustment, confidence decay,
+Tacit also has a SQLite signal store, dashboard ingestion, manual teach APIs, feedback adjustment, confidence decay,
 context filters, and rejected-candidate storage. That means the shipped taxonomy is already only one source of learning,
 not the only source of truth.
 
 ## Decision
 
-DashForge should treat the packaged taxonomy as bootstrap guidance, not a rigid universal ontology. The system should
+Tacit should treat the packaged taxonomy as bootstrap guidance, not a rigid universal ontology. The system should
 learn operational semantics from observed usage: existing dashboards, explicit teaching, feedback, and review outcomes.
 
 ## Consequences
@@ -31,11 +31,11 @@ Implementation status: partially implemented.
 
 Validated against:
 
-- `dashforge/data/signals.yaml`: provides bootstrap categories and patterns.
-- `dashforge/signals.py`: persists mappings, confidence, context filters, feedback counts, review state, rejected
+- `tacit/data/signals.yaml`: provides bootstrap categories and patterns.
+- `tacit/signals.py`: persists mappings, confidence, context filters, feedback counts, review state, rejected
   candidates, and SQLite-backed learning state.
-- `dashforge/dashboard_ingest.py`: infers signals from ingested dashboards and records candidates.
-- `dashforge/main.py`: exposes teach, learn, approve/reject/ignore endpoints.
+- `tacit/dashboard_ingest.py`: infers signals from ingested dashboards and records candidates.
+- `tacit/main.py`: exposes teach, learn, approve/reject/ignore endpoints.
 - `README.md`: still describes a "Signal Taxonomy" prominently, which is accurate but should be read as bootstrap data.
 
 TODO:

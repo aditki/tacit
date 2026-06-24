@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 def test_panel_query_cloudwatch_fields():
     """PanelQuery should accept CloudWatch-specific fields including region."""
-    from dashforge.models.schemas import PanelQuery
+    from tacit.models.schemas import PanelQuery
 
     q = PanelQuery(
         expr="HTTPCode_ELB_5XX",
@@ -38,7 +38,7 @@ def test_panel_query_cloudwatch_fields():
 
 def test_panel_query_cloudwatch_fields_default_empty():
     """CloudWatch fields should default to empty when not provided."""
-    from dashforge.models.schemas import PanelQuery
+    from tacit.models.schemas import PanelQuery
 
     q = PanelQuery(expr="up", datasource_uid="prom1")
     assert q.cloudwatch_namespace == ""
@@ -53,8 +53,8 @@ def test_panel_query_cloudwatch_fields_default_empty():
 
 def test_dashboard_cloudwatch_target_rendering():
     """CloudWatch panels should include namespace, metricName, statistics, dimensions, region."""
-    from dashforge.grafana.dashboard import _build_panel_json
-    from dashforge.models.schemas import PanelQuery, PanelSpec
+    from tacit.grafana.dashboard import _build_panel_json
+    from tacit.models.schemas import PanelQuery, PanelSpec
 
     panel = PanelSpec(
         title="5xx Errors",
@@ -82,8 +82,8 @@ def test_dashboard_cloudwatch_target_rendering():
 
 def test_dashboard_prometheus_target_no_cloudwatch_fields():
     """Prometheus panels should NOT include CloudWatch-specific fields."""
-    from dashforge.grafana.dashboard import _build_panel_json
-    from dashforge.models.schemas import PanelQuery, PanelSpec
+    from tacit.grafana.dashboard import _build_panel_json
+    from tacit.models.schemas import PanelQuery, PanelSpec
 
     panel = PanelSpec(
         title="Request Rate",
@@ -130,7 +130,7 @@ def test_check_llm_bedrock_with_role_arn_calls_assume_role():
 
     mock_boto3.Session.side_effect = [base_session, assumed_session]
 
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), patch("dashforge.config.settings") as mock_settings:
+    with patch.dict("sys.modules", {"boto3": mock_boto3}), patch("tacit.config.settings") as mock_settings:
         mock_settings.llm_provider = "bedrock"
         mock_settings.llm_api_key = ""
         mock_settings.llm_model = "claude-sonnet-4-20250514"
@@ -140,14 +140,14 @@ def test_check_llm_bedrock_with_role_arn_calls_assume_role():
         mock_settings.llm_bedrock_role_arn = "arn:aws:iam::123456789012:role/TestRole"
         mock_settings.llm_bedrock_model_id = ""
 
-        from dashforge.cli import _check_llm
+        from tacit.cli import _check_llm
 
         result = _check_llm()
 
         # Must have called assume_role on the base session's STS client
         mock_sts_base.assume_role.assert_called_once_with(
             RoleArn="arn:aws:iam::123456789012:role/TestRole",
-            RoleSessionName="dashforge-bedrock",
+            RoleSessionName="tacit-bedrock",
             DurationSeconds=3600,
         )
         # get_caller_identity should be called on the ASSUMED session, not base
@@ -170,7 +170,7 @@ def test_check_llm_bedrock_bad_role_arn_returns_false():
 
     mock_boto3.Session.return_value = base_session
 
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), patch("dashforge.config.settings") as mock_settings:
+    with patch.dict("sys.modules", {"boto3": mock_boto3}), patch("tacit.config.settings") as mock_settings:
         mock_settings.llm_provider = "bedrock"
         mock_settings.llm_api_key = ""
         mock_settings.llm_model = "claude-sonnet-4-20250514"
@@ -180,7 +180,7 @@ def test_check_llm_bedrock_bad_role_arn_returns_false():
         mock_settings.llm_bedrock_role_arn = "arn:aws:iam::999999999999:role/BadRole"
         mock_settings.llm_bedrock_model_id = ""
 
-        from dashforge.cli import _check_llm
+        from tacit.cli import _check_llm
 
         result = _check_llm()
 

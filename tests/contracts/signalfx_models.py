@@ -1,8 +1,8 @@
 """Pydantic contract models for the SignalFx (Splunk Observability) v2 REST API.
 
-DashForge reads:
+Tacit reads:
   GET  /v2/metric?query=&limit=&offset=  -> {count, results: [{name, type, ...}]}
-DashForge writes:
+Tacit writes:
   POST /v2/chart       {name, programText, options}  -> {id, name, ...}
   POST /v2/dashboard   {name, charts}                 -> {id, name, ...}
 """
@@ -27,7 +27,7 @@ class SignalFxMetricSearchResponse(BaseModel):
 
 
 class SignalFxChartCreate(BaseModel):
-    """POST /v2/chart request body DashForge must send."""
+    """POST /v2/chart request body Tacit must send."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -57,7 +57,7 @@ class SignalFxDashboardChart(BaseModel):
 
 
 class SignalFxDashboardCreate(BaseModel):
-    """POST /v2/dashboard request body DashForge must send."""
+    """POST /v2/dashboard request body Tacit must send."""
 
     model_config = ConfigDict(extra="forbid")
 

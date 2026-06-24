@@ -7,7 +7,7 @@
 # local-only. This file does not start Grafana with anonymous Editor access.
 
 services:
-  dashforge:
+  tacit:
     build: .
     ports:
       - "8000:8000"
@@ -15,7 +15,7 @@ services:
       - path: .env
         required: false
     volumes:
-      - dashforge_data:/app/data
+      - tacit_data:/app/data
     read_only: true
     tmpfs:
       - /tmp
@@ -25,4 +25,4 @@ services:
       - ALL
 
 volumes:
-  dashforge_data:
+  tacit_data:

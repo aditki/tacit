@@ -1,6 +1,6 @@
 """Pydantic contract models for the Graphite metrics/find API (via Grafana proxy).
 
-DashForge reads:
+Tacit reads:
   GET .../metrics/find?query=pattern -> [{id, text, leaf, expandable, allowChildren}]
 """
 

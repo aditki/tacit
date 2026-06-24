@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 def test_registry_routes_bedrock():
     """Registry should route 'bedrock' to BedrockProvider."""
-    import dashforge.agents.providers.registry as reg
+    import tacit.agents.providers.registry as reg
 
     reg._provider = None  # reset singleton
 
@@ -35,7 +35,7 @@ def test_registry_routes_bedrock():
 
         provider = reg.get_provider()
 
-        from dashforge.agents.providers.bedrock import BedrockProvider
+        from tacit.agents.providers.bedrock import BedrockProvider
 
         assert isinstance(provider, BedrockProvider)
 
@@ -46,7 +46,7 @@ def test_registry_routes_bedrock():
 
 def test_registry_unknown_provider_includes_bedrock_in_error():
     """Unknown provider error message should list 'bedrock' as an option."""
-    import dashforge.agents.providers.registry as reg
+    import tacit.agents.providers.registry as reg
 
     reg._provider = None
 

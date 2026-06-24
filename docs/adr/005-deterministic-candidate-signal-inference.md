@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Signal inference affects trust. If DashForge silently learns bad mappings, future dashboards become worse. The current
+Signal inference affects trust. If Tacit silently learns bad mappings, future dashboards become worse. The current
 repo uses deterministic inference over metric names, panel titles, units, query shape, dashboard grouping, and bootstrap
 patterns. The inference code records evidence, score, confidence, margin, and auto-teach eligibility.
 
@@ -27,8 +27,8 @@ Implementation status: implemented.
 
 Validated against:
 
-- `dashforge/signal_inference.py`: deterministic rules and `auto_teach_eligible` logic.
-- `dashforge/dashboard_ingest.py`: combines taxonomy matches and heuristic candidates, preserves evidence, and records
+- `tacit/signal_inference.py`: deterministic rules and `auto_teach_eligible` logic.
+- `tacit/dashboard_ingest.py`: combines taxonomy matches and heuristic candidates, preserves evidence, and records
   rejected candidates.
 - `tests/unit/test_signal_inference.py`: verifies explainable heuristic behavior and conservative gates.
 - `tests/unit/test_signals.py`: covers dashboard ingestion and candidate persistence.

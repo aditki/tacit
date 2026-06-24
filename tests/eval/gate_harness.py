@@ -1,4 +1,4 @@
-"""Offline gate-metric harness for the DashForge accuracy gates.
+"""Offline gate-metric harness for the Tacit accuracy gates.
 
 Measures the *datasource-free* gates against labeled gold-set fixtures, under a
 cold-isolated runtime, with explicit numerators/denominators:
@@ -32,10 +32,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from dashforge.archetypes.engine import rank_archetypes_by_coverage
-from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
-from dashforge.models.schemas import MetricEntry
-from dashforge.signal_inference import infer_signal
+from tacit.archetypes.engine import rank_archetypes_by_coverage
+from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from tacit.models.schemas import MetricEntry
+from tacit.signal_inference import infer_signal
 from tests.eval.cold_isolation import cold_isolation
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"

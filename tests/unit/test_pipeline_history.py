@@ -1,14 +1,14 @@
 from promql_parser import parse
 
-from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
-from dashforge.evidence import SUPPORTED_OBSERVATION, requirements_for_archetype
-from dashforge.evidence_artifacts import (
+from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from tacit.evidence import SUPPORTED_OBSERVATION, requirements_for_archetype
+from tacit.evidence_artifacts import (
     build_evidence_gap_dashboard,
     build_symptom_evidence_dashboard,
     missing_critical_evidence_gap_requirements,
     missing_critical_symptom_requirements,
 )
-from dashforge.models.schemas import (
+from tacit.models.schemas import (
     ArchetypeMatch,
     DashboardSpec,
     EvidenceObservation,
@@ -19,13 +19,13 @@ from dashforge.models.schemas import (
     PanelSpec,
     SignalType,
 )
-from dashforge.pipeline import (
+from tacit.pipeline import (
     _compiled_query_diagnostics,
     _history_archetypes,
     _history_signals,
     _semantic_mapping_diagnostics,
 )
-from dashforge.signals import SignalStore
+from tacit.signals import SignalStore
 
 
 def _arch(
@@ -200,7 +200,7 @@ def test_symptom_evidence_dashboard_preserves_resolved_application_symptoms():
         timerange="30m",
     )
 
-    assert dashboard.tags == ["dashforge", "evidence", "symptom"]
+    assert dashboard.tags == ["tacit", "evidence", "symptom"]
     assert [resolution.reason_code for resolution in rescue_resolutions] == [
         "live_signal_resolved",
         "live_signal_resolved",
@@ -258,7 +258,7 @@ def test_symptom_evidence_dashboard_does_not_promote_resource_evidence():
 def test_symptom_evidence_dashboard_resolves_direct_latency_when_template_shape_fails(monkeypatch, tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = InvestigationArchetype(
         id="latency_investigation",
         name="Latency Investigation",
@@ -836,7 +836,7 @@ def test_symptom_evidence_dashboard_scopes_signalflow_when_dimension_values_unsa
 def test_symptom_evidence_dashboard_abstains_on_tied_metric_owners(monkeypatch, tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = InvestigationArchetype(
         id="latency_investigation",
         name="Latency Investigation",
@@ -1074,7 +1074,7 @@ def testmissing_critical_symptom_requirements_treats_signalfx_exists_as_surfaced
 def test_evidence_gap_dashboard_resolves_supported_resource_observation(monkeypatch, tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = _arch(
         "resource_saturation",
         required_signals=["cpu_usage"],
@@ -1113,7 +1113,7 @@ def test_evidence_gap_dashboard_resolves_supported_resource_observation(monkeypa
         timerange="15m",
     )
 
-    assert dashboard.tags == ["dashforge", "evidence", "gap-observation"]
+    assert dashboard.tags == ["tacit", "evidence", "gap-observation"]
     assert dashboard.panels[0].title == "Supported CPU Observation"
     assert dashboard.panels[0].row == "Supported Observations"
     assert dashboard.panels[0].queries[0].expr == (
@@ -1187,7 +1187,7 @@ def test_evidence_gap_dashboard_marks_reused_primary_resolution_as_gap():
 def test_evidence_gap_dashboard_requires_requested_service_scope(monkeypatch, tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = _arch(
         "resource_saturation",
         required_signals=["cpu_usage"],
@@ -1266,7 +1266,7 @@ def test_evidence_gap_dashboard_requires_catalog_owner_for_service_scope():
 def test_evidence_gap_dashboard_abstains_on_ambiguous_owners(monkeypatch, tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("dashforge.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     archetype = _arch(
         "resource_saturation",
         required_signals=["cpu_usage"],

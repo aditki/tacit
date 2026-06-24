@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dashforge.signals.learning_index import build_learning_context_rows, infer_services_for_learning
+from tacit.signals.learning_index import build_learning_context_rows, infer_services_for_learning
 
 
 def test_infer_services_preserves_job_and_pod_labels():

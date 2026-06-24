@@ -1,6 +1,6 @@
 """Pydantic contract models for the Grafana CloudWatch datasource resource API.
 
-DashForge calls (POST, via /api/datasources/uid/{uid}/resources/...):
+Tacit calls (POST, via /api/datasources/uid/{uid}/resources/...):
   namespaces       {region}                         -> [namespace, ...]
   metrics          {region, namespace}              -> [metricName, ...]
   dimension-keys   {region, namespace, metricName}  -> [dimensionKey, ...]

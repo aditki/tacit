@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from dashforge.grafana.client import GrafanaClient
-from dashforge.models.schemas import DatasourceInfo
+from tacit.grafana.client import GrafanaClient
+from tacit.models.schemas import DatasourceInfo
 
 GRAFANA_BASE = "https://grafana.test"
 

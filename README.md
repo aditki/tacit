@@ -2,7 +2,7 @@
 
 Early Project Status
 
-DashForge is an experimental infrastructure engineering project.
+Tacit is an experimental infrastructure engineering project.
 
 It is not production-ready and should currently be treated as a development/private-beta system only.
 
@@ -15,20 +15,20 @@ learning from real-world operational tradeoffs
 
 APIs, configuration formats, internal architecture, and integrations may change significantly between versions.
 
-# DashForge
+# Tacit
 
 **Natural language → operational investigation artifacts.**
 
-DashForge is an experimental operational cognition layer for incident response. It lets on-call engineers describe a problem in plain English (via Slack, Web UI, or HTTP API), then turns that prompt into a structured investigation path and one or more evidence artifacts. Today the primary artifact is a purpose-built dashboard published to **Grafana**, **Splunk Observability Cloud (SignalFx)**, or both. The longer-term object is the investigation itself: selected signals, learned telemetry mappings, validation results, history, feedback, and generated dashboards that explain where to look next.
+Tacit is an experimental operational cognition layer for incident response. It lets on-call engineers describe a problem in plain English (via Slack, Web UI, or HTTP API), then turns that prompt into a structured investigation path and one or more evidence artifacts. Today the primary artifact is a purpose-built dashboard published to **Grafana**, **Splunk Observability Cloud (SignalFx)**, or both. The longer-term object is the investigation itself: selected signals, learned telemetry mappings, validation results, history, feedback, and generated dashboards that explain where to look next.
 
-> **Public beta / early alpha:** DashForge is demoable and useful for controlled trials, but it is not production-ready software. Expect rough edges, incomplete vendor coverage, and breaking changes. Do not expose it to the public internet or production observability systems without enabling API auth, reviewing generated queries, and applying your own deployment controls.
+> **Public beta / early alpha:** Tacit is demoable and useful for controlled trials, but it is not production-ready software. Expect rough edges, incomplete vendor coverage, and breaking changes. Do not expose it to the public internet or production observability systems without enabling API auth, reviewing generated queries, and applying your own deployment controls.
 
 > *"High latency on the checkout service in the last hour"*
 > → an investigation artifact with request rate, error rate, p99 latency, CPU, memory, and pod restarts — published as a Grafana or SignalFx dashboard and recorded with provenance for review.
 
 ## Demo
 
-Want the fastest way to see the idea? Run the [checkout incident demo](demo/README.md). It uploads a known-good Grafana dashboard, lets DashForge infer reusable observability signals, approves those signals, and then asks for a fresh investigation dashboard from one plain-English incident prompt.
+Want the fastest way to see the idea? Run the [checkout incident demo](demo/README.md). It uploads a known-good Grafana dashboard, lets Tacit infer reusable observability signals, approves those signals, and then asks for a fresh investigation dashboard from one plain-English incident prompt.
 
 ---
 
@@ -64,7 +64,7 @@ Even advanced systems today are mostly doing one thing well:
 
 But the operator still performs **navigation**, **prioritization**, **hypothesis sequencing**, and **drilldown orchestration** — and that cognitive load is enormous during incidents.
 
-DashForge closes this gap by turning a problem statement into an investigation path with concrete evidence artifacts. Dashboards are the first artifact because they are the fastest way to inspect evidence during a live incident; they are not the final product boundary.
+Tacit closes this gap by turning a problem statement into an investigation path with concrete evidence artifacts. Dashboards are the first artifact because they are the fastest way to inspect evidence during a live incident; they are not the final product boundary.
 
 ## How it works
 
@@ -131,7 +131,7 @@ DashForge closes this gap by turning a problem statement into an investigation p
 └──────┬───────────────────┘
        ▼
 ┌──────────────────────────┐
-│ Signal Inference Engine  │  Matches metrics → signal taxonomy (dashforge/data/signals.yaml)
+│ Signal Inference Engine  │  Matches metrics → signal taxonomy (tacit/data/signals.yaml)
 │                          │  12 categories, pattern-based with confidence scores
 └──────┬───────────────────┘
        ▼
@@ -159,16 +159,16 @@ Inspired by [Uber's QueryGPT](https://www.uber.com/us/en/blog/query-gpt/) multi-
 pip install -e .
 
 # Interactive setup — walks you through Grafana URL, API key, LLM provider
-dashforge init
+tacit init
 
 # Validate everything is connected
-dashforge doctor
+tacit doctor
 
 # Run a sample investigation (publishes a dashboard artifact)
-dashforge test
+tacit test
 
 # Start the server
-dashforge serve
+tacit serve
 ```
 
 That's it. Three commands from zero to a generated investigation artifact.
@@ -177,18 +177,18 @@ That's it. Three commands from zero to a generated investigation artifact.
 
 | Command                               | What it does                                                                                        |
 | ------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `dashforge init`                      | Interactive setup wizard → `~/.dashforge/config.yaml` + secrets in `~/.dashforge/.env`              |
-| `dashforge doctor`                    | Validates Grafana + SignalFx connectivity, datasource permissions, LLM key, archetypes, cache state |
-| `dashforge connect grafana`           | Test & persist a Grafana connection (interactive or `--url` / `--api-key` flags)                    |
-| `dashforge connect signalfx`          | Test & persist a Splunk SignalFx connection (interactive or `--realm` / `--token` flags)            |
-| `dashforge test [-p "custom prompt"]` | Runs a full investigation pipeline and opens the resulting dashboard                                |
-| `dashforge learn dashboard <uid>`     | Ingests an existing dashboard and reports signal quality + before/after learning impact             |
-| `dashforge serve`                     | Starts the API server (+ Slack if configured)                                                       |
-| `dashforge history list`              | List recent investigations with status, timings, archetypes                                         |
-| `dashforge history show <id>`         | Full investigation detail (intent → metrics → queries → result)                                     |
-| `dashforge history stats`             | Aggregate stats: success rates, avg time, path distribution                                         |
+| `tacit init`                      | Interactive setup wizard → `~/.tacit/config.yaml` + secrets in `~/.tacit/.env`              |
+| `tacit doctor`                    | Validates Grafana + SignalFx connectivity, datasource permissions, LLM key, archetypes, cache state |
+| `tacit connect grafana`           | Test & persist a Grafana connection (interactive or `--url` / `--api-key` flags)                    |
+| `tacit connect signalfx`          | Test & persist a Splunk SignalFx connection (interactive or `--realm` / `--token` flags)            |
+| `tacit test [-p "custom prompt"]` | Runs a full investigation pipeline and opens the resulting dashboard                                |
+| `tacit learn dashboard <uid>`     | Ingests an existing dashboard and reports signal quality + before/after learning impact             |
+| `tacit serve`                     | Starts the API server (+ Slack if configured)                                                       |
+| `tacit history list`              | List recent investigations with status, timings, archetypes                                         |
+| `tacit history show <id>`         | Full investigation detail (intent → metrics → queries → result)                                     |
+| `tacit history stats`             | Aggregate stats: success rates, avg time, path distribution                                         |
 
-`dashforge serve` options: `--host`, `--port`, `--reload` (dev mode), `--no-slack`.
+`tacit serve` options: `--host`, `--port`, `--reload` (dev mode), `--no-slack`.
 
 ### Option B: Docker
 
@@ -198,10 +198,10 @@ cp .env.example .env
 
 docker compose up -d
 
-# Go to localhost:8000 for DashForge
+# Go to localhost:8000 for Tacit
 ```
 
-This starts only DashForge. Point `GRAFANA_URL` and `GRAFANA_API_KEY` at a Grafana instance you control.
+This starts only Tacit. Point `GRAFANA_URL` and `GRAFANA_API_KEY` at a Grafana instance you control.
 
 For the full local demo stack with Grafana, Prometheus, and fake metrics:
 
@@ -218,18 +218,18 @@ The dev stack is local-only. It intentionally uses `admin/admin` and anonymous G
 ./scripts/build.sh
 
 # Install
-sudo cp dist/dashforge /usr/local/bin/
+sudo cp dist/tacit /usr/local/bin/
 
 # Use
-dashforge init
-dashforge serve
+tacit init
+tacit serve
 ```
 
 ### Grafana Service Account
 
 1. Open Grafana → Administration → Service Accounts
 2. Create a service account with **Editor** role
-3. Generate a token — `dashforge init` will prompt for it, or set `GRAFANA_API_KEY` in your env
+3. Generate a token — `tacit init` will prompt for it, or set `GRAFANA_API_KEY` in your env
 
 ### Try the HTTP API
 
@@ -276,12 +276,12 @@ The current API response names the generated dashboard fields directly because d
 2. Enable **Socket Mode** and generate an App-Level Token
 3. Add Bot Token Scopes: `app_mentions:read`, `chat:write`, `commands`
 4. Install the app to your workspace
-5. (Optional) Create a `/dashforge` slash command
+5. (Optional) Create a `/tacit` slash command
 6. Add the Slack tokens to your config:
 
-   **Option A: CLI** — `dashforge init` will prompt for Slack tokens during interactive setup. They are stored in `~/.dashforge/.env`.
+   **Option A: CLI** — `tacit init` will prompt for Slack tokens during interactive setup. They are stored in `~/.tacit/.env`.
 
-   **Option B: Manual** — add to `~/.dashforge/.env` or your project `.env`:
+   **Option B: Manual** — add to `~/.tacit/.env` or your project `.env`:
    ```
    SLACK_BOT_TOKEN=<slack-bot-token>
    SLACK_APP_TOKEN=<slack-app-token>
@@ -290,60 +290,60 @@ The current API response names the generated dashboard fields directly because d
 
 7. Start the server:
    ```bash
-   dashforge serve              # Slack enabled by default
-   dashforge serve --no-slack   # disable Slack integration
+   tacit serve              # Slack enabled by default
+   tacit serve --no-slack   # disable Slack integration
    ```
-   Or with the local demo stack: `docker compose -f docker-compose.dev.yml restart dashforge`
+   Or with the local demo stack: `docker compose -f docker-compose.dev.yml restart tacit`
 
 ### Usage
 
 Mention the bot in any channel:
 
 ```
-@DashForge high error rate on the payments API since 2pm
+@Tacit high error rate on the payments API since 2pm
 ```
 
 Or use the slash command:
 
 ```
-/dashforge disk almost full on the database nodes
+/tacit disk almost full on the database nodes
 ```
 
 The bot will reply with a link to the freshly created investigation dashboard artifact.
 
 ## Splunk SignalFx (Direct Integration)
 
-DashForge can publish investigation dashboard artifacts **directly to Splunk Observability Cloud** (SignalFx),
+Tacit can publish investigation dashboard artifacts **directly to Splunk Observability Cloud** (SignalFx),
 in addition to Grafana. When enabled, each pipeline run creates both a Grafana dashboard
 and a native SignalFx dashboard with SignalFlow charts.
 
 ### Setup
 
 1. Get a SignalFx API access token from **Settings → Access Tokens** in Splunk Observability Cloud
-2. Configure via `dashforge init` or add to `~/.dashforge/.env`:
+2. Configure via `tacit init` or add to `~/.tacit/.env`:
    ```
    SIGNALFX_API_TOKEN=<your-token>
    ```
-   And in `~/.dashforge/config.yaml`:
+   And in `~/.tacit/config.yaml`:
    ```yaml
    signalfx:
      enabled: true
      realm: us1       # us0, us1, us2, eu0, jp0, au0
-     dashboard_group: DashForge
+     dashboard_group: Tacit
    ```
-3. Run `dashforge doctor` to verify connectivity
+3. Run `tacit doctor` to verify connectivity
 
 When enabled, the API response includes `signalfx_url` and `signalfx_dashboard_id`
 alongside the standard Grafana fields.
 
 ## Dashboard Learning & Signals
 
-DashForge can **learn from existing dashboards** — ingest a Grafana or SignalFx dashboard
+Tacit can **learn from existing dashboards** — ingest a Grafana or SignalFx dashboard
 and automatically infer which observability signals (latency, error rate, saturation, etc.)
 its metrics represent. Learned mappings feed back into the pipeline to improve metric
 ranking and archetype selection.
 
-This is the operational intelligence layer: DashForge should learn an environment's
+This is the operational intelligence layer: Tacit should learn an environment's
 telemetry language from the dashboards operators already trust. The current implementation
 keeps that learning reviewable:
 
@@ -359,7 +359,7 @@ Via the **Web UI** — go to the **Learning** tab, enter a dashboard UID, select
 Via the **CLI**:
 
 ```bash
-dashforge learn dashboard my-service-overview --backend grafana
+tacit learn dashboard my-service-overview --backend grafana
 ```
 
 Via the **API**:
@@ -380,7 +380,7 @@ Ingestion responses include `signal_quality` and `learning_impact` so reviewers 
 
 ### Teach a Signal Mapping
 
-Manually teach DashForge that a custom metric maps to a signal:
+Manually teach Tacit that a custom metric maps to a signal:
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/signals/teach \
@@ -394,7 +394,7 @@ curl -X POST http://localhost:8000/api/v1/signals/teach \
 
 ### Signal Taxonomy
 
-The packaged signal taxonomy (`dashforge/data/signals.yaml`) defines 12 categories with metric patterns:
+The packaged signal taxonomy (`tacit/data/signals.yaml`) defines 12 categories with metric patterns:
 
 | Category | Signals |
 |---|---|
@@ -428,28 +428,28 @@ The packaged signal taxonomy (`dashforge/data/signals.yaml`) defines 12 categori
 
 ## AWS Bedrock (LLM Provider)
 
-DashForge supports **AWS Bedrock** as an LLM provider for organizations that require
+Tacit supports **AWS Bedrock** as an LLM provider for organizations that require
 all AI calls to stay within their AWS account.
 
 ### Setup
 
 1. Install the optional dependency:
    ```bash
-   pip install 'dashforge[bedrock]'
+   pip install 'tacit[bedrock]'
    ```
-2. Configure via `dashforge init` or manually in `~/.dashforge/config.yaml`:
+2. Configure via `tacit init` or manually in `~/.tacit/config.yaml`:
    ```yaml
    llm:
      provider: bedrock
      model: anthropic.claude-sonnet-4-20250514-v1:0
      bedrock_region: us-east-1
-     # bedrock_role_arn: arn:aws:iam::123456789012:role/DashForgeBedrock  # optional cross-account
+     # bedrock_role_arn: arn:aws:iam::123456789012:role/TacitBedrock  # optional cross-account
    ```
 3. Authentication (resolved in order):
-   - **Explicit keys** — set `LLM_AWS_ACCESS_KEY_ID` + `LLM_AWS_SECRET_ACCESS_KEY` in `~/.dashforge/.env`
+   - **Explicit keys** — set `LLM_AWS_ACCESS_KEY_ID` + `LLM_AWS_SECRET_ACCESS_KEY` in `~/.tacit/.env`
    - **Assume-role** — set `llm.bedrock_role_arn` in config (uses STS)
    - **Default boto3 chain** — env vars, `~/.aws/credentials`, EC2 instance profile, ECS task role
-4. Run `dashforge doctor` to verify (calls `sts:GetCallerIdentity`)
+4. Run `tacit doctor` to verify (calls `sts:GetCallerIdentity`)
 
 No API key is needed — Bedrock uses IAM authentication.
 
@@ -484,7 +484,7 @@ provider-agnostic — set `LLM_PROVIDER` to `anthropic`, `openai`, `azure`, `bed
 - **Query validation** — before publishing, every panel query is tested against the live datasource. Panels with no matching series are dropped. If all panels are empty, no dashboard is created and the user gets a clear error.
 - **Per-metric label discovery** — the Prometheus adapter fetches actual label names and values for each metric via `/api/v1/series`, so the LLM writes queries with correct selectors instead of guessing.
 - **Hallucination post-validation** — after the Metrics Discovery LLM runs, any metric referencing a datasource UID not in the real catalog is silently dropped.
-- **Layered configuration** — schema-validated YAML config file with env var overrides. Secrets stay in env vars, non-sensitive config in `dashforge.yaml`.
+- **Layered configuration** — schema-validated YAML config file with env var overrides. Secrets stay in env vars, non-sensitive config in `tacit.yaml`.
 - **Concurrency & timeout guards** — pipeline runs are bounded by a semaphore and a configurable timeout to prevent runaway LLM calls.
 - **Security hardening** — all three agent system prompts include injection guardrails; API key auth is optional but built-in.
 
@@ -505,7 +505,7 @@ provider-agnostic — set `LLM_PROVIDER` to `anthropic`, `openai`, `azure`, `bed
 
 ## Supported Backends & Datasources
 
-DashForge publishes dashboard artifacts to multiple backends simultaneously. Each backend discovers
+Tacit publishes dashboard artifacts to multiple backends simultaneously. Each backend discovers
 metrics from its own sources, validates queries, ingests existing dashboards where supported, and publishes independently.
 
 | Backend             | Discovery                                             | Query Language                                          | Publishing         |
@@ -517,7 +517,7 @@ When both are enabled, a single prompt creates dashboard artifacts in **both** s
 
 ### Grafana Datasources
 
-When Grafana is enabled, DashForge searches **all** registered datasources, not just Prometheus.
+When Grafana is enabled, Tacit searches **all** registered datasources, not just Prometheus.
 When you say "5xx on checkout", it searches CloudWatch for ALB errors, Prometheus for
 pod-level metrics, Elasticsearch for log-derived data — all at once.
 
@@ -539,8 +539,8 @@ the correct query language for each.
 ## Project Structure
 
 ```
-dashforge/
-├── dashforge/
+tacit/
+├── tacit/
 │   ├── cli.py               # CLI: init, doctor, connect, test, serve, history
 │   ├── main.py              # FastAPI + Slack bot startup
 │   ├── config.py            # Layered config: YAML + env vars + Pydantic validation
@@ -607,7 +607,7 @@ dashforge/
 │       └── index.html       # Web UI (Generate, Learning, Signals, Insights, Archetypes, History)
 ├── tests/                   # Hermetic unit/contract tests plus live scripts
 │   ├── validate.py          # Validation suite (archetype + pipeline accuracy)
-│   ├── dashforge_validation_prompts.csv  # 100-prompt test dataset
+│   ├── tacit_validation_prompts.csv  # 100-prompt test dataset
 │   ├── test_*.py            # Hermetic pytest suite
 │   └── live/                # Opt-in scripts that can mutate real vendor accounts
 ├── dev/                     # Local dev environment
@@ -618,8 +618,8 @@ dashforge/
 ├── docker-compose.dev.yml   # Local demo stack with unsafe Grafana dev defaults
 ├── Dockerfile               # Hardened non-root runtime image
 ├── pyproject.toml           # Project metadata & deps (uv)
-├── dashforge.yaml.example   # Reference YAML config (schema-validated)
-├── dashforge.spec           # PyInstaller spec for single-binary builds
+├── tacit.yaml.example   # Reference YAML config (schema-validated)
+├── tacit.spec           # PyInstaller spec for single-binary builds
 ├── scripts/
 │   └── build.sh             # Build single binary
 └── .env.example             # Reference env vars (secrets go here)
@@ -635,10 +635,10 @@ See also:
 
 ### Product Principles
 
-- DashForge should optimize investigation quality, not dashboard generation alone.
+- Tacit should optimize investigation quality, not dashboard generation alone.
 - Dashboards are evidence artifacts inside an investigation. The system should also preserve intent, selected signals, queries, validation, history, and feedback.
-- DashForge should learn an organization's operational language from reviewed dashboards and feedback before attempting heavier stateful incident sessions.
-- Enterprise context should come from customer-owned systems through pluggable RAG / A2A / MCP providers. DashForge should own observability outcomes and provenance, not become the system of record for all organizational knowledge.
+- Tacit should learn an organization's operational language from reviewed dashboards and feedback before attempting heavier stateful incident sessions.
+- Enterprise context should come from customer-owned systems through pluggable RAG / A2A / MCP providers. Tacit should own observability outcomes and provenance, not become the system of record for all organizational knowledge.
 
 ### Implemented Foundation
 
@@ -670,7 +670,7 @@ See also:
 - [ ] **Conservative learning UX** — make candidate vs approved/trusted mappings obvious in API/UI output, and keep rejected/ignored candidates out of trusted retrieval paths.
 - [ ] **Explainable signal inference** — show why a metric was inferred as latency/errors/saturation, including confidence, source dashboard, panel title, query language, and review state.
 - [ ] **Learning retrieval/indexing** — add a scalable metadata search layer for learned dashboard context and service descriptions, with explicit fallback behavior if the local SQLite/FTS capability is unavailable.
-- [ ] **Bulk backend learning** — add first-class CLI flows such as `dashforge learn dashboard <uid>` and `dashforge learn grafana/signalfx`, including pagination, bounded concurrency, retry/backoff, and progress output.
+- [ ] **Bulk backend learning** — add first-class CLI flows such as `tacit learn dashboard <uid>` and `tacit learn grafana/signalfx`, including pagination, bounded concurrency, retry/backoff, and progress output.
 - [ ] **Demo hardening** — ship a repeatable 5-minute demo path, README screenshots/GIFs, and fresh-clone Docker smoke tests.
 - [ ] **Evaluation expansion** — add ingestion-quality benchmarks, before/after learned-mapping tests, dashboard usefulness snapshots, and failure examples.
 - [ ] **Self-observability** — expose Prometheus metrics for prompt latency, query success rate, hallucination/drop rate, artifact usefulness, token cost, and cache hit rate.
@@ -695,7 +695,7 @@ See also:
 - [ ] **Query cost planner** — estimate cardinality, time range cost, datasource load, and query complexity before execution.
 - [ ] **Structured trust boundaries** — tag logs, labels, RAG content, Slack text, and datasource metadata with trust levels in prompts and outputs.
 - [ ] **RBAC-aware retrieval** — filter metrics, context, history, and generated artifacts by user/team/org/datasource permissions.
-- [ ] **Grafana App Plugin** — native "Investigate with DashForge" side panel inside Grafana, calling the DashForge API and opening artifacts in-place.
+- [ ] **Grafana App Plugin** — native "Investigate with Tacit" side panel inside Grafana, calling the Tacit API and opening artifacts in-place.
 - [ ] **Incident-management integrations** — PagerDuty, incident.io, Rootly, Slack workflows, and timeline export should consume investigation artifacts after the core learning loop is reliable.
 
 ## License

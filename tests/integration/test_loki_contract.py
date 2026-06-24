@@ -5,7 +5,7 @@ from __future__ import annotations
 import respx
 from httpx import Response
 
-from dashforge.grafana.adapters.loki import LokiAdapter
+from tacit.grafana.adapters.loki import LokiAdapter
 from tests.contracts import factories as f
 from tests.integration.conftest import datasource, make_grafana_client, proxy_url
 

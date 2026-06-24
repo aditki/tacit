@@ -1,13 +1,13 @@
 """Pydantic contract models for the Grafana HTTP API.
 
-These capture the exact request/response shapes DashForge depends on
-(`dashforge/grafana/client.py`, `grafana/dashboard.py`, `grafana/datasource.py`).
+These capture the exact request/response shapes Tacit depends on
+(`tacit/grafana/client.py`, `grafana/dashboard.py`, `grafana/datasource.py`).
 They are the single source of truth for hermetic mocks: a factory builds a
 payload *through* these models, so if Grafana renames a field we only update it
 here and every dependent test breaks loudly.
 
 Field names mirror the wire (camelCase) via aliases so the same model validates
-both Grafana's real responses and DashForge's outgoing requests.
+both Grafana's real responses and Tacit's outgoing requests.
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ class GrafanaFolder(BaseModel):
 
 
 class GrafanaDashboardSaveCommand(BaseModel):
-    """POST /api/dashboards/db request body that DashForge must send.
+    """POST /api/dashboards/db request body that Tacit must send.
 
     ``extra="forbid"`` so an unexpected/renamed key in our outgoing payload is
     caught by contract validation.

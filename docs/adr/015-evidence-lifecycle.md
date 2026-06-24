@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-The GAMMA pre-evidence-model baseline showed that DashForge can semantically map and bind present CPU/memory signals,
+The GAMMA pre-evidence-model baseline showed that Tacit can semantically map and bind present CPU/memory signals,
 while still losing application symptom evidence before it survives into validated panels. The important missing model is
 not an investigation graph or an agent state machine. It is explicit evidence.
 
@@ -38,8 +38,8 @@ Implementation status: partially implemented.
 
 Validated against:
 
-- `dashforge/models/schemas.py`: defines requirement, resolution, and observation models.
-- `dashforge/evidence.py`: derives evidence needs from selected archetypes and records resolution/observation counts.
-- `dashforge/pipeline.py`: records a reason-coded `evidence` diagnostic stage after validation.
+- `tacit/models/schemas.py`: defines requirement, resolution, and observation models.
+- `tacit/evidence.py`: derives evidence needs from selected archetypes and records resolution/observation counts.
+- `tacit/pipeline.py`: records a reason-coded `evidence` diagnostic stage after validation.
 - `docs/results/gamma-pre-evidence-model-baseline-2026-06-22.md`: freezes the pre-model target that evidence survival
   should improve next.

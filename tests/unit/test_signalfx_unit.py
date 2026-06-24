@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from dashforge.models.schemas import (
+from tacit.models.schemas import (
     ArchetypeMatch,
     DashboardSpec,
     Intent,
@@ -61,7 +61,7 @@ def _make_catalog(
 
 
 def test_find_best_label_service():
-    from dashforge.archetypes.engine import _find_best_label
+    from tacit.archetypes.engine import _find_best_label
 
     intent = _make_intent()
     catalog = _make_catalog(dims=["service={checkout-service,api-gateway}"])
@@ -72,7 +72,7 @@ def test_find_best_label_service():
 
 
 def test_find_best_label_container_restrict():
-    from dashforge.archetypes.engine import _find_best_label
+    from tacit.archetypes.engine import _find_best_label
 
     intent = _make_intent()
     catalog = _make_catalog(dims=["container={checkout-service}", "service={checkout-service}"])
@@ -83,7 +83,7 @@ def test_find_best_label_container_restrict():
 
 
 def test_find_best_label_no_services():
-    from dashforge.archetypes.engine import _find_best_label
+    from tacit.archetypes.engine import _find_best_label
 
     intent = _make_intent(services=[])
     catalog = _make_catalog()
@@ -93,7 +93,7 @@ def test_find_best_label_no_services():
 
 
 def test_resolve_sfx_service_filter():
-    from dashforge.archetypes.engine import _resolve_sfx_service_filter
+    from tacit.archetypes.engine import _resolve_sfx_service_filter
 
     intent = _make_intent()
     catalog = _make_catalog(dims=["service={checkout-service}"])
@@ -103,7 +103,7 @@ def test_resolve_sfx_service_filter():
 
 
 def test_resolve_sfx_service_filter_fallback():
-    from dashforge.archetypes.engine import _resolve_sfx_service_filter
+    from tacit.archetypes.engine import _resolve_sfx_service_filter
 
     intent = _make_intent()
     catalog = _make_catalog(dims=[])  # no dimensions to match
@@ -114,7 +114,7 @@ def test_resolve_sfx_service_filter_fallback():
 
 
 def test_resolve_sfx_container_filter():
-    from dashforge.archetypes.engine import _resolve_sfx_container_filter
+    from tacit.archetypes.engine import _resolve_sfx_container_filter
 
     intent = _make_intent()
     catalog = _make_catalog(dims=["container={checkout-service}"])
@@ -129,7 +129,7 @@ def test_resolve_sfx_container_filter():
 
 
 def test_signalflow_simple_metric():
-    from dashforge.archetypes.engine import _promql_template_to_signalflow
+    from tacit.archetypes.engine import _promql_template_to_signalflow
 
     sf = "filter('service', 'checkout-service')"
     result = _promql_template_to_signalflow(f"http_requests_total{{{sf}}}", sf, "", "rate")
@@ -139,7 +139,7 @@ def test_signalflow_simple_metric():
 
 
 def test_signalflow_rate():
-    from dashforge.archetypes.engine import _promql_template_to_signalflow
+    from tacit.archetypes.engine import _promql_template_to_signalflow
 
     sf = "filter('service', 'checkout-service')"
     result = _promql_template_to_signalflow(f"rate(http_requests_total{{{sf}}}[5m])", sf, "", "rps")
@@ -150,7 +150,7 @@ def test_signalflow_rate():
 
 
 def test_signalflow_sum_rate():
-    from dashforge.archetypes.engine import _promql_template_to_signalflow
+    from tacit.archetypes.engine import _promql_template_to_signalflow
 
     sf = "filter('service', 'checkout-service')"
     result = _promql_template_to_signalflow(f"sum(rate(http_requests_total{{{sf}}}[5m]))", sf, "", "total")
@@ -162,7 +162,7 @@ def test_signalflow_sum_rate():
 
 
 def test_signalflow_sum_rate_by():
-    from dashforge.archetypes.engine import _promql_template_to_signalflow
+    from tacit.archetypes.engine import _promql_template_to_signalflow
 
     sf = "filter('service', 'checkout-service')"
     expr = f'sum(rate(http_requests_total{{{sf}, status=~"5.."}}[5m])) by (status)'
@@ -174,7 +174,7 @@ def test_signalflow_sum_rate_by():
 
 
 def test_signalflow_histogram_quantile():
-    from dashforge.archetypes.engine import _promql_template_to_signalflow
+    from tacit.archetypes.engine import _promql_template_to_signalflow
 
     sf = "filter('service', 'checkout-service')"
     expr = f"histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{{sf}}}[5m])) by (le))"
@@ -186,7 +186,7 @@ def test_signalflow_histogram_quantile():
 
 
 def test_signalflow_ratio():
-    from dashforge.archetypes.engine import _promql_template_to_signalflow
+    from tacit.archetypes.engine import _promql_template_to_signalflow
 
     sf = "filter('service', 'checkout-service')"
     expr = (
@@ -201,7 +201,7 @@ def test_signalflow_ratio():
 
 
 def test_signalflow_topk():
-    from dashforge.archetypes.engine import _promql_template_to_signalflow
+    from tacit.archetypes.engine import _promql_template_to_signalflow
 
     sf = "filter('service', 'checkout-service')"
     expr = f"topk(5, sum(rate(http_requests_total{{{sf}}}[5m])) by (path))"
@@ -212,7 +212,7 @@ def test_signalflow_topk():
 
 
 def test_signalflow_increase():
-    from dashforge.archetypes.engine import _promql_template_to_signalflow
+    from tacit.archetypes.engine import _promql_template_to_signalflow
 
     sf = "filter('service', 'checkout-service')"
     expr = f"increase(http_requests_total{{{sf}}}[5m])"
@@ -223,7 +223,7 @@ def test_signalflow_increase():
 
 
 def test_signalflow_bare_metric():
-    from dashforge.archetypes.engine import _promql_template_to_signalflow
+    from tacit.archetypes.engine import _promql_template_to_signalflow
 
     result = _promql_template_to_signalflow("up", "", "", "heartbeat")
     assert result == "data('up').publish(label='heartbeat')"
@@ -236,8 +236,8 @@ def test_signalflow_bare_metric():
 
 
 def test_compile_archetype_signalflow():
-    from dashforge.archetypes.engine import compile_archetype
-    from dashforge.archetypes.templates import get_archetype
+    from tacit.archetypes.engine import compile_archetype
+    from tacit.archetypes.templates import get_archetype
 
     intent = _make_intent()
     catalog = _make_catalog(dims=["service={checkout-service}"])
@@ -259,8 +259,8 @@ def test_compile_archetype_signalflow():
 
 
 def test_compile_archetype_promql():
-    from dashforge.archetypes.engine import compile_archetype
-    from dashforge.archetypes.templates import get_archetype
+    from tacit.archetypes.engine import compile_archetype
+    from tacit.archetypes.templates import get_archetype
 
     intent = _make_intent()
     catalog = _make_catalog(dims=["service={checkout-service}"])
@@ -279,8 +279,8 @@ def test_compile_archetype_promql():
 
 
 def test_blend_archetypes_signalflow():
-    from dashforge.archetypes.engine import blend_archetypes
-    from dashforge.archetypes.templates import get_archetype
+    from tacit.archetypes.engine import blend_archetypes
+    from tacit.archetypes.templates import get_archetype
 
     intent = _make_intent(
         archetypes=[
@@ -315,7 +315,7 @@ def test_blend_archetypes_signalflow():
 
 
 def test_is_promql_true():
-    from dashforge.signalfx.publisher import _is_promql
+    from tacit.signalfx.publisher import _is_promql
 
     assert _is_promql('rate(http_requests_total{service="web"}[5m])') is True
     assert _is_promql('sum(rate(x{a="b"}[5m]))') is True
@@ -326,7 +326,7 @@ def test_is_promql_true():
 
 
 def test_is_promql_false():
-    from dashforge.signalfx.publisher import _is_promql
+    from tacit.signalfx.publisher import _is_promql
 
     assert _is_promql("data('cpu.utilization').mean().publish()") is False
     assert _is_promql("data('http_requests', filter=filter('service', 'web')).sum().publish(label='A')") is False
@@ -339,7 +339,7 @@ def test_is_promql_false():
 
 
 def test_publisher_promql_to_signalflow_simple():
-    from dashforge.signalfx.publisher import _promql_to_signalflow
+    from tacit.signalfx.publisher import _promql_to_signalflow
 
     result = _promql_to_signalflow('http_requests_total{service="web"}', "A")
     assert "data('http_requests_total'" in result
@@ -349,7 +349,7 @@ def test_publisher_promql_to_signalflow_simple():
 
 
 def test_publisher_promql_to_signalflow_rate():
-    from dashforge.signalfx.publisher import _promql_to_signalflow
+    from tacit.signalfx.publisher import _promql_to_signalflow
 
     result = _promql_to_signalflow('rate(http_requests_total{service="web"}[5m])', "B")
     assert "data('http_requests_total'" in result
@@ -359,7 +359,7 @@ def test_publisher_promql_to_signalflow_rate():
 
 
 def test_publisher_promql_to_signalflow_histogram():
-    from dashforge.signalfx.publisher import _promql_to_signalflow
+    from tacit.signalfx.publisher import _promql_to_signalflow
 
     expr = 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service="web"}[5m])) by (le))'
     result = _promql_to_signalflow(expr, "p95")
@@ -369,7 +369,7 @@ def test_publisher_promql_to_signalflow_histogram():
 
 
 def test_publisher_promql_to_signalflow_ratio():
-    from dashforge.signalfx.publisher import _promql_to_signalflow
+    from tacit.signalfx.publisher import _promql_to_signalflow
 
     # No-space label format (matches the ratio regex)
     expr = 'sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total{service="web"}[5m]))'
@@ -381,7 +381,7 @@ def test_publisher_promql_to_signalflow_ratio():
 
 
 def test_publisher_promql_to_signalflow_bare():
-    from dashforge.signalfx.publisher import _promql_to_signalflow
+    from tacit.signalfx.publisher import _promql_to_signalflow
 
     result = _promql_to_signalflow("up", "heartbeat")
     assert result == "data('up').publish(label='heartbeat')"
@@ -394,7 +394,7 @@ def test_publisher_promql_to_signalflow_bare():
 
 
 def test_build_chart_json_signalflow():
-    from dashforge.signalfx.publisher import _build_chart_json
+    from tacit.signalfx.publisher import _build_chart_json
 
     panel = PanelSpec(
         title="Request Rate",
@@ -419,7 +419,7 @@ def test_build_chart_json_signalflow():
 
 
 def test_build_chart_json_auto_publish():
-    from dashforge.signalfx.publisher import _build_chart_json
+    from tacit.signalfx.publisher import _build_chart_json
 
     panel = PanelSpec(
         title="CPU",
@@ -439,7 +439,7 @@ def test_build_chart_json_auto_publish():
 
 
 def test_build_chart_json_panel_types():
-    from dashforge.signalfx.publisher import _build_chart_json
+    from tacit.signalfx.publisher import _build_chart_json
 
     for ptype, expected in [
         ("timeseries", "TimeSeriesChart"),
@@ -465,7 +465,7 @@ def test_build_chart_json_panel_types():
 
 
 def test_build_chart_json_multi_query():
-    from dashforge.signalfx.publisher import _build_chart_json
+    from tacit.signalfx.publisher import _build_chart_json
 
     panel = PanelSpec(
         title="Multi",
@@ -489,7 +489,7 @@ def test_build_chart_json_multi_query():
 
 
 def test_build_dashboard_json_layout():
-    from dashforge.signalfx.publisher import _build_dashboard_json
+    from tacit.signalfx.publisher import _build_dashboard_json
 
     spec = DashboardSpec(
         title="Test Dash",
@@ -525,7 +525,7 @@ def test_build_dashboard_json_layout():
 
 
 def test_config_grafana_enabled():
-    from dashforge.config import Settings
+    from tacit.config import Settings
 
     s = Settings(grafana_enabled=True, signalfx_enabled=False)
     assert s.grafana_enabled is True
@@ -534,7 +534,7 @@ def test_config_grafana_enabled():
 
 
 def test_config_grafana_disabled():
-    from dashforge.config import Settings
+    from tacit.config import Settings
 
     s = Settings(grafana_enabled=False, signalfx_enabled=True, signalfx_api_token="test")
     assert s.grafana_enabled is False
@@ -544,7 +544,7 @@ def test_config_grafana_disabled():
 
 def test_config_sfx_backend_routing():
     """When grafana disabled + signalfx enabled, pipeline should route to signalflow."""
-    from dashforge.config import Settings
+    from tacit.config import Settings
 
     s = Settings(grafana_enabled=False, signalfx_enabled=True, signalfx_api_token="tok")
     sfx_backend = s.signalfx_enabled and s.signalfx_api_token and not s.grafana_enabled
@@ -565,7 +565,7 @@ def test_config_sfx_backend_routing():
 
 
 def test_parse_labels():
-    from dashforge.signalfx.publisher import _parse_labels
+    from tacit.signalfx.publisher import _parse_labels
 
     labels = _parse_labels('service="web", status=~"5..", method!="OPTIONS"')
     assert len(labels) == 3
@@ -576,7 +576,7 @@ def test_parse_labels():
 
 
 def test_labels_to_filter():
-    from dashforge.signalfx.publisher import _labels_to_filter
+    from tacit.signalfx.publisher import _labels_to_filter
 
     # Simple regex (no [ or |) keeps the value
     labels = [("service", "=", "web"), ("status", "=~", "5..")]
@@ -598,7 +598,7 @@ def test_labels_to_filter():
 
 
 def test_labels_to_filter_not_equal():
-    from dashforge.signalfx.publisher import _labels_to_filter
+    from tacit.signalfx.publisher import _labels_to_filter
 
     labels = [("method", "!=", "OPTIONS")]
     result = _labels_to_filter(labels)
@@ -612,7 +612,7 @@ def test_labels_to_filter_not_equal():
 
 
 def test_find_top_level_slash():
-    from dashforge.archetypes.engine import _find_top_level_slash
+    from tacit.archetypes.engine import _find_top_level_slash
 
     # Simple ratio
     assert _find_top_level_slash("a / b") == 2
@@ -631,7 +631,7 @@ def test_find_top_level_slash():
 
 
 def test_dash_response_signalfx_fields():
-    from dashforge.models.schemas import DashResponse
+    from tacit.models.schemas import DashResponse
 
     resp = DashResponse(
         dashboard_url="",
@@ -658,7 +658,7 @@ def test_dash_response_signalfx_fields():
 
 
 def test_keyword_metric_map():
-    from dashforge.grafana.adapters.signalfx import KEYWORD_METRIC_MAP
+    from tacit.grafana.adapters.signalfx import KEYWORD_METRIC_MAP
 
     assert isinstance(KEYWORD_METRIC_MAP, dict)
     assert len(KEYWORD_METRIC_MAP) > 0
@@ -678,7 +678,7 @@ def test_keyword_metric_map():
 
 
 def test_extract_signalflow_metrics():
-    from dashforge.validation import _extract_signalflow_metrics
+    from tacit.validation import _extract_signalflow_metrics
 
     # Single data() call
     assert _extract_signalflow_metrics("data('cpu.utilization').mean().publish()") == ["cpu.utilization"]
@@ -699,7 +699,7 @@ def test_validate_signalflow_drops_missing_panels():
     import asyncio
     from unittest.mock import AsyncMock
 
-    from dashforge.validation import validate_signalflow_queries
+    from tacit.validation import validate_signalflow_queries
 
     mock_client = AsyncMock()
 
@@ -750,7 +750,7 @@ def test_validate_signalflow_keeps_all_when_valid():
     import asyncio
     from unittest.mock import AsyncMock
 
-    from dashforge.validation import validate_signalflow_queries
+    from tacit.validation import validate_signalflow_queries
 
     mock_client = AsyncMock()
     mock_client.get_metric = AsyncMock(return_value={"name": "ok"})
@@ -783,7 +783,7 @@ def test_validate_signalflow_drops_missing_sibling_query():
     import asyncio
     from unittest.mock import AsyncMock
 
-    from dashforge.validation import validate_signalflow_queries
+    from tacit.validation import validate_signalflow_queries
 
     mock_client = AsyncMock()
 
@@ -831,7 +831,7 @@ def test_validate_signalflow_drops_helpers_when_all_data_queries_missing():
     import asyncio
     from unittest.mock import AsyncMock
 
-    from dashforge.validation import validate_signalflow_queries
+    from tacit.validation import validate_signalflow_queries
 
     mock_client = AsyncMock()
     mock_client.get_metric = AsyncMock(side_effect=Exception("404 Not Found"))
@@ -870,7 +870,7 @@ def test_validate_signalflow_all_missing():
     import asyncio
     from unittest.mock import AsyncMock
 
-    from dashforge.validation import validate_signalflow_queries
+    from tacit.validation import validate_signalflow_queries
 
     mock_client = AsyncMock()
     mock_client.get_metric = AsyncMock(side_effect=Exception("404"))

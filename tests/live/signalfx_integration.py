@@ -25,14 +25,14 @@ import httpx
 import pytest
 import structlog
 
-# Ensure dashforge is importable
+# Ensure tacit is importable
 sys.path.insert(0, ".")
 
-from dashforge.config import settings
-from dashforge.models.schemas import DashboardSpec, PanelQuery, PanelSpec
-from dashforge.signalfx.client import SignalFxClient
-from dashforge.signalfx.discovery import discover_metrics
-from dashforge.signalfx.publisher import publish_dashboard
+from tacit.config import settings
+from tacit.models.schemas import DashboardSpec, PanelQuery, PanelSpec
+from tacit.signalfx.client import SignalFxClient
+from tacit.signalfx.discovery import discover_metrics
+from tacit.signalfx.publisher import publish_dashboard
 
 logger = structlog.get_logger()
 
@@ -51,32 +51,32 @@ async def client():
 # ── Dummy metrics to ingest ──────────────────────────────────────────────────
 
 DUMMY_METRICS = {
-    "dashforge.test.http_request_duration_seconds": {
+    "tacit.test.http_request_duration_seconds": {
         "type": "gauge",
         "dimensions": {"service": "checkout", "method": "GET", "endpoint": "/api/orders"},
         "values": [0.045, 0.052, 0.048, 0.12, 0.063, 0.055],
     },
-    "dashforge.test.http_requests_total": {
+    "tacit.test.http_requests_total": {
         "type": "counter",
         "dimensions": {"service": "checkout", "method": "GET", "status_code": "200"},
         "values": [100, 150, 200, 250, 300, 350],
     },
-    "dashforge.test.cpu_utilization_percent": {
+    "tacit.test.cpu_utilization_percent": {
         "type": "gauge",
         "dimensions": {"host": "web-01", "service": "checkout"},
         "values": [45.2, 52.1, 48.7, 67.3, 55.0, 61.2],
     },
-    "dashforge.test.memory_used_bytes": {
+    "tacit.test.memory_used_bytes": {
         "type": "gauge",
         "dimensions": {"host": "web-01", "service": "checkout"},
         "values": [2_147_483_648, 2_200_000_000, 2_300_000_000, 2_250_000_000],
     },
-    "dashforge.test.error_rate": {
+    "tacit.test.error_rate": {
         "type": "gauge",
         "dimensions": {"service": "checkout", "error_type": "timeout"},
         "values": [0.02, 0.03, 0.05, 0.08, 0.04, 0.03],
     },
-    "dashforge.test.queue_depth": {
+    "tacit.test.queue_depth": {
         "type": "gauge",
         "dimensions": {"queue": "order-processing", "service": "checkout"},
         "values": [12, 18, 25, 42, 30, 15],
@@ -151,7 +151,7 @@ def wait_for_indexing(realm: str, token: str, max_wait: int = 60) -> bool:
     """Poll the metric API until our test metrics are discoverable."""
     api_url = f"https://api.{realm}.signalfx.com/v2/metric"
     headers = {"X-SF-TOKEN": token}
-    target = "dashforge.test.http_request_duration_seconds"
+    target = "tacit.test.http_request_duration_seconds"
 
     _info(f"Waiting for metrics to be indexed (up to {max_wait}s)...")
     start = time.time()
@@ -180,10 +180,10 @@ def wait_for_indexing(realm: str, token: str, max_wait: int = 60) -> bool:
 
 async def test_discovery(client: SignalFxClient) -> list:
     """Test direct metric discovery using our test keywords."""
-    keywords = ["http", "cpu", "error", "queue", "dashforge.test"]
+    keywords = ["http", "cpu", "error", "queue", "tacit.test"]
     entries = await discover_metrics(client, keywords)
 
-    test_metrics = [e for e in entries if e.name.startswith("dashforge.test.")]
+    test_metrics = [e for e in entries if e.name.startswith("tacit.test.")]
 
     if test_metrics:
         _ok(f"Discovery found {len(entries)} total metrics, {len(test_metrics)} test metrics:")
@@ -191,7 +191,7 @@ async def test_discovery(client: SignalFxClient) -> list:
             dims_str = f" dims=[{', '.join(m.dimensions[:3])}]" if m.dimensions else ""
             _info(f"  {m.name}{dims_str}")
     else:
-        _fail(f"Discovery found {len(entries)} metrics but none matching 'dashforge.test.*'")
+        _fail(f"Discovery found {len(entries)} metrics but none matching 'tacit.test.*'")
 
     return entries
 
@@ -202,10 +202,10 @@ async def test_discovery(client: SignalFxClient) -> list:
 async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
     """Test chart + dashboard creation with a real DashboardSpec."""
     spec = DashboardSpec(
-        title="DashForge Integration Test",
+        title="Tacit Integration Test",
         description="Auto-generated test dashboard for SignalFx integration verification",
         timerange="1h",
-        tags=["dashforge-test", "integration-test"],
+        tags=["tacit-test", "integration-test"],
         panels=[
             PanelSpec(
                 title="Request Duration (P99)",
@@ -214,7 +214,7 @@ async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
                 unit="s",
                 queries=[
                     PanelQuery(
-                        expr="data('dashforge.test.http_request_duration_seconds', "
+                        expr="data('tacit.test.http_request_duration_seconds', "
                         "filter=filter('service', 'checkout')).percentile(pct=99).publish(label='P99')",
                         legend_format="P99",
                         datasource_uid="signalfx-direct",
@@ -230,7 +230,7 @@ async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
                 unit="reqps",
                 queries=[
                     PanelQuery(
-                        expr="data('dashforge.test.http_requests_total', "
+                        expr="data('tacit.test.http_requests_total', "
                         "filter=filter('service', 'checkout')).sum().publish(label='RPS')",
                         legend_format="RPS",
                         datasource_uid="signalfx-direct",
@@ -246,7 +246,7 @@ async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
                 unit="percent",
                 queries=[
                     PanelQuery(
-                        expr="data('dashforge.test.cpu_utilization_percent').mean().publish(label='CPU %')",
+                        expr="data('tacit.test.cpu_utilization_percent').mean().publish(label='CPU %')",
                         legend_format="CPU %",
                         datasource_uid="signalfx-direct",
                         datasource_type="signalfx",
@@ -261,7 +261,7 @@ async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
                 unit="percentunit",
                 queries=[
                     PanelQuery(
-                        expr="data('dashforge.test.error_rate', "
+                        expr="data('tacit.test.error_rate', "
                         "filter=filter('service', 'checkout')).mean().publish(label='Error Rate')",
                         legend_format="Error Rate",
                         datasource_uid="signalfx-direct",
@@ -273,7 +273,7 @@ async def test_publishing(client: SignalFxClient) -> tuple[str, str]:
         ],
     )
 
-    url, dashboard_id = await publish_dashboard(client, spec, group_name="DashForge Test")
+    url, dashboard_id = await publish_dashboard(client, spec, group_name="Tacit Test")
 
     if url and dashboard_id:
         _ok(f"Dashboard created: {dashboard_id}")
@@ -311,7 +311,7 @@ async def main():
     realm = settings.signalfx_realm
 
     if not api_token:
-        _fail("SIGNALFX_API_TOKEN not set. Configure it in ~/.dashforge/.env")
+        _fail("SIGNALFX_API_TOKEN not set. Configure it in ~/.tacit/.env")
         sys.exit(1)
 
     _header("SignalFx Integration Test")

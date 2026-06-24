@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for taking a look at DashForge. This repository is in public beta, so the
+Thanks for taking a look at Tacit. This repository is in public beta, so the
 bar for contributions is practical: keep changes small, testable, and honest
 about what is supported versus experimental.
 
@@ -8,7 +8,7 @@ about what is supported versus experimental.
 
 ```bash
 uv sync --all-extras --dev
-uv run dashforge --version
+uv run tacit --version
 ```
 
 For local demos:
@@ -28,9 +28,9 @@ Run these before opening a PR:
 ```bash
 uv run ruff check .
 uv run black --check .
-uv run mypy dashforge
+uv run mypy tacit
 uv run pytest -q
-docker build -t dashforge:local .
+docker build -t tacit:local .
 ```
 
 Live vendor scripts under `tests/live/` are not part of the hermetic test suite.

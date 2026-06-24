@@ -1,6 +1,6 @@
 # Real Telemetry Dataset Testing Roadmap
 
-DashForge's current validation suite is useful for deterministic regression testing, but much of its telemetry is synthetic. This roadmap adds public observability datasets in controlled milestones so DashForge can be evaluated against real metric catalogs, real service topologies, and labeled incidents.
+Tacit's current validation suite is useful for deterministic regression testing, but much of its telemetry is synthetic. This roadmap adds public observability datasets in controlled milestones so Tacit can be evaluated against real metric catalogs, real service topologies, and labeled incidents.
 
 Grafana remains the visualization and datasource-discovery layer. It is not the telemetry store. Metrics are loaded into a Prometheus-compatible time-series database; logs and traces remain in their native backends and are introduced only when investigation-plan generation is ready to use them as evidence.
 
@@ -27,16 +27,16 @@ flowchart LR
     D --> G[Grafana]
     E --> G
     F --> G
-    G --> H[DashForge]
+    G --> H[Tacit]
     C --> I[Evaluation harness]
     H --> I
 ```
 
-VictoriaMetrics is exposed to Grafana as a standard Prometheus datasource, so the existing DashForge Prometheus adapter and PromQL compiler remain the integration boundary. The OpenTelemetry Collector accepts official OTLP fixtures and forwards their metrics through Prometheus remote write.
+VictoriaMetrics is exposed to Grafana as a standard Prometheus datasource, so the existing Tacit Prometheus adapter and PromQL compiler remain the integration boundary. The OpenTelemetry Collector accepts official OTLP fixtures and forwards their metrics through Prometheus remote write.
 
 ## Dataset Inventory
 
-| Dataset | Signals | Ground truth | Scale / access | Primary DashForge use |
+| Dataset | Signals | Ground truth | Scale / access | Primary Tacit use |
 |---|---|---|---|---|
 | [ClickStack sample](https://clickhouse.com/docs/use-cases/observability/clickstack/getting-started/sample-data) | Metrics, logs, traces | Checkout failure caused by a full payment cache | Small OTLP JSON archive | Demo and end-to-end multimodal smoke test |
 | [LO2](https://zenodo.org/records/14265858) | Primarily service logs; sparse metrics and mostly empty/single-span traces | Correct runs, expected OAuth2 rejection cases, and a small number of broken runs | 1.1 GB sample; 46.5 GB full archive, about 540 GB expanded | Negative-control, missing-artifact, log-noise, and ingestion-scale evaluation |
@@ -44,7 +44,7 @@ VictoriaMetrics is exposed to Grafana as a standard Prometheus datasource, so th
 | [Alibaba microservice trace 2021](https://github.com/alibaba/clusterdata/blob/master/cluster-trace-microservices-v2021/README.md) | Node/container metrics, call rate, response time, call graphs | Production behavior rather than injected fault labels | About 61 GB compressed | Scale, cardinality, topology, and downstream-latency evaluation |
 | [Illinois/FIRM traces](https://databank.illinois.edu/datasets/IDB-6738796) | Unsampled preprocessed traces | Anomaly target encoded by file; execution paths supplied | 2.98 GB; CC0 | Trace culprit ranking across four benchmark applications |
 
-LO2 is not a primary root-cause accuracy benchmark. Its appendix reports 1,740 correct runs out of 93,583, 934,935 empty artifacts, and an almost-always-empty aggregate Jaeger trace. Correct and error cases also have sharply different artifact sizes, creating an easy leakage path through run duration and file volume. Use LO2 to test whether DashForge avoids inventing infrastructure causes for expected functional rejections, handles sparse artifacts, retrieves evidence from very noisy logs, and scales ingestion. Any LO2 evaluation must exclude filenames, expected HTTP outcomes, artifact size, run duration, and missing-file counts from model evidence and scoring.
+LO2 is not a primary root-cause accuracy benchmark. Its appendix reports 1,740 correct runs out of 93,583, 934,935 empty artifacts, and an almost-always-empty aggregate Jaeger trace. Correct and error cases also have sharply different artifact sizes, creating an easy leakage path through run duration and file volume. Use LO2 to test whether Tacit avoids inventing infrastructure causes for expected functional rejections, handles sparse artifacts, retrieves evidence from very noisy logs, and scales ingestion. Any LO2 evaluation must exclude filenames, expected HTTP outcomes, artifact size, run duration, and missing-file counts from model evidence and scoring.
 
 The Illinois dataset should remain trace-shaped; converting component duration vectors into synthetic metrics would discard its execution-path and culprit-localization value.
 
@@ -113,7 +113,7 @@ Tie the first real-data milestone directly to the existing checkout incident dem
 
 - Grafana reports the real-telemetry datasource healthy.
 - At least one OTLP metric is queryable through Grafana's datasource proxy.
-- DashForge discovers the imported catalog without a custom adapter.
+- Tacit discovers the imported catalog without a custom adapter.
 - The generated dashboard contains non-empty real-data panels.
 - The run produces one successful investigation-history record.
 - The demo remains runnable with one documented command after the stack starts.
@@ -192,9 +192,9 @@ Use the frozen convention-faithful GAMMA slice only as a regression guard; it is
 - ingest CPU, memory, I/O, network, and request-latency time series;
 - model interference intensity, duration, VM, and affected services in manifests;
 - cover single-resource and simultaneous bottlenecks;
-- test whether DashForge ranks multiple plausible causes without flooding the dashboard.
+- test whether Tacit ranks multiple plausible causes without flooding the dashboard.
 
-**Pilot gates:** reproducible download and checksum, schema inventory, machine-readable ground truth, bounded labels, timestamp alignment, successful VictoriaMetrics import, Grafana discovery, and at least one non-empty DashForge investigation using real GAMMA metrics.
+**Pilot gates:** reproducible download and checksum, schema inventory, machine-readable ground truth, bounded labels, timestamp alignment, successful VictoriaMetrics import, Grafana discovery, and at least one non-empty Tacit investigation using real GAMMA metrics.
 
 **Evaluation gates:** fault-type recall, culprit-service top-k accuracy, mixed-bottleneck recall, unsupported-cause rate, and bounded panel duplication. Record cold-start and learned-dashboard results separately, and preserve the first real-corpus result as the untuned baseline.
 
@@ -218,7 +218,7 @@ candidate evidence, followed by culprit top-k scoring.
 - preserve joins among node, service, and instance IDs;
 - establish catalog-size, label-cardinality, ingestion-throughput, discovery-latency, and query-cost budgets.
 
-**Exit gates:** full metric corpus imports without loading archives wholly into memory, DashForge discovers useful signals under catalog limits, and representative queries stay within the agreed latency budget.
+**Exit gates:** full metric corpus imports without loading archives wholly into memory, Tacit discovers useful signals under catalog limits, and representative queries stay within the agreed latency budget.
 
 ### M4: ClickStack Logs and Traces
 
@@ -241,7 +241,7 @@ candidate evidence, followed by culprit top-k scoring.
 - use anomaly-target filenames as ground truth;
 - evaluate culprit ranking independently from metric selection.
 
-**Exit gates:** execution paths survive conversion, trace IDs remain out of metric labels, and the injected component appears in DashForge's top-k investigation steps.
+**Exit gates:** execution paths survive conversion, trace IDs remain out of metric labels, and the injected component appears in Tacit's top-k investigation steps.
 
 ### M6: LO2 Negative-Control and Log-Scale Run
 

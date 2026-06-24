@@ -13,9 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from dashforge.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
-from dashforge.backends.base import DashboardFeatures
-from dashforge.dashboard_ingest import (
+from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from tacit.backends.base import DashboardFeatures
+from tacit.dashboard_ingest import (
     approve_ingested_dashboard_record,
     build_learning_impact_report,
     build_signal_quality_report,
@@ -26,9 +26,9 @@ from dashforge.dashboard_ingest import (
     parse_dashboard_json,
     reject_ingested_dashboard_record,
 )
-from dashforge.dashboard_uploads import parse_uploaded_dashboard
-from dashforge.models.schemas import MetricEntry
-from dashforge.signals import (
+from tacit.dashboard_uploads import parse_uploaded_dashboard
+from tacit.models.schemas import MetricEntry
+from tacit.signals import (
     SignalStore,
     _context_matches,
     _effective_confidence,
@@ -52,15 +52,15 @@ def signal_store_with_bootstrap(tmp_path, monkeypatch):
 
     Also redirects the global ``get_signal_store`` accessor to this fresh store so
     helpers like ``infer_signals_from_metrics`` (which resolve the store globally)
-    don't read the developer's persisted ``data/dashforge_signals.db``. Without
+    don't read the developer's persisted ``data/tacit_signals.db``. Without
     this, a stale local DB can make tests pass locally while failing on a hermetic
     CI runner.
     """
     db_path = tmp_path / "test_signals.db"
     store = SignalStore(db_path=db_path)
     store.load_from_yaml()
-    import dashforge.dashboard_ingest as _ingest
-    import dashforge.signals as _signals
+    import tacit.dashboard_ingest as _ingest
+    import tacit.signals as _signals
 
     monkeypatch.setattr(_signals, "get_signal_store", lambda: store)
     monkeypatch.setattr(_ingest, "get_signal_store", lambda: store)
@@ -549,7 +549,7 @@ class TestSignalResolution:
 class TestArchetypeMetricSubstitution:
 
     def test_apply_metric_substitutions(self):
-        from dashforge.archetypes.engine import _apply_metric_substitutions
+        from tacit.archetypes.engine import _apply_metric_substitutions
 
         archetype = InvestigationArchetype(
             id="test_auth",
@@ -588,7 +588,7 @@ class TestArchetypeMetricSubstitution:
         assert "sso_auth_failures_total" in result.panels[1].queries[0].expr
 
     def test_no_substitution_returns_same(self):
-        from dashforge.archetypes.engine import _apply_metric_substitutions
+        from tacit.archetypes.engine import _apply_metric_substitutions
 
         archetype = InvestigationArchetype(
             id="test",
@@ -1163,7 +1163,7 @@ class TestIngestedDashboards:
 
     @pytest.mark.asyncio
     async def test_ingest_dashboard_persists_generated_archetype(self, signal_store, monkeypatch):
-        from dashforge import dashboard_ingest as di
+        from tacit import dashboard_ingest as di
 
         class FakeBackend:
             async def ingest_dashboard(self, uid):
@@ -1202,12 +1202,12 @@ class TestIngestedDashboards:
 
     @pytest.mark.asyncio
     async def test_auto_approve_registers_generated_archetype(self, signal_store, monkeypatch, tmp_path):
-        from dashforge import dashboard_ingest as di
+        from tacit import dashboard_ingest as di
 
         monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
         monkeypatch.setattr(di.settings, "learning_auto_register_archetype", True)
         archetype_path = tmp_path / "learned_archetypes.yaml"
-        monkeypatch.setenv("DASHFORGE_ARCHETYPES_PATH", str(archetype_path))
+        monkeypatch.setenv("TACIT_ARCHETYPES_PATH", str(archetype_path))
 
         features = DashboardFeatures(
             dashboard_uid="checkout-autoreg",
@@ -1234,7 +1234,7 @@ class TestIngestedDashboards:
 
     @pytest.mark.asyncio
     async def test_auto_approve_keeps_held_candidates_out_of_approved_context(self, signal_store, monkeypatch):
-        from dashforge import dashboard_ingest as di
+        from tacit import dashboard_ingest as di
 
         monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
         features = DashboardFeatures(
@@ -1278,11 +1278,11 @@ class TestIngestedDashboards:
         assert candidate[0]["review_state"] == "candidate"
 
     def test_manual_approval_registers_generated_archetype(self, signal_store, monkeypatch, tmp_path):
-        from dashforge import dashboard_ingest as di
+        from tacit import dashboard_ingest as di
 
         monkeypatch.setattr(di.settings, "learning_auto_register_archetype", True)
         archetype_path = tmp_path / "learned_archetypes.yaml"
-        monkeypatch.setenv("DASHFORGE_ARCHETYPES_PATH", str(archetype_path))
+        monkeypatch.setenv("TACIT_ARCHETYPES_PATH", str(archetype_path))
 
         signal_store.record_ingested_dashboard(
             "checkout-manual",
@@ -1485,7 +1485,7 @@ archetypes:
 
     @pytest.mark.asyncio
     async def test_auto_approve_honors_heuristic_auto_teach_gate(self, signal_store, monkeypatch):
-        from dashforge import dashboard_ingest as di
+        from tacit import dashboard_ingest as di
 
         features = DashboardFeatures(
             dashboard_uid="memory-context",
@@ -1647,7 +1647,7 @@ archetypes:
 
     @pytest.mark.asyncio
     async def test_before_after_learning_fixture_resolves_custom_checkout_metrics(self, signal_store, monkeypatch):
-        from dashforge import dashboard_ingest as di
+        from tacit import dashboard_ingest as di
 
         monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
         catalog = [
@@ -1740,8 +1740,8 @@ archetypes:
 
     @pytest.mark.asyncio
     async def test_bulk_auto_approve_registers_archetypes_once(self, signal_store, monkeypatch):
-        import dashforge.backends as backends_mod
-        from dashforge import dashboard_ingest as di
+        import tacit.backends as backends_mod
+        from tacit import dashboard_ingest as di
 
         class FakeBackend:
             name = "grafana"
@@ -1985,13 +1985,13 @@ class TestSignalFlowExtraction:
     """Test SignalFlow metric name and pattern extraction."""
 
     def test_simple_data_call(self):
-        from dashforge.backends.signalfx import _extract_metrics_from_signalflow
+        from tacit.backends.signalfx import _extract_metrics_from_signalflow
 
         metrics = _extract_metrics_from_signalflow("data('cpu.utilization').publish()")
         assert metrics == ["cpu.utilization"]
 
     def test_multiple_data_calls(self):
-        from dashforge.backends.signalfx import _extract_metrics_from_signalflow
+        from tacit.backends.signalfx import _extract_metrics_from_signalflow
 
         program = """
         A = data('requests.count', filter=filter('service', 'api')).publish()
@@ -2003,13 +2003,13 @@ class TestSignalFlowExtraction:
         assert len(metrics) == 2
 
     def test_data_with_double_quotes(self):
-        from dashforge.backends.signalfx import _extract_metrics_from_signalflow
+        from tacit.backends.signalfx import _extract_metrics_from_signalflow
 
         metrics = _extract_metrics_from_signalflow('data("memory.usage").publish()')
         assert metrics == ["memory.usage"]
 
     def test_analytics_patterns(self):
-        from dashforge.backends.signalfx import _extract_signalflow_patterns
+        from tacit.backends.signalfx import _extract_signalflow_patterns
 
         program = "data('cpu.utilization').mean().percentile(pct=95).publish()"
         patterns = _extract_signalflow_patterns(program)
@@ -2018,7 +2018,7 @@ class TestSignalFlowExtraction:
         assert "percentile" in agg_names
 
     def test_rate_and_sum(self):
-        from dashforge.backends.signalfx import _extract_signalflow_patterns
+        from tacit.backends.signalfx import _extract_signalflow_patterns
 
         program = "data('requests.count').sum().rate().publish()"
         patterns = _extract_signalflow_patterns(program)
@@ -2027,7 +2027,7 @@ class TestSignalFlowExtraction:
         assert "rate" in agg_names
 
     def test_no_metrics(self):
-        from dashforge.backends.signalfx import _extract_metrics_from_signalflow
+        from tacit.backends.signalfx import _extract_metrics_from_signalflow
 
         assert _extract_metrics_from_signalflow("") == []
         assert _extract_metrics_from_signalflow("publish()") == []
@@ -2072,7 +2072,7 @@ class TestDashboardFeatures:
         assert f.query_language == "signalflow"
 
     def test_features_to_dict(self):
-        from dashforge.dashboard_ingest import _features_to_dict
+        from tacit.dashboard_ingest import _features_to_dict
 
         f = DashboardFeatures(
             dashboard_uid="test",
@@ -2234,7 +2234,7 @@ class TestSignalCoverageDashboard:
 
     def test_dashboard_tags(self, extracted):
         tags = extracted["dashboard_tags"]
-        assert "dashforge" in tags or "signals" in tags
+        assert "tacit" in tags or "signals" in tags
 
     # ── Signal inference ───────────────────────────────────────────────
 
@@ -2289,7 +2289,7 @@ class TestSignalCoverageDashboard:
         # the signal_type in the bootstrap yaml
         import yaml
 
-        resource = files("dashforge.data").joinpath("signals.yaml")
+        resource = files("tacit.data").joinpath("signals.yaml")
         with resource.open() as f:
             data = yaml.safe_load(f)
         sig_defs = data.get("signals", {})
@@ -2403,11 +2403,11 @@ class TestArchetypeYamlBraceEscaping:
         assert "[ 1m ]" in expr.format(service_filter="", container_filter="", rate_interval="1m")
 
     def test_kafka_topic_selector_literal_braces_compile(self):
-        from dashforge.archetypes.engine import compile_archetype
-        from dashforge.archetypes.templates import _load_archetypes_from_yaml
-        from dashforge.models.schemas import ArchetypeMatch, Intent
+        from tacit.archetypes.engine import compile_archetype
+        from tacit.archetypes.templates import _load_archetypes_from_yaml
+        from tacit.models.schemas import ArchetypeMatch, Intent
 
-        archetypes = _load_archetypes_from_yaml(Path(__file__).resolve().parents[2] / "dashforge/data/archetypes.yaml")
+        archetypes = _load_archetypes_from_yaml(Path(__file__).resolve().parents[2] / "tacit/data/archetypes.yaml")
         archetype = next(a for a in archetypes if a.id == "kafka_topic_throughput")
         intent = Intent(
             summary="kafka topic imbalance",
@@ -2441,8 +2441,8 @@ class TestArchetypeYamlBraceEscaping:
 class TestSignalFlowCompileCompatibility:
 
     def test_raw_signalfx_query_is_not_recompiled_as_promql(self):
-        from dashforge.archetypes.engine import compile_archetype
-        from dashforge.models.schemas import ArchetypeMatch, Intent
+        from tacit.archetypes.engine import compile_archetype
+        from tacit.models.schemas import ArchetypeMatch, Intent
 
         archetype = InvestigationArchetype(
             id="sfx_cpu",
@@ -2488,8 +2488,8 @@ class TestSignalFlowCompileCompatibility:
         assert spec.panels[0].queries[0].expr == "data('cpu.utilization').publish()"
 
     def test_explicit_query_language_marks_raw_signalflow(self):
-        from dashforge.archetypes.engine import compile_archetype
-        from dashforge.models.schemas import ArchetypeMatch, Intent
+        from tacit.archetypes.engine import compile_archetype
+        from tacit.models.schemas import ArchetypeMatch, Intent
 
         archetype = InvestigationArchetype(
             id="sfx_cpu_language",
@@ -2559,7 +2559,7 @@ class TestSuffixAwareMetricSubstitution:
 
     def test_base_metric_replaced(self):
         """Simple base metric replacement still works."""
-        from dashforge.archetypes.engine import _apply_metric_substitutions
+        from tacit.archetypes.engine import _apply_metric_substitutions
 
         arch = self._make_archetype(
             expr="rate(http_request_duration_seconds[5m])",
@@ -2576,7 +2576,7 @@ class TestSuffixAwareMetricSubstitution:
     def test_suffixed_variant_no_double_suffix(self):
         """Replacing base metric when the template uses _bucket suffix.
         The resolved metric is the base form, so the suffix should survive."""
-        from dashforge.archetypes.engine import _apply_metric_substitutions
+        from tacit.archetypes.engine import _apply_metric_substitutions
 
         arch = self._make_archetype(
             expr="histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))",
@@ -2594,7 +2594,7 @@ class TestSuffixAwareMetricSubstitution:
     def test_resolved_metric_already_suffixed(self):
         """When the catalog match is already a suffixed form (e.g. _bucket),
         replacing the base binding should NOT produce double suffix."""
-        from dashforge.archetypes.engine import _apply_metric_substitutions
+        from tacit.archetypes.engine import _apply_metric_substitutions
 
         arch = self._make_archetype(
             expr="histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))",
@@ -2614,7 +2614,7 @@ class TestSuffixAwareMetricSubstitution:
 
     def test_multiple_suffixes_in_one_expression(self):
         """An expression referencing both _bucket and _count of the same base."""
-        from dashforge.archetypes.engine import _apply_metric_substitutions
+        from tacit.archetypes.engine import _apply_metric_substitutions
 
         arch = self._make_archetype(
             expr=(
@@ -2636,7 +2636,7 @@ class TestSuffixAwareMetricSubstitution:
         assert "_count_count" not in expr
 
     def test_replacement_not_reprocessed_when_new_metric_contains_old_metric(self):
-        from dashforge.archetypes.engine import _apply_metric_substitutions
+        from tacit.archetypes.engine import _apply_metric_substitutions
 
         arch = self._make_archetype(
             expr="rate(request_duration_seconds_bucket[5m])",
@@ -2652,7 +2652,7 @@ class TestSuffixAwareMetricSubstitution:
         assert result.panels[0].queries[0].expr == "rate(custom_request_duration_seconds_bucket[5m])"
 
     def test_replacement_obeys_metric_token_boundaries(self):
-        from dashforge.archetypes.engine import _apply_metric_substitutions
+        from tacit.archetypes.engine import _apply_metric_substitutions
 
         arch = self._make_archetype(
             expr="rate(foo_request_duration_seconds[5m]) + rate(request_duration_seconds[5m])",
@@ -2671,7 +2671,7 @@ class TestSuffixAwareMetricSubstitution:
         assert "foo_custom_request_duration_seconds" not in expr
 
     def test_already_suffixed_metric_rebases_other_suffixes(self):
-        from dashforge.archetypes.engine import _apply_metric_substitutions
+        from tacit.archetypes.engine import _apply_metric_substitutions
 
         arch = self._make_archetype(
             expr="rate(http_request_duration_seconds_count[5m])",
@@ -2695,7 +2695,7 @@ class TestSuffixAwareMetricSubstitution:
         Template: ...http_request_duration_seconds_bucket...
         Expected: no change (already correct), NOT _bucket_bucket.
         """
-        from dashforge.archetypes.engine import _apply_metric_substitutions
+        from tacit.archetypes.engine import _apply_metric_substitutions
 
         arch = self._make_archetype(
             expr="histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))",
@@ -2896,7 +2896,7 @@ class TestSignalFlowArchetypeGeneration:
 class TestLearningTabRendering:
 
     def _learning_load_section(self) -> str:
-        html = (Path(__file__).parent.parent.parent / "dashforge" / "static" / "index.html").read_text()
+        html = (Path(__file__).parent.parent.parent / "tacit" / "static" / "index.html").read_text()
         return html.split("async function loadIngestedDashboards()", 1)[1].split("async function approveDashboard", 1)[
             0
         ]
@@ -2914,7 +2914,7 @@ class TestLearningTabRendering:
         assert "Generated archetype YAML" in load_section
 
     def test_ingested_dashboard_approval_uses_data_attributes_not_inline_js(self):
-        html = (Path(__file__).parent.parent.parent / "dashforge" / "static" / "index.html").read_text()
+        html = (Path(__file__).parent.parent.parent / "tacit" / "static" / "index.html").read_text()
         load_section = self._learning_load_section()
         assert 'onclick="approveDashboard' not in load_section
         assert "data-dashboard-uid" in load_section

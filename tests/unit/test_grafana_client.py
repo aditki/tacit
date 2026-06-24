@@ -1,7 +1,7 @@
 import pytest
 
-from dashforge.config import settings
-from dashforge.grafana.client import GrafanaClient
+from tacit.config import settings
+from tacit.grafana.client import GrafanaClient
 
 
 @pytest.mark.asyncio

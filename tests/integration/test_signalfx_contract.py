@@ -11,9 +11,9 @@ import json
 import respx
 from httpx import Response
 
-from dashforge.models.schemas import DashboardSpec, PanelQuery, PanelSpec
-from dashforge.signalfx.client import SignalFxClient
-from dashforge.signalfx.publisher import _build_chart_json, _build_dashboard_json
+from tacit.models.schemas import DashboardSpec, PanelQuery, PanelSpec
+from tacit.signalfx.client import SignalFxClient
+from tacit.signalfx.publisher import _build_chart_json, _build_dashboard_json
 from tests.contracts import factories as f
 from tests.contracts.signalfx_models import SignalFxChartCreate, SignalFxDashboardCreate
 
@@ -65,7 +65,7 @@ async def test_create_chart_post_contract():
         await client.close()
 
     assert created["id"] == "CHART1"
-    # DashForge's outgoing chart body satisfies the SignalFx chart contract.
+    # Tacit's outgoing chart body satisfies the SignalFx chart contract.
     sent = json.loads(route.calls.last.request.content)
     chart = SignalFxChartCreate.model_validate(sent)
     assert chart.name == "CPU"
@@ -75,10 +75,10 @@ async def test_create_chart_post_contract():
 @respx.mock
 async def test_create_dashboard_post_contract():
     route = respx.post(f"{SFX_BASE}/v2/dashboard").mock(
-        return_value=Response(200, json=f.signalfx_dashboard_response(dash_id="DASH1", name="DashForge"))
+        return_value=Response(200, json=f.signalfx_dashboard_response(dash_id="DASH1", name="Tacit"))
     )
     spec = DashboardSpec(
-        title="DashForge",
+        title="Tacit",
         tags=["sre"],
         timerange="1h",
         panels=[],
@@ -93,4 +93,4 @@ async def test_create_dashboard_post_contract():
     assert created["id"] == "DASH1"
     sent = json.loads(route.calls.last.request.content)
     dashboard = SignalFxDashboardCreate.model_validate(sent)
-    assert dashboard.name == "DashForge"
+    assert dashboard.name == "Tacit"

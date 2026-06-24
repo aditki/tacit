@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-import dashforge.pipeline as pipeline_mod
-from dashforge.api.app import create_app
-from dashforge.backends.base import DashboardFeatures
-from dashforge.config import Settings
-from dashforge.models.schemas import DashRequest, DashResponse
+import tacit.pipeline as pipeline_mod
+from tacit.api.app import create_app
+from tacit.backends.base import DashboardFeatures
+from tacit.config import Settings
+from tacit.models.schemas import DashRequest, DashResponse
 
 
 def test_chart_route_uses_app_scoped_pipeline_settings(monkeypatch):
@@ -30,7 +30,7 @@ def test_chart_route_uses_app_scoped_pipeline_settings(monkeypatch):
         )
 
     monkeypatch.setattr(pipeline_mod, "get_active_backends", fake_get_active_backends)
-    monkeypatch.setattr("dashforge.api.routes.dashboard.run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr("tacit.api.routes.dashboard.run_pipeline", fake_run_pipeline)
 
     response = TestClient(app).post("/api/v1/chart", json={"prompt": "checkout latency"})
 
@@ -51,7 +51,7 @@ def test_api_auth_uses_app_scoped_settings(monkeypatch):
             summary=request.prompt,
         )
 
-    monkeypatch.setattr("dashforge.api.routes.dashboard.run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr("tacit.api.routes.dashboard.run_pipeline", fake_run_pipeline)
     client = TestClient(app)
 
     assert client.post("/api/v1/chart", json={"prompt": "checkout latency"}).status_code == 401
@@ -93,8 +93,8 @@ def test_learning_dashboard_route_uses_app_scoped_backend_settings(monkeypatch):
     async def fake_ingest_features(features, **kwargs):
         return {"dashboard_uid": features.dashboard_uid, "backend": features.backend_name}
 
-    monkeypatch.setattr("dashforge.backends.get_active_backends", fake_get_active_backends)
-    monkeypatch.setattr("dashforge.dashboard_ingest.service.ingest_dashboard_features", fake_ingest_features)
+    monkeypatch.setattr("tacit.backends.get_active_backends", fake_get_active_backends)
+    monkeypatch.setattr("tacit.dashboard_ingest.service.ingest_dashboard_features", fake_ingest_features)
 
     response = TestClient(app).post(
         "/api/v1/learn/dashboard",
@@ -124,7 +124,7 @@ def test_learning_backend_route_uses_app_scoped_backend_settings(monkeypatch):
         seen_settings.append(settings_arg)
         return [FakeBackend()]
 
-    monkeypatch.setattr("dashforge.backends.get_active_backends", fake_get_active_backends)
+    monkeypatch.setattr("tacit.backends.get_active_backends", fake_get_active_backends)
 
     response = TestClient(app).post("/api/v1/learn/grafana?limit=1")
 

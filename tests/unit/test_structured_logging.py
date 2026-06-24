@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import structlog
 
-from dashforge.agents.providers.base import LLMResult, TokenUsage
+from tacit.agents.providers.base import LLMResult, TokenUsage
 
 # ── TokenUsage ────────────────────────────────────────────────────────────────
 
@@ -57,7 +57,7 @@ def test_llm_result_with_usage():
 
 
 def test_bind_request_id_generates_id():
-    from dashforge.logging import bind_request_id, unbind_request_id
+    from tacit.logging import bind_request_id, unbind_request_id
 
     rid = bind_request_id()
     assert len(rid) == 12
@@ -65,7 +65,7 @@ def test_bind_request_id_generates_id():
 
 
 def test_bind_request_id_uses_provided():
-    from dashforge.logging import bind_request_id, unbind_request_id
+    from tacit.logging import bind_request_id, unbind_request_id
 
     rid = bind_request_id("custom-id-123")
     assert rid == "custom-id-123"
@@ -75,7 +75,7 @@ def test_bind_request_id_uses_provided():
 def test_bind_unbind_cycle():
     from structlog.contextvars import get_contextvars
 
-    from dashforge.logging import bind_request_id, unbind_request_id
+    from tacit.logging import bind_request_id, unbind_request_id
 
     bind_request_id("test-rid")
     ctx = get_contextvars()
@@ -89,7 +89,7 @@ def test_bind_unbind_cycle():
 
 
 def test_stage_log_emits_event():
-    from dashforge.logging import bind_request_id, stage_log, unbind_request_id
+    from tacit.logging import bind_request_id, stage_log, unbind_request_id
 
     captured = {}
 
@@ -135,7 +135,7 @@ def test_stage_log_emits_event():
 
 
 def test_stage_log_without_token_usage():
-    from dashforge.logging import stage_log
+    from tacit.logging import stage_log
 
     captured = {}
 
@@ -172,7 +172,7 @@ def test_stage_log_without_token_usage():
 def test_call_llm_returns_tuple():
     from pydantic import BaseModel
 
-    from dashforge.agents.llm import call_llm
+    from tacit.agents.llm import call_llm
 
     class Simple(BaseModel):
         v: int
@@ -185,7 +185,7 @@ def test_call_llm_returns_tuple():
         )
     )
 
-    with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+    with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
         model, usage = asyncio.run(call_llm("sys", "user", Simple))
 
     assert model.v == 42
@@ -197,7 +197,7 @@ def test_call_llm_accumulates_repair_tokens():
     """When JSON repair is needed, tokens from both calls are accumulated."""
     from pydantic import BaseModel
 
-    from dashforge.agents.llm import call_llm
+    from tacit.agents.llm import call_llm
 
     class Simple(BaseModel):
         v: int
@@ -216,7 +216,7 @@ def test_call_llm_accumulates_repair_tokens():
         ]
     )
 
-    with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+    with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
         model, usage = asyncio.run(call_llm("sys", "user", Simple))
 
     assert model.v == 7
@@ -228,7 +228,7 @@ def test_call_llm_accumulates_repair_tokens():
 
 
 def test_classify_intent_returns_usage():
-    from dashforge.agents.intent import classify_intent
+    from tacit.agents.intent import classify_intent
 
     intent_json = json.dumps(
         {
@@ -251,7 +251,7 @@ def test_classify_intent_returns_usage():
         )
     )
 
-    with patch("dashforge.agents.llm.get_provider", return_value=mock_provider):
+    with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
         intent, usage = asyncio.run(classify_intent("high cpu"))
 
     assert intent.domain == "general"

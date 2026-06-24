@@ -1,6 +1,6 @@
 """Pydantic contract models for the Prometheus HTTP API (via Grafana proxy).
 
-DashForge reads:
+Tacit reads:
   GET .../api/v1/label/__name__/values  -> {status, data: [metric names]}
   GET .../api/v1/series?match[]=metric  -> {status, data: [{__name__, label: val}]}
 """

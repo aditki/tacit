@@ -1,6 +1,6 @@
 """Pydantic contract models for the Elasticsearch / OpenSearch _mapping API.
 
-DashForge reads (via Grafana proxy):
+Tacit reads (via Grafana proxy):
   GET .../{index}/_mapping -> {index: {mappings: {properties: {field: {type}}}}}
 """
 

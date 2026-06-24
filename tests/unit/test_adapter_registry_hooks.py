@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from dashforge.grafana.adapters.base import DatasourceAdapter
-from dashforge.grafana.adapters.registry import (
+from tacit.grafana.adapters.base import DatasourceAdapter
+from tacit.grafana.adapters.registry import (
     get_adapter_for_type,
     register_adapter_factory,
     reset_adapters_for_tests,
     supported_datasource_types,
 )
-from dashforge.grafana.client import GrafanaClient
-from dashforge.models.schemas import DatasourceInfo, MetricEntry
+from tacit.grafana.client import GrafanaClient
+from tacit.models.schemas import DatasourceInfo, MetricEntry
 
 
 class DummyAdapter(DatasourceAdapter):

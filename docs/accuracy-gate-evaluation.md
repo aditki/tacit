@@ -1,4 +1,4 @@
-# DashForge Accuracy Gates — Current Evaluation
+# Tacit Accuracy Gates — Current Evaluation
 
 This document defines the accuracy gates, records measured results, and tracks
 remaining risks before large-dataset ingestion. Curated offline slices and repeated
@@ -209,7 +209,7 @@ found **48 of 115 phrases (42%) appeared near-verbatim in the 30-prompt corpus**
 the synonyms-only deterministic floor hit reworded 6/6 — a textbook test-leakage
 signal, since the table was both tuned and measured on the same prompts.
 
-**Corrected architecture — two tiers with provenance** (`dashforge/agents/synonyms.py`):
+**Corrected architecture — two tiers with provenance** (`tacit/agents/synonyms.py`):
 
 - *Conventional* (high precision, dataset-independent): standard SRE terms, vendor
   aliases, abbreviations (`redis`/`memcached` → cache, `oom` → memory, `5xx` →

@@ -4,8 +4,8 @@ __pycache__/
 dist/
 build/
 .env
-dashforge.yaml
-dashforge.yml
+tacit.yaml
+tacit.yml
 config/
 .venv/
 venv/
@@ -13,8 +13,8 @@ venv/
 .DS_Store
 grafana_data/
 data/
-!dashforge/data/
-!dashforge/data/**
-dashforge/data/__pycache__/
-dashforge/data/**/*.py[cod]
+!tacit/data/
+!tacit/data/**
+tacit/data/__pycache__/
+tacit/data/**/*.py[cod]
 results.json

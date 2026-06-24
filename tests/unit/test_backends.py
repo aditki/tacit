@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from dashforge.models.schemas import (
+from tacit.models.schemas import (
     ArchetypeMatch,
     DashboardSpec,
     DatasourceInfo,
@@ -81,7 +81,7 @@ def _configure_backend_settings(mock_settings, *, grafana: bool, signalfx: bool,
 
 
 def test_publish_result_defaults():
-    from dashforge.backends.base import PublishResult
+    from tacit.backends.base import PublishResult
 
     r = PublishResult()
     assert r.url == ""
@@ -91,7 +91,7 @@ def test_publish_result_defaults():
 
 
 def test_publish_result_with_values():
-    from dashforge.backends.base import PublishResult
+    from tacit.backends.base import PublishResult
 
     r = PublishResult(url="http://grafana/d/abc", uid="abc", backend_name="grafana")
     assert r.url == "http://grafana/d/abc"
@@ -108,7 +108,7 @@ def test_publish_result_with_values():
 def test_backend_protocol_attributes():
     import inspect
 
-    from dashforge.backends.base import DashboardBackend
+    from tacit.backends.base import DashboardBackend
 
     # Protocol should define these methods
     members = {name for name, _ in inspect.getmembers(DashboardBackend)}
@@ -125,7 +125,7 @@ def test_backend_protocol_attributes():
 
 
 def test_grafana_backend_properties():
-    from dashforge.backends.grafana import GrafanaBackend
+    from tacit.backends.grafana import GrafanaBackend
 
     backend = GrafanaBackend.__new__(GrafanaBackend)
     assert backend.name == "grafana"
@@ -139,7 +139,7 @@ def test_grafana_backend_properties():
 
 
 def test_grafana_backend_discover_metrics():
-    from dashforge.backends.grafana import GrafanaBackend
+    from tacit.backends.grafana import GrafanaBackend
 
     mock_client = AsyncMock()
     backend = GrafanaBackend(client=mock_client)
@@ -155,10 +155,10 @@ def test_grafana_backend_discover_metrics():
     ]
 
     with (
-        patch("dashforge.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list,
-        patch("dashforge.backends.grafana.filter_datasources_by_signal") as mock_filter,
-        patch("dashforge.backends.grafana.filter_searchable_datasources") as mock_searchable,
-        patch("dashforge.backends.grafana.discover_all_metrics", new_callable=AsyncMock) as mock_discover,
+        patch("tacit.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list,
+        patch("tacit.backends.grafana.filter_datasources_by_signal") as mock_filter,
+        patch("tacit.backends.grafana.filter_searchable_datasources") as mock_searchable,
+        patch("tacit.backends.grafana.discover_all_metrics", new_callable=AsyncMock) as mock_discover,
     ):
 
         mock_list.return_value = [MagicMock(type="prometheus")]
@@ -182,14 +182,14 @@ def test_grafana_backend_discover_metrics():
 
 
 def test_grafana_backend_validate_queries():
-    from dashforge.backends.grafana import GrafanaBackend
+    from tacit.backends.grafana import GrafanaBackend
 
     mock_client = AsyncMock()
     backend = GrafanaBackend(client=mock_client)
 
     spec = _make_spec()
 
-    with patch("dashforge.backends.grafana.validate_dashboard_queries", new_callable=AsyncMock) as mock_val:
+    with patch("tacit.backends.grafana.validate_dashboard_queries", new_callable=AsyncMock) as mock_val:
         mock_val.return_value = (spec, [])
         result_spec, warnings = asyncio.run(backend.validate_queries(spec))
         assert len(result_spec.panels) == 1
@@ -205,17 +205,17 @@ def test_grafana_backend_validate_queries():
 
 
 def test_grafana_backend_publish():
-    from dashforge.backends.base import PublishResult
-    from dashforge.backends.grafana import GrafanaBackend
-    from dashforge.config import Settings
+    from tacit.backends.base import PublishResult
+    from tacit.backends.grafana import GrafanaBackend
+    from tacit.config import Settings
 
     mock_client = AsyncMock()
-    runtime_settings = Settings(grafana_url="http://runtime-grafana.test", dashforge_dashboard_folder="Runtime")
+    runtime_settings = Settings(grafana_url="http://runtime-grafana.test", tacit_dashboard_folder="Runtime")
     backend = GrafanaBackend(client=mock_client, runtime_settings=runtime_settings)
 
     spec = _make_spec()
 
-    with patch("dashforge.backends.grafana.publish_dashboard_fn", new_callable=AsyncMock) as mock_pub:
+    with patch("tacit.backends.grafana.publish_dashboard_fn", new_callable=AsyncMock) as mock_pub:
         mock_pub.return_value = ("http://grafana/d/abc", "abc")
         result = asyncio.run(backend.publish(spec))
         assert isinstance(result, PublishResult)
@@ -233,7 +233,7 @@ def test_grafana_backend_publish():
 
 
 def test_signalfx_backend_properties():
-    from dashforge.backends.signalfx import SignalFxBackend
+    from tacit.backends.signalfx import SignalFxBackend
 
     backend = SignalFxBackend.__new__(SignalFxBackend)
     assert backend.name == "signalfx"
@@ -247,7 +247,7 @@ def test_signalfx_backend_properties():
 
 
 def test_signalfx_backend_discover_metrics():
-    from dashforge.backends.signalfx import SignalFxBackend
+    from tacit.backends.signalfx import SignalFxBackend
 
     mock_client = AsyncMock()
     backend = SignalFxBackend(client=mock_client)
@@ -262,7 +262,7 @@ def test_signalfx_backend_discover_metrics():
         ),
     ]
 
-    with patch("dashforge.backends.signalfx.sfx_discover", new_callable=AsyncMock) as mock_disc:
+    with patch("tacit.backends.signalfx.sfx_discover", new_callable=AsyncMock) as mock_disc:
         mock_disc.return_value = fake_entries
         intent = _make_intent()
         result = asyncio.run(backend.discover_metrics(intent.keywords, intent))
@@ -279,14 +279,14 @@ def test_signalfx_backend_discover_metrics():
 
 
 def test_signalfx_backend_validate_queries():
-    from dashforge.backends.signalfx import SignalFxBackend
+    from tacit.backends.signalfx import SignalFxBackend
 
     mock_client = AsyncMock()
     backend = SignalFxBackend(client=mock_client)
 
     spec = _make_spec(query_lang="signalflow", ds_type="signalfx")
 
-    with patch("dashforge.backends.signalfx.validate_signalflow_queries", new_callable=AsyncMock) as mock_val:
+    with patch("tacit.backends.signalfx.validate_signalflow_queries", new_callable=AsyncMock) as mock_val:
         mock_val.return_value = (spec, [])
         result_spec, warnings = asyncio.run(backend.validate_queries(spec))
         assert len(result_spec.panels) == 1
@@ -302,9 +302,9 @@ def test_signalfx_backend_validate_queries():
 
 
 def test_signalfx_backend_publish():
-    from dashforge.backends.base import PublishResult
-    from dashforge.backends.signalfx import SignalFxBackend
-    from dashforge.config import Settings
+    from tacit.backends.base import PublishResult
+    from tacit.backends.signalfx import SignalFxBackend
+    from tacit.config import Settings
 
     mock_client = AsyncMock()
     runtime_settings = Settings(signalfx_dashboard_group="Runtime Group")
@@ -312,7 +312,7 @@ def test_signalfx_backend_publish():
 
     spec = _make_spec(query_lang="signalflow", ds_type="signalfx")
 
-    with patch("dashforge.backends.signalfx.sfx_publish", new_callable=AsyncMock) as mock_pub:
+    with patch("tacit.backends.signalfx.sfx_publish", new_callable=AsyncMock) as mock_pub:
         mock_pub.return_value = ("https://app.us1.signalfx.com/#/dashboard/D123", "D123")
         result = asyncio.run(backend.publish(spec))
         assert isinstance(result, PublishResult)
@@ -330,9 +330,9 @@ def test_signalfx_backend_publish():
 
 
 def test_registry_grafana_only():
-    from dashforge.backends import get_active_backends
+    from tacit.backends import get_active_backends
 
-    with patch("dashforge.backends.settings") as mock_settings:
+    with patch("tacit.backends.settings") as mock_settings:
         _configure_backend_settings(mock_settings, grafana=True, signalfx=False)
         backends = get_active_backends()
         try:
@@ -346,9 +346,9 @@ def test_registry_grafana_only():
 
 
 def test_registry_signalfx_only():
-    from dashforge.backends import get_active_backends
+    from tacit.backends import get_active_backends
 
-    with patch("dashforge.backends.settings") as mock_settings:
+    with patch("tacit.backends.settings") as mock_settings:
         _configure_backend_settings(mock_settings, grafana=False, signalfx=True, token="test-token")
         backends = get_active_backends()
         try:
@@ -362,9 +362,9 @@ def test_registry_signalfx_only():
 
 
 def test_registry_both_enabled():
-    from dashforge.backends import get_active_backends
+    from tacit.backends import get_active_backends
 
-    with patch("dashforge.backends.settings") as mock_settings:
+    with patch("tacit.backends.settings") as mock_settings:
         _configure_backend_settings(mock_settings, grafana=True, signalfx=True, token="test-token")
         backends = get_active_backends()
         try:
@@ -379,9 +379,9 @@ def test_registry_both_enabled():
 
 
 def test_registry_none_enabled():
-    from dashforge.backends import get_active_backends
+    from tacit.backends import get_active_backends
 
-    with patch("dashforge.backends.settings") as mock_settings:
+    with patch("tacit.backends.settings") as mock_settings:
         _configure_backend_settings(mock_settings, grafana=False, signalfx=False)
         backends = get_active_backends()
         assert len(backends) == 0
@@ -390,8 +390,8 @@ def test_registry_none_enabled():
 
 
 def test_registry_uses_explicit_runtime_settings():
-    from dashforge.backends import get_active_backends
-    from dashforge.config import Settings
+    from tacit.backends import get_active_backends
+    from tacit.config import Settings
 
     runtime_settings = Settings(
         grafana_enabled=False,
@@ -419,9 +419,9 @@ def test_registry_uses_explicit_runtime_settings():
 
 def test_registry_primary_is_first():
     """When both enabled, the primary backend (first) determines query language."""
-    from dashforge.backends import get_active_backends
+    from tacit.backends import get_active_backends
 
-    with patch("dashforge.backends.settings") as mock_settings:
+    with patch("tacit.backends.settings") as mock_settings:
         _configure_backend_settings(mock_settings, grafana=True, signalfx=True, token="tok")
         backends = get_active_backends()
         try:
@@ -442,7 +442,7 @@ def test_registry_primary_is_first():
 
 
 def test_grafana_backend_close():
-    from dashforge.backends.grafana import GrafanaBackend
+    from tacit.backends.grafana import GrafanaBackend
 
     mock_client = AsyncMock()
     backend = GrafanaBackend(client=mock_client)
@@ -452,7 +452,7 @@ def test_grafana_backend_close():
 
 
 def test_signalfx_backend_close():
-    from dashforge.backends.signalfx import SignalFxBackend
+    from tacit.backends.signalfx import SignalFxBackend
 
     mock_client = AsyncMock()
     backend = SignalFxBackend(client=mock_client)
@@ -462,7 +462,7 @@ def test_signalfx_backend_close():
 
 
 def test_signalfx_backend_list_dashboards_reads_dashboard_configs():
-    from dashforge.backends.signalfx import SignalFxBackend
+    from tacit.backends.signalfx import SignalFxBackend
 
     mock_client = AsyncMock()
     mock_client.list_dashboard_groups.return_value = {
@@ -493,15 +493,15 @@ def test_signalfx_backend_list_dashboards_reads_dashboard_configs():
 
 
 def test_grafana_backend_discover_no_datasources():
-    from dashforge.backends.grafana import GrafanaBackend
+    from tacit.backends.grafana import GrafanaBackend
 
     mock_client = AsyncMock()
     backend = GrafanaBackend(client=mock_client)
 
     with (
-        patch("dashforge.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list,
-        patch("dashforge.backends.grafana.filter_datasources_by_signal") as mock_filter,
-        patch("dashforge.backends.grafana.filter_searchable_datasources") as mock_searchable,
+        patch("tacit.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list,
+        patch("tacit.backends.grafana.filter_datasources_by_signal") as mock_filter,
+        patch("tacit.backends.grafana.filter_searchable_datasources") as mock_searchable,
     ):
 
         mock_list.return_value = []
@@ -516,7 +516,7 @@ def test_grafana_backend_discover_no_datasources():
 
 
 def test_grafana_backend_datasource_targets_when_metrics_absent():
-    from dashforge.backends.grafana import GrafanaBackend
+    from tacit.backends.grafana import GrafanaBackend
 
     mock_client = AsyncMock()
     backend = GrafanaBackend(client=mock_client)
@@ -527,9 +527,9 @@ def test_grafana_backend_datasource_targets_when_metrics_absent():
     )
 
     with (
-        patch("dashforge.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list,
-        patch("dashforge.backends.grafana.filter_datasources_by_signal") as mock_filter,
-        patch("dashforge.backends.grafana.filter_searchable_datasources") as mock_searchable,
+        patch("tacit.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list,
+        patch("tacit.backends.grafana.filter_datasources_by_signal") as mock_filter,
+        patch("tacit.backends.grafana.filter_searchable_datasources") as mock_searchable,
     ):
         mock_list.return_value = [prom_ds]
         mock_filter.return_value = [prom_ds]
@@ -550,12 +550,12 @@ def test_grafana_backend_datasource_targets_when_metrics_absent():
 
 
 def test_grafana_backend_marks_connection_failure_unavailable():
-    from dashforge.backends.grafana import GrafanaBackend
+    from tacit.backends.grafana import GrafanaBackend
 
     mock_client = AsyncMock()
     backend = GrafanaBackend(client=mock_client)
 
-    with patch("dashforge.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list:
+    with patch("tacit.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list:
         mock_list.side_effect = RuntimeError("connection refused")
         intent = _make_intent()
         result = asyncio.run(backend.discover_metrics(intent.keywords, intent))
@@ -573,12 +573,12 @@ def test_grafana_backend_marks_connection_failure_unavailable():
 
 
 def test_signalfx_backend_discover_error():
-    from dashforge.backends.signalfx import SignalFxBackend
+    from tacit.backends.signalfx import SignalFxBackend
 
     mock_client = AsyncMock()
     backend = SignalFxBackend(client=mock_client)
 
-    with patch("dashforge.backends.signalfx.sfx_discover", new_callable=AsyncMock) as mock_disc:
+    with patch("tacit.backends.signalfx.sfx_discover", new_callable=AsyncMock) as mock_disc:
         mock_disc.side_effect = Exception("Connection refused")
         intent = _make_intent()
         result = asyncio.run(backend.discover_metrics(intent.keywords, intent))
@@ -594,7 +594,7 @@ def test_ingest_dashboard_closes_all_backends():
     """When get_active_backends() returns multiple backends and one is
     selected by name, ALL backends must be closed — not just the selected
     one.  Otherwise, unused HTTP clients leak."""
-    from dashforge.backends.base import DashboardFeatures
+    from tacit.backends.base import DashboardFeatures
 
     grafana_backend = AsyncMock()
     grafana_backend.name = "grafana"
@@ -614,10 +614,10 @@ def test_ingest_dashboard_closes_all_backends():
     signalfx_backend.name = "signalfx"
 
     with patch(
-        "dashforge.backends.get_active_backends",
+        "tacit.backends.get_active_backends",
         return_value=[grafana_backend, signalfx_backend],
     ):
-        from dashforge.dashboard_ingest import ingest_dashboard
+        from tacit.dashboard_ingest import ingest_dashboard
 
         asyncio.run(
             ingest_dashboard(

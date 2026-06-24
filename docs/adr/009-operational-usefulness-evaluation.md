@@ -30,9 +30,9 @@ Validated against:
 
 - `docs/evaluation.md`: reports archetype accuracy, recall, critical recall, weighted recall, SNR, pipeline success, and
   known weaknesses.
-- `tests/validate.py` and `tests/dashforge_validation_prompts.csv`: implement the public validation dataset/runner.
-- `dashforge/feedback.py`: stores dimensional feedback and analysis.
-- `dashforge/main.py`: exposes feedback endpoints.
+- `tests/validate.py` and `tests/tacit_validation_prompts.csv`: implement the public validation dataset/runner.
+- `tacit/feedback.py`: stores dimensional feedback and analysis.
+- `tacit/main.py`: exposes feedback endpoints.
 - `tests/README.md`: describes usefulness-oriented E2E scenarios.
 
 TODO:

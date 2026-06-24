@@ -3,11 +3,11 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-import dashforge.pipeline as pipeline_mod
-from dashforge.agents.providers.base import TokenUsage
-from dashforge.config import settings
-from dashforge.main import app
-from dashforge.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
+import tacit.pipeline as pipeline_mod
+from tacit.agents.providers.base import TokenUsage
+from tacit.config import settings
+from tacit.main import app
+from tacit.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
 from tests.e2e.framework import CapturingBackend, build_grafana_dashboard, load_scenario
 from tests.e2e.test_dashboard_upload_learning import SCENARIO_PATH, _no_context
 

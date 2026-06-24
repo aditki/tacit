@@ -1,4 +1,4 @@
-from dashforge.cache import TTLCache
+from tacit.cache import TTLCache
 
 
 def test_cache_stats_distinguish_hits_and_misses():

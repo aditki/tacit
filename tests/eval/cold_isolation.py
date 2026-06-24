@@ -41,12 +41,12 @@ from typing import Any
 # Listed as (module_path, attribute) so they can be patched lazily — a module
 # that fails to import in a constrained interpreter is skipped rather than
 # breaking the whole reset.
-_SIGNAL_STORE_TARGETS = [("dashforge.signals", "get_signal_store"), ("dashforge.dashboard_ingest", "get_signal_store")]
+_SIGNAL_STORE_TARGETS = [("tacit.signals", "get_signal_store"), ("tacit.dashboard_ingest", "get_signal_store")]
 _HISTORY_STORE_TARGETS = [
-    ("dashforge.history", "get_investigation_store"),
-    ("dashforge.pipeline", "get_investigation_store"),
+    ("tacit.history", "get_investigation_store"),
+    ("tacit.pipeline", "get_investigation_store"),
 ]
-_FEEDBACK_STORE_TARGETS = [("dashforge.feedback", "get_feedback_store"), ("dashforge.main", "get_feedback_store")]
+_FEEDBACK_STORE_TARGETS = [("tacit.feedback", "get_feedback_store"), ("tacit.main", "get_feedback_store")]
 
 
 @dataclass
@@ -83,7 +83,7 @@ def _patch_all(targets: list[tuple[str, str]], value: Any) -> list[tuple[Any, st
 def _reset_caches() -> None:
     """Clear the in-memory metric + LLM caches and the feedback quality cache."""
     try:
-        from dashforge.cache import llm_cache, metric_cache
+        from tacit.cache import llm_cache, metric_cache
 
         metric_cache.invalidate()
         llm_cache.invalidate()
@@ -91,7 +91,7 @@ def _reset_caches() -> None:
         pass
     # Ranking memoizes feedback-derived metric quality; force a reload.
     try:
-        import dashforge.ranking as ranking
+        import tacit.ranking as ranking
 
         ranking._metric_quality_cache = {}
         ranking._metric_quality_expires = 0.0
@@ -107,15 +107,15 @@ def cold_isolation(workdir: str | os.PathLike[str] | None = None) -> Iterator[Is
     only the packaged signal taxonomy, points archetype loading at an empty
     learned-archetypes file, clears caches, and redirects every ``get_*_store``
     accessor to the fresh instances. On exit: restores the accessors, the
-    ``DASHFORGE_ARCHETYPES_PATH`` env var, and reloads archetypes.
+    ``TACIT_ARCHETYPES_PATH`` env var, and reloads archetypes.
     """
-    from dashforge.feedback import FeedbackStore
-    from dashforge.history import InvestigationStore
-    from dashforge.signals import SignalStore
+    from tacit.feedback import FeedbackStore
+    from tacit.history import InvestigationStore
+    from tacit.signals import SignalStore
 
     tmp_ctx: tempfile.TemporaryDirectory[str] | None = None
     if workdir is None:
-        tmp_ctx = tempfile.TemporaryDirectory(prefix="dashforge-cold-")
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="tacit-cold-")
         base = Path(tmp_ctx.name)
     else:
         base = Path(workdir)
@@ -123,7 +123,7 @@ def cold_isolation(workdir: str | os.PathLike[str] | None = None) -> Iterator[Is
 
     signal_store = SignalStore(db_path=base / "signals.db")
     packaged_signals = base / "packaged_signals.yaml"
-    resource = files("dashforge.data").joinpath("signals.yaml")
+    resource = files("tacit.data").joinpath("signals.yaml")
     with resource.open() as source:
         packaged_signals.write_text(source.read())
     mappings_loaded = signal_store.load_from_yaml(packaged_signals)
@@ -136,10 +136,10 @@ def cold_isolation(workdir: str | os.PathLike[str] | None = None) -> Iterator[Is
     restores += _patch_all(_HISTORY_STORE_TARGETS, history_store)
     restores += _patch_all(_FEEDBACK_STORE_TARGETS, feedback_store)
 
-    prior_arch_path = os.environ.get("DASHFORGE_ARCHETYPES_PATH")
-    os.environ["DASHFORGE_ARCHETYPES_PATH"] = str(archetypes_path)
+    prior_arch_path = os.environ.get("TACIT_ARCHETYPES_PATH")
+    os.environ["TACIT_ARCHETYPES_PATH"] = str(archetypes_path)
 
-    import dashforge.archetypes.templates as templates
+    import tacit.archetypes.templates as templates
 
     templates.reload_archetypes()
     _reset_caches()
@@ -158,9 +158,9 @@ def cold_isolation(workdir: str | os.PathLike[str] | None = None) -> Iterator[Is
         for module, attr, original in restores:
             setattr(module, attr, original)
         if prior_arch_path is None:
-            os.environ.pop("DASHFORGE_ARCHETYPES_PATH", None)
+            os.environ.pop("TACIT_ARCHETYPES_PATH", None)
         else:
-            os.environ["DASHFORGE_ARCHETYPES_PATH"] = prior_arch_path
+            os.environ["TACIT_ARCHETYPES_PATH"] = prior_arch_path
         templates.reload_archetypes()
         _reset_caches()
         if tmp_ctx is not None:
@@ -169,10 +169,10 @@ def cold_isolation(workdir: str | os.PathLike[str] | None = None) -> Iterator[Is
 
 def _verify() -> int:
     """Enter an isolated runtime and print the baseline; non-zero on a dirty slate."""
-    from dashforge.cache import llm_cache, metric_cache
+    from tacit.cache import llm_cache, metric_cache
 
     with cold_isolation() as state:
-        import dashforge.archetypes.templates as templates
+        import tacit.archetypes.templates as templates
 
         archetype_count = len(getattr(templates, "ALL_ARCHETYPES", []))
         learned = [a for a in getattr(templates, "ALL_ARCHETYPES", []) if "learned" in getattr(a, "tags", [])]
@@ -189,7 +189,7 @@ def _verify() -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Cold-isolation runtime for DashForge eval runs.")
+    parser = argparse.ArgumentParser(description="Cold-isolation runtime for Tacit eval runs.")
     parser.add_argument("--verify", action="store_true", help="Print the baseline and exit non-zero if not clean.")
     args = parser.parse_args()
     if args.verify:

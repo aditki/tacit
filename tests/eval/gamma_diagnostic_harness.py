@@ -23,12 +23,12 @@ from typing import Any
 
 import httpx
 
-from dashforge.agents.providers import registry as provider_registry
-from dashforge.cache import llm_cache, metric_cache
-from dashforge.config import settings
-from dashforge.models.schemas import DashRequest
-from dashforge.pipeline import run_pipeline
 from demo.gamma_pilot import DEFAULT_ARCHIVE, DEFAULT_SCENARIO, build
+from tacit.agents.providers import registry as provider_registry
+from tacit.cache import llm_cache, metric_cache
+from tacit.config import settings
+from tacit.models.schemas import DashRequest
+from tacit.pipeline import run_pipeline
 from tests.eval.cold_isolation import cold_isolation
 
 PROTOCOL_PATH = Path(__file__).parent / "fixtures" / "gamma_diagnostic_protocol.json"

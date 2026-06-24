@@ -1,6 +1,6 @@
-# DashForge — Project Context & Knowledge Transfer
+# Tacit — Project Context & Knowledge Transfer
 
-> This file captures the full context of the DashForge project: architecture, design
+> This file captures the full context of the Tacit project: architecture, design
 > decisions, pivots, tradeoffs, bugs encountered, and current state. It is intended to
 > onboard a new AI assistant or developer on a different machine.
 >
@@ -8,7 +8,7 @@
 
 ---
 
-## 1. What Is DashForge
+## 1. What Is Tacit
 
 **Natural language → Grafana dashboards.** An AI-powered observability navigation layer
 that lets on-call engineers describe a problem in plain English (via Slack, Web UI, or
@@ -26,8 +26,8 @@ decomposition pattern.
 - **HTTP client**: httpx
 - **Logging**: structlog (structured JSON)
 - **Slack**: slack-bolt + slack-sdk (socket mode)
-- **CLI**: Click + Rich — `dashforge init/doctor/connect/test/serve`
-- **Config**: Layered YAML (`dashforge.yaml` or `~/.dashforge/config.yaml`) + env vars + Pydantic Settings
+- **CLI**: Click + Rich — `tacit init/doctor/connect/test/serve`
+- **Config**: Layered YAML (`tacit.yaml` or `~/.tacit/config.yaml`) + env vars + Pydantic Settings
 - **Persistence**: SQLite (feedback store) — in-memory TTLCache for metrics/LLM cache
 - **Dependency management**: `uv` with `pyproject.toml` + `uv.lock`
 - **SSL**: `truststore` package for system certificate store integration
@@ -46,8 +46,8 @@ decomposition pattern.
 | `SLACK_APP_TOKEN` | Slack app-level token (`xapp-...`) |
 | `API_AUTH_ENABLED` | Enable API key auth (`true`/`false`) |
 | `API_AUTH_KEY` | API key for `X-API-Key` header |
-| `DASHFORGE_ARCHETYPES_PATH` | Custom path to `archetypes.yaml` |
-| `DASHFORGE_CONFIG` | Custom path to `dashforge.yaml` |
+| `TACIT_ARCHETYPES_PATH` | Custom path to `archetypes.yaml` |
+| `TACIT_CONFIG` | Custom path to `tacit.yaml` |
 
 ---
 
@@ -59,7 +59,7 @@ Prompt → Sanitizer → Intent Agent → Context Enrichment → Datasource Disc
   → Query Validation → Dashboard Publisher → Provenance Recording
 ```
 
-### Pipeline Steps (dashforge/pipeline.py)
+### Pipeline Steps (tacit/pipeline.py)
 
 1. **Prompt Sanitizer** — length cap (2000 chars), control-char removal, injection guard
 2. **Intent Agent** (`agents/intent.py`) — LLM classifies: domain, services, keywords,
@@ -131,7 +131,7 @@ for SRE teams.
 **Solution**: `archetypes.yaml` with hot-reload API endpoint (`POST /api/v1/archetypes/reload`).
 
 **Implementation**:
-- `archetypes.yaml` at project root (or `DASHFORGE_ARCHETYPES_PATH` env var)
+- `archetypes.yaml` at project root (or `TACIT_ARCHETYPES_PATH` env var)
 - `templates.py` loads YAML first, falls back to hardcoded Python definitions
 - Uses `yaml.safe_load` (security: no arbitrary code execution)
 - Template placeholders: `{service_filter}`, `{container_filter}`, `{rate_interval}`
@@ -158,7 +158,7 @@ to improve over time.
    quality <= 0.3 → 0.7x penalty) + auto-generated recommendations
 
 **Implementation**:
-- SQLite at `data/dashforge_feedback.db` (auto-created)
+- SQLite at `data/tacit_feedback.db` (auto-created)
 - Two tables: `dashboard_provenance` (prompt → dashboard mapping) and `feedback`
   (dimensional ratings per dashboard)
 - `ranking.py` loads metric quality scores, cached 10min, applied as multipliers
@@ -201,12 +201,12 @@ discovery is batched and cached at the datasource level.
 **Problem**: Flat `.env` files don't scale — no nesting, no validation, secrets mixed
 with config.
 
-**Solution**: Schema-validated `dashforge.yaml` with env var overrides. Secrets stay in
+**Solution**: Schema-validated `tacit.yaml` with env var overrides. Secrets stay in
 env vars, non-sensitive config in YAML.
 
 **Implementation** (`config.py`):
-- Config file discovery: `DASHFORGE_CONFIG` env var → `./dashforge.yaml` → `./dashforge.yml` → `~/.dashforge/config.yaml`
-- Secrets loaded from `.env` and `~/.dashforge/.env`
+- Config file discovery: `TACIT_CONFIG` env var → `./tacit.yaml` → `./tacit.yml` → `~/.tacit/config.yaml`
+- Secrets loaded from `.env` and `~/.tacit/.env`
 - Pydantic Settings with `SettingsConfigDict` for validation
 - YAML sections flattened: `{llm: {provider: x}}` → `{llm_provider: x}`
 
@@ -257,7 +257,7 @@ dashboard_uid values.
 
 ---
 
-## 5. Data Model (Pydantic Schemas — dashforge/models/schemas.py)
+## 5. Data Model (Pydantic Schemas — tacit/models/schemas.py)
 
 ### Core Pipeline Models
 
@@ -281,14 +281,14 @@ dashboard_uid values.
 - **`FeedbackStatsResponse`** — totals, averages, useful_rate
 - **`HealthResponse`**, **`ArchetypeListResponse`**, **`ArchetypeReloadResponse`**
 
-### Archetype Schema (dashforge/archetypes/schema.py)
+### Archetype Schema (tacit/archetypes/schema.py)
 
 - **`InvestigationArchetype`** — id, name, description, problem_types, required_metrics,
   required_signals, signal_bindings, panels, tags, default_timerange
 - **`PanelTemplate`** — title, description, panel_type, row, queries, unit
 - **`QueryTemplate`** — expr (with placeholders), legend_format, datasource_type
 
-### Signal Schema (dashforge/signals.py)
+### Signal Schema (tacit/signals.py)
 
 - **`signal_types` table** — signal_type (PK), description, category, unit, timestamps
 - **`signal_metric_mappings` table** — many-to-many signal ↔ metric with context filters
@@ -300,7 +300,7 @@ dashboard_uid values.
 
 ---
 
-## 6. Database Schema (SQLite — dashforge/feedback.py)
+## 6. Database Schema (SQLite — tacit/feedback.py)
 
 ### Table: dashboard_provenance
 
@@ -367,7 +367,7 @@ Two validation modes:
 
 ### Test Dataset
 
-`tests/dashforge_validation_prompts.csv` — 100 prompts with:
+`tests/tacit_validation_prompts.csv` — 100 prompts with:
 - prompt_id, prompt, expected_archetype, expected_metrics, expected_datasources,
   difficulty, validation_goal
 - `critical_metrics` column: header added but not yet populated (semicolon-delimited)
@@ -428,7 +428,7 @@ persistent store. No Redis/Postgres yet.
 
 ## 11. Supported Datasources
 
-Each datasource type has a dedicated adapter in `dashforge/grafana/adapters/`:
+Each datasource type has a dedicated adapter in `tacit/grafana/adapters/`:
 
 | Datasource | Adapter | Query Language |
 |---|---|---|
@@ -448,8 +448,8 @@ proxy/resource APIs.
 ## 12. Project File Structure
 
 ```
-dashforge/
-├── dashforge/
+tacit/
+├── tacit/
 │   ├── cli.py               # CLI: init, doctor, connect, test, serve, history (Click + Rich)
 │   ├── main.py              # FastAPI entrypoint (routes, auth, lifespan)
 │   ├── config.py            # Layered config: YAML + env vars + Pydantic
@@ -489,13 +489,13 @@ dashforge/
 │       └── index.html       # Web UI (dark theme, feedback forms, archetype info)
 ├── tests/
 │   ├── validate.py          # Tiered validation suite
-│   ├── dashforge_validation_prompts.csv  # 100-prompt test dataset
+│   ├── tacit_validation_prompts.csv  # 100-prompt test dataset
 │   └── README.md            # Validation documentation
 ├── dev/                     # Docker dev environment (Grafana, Prometheus, fake app)
 ├── archetypes.yaml          # Editable investigation templates (41 archetypes)
 ├── signals.yaml             # Bootstrap signal taxonomy (semantic signals → metric patterns)
-├── dashforge.yaml.example   # Reference config
-├── dashforge.spec           # PyInstaller spec for single-binary builds
+├── tacit.yaml.example   # Reference config
+├── tacit.spec           # PyInstaller spec for single-binary builds
 ├── scripts/
 │   └── build.sh             # Build single binary
 ├── docker-compose.yml
@@ -513,28 +513,28 @@ dashforge/
 # Install
 pip install -e .
 
-# Interactive setup — creates ~/.dashforge/config.yaml + .env
-dashforge init
+# Interactive setup — creates ~/.tacit/config.yaml + .env
+tacit init
 
 # Validate your setup
-dashforge doctor
+tacit doctor
 
 # Connect to Grafana (interactive)
-dashforge connect grafana
+tacit connect grafana
 
 # Run a sample investigation (opens dashboard in browser)
-dashforge test
+tacit test
 
 # Start the API server
-dashforge serve
-dashforge serve --port 9000 --reload  # dev mode
-dashforge serve --no-slack             # disable Slack
+tacit serve
+tacit serve --port 9000 --reload  # dev mode
+tacit serve --no-slack             # disable Slack
 ```
 
 ### Option B: Docker
 
 ```bash
-# Start supporting services + DashForge
+# Start supporting services + Tacit
 docker compose up -d
 
 # Create Grafana service account token (Editor role)
@@ -554,21 +554,21 @@ docker compose up -d
 
 | Command | Purpose |
 |---|---|
-| `dashforge init` | Interactive setup wizard → `~/.dashforge/config.yaml` + `.env` |
-| `dashforge doctor` | Validate Grafana, datasources, LLM, archetypes, cache |
-| `dashforge connect grafana` | Test and persist Grafana connection |
-| `dashforge test [-p "prompt"]` | Run sample investigation, open dashboard in browser |
-| `dashforge serve [--port --reload --no-slack]` | Start API + Slack server |
-| `dashforge history list [-n --status --user]` | List recent investigations (Rich table) |
-| `dashforge history show <id>` | Full investigation detail (intent, metrics, queries, timings) |
-| `dashforge history stats` | Aggregate stats (success/fail rates, avg time, path distribution) |
+| `tacit init` | Interactive setup wizard → `~/.tacit/config.yaml` + `.env` |
+| `tacit doctor` | Validate Grafana, datasources, LLM, archetypes, cache |
+| `tacit connect grafana` | Test and persist Grafana connection |
+| `tacit test [-p "prompt"]` | Run sample investigation, open dashboard in browser |
+| `tacit serve [--port --reload --no-slack]` | Start API + Slack server |
+| `tacit history list [-n --status --user]` | List recent investigations (Rich table) |
+| `tacit history show <id>` | Full investigation detail (intent, metrics, queries, timings) |
+| `tacit history stats` | Aggregate stats (success/fail rates, avg time, path distribution) |
 
 ### Single Binary Distribution
 
 ```bash
-./scripts/build.sh              # builds dist/dashforge
-sudo cp dist/dashforge /usr/local/bin/
-dashforge init && dashforge serve
+./scripts/build.sh              # builds dist/tacit
+sudo cp dist/tacit /usr/local/bin/
+tacit init && tacit serve
 ```
 
 ### Validation
@@ -606,10 +606,10 @@ python tests/validate.py --mode pipeline --api-url http://localhost:8000 --revie
 - Swagger/ReDoc API documentation
 - Query validation (drops panels with no data)
 - 100-prompt validation suite with tiered metrics
-- **CLI** — `dashforge init/doctor/connect/test/serve/history` with Rich terminal UI
-- **Config discovery** — `~/.dashforge/config.yaml` + `~/.dashforge/.env`
+- **CLI** — `tacit init/doctor/connect/test/serve/history` with Rich terminal UI
+- **Config discovery** — `~/.tacit/config.yaml` + `~/.tacit/.env`
 - **Single-binary distribution** — PyInstaller spec for macOS/Linux/Windows
-- **Investigation history** — full pipeline telemetry persisted in SQLite (`data/dashforge_history.db`).
+- **Investigation history** — full pipeline telemetry persisted in SQLite (`data/tacit_history.db`).
   Stores: prompt, intent, archetypes, datasources, metrics catalog, selected metrics,
   generated queries, validation warnings, per-step timings, failures, dashboard URLs.
 - **Splunk SignalFx direct integration** — dual-publish to Splunk Observability Cloud.
@@ -626,19 +626,19 @@ python tests/validate.py --mode pipeline --api-url http://localhost:8000 --revie
 - No Prometheus `/metrics` endpoint for self-observability
 
 ### Roadmap (see README.md for full list)
-- **Product boundary**: DashForge should consume organizational knowledge, not custody it.
+- **Product boundary**: Tacit should consume organizational knowledge, not custody it.
   Enterprise runbooks, service catalogs, ownership data, postmortems, and policy knowledge
-  should come through customer-owned RAG/A2A/MCP systems. DashForge owns observability
+  should come through customer-owned RAG/A2A/MCP systems. Tacit owns observability
   outcomes: investigation history, dashboard provenance, feedback-derived metric quality,
   archetype gaps, and what worked in prior incidents.
 - **Near term**: Ephemeral dashboard TTL, Loki/Tempo support, conversational refinement,
   alert context ingestion, dashboard versioning
-- **Personal/demo memory**: Optional local memory mode using SQLite FTS over DashForge
+- **Personal/demo memory**: Optional local memory mode using SQLite FTS over Tacit
   history/feedback, with Qdrant as an optional Docker-backed semantic demo backend.
   This is a convenience path, not the enterprise knowledge strategy.
-- **Highest-leverage**: Grafana App Plugin — native "Investigate with DashForge" side panel
+- **Highest-leverage**: Grafana App Plugin — native "Investigate with Tacit" side panel
   inside Grafana. Shifts from external service to native workflow. Zero context switch.
-- **Enterprise**: Hardened context provider contract for RAG/A2A/MCP, DashForge-native
+- **Enterprise**: Hardened context provider contract for RAG/A2A/MCP, Tacit-native
   observability memory, metadata indexing, semantic metric retrieval, Observability IR,
   deterministic query compiler, query cost planner, RBAC, circuit breakers,
   self-observability

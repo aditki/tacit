@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Dashboards are the current concrete output of DashForge. They are valuable because operators can inspect and share them.
+Dashboards are the current concrete output of Tacit. They are valuable because operators can inspect and share them.
 However, the repo already treats dashboards as products of intent, archetypes, learned signals, metric discovery,
 validation, provenance, and feedback.
 
@@ -19,7 +19,7 @@ important output, not the entire product.
 
 - Dashboard specs should preserve why panels were selected through provenance/history where possible.
 - API and CLI surfaces should gradually expose more investigation context alongside URLs.
-- Docs should avoid reducing DashForge to only "prompt to dashboard."
+- Docs should avoid reducing Tacit to only "prompt to dashboard."
 
 ## Implementation Notes
 
@@ -27,10 +27,10 @@ Implementation status: partially implemented.
 
 Validated against:
 
-- `dashforge/models/schemas.py`: `DashResponse` primarily returns dashboard URL, UID, panel count, summary, backend URLs,
+- `tacit/models/schemas.py`: `DashResponse` primarily returns dashboard URL, UID, panel count, summary, backend URLs,
   path, and archetypes.
-- `dashforge/pipeline.py`: records provenance and validation decisions.
-- `dashforge/feedback.py`: connects generated dashboards to human usefulness feedback.
+- `tacit/pipeline.py`: records provenance and validation decisions.
+- `tacit/feedback.py`: connects generated dashboards to human usefulness feedback.
 - `README.md` and `docs/operational-cognition.md`: both frame dashboards as part of an investigation workflow.
 
 TODO:

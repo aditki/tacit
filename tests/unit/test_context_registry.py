@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dashforge.config import Settings
-from dashforge.context.registry import create_context_provider
+from tacit.config import Settings
+from tacit.context.registry import create_context_provider
 
 
 def test_create_context_provider_uses_runtime_settings():

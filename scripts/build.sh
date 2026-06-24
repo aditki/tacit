@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build DashForge single binary for the current platform.
+# Build Tacit single binary for the current platform.
 # Usage: ./scripts/build.sh
 set -euo pipefail
 
@@ -12,20 +12,20 @@ echo "── Installing build dependencies ──"
 uv sync --all-extras --dev
 
 echo "── Building single binary ──"
-uv run pyinstaller dashforge.spec --clean --noconfirm
+uv run pyinstaller tacit.spec --clean --noconfirm
 
-BINARY="dist/dashforge"
+BINARY="dist/tacit"
 if [[ -f "$BINARY" ]]; then
     SIZE=$(du -h "$BINARY" | cut -f1)
     echo ""
     echo "✔ Built: $BINARY ($SIZE)"
     echo ""
     echo "Install globally:"
-    echo "  sudo cp dist/dashforge /usr/local/bin/"
+    echo "  sudo cp dist/tacit /usr/local/bin/"
     echo ""
     echo "Or run directly:"
-    echo "  ./dist/dashforge init"
-    echo "  ./dist/dashforge serve"
+    echo "  ./dist/tacit init"
+    echo "  ./dist/tacit serve"
 else
     echo "✘ Build failed — binary not found at $BINARY"
     exit 1

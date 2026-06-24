@@ -17,17 +17,17 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: dashforge-linux-x86_64
-            binary: dist/dashforge
-            package: dashforge-linux-x86_64.tar.gz
+            artifact: tacit-linux-x86_64
+            binary: dist/tacit
+            package: tacit-linux-x86_64.tar.gz
           - os: macos-latest
-            artifact: dashforge-macos-arm64
-            binary: dist/dashforge
-            package: dashforge-macos-arm64.tar.gz
+            artifact: tacit-macos-arm64
+            binary: dist/tacit
+            package: tacit-macos-arm64.tar.gz
           - os: windows-latest
-            artifact: dashforge-windows-x86_64
-            binary: dist/dashforge.exe
-            package: dashforge-windows-x86_64.zip
+            artifact: tacit-windows-x86_64
+            binary: dist/tacit.exe
+            package: tacit-windows-x86_64.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,18 +36,18 @@ jobs:
           python-version: "3.12"
       - run: uv sync --all-extras --dev
       - name: Build binary
-        run: uv run pyinstaller dashforge.spec --clean --noconfirm
+        run: uv run pyinstaller tacit.spec --clean --noconfirm
       - name: Package artifact
         shell: bash
         run: |
           set -euo pipefail
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp "${{ matrix.binary }}" dashforge.exe
-            7z a "${{ matrix.package }}" dashforge.exe
+            cp "${{ matrix.binary }}" tacit.exe
+            7z a "${{ matrix.package }}" tacit.exe
           else
-            cp "${{ matrix.binary }}" dashforge
-            chmod 755 dashforge
-            tar -czf "${{ matrix.package }}" dashforge
+            cp "${{ matrix.binary }}" tacit
+            chmod 755 tacit
+            tar -czf "${{ matrix.package }}" tacit
           fi
       - uses: actions/upload-artifact@v4
         with:

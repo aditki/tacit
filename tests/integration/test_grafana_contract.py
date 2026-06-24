@@ -11,9 +11,9 @@ import json
 import respx
 from httpx import Response
 
-from dashforge.grafana.dashboard import publish_dashboard
-from dashforge.grafana.datasource import list_datasources
-from dashforge.models.schemas import DashboardSpec, PanelQuery, PanelSpec
+from tacit.grafana.dashboard import publish_dashboard
+from tacit.grafana.datasource import list_datasources
+from tacit.models.schemas import DashboardSpec, PanelQuery, PanelSpec
 from tests.contracts import factories as f
 from tests.contracts.grafana_models import GrafanaDashboardSaveCommand
 from tests.integration.conftest import GRAFANA_BASE, make_grafana_client
@@ -44,7 +44,7 @@ async def test_list_datasources_get_contract():
 
 @respx.mock
 async def test_ingest_dashboard_get_contract():
-    from dashforge.backends.grafana import GrafanaBackend
+    from tacit.backends.grafana import GrafanaBackend
 
     panels = [
         {
@@ -71,7 +71,7 @@ async def test_ingest_dashboard_get_contract():
 
 @respx.mock
 async def test_publish_dashboard_post_contract():
-    """DashForge's POST body must satisfy the Grafana save-command contract."""
+    """Tacit's POST body must satisfy the Grafana save-command contract."""
     respx.get(f"{GRAFANA_BASE}/api/folders").mock(return_value=Response(200, json=[]))
     respx.post(f"{GRAFANA_BASE}/api/folders").mock(return_value=Response(200, json=f.grafana_folder()))
     save_route = respx.post(f"{GRAFANA_BASE}/api/dashboards/db").mock(

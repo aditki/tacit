@@ -319,7 +319,7 @@ def build(
     metrics_path = output_dir / f"{output_stem}.prom"
     metrics_path.write_text("\n".join(lines) + "\n")
 
-    # This file is scorer-only. Never send its ground_truth block to DashForge.
+    # This file is scorer-only. Never send its ground_truth block to Tacit.
     manifest = {
         "schema_version": 1,
         "dataset": "gamma",

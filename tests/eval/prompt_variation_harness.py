@@ -19,9 +19,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from dashforge.agents.intent import classify_intent
-from dashforge.cache import llm_cache
-from dashforge.config import settings
+from tacit.agents.intent import classify_intent
+from tacit.cache import llm_cache
+from tacit.config import settings
 from tests.eval.cold_isolation import cold_isolation
 from tests.eval.prompt_scoring import evaluate as _evaluate
 from tests.eval.prompt_scoring import is_negative as _is_negative
@@ -127,7 +127,7 @@ def _apply_model_overrides(provider: str, model: str, api_key: str, api_base: st
     if api_base:
         settings.llm_api_base = api_base
     try:
-        import dashforge.agents.providers.registry as _registry
+        import tacit.agents.providers.registry as _registry
 
         _registry._provider = None  # force rebuild with the new settings
     except Exception:

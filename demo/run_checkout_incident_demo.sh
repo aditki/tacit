@@ -34,11 +34,11 @@ pretty() {
 need curl
 need python3
 
-echo "DashForge checkout incident demo"
+echo "Tacit checkout incident demo"
 echo "API: $API_URL"
 echo
 
-echo "1. Checking DashForge health"
+echo "1. Checking Tacit health"
 request_json GET "/healthz" | pretty
 echo
 
@@ -70,7 +70,7 @@ echo "4. Listing learned dashboards"
 request_json GET "/api/v1/learn/dashboards?limit=5" | pretty
 echo
 
-echo "5. Asking DashForge to generate a fresh incident dashboard"
+echo "5. Asking Tacit to generate a fresh incident dashboard"
 CHART_PAYLOAD="$(python3 - "$PROMPT" <<'PY'
 import json
 import sys

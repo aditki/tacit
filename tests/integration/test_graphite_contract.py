@@ -7,7 +7,7 @@ import re
 import respx
 from httpx import Response
 
-from dashforge.grafana.adapters.graphite import GraphiteAdapter
+from tacit.grafana.adapters.graphite import GraphiteAdapter
 from tests.contracts import factories as f
 from tests.integration.conftest import GRAFANA_BASE, datasource, make_grafana_client
 
