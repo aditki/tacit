@@ -5,7 +5,7 @@ from typing import cast
 import httpx
 import structlog
 
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 
 logger = structlog.get_logger()
 
@@ -18,10 +18,12 @@ class GrafanaClient:
         base_url: str | None = None,
         api_key: str | None = None,
         org_id: int | None = None,
+        runtime_settings: Settings | None = None,
     ):
-        self.base_url = (base_url or settings.grafana_url).rstrip("/")
-        self.api_key = api_key or settings.grafana_api_key
-        self.org_id = org_id or settings.grafana_org_id
+        config = runtime_settings or settings
+        self.base_url = (base_url or config.grafana_url).rstrip("/")
+        self.api_key = api_key if api_key is not None else config.grafana_api_key
+        self.org_id = org_id if org_id is not None else config.grafana_org_id
         headers = {
             "Content-Type": "application/json",
             "X-Grafana-Org-Id": str(self.org_id),

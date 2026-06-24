@@ -30,7 +30,7 @@ def create_lifespan(runtime_settings: Settings = default_settings):
         if runtime_settings.slack_bot_token and runtime_settings.slack_app_token:
             from dashforge.integrations.slack import start_slack_bot
 
-            _slack_task = asyncio.create_task(start_slack_bot())
+            _slack_task = asyncio.create_task(start_slack_bot(runtime_settings))
             logger.info("slack_bot_scheduled")
         else:
             logger.warning("slack_not_configured", hint="Set SLACK_BOT_TOKEN and SLACK_APP_TOKEN to enable Slack")

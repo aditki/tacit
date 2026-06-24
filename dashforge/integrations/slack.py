@@ -8,16 +8,11 @@ import structlog
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
-from dashforge.config import settings
+from dashforge.config import Settings, settings
 from dashforge.models.schemas import DashRequest
 from dashforge.pipeline import run_pipeline
 
 logger = structlog.get_logger()
-
-app = AsyncApp(
-    token=settings.slack_bot_token,
-    signing_secret=settings.slack_signing_secret,
-)
 
 
 def _strip_mention(text: str) -> str:
@@ -46,7 +41,6 @@ def _build_action_buttons(response) -> list[dict]:
     return buttons
 
 
-@app.event("app_mention")
 async def handle_mention(event: dict, say):
     """Respond to @DashForge mentions in channels."""
     prompt = _strip_mention(event.get("text", ""))
@@ -99,7 +93,6 @@ async def handle_mention(event: dict, say):
         )
 
 
-@app.command("/dashforge")
 async def handle_slash_command(ack, command, say):
     """Handle /dashforge slash commands."""
     await ack()
@@ -140,8 +133,20 @@ async def handle_slash_command(ack, command, say):
         await say(text="❌ Something went wrong building the dashboard.")
 
 
-async def start_slack_bot():
+def create_slack_app(runtime_settings: Settings = settings) -> AsyncApp:
+    """Create a Slack app bound to one runtime settings object."""
+    slack_app = AsyncApp(
+        token=runtime_settings.slack_bot_token,
+        signing_secret=runtime_settings.slack_signing_secret,
+    )
+    slack_app.event("app_mention")(handle_mention)
+    slack_app.command("/dashforge")(handle_slash_command)
+    return slack_app
+
+
+async def start_slack_bot(runtime_settings: Settings = settings):
     """Start the Slack bot in Socket Mode."""
-    handler = AsyncSocketModeHandler(app, settings.slack_app_token)
+    slack_app = create_slack_app(runtime_settings)
+    handler = AsyncSocketModeHandler(slack_app, runtime_settings.slack_app_token)
     logger.info("slack_bot_starting")
     await handler.start_async()

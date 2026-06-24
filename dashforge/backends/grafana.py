@@ -7,6 +7,7 @@ from typing import Any, cast
 import structlog
 
 from dashforge.backends.base import DashboardFeatures, DiscoveryStatus, PublishResult
+from dashforge.config import Settings
 from dashforge.grafana.adapters.registry import get_adapter
 from dashforge.grafana.client import GrafanaClient
 from dashforge.grafana.dashboard import publish_dashboard as publish_dashboard_fn
@@ -25,8 +26,8 @@ logger = structlog.get_logger()
 class GrafanaBackend:
     """Dashboard backend that talks to Grafana."""
 
-    def __init__(self, client: GrafanaClient | None = None):
-        self._client = client or GrafanaClient()
+    def __init__(self, client: GrafanaClient | None = None, runtime_settings: Settings | None = None):
+        self._client = client or GrafanaClient(runtime_settings=runtime_settings)
         self.last_discovery_status = DiscoveryStatus()
 
     # ── Protocol properties ───────────────────────────────────────────

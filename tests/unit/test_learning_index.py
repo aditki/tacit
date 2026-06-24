@@ -16,6 +16,26 @@ def test_infer_services_preserves_job_and_pod_labels():
     assert "checkout-api-7f9d" in services
 
 
+def test_infer_services_does_not_index_generic_infra_metric_prefixes_as_services():
+    for metric in (
+        "cpu_usage_seconds_total",
+        "memory_working_set_bytes",
+        "redis_connected_clients",
+        "kafka_consumer_lag",
+        "kube_pod_container_status_restarts_total",
+    ):
+        services = infer_services_for_learning(
+            metric=metric,
+            query_text=f"sum({metric})",
+            dashboard_title="Infrastructure",
+            panel_title="Saturation",
+            tags=[],
+        )
+
+        first_token = metric.split("_", 1)[0]
+        assert first_token not in services
+
+
 def test_learning_context_rows_include_job_and_pod_services():
     rows = build_learning_context_rows(
         dashboard_uid="dash-1",

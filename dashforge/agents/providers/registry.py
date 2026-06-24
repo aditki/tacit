@@ -54,6 +54,7 @@ _PROVIDER_FACTORIES = {
 def register_provider_factory(name: str, factory) -> None:
     """Register or override an LLM provider factory."""
     _PROVIDER_FACTORIES[name.lower()] = factory
+    reset_provider_for_tests()
 
 
 def reset_provider_for_tests() -> None:

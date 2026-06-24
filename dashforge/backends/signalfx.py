@@ -8,6 +8,7 @@ from typing import Any, cast
 import structlog
 
 from dashforge.backends.base import DashboardFeatures, DiscoveryStatus, PublishResult
+from dashforge.config import Settings
 from dashforge.models.schemas import DashboardSpec, Intent, MetricEntry
 from dashforge.signalfx.client import SignalFxClient
 from dashforge.signalfx.discovery import discover_metrics as sfx_discover
@@ -20,8 +21,8 @@ logger = structlog.get_logger()
 class SignalFxBackend:
     """Dashboard backend that talks to Splunk Observability Cloud (SignalFx)."""
 
-    def __init__(self, client: SignalFxClient | None = None):
-        self._client = client or SignalFxClient()
+    def __init__(self, client: SignalFxClient | None = None, runtime_settings: Settings | None = None):
+        self._client = client or SignalFxClient(runtime_settings=runtime_settings)
         self.last_discovery_status = DiscoveryStatus()
 
     # ── Protocol properties ───────────────────────────────────────────
