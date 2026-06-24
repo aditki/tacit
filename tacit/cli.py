@@ -906,6 +906,117 @@ def _print_bulk_learning_summary(result: dict):
             _fail(f"  {item.get('dashboard_uid')}: {item.get('error')}")
 
 
+def _print_bulk_alert_learning_summary(result: dict):
+    prefix = "Previewed" if result.get("dry_run") else "Learned from"
+    _success(f"{prefix} {result.get('alerts_learned', 0)} {result.get('backend')} alerts")
+    _info(f"Alerts discovered: {result.get('alerts_discovered', 0)}")
+    _info(f"Alerts failed: {result.get('alerts_failed', 0)}")
+    _info(f"Metrics found: {result.get('metrics_found', 0)}")
+    _info(f"Signals inferred: {result.get('signals_inferred', 0)}")
+    _info(f"Indexed context rows: {result.get('indexed_context_rows', 0)}")
+    if result.get("stale_marked", 0):
+        _info(f"Alerts marked stale: {result.get('stale_marked', 0)}")
+    summary = result.get("summary", {})
+    if summary:
+        unmapped = max(0, result.get("alerts_learned", 0) - summary.get("signals_mapped", 0))
+        _info(
+            "Preview: "
+            f"{result.get('alerts_discovered', 0)} discovered, "
+            f"{summary.get('signals_mapped', 0)} mapped to known signals, "
+            f"{summary.get('runbooks_found', 0)} with runbook links, "
+            f"{summary.get('ownership_hints', 0)} with ownership/team labels, "
+            f"{unmapped} unmapped"
+        )
+    if result.get("auto_approve"):
+        _info(f"Mappings created: {result.get('mappings_created', 0)}")
+
+    learned = result.get("learned", [])
+    if learned:
+        _info("Top learned alerts:")
+        for item in learned[:10]:
+            _info(
+                f"  • {item.get('alert_title') or item.get('alert_uid')} "
+                f"({item.get('metrics_found', 0)} metrics, "
+                f"{item.get('signals_inferred', 0)} signals, "
+                f"{item.get('indexed_context_rows', 0)} indexed rows)"
+            )
+
+    failures = result.get("failures", [])
+    if failures:
+        _info("Failures:")
+        for item in failures[:5]:
+            _fail(f"  {item.get('alert_uid')}: {item.get('error')}")
+
+
+@learn.command("alerts")
+@click.option("--from", "source", default="grafana", show_default=True, help="Backend source: grafana or signalfx")
+@click.option("--uid", "alert_uid", default="", help="Ingest one alert UID instead of crawling all alerts")
+@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+@click.option("--dry-run", is_flag=True, help="Preview alert ingestion without persisting learned context")
+@click.option("--limit", default=500, show_default=True, help="Maximum alerts to crawl")
+def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool, limit: int):
+    """Crawl or preview alert rules from a backend."""
+    _header(f"Learn {source.title()} Alerts")
+    _load_env()
+
+    import asyncio
+
+    async def _run():
+        if alert_uid:
+            from tacit.alert_ingest import ingest_alert
+
+            return await ingest_alert(
+                alert_uid=alert_uid,
+                backend_name=source,
+                auto_approve=auto_approve,
+                dry_run=dry_run,
+            )
+        from tacit.alert_ingest import learn_backend_alerts
+
+        return await learn_backend_alerts(
+            source,
+            auto_approve=auto_approve,
+            dry_run=dry_run,
+            limit=limit,
+        )
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as e:
+        _fail(f"Alert ingestion failed: {e}")
+        _info("Run `tacit doctor` to check backend connectivity.")
+        return
+
+    if "alerts_learned" in result:
+        _print_bulk_alert_learning_summary(result)
+        return
+
+    quality = result.get("signal_quality", {})
+    action = "Previewed" if dry_run else "Ingested"
+    _success(f"{action} {result.get('alert_title') or alert_uid}")
+    _info(f"Status: {result.get('status', 'pending')}")
+    _info(f"Metrics found: {len(result.get('metrics_found', []))}")
+    _info(f"Signals inferred: {len(result.get('signals_inferred', []))}")
+    _info(f"Indexed context rows: {result.get('indexed_context_rows', 0)}")
+    summary = result.get("summary", {})
+    if summary:
+        _info(
+            "Summary: "
+            f"{summary.get('signals_mapped', 0)} mapped, "
+            f"{summary.get('runbooks_found', 0)} runbook links, "
+            f"{summary.get('ownership_hints', 0)} ownership/team hints"
+        )
+    if quality:
+        _info(
+            "Inference quality: "
+            f"{quality.get('taxonomy_matches', 0)} taxonomy, "
+            f"{quality.get('heuristic_candidates', 0)} heuristic, "
+            f"{quality.get('held_for_review', 0)} held for review"
+        )
+    if auto_approve and not dry_run:
+        _info(f"Mappings created: {result.get('mappings_created', 0)}")
+
+
 def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
     _header(f"Learn {backend_name.title()} Dashboards")
     _load_env()

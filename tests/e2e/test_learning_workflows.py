@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 import tacit.backends as backends_mod
 import tacit.signals as signals_mod
-from tacit.backends.base import DashboardFeatures
+from tacit.backends.base import AlertFeatures, DashboardFeatures
 from tacit.cli import cli
 from tacit.main import app
 
@@ -165,7 +165,7 @@ def test_bulk_grafana_learning_cli_indexes_backend_dashboards_e2e(isolated_learn
         async def close(self):
             return None
 
-    monkeypatch.setattr(backends_mod, "get_active_backends", lambda: [FakeGrafanaBackend()])
+    monkeypatch.setattr(backends_mod, "get_active_backends", lambda *_args, **_kwargs: [FakeGrafanaBackend()])
 
     runner = CliRunner()
     result = runner.invoke(cli, ["learn", "grafana", "--auto-approve", "--limit", "25"])
@@ -181,6 +181,84 @@ def test_bulk_grafana_learning_cli_indexes_backend_dashboards_e2e(isolated_learn
         "checkout_custom_latency_ms",
         "checkout_5xx_count",
     }
+
+
+def test_bulk_grafana_alert_learning_indexes_alert_context_e2e(client, isolated_learning_store, monkeypatch):
+    if not isolated_learning_store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+
+    class FakeGrafanaBackend:
+        name = "grafana"
+        query_language = "promql"
+
+        async def list_alerts(self, limit: int = 500):
+            assert limit == 25
+            return [{"uid": "checkout-latency-alert", "title": "Checkout latency high", "backend": "grafana"}]
+
+        async def ingest_alert(self, uid: str):
+            assert uid == "checkout-latency-alert"
+            return AlertFeatures(
+                alert_uid=uid,
+                alert_title="Checkout latency high",
+                alert_tags=["service:checkout", "severity:critical"],
+                backend_name="grafana",
+                query_language="promql",
+                condition="A > 1",
+                severity="critical",
+                labels={"service": "checkout", "severity": "critical"},
+                metrics_found=["checkout_request_duration_seconds"],
+                query_transformations=[
+                    'histogram_quantile(0.95, checkout_request_duration_seconds{service="checkout"})'
+                ],
+                service_hints=["checkout"],
+            )
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(backends_mod, "get_active_backends", lambda *_args, **_kwargs: [FakeGrafanaBackend()])
+
+    runner = CliRunner()
+    dry_run = runner.invoke(cli, ["learn", "alerts", "--from", "grafana", "--limit", "25", "--dry-run"])
+    assert dry_run.exit_code == 0
+    assert "Previewed 1 grafana alerts" in dry_run.output
+
+    listed_after_dry_run = client.get("/api/v1/learn/alerts")
+    assert listed_after_dry_run.status_code == 200
+    assert listed_after_dry_run.json()["count"] == 0
+
+    api_dry_run = client.post(
+        "/api/v1/learn/backends/grafana/alerts",
+        params={"limit": 25, "dry_run": "true"},
+    )
+    assert api_dry_run.status_code == 200
+    assert api_dry_run.json()["summary"]["source"] == "grafana"
+    assert api_dry_run.json()["summary"]["artifact_type"] == "alert_rule"
+
+    listed_after_api_dry_run = client.get("/api/v1/learn/alerts")
+    assert listed_after_api_dry_run.status_code == 200
+    assert listed_after_api_dry_run.json()["count"] == 0
+
+    result = runner.invoke(cli, ["learn", "alerts", "--from", "grafana", "--limit", "25"])
+
+    assert result.exit_code == 0
+    assert "Learned from 1 grafana alerts" in result.output
+    assert "Indexed context rows: 1" in result.output
+
+    search = client.get(
+        "/api/v1/learning/search",
+        params={"q": "checkout latency", "service": "checkout"},
+    )
+    assert search.status_code == 200
+    rows = search.json()["results"]
+    assert rows
+    assert rows[0]["source_kind"] == "alert_rule"
+    assert rows[0]["review_state"] == "candidate"
+
+    listed = client.get("/api/v1/learn/alerts")
+    assert listed.status_code == 200
+    assert listed.json()["count"] == 1
+    assert listed.json()["alerts"][0]["alert_uid"] == "checkout-latency-alert"
 
 
 def test_cli_reject_records_negative_training_data_e2e(client, isolated_learning_store):

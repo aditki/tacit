@@ -34,6 +34,7 @@ from tacit.config import settings
 from tacit.models.schemas import MetricEntry
 from tacit.signals.confidence import TRUST_THRESHOLD, stronger_review_state
 from tacit.signals.learning_index import (
+    build_alert_context_rows,
     build_learning_context_rows,
 )
 from tacit.signals.learning_index import (
@@ -43,6 +44,7 @@ from tacit.signals.learning_index import (
     fts_query as _fts_query,
 )
 from tacit.signals.migrations import (
+    ensure_ingested_alert_columns,
     ensure_ingested_dashboard_backend_scope,
     ensure_learning_index,
     ensure_mapping_columns,
@@ -147,6 +149,9 @@ class SignalStore:
 
     def _ensure_ingested_dashboard_backend_scope(self, conn: sqlite3.Connection) -> None:
         ensure_ingested_dashboard_backend_scope(conn)
+
+    def _ensure_ingested_alert_columns(self, conn: sqlite3.Connection) -> None:
+        ensure_ingested_alert_columns(conn)
 
     def _rebuild_ingested_dashboards_table(self, conn: sqlite3.Connection) -> None:
         rebuild_ingested_dashboards_table(conn)
@@ -786,6 +791,206 @@ class SignalStore:
             return 0
         return len(rows)
 
+    def record_ingested_alert(
+        self,
+        alert_uid: str,
+        *,
+        backend_name: str = "",
+        source_vendor: str = "",
+        source_instance: str = "",
+        external_id: str = "",
+        fingerprint: str = "",
+        alert_title: str = "",
+        alert_tags: list[str] | None = None,
+        condition: str = "",
+        severity: str = "",
+        enabled: bool = True,
+        labels: dict[str, str] | None = None,
+        annotations: dict[str, str] | None = None,
+        metrics_found: list[str] | None = None,
+        query_transformations: list[str] | None = None,
+        service_hints: list[str] | None = None,
+        dashboard_uid: str = "",
+        panel_title: str = "",
+        source_url: str = "",
+        provenance_url: str = "",
+        confidence: float = 0.0,
+        signals_inferred: list[str] | list[dict] | None = None,
+        status: str = "pending",
+    ) -> str:
+        """Record features extracted from an ingested alert rule/detector.
+
+        Returns ``created``, ``updated``, or ``skipped``.
+        """
+        now = time.time()
+        with self._conn() as conn:
+            existing = conn.execute(
+                """SELECT id, fingerprint, first_seen_at FROM ingested_alerts
+                   WHERE alert_uid = ? AND backend_name = ?""",
+                (alert_uid, backend_name),
+            ).fetchone()
+            first_seen = existing["first_seen_at"] if existing and existing["first_seen_at"] else now
+            change_state = "created"
+            if existing is not None:
+                change_state = "skipped" if fingerprint and existing["fingerprint"] == fingerprint else "updated"
+            conn.execute(
+                """INSERT INTO ingested_alerts
+                   (alert_uid, backend_name, source_vendor, source_instance,
+                    external_id, fingerprint, alert_title, alert_tags,
+                    condition, severity, enabled, labels, annotations,
+                    metrics_found, query_transformations, service_hints,
+                    dashboard_uid, panel_title, source_url, provenance_url,
+                    confidence, stale, missing_since, status, signals_inferred, first_seen_at,
+                    last_seen_at, updated_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(alert_uid, backend_name) DO UPDATE SET
+                       source_vendor = excluded.source_vendor,
+                       source_instance = excluded.source_instance,
+                       external_id = excluded.external_id,
+                       fingerprint = excluded.fingerprint,
+                       alert_title = excluded.alert_title,
+                       alert_tags = excluded.alert_tags,
+                       condition = excluded.condition,
+                       severity = excluded.severity,
+                       enabled = excluded.enabled,
+                       labels = excluded.labels,
+                       annotations = excluded.annotations,
+                       metrics_found = excluded.metrics_found,
+                       query_transformations = excluded.query_transformations,
+                       service_hints = excluded.service_hints,
+                       dashboard_uid = excluded.dashboard_uid,
+                       panel_title = excluded.panel_title,
+                       source_url = excluded.source_url,
+                       provenance_url = excluded.provenance_url,
+                       confidence = excluded.confidence,
+                       stale = 0,
+                       missing_since = NULL,
+                       status = excluded.status,
+                       signals_inferred = excluded.signals_inferred,
+                       first_seen_at = ingested_alerts.first_seen_at,
+                       last_seen_at = excluded.last_seen_at,
+                       updated_at = CASE
+                           WHEN ingested_alerts.fingerprint = excluded.fingerprint THEN ingested_alerts.updated_at
+                           ELSE excluded.updated_at
+                       END,
+                       created_at = ingested_alerts.created_at""",
+                (
+                    alert_uid,
+                    backend_name,
+                    source_vendor or backend_name,
+                    source_instance,
+                    external_id or alert_uid,
+                    fingerprint,
+                    alert_title,
+                    json.dumps(alert_tags or []),
+                    condition,
+                    severity,
+                    1 if enabled else 0,
+                    json.dumps(labels or {}),
+                    json.dumps(annotations or {}),
+                    json.dumps(metrics_found or []),
+                    json.dumps(query_transformations or []),
+                    json.dumps(service_hints or []),
+                    dashboard_uid,
+                    panel_title,
+                    source_url,
+                    provenance_url or source_url,
+                    confidence,
+                    0,
+                    None,
+                    status,
+                    json.dumps(signals_inferred or []),
+                    first_seen,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        return change_state
+
+    def mark_missing_alerts_stale(
+        self,
+        *,
+        backend_name: str,
+        seen_alert_uids: set[str],
+    ) -> int:
+        """Mark previously ingested backend alerts stale when absent from a crawl."""
+        now = time.time()
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT alert_uid FROM ingested_alerts
+                   WHERE backend_name = ? AND stale = 0""",
+                (backend_name,),
+            ).fetchall()
+            missing = [row["alert_uid"] for row in rows if row["alert_uid"] not in seen_alert_uids]
+            if not missing:
+                return 0
+            placeholders = ", ".join("?" for _ in missing)
+            cursor = conn.execute(
+                f"""UPDATE ingested_alerts
+                    SET stale = 1,
+                        missing_since = COALESCE(missing_since, ?),
+                        status = 'stale',
+                        updated_at = ?
+                    WHERE backend_name = ? AND alert_uid IN ({placeholders})""",
+                (now, now, backend_name, *missing),
+            )
+            return cursor.rowcount
+
+    def index_alert_context(
+        self,
+        *,
+        alert_uid: str,
+        backend_name: str = "",
+        alert_title: str = "",
+        alert_tags: list[str] | None = None,
+        condition: str = "",
+        metrics_found: list[str] | None = None,
+        query_transformations: list[str] | None = None,
+        service_hints: list[str] | None = None,
+        signals_inferred: list[dict[str, Any]] | list[str] | None = None,
+        status: str = "pending",
+        activated_pairs: set[tuple[str, str]] | None = None,
+    ) -> int:
+        """Index learned alert-rule context for fast operational-language retrieval."""
+        if not self._learning_index_available():
+            return 0
+
+        rows = build_alert_context_rows(
+            alert_uid=alert_uid,
+            backend_name=backend_name,
+            alert_title=alert_title,
+            alert_tags=alert_tags or [],
+            condition=condition,
+            metrics_found=metrics_found or [],
+            query_transformations=query_transformations or [],
+            service_hints=service_hints or [],
+            signals_inferred=signals_inferred or [],
+            status=status,
+            activated_pairs=activated_pairs,
+        )
+
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    """DELETE FROM learning_context_fts
+                       WHERE source_kind = 'alert_rule' AND dashboard_uid = ? AND backend_name = ?""",
+                    (alert_uid, backend_name),
+                )
+                conn.executemany(
+                    """INSERT INTO learning_context_fts
+                       (source_kind, source_id, backend_name, dashboard_uid,
+                        dashboard_title, dashboard_tags, panel_title, metric_name,
+                        query_text, service, signal_type, review_state, reason,
+                        provenance, indexed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+        except sqlite3.OperationalError as exc:
+            logger.warning("alert_context_index_failed", error=str(exc))
+            return 0
+        return len(rows)
+
     def update_learning_context_review_state(
         self,
         dashboard_uid: str,
@@ -1011,6 +1216,23 @@ class SignalStore:
                 ).fetchall()
         return [_deserialize_ingested(r) for r in rows]
 
+    def list_ingested_alerts(self, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        """List ingested alerts, optionally filtered by status."""
+        with self._conn() as conn:
+            if status:
+                rows = conn.execute(
+                    """SELECT * FROM ingested_alerts
+                       WHERE status = ? ORDER BY created_at DESC LIMIT ?""",
+                    (status, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM ingested_alerts
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+        return [_deserialize_ingested_alert(r) for r in rows]
+
     def update_ingested_dashboard_status(
         self,
         dashboard_uid: str,
@@ -1078,6 +1300,7 @@ class SignalStore:
             signal_count = conn.execute("SELECT COUNT(*) FROM signal_types").fetchone()[0]
             mapping_count = conn.execute("SELECT COUNT(*) FROM signal_metric_mappings").fetchone()[0]
             ingested_count = conn.execute("SELECT COUNT(*) FROM ingested_dashboards").fetchone()[0]
+            ingested_alert_count = conn.execute("SELECT COUNT(*) FROM ingested_alerts").fetchone()[0]
 
             by_source = conn.execute("""SELECT source_type, COUNT(*) as n
                    FROM signal_metric_mappings GROUP BY source_type""").fetchall()
@@ -1089,6 +1312,7 @@ class SignalStore:
             "signal_types": signal_count,
             "metric_mappings": mapping_count,
             "ingested_dashboards": ingested_count,
+            "ingested_alerts": ingested_alert_count,
             "mappings_by_source": {r["source_type"]: r["n"] for r in by_source},
             "signals_by_category": {r["category"]: r["n"] for r in by_category},
         }
@@ -1126,6 +1350,27 @@ def _deserialize_ingested(row: sqlite3.Row) -> dict[str, Any]:
     ):
         if field in d and isinstance(d[field], str):
             d[field] = json.loads(d[field])
+    return d
+
+
+def _deserialize_ingested_alert(row: sqlite3.Row) -> dict[str, Any]:
+    """Convert an ingested alert DB row to a dict."""
+    d = dict(row)
+    for field in (
+        "alert_tags",
+        "labels",
+        "annotations",
+        "metrics_found",
+        "query_transformations",
+        "service_hints",
+        "signals_inferred",
+    ):
+        if field in d and isinstance(d[field], str):
+            d[field] = json.loads(d[field])
+    if "enabled" in d:
+        d["enabled"] = bool(d["enabled"])
+    if "stale" in d:
+        d["stale"] = bool(d["stale"])
     return d
 
 

@@ -10,7 +10,7 @@ from fastapi import Path as PathParam
 
 import tacit.signals as signals_mod
 from tacit.api.security import verify_api_key
-from tacit.models.schemas import LearnDashboardRequest, LearnDashboardUploadRequest
+from tacit.models.schemas import LearnAlertRequest, LearnDashboardRequest, LearnDashboardUploadRequest
 
 logger = structlog.get_logger()
 router = APIRouter(dependencies=[Depends(verify_api_key)])
@@ -26,6 +26,18 @@ async def _call_learn_backend_dashboards(learn_backend_dashboards, **kwargs):
     if "runtime_settings" not in inspect.signature(learn_backend_dashboards).parameters:
         kwargs.pop("runtime_settings", None)
     return await learn_backend_dashboards(**kwargs)
+
+
+async def _call_ingest_alert(ingest_alert, **kwargs):
+    if "runtime_settings" not in inspect.signature(ingest_alert).parameters:
+        kwargs.pop("runtime_settings", None)
+    return await ingest_alert(**kwargs)
+
+
+async def _call_learn_backend_alerts(learn_backend_alerts, **kwargs):
+    if "runtime_settings" not in inspect.signature(learn_backend_alerts).parameters:
+        kwargs.pop("runtime_settings", None)
+    return await learn_backend_alerts(**kwargs)
 
 
 @router.post(
@@ -55,6 +67,37 @@ async def learn_from_dashboard(request: Request, payload: LearnDashboardRequest)
             status_code=500,
             detail=f"Failed to ingest dashboard '{payload.dashboard_uid}'. "
             "Check that the UID exists and the backend is accessible.",
+        )
+
+
+@router.post(
+    "/api/v1/learn/alerts",
+    tags=["Learning"],
+    summary="Learn from an existing alert rule",
+    response_description="Extracted alert features and inferred signals",
+)
+async def learn_from_alert(request: Request, payload: LearnAlertRequest):
+    """Ingest an existing alert rule/detector to learn operational patterns."""
+    from tacit.alert_ingest import ingest_alert
+    from tacit.config import settings
+
+    try:
+        return await _call_ingest_alert(
+            ingest_alert,
+            alert_uid=payload.alert_uid,
+            backend_name=payload.backend,
+            auto_approve=payload.auto_approve,
+            dry_run=payload.dry_run,
+            runtime_settings=getattr(request.app.state, "settings", settings),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("alert_ingest_failed", uid=payload.alert_uid, backend=payload.backend)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to ingest alert '{payload.alert_uid}'. "
+            "Check that the alert exists and the backend is accessible.",
         )
 
 
@@ -120,6 +163,42 @@ async def learn_backend(
         )
 
 
+@router.post(
+    "/api/v1/learn/backends/{backend_name}/alerts",
+    tags=["Learning"],
+    summary="Crawl and learn from all alerts in a backend",
+    response_description="Bulk alert learning summary",
+)
+async def learn_backend_alert_rules(
+    request: Request,
+    backend_name: str = PathParam(description="Backend name: grafana or signalfx"),
+    auto_approve: bool = Query(False, description="Immediately approve eligible inferred mappings"),
+    dry_run: bool = Query(False, description="Preview alert ingestion without persisting learned context"),
+    limit: int = Query(500, ge=1, le=5000, description="Maximum alerts to crawl"),
+):
+    """Crawl a connected backend and persist learned alert context."""
+    from tacit.alert_ingest import learn_backend_alerts
+    from tacit.config import settings
+
+    try:
+        return await _call_learn_backend_alerts(
+            learn_backend_alerts,
+            backend_name=backend_name,
+            auto_approve=auto_approve,
+            dry_run=dry_run,
+            limit=limit,
+            runtime_settings=getattr(request.app.state, "settings", settings),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("backend_alert_learning_failed", backend=backend_name)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to learn alerts from backend '{backend_name}'. Check backend connectivity.",
+        )
+
+
 @router.get(
     "/api/v1/learn/dashboards",
     tags=["Learning"],
@@ -146,6 +225,34 @@ async def list_ingested_dashboards(
                 approved=dashboard.get("status") == "approved",
             )
     return {"count": len(dashboards), "dashboards": dashboards}
+
+
+@router.get(
+    "/api/v1/learn/alerts",
+    tags=["Learning"],
+    summary="List ingested alerts",
+    response_description="Ingested alerts with extracted features and status",
+)
+async def list_ingested_alerts(
+    status: str | None = None,
+    limit: int = 50,
+):
+    """List alerts that have been ingested for learning."""
+    from tacit.dashboard_ingest import build_learning_impact_report, build_signal_quality_report
+
+    store = signals_mod.get_signal_store()
+    alerts = store.list_ingested_alerts(status=status, limit=limit)
+    for alert in alerts:
+        metrics = alert.get("metrics_found", [])
+        signals = alert.get("signals_inferred", [])
+        if isinstance(metrics, list) and isinstance(signals, list):
+            alert["signal_quality"] = build_signal_quality_report(metrics=metrics, signals=signals)
+            alert["learning_impact"] = build_learning_impact_report(
+                metrics=metrics,
+                signals=signals,
+                approved=alert.get("status") == "approved",
+            )
+    return {"count": len(alerts), "alerts": alerts}
 
 
 @router.get(

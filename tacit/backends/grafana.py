@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import structlog
 
-from tacit.backends.base import DashboardFeatures, DiscoveryStatus, PublishResult
+from tacit.backends.base import AlertFeatures, DashboardFeatures, DiscoveryStatus, PublishResult
 from tacit.config import Settings
 from tacit.grafana.adapters.registry import get_adapter
 from tacit.grafana.client import GrafanaClient
@@ -187,7 +187,165 @@ class GrafanaBackend:
             )
         return out[:limit]
 
+    async def ingest_alert(self, uid: str) -> AlertFeatures:
+        """Fetch a Grafana alert rule and extract operational features."""
+        try:
+            rule = cast(dict[str, Any], await self._client._get(f"/api/v1/provisioning/alert-rules/{uid}"))
+            return _parse_grafana_alert_rule(rule, backend_name=self.name, base_url=self._client.base_url)
+        except Exception:
+            legacy = cast(dict[str, Any], await self._client._get(f"/api/alerts/{uid}"))
+            return _parse_legacy_grafana_alert(legacy, backend_name=self.name, base_url=self._client.base_url)
+
+    async def list_alerts(self, limit: int = 500) -> list[dict]:
+        """List Grafana alert rules discoverable by the configured token."""
+        try:
+            raw = await self._client._get("/api/v1/provisioning/alert-rules")
+            rules = raw if isinstance(raw, list) else []
+            out = []
+            for item in rules:
+                if not isinstance(item, dict):
+                    continue
+                uid = item.get("uid", "")
+                if not uid:
+                    continue
+                out.append(
+                    {
+                        "uid": uid,
+                        "title": item.get("title", ""),
+                        "folder": item.get("folderUID", ""),
+                        "backend": self.name,
+                    }
+                )
+            return out[:limit]
+        except Exception as exc:
+            logger.warning("grafana_unified_alert_list_failed", error=str(exc))
+
+        raw = await self._client._get("/api/alerts", params={"limit": limit})
+        alerts = raw if isinstance(raw, list) else []
+        out = []
+        for item in alerts:
+            if not isinstance(item, dict):
+                continue
+            uid = str(item.get("id", "") or item.get("uid", ""))
+            if not uid:
+                continue
+            out.append(
+                {
+                    "uid": uid,
+                    "title": item.get("name", "") or item.get("title", ""),
+                    "folder": item.get("folderTitle", ""),
+                    "backend": self.name,
+                }
+            )
+        return out[:limit]
+
     # ── Cleanup ───────────────────────────────────────────────────────
 
     async def close(self) -> None:
         await self._client.close()
+
+
+def _string_dict(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): str(v) for k, v in value.items() if v is not None}
+
+
+def _service_hints_from_labels(labels: dict[str, str], tags: list[str]) -> list[str]:
+    hints: list[str] = []
+
+    def add(value: str) -> None:
+        cleaned = value.strip()
+        if cleaned and cleaned not in hints:
+            hints.append(cleaned)
+
+    for key, value in labels.items():
+        if key.lower() in {"service", "service_name", "app", "application", "component", "team"}:
+            add(value)
+    for tag in tags:
+        if ":" in tag:
+            key, value = tag.split(":", 1)
+            if key.lower() in {"service", "app", "application", "component", "team"}:
+                add(value)
+    return hints
+
+
+def _extract_grafana_rule_queries(rule: dict[str, Any]) -> list[str]:
+    queries: list[str] = []
+    for item in rule.get("data", []) or []:
+        if not isinstance(item, dict):
+            continue
+        model = item.get("model", {})
+        if not isinstance(model, dict):
+            continue
+        for key in ("expr", "query", "expression"):
+            value = model.get(key, "")
+            if isinstance(value, str) and value:
+                queries.append(value)
+    return list(dict.fromkeys(queries))
+
+
+def _extract_promql_metrics(queries: list[str]) -> list[str]:
+    from tacit.dashboard_ingest import extract_metrics_from_promql
+
+    metrics: list[str] = []
+    for query in queries:
+        try:
+            metrics.extend(extract_metrics_from_promql(query))
+        except Exception:
+            logger.debug("grafana_alert_metric_parse_failed", query=query)
+    return list(dict.fromkeys(metrics))
+
+
+def _parse_grafana_alert_rule(rule: dict[str, Any], *, backend_name: str, base_url: str) -> AlertFeatures:
+    labels = _string_dict(rule.get("labels", {}))
+    annotations = _string_dict(rule.get("annotations", {}))
+    title = str(rule.get("title", ""))
+    uid = str(rule.get("uid", ""))
+    queries = _extract_grafana_rule_queries(rule)
+    tags = [f"{key}:{value}" for key, value in labels.items() if key.lower() in {"service", "team", "severity"}]
+    dashboard_uid = annotations.get("__dashboardUid__", "") or annotations.get("dashboardUid", "")
+    panel_title = annotations.get("__panelTitle__", "") or annotations.get("panelTitle", "")
+    return AlertFeatures(
+        alert_uid=uid,
+        alert_title=title,
+        alert_tags=tags,
+        backend_name=backend_name,
+        query_language="promql",
+        condition=str(rule.get("condition", "")),
+        severity=labels.get("severity", ""),
+        enabled=not bool(rule.get("isPaused", False)),
+        labels=labels,
+        annotations=annotations,
+        metrics_found=_extract_promql_metrics(queries),
+        query_transformations=queries,
+        service_hints=_service_hints_from_labels(labels, tags),
+        dashboard_uid=dashboard_uid,
+        panel_title=panel_title,
+        source_url=f"{base_url}/alerting/grafana/{uid}/view" if uid else "",
+    )
+
+
+def _parse_legacy_grafana_alert(alert: dict[str, Any], *, backend_name: str, base_url: str) -> AlertFeatures:
+    uid = str(alert.get("id", "") or alert.get("uid", ""))
+    title = str(alert.get("name", "") or alert.get("title", ""))
+    dashboard_uid = str(alert.get("dashboardUid", ""))
+    state = str(alert.get("state", ""))
+    return AlertFeatures(
+        alert_uid=uid,
+        alert_title=title,
+        alert_tags=[state] if state else [],
+        backend_name=backend_name,
+        query_language="promql",
+        condition=state,
+        severity=state,
+        enabled=state.lower() != "paused",
+        labels={},
+        annotations={},
+        metrics_found=[],
+        query_transformations=[],
+        service_hints=[],
+        dashboard_uid=dashboard_uid,
+        panel_title=str(alert.get("panelTitle", "")),
+        source_url=f"{base_url}{alert.get('url', '')}" if alert.get("url") else "",
+    )

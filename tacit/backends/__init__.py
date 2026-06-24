@@ -6,12 +6,13 @@ over these instead of using vendor-specific if/else branches.
 
 from __future__ import annotations
 
-from tacit.backends.base import DashboardBackend, DashboardFeatures, DiscoveryStatus, PublishResult
+from tacit.backends.base import AlertFeatures, DashboardBackend, DashboardFeatures, DiscoveryStatus, PublishResult
 from tacit.config import Settings, settings
 
 __all__ = [
     "DashboardBackend",
     "DashboardFeatures",
+    "AlertFeatures",
     "DiscoveryStatus",
     "PublishResult",
     "get_active_backends",
