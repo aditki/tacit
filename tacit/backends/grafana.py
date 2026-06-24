@@ -291,7 +291,7 @@ def _service_hints_from_labels(labels: dict[str, str], tags: list[str]) -> list[
 
 def _datasource_type(value: Any) -> str:
     if isinstance(value, dict):
-        return str(value.get("type", "") or value.get("name", "")).lower()
+        return str(value.get("type", "") or "").lower()
     return ""
 
 
@@ -332,6 +332,25 @@ def _is_prometheus_alert_query_item(
     return False
 
 
+def _grafana_expression_details(model: dict[str, Any]) -> str:
+    keys = (
+        "type",
+        "expression",
+        "conditions",
+        "reducer",
+        "evaluator",
+        "operator",
+        "threshold",
+        "params",
+    )
+    details = {key: model[key] for key in keys if key in model and model[key] not in ("", None, [], {})}
+    if not details:
+        return ""
+    import json
+
+    return json.dumps(details, sort_keys=True, separators=(",", ":"))
+
+
 def _extract_grafana_rule_queries(
     rule: dict[str, Any],
     datasource_types_by_uid: dict[str, str] | None = None,
@@ -350,6 +369,25 @@ def _extract_grafana_rule_queries(
             if isinstance(value, str) and value:
                 queries.append(value)
     return list(dict.fromkeys(queries))
+
+
+def _extract_grafana_expression_conditions(rule: dict[str, Any]) -> list[str]:
+    conditions: list[str] = []
+    for item in rule.get("data", []) or []:
+        if not isinstance(item, dict):
+            continue
+        model = item.get("model", {})
+        if not isinstance(model, dict):
+            continue
+        datasource_uid = str(item.get("datasourceUid", "") or model.get("datasourceUid", "") or "").lower()
+        model_type = str(model.get("type", "") or "").lower()
+        if datasource_uid != "__expr__" and model_type not in {"math", "reduce", "classic_conditions"}:
+            continue
+        ref_id = str(item.get("refId", "") or model.get("refId", "") or "")
+        details = _grafana_expression_details(model)
+        if details:
+            conditions.append(f"{ref_id}:{details}" if ref_id else details)
+    return conditions
 
 
 def _extract_promql_metrics(queries: list[str]) -> list[str]:
@@ -376,6 +414,9 @@ def _parse_grafana_alert_rule(
     title = str(rule.get("title", ""))
     uid = str(rule.get("uid", ""))
     queries = _extract_grafana_rule_queries(rule, datasource_types_by_uid)
+    expression_conditions = _extract_grafana_expression_conditions(rule)
+    condition_parts = [str(rule.get("condition", "")), *expression_conditions]
+    condition = " | ".join(part for part in condition_parts if part)
     tags = [f"{key}:{value}" for key, value in labels.items() if key.lower() in {"service", "team", "severity"}]
     dashboard_uid = annotations.get("__dashboardUid__", "") or annotations.get("dashboardUid", "")
     panel_title = annotations.get("__panelTitle__", "") or annotations.get("panelTitle", "")
@@ -385,7 +426,7 @@ def _parse_grafana_alert_rule(
         alert_tags=tags,
         backend_name=backend_name,
         query_language="promql",
-        condition=str(rule.get("condition", "")),
+        condition=condition,
         severity=labels.get("severity", ""),
         enabled=not bool(rule.get("isPaused", False)),
         labels=labels,

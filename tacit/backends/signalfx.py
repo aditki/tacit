@@ -137,25 +137,43 @@ class SignalFxBackend:
     async def list_alerts(self, limit: int = 500) -> list[dict]:
         """List SignalFx detectors discoverable by the configured token."""
         self.last_alert_list_complete = False
-        data = await self._client._get("/v2/detector", params={"limit": limit})
-        detectors = data.get("results", []) if isinstance(data, dict) else data
-        detector_count = len(detectors) if isinstance(detectors, list) else 0
-        self.last_alert_list_complete = _signalfx_detector_page_complete(data, detector_count, limit)
         out: list[dict] = []
-        for item in detectors if isinstance(detectors, list) else []:
-            if not isinstance(item, dict):
-                continue
-            uid = str(item.get("id", ""))
-            if not uid:
-                continue
-            out.append(
-                {
-                    "uid": uid,
-                    "title": item.get("name", ""),
-                    "backend": self.name,
-                }
+        offset = 0
+        page_complete = False
+        while len(out) < limit:
+            page_limit = max(1, min(100, limit - len(out)))
+            params = {"limit": page_limit}
+            if offset:
+                params["offset"] = offset
+            data = await self._client._get("/v2/detector", params=params)
+            detectors = data.get("results", []) if isinstance(data, dict) else data
+            detector_items = detectors if isinstance(detectors, list) else []
+            for item in detector_items:
+                if not isinstance(item, dict):
+                    continue
+                uid = str(item.get("id", ""))
+                if not uid:
+                    continue
+                out.append(
+                    {
+                        "uid": uid,
+                        "title": item.get("name", ""),
+                        "backend": self.name,
+                    }
+                )
+                if len(out) >= limit:
+                    break
+            page_complete = _signalfx_detector_page_complete(
+                data,
+                page_count=len(detector_items),
+                page_limit=page_limit,
+                total_seen=len(out),
             )
-        return out[:limit]
+            if page_complete or not detector_items:
+                break
+            offset += len(detector_items)
+        self.last_alert_list_complete = page_complete and len(out) < limit
+        return out
 
     async def _parse_sfx_dashboard(self, dashboard_json: dict) -> DashboardFeatures:
         """Parse a SignalFx dashboard + its charts into DashboardFeatures."""
@@ -347,18 +365,18 @@ def _detector_condition(detector: dict[str, Any]) -> str:
     return "; ".join(dict.fromkeys(labels))
 
 
-def _signalfx_detector_page_complete(data: Any, detector_count: int, limit: int) -> bool:
+def _signalfx_detector_page_complete(data: Any, *, page_count: int, page_limit: int, total_seen: int) -> bool:
     """Return true when the detector response is known to be a complete snapshot."""
     if not isinstance(data, dict):
-        return detector_count < limit
+        return page_count < page_limit
     if data.get("next") or data.get("nextPage") or data.get("nextPageLink"):
         return False
     if data.get("more") is True or data.get("hasMore") is True:
         return False
     total = data.get("count", data.get("total", data.get("totalCount")))
     if isinstance(total, int):
-        return detector_count >= total
-    return detector_count < limit
+        return total_seen >= total
+    return page_count < page_limit
 
 
 def _parse_signalfx_detector(detector: dict[str, Any], *, backend_name: str, realm: str) -> AlertFeatures:

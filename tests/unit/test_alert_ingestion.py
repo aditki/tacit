@@ -73,6 +73,7 @@ def test_grafana_alert_rule_skips_expression_ref_ids_and_non_prometheus_queries(
 
     assert features.metrics_found == ["checkout_latency_seconds_count"]
     assert features.query_transformations == ['rate(checkout_latency_seconds_count{service="checkout"}[5m])']
+    assert "$A > 0" in features.condition
 
 
 def test_grafana_alert_rule_skips_unknown_datasource_uid_queries():
@@ -120,6 +121,73 @@ def test_grafana_alert_rule_resolves_datasource_uid_only_prometheus_queries():
 
     assert features.metrics_found == ["checkout_latency_seconds_count"]
     assert features.query_transformations == ['rate(checkout_latency_seconds_count{service="checkout"}[5m])']
+
+
+def test_grafana_alert_rule_uses_uid_resolution_when_datasource_object_has_name_only():
+    features = _parse_grafana_alert_rule(
+        {
+            "uid": "checkout-latency",
+            "title": "Checkout latency high",
+            "condition": "A",
+            "labels": {"service": "checkout"},
+            "data": [
+                {
+                    "refId": "A",
+                    "model": {
+                        "datasource": {"uid": "prom-prod", "name": "Prod Prometheus"},
+                        "expr": 'rate(checkout_latency_seconds_count{service="checkout"}[5m])',
+                    },
+                }
+            ],
+        },
+        backend_name="grafana",
+        base_url="http://grafana.example",
+        datasource_types_by_uid={"prom-prod": "prometheus"},
+    )
+
+    assert features.metrics_found == ["checkout_latency_seconds_count"]
+
+
+def test_grafana_alert_threshold_details_change_condition_for_fingerprint():
+    base_rule = {
+        "uid": "checkout-latency",
+        "title": "Checkout latency high",
+        "condition": "C",
+        "labels": {"service": "checkout"},
+        "data": [
+            {
+                "refId": "A",
+                "model": {
+                    "datasource": {"type": "prometheus", "uid": "prom"},
+                    "expr": 'rate(checkout_latency_seconds_count{service="checkout"}[5m])',
+                },
+            },
+            {
+                "refId": "C",
+                "datasourceUid": "__expr__",
+                "model": {"type": "math", "expression": "$A > 10"},
+            },
+        ],
+    }
+    changed_rule = {
+        **base_rule,
+        "data": [
+            base_rule["data"][0],
+            {
+                "refId": "C",
+                "datasourceUid": "__expr__",
+                "model": {"type": "math", "expression": "$A > 20"},
+            },
+        ],
+    }
+
+    first = _parse_grafana_alert_rule(base_rule, backend_name="grafana", base_url="http://grafana.example")
+    changed = _parse_grafana_alert_rule(changed_rule, backend_name="grafana", base_url="http://grafana.example")
+
+    assert first.metrics_found == changed.metrics_found == ["checkout_latency_seconds_count"]
+    assert "$A > 10" in first.condition
+    assert "$A > 20" in changed.condition
+    assert first.condition != changed.condition
 
 
 @pytest.mark.asyncio
@@ -273,7 +341,10 @@ async def test_signalfx_detector_crawl_keeps_paged_response_incomplete():
         async def _get(self, path: str, params=None):
             assert path == "/v2/detector"
             assert params == {"limit": 10}
-            return {"results": [{"id": "detector-1", "name": "Checkout"}], "nextPageLink": "/v2/detector?offset=1"}
+            return {
+                "results": [{"id": f"detector-{idx}", "name": f"Detector {idx}"} for idx in range(10)],
+                "nextPageLink": "/v2/detector?offset=10",
+            }
 
         async def close(self):
             return None
@@ -283,3 +354,31 @@ async def test_signalfx_detector_crawl_keeps_paged_response_incomplete():
     await backend.list_alerts(limit=10)
 
     assert backend.last_alert_list_complete is False
+
+
+@pytest.mark.asyncio
+async def test_signalfx_detector_crawl_pages_until_limit_or_complete():
+    class FakeSignalFxClient:
+        realm = "us1"
+
+        async def _get(self, path: str, params=None):
+            assert path == "/v2/detector"
+            if params == {"limit": 100}:
+                return {
+                    "results": [{"id": f"detector-{idx}", "name": f"Detector {idx}"} for idx in range(100)],
+                    "nextPageLink": "/v2/detector?offset=100",
+                }
+            assert params == {"limit": 100, "offset": 100}
+            return {"results": [{"id": f"detector-{idx}", "name": f"Detector {idx}"} for idx in range(100, 125)]}
+
+        async def close(self):
+            return None
+
+    backend = SignalFxBackend(client=FakeSignalFxClient())
+
+    alerts = await backend.list_alerts(limit=200)
+
+    assert len(alerts) == 125
+    assert alerts[0]["uid"] == "detector-0"
+    assert alerts[-1]["uid"] == "detector-124"
+    assert backend.last_alert_list_complete is True
