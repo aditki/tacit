@@ -77,6 +77,7 @@ class EvidenceRequirementContext(BaseModel):
     signal_hint: str = ""
     observation_state: Literal["observed", "not_observed", "indeterminate"] = "indeterminate"
     stale: bool = False
+    source_type: str = ""
     source: str = "artifact_learning"
 
 
@@ -356,17 +357,17 @@ def rank_context_bundle(bundle: ContextBundle) -> RankedSuspectsResult:
             detail=f"{dependency_hint.source_entity} {dependency_hint.direction} {dependency_hint.target_entity}",
         )
 
-    seen_alerts: set[tuple[str, tuple[str, ...]]] = set()
+    seen_alerts: set[tuple[str, tuple[str, ...], bool]] = set()
     for alert in bundle.context.alerts:
         entity = alert.entity
         if entity not in connected:
             continue
-        alert_key = (entity, tuple(sorted(dict.fromkeys(alert.signals))))
+        if not alert.enabled:
+            continue
+        alert_key = (entity, tuple(sorted(dict.fromkeys(alert.signals))), alert.stale)
         if alert_key in seen_alerts:
             continue
         seen_alerts.add(alert_key)
-        if not alert.enabled:
-            continue
 
         cand = _candidate(candidates, entity)
         if alert.stale:
@@ -400,7 +401,9 @@ def rank_context_bundle(bundle: ContextBundle) -> RankedSuspectsResult:
             continue
         if requirement.observation_state == "observed":
             cand = _candidate(candidates, entity)
-            from_incident_history = requirement.source.startswith("incident_history")
+            from_incident_history = requirement.source_type == "incident" or requirement.source.startswith(
+                "incident_history"
+            )
             reason_type = "incident_observed_evidence" if from_incident_history else "evidence_requirement_observed"
             cand.raw_score += WEIGHTS[reason_type]
             if not from_incident_history:

@@ -151,8 +151,14 @@ def _row_id(*parts: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:24]
 
 
-def _artifact_id(artifact_type: str, external_id: str, source_instance: str = "") -> str:
-    stable = f"{source_instance}:{external_id}" if source_instance else external_id
+def _artifact_id(
+    artifact_type: str,
+    external_id: str,
+    source_instance: str = "",
+    source_vendor: str = "",
+) -> str:
+    stable_parts = [source_vendor, source_instance, external_id]
+    stable = ":".join(part for part in stable_parts if part)
     return f"{artifact_type}:{_fingerprint(stable)[:20]}"
 
 
@@ -257,7 +263,7 @@ class RunbookExtractor:
         priority = 0
         symptom = artifact.title
         lines = artifact.body_text.splitlines()
-        for raw in lines:
+        for line_no, raw in enumerate(lines, start=1):
             maybe_section = _section_name(raw)
             if maybe_section:
                 section = maybe_section
@@ -275,7 +281,7 @@ class RunbookExtractor:
             if dep:
                 result.dependency_hints.append(
                     DependencyHint(
-                        id=_row_id(artifact.id, "dependency", line),
+                        id=_row_id(artifact.id, "dependency", str(line_no), line),
                         source_entity=dep.group("src"),
                         target_entity=dep.group("tgt"),
                         direction="depends_on" if dep.group("dir").lower() == "depends on" else "calls",
@@ -293,7 +299,7 @@ class RunbookExtractor:
                 owner = ownership.group("owner").strip().strip(".")
                 result.ownership_hints.append(
                     OwnershipHint(
-                        id=_row_id(artifact.id, "ownership", line),
+                        id=_row_id(artifact.id, "ownership", str(line_no), line),
                         entity=artifact.title,
                         owner=owner,
                         hint_kind=(
@@ -316,7 +322,7 @@ class RunbookExtractor:
                 signal_hint = metrics[0] if metrics else None
                 result.evidence_requirements.append(
                     EvidenceRequirement(
-                        id=_row_id(artifact.id, "evidence", line),
+                        id=_row_id(artifact.id, "evidence", str(line_no), line),
                         subject=check_body,
                         evidence_kind=_infer_evidence_kind(check_body),
                         target_entity=_entity_from_text(check_body),
@@ -359,7 +365,7 @@ class IncidentExtractor:
         section = ""
         priority = 0
         symptom = artifact.title
-        for raw in artifact.body_text.splitlines():
+        for line_no, raw in enumerate(artifact.body_text.splitlines(), start=1):
             maybe_section = _section_name(raw)
             if maybe_section:
                 section = maybe_section
@@ -378,7 +384,7 @@ class IncidentExtractor:
             if dep:
                 result.dependency_hints.append(
                     DependencyHint(
-                        id=_row_id(artifact.id, "dependency", line),
+                        id=_row_id(artifact.id, "dependency", str(line_no), line),
                         source_entity=dep.group("src"),
                         target_entity=dep.group("tgt"),
                         direction="depends_on" if dep.group("dir").lower() == "depends on" else "calls",
@@ -396,7 +402,7 @@ class IncidentExtractor:
                 owner = ownership.group("owner").strip().strip(".")
                 result.ownership_hints.append(
                     OwnershipHint(
-                        id=_row_id(artifact.id, "ownership", line),
+                        id=_row_id(artifact.id, "ownership", str(line_no), line),
                         entity=artifact.title,
                         owner=owner,
                         hint_kind=(
@@ -430,7 +436,7 @@ class IncidentExtractor:
                 signal_hint = metrics[0] if metrics else None
                 result.evidence_requirements.append(
                     EvidenceRequirement(
-                        id=_row_id(artifact.id, "evidence", line),
+                        id=_row_id(artifact.id, "evidence", str(line_no), line),
                         subject=evidence_body,
                         evidence_kind=_infer_evidence_kind(evidence_body),
                         target_entity=_entity_from_text(evidence_body),
@@ -477,7 +483,7 @@ def artifact_from_text(
 ) -> LearnedArtifact:
     now = _now()
     return LearnedArtifact(
-        id=_artifact_id(artifact_type, external_id, source_instance or ""),
+        id=_artifact_id(artifact_type, external_id, source_instance or "", source_vendor or ""),
         artifact_type=artifact_type,
         source_vendor=source_vendor,
         source_instance=source_instance,
@@ -562,17 +568,6 @@ def learn_artifact(
                 dependency_hints=dependency_rows,
                 signal_mapping_candidates=signal_rows,
             )
-            for candidate in result.signal_mapping_candidates:
-                if candidate.candidate_metric:
-                    store.add_mapping(
-                        candidate.signal_type,
-                        candidate.candidate_metric,
-                        confidence=candidate.confidence_prior,
-                        source_type=artifact.artifact_type,
-                        source_refs=[artifact.id],
-                        review_state=candidate.review_state,
-                    )
-                    mappings_created += 1
     return {
         "artifact": asdict(artifact),
         "artifact_id": artifact.id,
@@ -640,7 +635,12 @@ def learn_incident_dir(path: Path, *, dry_run: bool = False) -> dict[str, object
     if not dry_run:
         store = get_signal_store()
         seen = {str(item["artifact_id"]) for item in learned}
-        stale_marked = store.mark_missing_artifacts_stale(artifact_type="incident", seen_artifact_ids=seen)
+        stale_marked = store.mark_missing_artifacts_stale(
+            artifact_type="incident",
+            seen_artifact_ids=seen,
+            source_vendor="file",
+            external_id_prefix=f"{path.resolve()}/",
+        )
     return {
         "artifact_type": "incident",
         "dry_run": dry_run,
@@ -676,7 +676,12 @@ def learn_runbook_dir(path: Path, *, dry_run: bool = False) -> dict[str, object]
     if not dry_run:
         store = get_signal_store()
         seen = {str(item["artifact_id"]) for item in learned}
-        stale_marked = store.mark_missing_artifacts_stale(artifact_type="runbook", seen_artifact_ids=seen)
+        stale_marked = store.mark_missing_artifacts_stale(
+            artifact_type="runbook",
+            seen_artifact_ids=seen,
+            source_vendor="file",
+            external_id_prefix=f"{path.resolve()}/",
+        )
     return {
         "artifact_type": "runbook",
         "dry_run": dry_run,

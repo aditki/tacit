@@ -1217,14 +1217,33 @@ class SignalStore:
             return 0
         return len(rows)
 
-    def mark_missing_artifacts_stale(self, *, artifact_type: str, seen_artifact_ids: set[str]) -> int:
+    def mark_missing_artifacts_stale(
+        self,
+        *,
+        artifact_type: str,
+        seen_artifact_ids: set[str],
+        source_vendor: str | None = None,
+        source_instance: str | None = None,
+        external_id_prefix: str | None = None,
+    ) -> int:
         """Mark previously learned artifacts stale when absent from a complete crawl."""
         now = time.time()
         with self._conn() as conn:
+            clauses = ["artifact_type = ?", "stale = 0"]
+            params: list[Any] = [artifact_type]
+            if source_vendor is not None:
+                clauses.append("source_vendor = ?")
+                params.append(source_vendor)
+            if source_instance is not None:
+                clauses.append("source_instance = ?")
+                params.append(source_instance)
+            if external_id_prefix is not None:
+                clauses.append("external_id LIKE ?")
+                params.append(f"{external_id_prefix}%")
             rows = conn.execute(
-                """SELECT artifact_id FROM learned_artifacts
-                   WHERE artifact_type = ? AND stale = 0""",
-                (artifact_type,),
+                f"""SELECT artifact_id FROM learned_artifacts
+                    WHERE {' AND '.join(clauses)}""",
+                params,
             ).fetchall()
             missing = [row["artifact_id"] for row in rows if row["artifact_id"] not in seen_artifact_ids]
             if not missing:
@@ -1248,6 +1267,24 @@ class SignalStore:
                     )
                 except sqlite3.OperationalError as exc:
                     logger.warning("stale_artifact_context_update_failed", error=str(exc))
+            mapping_rows = conn.execute(
+                """SELECT id, source_refs FROM signal_metric_mappings
+                   WHERE source_type = ?""",
+                (artifact_type,),
+            ).fetchall()
+            missing_set = set(missing)
+            for mapping in mapping_rows:
+                refs = json.loads(mapping["source_refs"] or "[]")
+                if not any(ref in missing_set for ref in refs):
+                    continue
+                remaining_refs = [ref for ref in refs if ref not in missing_set]
+                if remaining_refs:
+                    conn.execute(
+                        "UPDATE signal_metric_mappings SET source_refs = ? WHERE id = ?",
+                        (json.dumps(remaining_refs), mapping["id"]),
+                    )
+                else:
+                    conn.execute("DELETE FROM signal_metric_mappings WHERE id = ?", (mapping["id"],))
             return cursor.rowcount
 
     def list_learned_artifacts(

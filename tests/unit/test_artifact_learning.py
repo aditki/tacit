@@ -58,6 +58,50 @@ def test_missing_signal_requirement_is_indeterminate():
     assert result.evidence_requirements[0].observation_state == "indeterminate"
 
 
+def test_artifact_ids_include_source_vendor():
+    pagerduty = artifact_from_text(
+        artifact_type="incident",
+        title="INC-123",
+        body_text="observed checkout_errors_total",
+        external_id="INC-123",
+        source_vendor="pagerduty",
+    )
+    jira = artifact_from_text(
+        artifact_type="incident",
+        title="INC-123",
+        body_text="observed checkout_errors_total",
+        external_id="INC-123",
+        source_vendor="jira",
+    )
+
+    assert pagerduty.id != jira.id
+
+
+def test_repeated_check_lines_persist_as_distinct_extractions(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total\n- check redis_cache_misses_total")
+
+    result = learn_artifact(artifact, RunbookExtractor())
+    rows = store.list_artifact_extractions(artifact.id)
+
+    assert result["change_state"] == "created"
+    assert len(rows["evidence_requirements"]) == 2
+    assert rows["evidence_requirements"][0]["id"] != rows["evidence_requirements"][1]["id"]
+
+
+def test_artifact_signal_candidates_do_not_create_active_mappings(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+
+    result = learn_artifact(artifact, RunbookExtractor())
+
+    assert result["summary"]["signal_mapping_candidates"] == 1
+    assert result["mappings_created"] == 0
+    assert store.get_signal_type("cache_misses") is None
+
+
 def test_incident_extractor_preserves_observed_evidence_without_learning_root_cause():
     result = IncidentExtractor().extract(
         artifact_from_text(
@@ -133,6 +177,80 @@ def test_missing_runbook_marks_stale_not_deleted(tmp_path):
     assert row is not None
     assert row["stale"] is True
     assert row["missing_since"] is not None
+
+
+def test_missing_artifact_stale_marking_is_scoped_to_crawled_source(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    first = artifact_from_text(
+        artifact_type="runbook",
+        title="A",
+        body_text="check redis_cache_misses_total",
+        external_id="/tmp/team-a/a.md",
+        source_vendor="file",
+    )
+    second = artifact_from_text(
+        artifact_type="runbook",
+        title="B",
+        body_text="check checkout_latency_seconds",
+        external_id="/tmp/team-b/b.md",
+        source_vendor="file",
+    )
+    for artifact in (first, second):
+        store.record_learned_artifact(
+            artifact_id=artifact.id,
+            artifact_type=artifact.artifact_type,
+            source_vendor=artifact.source_vendor or "",
+            external_id=artifact.external_id,
+            title=artifact.title,
+            body_text=artifact.body_text,
+            fingerprint=artifact.fingerprint,
+        )
+
+    marked = store.mark_missing_artifacts_stale(
+        artifact_type="runbook",
+        seen_artifact_ids=set(),
+        source_vendor="file",
+        external_id_prefix="/tmp/team-a/",
+    )
+
+    first_row = store.get_learned_artifact(first.id)
+    second_row = store.get_learned_artifact(second.id)
+    assert marked == 1
+    assert first_row is not None and first_row["stale"] is True
+    assert second_row is not None and second_row["stale"] is False
+
+
+def test_stale_artifact_removes_legacy_artifact_only_mappings(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+    store.record_learned_artifact(
+        artifact_id=artifact.id,
+        artifact_type=artifact.artifact_type,
+        source_vendor=artifact.source_vendor or "",
+        external_id=artifact.external_id,
+        title=artifact.title,
+        body_text=artifact.body_text,
+        fingerprint=artifact.fingerprint,
+    )
+    store.add_mapping(
+        "cache_misses",
+        "redis_cache_misses_total",
+        confidence=0.4,
+        source_type="runbook",
+        source_refs=[artifact.id],
+        review_state="candidate",
+    )
+
+    marked = store.mark_missing_artifacts_stale(
+        artifact_type="runbook",
+        seen_artifact_ids=set(),
+        source_vendor=artifact.source_vendor or "",
+    )
+
+    signal_type = store.get_signal_type("cache_misses")
+    assert marked == 1
+    assert signal_type is not None
+    assert signal_type["mappings"] == []
 
 
 def test_stale_runbook_reappears_as_restored_and_reindexed(tmp_path, monkeypatch):

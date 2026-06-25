@@ -282,6 +282,68 @@ def test_alert_context_can_break_contextual_tie_without_rca_claim():
     assert result.abstention_reason == "suspects_ranked_without_runtime_proof"
 
 
+def test_incident_artifact_observed_evidence_does_not_count_as_runtime_support():
+    result = rank_context_bundle(
+        _bundle(
+            {
+                "incident": {"symptom": "checkout latency increased", "affected_service": "checkout-api"},
+                "context": {
+                    "services": [{"name": "checkout-api", "depends_on": ["checkout-db"]}],
+                    "evidence_requirements": [
+                        {
+                            "subject": "observed checkout-db latency in prior incident",
+                            "evidence_kind": "latency",
+                            "target_entity": "checkout-db",
+                            "signal_hint": "checkout_db_latency",
+                            "observation_state": "observed",
+                            "source_type": "incident",
+                            "source": "artifact_learning",
+                        }
+                    ],
+                },
+                "evidence": {"observations": []},
+            }
+        )
+    )
+
+    assert result.suspects[0].entity == "checkout-db"
+    assert any(reason.type == "incident_observed_evidence" for reason in result.suspects[0].reasons)
+    assert result.abstention_reason == "suspects_ranked_without_runtime_proof"
+
+
+def test_disabled_duplicate_alert_does_not_hide_later_active_alert():
+    result = rank_context_bundle(
+        _bundle(
+            {
+                "incident": {"symptom": "checkout latency increased", "affected_service": "checkout-api"},
+                "context": {
+                    "services": [{"name": "checkout-api", "depends_on": ["checkout-db"]}],
+                    "alerts": [
+                        {
+                            "entity": "checkout-db",
+                            "signals": ["checkout db latency alert"],
+                            "enabled": False,
+                            "source": "disabled_alert",
+                        },
+                        {
+                            "entity": "checkout-db",
+                            "signals": ["checkout db latency alert"],
+                            "enabled": True,
+                            "source": "active_alert",
+                        },
+                    ],
+                },
+                "evidence": {"observations": []},
+            }
+        )
+    )
+
+    assert result.suspects[0].entity == "checkout-db"
+    assert any(
+        reason.type == "alert_association" and reason.source == "active_alert" for reason in result.suspects[0].reasons
+    )
+
+
 def test_feature_weights_are_explicit_and_stable():
     assert WEIGHTS == {
         "runtime_observation_match": 40,

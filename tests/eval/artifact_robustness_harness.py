@@ -169,20 +169,23 @@ def _inject_noise(fixture: dict[str, Any], *, noise_count: int) -> dict[str, Any
     noised = copy.deepcopy(fixture)
     for case in noised["cases"]:
         context = case["bundle"].setdefault("context", {})
+        affected = case["bundle"]["incident"]["affected_service"]
         for idx in range(noise_count):
+            noise_entity = f"{affected}-noise-{idx}"
             context.setdefault("alerts", []).append(
                 {
-                    "entity": f"noise-service-{idx}",
+                    "entity": noise_entity,
                     "signals": [f"noise_metric_{idx}_total"],
-                    "severity": "critical",
+                    "severity": "info",
                     "enabled": True,
+                    "stale": True,
                     "source": "noise_injection",
                 }
             )
             context.setdefault("dependency_hints", []).append(
                 {
-                    "source_entity": f"noise-api-{idx}",
-                    "target_entity": f"noise-db-{idx}",
+                    "source_entity": affected,
+                    "target_entity": noise_entity,
                     "direction": "depends_on",
                     "source": "noise_injection",
                 }
@@ -191,9 +194,9 @@ def _inject_noise(fixture: dict[str, Any], *, noise_count: int) -> dict[str, Any
                 {
                     "subject": f"observed noise_metric_{idx}_total",
                     "evidence_kind": "errors",
-                    "target_entity": f"noise-db-{idx}",
+                    "target_entity": noise_entity,
                     "signal_hint": f"noise_metric_{idx}_total",
-                    "observation_state": "observed",
+                    "observation_state": "indeterminate",
                     "source": "noise_injection",
                 }
             )
@@ -210,10 +213,17 @@ def evaluate_noise_injection(path: Path = FIXTURE_PATH) -> dict[str, Any]:
             noise_count = int(artifact_count * noise_level / 100)
             report = evaluate_fixture(_inject_noise(base_fixture, noise_count=noise_count))
             metrics = report["metrics"]
+            noise_suspect_count = sum(
+                1
+                for result in report["results"].values()
+                for suspect in result["suspects"]
+                if any(reason["source"] == "noise_injection" for reason in suspect["reasons"])
+            )
             row = {
                 "artifact_count": artifact_count,
                 "noise_level": noise_level,
                 "noise_rows_per_case": noise_count,
+                "noise_suspect_count": noise_suspect_count,
                 "top1_recall": metrics["top1_recall"],
                 "mrr": metrics["mrr"],
                 "false_culprit_rate": metrics["false_culprit_rate"],
@@ -230,6 +240,8 @@ def evaluate_noise_injection(path: Path = FIXTURE_PATH) -> dict[str, Any]:
                 failures.append({**row, "reason": "false_culprit_regressed"})
             if metrics["unsupported_rca_rate"] > baseline["metrics"]["unsupported_rca_rate"]:
                 failures.append({**row, "reason": "unsupported_rca_regressed"})
+            if noise_count and noise_suspect_count == 0:
+                failures.append({**row, "reason": "noise_did_not_reach_ranker"})
 
     return {
         "baseline_metrics": baseline["metrics"],
