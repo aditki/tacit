@@ -343,6 +343,36 @@ def test_incident_artifact_observed_evidence_does_not_count_as_runtime_support()
     assert result.abstention_reason == "suspects_ranked_without_runtime_proof"
 
 
+def test_stale_observed_evidence_requirement_does_not_score_or_prove_runtime():
+    result = rank_context_bundle(
+        _bundle(
+            {
+                "incident": {"symptom": "checkout latency increased", "affected_service": "checkout-api"},
+                "context": {
+                    "services": [{"name": "checkout-api", "depends_on": ["checkout-db"]}],
+                    "evidence_requirements": [
+                        {
+                            "subject": "observed checkout-db latency in old runbook",
+                            "evidence_kind": "latency",
+                            "target_entity": "checkout-db",
+                            "signal_hint": "checkout_db_latency",
+                            "observation_state": "observed",
+                            "source_type": "runbook",
+                            "source": "artifact_learning",
+                            "stale": True,
+                        }
+                    ],
+                },
+                "evidence": {"observations": []},
+            }
+        )
+    )
+
+    assert result.suspects[0].entity == "checkout-db"
+    assert {reason.type for reason in result.suspects[0].reasons} == {"dependency_match"}
+    assert result.abstention_reason == "suspects_ranked_without_runtime_proof"
+
+
 def test_disabled_duplicate_alert_does_not_hide_later_active_alert():
     result = rank_context_bundle(
         _bundle(

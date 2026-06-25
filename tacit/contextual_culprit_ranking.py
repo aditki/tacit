@@ -396,6 +396,8 @@ def rank_context_bundle(bundle: ContextBundle) -> RankedSuspectsResult:
         )
 
     for requirement in bundle.context.evidence_requirements:
+        if requirement.stale:
+            continue
         entity = requirement.target_entity
         if not entity or entity not in connected:
             continue

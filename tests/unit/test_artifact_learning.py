@@ -36,6 +36,14 @@ def test_runbook_dependency_hint_is_not_evidence_requirement():
     assert result.evidence_requirements == []
 
 
+def test_runbook_dependency_preserves_leading_digit_entity():
+    result = RunbookExtractor().extract(_artifact("## Dependencies\n3ds-gateway depends on auth-db"))
+
+    assert len(result.dependency_hints) == 1
+    assert result.dependency_hints[0].source_entity == "3ds-gateway"
+    assert result.dependency_hints[0].target_entity == "auth-db"
+
+
 def test_runbook_dependency_section_shorthand_uses_artifact_entity():
     result = RunbookExtractor().extract(_artifact("## Dependencies\n- calls redis-cart"))
 
@@ -218,6 +226,23 @@ def test_runbook_reingest_lifecycle_is_idempotent_and_updates_on_change(tmp_path
     assert changed_row["updated_at"] > second_row["updated_at"]
 
 
+def test_skipped_reingest_rebuilds_missing_extractions(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+
+    first = learn_artifact(artifact, RunbookExtractor())
+    with store._conn() as conn:
+        conn.execute("DELETE FROM evidence_requirements WHERE artifact_id = ?", (artifact.id,))
+
+    second = learn_artifact(artifact, RunbookExtractor())
+    rows = store.list_artifact_extractions(artifact.id)
+
+    assert first["change_state"] == "created"
+    assert second["change_state"] == "skipped"
+    assert len(rows["evidence_requirements"]) == 1
+
+
 def test_missing_runbook_marks_stale_not_deleted(tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     artifact = _artifact("## Checks\n- check redis_cache_misses_total")
@@ -278,6 +303,47 @@ def test_missing_artifact_stale_marking_is_scoped_to_crawled_source(tmp_path):
     assert marked == 1
     assert first_row is not None and first_row["stale"] is True
     assert second_row is not None and second_row["stale"] is False
+
+
+def test_missing_artifact_stale_prefix_treats_like_metacharacters_literally(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    team_a = artifact_from_text(
+        artifact_type="runbook",
+        title="A",
+        body_text="check redis_cache_misses_total",
+        external_id="/tmp/runbooks/team_a/a.md",
+        source_vendor="file",
+    )
+    team_xa = artifact_from_text(
+        artifact_type="runbook",
+        title="B",
+        body_text="check checkout_latency_seconds",
+        external_id="/tmp/runbooks/teamXa/b.md",
+        source_vendor="file",
+    )
+    for artifact in (team_a, team_xa):
+        store.record_learned_artifact(
+            artifact_id=artifact.id,
+            artifact_type=artifact.artifact_type,
+            source_vendor=artifact.source_vendor or "",
+            external_id=artifact.external_id,
+            title=artifact.title,
+            body_text=artifact.body_text,
+            fingerprint=artifact.fingerprint,
+        )
+
+    marked = store.mark_missing_artifacts_stale(
+        artifact_type="runbook",
+        seen_artifact_ids=set(),
+        source_vendor="file",
+        external_id_prefix="/tmp/runbooks/team_a/",
+    )
+
+    team_a_row = store.get_learned_artifact(team_a.id)
+    team_xa_row = store.get_learned_artifact(team_xa.id)
+    assert marked == 1
+    assert team_a_row is not None and team_a_row["stale"] is True
+    assert team_xa_row is not None and team_xa_row["stale"] is False
 
 
 def test_stale_artifact_removes_legacy_artifact_only_mappings(tmp_path):

@@ -100,6 +100,10 @@ class LearningIndexUnavailable(RuntimeError):
     """Raised when SQLite FTS5-backed learning retrieval is unavailable."""
 
 
+def _escape_like_prefix(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _stronger_review_state(existing: str, incoming: str) -> str:
     """Return the higher-trust review state without allowing downgrades."""
     return stronger_review_state(existing, incoming)
@@ -1267,8 +1271,8 @@ class SignalStore:
                 clauses.append("source_instance = ?")
                 params.append(source_instance)
             if external_id_prefix is not None:
-                clauses.append("external_id LIKE ?")
-                params.append(f"{external_id_prefix}%")
+                clauses.append("external_id LIKE ? ESCAPE '\\'")
+                params.append(f"{_escape_like_prefix(external_id_prefix)}%")
             rows = conn.execute(
                 f"""SELECT artifact_id FROM learned_artifacts
                     WHERE {' AND '.join(clauses)}""",

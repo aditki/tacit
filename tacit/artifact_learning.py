@@ -138,6 +138,7 @@ CAUSAL_CLAIM_RE = re.compile(
 )
 METRIC_RE = re.compile(r"\b[a-zA-Z_:][a-zA-Z0-9_:]*(?:_[a-zA-Z0-9_:]+)+\b")
 CODE_RE = re.compile(r"`([^`]+)`")
+BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*]\s+|\d+[.)]\s+)")
 
 
 def _now() -> datetime:
@@ -165,7 +166,7 @@ def _artifact_id(
 
 
 def _clean_line(line: str) -> str:
-    return line.strip().lstrip("-*0123456789. ").strip()
+    return BULLET_PREFIX_RE.sub("", line.strip(), count=1).strip()
 
 
 def _infer_evidence_kind(text: str) -> str:
@@ -620,24 +621,23 @@ def learn_artifact(
             provenance_url=artifact.provenance_url or "",
             fingerprint=artifact.fingerprint,
         )
-        if change_state != "skipped":
-            store.replace_artifact_extractions(
-                artifact_id=artifact.id,
-                evidence_requirements=evidence_rows,
-                ownership_hints=ownership_rows,
-                dependency_hints=dependency_rows,
-                signal_mapping_candidates=signal_rows,
-            )
-            indexed_context_rows = store.index_artifact_context(
-                artifact_id=artifact.id,
-                artifact_type=artifact.artifact_type,
-                title=artifact.title,
-                body_text=_sanitized_body_text_for_index(artifact, result),
-                evidence_requirements=evidence_rows,
-                ownership_hints=ownership_rows,
-                dependency_hints=dependency_rows,
-                signal_mapping_candidates=signal_rows,
-            )
+        store.replace_artifact_extractions(
+            artifact_id=artifact.id,
+            evidence_requirements=evidence_rows,
+            ownership_hints=ownership_rows,
+            dependency_hints=dependency_rows,
+            signal_mapping_candidates=signal_rows,
+        )
+        indexed_context_rows = store.index_artifact_context(
+            artifact_id=artifact.id,
+            artifact_type=artifact.artifact_type,
+            title=artifact.title,
+            body_text=_sanitized_body_text_for_index(artifact, result),
+            evidence_requirements=evidence_rows,
+            ownership_hints=ownership_rows,
+            dependency_hints=dependency_rows,
+            signal_mapping_candidates=signal_rows,
+        )
     return {
         "artifact": asdict(artifact),
         "artifact_id": artifact.id,
