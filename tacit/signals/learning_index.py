@@ -238,3 +238,86 @@ def build_learning_context_rows(
                     )
                 )
     return rows
+
+
+def build_alert_context_rows(
+    *,
+    alert_uid: str,
+    backend_name: str,
+    alert_title: str,
+    alert_tags: list[str],
+    condition: str,
+    metrics_found: list[str],
+    query_transformations: list[str],
+    service_hints: list[str],
+    signals_inferred: list[dict[str, Any]] | list[str],
+    status: str,
+    activated_pairs: set[tuple[str, str]] | None,
+) -> list[tuple[str, str, str, str, str, str, str, str, str, str, str, str, str, str, float]]:
+    """Build FTS rows for learned alert-rule context."""
+    alert_context_id = f"alert:{alert_uid}"
+    tags = alert_tags or []
+    metrics = list(dict.fromkeys(metrics_found or []))
+    query_text = "\n".join(str(q) for q in query_transformations or [] if q)
+    signal_by_metric: dict[str, list[dict[str, Any]]] = {}
+    for sig in signals_inferred or []:
+        if not isinstance(sig, dict):
+            continue
+        metric = sig.get("metric", "")
+        if metric:
+            signal_by_metric.setdefault(metric, []).append(sig)
+
+    rows: list[tuple[str, str, str, str, str, str, str, str, str, str, str, str, str, str, float]] = []
+    indexed_at = time.time()
+    for metric in metrics:
+        related_signals = signal_by_metric.get(metric) or [{}]
+        inferred_services = infer_services_for_learning(
+            metric=metric,
+            query_text=query_text,
+            dashboard_title=alert_title,
+            panel_title=condition,
+            tags=tags,
+        )
+        services = " ".join(dict.fromkeys([*service_hints, *inferred_services]))
+        for sig_index, sig in enumerate(related_signals):
+            if not isinstance(sig, dict):
+                sig = {}
+            signal_type = str(sig.get("signal_type", ""))
+            review_state = learning_row_review_state(
+                status=status,
+                metric=metric,
+                signal_type=signal_type,
+                sig=sig,
+                activated_pairs=activated_pairs,
+            )
+            reason = str(sig.get("reason", ""))
+            provenance = " ".join(
+                part
+                for part in (
+                    "source:alert_ingest",
+                    f"inference_source:{sig.get('source', '')}" if sig.get("source") else "",
+                    f"family:{sig.get('signal_family', '')}" if sig.get("signal_family") else "",
+                    f"confidence:{sig.get('confidence', '')}" if sig.get("confidence") else "",
+                )
+                if part
+            )
+            rows.append(
+                (
+                    "alert_rule",
+                    f"{backend_name}:alert:{alert_uid}:{metric}:{sig_index}",
+                    backend_name,
+                    alert_context_id,
+                    alert_title,
+                    " ".join(tags),
+                    condition,
+                    metric,
+                    query_text,
+                    services,
+                    signal_type,
+                    review_state,
+                    reason,
+                    provenance,
+                    indexed_at,
+                )
+            )
+    return rows

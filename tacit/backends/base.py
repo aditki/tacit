@@ -61,6 +61,34 @@ class DashboardFeatures:
     panels: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class AlertFeatures:
+    """Vendor-agnostic features extracted from an alert rule or detector.
+
+    Backend adapters normalize Grafana alert rules and SignalFx detectors into
+    this structure so downstream learning/indexing stays vendor-neutral.
+    """
+
+    alert_uid: str = ""
+    alert_title: str = ""
+    alert_tags: list[str] = field(default_factory=list)
+    backend_name: str = ""
+    query_language: str = ""
+
+    condition: str = ""
+    severity: str = ""
+    enabled: bool = True
+    labels: dict[str, str] = field(default_factory=dict)
+    annotations: dict[str, str] = field(default_factory=dict)
+
+    metrics_found: list[str] = field(default_factory=list)
+    query_transformations: list[str] = field(default_factory=list)
+    service_hints: list[str] = field(default_factory=list)
+    dashboard_uid: str = ""
+    panel_title: str = ""
+    source_url: str = ""
+
+
 @runtime_checkable
 class DashboardBackend(Protocol):
     """Common interface every dashboard vendor must implement."""
@@ -132,6 +160,14 @@ class DashboardBackend(Protocol):
 
         Each item should include at least ``uid`` and may include ``title``.
         """
+        ...
+
+    async def ingest_alert(self, uid: str) -> AlertFeatures:
+        """Fetch an existing alert rule/detector and extract operational features."""
+        ...
+
+    async def list_alerts(self, limit: int = 500) -> list[dict]:
+        """Return alert summaries that can be passed to ``ingest_alert``."""
         ...
 
     async def close(self) -> None:

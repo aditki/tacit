@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import structlog
 
-from tacit.backends.base import DashboardFeatures, DiscoveryStatus, PublishResult
+from tacit.backends.base import AlertFeatures, DashboardFeatures, DiscoveryStatus, PublishResult
 from tacit.config import Settings
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
 from tacit.signalfx.client import SignalFxClient
@@ -25,6 +25,7 @@ class SignalFxBackend:
         self._settings = runtime_settings
         self._client = client or SignalFxClient(runtime_settings=runtime_settings)
         self.last_discovery_status = DiscoveryStatus()
+        self.last_alert_list_complete = False
 
     # ── Protocol properties ───────────────────────────────────────────
 
@@ -126,6 +127,52 @@ class SignalFxBackend:
                 )
                 if len(out) >= limit:
                     return out
+        return out
+
+    async def ingest_alert(self, uid: str) -> AlertFeatures:
+        """Fetch a SignalFx detector and extract operational alert features."""
+        detector = cast(dict[str, Any], await self._client._get(f"/v2/detector/{uid}"))
+        return _parse_signalfx_detector(detector, backend_name=self.name, realm=self._client.realm)
+
+    async def list_alerts(self, limit: int = 500) -> list[dict]:
+        """List SignalFx detectors discoverable by the configured token."""
+        self.last_alert_list_complete = False
+        out: list[dict] = []
+        offset = 0
+        page_complete = False
+        while len(out) < limit:
+            page_limit = max(1, min(100, limit - len(out)))
+            params = {"limit": page_limit}
+            if offset:
+                params["offset"] = offset
+            data = await self._client._get("/v2/detector", params=params)
+            detectors = data.get("results", []) if isinstance(data, dict) else data
+            detector_items = detectors if isinstance(detectors, list) else []
+            for item in detector_items:
+                if not isinstance(item, dict):
+                    continue
+                uid = str(item.get("id", ""))
+                if not uid:
+                    continue
+                out.append(
+                    {
+                        "uid": uid,
+                        "title": item.get("name", ""),
+                        "backend": self.name,
+                    }
+                )
+                if len(out) >= limit:
+                    break
+            page_complete = _signalfx_detector_page_complete(
+                data,
+                page_count=len(detector_items),
+                page_limit=page_limit,
+                total_seen=len(out),
+            )
+            if page_complete or not detector_items:
+                break
+            offset += len(detector_items)
+        self.last_alert_list_complete = page_complete
         return out
 
     async def _parse_sfx_dashboard(self, dashboard_json: dict) -> DashboardFeatures:
@@ -276,3 +323,98 @@ def _extract_signalflow_patterns(program: str) -> list[dict[str, str]]:
     for match in _SFX_FUNC_RE.finditer(program):
         patterns.append({"aggregation": match.group(1)})
     return patterns
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item]
+
+
+def _string_dict(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): str(v) for k, v in value.items() if v is not None}
+
+
+def _detector_program(detector: dict[str, Any]) -> str:
+    program = detector.get("programText", "")
+    if isinstance(program, str) and program:
+        return program
+    program = detector.get("program", "")
+    if isinstance(program, str) and program:
+        return program
+    return ""
+
+
+def _detector_severity(detector: dict[str, Any]) -> str:
+    severities: list[str] = []
+    for rule in detector.get("rules", []) or []:
+        if isinstance(rule, dict) and rule.get("severity"):
+            severities.append(str(rule["severity"]))
+    return severities[0] if severities else ""
+
+
+def _detector_condition(detector: dict[str, Any]) -> str:
+    labels: list[str] = []
+    for rule in detector.get("rules", []) or []:
+        if isinstance(rule, dict):
+            label = rule.get("detectLabel", "") or rule.get("description", "")
+            if label:
+                labels.append(str(label))
+    return "; ".join(dict.fromkeys(labels))
+
+
+def _detector_annotations(detector: dict[str, Any]) -> dict[str, str]:
+    annotations: dict[str, str] = {"description": str(detector.get("description", ""))}
+    for index, rule in enumerate(detector.get("rules", []) or []):
+        if not isinstance(rule, dict):
+            continue
+        for key in ("runbookUrl", "runbook_url", "tip", "message", "description"):
+            value = rule.get(key)
+            if value:
+                annotations[f"rule_{index}_{key}"] = str(value)
+    return annotations
+
+
+def _signalfx_detector_page_complete(data: Any, *, page_count: int, page_limit: int, total_seen: int) -> bool:
+    """Return true when the detector response is known to be a complete snapshot."""
+    if not isinstance(data, dict):
+        return page_count < page_limit
+    if data.get("next") or data.get("nextPage") or data.get("nextPageLink"):
+        return False
+    if data.get("more") is True or data.get("hasMore") is True:
+        return False
+    total = data.get("count", data.get("total", data.get("totalCount")))
+    if isinstance(total, int):
+        return total_seen >= total
+    return page_count < page_limit
+
+
+def _parse_signalfx_detector(detector: dict[str, Any], *, backend_name: str, realm: str) -> AlertFeatures:
+    uid = str(detector.get("id", ""))
+    title = str(detector.get("name", ""))
+    program = _detector_program(detector)
+    tags = _string_list(detector.get("tags", []))
+    labels = _string_dict(detector.get("labels", {}))
+    teams = _string_list(detector.get("teams", []))
+    if teams:
+        labels.setdefault("team", teams[0])
+    return AlertFeatures(
+        alert_uid=uid,
+        alert_title=title,
+        alert_tags=tags,
+        backend_name=backend_name,
+        query_language="signalflow",
+        condition=_detector_condition(detector),
+        severity=_detector_severity(detector),
+        enabled=not bool(detector.get("disabled", False)),
+        labels=labels,
+        annotations=_detector_annotations(detector),
+        metrics_found=_extract_metrics_from_signalflow(program),
+        query_transformations=[program] if program else [],
+        service_hints=[],
+        dashboard_uid="",
+        panel_title="",
+        source_url=f"https://app.{realm}.signalfx.com/#/detector/{uid}" if uid else "",
+    )

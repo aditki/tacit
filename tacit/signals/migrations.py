@@ -16,6 +16,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     ensure_learning_index(conn)
     ensure_ingested_dashboard_backend_scope(conn)
+    ensure_ingested_alert_columns(conn)
     ensure_mapping_columns(conn)
 
 
@@ -53,6 +54,30 @@ def ensure_ingested_dashboard_backend_scope(conn: sqlite3.Connection) -> None:
 
     conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_uid_backend
            ON ingested_dashboards(dashboard_uid, backend_name)""")
+
+
+def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
+    """Add alert-ingestion metadata columns on pre-existing DBs."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(ingested_alerts)").fetchall()}
+    if not columns:
+        return
+
+    additions = {
+        "source_vendor": "TEXT NOT NULL DEFAULT ''",
+        "source_instance": "TEXT NOT NULL DEFAULT ''",
+        "external_id": "TEXT NOT NULL DEFAULT ''",
+        "fingerprint": "TEXT NOT NULL DEFAULT ''",
+        "provenance_url": "TEXT NOT NULL DEFAULT ''",
+        "confidence": "REAL NOT NULL DEFAULT 0.0",
+        "stale": "INTEGER NOT NULL DEFAULT 0",
+        "missing_since": "REAL",
+        "first_seen_at": "REAL NOT NULL DEFAULT 0",
+        "last_seen_at": "REAL NOT NULL DEFAULT 0",
+        "updated_at": "REAL NOT NULL DEFAULT 0",
+    }
+    for name, ddl in additions.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE ingested_alerts ADD COLUMN {name} {ddl}")
 
 
 def rebuild_ingested_dashboards_table(conn: sqlite3.Connection) -> None:

@@ -95,8 +95,49 @@ CREATE TABLE IF NOT EXISTS ingested_dashboards (
     UNIQUE(dashboard_uid, backend_name)
 );
 
+CREATE TABLE IF NOT EXISTS ingested_alerts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_uid           TEXT NOT NULL,
+    backend_name        TEXT NOT NULL DEFAULT '',
+    source_vendor       TEXT NOT NULL DEFAULT '',
+    source_instance     TEXT NOT NULL DEFAULT '',
+    external_id         TEXT NOT NULL DEFAULT '',
+    fingerprint         TEXT NOT NULL DEFAULT '',
+    alert_title         TEXT NOT NULL DEFAULT '',
+    alert_tags          TEXT NOT NULL DEFAULT '[]',
+    condition           TEXT NOT NULL DEFAULT '',
+    severity            TEXT NOT NULL DEFAULT '',
+    enabled             INTEGER NOT NULL DEFAULT 1,
+    labels              TEXT NOT NULL DEFAULT '{}',
+    annotations         TEXT NOT NULL DEFAULT '{}',
+
+    -- Extracted features
+    metrics_found       TEXT NOT NULL DEFAULT '[]',
+    query_transformations TEXT NOT NULL DEFAULT '[]',
+    service_hints       TEXT NOT NULL DEFAULT '[]',
+    dashboard_uid       TEXT NOT NULL DEFAULT '',
+    panel_title         TEXT NOT NULL DEFAULT '',
+    source_url          TEXT NOT NULL DEFAULT '',
+    provenance_url      TEXT NOT NULL DEFAULT '',
+    confidence          REAL NOT NULL DEFAULT 0.0,
+    stale               INTEGER NOT NULL DEFAULT 0,
+    missing_since       REAL,
+
+    -- Status
+    status              TEXT NOT NULL DEFAULT 'pending',
+    signals_inferred    TEXT NOT NULL DEFAULT '[]',
+
+    first_seen_at       REAL NOT NULL,
+    last_seen_at        REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    created_at          REAL NOT NULL,
+    reviewed_at         REAL,
+    UNIQUE(alert_uid, backend_name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_smm_signal ON signal_metric_mappings(signal_type);
 CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern);
+CREATE INDEX IF NOT EXISTS idx_ingested_alert_uid_backend ON ingested_alerts(alert_uid, backend_name);
 """
 
 FTS_SCHEMA_SQL = """

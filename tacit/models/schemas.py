@@ -596,6 +596,46 @@ class LearnDashboardRequest(BaseModel):
         raise ValueError("auto_approve must be a boolean or the string 'true'/'false'")
 
 
+class LearnAlertRequest(BaseModel):
+    """Request body for ``POST /api/v1/learn/alerts``."""
+
+    model_config = {
+        "extra": "forbid",
+        "json_schema_extra": {"examples": [{"alert_uid": "checkout-latency", "backend": "grafana"}]},
+    }
+
+    alert_uid: str = Field(description="Alert rule/detector UID to ingest (interpretation is backend-specific)")
+    backend: str = Field(
+        default="", description="Backend to fetch from: 'grafana' or 'signalfx' (default: first active)"
+    )
+    auto_approve: bool = Field(
+        default=False,
+        description="If true, approve and create signal mappings immediately; otherwise store as 'pending'.",
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="If true, preview extracted signals and summary without persisting learned alert context.",
+    )
+
+    @field_validator("alert_uid")
+    @classmethod
+    def _strip_uid(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("alert_uid must not be empty")
+        return v
+
+    @field_validator("auto_approve", mode="before")
+    @classmethod
+    def _parse_auto_approve(cls, v: Any) -> bool:
+        return LearnDashboardRequest._parse_auto_approve(v)
+
+    @field_validator("dry_run", mode="before")
+    @classmethod
+    def _parse_dry_run(cls, v: Any) -> bool:
+        return LearnDashboardRequest._parse_auto_approve(v)
+
+
 class LearnDashboardUploadRequest(BaseModel):
     """Request body for ``POST /api/v1/learn/dashboard/json``."""
 
