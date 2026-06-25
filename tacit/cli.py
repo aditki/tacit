@@ -948,6 +948,88 @@ def _print_bulk_alert_learning_summary(result: dict):
             _fail(f"  {item.get('alert_uid')}: {item.get('error')}")
 
 
+def _print_artifact_learning_summary(result: dict):
+    summary = result.get("summary", {})
+    action = "Previewed" if result.get("dry_run") else "Learned from"
+    artifact_type = result.get("artifact_type") or summary.get("artifact_type") or "artifact"
+    if "artifacts_discovered" in result:
+        _success(f"{action} {result.get('artifacts_discovered', 0)} {artifact_type}s")
+        if result.get("stale_marked", 0):
+            _info(f"{artifact_type.title()}s marked stale: {result.get('stale_marked', 0)}")
+    else:
+        _success(f"{action} {result.get('title', artifact_type)}")
+        _info(f"Status: {result.get('change_state', 'dry_run')}")
+    if summary:
+        _info(
+            "Extracted: "
+            f"{summary.get('evidence_requirements', 0)} evidence requirements, "
+            f"{summary.get('ownership_hints', 0)} ownership hints, "
+            f"{summary.get('dependency_hints', 0)} dependency hints, "
+            f"{summary.get('signal_mapping_candidates', 0)} signal candidates"
+        )
+    warnings = summary.get("warnings", []) if summary else result.get("warnings", [])
+    if warnings:
+        _info(f"Warnings: {len(warnings)}")
+        for warning in warnings[:5]:
+            _warn(str(warning))
+
+
+@learn.command("runbooks")
+@click.option("--file", "file_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Runbook file")
+@click.option(
+    "--dir", "dir_path", type=click.Path(exists=True, file_okay=False, path_type=Path), help="Runbook directory"
+)
+@click.option("--dry-run", is_flag=True, help="Preview extraction without persisting learned context")
+def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool):
+    """Learn operational candidates from runbook artifacts."""
+    _header("Learn Runbooks")
+    _load_env()
+    if bool(file_path) == bool(dir_path):
+        _fail("Pass exactly one of --file or --dir.")
+        return
+    try:
+        if file_path:
+            from tacit.artifact_learning import learn_runbook_file
+
+            result = learn_runbook_file(file_path, dry_run=dry_run)
+        else:
+            from tacit.artifact_learning import learn_runbook_dir
+
+            result = learn_runbook_dir(dir_path, dry_run=dry_run)  # type: ignore[arg-type]
+    except Exception as e:
+        _fail(f"Runbook learning failed: {e}")
+        return
+    _print_artifact_learning_summary(result)
+
+
+@learn.command("incidents")
+@click.option("--file", "file_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Incident file")
+@click.option(
+    "--dir", "dir_path", type=click.Path(exists=True, file_okay=False, path_type=Path), help="Incident directory"
+)
+@click.option("--dry-run", is_flag=True, help="Preview extraction without persisting learned context")
+def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool):
+    """Learn operational IR candidates from incident history artifacts."""
+    _header("Learn Incidents")
+    _load_env()
+    if bool(file_path) == bool(dir_path):
+        _fail("Pass exactly one of --file or --dir.")
+        return
+    try:
+        if file_path:
+            from tacit.artifact_learning import learn_incident_file
+
+            result = learn_incident_file(file_path, dry_run=dry_run)
+        else:
+            from tacit.artifact_learning import learn_incident_dir
+
+            result = learn_incident_dir(dir_path, dry_run=dry_run)  # type: ignore[arg-type]
+    except Exception as e:
+        _fail(f"Incident learning failed: {e}")
+        return
+    _print_artifact_learning_summary(result)
+
+
 @learn.command("alerts")
 @click.option("--from", "source", default="grafana", show_default=True, help="Backend source: grafana or signalfx")
 @click.option("--uid", "alert_uid", default="", help="Ingest one alert UID instead of crawling all alerts")

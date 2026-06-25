@@ -10,7 +10,13 @@ from fastapi import Path as PathParam
 
 import tacit.signals as signals_mod
 from tacit.api.security import verify_api_key
-from tacit.models.schemas import LearnAlertRequest, LearnDashboardRequest, LearnDashboardUploadRequest
+from tacit.models.schemas import (
+    LearnAlertRequest,
+    LearnDashboardRequest,
+    LearnDashboardUploadRequest,
+    LearnIncidentRequest,
+    LearnRunbookRequest,
+)
 
 logger = structlog.get_logger()
 router = APIRouter(dependencies=[Depends(verify_api_key)])
@@ -99,6 +105,62 @@ async def learn_from_alert(request: Request, payload: LearnAlertRequest):
             detail=f"Failed to ingest alert '{payload.alert_uid}'. "
             "Check that the alert exists and the backend is accessible.",
         )
+
+
+@router.post(
+    "/api/v1/learn/runbooks",
+    tags=["Learning"],
+    summary="Learn from a runbook artifact",
+    response_description="Extracted operational IR candidates with provenance",
+)
+async def learn_from_runbook(payload: LearnRunbookRequest):
+    """Learn operational candidates from a markdown/plain-text runbook."""
+    from tacit.artifact_learning import RunbookExtractor, artifact_from_text, learn_artifact
+
+    try:
+        artifact = artifact_from_text(
+            artifact_type="runbook",
+            title=payload.title,
+            body_text=payload.body_text,
+            external_id=payload.external_id or payload.title,
+            source_vendor=payload.source_vendor,
+            source_instance=payload.source_instance,
+            provenance_url=payload.provenance_url,
+        )
+        return learn_artifact(artifact, RunbookExtractor(), dry_run=payload.dry_run)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("runbook_artifact_learning_failed", title=payload.title)
+        raise HTTPException(status_code=500, detail="Failed to learn from runbook artifact.")
+
+
+@router.post(
+    "/api/v1/learn/incidents",
+    tags=["Learning"],
+    summary="Learn from an incident-history artifact",
+    response_description="Extracted operational IR candidates with provenance",
+)
+async def learn_from_incident(payload: LearnIncidentRequest):
+    """Learn operational candidates from an incident-history record."""
+    from tacit.artifact_learning import IncidentExtractor, artifact_from_text, learn_artifact
+
+    try:
+        artifact = artifact_from_text(
+            artifact_type="incident",
+            title=payload.title,
+            body_text=payload.body_text,
+            external_id=payload.external_id or payload.title,
+            source_vendor=payload.source_vendor,
+            source_instance=payload.source_instance,
+            provenance_url=payload.provenance_url,
+        )
+        return learn_artifact(artifact, IncidentExtractor(), dry_run=payload.dry_run)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("incident_artifact_learning_failed", title=payload.title)
+        raise HTTPException(status_code=500, detail="Failed to learn from incident artifact.")
 
 
 @router.post(
@@ -253,6 +315,40 @@ async def list_ingested_alerts(
                 approved=alert.get("status") == "approved",
             )
     return {"count": len(alerts), "alerts": alerts}
+
+
+@router.get(
+    "/api/v1/learn/runbooks",
+    tags=["Learning"],
+    summary="List learned runbook artifacts",
+    response_description="Learned runbooks and extracted operational IR candidates",
+)
+async def list_learned_runbooks(
+    limit: int = 50,
+):
+    """List runbooks learned by Tacit Artifact Learning v1."""
+    store = signals_mod.get_signal_store()
+    runbooks = store.list_learned_artifacts(artifact_type="runbook", limit=limit)
+    for runbook in runbooks:
+        runbook["extractions"] = store.list_artifact_extractions(runbook["artifact_id"])
+    return {"count": len(runbooks), "runbooks": runbooks}
+
+
+@router.get(
+    "/api/v1/learn/incidents",
+    tags=["Learning"],
+    summary="List learned incident artifacts",
+    response_description="Learned incidents and extracted operational IR candidates",
+)
+async def list_learned_incidents(
+    limit: int = 50,
+):
+    """List incident history learned by Tacit Artifact Learning v1."""
+    store = signals_mod.get_signal_store()
+    incidents = store.list_learned_artifacts(artifact_type="incident", limit=limit)
+    for incident in incidents:
+        incident["extractions"] = store.list_artifact_extractions(incident["artifact_id"])
+    return {"count": len(incidents), "incidents": incidents}
 
 
 @router.get(

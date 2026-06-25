@@ -83,6 +83,30 @@ class ContextChunk(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict, description="Provider-specific metadata")
 
 
+class LearnRunbookRequest(BaseModel):
+    """Request to learn from a runbook body supplied over the API."""
+
+    title: str = Field(default="runbook", description="Human-readable runbook title")
+    body_text: str = Field(min_length=1, description="Markdown or plain-text runbook body")
+    external_id: str = Field(default="", description="Stable source identifier; defaults to title")
+    source_vendor: str = Field(default="api", description="Source vendor or integration name")
+    source_instance: str = Field(default="", description="Source instance/workspace name")
+    provenance_url: str = Field(default="", description="URL or source path for provenance")
+    dry_run: bool = Field(default=False, description="Preview extraction without persisting learned context")
+
+
+class LearnIncidentRequest(BaseModel):
+    """Request to learn from an incident-history body supplied over the API."""
+
+    title: str = Field(default="incident", description="Human-readable incident title")
+    body_text: str = Field(min_length=1, description="Markdown or plain-text incident body")
+    external_id: str = Field(default="", description="Stable source identifier; defaults to title")
+    source_vendor: str = Field(default="api", description="Source vendor or integration name")
+    source_instance: str = Field(default="", description="Source instance/workspace name")
+    provenance_url: str = Field(default="", description="URL or source path for provenance")
+    dry_run: bool = Field(default=False, description="Preview extraction without persisting learned context")
+
+
 # ── Metrics Discovery ────────────────────────────────────────────────────────
 
 

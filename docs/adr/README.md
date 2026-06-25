@@ -24,3 +24,4 @@ production-readiness claims.
 | [ADR-014](014-tacit-is-not-a-system-of-record.md) | Tacit Is Not a System of Record | Accepted | Partially implemented |
 | [ADR-015](015-evidence-lifecycle.md) | Evidence has a lightweight lifecycle | Accepted | Partially implemented |
 | [ADR-016](016-contextual-vs-telemetry-evidenced-ranking.md) | Culprit ranking has contextual and telemetry-evidenced tiers | Accepted | Partially implemented |
+| [ADR-017](017-artifact-learning-framework.md) | Artifact learning compiles operational artifacts into Operational IR | Proposed | Partially implemented |

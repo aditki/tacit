@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from tacit.contextual_culprit_ranking import CAUSAL_STATUS, ContextBundle, RankedSuspectsResult, rank_context_bundle
+from tests.eval.ranking_benchmark_contract import benchmark_contract, random_baselines
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "contextual_culprit_ranking.json"
 
@@ -66,8 +67,7 @@ def _has_attribution(result: RankedSuspectsResult) -> tuple[int, int]:
     return attributed, total
 
 
-def evaluate(path: Path = FIXTURE_PATH) -> dict[str, Any]:
-    fixture = _load(path)
+def evaluate_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     cases = fixture["cases"]
     results = {case["id"]: _result(case) for case in cases}
 
@@ -172,15 +172,35 @@ def evaluate(path: Path = FIXTURE_PATH) -> dict[str, Any]:
         "stability": not stability_failures,
         "counterfactual_sensitivity": not counterfactual_failures,
     }
+    random = random_baselines()
+    vs_random = {
+        "top1_recall": round(metrics["top1_recall"] - random["top1_recall"], 4),
+        "top3_recall": round(metrics["top3_recall"] - random["top3_recall"], 4),
+        "mrr": round(metrics["mrr"] - random["mrr"], 4),
+    }
 
     return {
         "benchmark": fixture["benchmark"],
         "version": fixture["version"],
         "target_matrix_size": fixture["target_matrix_size"],
         "case_count": len(cases),
+        "benchmark_contract": benchmark_contract(
+            case_count=len(cases),
+            scorable_case_count=positive_count,
+            negative_case_count=negative_count,
+            total_ranked_denominator=total_ranked,
+            context_available=[
+                "service_graph",
+                "runbooks",
+                "historical_incidents",
+                "deployments",
+                "dashboards",
+            ],
+        ),
         "positive_count": positive_count,
         "negative_count": negative_count,
         "metrics": metrics,
+        "vs_random": vs_random,
         "positive_cases": positive_rows,
         "contextual_top3_only_cases": [case["id"] for case in contextual_top3_only],
         "false_culprits": false_culprits,
@@ -192,6 +212,10 @@ def evaluate(path: Path = FIXTURE_PATH) -> dict[str, Any]:
             for case_id, result in sorted(results.items(), key=lambda item: item[0])
         },
     }
+
+
+def evaluate(path: Path = FIXTURE_PATH) -> dict[str, Any]:
+    return evaluate_fixture(_load(path))
 
 
 def gate_failures(report: dict[str, Any]) -> list[str]:
@@ -224,8 +248,15 @@ def gate_failures(report: dict[str, Any]) -> list[str]:
 
 def _print(report: dict[str, Any]) -> None:
     metrics = report["metrics"]
+    contract = report["benchmark_contract"]
     print("=== Contextual culprit ranking gate ===")
-    print(f"cases={report['case_count']} target_matrix_size={report['target_matrix_size']}")
+    print(
+        f"cases={report['case_count']} scorable={contract['scorable_cases']} "
+        f"candidate_set_size={contract['candidate_set_size']} top_k={contract['top_k']}"
+    )
+    print("random_baselines:", contract["random_baselines"])
+    print("vs_random:", report["vs_random"])
+    print(f"target_matrix_size={report['target_matrix_size']}")
     for key, value in metrics.items():
         print(f"{key}: {value}")
 

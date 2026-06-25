@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import time
+
+from tacit.artifact_learning import IncidentExtractor, RunbookExtractor, artifact_from_text, learn_artifact
+from tacit.signals import SignalStore
+
+
+def _artifact(body: str):
+    return artifact_from_text(
+        artifact_type="runbook",
+        title="Checkout Runbook",
+        body_text=body,
+        external_id="checkout-runbook",
+        source_vendor="test",
+    )
+
+
+def test_runbook_extractor_emits_evidence_requirement_for_check():
+    result = RunbookExtractor().extract(_artifact("## Checks\n- check Redis misses"))
+
+    assert len(result.evidence_requirements) == 1
+    assert result.evidence_requirements[0].evidence_kind == "cache_misses"
+    assert result.evidence_requirements[0].observation_state == "indeterminate"
+
+
+def test_runbook_dependency_hint_is_not_evidence_requirement():
+    result = RunbookExtractor().extract(_artifact("## Dependencies\ncheckout-api depends on redis-cart"))
+
+    assert len(result.dependency_hints) == 1
+    assert result.dependency_hints[0].source_entity == "checkout-api"
+    assert result.dependency_hints[0].target_entity == "redis-cart"
+    assert result.dependency_hints[0].source_type == "runbook"
+    assert result.evidence_requirements == []
+
+
+def test_runbook_ownership_hint_is_not_evidence_requirement():
+    result = RunbookExtractor().extract(_artifact("## Escalation\n- escalate to Payments"))
+
+    assert len(result.ownership_hints) == 1
+    assert result.ownership_hints[0].owner == "Payments"
+    assert result.ownership_hints[0].source_type == "runbook"
+    assert result.evidence_requirements == []
+
+
+def test_runbook_mitigation_is_ignored_as_non_evidential():
+    result = RunbookExtractor().extract(_artifact("## Checks\n- restart Redis"))
+
+    assert result.evidence_requirements == []
+    assert result.warnings == ["ignored_mitigation:restart Redis"]
+
+
+def test_missing_signal_requirement_is_indeterminate():
+    result = RunbookExtractor().extract(_artifact("## Checks\n- check DB latency"))
+
+    assert len(result.evidence_requirements) == 1
+    assert result.evidence_requirements[0].signal_hint is None
+    assert result.evidence_requirements[0].observation_state == "indeterminate"
+
+
+def test_incident_extractor_preserves_observed_evidence_without_learning_root_cause():
+    result = IncidentExtractor().extract(
+        artifact_from_text(
+            artifact_type="incident",
+            title="INC-482 checkout latency",
+            body_text="\n".join(
+                [
+                    "## Symptoms",
+                    "- observed redis_cache_misses_total above normal",
+                    "## Investigation References",
+                    "- See INC-481 and checkout runbook",
+                    "## Resolution",
+                    "- Root cause: redis-cart",
+                ]
+            ),
+            external_id="INC-482",
+            source_vendor="test",
+        )
+    )
+
+    assert len(result.evidence_requirements) == 1
+    assert result.evidence_requirements[0].source_type == "incident"
+    assert result.evidence_requirements[0].observation_state == "observed"
+    assert result.evidence_requirements[0].signal_hint == "redis_cache_misses_total"
+    assert len(result.signal_mapping_candidates) == 1
+    assert result.dependency_hints == []
+    assert result.warnings == ["ignored_causal_claim:Root cause: redis-cart"]
+
+
+def test_runbook_reingest_lifecycle_is_idempotent_and_updates_on_change(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    first_artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+
+    first = learn_artifact(first_artifact, RunbookExtractor())
+    first_row = store.get_learned_artifact(first_artifact.id)
+    assert first_row is not None
+
+    time.sleep(0.001)
+    second = learn_artifact(first_artifact, RunbookExtractor())
+    second_row = store.get_learned_artifact(first_artifact.id)
+    assert second_row is not None
+
+    changed_artifact = _artifact("## Checks\n- check redis_cache_misses_total\n- check checkout_latency_seconds")
+    time.sleep(0.001)
+    changed = learn_artifact(changed_artifact, RunbookExtractor())
+    changed_row = store.get_learned_artifact(changed_artifact.id)
+    assert changed_row is not None
+
+    assert first["change_state"] == "created"
+    assert second["change_state"] == "skipped"
+    assert changed["change_state"] == "updated"
+    assert second_row["updated_at"] == first_row["updated_at"]
+    assert changed_row["updated_at"] > second_row["updated_at"]
+
+
+def test_missing_runbook_marks_stale_not_deleted(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+    store.record_learned_artifact(
+        artifact_id=artifact.id,
+        artifact_type=artifact.artifact_type,
+        external_id=artifact.external_id,
+        title=artifact.title,
+        body_text=artifact.body_text,
+        fingerprint=artifact.fingerprint,
+    )
+
+    marked = store.mark_missing_artifacts_stale(artifact_type="runbook", seen_artifact_ids=set())
+    row = store.get_learned_artifact(artifact.id)
+
+    assert marked == 1
+    assert row is not None
+    assert row["stale"] is True
+    assert row["missing_since"] is not None
+
+
+def test_stale_runbook_reappears_as_restored_and_reindexed(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+
+    first = learn_artifact(artifact, RunbookExtractor())
+    first_row = store.get_learned_artifact(artifact.id)
+    assert first_row is not None
+
+    marked = store.mark_missing_artifacts_stale(artifact_type="runbook", seen_artifact_ids=set())
+    stale_row = store.get_learned_artifact(artifact.id)
+    assert marked == 1
+    assert stale_row is not None
+    assert stale_row["stale"] is True
+
+    restored = learn_artifact(artifact, RunbookExtractor())
+    restored_row = store.get_learned_artifact(artifact.id)
+    assert restored_row is not None
+
+    assert first["change_state"] == "created"
+    assert restored["change_state"] == "restored"
+    assert restored_row["stale"] is False
+    assert restored_row["missing_since"] is None
+    assert restored_row["first_seen_at"] == first_row["first_seen_at"]
+    if store._learning_index_available():
+        assert store.search_learning_context("redis_cache_misses_total")
