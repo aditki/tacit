@@ -162,6 +162,55 @@ async def test_alert_ingestion_is_idempotent_and_tracks_content_changes(tmp_path
     assert changed["change_state"] == "updated"
 
 
+async def test_alert_fingerprint_ignores_unordered_tag_metadata(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+
+    first = await ingest_alert_features(
+        AlertFeatures(
+            alert_uid="checkout-latency",
+            alert_title="Checkout latency high",
+            alert_tags=["severity:critical", "service:checkout"],
+            backend_name="grafana",
+            query_language="promql",
+            condition="A > 1",
+            labels={"service": "checkout", "severity": "critical"},
+            metrics_found=["checkout_request_duration_seconds", "checkout_request_errors_total"],
+            query_transformations=[
+                'checkout_request_duration_seconds{service="checkout"}',
+                'checkout_request_errors_total{service="checkout"}',
+            ],
+            service_hints=["checkout", "payments"],
+        )
+    )
+    first_row = store.get_ingested_alert("checkout-latency", "grafana")
+    assert first_row is not None
+
+    second = await ingest_alert_features(
+        AlertFeatures(
+            alert_uid="checkout-latency",
+            alert_title="Checkout latency high",
+            alert_tags=["service:checkout", "severity:critical"],
+            backend_name="grafana",
+            query_language="promql",
+            condition="A > 1",
+            labels={"severity": "critical", "service": "checkout"},
+            metrics_found=["checkout_request_errors_total", "checkout_request_duration_seconds"],
+            query_transformations=[
+                'checkout_request_errors_total{service="checkout"}',
+                'checkout_request_duration_seconds{service="checkout"}',
+            ],
+            service_hints=["payments", "checkout"],
+        )
+    )
+    second_row = store.get_ingested_alert("checkout-latency", "grafana")
+    assert second_row is not None
+
+    assert first["fingerprint"] == second["fingerprint"]
+    assert second["change_state"] == "skipped"
+    assert second_row["updated_at"] == first_row["updated_at"]
+
+
 async def test_unchanged_alert_recrawl_preserves_approved_status(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)

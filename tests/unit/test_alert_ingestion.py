@@ -246,6 +246,29 @@ def test_signalfx_detector_parses_to_common_alert_features():
     assert features.labels == {"team": "payments"}
 
 
+def test_signalfx_detector_preserves_rule_runbook_annotations():
+    features = _parse_signalfx_detector(
+        {
+            "id": "detector-1",
+            "name": "Checkout errors high",
+            "programText": "A = data('checkout.errors').sum().publish(label='A')",
+            "rules": [
+                {
+                    "detectLabel": "A above threshold",
+                    "severity": "Critical",
+                    "runbookUrl": "https://runbooks.example/checkout-errors",
+                    "tip": "Check checkout downstream dependencies",
+                }
+            ],
+        },
+        backend_name="signalfx",
+        realm="us1",
+    )
+
+    assert features.annotations["rule_0_runbookUrl"] == "https://runbooks.example/checkout-errors"
+    assert features.annotations["rule_0_tip"] == "Check checkout downstream dependencies"
+
+
 @pytest.mark.asyncio
 async def test_invalid_alert_backend_closes_instantiated_clients(monkeypatch):
     closed = []
@@ -381,4 +404,31 @@ async def test_signalfx_detector_crawl_pages_until_limit_or_complete():
     assert len(alerts) == 125
     assert alerts[0]["uid"] == "detector-0"
     assert alerts[-1]["uid"] == "detector-124"
+    assert backend.last_alert_list_complete is True
+
+
+@pytest.mark.asyncio
+async def test_signalfx_detector_exact_limit_complete_snapshot_can_reconcile():
+    class FakeSignalFxClient:
+        realm = "us1"
+
+        async def _get(self, path: str, params=None):
+            assert path == "/v2/detector"
+            assert params == {"limit": 2}
+            return {
+                "count": 2,
+                "results": [
+                    {"id": "detector-1", "name": "Detector 1"},
+                    {"id": "detector-2", "name": "Detector 2"},
+                ],
+            }
+
+        async def close(self):
+            return None
+
+    backend = SignalFxBackend(client=FakeSignalFxClient())
+
+    alerts = await backend.list_alerts(limit=2)
+
+    assert len(alerts) == 2
     assert backend.last_alert_list_complete is True

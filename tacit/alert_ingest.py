@@ -81,15 +81,15 @@ def _services_for_alert(features: AlertFeatures) -> list[str]:
 def _alert_fingerprint(features: AlertFeatures) -> str:
     payload = {
         "title": features.alert_title,
-        "tags": features.alert_tags,
+        "tags": sorted(dict.fromkeys(features.alert_tags)),
         "condition": features.condition,
         "severity": features.severity,
         "enabled": features.enabled,
-        "labels": features.labels,
-        "annotations": features.annotations,
-        "metrics": features.metrics_found,
-        "queries": features.query_transformations,
-        "service_hints": features.service_hints,
+        "labels": dict(sorted(features.labels.items())),
+        "annotations": dict(sorted(features.annotations.items())),
+        "metrics": sorted(dict.fromkeys(features.metrics_found)),
+        "queries": sorted(dict.fromkeys(features.query_transformations)),
+        "service_hints": sorted(dict.fromkeys(features.service_hints)),
         "dashboard_uid": features.dashboard_uid,
         "panel_title": features.panel_title,
     }

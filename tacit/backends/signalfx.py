@@ -172,7 +172,7 @@ class SignalFxBackend:
             if page_complete or not detector_items:
                 break
             offset += len(detector_items)
-        self.last_alert_list_complete = page_complete and len(out) < limit
+        self.last_alert_list_complete = page_complete
         return out
 
     async def _parse_sfx_dashboard(self, dashboard_json: dict) -> DashboardFeatures:
@@ -365,6 +365,18 @@ def _detector_condition(detector: dict[str, Any]) -> str:
     return "; ".join(dict.fromkeys(labels))
 
 
+def _detector_annotations(detector: dict[str, Any]) -> dict[str, str]:
+    annotations: dict[str, str] = {"description": str(detector.get("description", ""))}
+    for index, rule in enumerate(detector.get("rules", []) or []):
+        if not isinstance(rule, dict):
+            continue
+        for key in ("runbookUrl", "runbook_url", "tip", "message", "description"):
+            value = rule.get(key)
+            if value:
+                annotations[f"rule_{index}_{key}"] = str(value)
+    return annotations
+
+
 def _signalfx_detector_page_complete(data: Any, *, page_count: int, page_limit: int, total_seen: int) -> bool:
     """Return true when the detector response is known to be a complete snapshot."""
     if not isinstance(data, dict):
@@ -398,7 +410,7 @@ def _parse_signalfx_detector(detector: dict[str, Any], *, backend_name: str, rea
         severity=_detector_severity(detector),
         enabled=not bool(detector.get("disabled", False)),
         labels=labels,
-        annotations={"description": str(detector.get("description", ""))},
+        annotations=_detector_annotations(detector),
         metrics_found=_extract_metrics_from_signalflow(program),
         query_transformations=[program] if program else [],
         service_hints=[],
