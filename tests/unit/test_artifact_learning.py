@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from tacit.artifact_learning import IncidentExtractor, RunbookExtractor, artifact_from_text, learn_artifact
 from tacit.signals import SignalStore
 
@@ -31,6 +33,15 @@ def test_runbook_dependency_hint_is_not_evidence_requirement():
     assert result.dependency_hints[0].source_entity == "checkout-api"
     assert result.dependency_hints[0].target_entity == "redis-cart"
     assert result.dependency_hints[0].source_type == "runbook"
+    assert result.evidence_requirements == []
+
+
+def test_runbook_dependency_section_shorthand_uses_artifact_entity():
+    result = RunbookExtractor().extract(_artifact("## Dependencies\n- calls redis-cart"))
+
+    assert len(result.dependency_hints) == 1
+    assert result.dependency_hints[0].source_entity == "Checkout"
+    assert result.dependency_hints[0].target_entity == "redis-cart"
     assert result.evidence_requirements == []
 
 
@@ -90,6 +101,18 @@ def test_repeated_check_lines_persist_as_distinct_extractions(tmp_path, monkeypa
     assert rows["evidence_requirements"][0]["id"] != rows["evidence_requirements"][1]["id"]
 
 
+def test_dry_run_does_not_open_signal_store(monkeypatch):
+    def fail_store():
+        raise AssertionError("dry-run should not open the signal store")
+
+    monkeypatch.setattr("tacit.artifact_learning.get_signal_store", fail_store)
+
+    result = learn_artifact(_artifact("## Checks\n- check redis_cache_misses_total"), RunbookExtractor(), dry_run=True)
+
+    assert result["dry_run"] is True
+    assert result["summary"]["evidence_requirements"] == 1
+
+
 def test_artifact_signal_candidates_do_not_create_active_mappings(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
@@ -99,6 +122,9 @@ def test_artifact_signal_candidates_do_not_create_active_mappings(tmp_path, monk
 
     assert result["summary"]["signal_mapping_candidates"] == 1
     assert result["mappings_created"] == 0
+    rows = store.list_artifact_extractions(artifact.id)
+    assert len(rows["signal_mapping_candidates"]) == 1
+    assert rows["signal_mapping_candidates"][0]["candidate_metric"] == "redis_cache_misses_total"
     assert store.get_signal_type("cache_misses") is None
 
 
@@ -129,6 +155,40 @@ def test_incident_extractor_preserves_observed_evidence_without_learning_root_ca
     assert len(result.signal_mapping_candidates) == 1
     assert result.dependency_hints == []
     assert result.warnings == ["ignored_causal_claim:Root cause: redis-cart"]
+
+
+def test_incident_ignored_rca_text_is_not_indexed(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = artifact_from_text(
+        artifact_type="incident",
+        title="INC-900 checkout errors",
+        body_text="## Evidence\n- observed checkout_errors_total spike\n## Resolution\n- Root cause: redis-cart",
+        external_id="INC-900",
+        source_vendor="test",
+    )
+
+    result = learn_artifact(artifact, IncidentExtractor())
+
+    assert result["warnings"] == ["ignored_causal_claim:Root cause: redis-cart"]
+    assert store.search_learning_context("checkout_errors_total")
+    assert store.search_learning_context("redis") == []
+
+
+def test_dependency_target_is_searchable_as_service(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = _artifact("## Dependencies\n- checkout-api depends on redis-cart")
+
+    learn_artifact(artifact, RunbookExtractor())
+
+    rows = store.search_learning_context("redis-cart", service="redis-cart")
+    assert rows
+    assert rows[0]["signal_type"] == "dependency"
 
 
 def test_runbook_reingest_lifecycle_is_idempotent_and_updates_on_change(tmp_path, monkeypatch):

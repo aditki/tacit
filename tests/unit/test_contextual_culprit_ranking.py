@@ -155,6 +155,38 @@ def test_stale_runbook_dependency_lowers_ranking_contribution():
     assert fresh.suspects[0].score > stale.suspects[0].score
 
 
+def test_stale_dependency_hint_does_not_unlock_fresh_context_scoring():
+    result = rank_context_bundle(
+        _bundle(
+            {
+                "incident": {"symptom": "checkout latency increased", "affected_service": "checkout-api"},
+                "context": {
+                    "dependency_hints": [
+                        {
+                            "source_entity": "checkout-api",
+                            "target_entity": "redis-cart",
+                            "direction": "depends_on",
+                            "stale": True,
+                        }
+                    ],
+                    "alerts": [
+                        {
+                            "entity": "redis-cart",
+                            "signals": ["redis latency alert"],
+                            "enabled": True,
+                            "source": "fresh_alert",
+                        }
+                    ],
+                },
+                "evidence": {"observations": []},
+            }
+        )
+    )
+
+    assert result.suspects[0].entity == "redis-cart"
+    assert {reason.type for reason in result.suspects[0].reasons} == {"stale_artifact"}
+
+
 def test_distractor_runbook_service_does_not_outrank_connected_suspect():
     result = rank_context_bundle(
         _bundle(

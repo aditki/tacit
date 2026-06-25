@@ -179,6 +179,31 @@ def test_runbook_artifact_learning_cli_and_api_e2e(client, isolated_learning_sto
     assert listing.json()["count"] == 1
 
 
+def test_api_artifacts_without_external_id_do_not_collide(client, isolated_learning_store):
+    first = client.post(
+        "/api/v1/learn/runbooks",
+        json={
+            "title": "Checkout API Runbook",
+            "body_text": "## Checks\n- check checkout_latency_seconds",
+        },
+    )
+    second = client.post(
+        "/api/v1/learn/runbooks",
+        json={
+            "title": "Checkout API Runbook",
+            "body_text": "## Checks\n- check redis_cache_misses_total",
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    listing = client.get("/api/v1/learn/runbooks")
+    assert listing.status_code == 200
+    runbooks = listing.json()["runbooks"]
+    assert listing.json()["count"] == 2
+    assert len({runbook["artifact_id"] for runbook in runbooks}) == 2
+
+
 def test_incident_artifact_learning_cli_and_api_e2e(client, isolated_learning_store, tmp_path):
     incident = tmp_path / "inc-482.md"
     incident.write_text(

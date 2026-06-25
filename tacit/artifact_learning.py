@@ -89,6 +89,7 @@ class DependencyHint:
 
 @dataclass
 class SignalMappingCandidate:
+    id: str
     source: str
     candidate_metric: str
     symptom: str
@@ -120,6 +121,7 @@ OWNERSHIP_RE = re.compile(r"\b(escalate to|contact|owned by|owner:|maintainer:)\
 DEPENDENCY_RE = re.compile(
     r"\b(?P<src>[a-zA-Z0-9_.-]+)\s+(?P<dir>depends on|calls|downstream)\s+(?P<tgt>[a-zA-Z0-9_.-]+)", re.I
 )
+DEPENDENCY_SHORTHAND_RE = re.compile(r"\b(?P<dir>depends on|calls|downstream)\s+(?P<tgt>[a-zA-Z0-9_.-]+)", re.I)
 MITIGATION_RE = re.compile(r"\b(restart|rollback|scale|redeploy|flush|kill|delete)\b", re.I)
 INCIDENT_OBSERVED_RE = re.compile(
     r"\b(observed|saw|detected|confirmed|evidence:|signal:|symptom:|impact:)\b\s*(?P<body>.+)",
@@ -278,13 +280,37 @@ class RunbookExtractor:
                 continue
 
             dep = DEPENDENCY_RE.search(line)
+            dep_source = dep.group("src") if dep else ""
+            dep_target = dep.group("tgt") if dep else ""
+            dep_direction = dep.group("dir") if dep else ""
+            if not dep and section == "dependencies":
+                shorthand = DEPENDENCY_SHORTHAND_RE.search(line)
+                if shorthand:
+                    dep_source = _entity_from_text(artifact.title) or artifact.title
+                    dep_target = shorthand.group("tgt")
+                    dep_direction = shorthand.group("dir")
             if dep:
                 result.dependency_hints.append(
                     DependencyHint(
                         id=_row_id(artifact.id, "dependency", str(line_no), line),
-                        source_entity=dep.group("src"),
-                        target_entity=dep.group("tgt"),
-                        direction="depends_on" if dep.group("dir").lower() == "depends on" else "calls",
+                        source_entity=dep_source,
+                        target_entity=dep_target,
+                        direction="depends_on" if dep_direction.lower() == "depends on" else "calls",
+                        source_artifact_id=artifact.id,
+                        source_excerpt=line,
+                        source_type=artifact.artifact_type,
+                        confidence_prior=0.55,
+                        review_state="candidate",
+                    )
+                )
+                continue
+            if dep_target:
+                result.dependency_hints.append(
+                    DependencyHint(
+                        id=_row_id(artifact.id, "dependency", str(line_no), line),
+                        source_entity=dep_source,
+                        target_entity=dep_target,
+                        direction="depends_on" if dep_direction.lower() == "depends on" else "calls",
                         source_artifact_id=artifact.id,
                         source_excerpt=line,
                         source_type=artifact.artifact_type,
@@ -343,6 +369,7 @@ class RunbookExtractor:
                 for metric in _metric_candidates(line):
                     result.signal_mapping_candidates.append(
                         SignalMappingCandidate(
+                            id=_row_id(artifact.id, "signal", str(line_no), metric),
                             source=artifact.artifact_type,
                             candidate_metric=metric,
                             symptom=symptom,
@@ -381,13 +408,37 @@ class IncidentExtractor:
                 continue
 
             dep = DEPENDENCY_RE.search(line)
+            dep_source = dep.group("src") if dep else ""
+            dep_target = dep.group("tgt") if dep else ""
+            dep_direction = dep.group("dir") if dep else ""
+            if not dep and section == "dependencies":
+                shorthand = DEPENDENCY_SHORTHAND_RE.search(line)
+                if shorthand:
+                    dep_source = _entity_from_text(artifact.title) or artifact.title
+                    dep_target = shorthand.group("tgt")
+                    dep_direction = shorthand.group("dir")
             if dep:
                 result.dependency_hints.append(
                     DependencyHint(
                         id=_row_id(artifact.id, "dependency", str(line_no), line),
-                        source_entity=dep.group("src"),
-                        target_entity=dep.group("tgt"),
-                        direction="depends_on" if dep.group("dir").lower() == "depends on" else "calls",
+                        source_entity=dep_source,
+                        target_entity=dep_target,
+                        direction="depends_on" if dep_direction.lower() == "depends on" else "calls",
+                        source_artifact_id=artifact.id,
+                        source_excerpt=line,
+                        source_type=artifact.artifact_type,
+                        confidence_prior=0.5,
+                        review_state="candidate",
+                    )
+                )
+                continue
+            if dep_target:
+                result.dependency_hints.append(
+                    DependencyHint(
+                        id=_row_id(artifact.id, "dependency", str(line_no), line),
+                        source_entity=dep_source,
+                        target_entity=dep_target,
+                        direction="depends_on" if dep_direction.lower() == "depends on" else "calls",
                         source_artifact_id=artifact.id,
                         source_excerpt=line,
                         source_type=artifact.artifact_type,
@@ -457,6 +508,7 @@ class IncidentExtractor:
                 for metric in _metric_candidates(line):
                     result.signal_mapping_candidates.append(
                         SignalMappingCandidate(
+                            id=_row_id(artifact.id, "signal", str(line_no), metric),
                             source=artifact.artifact_type,
                             candidate_metric=metric,
                             symptom=symptom,
@@ -524,6 +576,23 @@ def _as_store_rows(items: Sequence[Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _sanitized_body_text_for_index(artifact: LearnedArtifact, result: ExtractionResult) -> str:
+    if artifact.artifact_type != "incident":
+        return artifact.body_text
+    suppressed = {
+        warning.split(":", 1)[1]
+        for warning in result.warnings
+        if warning.startswith(("ignored_causal_claim:", "ignored_mitigation:"))
+    }
+    kept = []
+    for raw in artifact.body_text.splitlines():
+        line = _clean_line(raw)
+        if line and line in suppressed:
+            continue
+        kept.append(raw)
+    return "\n".join(kept)
+
+
 def learn_artifact(
     artifact: LearnedArtifact,
     extractor: ArtifactExtractor,
@@ -531,15 +600,15 @@ def learn_artifact(
     dry_run: bool = False,
 ) -> dict[str, object]:
     result = extractor.extract(artifact)
-    store = get_signal_store()
     evidence_rows = _as_store_rows(result.evidence_requirements)
     ownership_rows = _as_store_rows(result.ownership_hints)
     dependency_rows = _as_store_rows(result.dependency_hints)
-    signal_rows = [asdict(candidate) for candidate in result.signal_mapping_candidates]
+    signal_rows = _as_store_rows(result.signal_mapping_candidates)
     change_state = "dry_run"
     indexed_context_rows = 0
     mappings_created = 0
     if not dry_run:
+        store = get_signal_store()
         change_state = store.record_learned_artifact(
             artifact_id=artifact.id,
             artifact_type=artifact.artifact_type,
@@ -557,12 +626,13 @@ def learn_artifact(
                 evidence_requirements=evidence_rows,
                 ownership_hints=ownership_rows,
                 dependency_hints=dependency_rows,
+                signal_mapping_candidates=signal_rows,
             )
             indexed_context_rows = store.index_artifact_context(
                 artifact_id=artifact.id,
                 artifact_type=artifact.artifact_type,
                 title=artifact.title,
-                body_text=artifact.body_text,
+                body_text=_sanitized_body_text_for_index(artifact, result),
                 evidence_requirements=evidence_rows,
                 ownership_hints=ownership_rows,
                 dependency_hints=dependency_rows,

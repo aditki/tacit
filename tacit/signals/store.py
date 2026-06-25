@@ -996,6 +996,7 @@ class SignalStore:
         evidence_requirements: list[dict[str, Any]] | None = None,
         ownership_hints: list[dict[str, Any]] | None = None,
         dependency_hints: list[dict[str, Any]] | None = None,
+        signal_mapping_candidates: list[dict[str, Any]] | None = None,
     ) -> dict[str, int]:
         """Replace extracted IR rows for one artifact."""
         now = time.time()
@@ -1003,6 +1004,7 @@ class SignalStore:
             conn.execute("DELETE FROM evidence_requirements WHERE artifact_id = ?", (artifact_id,))
             conn.execute("DELETE FROM ownership_hints WHERE artifact_id = ?", (artifact_id,))
             conn.execute("DELETE FROM dependency_hints WHERE artifact_id = ?", (artifact_id,))
+            conn.execute("DELETE FROM signal_mapping_candidates WHERE artifact_id = ?", (artifact_id,))
             for row in evidence_requirements or []:
                 conn.execute(
                     """INSERT INTO evidence_requirements
@@ -1074,10 +1076,34 @@ class SignalStore:
                         now,
                     ),
                 )
+            for row in signal_mapping_candidates or []:
+                conn.execute(
+                    """INSERT INTO signal_mapping_candidates
+                       (id, artifact_id, source, candidate_metric, symptom, signal_type,
+                        source_artifact_id, source_excerpt, query_hint, confidence_prior,
+                        review_state, extraction_hash, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        row["id"],
+                        artifact_id,
+                        row.get("source", ""),
+                        row.get("candidate_metric", ""),
+                        row.get("symptom", ""),
+                        row.get("signal_type", ""),
+                        row.get("source_artifact_id", artifact_id),
+                        row.get("source_excerpt", ""),
+                        row.get("query_hint"),
+                        row.get("confidence_prior", 0.5),
+                        row.get("review_state", "candidate"),
+                        row.get("extraction_hash", ""),
+                        now,
+                    ),
+                )
         return {
             "evidence_requirements": len(evidence_requirements or []),
             "ownership_hints": len(ownership_hints or []),
             "dependency_hints": len(dependency_hints or []),
+            "signal_mapping_candidates": len(signal_mapping_candidates or []),
         }
 
     def index_artifact_context(
@@ -1138,6 +1164,9 @@ class SignalStore:
                 )
             )
         for hint in dependency_hints or []:
+            service_key = " ".join(
+                part for part in [hint.get("source_entity", ""), hint.get("target_entity", "")] if part
+            )
             rows.append(
                 (
                     artifact_type,
@@ -1149,7 +1178,7 @@ class SignalStore:
                     hint.get("direction", ""),
                     "",
                     hint.get("source_excerpt", ""),
-                    hint.get("source_entity", ""),
+                    service_key,
                     "dependency",
                     hint.get("review_state", "candidate"),
                     hint.get("source_excerpt", ""),
@@ -1333,10 +1362,15 @@ class SignalStore:
                 "SELECT * FROM dependency_hints WHERE artifact_id = ? ORDER BY id",
                 (artifact_id,),
             ).fetchall()
+            signal_candidates = conn.execute(
+                "SELECT * FROM signal_mapping_candidates WHERE artifact_id = ? ORDER BY id",
+                (artifact_id,),
+            ).fetchall()
         return {
             "evidence_requirements": [dict(row) for row in evidence],
             "ownership_hints": [dict(row) for row in ownership],
             "dependency_hints": [dict(row) for row in dependencies],
+            "signal_mapping_candidates": [dict(row) for row in signal_candidates],
         }
 
     def mark_missing_alerts_stale(

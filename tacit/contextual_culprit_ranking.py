@@ -208,7 +208,7 @@ def _connected_entities(bundle: ContextBundle) -> set[str]:
         if service.name == affected:
             connected.update(service.depends_on)
     for hint in bundle.context.dependency_hints:
-        if hint.source_entity == affected:
+        if not hint.stale and hint.source_entity == affected:
             connected.add(hint.target_entity)
     return connected
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+from typing import Protocol
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -20,6 +22,26 @@ from tacit.models.schemas import (
 
 logger = structlog.get_logger()
 router = APIRouter(dependencies=[Depends(verify_api_key)])
+
+
+class _ArtifactPayload(Protocol):
+    title: str
+    body_text: str
+    external_id: str
+    source_vendor: str
+    source_instance: str
+    provenance_url: str
+
+
+def _artifact_external_id(payload: _ArtifactPayload, artifact_type: str) -> str:
+    if payload.external_id:
+        return payload.external_id
+    if payload.provenance_url:
+        return payload.provenance_url
+    source_vendor = payload.source_vendor or "api"
+    source_instance = payload.source_instance or ""
+    body_hash = hashlib.sha256(payload.body_text.encode()).hexdigest()[:16]
+    return f"{artifact_type}:{source_vendor}:{source_instance}:{payload.title}:{body_hash}"
 
 
 async def _call_ingest_dashboard(ingest_dashboard, **kwargs):
@@ -122,7 +144,7 @@ async def learn_from_runbook(payload: LearnRunbookRequest):
             artifact_type="runbook",
             title=payload.title,
             body_text=payload.body_text,
-            external_id=payload.external_id or payload.title,
+            external_id=_artifact_external_id(payload, "runbook"),
             source_vendor=payload.source_vendor,
             source_instance=payload.source_instance,
             provenance_url=payload.provenance_url,
@@ -150,7 +172,7 @@ async def learn_from_incident(payload: LearnIncidentRequest):
             artifact_type="incident",
             title=payload.title,
             body_text=payload.body_text,
-            external_id=payload.external_id or payload.title,
+            external_id=_artifact_external_id(payload, "incident"),
             source_vendor=payload.source_vendor,
             source_instance=payload.source_instance,
             provenance_url=payload.provenance_url,

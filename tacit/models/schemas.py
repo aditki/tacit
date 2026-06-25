@@ -88,7 +88,10 @@ class LearnRunbookRequest(BaseModel):
 
     title: str = Field(default="runbook", description="Human-readable runbook title")
     body_text: str = Field(min_length=1, description="Markdown or plain-text runbook body")
-    external_id: str = Field(default="", description="Stable source identifier; defaults to title")
+    external_id: str = Field(
+        default="",
+        description="Stable source identifier; defaults to provenance/body fingerprint",
+    )
     source_vendor: str = Field(default="api", description="Source vendor or integration name")
     source_instance: str = Field(default="", description="Source instance/workspace name")
     provenance_url: str = Field(default="", description="URL or source path for provenance")
@@ -100,7 +103,10 @@ class LearnIncidentRequest(BaseModel):
 
     title: str = Field(default="incident", description="Human-readable incident title")
     body_text: str = Field(min_length=1, description="Markdown or plain-text incident body")
-    external_id: str = Field(default="", description="Stable source identifier; defaults to title")
+    external_id: str = Field(
+        default="",
+        description="Stable source identifier; defaults to provenance/body fingerprint",
+    )
     source_vendor: str = Field(default="api", description="Source vendor or integration name")
     source_instance: str = Field(default="", description="Source instance/workspace name")
     provenance_url: str = Field(default="", description="URL or source path for provenance")

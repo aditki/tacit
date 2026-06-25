@@ -204,6 +204,22 @@ CREATE TABLE IF NOT EXISTS dependency_hints (
     created_at          REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS signal_mapping_candidates (
+    id                  TEXT PRIMARY KEY,
+    artifact_id         TEXT NOT NULL,
+    source              TEXT NOT NULL DEFAULT '',
+    candidate_metric    TEXT NOT NULL DEFAULT '',
+    symptom             TEXT NOT NULL DEFAULT '',
+    signal_type         TEXT NOT NULL DEFAULT '',
+    source_artifact_id  TEXT NOT NULL DEFAULT '',
+    source_excerpt      TEXT NOT NULL DEFAULT '',
+    query_hint          TEXT,
+    confidence_prior    REAL NOT NULL DEFAULT 0.5,
+    review_state        TEXT NOT NULL DEFAULT 'candidate',
+    extraction_hash     TEXT NOT NULL DEFAULT '',
+    created_at          REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_smm_signal ON signal_metric_mappings(signal_type);
 CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern);
 CREATE INDEX IF NOT EXISTS idx_ingested_alert_uid_backend ON ingested_alerts(alert_uid, backend_name);
@@ -211,6 +227,7 @@ CREATE INDEX IF NOT EXISTS idx_learned_artifacts_type ON learned_artifacts(artif
 CREATE INDEX IF NOT EXISTS idx_evidence_requirements_artifact ON evidence_requirements(artifact_id);
 CREATE INDEX IF NOT EXISTS idx_ownership_hints_artifact ON ownership_hints(artifact_id);
 CREATE INDEX IF NOT EXISTS idx_dependency_hints_artifact ON dependency_hints(artifact_id);
+CREATE INDEX IF NOT EXISTS idx_signal_mapping_candidates_artifact ON signal_mapping_candidates(artifact_id);
 """
 
 FTS_SCHEMA_SQL = """
