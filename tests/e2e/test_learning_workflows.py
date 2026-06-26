@@ -204,6 +204,14 @@ def test_api_artifacts_without_external_id_do_not_collide(client, isolated_learn
     assert len({runbook["artifact_id"] for runbook in runbooks}) == 2
 
 
+def test_artifact_list_limits_are_bounded(client, isolated_learning_store):
+    runbooks = client.get("/api/v1/learn/runbooks", params={"limit": -1})
+    incidents = client.get("/api/v1/learn/incidents", params={"limit": -1})
+
+    assert runbooks.status_code == 422
+    assert incidents.status_code == 422
+
+
 def test_incident_artifact_learning_cli_and_api_e2e(client, isolated_learning_store, tmp_path):
     incident = tmp_path / "inc-482.md"
     incident.write_text(

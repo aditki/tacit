@@ -129,16 +129,17 @@ INCIDENT_OBSERVED_RE = re.compile(
 )
 CAUSAL_CLAIM_RE = re.compile(
     r"\b("
-    r"root cause|culprit|caused by|caused when|primary issue|underlying issue|"
+    r"rca|root cause|root-cause|culprit|caused by|caused when|primary issue|underlying issue|"
     r"postmortem conclusion|contributing factor|contributing factors|lesson learned|lessons learned|"
     r"resolution:|fix:|fix was|resolved by|remediated by|recovered after|"
     r"rollback fixed|introduced by|triggered by|regression from|fault was|due to"
     r")",
     re.I,
 )
-METRIC_RE = re.compile(r"\b[a-zA-Z_:][a-zA-Z0-9_:]*(?:_[a-zA-Z0-9_:]+)+\b")
+METRIC_RE = re.compile(r"\b[a-zA-Z_:][a-zA-Z0-9_:]*(?:[._:][a-zA-Z0-9_:]+)+\b")
 CODE_RE = re.compile(r"`([^`]+)`")
 BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-*]\s+|\d+[.)]\s+)")
+TRAILING_ENTITY_PUNCTUATION = ".,;:)]}"
 
 
 def _now() -> datetime:
@@ -167,6 +168,15 @@ def _artifact_id(
 
 def _clean_line(line: str) -> str:
     return BULLET_PREFIX_RE.sub("", line.strip(), count=1).strip()
+
+
+def _normalize_entity_token(value: str) -> str:
+    return value.strip().rstrip(TRAILING_ENTITY_PUNCTUATION)
+
+
+def _is_causal_heading(line: str) -> bool:
+    cleaned = line.strip().strip("#").strip().rstrip(":").lower()
+    return cleaned in {"rca", "root cause", "root-cause"}
 
 
 def _infer_evidence_kind(text: str) -> str:
@@ -222,6 +232,7 @@ def _entity_from_text(text: str) -> str | None:
 def _metric_candidates(text: str) -> list[str]:
     metrics = []
     for candidate in METRIC_RE.findall(text):
+        candidate = candidate.rstrip(".,;:)]}")
         lowered = candidate.lower()
         if lowered in {"http", "https"} or candidate.isupper():
             continue
@@ -281,14 +292,14 @@ class RunbookExtractor:
                 continue
 
             dep = DEPENDENCY_RE.search(line)
-            dep_source = dep.group("src") if dep else ""
-            dep_target = dep.group("tgt") if dep else ""
+            dep_source = _normalize_entity_token(dep.group("src")) if dep else ""
+            dep_target = _normalize_entity_token(dep.group("tgt")) if dep else ""
             dep_direction = dep.group("dir") if dep else ""
             if not dep and section == "dependencies":
                 shorthand = DEPENDENCY_SHORTHAND_RE.search(line)
                 if shorthand:
-                    dep_source = _entity_from_text(artifact.title) or artifact.title
-                    dep_target = shorthand.group("tgt")
+                    dep_source = _normalize_entity_token(_entity_from_text(artifact.title) or artifact.title)
+                    dep_target = _normalize_entity_token(shorthand.group("tgt"))
                     dep_direction = shorthand.group("dir")
             if dep:
                 result.dependency_hints.append(
@@ -394,12 +405,20 @@ class IncidentExtractor:
         priority = 0
         symptom = artifact.title
         for line_no, raw in enumerate(artifact.body_text.splitlines(), start=1):
+            if _is_causal_heading(raw):
+                line = _clean_line(raw)
+                result.warnings.append(f"ignored_causal_claim:{line}")
+                section = "suppressed_causal"
+                continue
             maybe_section = _section_name(raw)
             if maybe_section:
                 section = maybe_section
                 continue
             line = _clean_line(raw)
             if not line:
+                continue
+            if section == "suppressed_causal":
+                result.warnings.append(f"ignored_causal_claim:{line}")
                 continue
             if CAUSAL_CLAIM_RE.search(line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
@@ -409,14 +428,14 @@ class IncidentExtractor:
                 continue
 
             dep = DEPENDENCY_RE.search(line)
-            dep_source = dep.group("src") if dep else ""
-            dep_target = dep.group("tgt") if dep else ""
+            dep_source = _normalize_entity_token(dep.group("src")) if dep else ""
+            dep_target = _normalize_entity_token(dep.group("tgt")) if dep else ""
             dep_direction = dep.group("dir") if dep else ""
             if not dep and section == "dependencies":
                 shorthand = DEPENDENCY_SHORTHAND_RE.search(line)
                 if shorthand:
-                    dep_source = _entity_from_text(artifact.title) or artifact.title
-                    dep_target = shorthand.group("tgt")
+                    dep_source = _normalize_entity_token(_entity_from_text(artifact.title) or artifact.title)
+                    dep_target = _normalize_entity_token(shorthand.group("tgt"))
                     dep_direction = shorthand.group("dir")
             if dep:
                 result.dependency_hints.append(

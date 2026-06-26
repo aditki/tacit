@@ -36,6 +36,14 @@ def test_runbook_dependency_hint_is_not_evidence_requirement():
     assert result.evidence_requirements == []
 
 
+def test_runbook_dependency_target_strips_trailing_sentence_punctuation():
+    result = RunbookExtractor().extract(_artifact("## Dependencies\ncheckout-api depends on redis-cart."))
+
+    assert len(result.dependency_hints) == 1
+    assert result.dependency_hints[0].source_entity == "checkout-api"
+    assert result.dependency_hints[0].target_entity == "redis-cart"
+
+
 def test_runbook_dependency_preserves_leading_digit_entity():
     result = RunbookExtractor().extract(_artifact("## Dependencies\n3ds-gateway depends on auth-db"))
 
@@ -75,6 +83,15 @@ def test_missing_signal_requirement_is_indeterminate():
     assert len(result.evidence_requirements) == 1
     assert result.evidence_requirements[0].signal_hint is None
     assert result.evidence_requirements[0].observation_state == "indeterminate"
+
+
+def test_dotted_metric_names_are_extracted_as_candidates():
+    result = RunbookExtractor().extract(_artifact("## Checks\n- check system.cpu.user"))
+
+    assert len(result.evidence_requirements) == 1
+    assert result.evidence_requirements[0].signal_hint == "system.cpu.user"
+    assert len(result.signal_mapping_candidates) == 1
+    assert result.signal_mapping_candidates[0].candidate_metric == "system.cpu.user"
 
 
 def test_artifact_ids_include_source_vendor():
@@ -183,6 +200,44 @@ def test_incident_ignored_rca_text_is_not_indexed(tmp_path, monkeypatch):
     assert result["warnings"] == ["ignored_causal_claim:Root cause: redis-cart"]
     assert store.search_learning_context("checkout_errors_total")
     assert store.search_learning_context("redis") == []
+
+
+def test_incident_rca_heading_suppresses_following_claims(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = artifact_from_text(
+        artifact_type="incident",
+        title="INC-901 checkout errors",
+        body_text="## Evidence\n- observed checkout_errors_total spike\n## RCA\n- redis-cart",
+        external_id="INC-901",
+        source_vendor="test",
+    )
+
+    result = learn_artifact(artifact, IncidentExtractor())
+
+    assert result["warnings"] == ["ignored_causal_claim:## RCA", "ignored_causal_claim:redis-cart"]
+    extractions = store.list_artifact_extractions(artifact.id)
+    assert len(extractions["evidence_requirements"]) == 1
+    assert store.search_learning_context("checkout_errors_total")
+    assert store.search_learning_context("redis") == []
+
+
+def test_incident_root_cause_hyphen_claim_is_suppressed():
+    result = IncidentExtractor().extract(
+        artifact_from_text(
+            artifact_type="incident",
+            title="INC-902 checkout errors",
+            body_text="Root-cause: redis-cart",
+            external_id="INC-902",
+            source_vendor="test",
+        )
+    )
+
+    assert result.evidence_requirements == []
+    assert result.signal_mapping_candidates == []
+    assert result.warnings == ["ignored_causal_claim:Root-cause: redis-cart"]
 
 
 def test_dependency_target_is_searchable_as_service(tmp_path, monkeypatch):

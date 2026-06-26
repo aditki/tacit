@@ -346,7 +346,7 @@ async def list_ingested_alerts(
     response_description="Learned runbooks and extracted operational IR candidates",
 )
 async def list_learned_runbooks(
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=500),
 ):
     """List runbooks learned by Tacit Artifact Learning v1."""
     store = signals_mod.get_signal_store()
@@ -363,7 +363,7 @@ async def list_learned_runbooks(
     response_description="Learned incidents and extracted operational IR candidates",
 )
 async def list_learned_incidents(
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=500),
 ):
     """List incident history learned by Tacit Artifact Learning v1."""
     store = signals_mod.get_signal_store()
