@@ -125,6 +125,150 @@ def test_dashboard_upload_approval_search_and_service_question_e2e(client, isola
     assert "checkout_custom_latency_ms" in search_cli.output
 
 
+def test_runbook_artifact_learning_cli_and_api_e2e(client, isolated_learning_store, tmp_path):
+    runbook = tmp_path / "checkout.md"
+    runbook.write_text(
+        "\n".join(
+            [
+                "# Checkout Runbook",
+                "## Checks",
+                "- check redis_cache_misses_total",
+                "- restart Redis",
+                "## Dependencies",
+                "- checkout-api depends on redis-cart",
+                "## Escalation",
+                "- escalate to Payments",
+            ]
+        )
+    )
+
+    runner = CliRunner()
+    dry_run = runner.invoke(cli, ["learn", "runbooks", "--file", str(runbook), "--dry-run"])
+
+    assert dry_run.exit_code == 0
+    assert "Previewed checkout" in dry_run.output
+    assert isolated_learning_store.list_learned_artifacts(artifact_type="runbook") == []
+
+    learned = runner.invoke(cli, ["learn", "runbooks", "--file", str(runbook)])
+
+    assert learned.exit_code == 0
+    artifacts = isolated_learning_store.list_learned_artifacts(artifact_type="runbook")
+    assert len(artifacts) == 1
+    extractions = isolated_learning_store.list_artifact_extractions(artifacts[0]["artifact_id"])
+    assert len(extractions["evidence_requirements"]) == 1
+    assert len(extractions["dependency_hints"]) == 1
+    assert len(extractions["ownership_hints"]) == 1
+
+    api = client.post(
+        "/api/v1/learn/runbooks",
+        json={
+            "title": "Checkout API Runbook",
+            "body_text": "## Checks\n- check checkout_latency_seconds\n## Escalation\n- contact Payments",
+            "external_id": "api-checkout-runbook",
+            "dry_run": True,
+        },
+    )
+
+    assert api.status_code == 200
+    assert api.json()["dry_run"] is True
+    assert api.json()["summary"]["evidence_requirements"] == 1
+
+    listing = client.get("/api/v1/learn/runbooks")
+
+    assert listing.status_code == 200
+    assert listing.json()["count"] == 1
+
+
+def test_api_artifacts_without_external_id_do_not_collide(client, isolated_learning_store):
+    first = client.post(
+        "/api/v1/learn/runbooks",
+        json={
+            "title": "Checkout API Runbook",
+            "body_text": "## Checks\n- check checkout_latency_seconds",
+        },
+    )
+    second = client.post(
+        "/api/v1/learn/runbooks",
+        json={
+            "title": "Checkout API Runbook",
+            "body_text": "## Checks\n- check redis_cache_misses_total",
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    listing = client.get("/api/v1/learn/runbooks")
+    assert listing.status_code == 200
+    runbooks = listing.json()["runbooks"]
+    assert listing.json()["count"] == 2
+    assert len({runbook["artifact_id"] for runbook in runbooks}) == 2
+
+
+def test_artifact_list_limits_are_bounded(client, isolated_learning_store):
+    runbooks = client.get("/api/v1/learn/runbooks", params={"limit": -1})
+    incidents = client.get("/api/v1/learn/incidents", params={"limit": -1})
+
+    assert runbooks.status_code == 422
+    assert incidents.status_code == 422
+
+
+def test_incident_artifact_learning_cli_and_api_e2e(client, isolated_learning_store, tmp_path):
+    incident = tmp_path / "inc-482.md"
+    incident.write_text(
+        "\n".join(
+            [
+                "# INC-482 Checkout Latency",
+                "## Symptoms",
+                "- observed redis_cache_misses_total above normal",
+                "## Dependencies",
+                "- checkout-api depends on redis-cart",
+                "## Escalation",
+                "- contact Payments",
+                "## Resolution",
+                "- Root cause: redis-cart",
+            ]
+        )
+    )
+
+    runner = CliRunner()
+    dry_run = runner.invoke(cli, ["learn", "incidents", "--file", str(incident), "--dry-run"])
+
+    assert dry_run.exit_code == 0
+    assert "Previewed inc 482" in dry_run.output
+    assert isolated_learning_store.list_learned_artifacts(artifact_type="incident") == []
+
+    learned = runner.invoke(cli, ["learn", "incidents", "--file", str(incident)])
+
+    assert learned.exit_code == 0
+    artifacts = isolated_learning_store.list_learned_artifacts(artifact_type="incident")
+    assert len(artifacts) == 1
+    extractions = isolated_learning_store.list_artifact_extractions(artifacts[0]["artifact_id"])
+    assert len(extractions["evidence_requirements"]) == 1
+    assert extractions["evidence_requirements"][0]["observation_state"] == "observed"
+    assert len(extractions["dependency_hints"]) == 1
+    assert len(extractions["ownership_hints"]) == 1
+
+    api = client.post(
+        "/api/v1/learn/incidents",
+        json={
+            "title": "INC-483 Checkout Errors",
+            "body_text": "## Evidence\n- detected checkout_errors_total spike\n## Resolution\n- Culprit: checkout-api",
+            "external_id": "INC-483",
+            "dry_run": True,
+        },
+    )
+
+    assert api.status_code == 200
+    assert api.json()["dry_run"] is True
+    assert api.json()["summary"]["evidence_requirements"] == 1
+    assert api.json()["warnings"] == ["ignored_causal_claim:Culprit: checkout-api"]
+
+    listing = client.get("/api/v1/learn/incidents")
+
+    assert listing.status_code == 200
+    assert listing.json()["count"] == 1
+
+
 def test_bulk_grafana_learning_cli_indexes_backend_dashboards_e2e(isolated_learning_store, monkeypatch):
     if not isolated_learning_store._learning_index_available():
         pytest.skip("SQLite FTS5 is not available")

@@ -60,6 +60,42 @@ class DashboardAssociation(BaseModel):
     source: str = "dashboard_catalog"
 
 
+class AlertAssociation(BaseModel):
+    entity: str
+    signals: list[str] = Field(default_factory=list)
+    severity: str = ""
+    enabled: bool = True
+    stale: bool = False
+    runbook_url: str = ""
+    source: str = "alert_catalog"
+
+
+class EvidenceRequirementContext(BaseModel):
+    subject: str
+    evidence_kind: str
+    target_entity: str = ""
+    signal_hint: str = ""
+    observation_state: Literal["observed", "not_observed", "indeterminate"] = "indeterminate"
+    stale: bool = False
+    source_type: str = ""
+    source: str = "artifact_learning"
+
+
+class OwnershipHintContext(BaseModel):
+    entity: str
+    owner: str
+    hint_kind: str = "owner_label"
+    source: str = "artifact_learning"
+
+
+class DependencyHintContext(BaseModel):
+    source_entity: str
+    target_entity: str
+    direction: str = "unknown"
+    stale: bool = False
+    source: str = "artifact_learning"
+
+
 class EvidenceObservationInput(BaseModel):
     signal: str
     status: Literal["abnormal", "normal", "missing", "unknown"] = "unknown"
@@ -72,6 +108,10 @@ class ContextSection(BaseModel):
     historical_incidents: list[HistoricalIncident] = Field(default_factory=list)
     recent_changes: list[RecentChange] = Field(default_factory=list)
     dashboards: list[DashboardAssociation] = Field(default_factory=list)
+    alerts: list[AlertAssociation] = Field(default_factory=list)
+    evidence_requirements: list[EvidenceRequirementContext] = Field(default_factory=list)
+    ownership_hints: list[OwnershipHintContext] = Field(default_factory=list)
+    dependency_hints: list[DependencyHintContext] = Field(default_factory=list)
 
 
 class EvidenceSection(BaseModel):
@@ -119,6 +159,12 @@ WEIGHTS = {
     "recent_deploy": 20,
     "runbook_match": 15,
     "historical_incident_match": 15,
+    "alert_association": 25,
+    "evidence_requirement_observed": 25,
+    "incident_observed_evidence": 18,
+    "dependency_hint": 12,
+    "stale_alert": 2,
+    "stale_runbook_hint": 2,
     "ownership_context": 5,
     "dashboard_association": 5,
     "stale_artifact": -20,
@@ -161,6 +207,9 @@ def _connected_entities(bundle: ContextBundle) -> set[str]:
     for service in bundle.context.services:
         if service.name == affected:
             connected.update(service.depends_on)
+    for hint in bundle.context.dependency_hints:
+        if not hint.stale and hint.source_entity == affected:
+            connected.add(hint.target_entity)
     return connected
 
 
@@ -286,6 +335,107 @@ def rank_context_bundle(bundle: ContextBundle) -> RankedSuspectsResult:
                 detail=", ".join(dashboard.signals),
             )
 
+    for dependency_hint in bundle.context.dependency_hints:
+        if dependency_hint.source_entity != affected:
+            continue
+        if not dependency_hint.target_entity:
+            continue
+        cand = _candidate(candidates, dependency_hint.target_entity)
+        if dependency_hint.stale:
+            cand.raw_score += WEIGHTS["stale_runbook_hint"]
+            reason_type = "stale_artifact"
+            confidence = 0.15
+        else:
+            cand.raw_score += WEIGHTS["dependency_hint"]
+            reason_type = "dependency_hint"
+            confidence = 0.45
+        _add_reason(
+            cand,
+            reason_type=reason_type,
+            source=dependency_hint.source,
+            confidence=confidence,
+            detail=f"{dependency_hint.source_entity} {dependency_hint.direction} {dependency_hint.target_entity}",
+        )
+
+    seen_alerts: set[tuple[str, tuple[str, ...], bool]] = set()
+    for alert in bundle.context.alerts:
+        entity = alert.entity
+        if entity not in connected:
+            continue
+        if not alert.enabled:
+            continue
+        alert_key = (entity, tuple(sorted(dict.fromkeys(alert.signals))), alert.stale)
+        if alert_key in seen_alerts:
+            continue
+        seen_alerts.add(alert_key)
+
+        cand = _candidate(candidates, entity)
+        if alert.stale:
+            cand.raw_score += WEIGHTS["stale_alert"]
+            _add_reason(
+                cand,
+                reason_type="stale_alert",
+                source=alert.source,
+                confidence=0.1,
+                detail=", ".join(alert.signals),
+            )
+            continue
+
+        cand.raw_score += WEIGHTS["alert_association"]
+        detail_parts = [", ".join(alert.signals)]
+        if alert.severity:
+            detail_parts.append(f"severity:{alert.severity}")
+        if alert.runbook_url:
+            detail_parts.append(f"runbook:{alert.runbook_url}")
+        _add_reason(
+            cand,
+            reason_type="alert_association",
+            source=alert.source,
+            confidence=0.55,
+            detail="; ".join(part for part in detail_parts if part),
+        )
+
+    for requirement in bundle.context.evidence_requirements:
+        if requirement.stale:
+            continue
+        entity = requirement.target_entity
+        if not entity or entity not in connected:
+            continue
+        if requirement.observation_state == "observed":
+            cand = _candidate(candidates, entity)
+            from_incident_history = requirement.source_type == "incident" or requirement.source.startswith(
+                "incident_history"
+            )
+            reason_type = "incident_observed_evidence" if from_incident_history else "evidence_requirement_observed"
+            cand.raw_score += WEIGHTS[reason_type]
+            if not from_incident_history:
+                cand.has_runtime_support = True
+            _add_reason(
+                cand,
+                reason_type=reason_type,
+                source=requirement.source,
+                confidence=0.6 if from_incident_history else 0.75,
+                detail=requirement.signal_hint or requirement.subject,
+            )
+        elif requirement.observation_state == "not_observed" and entity in candidates:
+            cand = candidates[entity]
+            cand.raw_score += WEIGHTS["contradictory_evidence"]
+            _add_reason(
+                cand,
+                reason_type="evidence_requirement_not_observed",
+                source=requirement.source,
+                confidence=0.65,
+                detail=requirement.signal_hint or requirement.subject,
+            )
+        elif requirement.observation_state == "indeterminate" and entity in candidates:
+            _add_reason(
+                candidates[entity],
+                reason_type="evidence_requirement_indeterminate",
+                source=requirement.source,
+                confidence=0.2,
+                detail=requirement.signal_hint or requirement.subject,
+            )
+
     for observation in bundle.evidence.observations:
         matched = _entities_for_observation(bundle, observation)
         if observation.status == "abnormal":
@@ -328,6 +478,20 @@ def rank_context_bundle(bundle: ContextBundle) -> RankedSuspectsResult:
                 source="service_catalog",
                 confidence=0.2,
                 detail=f"Owner: {service.owner}",
+            )
+
+    for ownership_hint in bundle.context.ownership_hints:
+        if not ownership_hint.entity or ownership_hint.entity not in candidates:
+            continue
+        cand = candidates[ownership_hint.entity]
+        if cand.reasons:
+            cand.raw_score += WEIGHTS["ownership_context"]
+            _add_reason(
+                cand,
+                reason_type="ownership_context",
+                source=ownership_hint.source,
+                confidence=0.2,
+                detail=f"{ownership_hint.hint_kind}: {ownership_hint.owner}",
             )
 
     ranked = sorted(

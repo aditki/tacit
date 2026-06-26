@@ -17,6 +17,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_learning_index(conn)
     ensure_ingested_dashboard_backend_scope(conn)
     ensure_ingested_alert_columns(conn)
+    ensure_artifact_learning_columns(conn)
     ensure_mapping_columns(conn)
 
 
@@ -78,6 +79,32 @@ def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
     for name, ddl in additions.items():
         if name not in columns:
             conn.execute(f"ALTER TABLE ingested_alerts ADD COLUMN {name} {ddl}")
+
+
+def ensure_artifact_learning_columns(conn: sqlite3.Connection) -> None:
+    """Add artifact-learning metadata columns on pre-existing DBs."""
+    artifact_columns = {row["name"] for row in conn.execute("PRAGMA table_info(learned_artifacts)").fetchall()}
+    if artifact_columns:
+        additions = {
+            "source_vendor": "TEXT NOT NULL DEFAULT ''",
+            "source_instance": "TEXT NOT NULL DEFAULT ''",
+            "provenance_url": "TEXT NOT NULL DEFAULT ''",
+            "stale": "INTEGER NOT NULL DEFAULT 0",
+            "missing_since": "REAL",
+            "first_seen_at": "REAL NOT NULL DEFAULT 0",
+            "last_seen_at": "REAL NOT NULL DEFAULT 0",
+            "updated_at": "REAL NOT NULL DEFAULT 0",
+        }
+        for name, ddl in additions.items():
+            if name not in artifact_columns:
+                conn.execute(f"ALTER TABLE learned_artifacts ADD COLUMN {name} {ddl}")
+
+    for table in ("evidence_requirements", "ownership_hints", "dependency_hints"):
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if columns and "extraction_hash" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN extraction_hash TEXT NOT NULL DEFAULT ''")
+        if columns and table in {"ownership_hints", "dependency_hints"} and "source_type" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN source_type TEXT NOT NULL DEFAULT ''")
 
 
 def rebuild_ingested_dashboards_table(conn: sqlite3.Connection) -> None:

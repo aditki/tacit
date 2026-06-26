@@ -100,6 +100,10 @@ class LearningIndexUnavailable(RuntimeError):
     """Raised when SQLite FTS5-backed learning retrieval is unavailable."""
 
 
+def _escape_like_prefix(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _stronger_review_state(existing: str, incoming: str) -> str:
     """Return the higher-trust review state without allowing downgrades."""
     return stronger_review_state(existing, incoming)
@@ -915,6 +919,515 @@ class SignalStore:
             )
         return change_state
 
+    def record_learned_artifact(
+        self,
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        source_vendor: str = "",
+        source_instance: str = "",
+        external_id: str = "",
+        title: str = "",
+        body_text: str = "",
+        provenance_url: str = "",
+        fingerprint: str = "",
+    ) -> str:
+        """Record a learned operational artifact lifecycle row.
+
+        Returns ``created``, ``updated``, ``skipped``, or ``restored``.
+        """
+        now = time.time()
+        with self._conn() as conn:
+            existing = conn.execute(
+                """SELECT fingerprint, first_seen_at, stale FROM learned_artifacts
+                   WHERE artifact_id = ?""",
+                (artifact_id,),
+            ).fetchone()
+            first_seen = existing["first_seen_at"] if existing and existing["first_seen_at"] else now
+            change_state = "created"
+            if existing is not None:
+                same_fingerprint = bool(fingerprint and existing["fingerprint"] == fingerprint)
+                if same_fingerprint and existing["stale"]:
+                    change_state = "restored"
+                else:
+                    change_state = "skipped" if same_fingerprint else "updated"
+            conn.execute(
+                """INSERT INTO learned_artifacts
+                   (artifact_id, artifact_type, source_vendor, source_instance,
+                    external_id, title, body_text, provenance_url, fingerprint,
+                    stale, missing_since, first_seen_at, last_seen_at, updated_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)
+                   ON CONFLICT(artifact_id) DO UPDATE SET
+                       artifact_type = excluded.artifact_type,
+                       source_vendor = excluded.source_vendor,
+                       source_instance = excluded.source_instance,
+                       external_id = excluded.external_id,
+                       title = excluded.title,
+                       body_text = excluded.body_text,
+                       provenance_url = excluded.provenance_url,
+                       fingerprint = excluded.fingerprint,
+                       stale = 0,
+                       missing_since = NULL,
+                       first_seen_at = learned_artifacts.first_seen_at,
+                       last_seen_at = excluded.last_seen_at,
+                       updated_at = CASE
+                           WHEN learned_artifacts.fingerprint = excluded.fingerprint THEN learned_artifacts.updated_at
+                           ELSE excluded.updated_at
+                       END,
+                       created_at = learned_artifacts.created_at""",
+                (
+                    artifact_id,
+                    artifact_type,
+                    source_vendor,
+                    source_instance,
+                    external_id,
+                    title,
+                    body_text,
+                    provenance_url,
+                    fingerprint,
+                    first_seen,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        return change_state
+
+    def replace_artifact_extractions(
+        self,
+        *,
+        artifact_id: str,
+        evidence_requirements: list[dict[str, Any]] | None = None,
+        ownership_hints: list[dict[str, Any]] | None = None,
+        dependency_hints: list[dict[str, Any]] | None = None,
+        signal_mapping_candidates: list[dict[str, Any]] | None = None,
+    ) -> dict[str, int]:
+        """Replace extracted IR rows for one artifact."""
+        now = time.time()
+        with self._conn() as conn:
+            conn.execute("DELETE FROM evidence_requirements WHERE artifact_id = ?", (artifact_id,))
+            conn.execute("DELETE FROM ownership_hints WHERE artifact_id = ?", (artifact_id,))
+            conn.execute("DELETE FROM dependency_hints WHERE artifact_id = ?", (artifact_id,))
+            conn.execute("DELETE FROM signal_mapping_candidates WHERE artifact_id = ?", (artifact_id,))
+            for row in evidence_requirements or []:
+                conn.execute(
+                    """INSERT INTO evidence_requirements
+                       (id, artifact_id, subject, evidence_kind, target_entity,
+                        signal_hint, query_hint, priority, source_artifact_id,
+                        source_excerpt, source_type, confidence_prior, review_state,
+                        observation_state, extraction_hash, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        row["id"],
+                        artifact_id,
+                        row.get("subject", ""),
+                        row.get("evidence_kind", ""),
+                        row.get("target_entity"),
+                        row.get("signal_hint"),
+                        row.get("query_hint"),
+                        row.get("priority"),
+                        row.get("source_artifact_id", artifact_id),
+                        row.get("source_excerpt", ""),
+                        row.get("source_type", ""),
+                        row.get("confidence_prior", 0.5),
+                        row.get("review_state", "candidate"),
+                        row.get("observation_state", "indeterminate"),
+                        row.get("extraction_hash", ""),
+                        now,
+                    ),
+                )
+            for row in ownership_hints or []:
+                conn.execute(
+                    """INSERT INTO ownership_hints
+                       (id, artifact_id, entity, owner, hint_kind, source_artifact_id,
+                        source_excerpt, source_type, confidence_prior, review_state,
+                        extraction_hash, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        row["id"],
+                        artifact_id,
+                        row.get("entity", ""),
+                        row.get("owner", ""),
+                        row.get("hint_kind", ""),
+                        row.get("source_artifact_id", artifact_id),
+                        row.get("source_excerpt", ""),
+                        row.get("source_type", ""),
+                        row.get("confidence_prior", 0.5),
+                        row.get("review_state", "candidate"),
+                        row.get("extraction_hash", ""),
+                        now,
+                    ),
+                )
+            for row in dependency_hints or []:
+                conn.execute(
+                    """INSERT INTO dependency_hints
+                       (id, artifact_id, source_entity, target_entity, direction,
+                        source_artifact_id, source_excerpt, source_type, confidence_prior,
+                        review_state, extraction_hash, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        row["id"],
+                        artifact_id,
+                        row.get("source_entity", ""),
+                        row.get("target_entity", ""),
+                        row.get("direction", "unknown"),
+                        row.get("source_artifact_id", artifact_id),
+                        row.get("source_excerpt", ""),
+                        row.get("source_type", ""),
+                        row.get("confidence_prior", 0.5),
+                        row.get("review_state", "candidate"),
+                        row.get("extraction_hash", ""),
+                        now,
+                    ),
+                )
+            for row in signal_mapping_candidates or []:
+                conn.execute(
+                    """INSERT INTO signal_mapping_candidates
+                       (id, artifact_id, source, candidate_metric, symptom, signal_type,
+                        source_artifact_id, source_excerpt, query_hint, confidence_prior,
+                        review_state, extraction_hash, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        row["id"],
+                        artifact_id,
+                        row.get("source", ""),
+                        row.get("candidate_metric", ""),
+                        row.get("symptom", ""),
+                        row.get("signal_type", ""),
+                        row.get("source_artifact_id", artifact_id),
+                        row.get("source_excerpt", ""),
+                        row.get("query_hint"),
+                        row.get("confidence_prior", 0.5),
+                        row.get("review_state", "candidate"),
+                        row.get("extraction_hash", ""),
+                        now,
+                    ),
+                )
+        return {
+            "evidence_requirements": len(evidence_requirements or []),
+            "ownership_hints": len(ownership_hints or []),
+            "dependency_hints": len(dependency_hints or []),
+            "signal_mapping_candidates": len(signal_mapping_candidates or []),
+        }
+
+    def index_artifact_context(
+        self,
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        title: str = "",
+        body_text: str = "",
+        evidence_requirements: list[dict[str, Any]] | None = None,
+        ownership_hints: list[dict[str, Any]] | None = None,
+        dependency_hints: list[dict[str, Any]] | None = None,
+        signal_mapping_candidates: list[dict[str, Any]] | None = None,
+    ) -> int:
+        """Index learned artifact context for retrieval when FTS5 is available."""
+        if not self._learning_index_available():
+            return 0
+        indexed_at = time.time()
+        rows: list[tuple[Any, ...]] = []
+        for req in evidence_requirements or []:
+            rows.append(
+                (
+                    artifact_type,
+                    artifact_id,
+                    artifact_type,
+                    artifact_id,
+                    title,
+                    artifact_type,
+                    req.get("evidence_kind", ""),
+                    req.get("signal_hint", ""),
+                    req.get("query_hint", "") or req.get("source_excerpt", ""),
+                    req.get("target_entity") or req.get("subject", ""),
+                    req.get("evidence_kind", ""),
+                    req.get("review_state", "candidate"),
+                    req.get("source_excerpt", ""),
+                    f"artifact:{artifact_id} type:evidence_requirement",
+                    indexed_at,
+                )
+            )
+        for hint in ownership_hints or []:
+            rows.append(
+                (
+                    artifact_type,
+                    artifact_id,
+                    artifact_type,
+                    artifact_id,
+                    title,
+                    artifact_type,
+                    hint.get("hint_kind", ""),
+                    "",
+                    hint.get("source_excerpt", ""),
+                    hint.get("entity", ""),
+                    "ownership",
+                    hint.get("review_state", "candidate"),
+                    hint.get("source_excerpt", ""),
+                    f"artifact:{artifact_id} type:ownership_hint owner:{hint.get('owner', '')}",
+                    indexed_at,
+                )
+            )
+        for hint in dependency_hints or []:
+            service_key = " ".join(
+                part for part in [hint.get("source_entity", ""), hint.get("target_entity", "")] if part
+            )
+            rows.append(
+                (
+                    artifact_type,
+                    artifact_id,
+                    artifact_type,
+                    artifact_id,
+                    title,
+                    artifact_type,
+                    hint.get("direction", ""),
+                    "",
+                    hint.get("source_excerpt", ""),
+                    service_key,
+                    "dependency",
+                    hint.get("review_state", "candidate"),
+                    hint.get("source_excerpt", ""),
+                    f"artifact:{artifact_id} type:dependency_hint target:{hint.get('target_entity', '')}",
+                    indexed_at,
+                )
+            )
+        for candidate in signal_mapping_candidates or []:
+            rows.append(
+                (
+                    artifact_type,
+                    artifact_id,
+                    artifact_type,
+                    artifact_id,
+                    title,
+                    artifact_type,
+                    "signal_mapping_candidate",
+                    candidate.get("candidate_metric", ""),
+                    candidate.get("query_hint", "") or candidate.get("source_excerpt", ""),
+                    candidate.get("symptom", ""),
+                    candidate.get("signal_type", ""),
+                    candidate.get("review_state", "candidate"),
+                    candidate.get("source_excerpt", ""),
+                    f"artifact:{artifact_id} type:signal_mapping_candidate",
+                    indexed_at,
+                )
+            )
+        if body_text:
+            rows.append(
+                (
+                    artifact_type,
+                    artifact_id,
+                    artifact_type,
+                    artifact_id,
+                    title,
+                    artifact_type,
+                    "artifact_text",
+                    "",
+                    body_text[:2000],
+                    "",
+                    "",
+                    "candidate",
+                    body_text[:500],
+                    f"artifact:{artifact_id} type:text",
+                    indexed_at,
+                )
+            )
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "DELETE FROM learning_context_fts WHERE source_kind = ? AND source_id = ?",
+                    (artifact_type, artifact_id),
+                )
+                conn.executemany(
+                    """INSERT INTO learning_context_fts
+                       (source_kind, source_id, backend_name, dashboard_uid,
+                        dashboard_title, dashboard_tags, panel_title, metric_name,
+                        query_text, service, signal_type, review_state, reason,
+                        provenance, indexed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+        except sqlite3.OperationalError as exc:
+            logger.warning("artifact_context_index_failed", error=str(exc))
+            return 0
+        return len(rows)
+
+    def mark_missing_artifacts_stale(
+        self,
+        *,
+        artifact_type: str,
+        seen_artifact_ids: set[str],
+        source_vendor: str | None = None,
+        source_instance: str | None = None,
+        external_id_prefix: str | None = None,
+    ) -> int:
+        """Mark previously learned artifacts stale when absent from a complete crawl."""
+        now = time.time()
+        with self._conn() as conn:
+            clauses = ["artifact_type = ?", "stale = 0"]
+            params: list[Any] = [artifact_type]
+            if source_vendor is not None:
+                clauses.append("source_vendor = ?")
+                params.append(source_vendor)
+            if source_instance is not None:
+                clauses.append("source_instance = ?")
+                params.append(source_instance)
+            if external_id_prefix is not None:
+                clauses.append("external_id LIKE ? ESCAPE '\\'")
+                params.append(f"{_escape_like_prefix(external_id_prefix)}%")
+            rows = conn.execute(
+                f"""SELECT artifact_id FROM learned_artifacts
+                    WHERE {' AND '.join(clauses)}""",
+                params,
+            ).fetchall()
+            missing = [row["artifact_id"] for row in rows if row["artifact_id"] not in seen_artifact_ids]
+            if not missing:
+                return 0
+            placeholders = ", ".join("?" for _ in missing)
+            cursor = conn.execute(
+                f"""UPDATE learned_artifacts
+                    SET stale = 1,
+                        missing_since = COALESCE(missing_since, ?),
+                        updated_at = ?
+                    WHERE artifact_type = ? AND artifact_id IN ({placeholders})""",
+                (now, now, artifact_type, *missing),
+            )
+            if self._learning_index_available():
+                try:
+                    conn.execute(
+                        f"""DELETE FROM learning_context_fts
+                            WHERE source_kind = ?
+                              AND source_id IN ({placeholders})""",
+                        (artifact_type, *missing),
+                    )
+                except sqlite3.OperationalError as exc:
+                    logger.warning("stale_artifact_context_update_failed", error=str(exc))
+            mapping_rows = conn.execute(
+                """SELECT id, source_refs FROM signal_metric_mappings
+                   WHERE source_type = ?""",
+                (artifact_type,),
+            ).fetchall()
+            missing_set = set(missing)
+            for mapping in mapping_rows:
+                refs = json.loads(mapping["source_refs"] or "[]")
+                if not any(ref in missing_set for ref in refs):
+                    continue
+                remaining_refs = [ref for ref in refs if ref not in missing_set]
+                if remaining_refs:
+                    conn.execute(
+                        "UPDATE signal_metric_mappings SET source_refs = ? WHERE id = ?",
+                        (json.dumps(remaining_refs), mapping["id"]),
+                    )
+                else:
+                    conn.execute("DELETE FROM signal_metric_mappings WHERE id = ?", (mapping["id"],))
+            return cursor.rowcount
+
+    def list_learned_artifacts(
+        self,
+        *,
+        artifact_type: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List learned operational artifacts."""
+        with self._conn() as conn:
+            if artifact_type:
+                rows = conn.execute(
+                    """SELECT id, artifact_id, artifact_type, source_vendor, source_instance,
+                              external_id, title, provenance_url, fingerprint,
+                              stale, missing_since, first_seen_at, last_seen_at,
+                              updated_at, created_at
+                       FROM learned_artifacts
+                       WHERE artifact_type = ? ORDER BY updated_at DESC LIMIT ?""",
+                    (artifact_type, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT id, artifact_id, artifact_type, source_vendor, source_instance,
+                              external_id, title, provenance_url, fingerprint,
+                              stale, missing_since, first_seen_at, last_seen_at,
+                              updated_at, created_at
+                       FROM learned_artifacts
+                       ORDER BY updated_at DESC LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+        return [_deserialize_learned_artifact(row) for row in rows]
+
+    def get_learned_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        """Return one learned artifact by stable artifact ID."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM learned_artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+        return _deserialize_learned_artifact(row) if row else None
+
+    def list_artifact_extractions(self, artifact_id: str) -> dict[str, list[dict[str, Any]]]:
+        """Return extracted IR rows for one artifact."""
+        with self._conn() as conn:
+            evidence = conn.execute(
+                "SELECT * FROM evidence_requirements WHERE artifact_id = ? ORDER BY priority, id",
+                (artifact_id,),
+            ).fetchall()
+            ownership = conn.execute(
+                "SELECT * FROM ownership_hints WHERE artifact_id = ? ORDER BY id",
+                (artifact_id,),
+            ).fetchall()
+            dependencies = conn.execute(
+                "SELECT * FROM dependency_hints WHERE artifact_id = ? ORDER BY id",
+                (artifact_id,),
+            ).fetchall()
+            signal_candidates = conn.execute(
+                "SELECT * FROM signal_mapping_candidates WHERE artifact_id = ? ORDER BY id",
+                (artifact_id,),
+            ).fetchall()
+        return {
+            "evidence_requirements": [dict(row) for row in evidence],
+            "ownership_hints": [dict(row) for row in ownership],
+            "dependency_hints": [dict(row) for row in dependencies],
+            "signal_mapping_candidates": [dict(row) for row in signal_candidates],
+        }
+
+    def artifact_extraction_counts(self, artifact_id: str) -> dict[str, int]:
+        """Return structured extraction row counts for one artifact."""
+        with self._conn() as conn:
+            evidence = conn.execute(
+                "SELECT COUNT(*) AS count FROM evidence_requirements WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+            ownership = conn.execute(
+                "SELECT COUNT(*) AS count FROM ownership_hints WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+            dependencies = conn.execute(
+                "SELECT COUNT(*) AS count FROM dependency_hints WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+            signal_candidates = conn.execute(
+                "SELECT COUNT(*) AS count FROM signal_mapping_candidates WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+        return {
+            "evidence_requirements": int(evidence["count"] if evidence else 0),
+            "ownership_hints": int(ownership["count"] if ownership else 0),
+            "dependency_hints": int(dependencies["count"] if dependencies else 0),
+            "signal_mapping_candidates": int(signal_candidates["count"] if signal_candidates else 0),
+        }
+
+    def artifact_context_indexed(self, *, artifact_id: str, artifact_type: str) -> bool:
+        """Return whether an artifact has rows in the optional learning index."""
+        if not self._learning_index_available():
+            return True
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    """SELECT 1 FROM learning_context_fts
+                       WHERE source_kind = ? AND source_id = ?
+                       LIMIT 1""",
+                    (artifact_type, artifact_id),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            logger.warning("artifact_context_index_check_failed", error=str(exc))
+            return True
+        return row is not None
+
     def mark_missing_alerts_stale(
         self,
         *,
@@ -1340,6 +1853,7 @@ class SignalStore:
             mapping_count = conn.execute("SELECT COUNT(*) FROM signal_metric_mappings").fetchone()[0]
             ingested_count = conn.execute("SELECT COUNT(*) FROM ingested_dashboards").fetchone()[0]
             ingested_alert_count = conn.execute("SELECT COUNT(*) FROM ingested_alerts").fetchone()[0]
+            learned_artifact_count = conn.execute("SELECT COUNT(*) FROM learned_artifacts").fetchone()[0]
 
             by_source = conn.execute("""SELECT source_type, COUNT(*) as n
                    FROM signal_metric_mappings GROUP BY source_type""").fetchall()
@@ -1352,6 +1866,7 @@ class SignalStore:
             "metric_mappings": mapping_count,
             "ingested_dashboards": ingested_count,
             "ingested_alerts": ingested_alert_count,
+            "learned_artifacts": learned_artifact_count,
             "mappings_by_source": {r["source_type"]: r["n"] for r in by_source},
             "signals_by_category": {r["category"]: r["n"] for r in by_category},
         }
@@ -1408,6 +1923,14 @@ def _deserialize_ingested_alert(row: sqlite3.Row) -> dict[str, Any]:
             d[field] = json.loads(d[field])
     if "enabled" in d:
         d["enabled"] = bool(d["enabled"])
+    if "stale" in d:
+        d["stale"] = bool(d["stale"])
+    return d
+
+
+def _deserialize_learned_artifact(row: sqlite3.Row) -> dict[str, Any]:
+    """Convert a learned artifact DB row to a dict."""
+    d = dict(row)
     if "stale" in d:
         d["stale"] = bool(d["stale"])
     return d

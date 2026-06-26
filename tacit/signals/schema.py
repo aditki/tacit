@@ -135,9 +135,99 @@ CREATE TABLE IF NOT EXISTS ingested_alerts (
     UNIQUE(alert_uid, backend_name)
 );
 
+CREATE TABLE IF NOT EXISTS learned_artifacts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    artifact_id         TEXT NOT NULL,
+    artifact_type       TEXT NOT NULL,
+    source_vendor       TEXT NOT NULL DEFAULT '',
+    source_instance     TEXT NOT NULL DEFAULT '',
+    external_id         TEXT NOT NULL DEFAULT '',
+    title               TEXT NOT NULL DEFAULT '',
+    body_text           TEXT NOT NULL DEFAULT '',
+    provenance_url      TEXT NOT NULL DEFAULT '',
+    fingerprint         TEXT NOT NULL DEFAULT '',
+    stale               INTEGER NOT NULL DEFAULT 0,
+    missing_since       REAL,
+    first_seen_at       REAL NOT NULL,
+    last_seen_at        REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    created_at          REAL NOT NULL,
+    UNIQUE(artifact_id)
+);
+
+CREATE TABLE IF NOT EXISTS evidence_requirements (
+    id                  TEXT PRIMARY KEY,
+    artifact_id         TEXT NOT NULL,
+    subject             TEXT NOT NULL DEFAULT '',
+    evidence_kind       TEXT NOT NULL DEFAULT '',
+    target_entity       TEXT,
+    signal_hint         TEXT,
+    query_hint          TEXT,
+    priority            INTEGER,
+    source_artifact_id  TEXT NOT NULL DEFAULT '',
+    source_excerpt      TEXT NOT NULL DEFAULT '',
+    source_type         TEXT NOT NULL DEFAULT '',
+    confidence_prior    REAL NOT NULL DEFAULT 0.5,
+    review_state        TEXT NOT NULL DEFAULT 'candidate',
+    observation_state   TEXT NOT NULL DEFAULT 'indeterminate',
+    extraction_hash     TEXT NOT NULL DEFAULT '',
+    created_at          REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ownership_hints (
+    id                  TEXT PRIMARY KEY,
+    artifact_id         TEXT NOT NULL,
+    entity              TEXT NOT NULL DEFAULT '',
+    owner               TEXT NOT NULL DEFAULT '',
+    hint_kind           TEXT NOT NULL DEFAULT '',
+    source_artifact_id  TEXT NOT NULL DEFAULT '',
+    source_excerpt      TEXT NOT NULL DEFAULT '',
+    source_type         TEXT NOT NULL DEFAULT '',
+    confidence_prior    REAL NOT NULL DEFAULT 0.5,
+    review_state        TEXT NOT NULL DEFAULT 'candidate',
+    extraction_hash     TEXT NOT NULL DEFAULT '',
+    created_at          REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dependency_hints (
+    id                  TEXT PRIMARY KEY,
+    artifact_id         TEXT NOT NULL,
+    source_entity       TEXT NOT NULL DEFAULT '',
+    target_entity       TEXT NOT NULL DEFAULT '',
+    direction           TEXT NOT NULL DEFAULT 'unknown',
+    source_artifact_id  TEXT NOT NULL DEFAULT '',
+    source_excerpt      TEXT NOT NULL DEFAULT '',
+    source_type         TEXT NOT NULL DEFAULT '',
+    confidence_prior    REAL NOT NULL DEFAULT 0.5,
+    review_state        TEXT NOT NULL DEFAULT 'candidate',
+    extraction_hash     TEXT NOT NULL DEFAULT '',
+    created_at          REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS signal_mapping_candidates (
+    id                  TEXT PRIMARY KEY,
+    artifact_id         TEXT NOT NULL,
+    source              TEXT NOT NULL DEFAULT '',
+    candidate_metric    TEXT NOT NULL DEFAULT '',
+    symptom             TEXT NOT NULL DEFAULT '',
+    signal_type         TEXT NOT NULL DEFAULT '',
+    source_artifact_id  TEXT NOT NULL DEFAULT '',
+    source_excerpt      TEXT NOT NULL DEFAULT '',
+    query_hint          TEXT,
+    confidence_prior    REAL NOT NULL DEFAULT 0.5,
+    review_state        TEXT NOT NULL DEFAULT 'candidate',
+    extraction_hash     TEXT NOT NULL DEFAULT '',
+    created_at          REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_smm_signal ON signal_metric_mappings(signal_type);
 CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern);
 CREATE INDEX IF NOT EXISTS idx_ingested_alert_uid_backend ON ingested_alerts(alert_uid, backend_name);
+CREATE INDEX IF NOT EXISTS idx_learned_artifacts_type ON learned_artifacts(artifact_type);
+CREATE INDEX IF NOT EXISTS idx_evidence_requirements_artifact ON evidence_requirements(artifact_id);
+CREATE INDEX IF NOT EXISTS idx_ownership_hints_artifact ON ownership_hints(artifact_id);
+CREATE INDEX IF NOT EXISTS idx_dependency_hints_artifact ON dependency_hints(artifact_id);
+CREATE INDEX IF NOT EXISTS idx_signal_mapping_candidates_artifact ON signal_mapping_candidates(artifact_id);
 """
 
 FTS_SCHEMA_SQL = """
