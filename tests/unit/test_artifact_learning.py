@@ -77,6 +77,14 @@ def test_runbook_mitigation_is_ignored_as_non_evidential():
     assert result.warnings == ["ignored_mitigation:restart Redis"]
 
 
+def test_runbook_causal_claim_does_not_emit_dependency_hint():
+    result = RunbookExtractor().extract(_artifact("## Notes\n- Root cause: checkout-api calls redis-cart"))
+
+    assert result.dependency_hints == []
+    assert result.evidence_requirements == []
+    assert result.warnings == ["ignored_causal_claim:Root cause: checkout-api calls redis-cart"]
+
+
 def test_missing_signal_requirement_is_indeterminate():
     result = RunbookExtractor().extract(_artifact("## Checks\n- check DB latency"))
 
@@ -202,6 +210,28 @@ def test_incident_ignored_rca_text_is_not_indexed(tmp_path, monkeypatch):
     assert store.search_learning_context("redis") == []
 
 
+def test_incident_plain_text_causal_label_suppresses_following_claim(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = artifact_from_text(
+        artifact_type="incident",
+        title="INC-904 checkout errors",
+        body_text="Evidence:\nobserved checkout_errors_total spike\nRoot cause:\nredis-cart",
+        external_id="INC-904",
+        source_vendor="test",
+    )
+
+    result = learn_artifact(artifact, IncidentExtractor())
+
+    assert result["warnings"] == ["ignored_causal_claim:Root cause:", "ignored_causal_claim:redis-cart"]
+    extractions = store.list_artifact_extractions(artifact.id)
+    assert len(extractions["evidence_requirements"]) == 1
+    assert store.search_learning_context("checkout_errors_total")
+    assert store.search_learning_context("redis") == []
+
+
 def test_incident_rca_heading_suppresses_following_claims(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     if not store._learning_index_available():
@@ -264,6 +294,25 @@ def test_incident_root_cause_hyphen_claim_is_suppressed():
     assert result.evidence_requirements == []
     assert result.signal_mapping_candidates == []
     assert result.warnings == ["ignored_causal_claim:Root-cause: redis-cart"]
+
+
+def test_incident_observed_mitigation_word_evidence_is_preserved():
+    result = IncidentExtractor().extract(
+        artifact_from_text(
+            artifact_type="incident",
+            title="INC-905 checkout restarts",
+            body_text="## Evidence\n- observed restart count increased\n- detected OOM kill events",
+            external_id="INC-905",
+            source_vendor="test",
+        )
+    )
+
+    assert [row.subject for row in result.evidence_requirements] == [
+        "restart count increased",
+        "OOM kill events",
+    ]
+    assert [row.observation_state for row in result.evidence_requirements] == ["observed", "observed"]
+    assert result.warnings == []
 
 
 def test_dependency_target_is_searchable_as_service(tmp_path, monkeypatch):

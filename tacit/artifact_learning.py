@@ -181,6 +181,11 @@ def _is_causal_heading(line: str) -> bool:
     return cleaned in {"rca", "root cause", "root-cause"} or bool(CAUSAL_CLAIM_RE.search(cleaned))
 
 
+def _is_causal_section_label(line: str) -> bool:
+    cleaned = _clean_line(line).strip()
+    return cleaned.endswith(":") and bool(CAUSAL_CLAIM_RE.search(cleaned))
+
+
 def _infer_evidence_kind(text: str) -> str:
     lowered = text.lower()
     if "miss" in lowered or "cache" in lowered:
@@ -286,6 +291,9 @@ class RunbookExtractor:
                 continue
             line = _clean_line(raw)
             if not line:
+                continue
+            if CAUSAL_CLAIM_RE.search(line):
+                result.warnings.append(f"ignored_causal_claim:{line}")
                 continue
             if section == "symptoms":
                 symptom = line
@@ -422,11 +430,12 @@ class IncidentExtractor:
             if section == "suppressed_causal":
                 result.warnings.append(f"ignored_causal_claim:{line}")
                 continue
+            if _is_causal_section_label(line):
+                result.warnings.append(f"ignored_causal_claim:{line}")
+                section = "suppressed_causal"
+                continue
             if CAUSAL_CLAIM_RE.search(line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
-                continue
-            if MITIGATION_RE.search(line) and not CHECK_RE.search(line):
-                result.warnings.append(f"ignored_mitigation:{line}")
                 continue
 
             dep = DEPENDENCY_RE.search(line)
@@ -492,6 +501,9 @@ class IncidentExtractor:
 
             observed = INCIDENT_OBSERVED_RE.search(line)
             check = CHECK_RE.search(line)
+            if MITIGATION_RE.search(line) and not (check or observed):
+                result.warnings.append(f"ignored_mitigation:{line}")
+                continue
             evidence_body = ""
             observation_state = "indeterminate"
             if observed:
