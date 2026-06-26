@@ -16,36 +16,51 @@ _LATENCY_TERMS = {"latency", "duration", "slow", "slowness", "timeout", "timeout
 _LATENCY_PHRASES = {"response time", "response times", "request time", "request times"}
 _CACHE_ARCHETYPES = {"redis_saturation"}
 _LATENCY_ARCHETYPES = {"latency_investigation", "api_response_time_spike", "golden_signals"}
+_PRESERVED_CACHE_TERMS = {"redis", "cache", "eviction", "evictions", "hit_ratio"}
+_PRESERVED_LATENCY_TERMS = {"latency"}
 
 
 def signals(intent: Any) -> dict[str, Any]:
     archetypes = {match.type for match in intent.archetypes if match.confidence >= 0.3}
     words = {str(word).lower() for word in intent.keywords}
+    keyword_evidence = getattr(intent, "keyword_evidence", []) or []
+    preserved = {
+        str(item.get("keyword", "")).lower()
+        for item in keyword_evidence
+        if float(item.get("score", 0.0) or 0.0) < 1.0
+    }
     summary = " ".join(re.findall(r"[a-z0-9_]+", str(intent.summary).lower()))
     padded_summary = f" {summary} "
     summary_words = set(summary.split())
     evidence = words | summary_words
-    has_cache = (
+    asserted_cache = (
         bool(archetypes & _CACHE_ARCHETYPES)
         or bool(evidence & _CACHE_TERMS)
         or any(f" {phrase} " in padded_summary for phrase in _CACHE_PHRASES)
     )
-    has_latency = (
+    asserted_latency = (
         bool(archetypes & _LATENCY_ARCHETYPES)
         or bool(evidence & _LATENCY_TERMS)
         or any(f" {phrase} " in padded_summary for phrase in _LATENCY_PHRASES)
     )
+    preserved_cache = bool(preserved & _PRESERVED_CACHE_TERMS)
+    preserved_latency = bool(preserved & _PRESERVED_LATENCY_TERMS)
     return {
         "archetypes": sorted(archetypes),
         "keywords": sorted(words),
+        "preserved_keywords": sorted(preserved),
         "evidence": evidence,
-        "has_cache": has_cache,
-        "has_latency": has_latency,
+        "asserted_cache": asserted_cache,
+        "asserted_latency": asserted_latency,
+        "preserved_cache": preserved_cache,
+        "preserved_latency": preserved_latency,
+        "has_cache": asserted_cache or preserved_cache,
+        "has_latency": asserted_latency or preserved_latency,
     }
 
 
 def is_negative(item: dict[str, Any]) -> bool:
-    return item.get("class") == "negative" or item.get("expects_cache") is False
+    return item.get("class") == "negative"
 
 
 def evaluate(intent: Any, item: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
@@ -60,10 +75,13 @@ def evaluate(intent: Any, item: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     if is_negative(item):
         forbidden = {k.lower() for k in item.get("forbidden_keywords", [])}
         injected_forbidden = sorted(forbidden & {k.lower() for k in s["keywords"]})
-        passed = (not s["has_cache"]) and not injected_forbidden
+        passed = (not s["asserted_cache"]) and not injected_forbidden
         detail = {
             "archetypes": s["archetypes"],
             "keywords": s["keywords"],
+            "preserved_keywords": s["preserved_keywords"],
+            "asserted_cache": s["asserted_cache"],
+            "preserved_cache": s["preserved_cache"],
             "has_cache": s["has_cache"],
             "injected_forbidden": injected_forbidden,
         }

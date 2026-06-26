@@ -12,12 +12,12 @@
     {"class": "precise", "text": "Build an incident view for HTTP duration and Redis cache capacity, eviction, memory, and connections."},
     {"class": "precise", "text": "Check cache hit ratio, misses and evictions against request latency and Redis client load."},
 
-    {"class": "vague", "text": "Checkout is slow. Show me what is under pressure."},
+    {"class": "vague", "text": "Checkout is slow. Show me what is under pressure.", "expects_cache": false, "expects_latency": true},
     {"class": "vague", "text": "Something around the payment cache looks unhealthy."},
-    {"class": "vague", "text": "Why did response times get bad during the traffic spike?"},
+    {"class": "vague", "text": "Why did response times get bad during the traffic spike?", "expects_cache": false, "expects_latency": true},
     {"class": "vague", "text": "The service degraded. Look at the cache and its dependencies."},
     {"class": "vague", "text": "Users are waiting longer and Redis might be involved."},
-    {"class": "vague", "text": "Investigate the checkout slowdown without assuming the cause."},
+    {"class": "vague", "text": "Investigate the checkout slowdown without assuming the cause.", "expects_cache": false, "expects_latency": true},
 
     {"class": "noisy", "text": "SEV2 checkout latency up after lunch; deploy looked normal, Kafka had a blip, Redis memory and clients seem weird."},
     {"class": "noisy", "text": "Payments slow, no clear 5xx jump, CPU okay, cache misses and evictions may have moved."},
@@ -28,8 +28,8 @@
 
     {"class": "misleading", "text": "This looks like CPU saturation, but verify whether cache evictions or Redis clients better explain the latency."},
     {"class": "misleading", "text": "Assume the database is slow, then challenge that assumption using request and cache evidence."},
-    {"class": "misleading", "text": "The alert says network loss; check whether memory pressure in Redis is the actual bottleneck."},
-    {"class": "misleading", "text": "A deploy happened nearby, but test the cache-pressure hypothesis before blaming the release."},
+    {"class": "misleading", "text": "The alert says network loss; check whether memory pressure in Redis is the actual bottleneck.", "expects_cache": true, "expects_latency": false},
+    {"class": "misleading", "text": "A deploy happened nearby, but test the cache-pressure hypothesis before blaming the release.", "expects_cache": true, "expects_latency": false},
     {"class": "misleading", "text": "Errors are flat, so this cannot be Redis. Prove or disprove that with latency, eviction, and client metrics."},
     {"class": "misleading", "text": "Kafka lag is noisy. Focus only if it explains the checkout latency better than cache pressure."},
 

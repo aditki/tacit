@@ -22,6 +22,7 @@ class _Intent:
     keywords: list[str] = field(default_factory=list)
     summary: str = ""
     archetypes: list[_Match] = field(default_factory=list)
+    keyword_evidence: list[dict[str, object]] = field(default_factory=list)
 
 
 def test_positive_requires_expected_signals():
@@ -40,6 +41,29 @@ def test_positive_can_waive_latency_via_label():
     assert evaluate(cache_only, item)[0]
 
 
+def test_positive_can_waive_cache_via_label():
+    latency_only = _Intent(keywords=["latency"])
+    item = {"class": "vague", "expects_cache": False, "expects_latency": True}
+    assert not is_negative(item)
+    assert evaluate(latency_only, item)[0]
+
+
+def test_colloquial_evidence_preserves_positive_cache_hypothesis():
+    preserved = _Intent(
+        keywords=["latency"],
+        keyword_evidence=[
+            {"keyword": "cache", "score": 0.4, "tier": "colloquial", "source": "key churn"},
+            {"keyword": "eviction", "score": 0.4, "tier": "colloquial", "source": "key churn"},
+        ],
+    )
+
+    result = signals(preserved)
+
+    assert result["preserved_cache"]
+    assert not result["asserted_cache"]
+    assert evaluate(preserved, {"class": "reworded"})[0]
+
+
 def test_negative_passes_when_cache_not_asserted():
     benign = _Intent(keywords=["auth", "security"], summary="rotate signing keys")
     item = {"class": "negative", "expects_cache": False, "forbidden_keywords": ["cache", "eviction"]}
@@ -53,6 +77,23 @@ def test_negative_fails_on_cache_false_positive():
     passed, detail = evaluate(leaked, item)
     assert not passed
     assert detail["injected_forbidden"] == ["cache", "eviction"]
+
+
+def test_negative_allows_unconfirmed_colloquial_evidence():
+    preserved_only = _Intent(
+        keywords=["auth", "security"],
+        summary="rotate signing keys",
+        keyword_evidence=[
+            {"keyword": "cache", "score": 0.4, "tier": "colloquial", "source": "key churn"},
+            {"keyword": "eviction", "score": 0.4, "tier": "colloquial", "source": "key churn"},
+        ],
+    )
+    item = {"class": "negative", "expects_cache": False, "forbidden_keywords": ["cache", "eviction"]}
+    passed, detail = evaluate(preserved_only, item)
+
+    assert passed
+    assert detail["preserved_cache"]
+    assert not detail["asserted_cache"]
 
 
 def test_archetype_evidence_counts_as_cache():
