@@ -117,23 +117,39 @@ class ArtifactExtractor(Protocol):
 
 
 CHECK_RE = re.compile(r"\b(check|verify|look at|inspect|observe|confirm)\b\s+(?P<body>.+)", re.I)
-OWNERSHIP_RE = re.compile(r"\b(escalate to|contact|owned by|owner:|maintainer:)\b\s*(?P<owner>.+)", re.I)
-DEPENDENCY_RE = re.compile(
-    r"\b(?P<src>[a-zA-Z0-9_.-]+)\s+(?P<dir>depends on|calls|downstream)\s+(?P<tgt>[a-zA-Z0-9_.-]+)", re.I
+OWNERSHIP_RE = re.compile(
+    r"(?:(?:\b(?:escalate to|contact|owned by)\b)|(?:\b(?:owner|maintainer):))\s*(?P<owner>.+)",
+    re.I,
 )
-DEPENDENCY_SHORTHAND_RE = re.compile(r"\b(?P<dir>depends on|calls|downstream)\s+(?P<tgt>[a-zA-Z0-9_.-]+)", re.I)
+DEPENDENCY_RE = re.compile(
+    r"^(?P<src>[a-zA-Z0-9_.-]+)\s+(?P<dir>depends on|calls|downstream)\s+(?P<tgt>[a-zA-Z0-9_.-]+)",
+    re.I,
+)
+DEPENDENCY_SHORTHAND_RE = re.compile(
+    r"^(?:also\s+|then\s+|next\s+)?(?P<dir>depends on|calls|downstream)\s+(?P<tgt>[a-zA-Z0-9_.-]+)",
+    re.I,
+)
 MITIGATION_RE = re.compile(r"\b(restart|rollback|scale|redeploy|flush|kill|delete)\b", re.I)
 INCIDENT_OBSERVED_RE = re.compile(
-    r"\b(observed|saw|detected|confirmed|evidence:|signal:|symptom:|impact:)\b\s*(?P<body>.+)",
+    r"(?:(?:\b(?:observed|saw|detected|confirmed)\b)|(?:\b(?:evidence|signal|symptom|impact):))\s*(?P<body>.+)",
     re.I,
 )
 CAUSAL_CLAIM_RE = re.compile(
     r"\b("
     r"rca|root cause|root-cause|culprit|caused by|caused when|primary issue|underlying issue|"
     r"postmortem conclusion|contributing factor|contributing factors|lesson learned|lessons learned|"
-    r"resolution:|fix:|fix was|resolved by|remediated by|recovered after|"
+    r"resolution|fix|fix was|resolved by|remediated by|recovered after|"
     r"rollback fixed|introduced by|triggered by|regression from|fault was|due to"
     r")",
+    re.I,
+)
+LEADING_CAUSAL_CLAIM_RE = re.compile(
+    r"^(?:"
+    r"rca|root cause|root-cause|culprit|caused by|caused when|primary issue|underlying issue|"
+    r"postmortem conclusion|contributing factor|contributing factors|lesson learned|lessons learned|"
+    r"resolution|fix|fix was|resolved by|remediated by|recovered after|"
+    r"rollback fixed|introduced by|triggered by|regression from|fault was|due to"
+    r")\b",
     re.I,
 )
 METRIC_RE = re.compile(r"\b[a-zA-Z_:][a-zA-Z0-9_:]*(?:[._:][a-zA-Z0-9_:]+)+\b")
@@ -178,6 +194,8 @@ def _is_causal_heading(line: str) -> bool:
     if not line.lstrip().startswith("#"):
         return False
     cleaned = line.strip().strip("#").strip().rstrip(":").lower()
+    if cleaned == "resolution":
+        return False
     return cleaned in {"rca", "root cause", "root-cause"} or bool(CAUSAL_CLAIM_RE.search(cleaned))
 
 
@@ -188,12 +206,18 @@ def _is_causal_section_label(line: str) -> bool:
 
 def _starts_causal_claim(line: str) -> bool:
     cleaned = _clean_line(line).strip().lower()
-    return bool(
-        re.match(
-            r"^(?:rca|root cause|root-cause|culprit|caused by|primary issue|underlying issue|resolution|fix)\b",
-            cleaned,
-        )
-    )
+    return bool(LEADING_CAUSAL_CLAIM_RE.search(cleaned))
+
+
+def _next_row_id(
+    artifact_id: str,
+    occurrences: dict[tuple[str, str], int],
+    kind: str,
+    stable_text: str,
+) -> str:
+    key = (kind, stable_text)
+    occurrences[key] = occurrences.get(key, 0) + 1
+    return _row_id(artifact_id, kind, stable_text, str(occurrences[key]))
 
 
 def _infer_evidence_kind(text: str) -> str:
@@ -293,8 +317,9 @@ class RunbookExtractor:
         section = ""
         priority = 0
         symptom = artifact.title
+        row_occurrences: dict[tuple[str, str], int] = {}
         lines = artifact.body_text.splitlines()
-        for line_no, raw in enumerate(lines, start=1):
+        for raw in lines:
             if _is_causal_heading(raw):
                 line = _clean_line(raw)
                 result.warnings.append(f"ignored_causal_claim:{line}")
@@ -302,7 +327,7 @@ class RunbookExtractor:
                 continue
             maybe_section = _section_name(raw)
             if maybe_section:
-                section = maybe_section
+                section = "suppressed_causal" if maybe_section == "resolution" else maybe_section
                 continue
             line = _clean_line(raw)
             if not line:
@@ -326,6 +351,8 @@ class RunbookExtractor:
                 continue
 
             dep = DEPENDENCY_RE.search(line)
+            if dep and section == "dependencies" and dep.group("src").lower() in {"also", "then", "next"}:
+                dep = None
             dep_source = _normalize_entity_token(dep.group("src")) if dep else ""
             dep_target = _normalize_entity_token(dep.group("tgt")) if dep else ""
             dep_direction = dep.group("dir") if dep else ""
@@ -338,7 +365,7 @@ class RunbookExtractor:
             if dep:
                 result.dependency_hints.append(
                     DependencyHint(
-                        id=_row_id(artifact.id, "dependency", str(line_no), line),
+                        id=_next_row_id(artifact.id, row_occurrences, "dependency", line),
                         source_entity=dep_source,
                         target_entity=dep_target,
                         direction="depends_on" if dep_direction.lower() == "depends on" else "calls",
@@ -353,7 +380,7 @@ class RunbookExtractor:
             if dep_target:
                 result.dependency_hints.append(
                     DependencyHint(
-                        id=_row_id(artifact.id, "dependency", str(line_no), line),
+                        id=_next_row_id(artifact.id, row_occurrences, "dependency", line),
                         source_entity=dep_source,
                         target_entity=dep_target,
                         direction="depends_on" if dep_direction.lower() == "depends on" else "calls",
@@ -371,7 +398,7 @@ class RunbookExtractor:
                 owner = ownership.group("owner").strip().strip(".")
                 result.ownership_hints.append(
                     OwnershipHint(
-                        id=_row_id(artifact.id, "ownership", str(line_no), line),
+                        id=_next_row_id(artifact.id, row_occurrences, "ownership", line),
                         entity=artifact.title,
                         owner=owner,
                         hint_kind=(
@@ -394,7 +421,7 @@ class RunbookExtractor:
                 signal_hint = metrics[0] if metrics else None
                 result.evidence_requirements.append(
                     EvidenceRequirement(
-                        id=_row_id(artifact.id, "evidence", str(line_no), line),
+                        id=_next_row_id(artifact.id, row_occurrences, "evidence", line),
                         subject=check_body,
                         evidence_kind=_infer_evidence_kind(check_body),
                         target_entity=_entity_from_text(check_body),
@@ -415,7 +442,7 @@ class RunbookExtractor:
                 for metric in _metric_candidates(line):
                     result.signal_mapping_candidates.append(
                         SignalMappingCandidate(
-                            id=_row_id(artifact.id, "signal", str(line_no), metric),
+                            id=_next_row_id(artifact.id, row_occurrences, "signal", f"{line}\0{metric}"),
                             source=artifact.artifact_type,
                             candidate_metric=metric,
                             symptom=symptom,
@@ -438,7 +465,8 @@ class IncidentExtractor:
         section = ""
         priority = 0
         symptom = artifact.title
-        for line_no, raw in enumerate(artifact.body_text.splitlines(), start=1):
+        row_occurrences: dict[tuple[str, str], int] = {}
+        for raw in artifact.body_text.splitlines():
             if _is_causal_heading(raw):
                 line = _clean_line(raw)
                 result.warnings.append(f"ignored_causal_claim:{line}")
@@ -465,6 +493,8 @@ class IncidentExtractor:
                 continue
 
             dep = DEPENDENCY_RE.search(line)
+            if dep and section == "dependencies" and dep.group("src").lower() in {"also", "then", "next"}:
+                dep = None
             dep_source = _normalize_entity_token(dep.group("src")) if dep else ""
             dep_target = _normalize_entity_token(dep.group("tgt")) if dep else ""
             dep_direction = dep.group("dir") if dep else ""
@@ -477,7 +507,7 @@ class IncidentExtractor:
             if dep:
                 result.dependency_hints.append(
                     DependencyHint(
-                        id=_row_id(artifact.id, "dependency", str(line_no), line),
+                        id=_next_row_id(artifact.id, row_occurrences, "dependency", line),
                         source_entity=dep_source,
                         target_entity=dep_target,
                         direction="depends_on" if dep_direction.lower() == "depends on" else "calls",
@@ -492,7 +522,7 @@ class IncidentExtractor:
             if dep_target:
                 result.dependency_hints.append(
                     DependencyHint(
-                        id=_row_id(artifact.id, "dependency", str(line_no), line),
+                        id=_next_row_id(artifact.id, row_occurrences, "dependency", line),
                         source_entity=dep_source,
                         target_entity=dep_target,
                         direction="depends_on" if dep_direction.lower() == "depends on" else "calls",
@@ -510,7 +540,7 @@ class IncidentExtractor:
                 owner = ownership.group("owner").strip().strip(".")
                 result.ownership_hints.append(
                     OwnershipHint(
-                        id=_row_id(artifact.id, "ownership", str(line_no), line),
+                        id=_next_row_id(artifact.id, row_occurrences, "ownership", line),
                         entity=artifact.title,
                         owner=owner,
                         hint_kind=(
@@ -547,7 +577,7 @@ class IncidentExtractor:
                 signal_hint = metrics[0] if metrics else None
                 result.evidence_requirements.append(
                     EvidenceRequirement(
-                        id=_row_id(artifact.id, "evidence", str(line_no), line),
+                        id=_next_row_id(artifact.id, row_occurrences, "evidence", line),
                         subject=evidence_body,
                         evidence_kind=_infer_evidence_kind(evidence_body),
                         target_entity=_entity_from_text(evidence_body),
@@ -568,7 +598,7 @@ class IncidentExtractor:
                 for metric in _metric_candidates(line):
                     result.signal_mapping_candidates.append(
                         SignalMappingCandidate(
-                            id=_row_id(artifact.id, "signal", str(line_no), metric),
+                            id=_next_row_id(artifact.id, row_occurrences, "signal", f"{line}\0{metric}"),
                             source=artifact.artifact_type,
                             candidate_metric=metric,
                             symptom=symptom,

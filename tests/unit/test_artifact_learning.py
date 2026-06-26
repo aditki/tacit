@@ -61,12 +61,29 @@ def test_runbook_dependency_section_shorthand_uses_artifact_entity():
     assert result.evidence_requirements == []
 
 
+def test_runbook_dependency_section_adverb_shorthand_uses_artifact_entity():
+    result = RunbookExtractor().extract(_artifact("## Dependencies\n- also depends on redis-cart"))
+
+    assert len(result.dependency_hints) == 1
+    assert result.dependency_hints[0].source_entity == "Checkout"
+    assert result.dependency_hints[0].target_entity == "redis-cart"
+    assert result.evidence_requirements == []
+
+
 def test_runbook_ownership_hint_is_not_evidence_requirement():
     result = RunbookExtractor().extract(_artifact("## Escalation\n- escalate to Payments"))
 
     assert len(result.ownership_hints) == 1
     assert result.ownership_hints[0].owner == "Payments"
     assert result.ownership_hints[0].source_type == "runbook"
+    assert result.evidence_requirements == []
+
+
+def test_runbook_owner_colon_label_emits_ownership_hint():
+    result = RunbookExtractor().extract(_artifact("## Owners\n- Owner: Payments\n- Maintainer: SRE"))
+
+    assert [hint.owner for hint in result.ownership_hints] == ["Payments", "SRE"]
+    assert all(hint.hint_kind == "owner_label" for hint in result.ownership_hints)
     assert result.evidence_requirements == []
 
 
@@ -110,6 +127,17 @@ def test_runbook_causal_section_does_not_emit_following_dependency_hint():
         "ignored_causal_claim:## RCA",
         "ignored_causal_claim:checkout-api depends on redis-cart",
     ]
+
+
+def test_runbook_resolution_section_does_not_emit_dependency_hint():
+    result = RunbookExtractor().extract(
+        _artifact("## Resolution\n- checkout-api depends on redis-cart\n## Checks\n- check checkout_latency_seconds")
+    )
+
+    assert result.dependency_hints == []
+    assert len(result.evidence_requirements) == 1
+    assert result.evidence_requirements[0].signal_hint == "checkout_latency_seconds"
+    assert result.warnings == ["ignored_causal_claim:checkout-api depends on redis-cart"]
 
 
 def test_runbook_ignored_text_is_not_indexed(tmp_path, monkeypatch):
@@ -243,6 +271,28 @@ def test_incident_extractor_preserves_observed_evidence_without_learning_root_ca
     assert result.warnings == ["ignored_causal_claim:Root cause: redis-cart"]
 
 
+def test_incident_colon_evidence_labels_emit_observed_requirements():
+    result = IncidentExtractor().extract(
+        artifact_from_text(
+            artifact_type="incident",
+            title="INC-908 checkout labels",
+            body_text="Evidence: checkout_errors_total spike\nSignal: checkout_latency_seconds elevated",
+            external_id="INC-908",
+            source_vendor="test",
+        )
+    )
+
+    assert [row.subject for row in result.evidence_requirements] == [
+        "checkout_errors_total spike",
+        "checkout_latency_seconds elevated",
+    ]
+    assert [row.signal_hint for row in result.evidence_requirements] == [
+        "checkout_errors_total",
+        "checkout_latency_seconds",
+    ]
+    assert all(row.observation_state == "observed" for row in result.evidence_requirements)
+
+
 def test_incident_ignored_rca_text_is_not_indexed(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     if not store._learning_index_available():
@@ -336,6 +386,55 @@ def test_incident_causal_claim_suppresses_continuation_dependency_hint(tmp_path,
     assert extractions["dependency_hints"] == []
     assert store.search_learning_context("checkout_errors_total")
     assert store.search_learning_context("redis") == []
+
+
+def test_incident_fix_heading_suppresses_following_dependency_hint(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = artifact_from_text(
+        artifact_type="incident",
+        title="INC-909 checkout fix",
+        body_text="## Evidence\n- observed checkout_errors_total spike\n## Fix:\n- checkout-api depends on redis-cart",
+        external_id="INC-909",
+        source_vendor="test",
+    )
+
+    result = learn_artifact(artifact, IncidentExtractor())
+
+    assert result["warnings"] == [
+        "ignored_causal_claim:## Fix:",
+        "ignored_causal_claim:checkout-api depends on redis-cart",
+    ]
+    extractions = store.list_artifact_extractions(artifact.id)
+    assert len(extractions["evidence_requirements"]) == 1
+    assert extractions["dependency_hints"] == []
+    assert store.search_learning_context("checkout_errors_total")
+    assert store.search_learning_context("redis") == []
+
+
+def test_incident_leading_causal_labels_suppress_continuation_dependency_hint():
+    for label in ("Triggered by:", "Due to:", "Postmortem conclusion:", "Resolved by:"):
+        result = IncidentExtractor().extract(
+            artifact_from_text(
+                artifact_type="incident",
+                title=f"INC {label}",
+                body_text=(
+                    f"## Evidence\n- observed checkout_errors_total spike\n- {label} deploy\n"
+                    "- checkout-api depends on redis-cart"
+                ),
+                external_id=label,
+                source_vendor="test",
+            )
+        )
+
+        assert result.dependency_hints == []
+        assert len(result.evidence_requirements) == 1
+        assert result.warnings == [
+            f"ignored_causal_claim:{label} deploy",
+            "ignored_causal_claim:checkout-api depends on redis-cart",
+        ]
 
 
 def test_incident_rca_heading_suppresses_following_claims(tmp_path, monkeypatch):
@@ -492,6 +591,29 @@ def test_artifact_title_change_rebuilds_title_derived_extractions(tmp_path, monk
     assert rows["signal_mapping_candidates"][0]["symptom"] == "Payments Runbook"
     assert artifact_row is not None
     assert artifact_row["title"] == "Payments Runbook"
+
+
+def test_line_number_only_edit_preserves_reviewed_extraction_state(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    first_artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+
+    learn_artifact(first_artifact, RunbookExtractor())
+    rows = store.list_artifact_extractions(first_artifact.id)
+    evidence_id = rows["evidence_requirements"][0]["id"]
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE evidence_requirements SET review_state = 'approved' WHERE id = ?",
+            (evidence_id,),
+        )
+
+    shifted_artifact = _artifact("A harmless note\n## Checks\n- check redis_cache_misses_total")
+    updated = learn_artifact(shifted_artifact, RunbookExtractor())
+    shifted_rows = store.list_artifact_extractions(shifted_artifact.id)
+
+    assert updated["change_state"] == "updated"
+    assert shifted_rows["evidence_requirements"][0]["id"] == evidence_id
+    assert shifted_rows["evidence_requirements"][0]["review_state"] == "approved"
 
 
 def test_updated_reingest_preserves_reviewed_extraction_state(tmp_path, monkeypatch):
