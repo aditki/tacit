@@ -85,6 +85,20 @@ def test_runbook_causal_claim_does_not_emit_dependency_hint():
     assert result.warnings == ["ignored_causal_claim:Root cause: checkout-api calls redis-cart"]
 
 
+def test_runbook_causal_section_does_not_emit_following_dependency_hint():
+    result = RunbookExtractor().extract(
+        _artifact("## RCA\n- checkout-api depends on redis-cart\n## Checks\n- check checkout_latency_seconds")
+    )
+
+    assert result.dependency_hints == []
+    assert len(result.evidence_requirements) == 1
+    assert result.evidence_requirements[0].signal_hint == "checkout_latency_seconds"
+    assert result.warnings == [
+        "ignored_causal_claim:## RCA",
+        "ignored_causal_claim:checkout-api depends on redis-cart",
+    ]
+
+
 def test_runbook_ignored_text_is_not_indexed(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     if not store._learning_index_available():
@@ -236,6 +250,28 @@ def test_incident_ignored_rca_text_is_not_indexed(tmp_path, monkeypatch):
     assert store.search_learning_context("redis") == []
 
 
+def test_incident_resolution_section_body_is_not_indexed(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = artifact_from_text(
+        artifact_type="incident",
+        title="INC-906 checkout resolution",
+        body_text="## Evidence\n- observed checkout_errors_total spike\n## Resolution\n- redis-cart saturated",
+        external_id="INC-906",
+        source_vendor="test",
+    )
+
+    result = learn_artifact(artifact, IncidentExtractor())
+
+    assert result["warnings"] == ["ignored_causal_claim:redis-cart saturated"]
+    extractions = store.list_artifact_extractions(artifact.id)
+    assert len(extractions["evidence_requirements"]) == 1
+    assert store.search_learning_context("checkout_errors_total")
+    assert store.search_learning_context("redis") == []
+
+
 def test_incident_plain_text_causal_label_suppresses_following_claim(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     if not store._learning_index_available():
@@ -380,6 +416,31 @@ def test_runbook_reingest_lifecycle_is_idempotent_and_updates_on_change(tmp_path
     assert changed["change_state"] == "updated"
     assert second_row["updated_at"] == first_row["updated_at"]
     assert changed_row["updated_at"] > second_row["updated_at"]
+
+
+def test_updated_reingest_preserves_reviewed_extraction_state(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    first_artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+
+    first = learn_artifact(first_artifact, RunbookExtractor())
+    rows = store.list_artifact_extractions(first_artifact.id)
+    evidence_id = rows["evidence_requirements"][0]["id"]
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE evidence_requirements SET review_state = 'approved' WHERE id = ?",
+            (evidence_id,),
+        )
+
+    changed_artifact = _artifact("## Checks\n- check redis_cache_misses_total\n- check checkout_latency_seconds")
+    updated = learn_artifact(changed_artifact, RunbookExtractor())
+    reviewed_rows = store.list_artifact_extractions(changed_artifact.id)
+    review_states = {row["signal_hint"]: row["review_state"] for row in reviewed_rows["evidence_requirements"]}
+
+    assert first["change_state"] == "created"
+    assert updated["change_state"] == "updated"
+    assert review_states["redis_cache_misses_total"] == "approved"
+    assert review_states["checkout_latency_seconds"] == "candidate"
 
 
 def test_skipped_reingest_rebuilds_missing_extractions(tmp_path, monkeypatch):

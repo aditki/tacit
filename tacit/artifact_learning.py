@@ -285,12 +285,24 @@ class RunbookExtractor:
         symptom = artifact.title
         lines = artifact.body_text.splitlines()
         for line_no, raw in enumerate(lines, start=1):
+            if _is_causal_heading(raw):
+                line = _clean_line(raw)
+                result.warnings.append(f"ignored_causal_claim:{line}")
+                section = "suppressed_causal"
+                continue
             maybe_section = _section_name(raw)
             if maybe_section:
                 section = maybe_section
                 continue
             line = _clean_line(raw)
             if not line:
+                continue
+            if section == "suppressed_causal":
+                result.warnings.append(f"ignored_causal_claim:{line}")
+                continue
+            if _is_causal_section_label(line):
+                result.warnings.append(f"ignored_causal_claim:{line}")
+                section = "suppressed_causal"
                 continue
             if CAUSAL_CLAIM_RE.search(line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
@@ -422,7 +434,7 @@ class IncidentExtractor:
                 continue
             maybe_section = _section_name(raw)
             if maybe_section:
-                section = maybe_section
+                section = "suppressed_causal" if maybe_section == "resolution" else maybe_section
                 continue
             line = _clean_line(raw)
             if not line:
@@ -688,7 +700,11 @@ def learn_artifact(
         index_dependency_rows = dependency_rows
         index_signal_rows = signal_rows
         should_replace_extractions = change_state != "skipped"
+        existing_rows = (
+            store.list_artifact_extractions(artifact.id) if change_state in {"updated", "restored", "skipped"} else None
+        )
         if change_state == "skipped":
+            assert existing_rows is not None
             expected_counts = _expected_extraction_counts(
                 evidence_rows=evidence_rows,
                 ownership_rows=ownership_rows,
@@ -698,7 +714,6 @@ def learn_artifact(
             should_replace_extractions = _has_missing_extractions(
                 store.artifact_extraction_counts(artifact.id), expected_counts
             )
-            existing_rows = store.list_artifact_extractions(artifact.id)
             if should_replace_extractions:
                 evidence_rows = _preserve_review_states(evidence_rows, existing_rows["evidence_requirements"])
                 ownership_rows = _preserve_review_states(ownership_rows, existing_rows["ownership_hints"])
@@ -717,6 +732,15 @@ def learn_artifact(
                 ownership_rows = index_ownership_rows
                 dependency_rows = index_dependency_rows
                 signal_rows = index_signal_rows
+        elif existing_rows is not None:
+            evidence_rows = _preserve_review_states(evidence_rows, existing_rows["evidence_requirements"])
+            ownership_rows = _preserve_review_states(ownership_rows, existing_rows["ownership_hints"])
+            dependency_rows = _preserve_review_states(dependency_rows, existing_rows["dependency_hints"])
+            signal_rows = _preserve_review_states(signal_rows, existing_rows["signal_mapping_candidates"])
+            index_evidence_rows = evidence_rows
+            index_ownership_rows = ownership_rows
+            index_dependency_rows = dependency_rows
+            index_signal_rows = signal_rows
         if should_replace_extractions:
             store.replace_artifact_extractions(
                 artifact_id=artifact.id,
