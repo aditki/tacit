@@ -1377,6 +1377,49 @@ class SignalStore:
             "signal_mapping_candidates": [dict(row) for row in signal_candidates],
         }
 
+    def artifact_extraction_counts(self, artifact_id: str) -> dict[str, int]:
+        """Return structured extraction row counts for one artifact."""
+        with self._conn() as conn:
+            evidence = conn.execute(
+                "SELECT COUNT(*) AS count FROM evidence_requirements WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+            ownership = conn.execute(
+                "SELECT COUNT(*) AS count FROM ownership_hints WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+            dependencies = conn.execute(
+                "SELECT COUNT(*) AS count FROM dependency_hints WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+            signal_candidates = conn.execute(
+                "SELECT COUNT(*) AS count FROM signal_mapping_candidates WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+        return {
+            "evidence_requirements": int(evidence["count"] if evidence else 0),
+            "ownership_hints": int(ownership["count"] if ownership else 0),
+            "dependency_hints": int(dependencies["count"] if dependencies else 0),
+            "signal_mapping_candidates": int(signal_candidates["count"] if signal_candidates else 0),
+        }
+
+    def artifact_context_indexed(self, *, artifact_id: str, artifact_type: str) -> bool:
+        """Return whether an artifact has rows in the optional learning index."""
+        if not self._learning_index_available():
+            return True
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    """SELECT 1 FROM learning_context_fts
+                       WHERE source_kind = ? AND source_id = ?
+                       LIMIT 1""",
+                    (artifact_type, artifact_id),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            logger.warning("artifact_context_index_check_failed", error=str(exc))
+            return True
+        return row is not None
+
     def mark_missing_alerts_stale(
         self,
         *,

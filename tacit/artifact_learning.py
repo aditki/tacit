@@ -611,8 +611,6 @@ def _as_store_rows(items: Sequence[Any]) -> list[dict[str, Any]]:
 
 
 def _sanitized_body_text_for_index(artifact: LearnedArtifact, result: ExtractionResult) -> str:
-    if artifact.artifact_type != "incident":
-        return artifact.body_text
     suppressed = {
         warning.split(":", 1)[1]
         for warning in result.warnings
@@ -625,6 +623,37 @@ def _sanitized_body_text_for_index(artifact: LearnedArtifact, result: Extraction
             continue
         kept.append(raw)
     return "\n".join(kept)
+
+
+def _expected_extraction_counts(
+    *,
+    evidence_rows: list[dict[str, Any]],
+    ownership_rows: list[dict[str, Any]],
+    dependency_rows: list[dict[str, Any]],
+    signal_rows: list[dict[str, Any]],
+) -> dict[str, int]:
+    return {
+        "evidence_requirements": len(evidence_rows),
+        "ownership_hints": len(ownership_rows),
+        "dependency_hints": len(dependency_rows),
+        "signal_mapping_candidates": len(signal_rows),
+    }
+
+
+def _has_missing_extractions(existing: dict[str, int], expected: dict[str, int]) -> bool:
+    return any(existing.get(key, 0) < count for key, count in expected.items())
+
+
+def _preserve_review_states(rows: list[dict[str, Any]], existing_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    existing_state_by_id = {row.get("id"): row.get("review_state") for row in existing_rows if row.get("id")}
+    preserved = []
+    for row in rows:
+        updated = dict(row)
+        existing_state = existing_state_by_id.get(row.get("id"))
+        if existing_state:
+            updated["review_state"] = existing_state
+        preserved.append(updated)
+    return preserved
 
 
 def learn_artifact(
@@ -654,23 +683,66 @@ def learn_artifact(
             provenance_url=artifact.provenance_url or "",
             fingerprint=artifact.fingerprint,
         )
-        store.replace_artifact_extractions(
-            artifact_id=artifact.id,
-            evidence_requirements=evidence_rows,
-            ownership_hints=ownership_rows,
-            dependency_hints=dependency_rows,
-            signal_mapping_candidates=signal_rows,
-        )
-        indexed_context_rows = store.index_artifact_context(
-            artifact_id=artifact.id,
-            artifact_type=artifact.artifact_type,
-            title=artifact.title,
-            body_text=_sanitized_body_text_for_index(artifact, result),
-            evidence_requirements=evidence_rows,
-            ownership_hints=ownership_rows,
-            dependency_hints=dependency_rows,
-            signal_mapping_candidates=signal_rows,
-        )
+        index_evidence_rows = evidence_rows
+        index_ownership_rows = ownership_rows
+        index_dependency_rows = dependency_rows
+        index_signal_rows = signal_rows
+        should_replace_extractions = change_state != "skipped"
+        if change_state == "skipped":
+            expected_counts = _expected_extraction_counts(
+                evidence_rows=evidence_rows,
+                ownership_rows=ownership_rows,
+                dependency_rows=dependency_rows,
+                signal_rows=signal_rows,
+            )
+            should_replace_extractions = _has_missing_extractions(
+                store.artifact_extraction_counts(artifact.id), expected_counts
+            )
+            existing_rows = store.list_artifact_extractions(artifact.id)
+            if should_replace_extractions:
+                evidence_rows = _preserve_review_states(evidence_rows, existing_rows["evidence_requirements"])
+                ownership_rows = _preserve_review_states(ownership_rows, existing_rows["ownership_hints"])
+                dependency_rows = _preserve_review_states(dependency_rows, existing_rows["dependency_hints"])
+                signal_rows = _preserve_review_states(signal_rows, existing_rows["signal_mapping_candidates"])
+                index_evidence_rows = evidence_rows
+                index_ownership_rows = ownership_rows
+                index_dependency_rows = dependency_rows
+                index_signal_rows = signal_rows
+            else:
+                index_evidence_rows = existing_rows["evidence_requirements"]
+                index_ownership_rows = existing_rows["ownership_hints"]
+                index_dependency_rows = existing_rows["dependency_hints"]
+                index_signal_rows = existing_rows["signal_mapping_candidates"]
+                evidence_rows = index_evidence_rows
+                ownership_rows = index_ownership_rows
+                dependency_rows = index_dependency_rows
+                signal_rows = index_signal_rows
+        if should_replace_extractions:
+            store.replace_artifact_extractions(
+                artifact_id=artifact.id,
+                evidence_requirements=evidence_rows,
+                ownership_hints=ownership_rows,
+                dependency_hints=dependency_rows,
+                signal_mapping_candidates=signal_rows,
+            )
+        if (
+            change_state != "skipped"
+            or should_replace_extractions
+            or not store.artifact_context_indexed(
+                artifact_id=artifact.id,
+                artifact_type=artifact.artifact_type,
+            )
+        ):
+            indexed_context_rows = store.index_artifact_context(
+                artifact_id=artifact.id,
+                artifact_type=artifact.artifact_type,
+                title=artifact.title,
+                body_text=_sanitized_body_text_for_index(artifact, result),
+                evidence_requirements=index_evidence_rows,
+                ownership_hints=index_ownership_rows,
+                dependency_hints=index_dependency_rows,
+                signal_mapping_candidates=index_signal_rows,
+            )
     return {
         "artifact": asdict(artifact),
         "artifact_id": artifact.id,

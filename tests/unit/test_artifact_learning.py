@@ -85,6 +85,32 @@ def test_runbook_causal_claim_does_not_emit_dependency_hint():
     assert result.warnings == ["ignored_causal_claim:Root cause: checkout-api calls redis-cart"]
 
 
+def test_runbook_ignored_text_is_not_indexed(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = _artifact(
+        "\n".join(
+            [
+                "## Checks",
+                "- check checkout_latency_seconds",
+                "- Root cause: redis-cart",
+                "- restart Redis",
+            ]
+        )
+    )
+
+    result = learn_artifact(artifact, RunbookExtractor())
+
+    assert result["warnings"] == [
+        "ignored_causal_claim:Root cause: redis-cart",
+        "ignored_mitigation:restart Redis",
+    ]
+    assert store.search_learning_context("checkout_latency_seconds")
+    assert store.search_learning_context("redis") == []
+
+
 def test_missing_signal_requirement_is_indeterminate():
     result = RunbookExtractor().extract(_artifact("## Checks\n- check DB latency"))
 
@@ -371,6 +397,60 @@ def test_skipped_reingest_rebuilds_missing_extractions(tmp_path, monkeypatch):
     assert first["change_state"] == "created"
     assert second["change_state"] == "skipped"
     assert len(rows["evidence_requirements"]) == 1
+
+
+def test_skipped_reingest_preserves_reviewed_extraction_state(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+
+    first = learn_artifact(artifact, RunbookExtractor())
+    rows = store.list_artifact_extractions(artifact.id)
+    evidence_id = rows["evidence_requirements"][0]["id"]
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE evidence_requirements SET review_state = 'approved' WHERE id = ?",
+            (evidence_id,),
+        )
+
+    second = learn_artifact(artifact, RunbookExtractor())
+    reviewed_rows = store.list_artifact_extractions(artifact.id)
+
+    assert first["change_state"] == "created"
+    assert second["change_state"] == "skipped"
+    assert second["evidence_requirements"][0]["review_state"] == "approved"
+    assert reviewed_rows["evidence_requirements"][0]["review_state"] == "approved"
+
+
+def test_skipped_reingest_repairs_missing_index_without_resetting_review_state(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+
+    learn_artifact(artifact, RunbookExtractor())
+    rows = store.list_artifact_extractions(artifact.id)
+    evidence_id = rows["evidence_requirements"][0]["id"]
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE evidence_requirements SET review_state = 'approved' WHERE id = ?",
+            (evidence_id,),
+        )
+        conn.execute(
+            "DELETE FROM learning_context_fts WHERE source_kind = ? AND source_id = ?",
+            (artifact.artifact_type, artifact.id),
+        )
+
+    second = learn_artifact(artifact, RunbookExtractor())
+    search = store.search_learning_context(
+        "redis_cache_misses_total",
+        include_candidates=False,
+    )
+
+    assert second["change_state"] == "skipped"
+    assert search
+    assert search[0]["review_state"] == "approved"
 
 
 def test_missing_runbook_marks_stale_not_deleted(tmp_path):
