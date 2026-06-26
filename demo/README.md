@@ -83,27 +83,6 @@ Prompt:
 > checkout-service is in an incident: p95 latency is spiking after deploy, 5xx errors are rising on payment routes, and requests are piling up. Build the dashboard before creating anything noisy.
 ~~~
 
-## LinkedIn Post Draft
-
-```text
-I've been building Tacit: an experimental observability tool that turns an incident description into a purpose-built investigation dashboard.
-
-The demo flow is intentionally on-call shaped:
-
-1. Upload a known-good checkout incident dashboard
-2. Infer the operational signals it contains: latency, errors, throughput, saturation, CPU, memory, DB wait
-3. Approve those learned mappings
-4. Ask a fresh question in plain English:
-
-"checkout-service is in an incident: p95 latency is spiking after deploy, 5xx errors are rising on payment routes, and requests are piling up. Build the dashboard before creating anything noisy."
-
-Tacit then creates a Grafana dashboard focused on the investigation path instead of asking the engineer to hunt through static dashboards at 3AM.
-
-The interesting part is not just natural language to charts. It is the feedback loop: existing dashboards teach reusable signal mappings, generated dashboards collect review feedback, and the system gets more operationally specific over time.
-
-Still early, still experimental, but this is the shape I think AI infra tooling should take: reduce navigation burden during incidents, keep humans in review, and make the system learn from the dashboards teams already trust.
-```
-
 ## Good Screenshot Targets
 
 - `http://localhost:8000`: prompt and learning tabs
