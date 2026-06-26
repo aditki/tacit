@@ -85,6 +85,19 @@ def test_runbook_causal_claim_does_not_emit_dependency_hint():
     assert result.warnings == ["ignored_causal_claim:Root cause: checkout-api calls redis-cart"]
 
 
+def test_runbook_causal_claim_suppresses_continuation_dependency_hint():
+    result = RunbookExtractor().extract(
+        _artifact("## Notes\n- Root cause: checkout-api saturation\n- checkout-api depends on redis-cart")
+    )
+
+    assert result.dependency_hints == []
+    assert result.evidence_requirements == []
+    assert result.warnings == [
+        "ignored_causal_claim:Root cause: checkout-api saturation",
+        "ignored_causal_claim:checkout-api depends on redis-cart",
+    ]
+
+
 def test_runbook_causal_section_does_not_emit_following_dependency_hint():
     result = RunbookExtractor().extract(
         _artifact("## RCA\n- checkout-api depends on redis-cart\n## Checks\n- check checkout_latency_seconds")
@@ -119,7 +132,7 @@ def test_runbook_ignored_text_is_not_indexed(tmp_path, monkeypatch):
 
     assert result["warnings"] == [
         "ignored_causal_claim:Root cause: redis-cart",
-        "ignored_mitigation:restart Redis",
+        "ignored_causal_claim:restart Redis",
     ]
     assert store.search_learning_context("checkout_latency_seconds")
     assert store.search_learning_context("redis") == []
@@ -294,6 +307,37 @@ def test_incident_plain_text_causal_label_suppresses_following_claim(tmp_path, m
     assert store.search_learning_context("redis") == []
 
 
+def test_incident_causal_claim_suppresses_continuation_dependency_hint(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = artifact_from_text(
+        artifact_type="incident",
+        title="INC-907 checkout errors",
+        body_text=(
+            "## Evidence\n"
+            "- observed checkout_errors_total spike\n"
+            "- Root cause: checkout-api saturation\n"
+            "- checkout-api depends on redis-cart"
+        ),
+        external_id="INC-907",
+        source_vendor="test",
+    )
+
+    result = learn_artifact(artifact, IncidentExtractor())
+
+    assert result["warnings"] == [
+        "ignored_causal_claim:Root cause: checkout-api saturation",
+        "ignored_causal_claim:checkout-api depends on redis-cart",
+    ]
+    extractions = store.list_artifact_extractions(artifact.id)
+    assert len(extractions["evidence_requirements"]) == 1
+    assert extractions["dependency_hints"] == []
+    assert store.search_learning_context("checkout_errors_total")
+    assert store.search_learning_context("redis") == []
+
+
 def test_incident_rca_heading_suppresses_following_claims(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     if not store._learning_index_available():
@@ -418,6 +462,38 @@ def test_runbook_reingest_lifecycle_is_idempotent_and_updates_on_change(tmp_path
     assert changed_row["updated_at"] > second_row["updated_at"]
 
 
+def test_artifact_title_change_rebuilds_title_derived_extractions(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    body = "## Dependencies\n- calls redis-cart\n## Queries\n- checkout_latency_seconds"
+    first_artifact = artifact_from_text(
+        artifact_type="runbook",
+        title="Checkout Runbook",
+        body_text=body,
+        external_id="stable-runbook",
+        source_vendor="test",
+    )
+    renamed_artifact = artifact_from_text(
+        artifact_type="runbook",
+        title="Payments Runbook",
+        body_text=body,
+        external_id="stable-runbook",
+        source_vendor="test",
+    )
+
+    first = learn_artifact(first_artifact, RunbookExtractor())
+    renamed = learn_artifact(renamed_artifact, RunbookExtractor())
+    rows = store.list_artifact_extractions(renamed_artifact.id)
+    artifact_row = store.get_learned_artifact(renamed_artifact.id)
+
+    assert first["change_state"] == "created"
+    assert renamed["change_state"] == "updated"
+    assert rows["dependency_hints"][0]["source_entity"] == "Payments"
+    assert rows["signal_mapping_candidates"][0]["symptom"] == "Payments Runbook"
+    assert artifact_row is not None
+    assert artifact_row["title"] == "Payments Runbook"
+
+
 def test_updated_reingest_preserves_reviewed_extraction_state(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
@@ -533,6 +609,28 @@ def test_missing_runbook_marks_stale_not_deleted(tmp_path):
     assert row is not None
     assert row["stale"] is True
     assert row["missing_since"] is not None
+
+
+def test_list_learned_artifacts_omits_body_text(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+    store.record_learned_artifact(
+        artifact_id=artifact.id,
+        artifact_type=artifact.artifact_type,
+        source_vendor=artifact.source_vendor or "",
+        external_id=artifact.external_id,
+        title=artifact.title,
+        body_text=artifact.body_text,
+        fingerprint=artifact.fingerprint,
+    )
+
+    listed = store.list_learned_artifacts(artifact_type="runbook")
+    detail = store.get_learned_artifact(artifact.id)
+
+    assert listed
+    assert "body_text" not in listed[0]
+    assert detail is not None
+    assert detail["body_text"] == artifact.body_text
 
 
 def test_missing_artifact_stale_marking_is_scoped_to_crawled_source(tmp_path):

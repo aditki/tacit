@@ -1330,13 +1330,21 @@ class SignalStore:
         with self._conn() as conn:
             if artifact_type:
                 rows = conn.execute(
-                    """SELECT * FROM learned_artifacts
+                    """SELECT id, artifact_id, artifact_type, source_vendor, source_instance,
+                              external_id, title, provenance_url, fingerprint,
+                              stale, missing_since, first_seen_at, last_seen_at,
+                              updated_at, created_at
+                       FROM learned_artifacts
                        WHERE artifact_type = ? ORDER BY updated_at DESC LIMIT ?""",
                     (artifact_type, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT * FROM learned_artifacts
+                    """SELECT id, artifact_id, artifact_type, source_vendor, source_instance,
+                              external_id, title, provenance_url, fingerprint,
+                              stale, missing_since, first_seen_at, last_seen_at,
+                              updated_at, created_at
+                       FROM learned_artifacts
                        ORDER BY updated_at DESC LIMIT ?""",
                     (limit,),
                 ).fetchall()

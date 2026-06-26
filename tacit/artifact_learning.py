@@ -186,6 +186,16 @@ def _is_causal_section_label(line: str) -> bool:
     return cleaned.endswith(":") and bool(CAUSAL_CLAIM_RE.search(cleaned))
 
 
+def _starts_causal_claim(line: str) -> bool:
+    cleaned = _clean_line(line).strip().lower()
+    return bool(
+        re.match(
+            r"^(?:rca|root cause|root-cause|culprit|caused by|primary issue|underlying issue|resolution|fix)\b",
+            cleaned,
+        )
+    )
+
+
 def _infer_evidence_kind(text: str) -> str:
     lowered = text.lower()
     if "miss" in lowered or "cache" in lowered:
@@ -306,6 +316,8 @@ class RunbookExtractor:
                 continue
             if CAUSAL_CLAIM_RE.search(line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
+                if _starts_causal_claim(line):
+                    section = "suppressed_causal"
                 continue
             if section == "symptoms":
                 symptom = line
@@ -448,6 +460,8 @@ class IncidentExtractor:
                 continue
             if CAUSAL_CLAIM_RE.search(line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
+                if _starts_causal_claim(line):
+                    section = "suppressed_causal"
                 continue
 
             dep = DEPENDENCY_RE.search(line)
@@ -589,7 +603,7 @@ def artifact_from_text(
         title=title,
         body_text=body_text,
         provenance_url=provenance_url,
-        fingerprint=_fingerprint(body_text),
+        fingerprint=_fingerprint(f"{title}\0{body_text}"),
         first_seen_at=now,
         last_seen_at=now,
         updated_at=now,
