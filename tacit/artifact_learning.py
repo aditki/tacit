@@ -175,8 +175,10 @@ def _normalize_entity_token(value: str) -> str:
 
 
 def _is_causal_heading(line: str) -> bool:
+    if not line.lstrip().startswith("#"):
+        return False
     cleaned = line.strip().strip("#").strip().rstrip(":").lower()
-    return cleaned in {"rca", "root cause", "root-cause"}
+    return cleaned in {"rca", "root cause", "root-cause"} or bool(CAUSAL_CLAIM_RE.search(cleaned))
 
 
 def _infer_evidence_kind(text: str) -> str:

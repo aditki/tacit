@@ -224,6 +224,32 @@ def test_incident_rca_heading_suppresses_following_claims(tmp_path, monkeypatch)
     assert store.search_learning_context("redis") == []
 
 
+def test_incident_causal_regex_heading_resets_previous_evidence_section(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    if not store._learning_index_available():
+        pytest.skip("SQLite FTS5 is not available")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    artifact = artifact_from_text(
+        artifact_type="incident",
+        title="INC-903 checkout errors",
+        body_text="## Evidence\n- observed checkout_errors_total spike\n## Root Cause Analysis\n- redis-cart",
+        external_id="INC-903",
+        source_vendor="test",
+    )
+
+    result = learn_artifact(artifact, IncidentExtractor())
+
+    assert result["warnings"] == [
+        "ignored_causal_claim:## Root Cause Analysis",
+        "ignored_causal_claim:redis-cart",
+    ]
+    extractions = store.list_artifact_extractions(artifact.id)
+    assert len(extractions["evidence_requirements"]) == 1
+    assert len(extractions["signal_mapping_candidates"]) == 1
+    assert store.search_learning_context("checkout_errors_total")
+    assert store.search_learning_context("redis") == []
+
+
 def test_incident_root_cause_hyphen_claim_is_suppressed():
     result = IncidentExtractor().extract(
         artifact_from_text(
