@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import uuid
@@ -48,6 +49,7 @@ _BENCHMARK_MODES = {
     "contextual_alerts_runbooks_baseline_v1": "gate",
     "contextual_culprit_ranking": "gate",
     "incident_context_ranking_lift": "gate",
+    "offline_gate": "gate",
     "prompt_variation": "prompt_variation",
     "gamma": "gamma",
     "artifact_robustness": "artifact_robustness",
@@ -122,6 +124,12 @@ _METRIC_NAMES = {
     "false_culprit_rate_controls",
     "control_abstention_rate",
     "healthy_symptom_panel_recall",
+    "semantic_precision",
+    "semantic_recall",
+    "semantic_coverage",
+    "cold_resolution_recall",
+    "learned_resolution_recall",
+    "learned_selection_rate",
 }
 _RANDOM_BASELINE_KEYS = {
     "assumption",
@@ -152,6 +160,12 @@ _CONTRACT_KEYS = {
     "top_k",
     "total_cases",
     "trials_per_prompt",
+    "classification_datasets",
+    "cold_resolution_datasets",
+    "learned_resolution_datasets",
+    "learned_selection_datasets",
+    "labeled_signal_metrics",
+    "critical_signals",
 }
 _REASON_CODES = {
     "false_culprit",
@@ -203,6 +217,13 @@ _REASON_CODES = {
     "runbook_context_regressed_top1_recall",
     "runbook_context_regressed_top3_recall",
     "top1_regressed",
+    "other",
+    "semantic_precision_below_threshold",
+    "semantic_recall_below_threshold",
+    "semantic_coverage_below_threshold",
+    "cold_resolution_below_threshold",
+    "learned_resolution_below_threshold",
+    "learned_selection_mismatch",
 }
 _SCHEMA_KEYS = {
     "actual_rank",
@@ -262,7 +283,14 @@ _SNAKE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ANON_ID_RE = re.compile(r"^[a-z][a-z0-9_]*_[0-9]{3,6}$")
 _HASH_RE = re.compile(r"^sha256:[0-9a-f]{16,64}$")
 _TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
-_VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+\-]{0,63}$")
+_VERSION_RE = re.compile(
+    r"^(?:"
+    r"v?\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.]+)?"
+    r"|[a-z][a-z0-9_]{0,48}_v\d+"
+    r"|version_hash_[0-9a-f]{16}"
+    r"|[0-9a-f]{7,40}"
+    r")$"
+)
 _FREE_TEXT_RE = re.compile(r"^[A-Za-z0-9 .,()\-]{1,200}$")
 
 _FREE_TEXT_KEYS = {"reason", "assumption"}
@@ -413,6 +441,9 @@ def _entries_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
     if result.get("dataset") == "gamma" and "prediction_evaluation" in result and "control_evaluation" in result:
         entry = summarize_gamma_report(result)
         return [entry] if entry else []
+    if {"classification", "cold_resolution", "learned_resolution", "learned_selection"} <= result.keys():
+        entry = summarize_offline_gate_report(result)
+        return [entry] if entry else []
     if {"positive_useful_rate", "negative_correct_rate", "worst_prompt_rate"} <= result.keys():
         entry = summarize_prompt_variation_report(result)
         return [entry] if entry else []
@@ -463,8 +494,8 @@ def summarize_lift_report(report: dict[str, Any]) -> dict[str, Any] | None:
                 metric["numerator"] = round(metric["value"] * int(denominator))
             entry["metrics"][name] = metric
 
-    failures = [_reason_code(str(item)) for item in (report.get("gate") or {}).get("failures", [])]
-    entry["failures"] = [failure for failure in failures if failure in _REASON_CODES]
+    failures = _safe_failure_codes((report.get("gate") or {}).get("failures", []))
+    entry["failures"] = failures
     for failure in entry["failures"]:
         entry["failure_reasons"][failure] = entry["failure_reasons"].get(failure, 0) + 1
     return entry
@@ -485,8 +516,8 @@ def summarize_artifact_robustness_report(report: dict[str, Any]) -> dict[str, An
     false_positive_suppressions = int(precision.get("false_positive_suppression_count", 0) or 0)
     noise_rows = [row for row in noise.get("rows", []) if isinstance(row, dict)]
     noise_mrr_deltas = [_float(row.get("mrr_delta")) for row in noise_rows]
-    failures = [_reason_code(str(item)) for item in (report.get("gate") or {}).get("failures", [])]
-    failure_reasons = _counts(failure for failure in failures if failure in _REASON_CODES)
+    failures = _safe_failure_codes((report.get("gate") or {}).get("failures", []))
+    failure_reasons = _counts(failures)
     contract = {
         "total_cases": rca_phrases + precision_phrases + len(noise_rows) + 1,
         "rca_phrases": rca_phrases,
@@ -498,9 +529,9 @@ def summarize_artifact_robustness_report(report: dict[str, Any]) -> dict[str, An
         "evaluation_version": EVALUATION_VERSION,
         "available": True,
         "benchmark_name": "artifact_learning_robustness",
-        "benchmark_version": str(report.get("version", "artifact_robustness_v1")),
+        "benchmark_version": _safe_version(report.get("version"), default="artifact_robustness_v1"),
         "dataset_hash": _dataset_hash(contract),
-        "runner_version": str(report.get("runner_version", "")) or __version__,
+        "runner_version": _safe_version(report.get("runner_version"), default=__version__),
         "generated_at": str(report.get("generated_at", "")) or _now_iso(),
         "mode": "artifact_robustness",
         "context_available": ["context", "alerts", "runbooks", "incidents"],
@@ -522,7 +553,7 @@ def summarize_artifact_robustness_report(report: dict[str, Any]) -> dict[str, An
             "indeterminate": 0,
         },
         "failure_reasons": failure_reasons,
-        "failures": [failure for failure in failures if failure in _REASON_CODES],
+        "failures": failures,
         "per_case": [],
     }
 
@@ -539,13 +570,13 @@ def summarize_gamma_report(report: dict[str, Any]) -> dict[str, Any] | None:
     dashboards = prediction_counts.get("dashboards") or {}
     known_gaps = control.get("known_gaps") or {}
     symptom_panel = known_gaps.get("evidence_absent_preserves_symptom_panel") or {}
-    failures = [
-        _reason_code(name)
+    failures = _safe_failure_codes(
+        name
         for checks in (prediction.get("checks") or {}, control.get("checks") or {})
         for name, passed in checks.items()
         if not passed
-    ]
-    failure_reasons = _counts(failure for failure in failures if failure in _REASON_CODES)
+    )
+    failure_reasons = _counts(failures)
     control_cases = int(control_counts.get("abstention", {}).get("denominator", 0) or 0)
     evidence_denominator = int(prediction_counts.get("canonical_evidence_recall", {}).get("denominator", 0) or 0)
     contract = {
@@ -567,7 +598,7 @@ def summarize_gamma_report(report: dict[str, Any]) -> dict[str, Any] | None:
         "benchmark_name": "gamma",
         "benchmark_version": "gamma_diagnostic_v1",
         "dataset_hash": _dataset_hash(dataset_contract),
-        "runner_version": str(report.get("runner_version", "")) or __version__,
+        "runner_version": _safe_version(report.get("runner_version"), default=__version__),
         "generated_at": str(report.get("generated_at", "")) or _now_iso(),
         "mode": "gamma",
         "context_available": ["context"],
@@ -592,7 +623,73 @@ def summarize_gamma_report(report: dict[str, Any]) -> dict[str, Any] | None:
             "indeterminate": 0,
         },
         "failure_reasons": failure_reasons,
-        "failures": [failure for failure in failures if failure in _REASON_CODES],
+        "failures": failures,
+        "per_case": [],
+    }
+
+
+def summarize_offline_gate_report(report: dict[str, Any]) -> dict[str, Any] | None:
+    """Summarize offline accuracy-gate reports without metric names or fixture rows."""
+    classification = [row for row in report.get("classification", []) if isinstance(row, dict)]
+    cold = [row for row in report.get("cold_resolution", []) if isinstance(row, dict)]
+    learned = [row for row in report.get("learned_resolution", []) if isinstance(row, dict)]
+    selection = [row for row in report.get("learned_selection", []) if isinstance(row, dict)]
+    if not classification and not cold and not learned and not selection:
+        return None
+
+    tp = sum(int(row.get("tp", 0) or 0) for row in classification)
+    fp = sum(int(row.get("fp", 0) or 0) for row in classification)
+    fn = sum(int(row.get("fn", 0) or 0) for row in classification)
+    labeled = sum(int(row.get("labeled_signal_metrics", 0) or 0) for row in classification)
+    uncovered = sum(len(row.get("uncovered", []) or []) for row in classification)
+    cold_resolved = sum(int(row.get("resolved", 0) or 0) for row in cold)
+    cold_total = sum(int(row.get("total", 0) or 0) for row in cold)
+    learned_resolved = sum(int(row.get("resolved", 0) or 0) for row in learned)
+    learned_total = sum(int(row.get("total", 0) or 0) for row in learned)
+    selection_passed = sum(1 for row in selection if row.get("passed"))
+
+    failures = [_offline_gate_failure_code(str(item)) for item in (report.get("gate") or {}).get("failures", [])]
+    failure_reasons = _counts(failures)
+    contract = {
+        "total_cases": len(classification) + len(cold) + len(learned) + len(selection),
+        "classification_datasets": len(classification),
+        "cold_resolution_datasets": len(cold),
+        "learned_resolution_datasets": len(learned),
+        "learned_selection_datasets": len(selection),
+        "labeled_signal_metrics": labeled,
+        "critical_signals": cold_total,
+    }
+
+    return {
+        "evaluation_version": EVALUATION_VERSION,
+        "available": True,
+        "benchmark_name": "offline_gate",
+        "benchmark_version": _safe_version(report.get("version"), default="offline_gate_v1"),
+        "dataset_hash": _dataset_hash(contract),
+        "runner_version": _safe_version(report.get("runner_version"), default=__version__),
+        "generated_at": str(report.get("generated_at", "")) or _now_iso(),
+        "mode": "gate",
+        "context_available": ["context"],
+        "anonymous": True,
+        "raw_inputs_included": False,
+        "contract": contract,
+        "metrics": {
+            "semantic_precision": _ratio(tp, tp + fp),
+            "semantic_recall": _ratio(tp, tp + fn),
+            "semantic_coverage": _ratio(labeled - uncovered, labeled),
+            "cold_resolution_recall": _ratio(cold_resolved, cold_total),
+            "learned_resolution_recall": _ratio(learned_resolved, learned_total),
+            "learned_selection_rate": _ratio(selection_passed, len(selection)),
+        },
+        "random_baselines": {},
+        "stage_counts": {
+            "passed": 1 if (report.get("gate") or {}).get("passed") else 0,
+            "failed": 0 if (report.get("gate") or {}).get("passed") else 1,
+            "dropped": 0,
+            "indeterminate": 0,
+        },
+        "failure_reasons": failure_reasons,
+        "failures": failures,
         "per_case": [],
     }
 
@@ -631,7 +728,7 @@ def summarize_ranking_report(report: dict[str, Any]) -> dict[str, Any] | None:
         alias = case_alias[case_id]
         if case_id in positive_ids:
             row = next(row for row in positive_rows if str(row.get("id", "")) == case_id)
-            rank = row.get("rank")
+            rank = _finite_int(row.get("rank"))
             per_case.append(
                 {
                     "case_id": alias,
@@ -740,9 +837,9 @@ def summarize_ranking_report(report: dict[str, Any]) -> dict[str, Any] | None:
         "evaluation_version": EVALUATION_VERSION,
         "available": True,
         "benchmark_name": benchmark_name,
-        "benchmark_version": str(report.get("version", "")),
+        "benchmark_version": _safe_version(report.get("version"), default="version_hash_0000000000000000"),
         "dataset_hash": _dataset_hash(contract_in),
-        "runner_version": str(report.get("runner_version", "")) or __version__,
+        "runner_version": _safe_version(report.get("runner_version"), default=__version__),
         "generated_at": str(report.get("generated_at", "")) or _now_iso(),
         "mode": _BENCHMARK_MODES.get(benchmark_name, "gate"),
         "context_available": context_available,
@@ -790,9 +887,12 @@ def summarize_prompt_variation_report(report: dict[str, Any]) -> dict[str, Any] 
 
     per_case = []
     failure_reasons: dict[str, int] = {}
+    prompt_rates: list[float] = []
     for index, row in enumerate(rows, start=1):
         trials = int(row.get("trials", trials_per_prompt) or 0)
         passed = int(row.get("passed", 0) or 0)
+        rate = round(passed / trials, 4) if trials else 0.0
+        prompt_rates.append(rate)
         case_failed = passed < trials
         if case_failed:
             failure_reasons["prompt_intent_mismatch"] = failure_reasons.get("prompt_intent_mismatch", 0) + 1
@@ -802,7 +902,7 @@ def summarize_prompt_variation_report(report: dict[str, Any]) -> dict[str, Any] 
                 "case_class": str(row.get("polarity") or "unknown"),
                 "passed_trials": passed,
                 "total_trials": trials,
-                "rate": _float(row.get("rate")),
+                "rate": rate,
                 "failure_stage": "intent" if case_failed else None,
                 "reason_codes": ["prompt_intent_mismatch"] if case_failed else [],
             }
@@ -821,7 +921,7 @@ def summarize_prompt_variation_report(report: dict[str, Any]) -> dict[str, Any] 
         "evaluation_version": EVALUATION_VERSION,
         "available": True,
         "benchmark_name": "prompt_variation",
-        "benchmark_version": str(report.get("version", "prompt_variation_v1")),
+        "benchmark_version": _safe_version(report.get("version"), default="prompt_variation_v1"),
         "dataset_hash": _dataset_hash(
             {
                 "corpus": report.get("corpus", ""),
@@ -830,7 +930,7 @@ def summarize_prompt_variation_report(report: dict[str, Any]) -> dict[str, Any] 
                 "trials_per_prompt": trials_per_prompt,
             }
         ),
-        "runner_version": str(report.get("runner_version", "")) or __version__,
+        "runner_version": _safe_version(report.get("runner_version"), default=__version__),
         "generated_at": str(report.get("generated_at", "")) or _now_iso(),
         "mode": "prompt_variation",
         "context_available": [],
@@ -841,14 +941,14 @@ def summarize_prompt_variation_report(report: dict[str, Any]) -> dict[str, Any] 
             "positive_useful_rate": {
                 "numerator": positive_passed,
                 "denominator": positive_trials,
-                "value": _float(report.get("positive_useful_rate")),
+                "value": _ratio_value(positive_passed, positive_trials),
             },
             "negative_correct_rate": {
                 "numerator": negative_passed,
                 "denominator": negative_trials,
-                "value": _float(report.get("negative_correct_rate")),
+                "value": _ratio_value(negative_passed, negative_trials),
             },
-            "worst_prompt_rate": {"value": _float(report.get("worst_prompt_rate"))},
+            "worst_prompt_rate": {"value": min(prompt_rates) if prompt_rates else 0.0},
         },
         "random_baselines": {},
         "stage_counts": {
@@ -881,6 +981,9 @@ def _walk_validate(value: Any, path: str, findings: list[dict[str, str]], key: s
     elif isinstance(value, str):
         if not _string_is_allowed(key, value, path):
             findings.append({"path": path, "kind": "forbidden_value", "sample": "<redacted_value>"})
+    elif isinstance(value, int | float) and not isinstance(value, bool):
+        if not math.isfinite(float(value)):
+            findings.append({"path": path, "kind": "non_finite_number", "sample": "<redacted_value>"})
 
 
 def _string_is_allowed(key: str, value: str, path: str) -> bool:
@@ -960,8 +1063,15 @@ def _ratio(numerator: int | float, denominator: int | float) -> dict[str, Any]:
     return {
         "numerator": numerator,
         "denominator": denominator,
-        "value": round(numerator / denominator, 4) if denominator else 0.0,
+        "value": _ratio_value(numerator, denominator),
     }
+
+
+def _ratio_value(numerator: int | float, denominator: int | float) -> float:
+    denominator = float(denominator or 0)
+    if not denominator:
+        return 0.0
+    return round(float(numerator or 0) / denominator, 4)
 
 
 def _metric_from_count(value: Any) -> dict[str, Any]:
@@ -982,6 +1092,39 @@ def _counts(values: Any) -> dict[str, int]:
     return counts
 
 
+def _safe_failure_codes(values: Any) -> list[str]:
+    codes = []
+    for value in values:
+        code = _reason_code(str(value))
+        codes.append(code if code in _REASON_CODES else "other")
+    return codes
+
+
+def _offline_gate_failure_code(value: str) -> str:
+    normalized = _reason_code(value)
+    if "semantic_precision" in normalized:
+        return "semantic_precision_below_threshold"
+    if "semantic_recall" in normalized:
+        return "semantic_recall_below_threshold"
+    if "semantic_coverage" in normalized:
+        return "semantic_coverage_below_threshold"
+    if "cold_resolution" in normalized:
+        return "cold_resolution_below_threshold"
+    if "learned_resolution" in normalized:
+        return "learned_resolution_below_threshold"
+    if "learned_selection" in normalized:
+        return "learned_selection_mismatch"
+    return "other"
+
+
+def _safe_version(value: Any, *, default: str) -> str:
+    candidate = str(value or default)
+    if _VERSION_RE.match(candidate):
+        return candidate
+    digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:16]
+    return f"version_hash_{digest}"
+
+
 def _reason_code(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
     return cleaned or "unknown"
@@ -989,9 +1132,20 @@ def _reason_code(value: str) -> str:
 
 def _float(value: Any) -> float:
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return 0.0
+    return number if math.isfinite(number) else 0.0
+
+
+def _finite_int(value: Any) -> int | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number)
 
 
 def _now_iso() -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import UTC, datetime
 
 from tacit.evaluation_summary import (
@@ -180,6 +181,80 @@ def test_evaluation_summary_rejects_free_form_reason_in_preshaped_entry():
     assert summary["available"] is False
 
 
+def test_evaluation_summary_rejects_private_slug_versions_in_preshaped_entry():
+    raw_entry = {
+        "benchmark_name": "contextual_culprit_ranking",
+        "benchmark_version": "checkout-api",
+        "dataset_hash": "sha256:0123456789abcdef",
+        "runner_version": "checkout-api",
+        "generated_at": "2026-07-02T04:15:00Z",
+        "mode": "gate",
+        "context_available": [],
+        "anonymous": True,
+        "raw_inputs_included": False,
+        "contract": {},
+        "metrics": {},
+        "random_baselines": {},
+        "stage_counts": {},
+        "failure_reasons": {},
+        "per_case": [],
+    }
+
+    summary = build_evaluation_summary([{"evaluations": [raw_entry]}])
+
+    assert summary["available"] is False
+
+
+def test_adapters_hash_private_slug_versions_before_export():
+    report = evaluate()
+    report["version"] = "checkout-api"
+    report["runner_version"] = "checkout-api"
+
+    summary = build_evaluation_summary([report])
+    evaluation = summary["evaluations"][0]
+
+    assert evaluation["benchmark_version"].startswith("version_hash_")
+    assert evaluation["runner_version"].startswith("version_hash_")
+    assert "checkout-api" not in json.dumps(summary)
+
+
+def test_non_finite_metric_values_are_coerced_or_rejected():
+    report = evaluate()
+    report["metrics"]["mrr"] = "nan"
+    report["positive_cases"][0]["rank"] = math.inf
+
+    summary = build_evaluation_summary([report])
+    evaluation = summary["evaluations"][0]
+
+    assert evaluation["metrics"]["mrr"]["value"] == 0.0
+    assert validate_evaluation_summary(summary)["passed"] is True
+
+    preshaped = {
+        "evaluation_version": "1",
+        "available": True,
+        "evaluations": [
+            {
+                "benchmark_name": "contextual_culprit_ranking",
+                "benchmark_version": "2",
+                "dataset_hash": "sha256:0123456789abcdef",
+                "runner_version": "0.1.0",
+                "generated_at": "2026-07-02T04:15:00Z",
+                "mode": "gate",
+                "context_available": [],
+                "anonymous": True,
+                "raw_inputs_included": False,
+                "contract": {},
+                "metrics": {"mrr": {"value": math.inf}},
+                "random_baselines": {},
+                "stage_counts": {},
+                "failure_reasons": {},
+                "per_case": [],
+            }
+        ],
+    }
+    assert validate_evaluation_summary(preshaped)["passed"] is False
+
+
 def test_evaluation_summary_validator_rejects_unknown_metric_keys():
     summary = {
         "evaluation_version": "1",
@@ -274,7 +349,7 @@ def test_lift_harness_reports_are_summarized_from_after_metrics():
 
     report = evaluate_alert_lift()
     report["generated_at"] = "2026-07-02T04:15:00Z"
-    report["gate"]["failures"] = ["alert context did not improve top1_recall"]
+    report["gate"]["failures"] = ["alert context did not improve top1_recall", "frozen baseline gate failed"]
 
     summary = build_evaluation_summary([report])
     evaluation = summary["evaluations"][0]
@@ -286,7 +361,8 @@ def test_lift_harness_reports_are_summarized_from_after_metrics():
     assert evaluation["metrics"]["top1"]["denominator"] == 38
     assert "top1_delta" in evaluation["metrics"]
     assert "alert_contribution_rate" in evaluation["metrics"]
-    assert evaluation["failures"] == ["alert_context_did_not_improve_top1_recall"]
+    assert evaluation["failures"] == ["alert_context_did_not_improve_top1_recall", "other"]
+    assert evaluation["failure_reasons"]["other"] == 1
     assert evaluation["random_baselines"]["mrr"] == 0.4567
 
 
@@ -388,6 +464,52 @@ def test_gamma_report_is_summarized_without_prompts_or_model():
     assert "raw prompt" not in text
 
 
+def test_offline_gate_report_is_summarized_without_fixture_details():
+    report = {
+        "classification": [
+            {
+                "dataset": "clickstack",
+                "role": "development",
+                "tp": 8,
+                "fp": 1,
+                "fn": 2,
+                "tn": 3,
+                "labeled_signal_metrics": 10,
+                "precision": 0.8889,
+                "recall": 0.8,
+                "coverage": 0.8,
+                "misclassified": [{"metric": "checkout_latency_seconds", "gold": "latency", "got": "errors"}],
+                "uncovered": ["checkout_errors_total"],
+            }
+        ],
+        "cold_resolution": [
+            {"dataset": "clickstack", "role": "development", "resolved": 3, "total": 4, "recall": 0.75, "misses": []}
+        ],
+        "learned_resolution": [
+            {"dataset": "clickstack", "role": "development", "resolved": 4, "total": 4, "recall": 1.0, "misses": []}
+        ],
+        "learned_selection": [
+            {
+                "dataset": "clickstack",
+                "selected": "learned_clickstack",
+                "expected": "learned_clickstack",
+                "passed": True,
+            }
+        ],
+        "gate": {"passed": False, "failures": ["clickstack semantic precision 0.8889 < 0.90"]},
+    }
+
+    summary = build_evaluation_summary([report])
+    text = json.dumps(summary)
+    evaluation = summary["evaluations"][0]
+
+    assert summary["available"] is True
+    assert evaluation["benchmark_name"] == "offline_gate"
+    assert evaluation["metrics"]["semantic_precision"] == {"numerator": 8, "denominator": 9, "value": 0.8889}
+    assert evaluation["failures"] == ["semantic_precision_below_threshold"]
+    assert "checkout_latency_seconds" not in text
+
+
 def test_save_evaluation_result_uses_unique_paths_for_same_second(tmp_path, monkeypatch):
     monkeypatch.setattr("tacit.evaluation_summary.datetime", FrozenDateTime)
 
@@ -442,3 +564,34 @@ def test_prompt_variation_summary_drops_raw_prompts():
     assert evaluation["metrics"]["negative_correct_rate"] == {"numerator": 4, "denominator": 5, "value": 0.8}
     assert "checkout-api" not in text
     assert "raw model output" not in text
+
+
+def test_prompt_variation_rates_are_derived_from_exported_counts():
+    report = {
+        "corpus": "clickstack_prompts.json",
+        "role": "dev",
+        "prompts": 1,
+        "trials_per_prompt": 5,
+        "positive_useful_rate": 1.0,
+        "negative_correct_rate": 1.0,
+        "worst_prompt_rate": 1.0,
+        "results": [
+            {
+                "prompt_index": 1,
+                "class": "reworded",
+                "polarity": "positive",
+                "prompt": "checkout-api latency is high",
+                "passed": 0,
+                "trials": 5,
+                "rate": "nan",
+                "failures": [],
+            }
+        ],
+    }
+
+    summary = build_evaluation_summary([report])
+    evaluation = summary["evaluations"][0]
+
+    assert evaluation["metrics"]["positive_useful_rate"] == {"numerator": 0, "denominator": 5, "value": 0.0}
+    assert evaluation["metrics"]["worst_prompt_rate"] == {"value": 0.0}
+    assert evaluation["per_case"][0]["rate"] == 0.0

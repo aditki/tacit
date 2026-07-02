@@ -804,7 +804,7 @@ def _raw_readme() -> str:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _anonymous_tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo:
