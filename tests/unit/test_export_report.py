@@ -249,6 +249,77 @@ def test_anonymizer_sanitizes_known_and_unknown_dict_keys():
     assert anonymized["knowledge_coverage"]["backend_distribution"] == {"backend_001": 1}
 
 
+def test_anonymizer_preserves_packaged_taxonomy_and_diagnostics():
+    report = {
+        "artifact_stats": {
+            "dashboards": {
+                "metrics_found": {"count": 2, "min": 1, "max": 3, "avg": 2},
+                "signals_inferred": {"count": 2, "min": 1, "max": 3, "avg": 2},
+            }
+        },
+        "knowledge_coverage": {
+            "signals_by_category": {
+                "auth": 1,
+                "caching": 1,
+                "network": 1,
+                "storage": 1,
+                "serverless": 1,
+                "traffic_management": 1,
+                "prod-us-east-1-payments-vip": 1,
+            }
+        },
+        "ranking_summary": {
+            "all_archetype_counts": {
+                "kubernetes_investigation": 1,
+                "rate_limiting_investigation": 1,
+                "redis_saturation": 1,
+                "kafka_broker_health": 1,
+            },
+            "datasource_type_counts": {"prometheus": 1},
+            "metrics_catalog_size": {"count": 1, "min": 1, "max": 1, "avg": 1},
+            "metrics_selected_count": {"count": 1, "min": 1, "max": 1, "avg": 1},
+            "panels_dropped": {"count": 1, "min": 0, "max": 0, "avg": 0},
+        },
+        "robustness_summary": {
+            "reason_code_counts": {
+                "named_metrics_discovered": 1,
+                "all_compiled_metrics_present": 1,
+                "all_panels_survived": 1,
+                "culprit_ranking_not_implemented": 1,
+            },
+            "stage_status_counts": {
+                "semantic_mapping:partial": 1,
+                "binding:passed": 1,
+                "compilation:passed": 1,
+                "symptom_evidence_rescue:skipped": 1,
+                "evidence_gap_resolution:passed": 1,
+            },
+        },
+        "assessment_summary": {
+            "status_counts": {"running": 1, "partial": 1},
+            "path_counts": {"failed": 1},
+        },
+    }
+
+    anonymized = ReportAnonymizer().anonymize_report(report)
+    text = json.dumps(anonymized)
+
+    assert "key_" not in text
+    assert "signal_category_" in text
+    assert "prod-us-east-1-payments-vip" not in text
+    assert "auth" in anonymized["knowledge_coverage"]["signals_by_category"]
+    assert "traffic_management" in anonymized["knowledge_coverage"]["signals_by_category"]
+    assert "kubernetes_investigation" in anonymized["ranking_summary"]["all_archetype_counts"]
+    assert "rate_limiting_investigation" in anonymized["ranking_summary"]["all_archetype_counts"]
+    assert "kafka_broker_health" in anonymized["ranking_summary"]["all_archetype_counts"]
+    assert "metrics_found" in anonymized["artifact_stats"]["dashboards"]
+    assert "datasource_type_counts" in anonymized["ranking_summary"]
+    assert "all_panels_survived" in anonymized["robustness_summary"]["reason_code_counts"]
+    assert "semantic_mapping:partial" in anonymized["robustness_summary"]["stage_status_counts"]
+    assert "running" in anonymized["assessment_summary"]["status_counts"]
+    assert "failed" in anonymized["assessment_summary"]["path_counts"]
+
+
 def _tar_member_texts(tar: tarfile.TarFile) -> dict[str, str]:
     out: dict[str, str] = {}
     for name in tar.getnames():

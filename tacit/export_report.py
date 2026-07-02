@@ -15,8 +15,12 @@ import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from tacit import __version__
 
@@ -59,13 +63,16 @@ SAFE_DATA_KEYS: dict[str, set[str]] = {
         "approved",
         "failed",
         "ignored",
+        "partial",
         "pending",
+        "passed",
         "rejected",
+        "running",
         "skipped",
         "success",
         "timeout",
     },
-    "path": {"", "archetype", "freeform"},
+    "path": {"", "archetype", "failed", "freeform"},
     "signal_category": {
         "",
         "availability",
@@ -105,14 +112,54 @@ SAFE_DATA_KEYS: dict[str, set[str]] = {
     "reason_code": {
         "",
         "backend_config",
+        "all_compiled_metrics_present",
+        "all_critical_evidence_observed",
+        "all_metrics_semantically_mapped",
+        "all_panels_rejected",
+        "all_panels_survived",
+        "ambiguous_default_metric_owner",
+        "ambiguous_live_signal",
+        "compiled_metrics_absent_from_catalog",
+        "contextual_suspects_ranked",
+        "culprit_ranking_not_implemented",
         "datasource_issue",
+        "datasource_targets_without_metric_names",
+        "default_metric_present",
+        "direct_symptom_signal_resolved",
+        "evidence_gap_supported_observation",
+        "gap_observations_rejected",
         "invalid_syntax",
+        "live_signal_resolved",
         "metric_not_in_catalog",
+        "named_metrics_discovered",
         "no_data",
+        "no_compatible_live_signal",
+        "no_contextual_or_runtime_candidates",
+        "no_critical_evidence_observed",
+        "no_declared_evidence_requirements",
+        "no_metrics_or_datasource_targets",
+        "no_metrics_semantically_mapped",
         "no_series",
+        "no_missing_gap_evidence",
+        "no_named_metrics",
+        "no_queries_compiled",
+        "no_resolved_symptom_evidence",
+        "no_semantic_signal_for_requirement",
+        "no_supported_gap_observation",
+        "no_supported_runtime_evidence",
         "not_implemented",
         "other",
+        "queries_compiled",
+        "signal_store_unavailable",
+        "some_critical_evidence_observed",
+        "some_metrics_unmapped",
+        "some_panels_rejected",
+        "supported_observations_validated",
+        "symptom_panels_rejected",
+        "symptom_panels_validated",
+        "telemetry_evidenced_suspects_ranked",
         "timeout",
+        "unknown",
         "validation_failed",
     },
     "warning_kind": {
@@ -196,8 +243,10 @@ SAFE_SCHEMA_KEYS = {
     "checks",
     "collection",
     "count",
+    "all_archetype_counts",
     "dashboard_review_states",
     "dashboards",
+    "datasource_type_counts",
     "emails_included",
     "error_kind_counts",
     "export_warnings",
@@ -220,8 +269,13 @@ SAFE_SCHEMA_KEYS = {
     "mappings_by_source",
     "max",
     "metadata",
+    "metrics_catalog_size",
+    "metrics_found",
+    "metrics_ranked_size",
+    "metrics_selected_count",
     "min",
     "panel_count",
+    "panels_dropped",
     "passed",
     "path_counts",
     "ranking_summary",
@@ -940,10 +994,12 @@ def _safe_data_key(value: str, kind: str) -> bool:
     if normalized != value:
         return False
     safe_values = SAFE_DATA_KEYS.get(kind)
+    if kind == "signal_category":
+        return normalized in (safe_values or set()) or normalized in _packaged_signal_categories()
     if safe_values is not None:
         return normalized in safe_values
     if kind == "archetype":
-        return bool(re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value)) and value in _safe_archetype_names()
+        return bool(re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value)) and value in _packaged_archetype_ids()
     return False
 
 
@@ -955,32 +1011,53 @@ def _safe_stage_names() -> set[str]:
     return {
         "",
         "archetypes",
+        "binding",
         "completion",
+        "compilation",
         "context",
         "discovery",
         "evidence",
+        "evidence_gap_resolution",
         "freeform",
         "intent",
         "publish",
+        "query_validation",
         "ranking",
+        "semantic_mapping",
+        "symptom_evidence_rescue",
         "validation",
     }
 
 
-def _safe_archetype_names() -> set[str]:
+@lru_cache(maxsize=1)
+def _packaged_signal_categories() -> set[str]:
+    data = _load_packaged_yaml("signals.yaml")
+    signals = data.get("signals", {})
+    if not isinstance(signals, dict):
+        return set()
     return {
-        "database_slowdown",
-        "deployment_regression",
-        "downstream_outage",
-        "error_spike",
-        "general",
-        "golden_signals",
-        "latency_investigation",
-        "network_instability",
-        "pod_instability",
-        "queue_lag",
-        "resource_saturation",
+        str(spec.get("category", "")).lower()
+        for spec in signals.values()
+        if isinstance(spec, dict) and spec.get("category")
     }
+
+
+@lru_cache(maxsize=1)
+def _packaged_archetype_ids() -> set[str]:
+    data = _load_packaged_yaml("archetypes.yaml")
+    archetypes = data.get("archetypes", [])
+    if not isinstance(archetypes, list):
+        return set()
+    return {
+        str(spec.get("id", "")).lower()
+        for spec in archetypes
+        if isinstance(spec, dict) and spec.get("id")
+    }
+
+
+def _load_packaged_yaml(name: str) -> dict[str, Any]:
+    data = yaml.safe_load(files("tacit.data").joinpath(name).read_text(encoding="utf-8")) or {}
+    return data if isinstance(data, dict) else {}
 
 
 def _kind_for_key(key: str) -> str:
