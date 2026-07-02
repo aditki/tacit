@@ -147,6 +147,21 @@ The learning loop is intentionally conservative:
 - rejected dashboards preserve negative examples
 - ignored dashboards do not create mappings
 
+### Learn PagerDuty Incident History
+
+Incident history can also be learned from PagerDuty (read-only, metadata only —
+no notes or causal narratives are ingested):
+
+```bash
+tacit learn pagerduty --since 2026-01-01T00:00:00Z --dry-run
+```
+
+`--since` is required: the PagerDuty list API otherwise returns only its
+default recent window, not full history. Set `pagerduty_api_token` via env or
+`.env`. See
+[docs/research/opensre-integration-review.md](docs/research/opensre-integration-review.md)
+for design notes.
+
 ## Supported Backends
 
 Grafana:
