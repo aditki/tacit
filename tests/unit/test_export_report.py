@@ -153,6 +153,7 @@ def test_anonymous_export_writes_safe_bundle_files(tmp_path: Path, fake_stores):
         assert metadata["anonymous"] is True
         assert metadata["mapping_included"] is False
         assert metadata["raw_artifacts_included"] is False
+        assert metadata["collection"]["investigations"]["row_limit"] == 10000
         assert metadata["collection"]["ingested_dashboards"]["truncated"] is True
         assert metadata["collection"]["ingested_dashboards"]["source_total"] == 10001
         members = _tar_member_texts(tar)
@@ -209,6 +210,10 @@ def test_anonymizer_is_deterministic_per_kind():
 
 def test_anonymizer_sanitizes_known_and_unknown_dict_keys():
     report = {
+        "assessment_summary": {
+            "investigations": {"total": 1, "succeeded": 1, "failed": 0, "timed_out": 0},
+            "feedback": {"total_feedback": 1, "useful_rate": 1.0},
+        },
         "knowledge_coverage": {
             "backend_distribution": {"prod.internal.example.com": 1},
         },
@@ -226,6 +231,13 @@ def test_anonymizer_sanitizes_known_and_unknown_dict_keys():
     assert "prod-us-east-1-payments-vip" not in text
     assert "custom_sensitive_section" not in text
     assert "user@example.com" not in text
+    assert anonymized["assessment_summary"]["investigations"] == {
+        "failed": 0,
+        "succeeded": 1,
+        "timed_out": 0,
+        "total": 1,
+    }
+    assert anonymized["assessment_summary"]["feedback"] == {"total_feedback": 1, "useful_rate": 1.0}
     assert anonymized["knowledge_coverage"]["backend_distribution"] == {"backend_001": 1}
 
 

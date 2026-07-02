@@ -151,6 +151,36 @@ DATA_KEY_PATHS: dict[str, str] = {
     "$.warnings.validation_warnings_by_kind": "warning_kind",
 }
 
+SCHEMA_KEY_PATHS: dict[str, set[str]] = {
+    "$.assessment_summary.investigations": {
+        "archetype_path",
+        "avg_catalog_size",
+        "avg_panels",
+        "avg_time",
+        "failed",
+        "freeform_path",
+        "succeeded",
+        "timed_out",
+        "total",
+    },
+    "$.assessment_summary.feedback": {
+        "avg_investigation_speed",
+        "avg_noise_level",
+        "avg_root_cause_support",
+        "avg_symptom_visibility",
+        "total_dashboards",
+        "total_feedback",
+        "useful_rate",
+    },
+    "$.assessment_summary.learning": {
+        "ingested_alerts",
+        "ingested_dashboards",
+        "learned_artifacts",
+        "metric_mappings",
+        "signal_types",
+    },
+}
+
 SAFE_SCHEMA_KEYS = {
     "alert_review_states",
     "alerts",
@@ -252,7 +282,7 @@ class ReportAnonymizer:
             out: dict[str, Any] = {}
             key_kind = DATA_KEY_PATHS.get(path)
             for key, item in value.items():
-                safe_key = self._sanitize_key(str(key), key_kind)
+                safe_key = self._sanitize_key(str(key), key_kind, path)
                 if isinstance(item, str):
                     kind = _kind_for_key(safe_key)
                     out[safe_key] = self._sanitize_string(item, kind)
@@ -265,9 +295,9 @@ class ReportAnonymizer:
             return self._sanitize_string(value, "value")
         return value
 
-    def _sanitize_key(self, value: str, kind: str | None) -> str:
+    def _sanitize_key(self, value: str, kind: str | None, path: str) -> str:
         if kind is None:
-            if _schema_key_is_safe(value):
+            if _schema_key_is_safe(value) or value in SCHEMA_KEY_PATHS.get(path, set()):
                 return value
             return self.anonymize_value(value, _key_alias_kind(value))
         if _safe_data_key(value, kind):
@@ -392,12 +422,7 @@ def export_assessment_report(
         tmp_path = Path(tmp)
         files = _write_report_files(tmp_path, report, anonymous=anonymous)
         if anonymous:
-            validation_report = validate_report_files_for_leakage(tmp_path, files)
-            report["validation_report"] = validation_report
-            _write_json(tmp_path / "validation_report.json", validation_report)
-            validation_report = validate_report_files_for_leakage(tmp_path, files)
-            report["validation_report"] = validation_report
-            _write_json(tmp_path / "validation_report.json", validation_report)
+            validation_report = _finalize_anonymous_validation_report(tmp_path, files, report)
             if validate and not validation_report["passed"]:
                 findings = validation_report["findings_count"]
                 raise ValueError(f"Anonymous report failed leakage validation with {findings} finding(s)")
@@ -470,6 +495,22 @@ def validate_report_files_for_leakage(root: Path, files: tuple[str, ...] | list[
         "checks": [kind for kind, _pattern in _LEAKAGE_PATTERNS],
         "scope": "staged_archive_files",
     }
+
+
+def _finalize_anonymous_validation_report(
+    root: Path,
+    files: tuple[str, ...] | list[str],
+    report: AssessmentReport,
+) -> dict[str, Any]:
+    # Pass one validates all staged files and writes those findings into the bundle.
+    # Pass two validates the final validation_report.json as a shipped file too.
+    validation_report = validate_report_files_for_leakage(root, files)
+    report["validation_report"] = validation_report
+    _write_json(root / "validation_report.json", validation_report)
+    validation_report = validate_report_files_for_leakage(root, files)
+    report["validation_report"] = validation_report
+    _write_json(root / "validation_report.json", validation_report)
+    return validation_report
 
 
 def _metadata(generated_at: str, *, anonymous: bool, collection: dict[str, Any]) -> dict[str, Any]:
@@ -708,7 +749,7 @@ def _collection_metadata(
         "investigations": _collection_entry(
             rows_exported=len(investigations),
             source_total=history_stats.get("total"),
-            row_limit=None,
+            row_limit=EXPORT_ROW_LIMIT,
         ),
         "ingested_dashboards": _collection_entry(
             rows_exported=len(dashboards),
