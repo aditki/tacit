@@ -108,14 +108,19 @@ command execution, and all agent/RCA/memory/hypothesis machinery.
 
 **`tacit/integrations/pagerduty.py`** — read-only PagerDuty incident-metadata connector.
 
-- **Auth:** `Token token=<key>` (REST API v2), configured via new settings
-  `pagerduty_api_token` / `pagerduty_base_url` (secrets via env/.env, consistent with
-  existing conventions).
+- **Auth:** `Token token=<key>` with the versioned `Accept:
+  application/vnd.pagerduty+json;version=2` header (REST v2 versions via Accept),
+  configured via new settings `pagerduty_api_token` / `pagerduty_base_url` (secrets via
+  env/.env, consistent with existing conventions).
 - **Pagination:** classic PagerDuty offset/`more` loop, page size 100, `max_items` cap
   (validated ≥ 1) — an improvement over the OpenSRE client, which fetches a single page.
-  Offset advances by the server's raw batch length (pre-filter) so malformed entries
-  cannot skew subsequent offsets. Non-object JSON responses yield no items; invalid JSON
-  raises.
+  Requests pin `sort_by=created_at:asc` so offset paging is stable while incidents arrive
+  mid-crawl. Windows wider than PagerDuty's six-month `since`/`until` cap are split into
+  contiguous 180-day sub-windows (deduplicated by incident id). Hitting `max_items` with
+  pages remaining returns a `truncated` flag that surfaces as a CLI warning — a capped
+  import never silently poses as complete history. Offset advances by the server's raw
+  batch length (pre-filter) so malformed entries cannot skew subsequent offsets.
+  Non-object JSON responses yield no items; invalid JSON raises.
 - **Retries:** bounded (3), exponential backoff capped at 8s, honors `Retry-After` on
   429/5xx clamped to 60s (a hostile/broken header cannot hang the CLI); transport errors
   raise immediately on the final attempt (no wasted terminal sleep). Absent in the
@@ -133,9 +138,15 @@ command execution, and all agent/RCA/memory/hypothesis machinery.
   `source_instance=<base_url>`, `external_id=<incident id>`,
   `provenance_url=<html_url>`; stable ids also appear in an inert `pagerduty ids:` body
   line) and feeds `learn_artifact(..., PagerDutyIncidentExtractor())` — a thin wrapper
-  over `IncidentExtractor` that re-points ownership hints at the stable `service:` entity
-  instead of the per-incident title. Same untrusted-input path as file-based incidents,
-  so causal-claim suppression and body-text sanitization apply unchanged.
+  over `IncidentExtractor` that (a) accepts ownership hints only from the
+  connector-generated `owner:` metadata line, so free text such as an incident title
+  containing `owner: evil-team` cannot mint hints that masquerade as vendor metadata, and
+  (b) re-points accepted hints at the stable `service:` entity instead of the
+  per-incident title. The artifact *title* is an inert identifier (`PagerDuty incident
+  <id>`), because `learn_artifact()` indexes titles verbatim, bypassing extractor
+  suppression — raw incident titles appear only in the body (newline-collapsed onto one
+  line), where causal-claim/injection suppression applies. Same untrusted-input path as
+  file-based incidents.
 - **Dry run:** `--dry-run` extracts and summarizes without touching the signal store.
 - **CLI:** `tacit learn pagerduty --since <ISO8601> [--until --status --limit --dry-run]`.
   `--since` is required at both the CLI and library level (`learn_pagerduty_incidents`
@@ -145,17 +156,22 @@ command execution, and all agent/RCA/memory/hypothesis machinery.
 
 ## 6. Tests
 
-`tests/unit/test_pagerduty_integration.py` (25 tests):
+`tests/unit/test_pagerduty_integration.py` (32 tests):
 
-- auth/config parsing (missing-token error; settings-driven token/base URL; `Token token=` header)
-- pagination follows the `more` flag across offsets and advances by raw batch length past
-  malformed entries; multi-value filters encode as repeated `statuses[]`/`service_ids[]`
-  params; non-positive `max_items` rejected; non-dict JSON yields no incidents; invalid
-  JSON raises
+- auth/config parsing (missing-token error; settings-driven token/base URL; `Token token=`
+  header; versioned `Accept` header)
+- pagination follows the `more` flag across offsets with a pinned `created_at:asc` sort
+  and advances by raw batch length past malformed entries; >6-month windows chunk into
+  contiguous sub-windows with boundary dedup; invalid `since` raises a clear error;
+  hitting `max_items` surfaces a `truncated` flag and warning; multi-value filters encode
+  as repeated `statuses[]`/`service_ids[]` params; non-positive `max_items` rejected;
+  non-dict JSON yields no incidents; invalid JSON raises
 - retry honors `Retry-After` on 429 and clamps hostile values to the 60s cap; transport
   errors exhaust retries without a wasted final sleep; non-retryable 401 raises
 - normalization excludes free-text fields (description / trigger log entries) and
-  preserves stable ids; ownership hints attach to the service entity, not the title
+  preserves stable ids; ownership hints attach to the service entity and are accepted
+  only from the metadata `owner:` line; artifact titles are inert identifiers; newlines
+  in incident titles cannot smuggle extractor-parseable lines
 - CLI contract: `--since` required, `--limit` ≥ 1 enforced, failures exit non-zero
 - **safety:** causal claim leaking through an incident title is suppressed by
   `IncidentExtractor` (warning emitted, no extraction carries the claim); prompt-injection
@@ -169,7 +185,7 @@ The sandbox has Python 3.10 only (repo targets ≥3.12; the pinned interpreter c
 downloaded there), so tests ran under 3.10 with a two-line stdlib compat shim
 (`datetime.UTC`, `enum.StrEnum`). Results:
 
-- `tests/unit/test_pagerduty_integration.py`: **25 passed**
+- `tests/unit/test_pagerduty_integration.py`: **32 passed**
 - `tests/unit/test_artifact_learning.py`: **46 passed** (no regressions)
 - broader unit suite: **559 passed**; remaining failures/errors are pre-existing sandbox
   environment gaps only (missing optional deps `openai`/`boto3`, and modules using PEP 695
