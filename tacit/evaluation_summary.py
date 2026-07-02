@@ -41,11 +41,135 @@ EVALUATION_MODES = {
 }
 
 _BENCHMARK_MODES = {
+    "alert_context_ranking_lift": "gate",
     "contextual_artifact_ranking": "gate",
+    "contextual_alerts_runbooks_baseline_v1": "gate",
     "contextual_culprit_ranking": "gate",
+    "incident_context_ranking_lift": "gate",
     "prompt_variation": "prompt_variation",
     "gamma": "gamma",
     "artifact_robustness": "artifact_robustness",
+}
+
+_BENCHMARK_NAMES = set(_BENCHMARK_MODES)
+_CONTEXT_VALUES = {
+    "alerts",
+    "context",
+    "dashboards",
+    "deployments",
+    "historical_incidents",
+    "incidents",
+    "runbooks",
+    "service_graph",
+}
+_CASE_CLASSES = {"negative", "negative_noise", "positive", "scorable", "unknown"}
+_STAGE_NAMES = {
+    "intent",
+    "ranking",
+    "passed",
+    "failed",
+    "dropped",
+    "indeterminate",
+    "intent_parsed",
+    "evidence_requirements_created",
+    "evidence_resolved",
+    "queries_built",
+    "queries_validated",
+    "panels_created",
+}
+_METRIC_NAMES = {
+    "top1",
+    "top3",
+    "mrr",
+    "false_culprit_rate",
+    "unsupported_rca_rate",
+    "positive_useful_rate",
+    "negative_correct_rate",
+    "worst_prompt_rate",
+}
+_RANDOM_BASELINE_KEYS = {
+    "assumption",
+    "mrr",
+    "mrr_truncation",
+    "per_case_computed",
+    "top1",
+    "top3",
+}
+_CONTRACT_KEYS = {
+    "candidate_set_fixed",
+    "candidate_set_size",
+    "mrr_denominator",
+    "mrr_truncation",
+    "negative_cases",
+    "negative_denominator",
+    "negative_noise_cases",
+    "positive_cases",
+    "positive_denominator",
+    "recall_denominator",
+    "scorable_culprit_cases",
+    "source_contribution_denominator",
+    "top_k",
+    "total_cases",
+    "trials_per_prompt",
+}
+_REASON_CODES = {
+    "false_culprit",
+    "prompt_intent_mismatch",
+    "top1_missed",
+    "top3_missed",
+    "unsupported_rca",
+}
+_SCHEMA_KEYS = {
+    "actual_rank",
+    "anonymous",
+    "available",
+    "benchmark_name",
+    "benchmark_version",
+    "case_class",
+    "case_id",
+    "checks",
+    "context_available",
+    "contract",
+    "dataset_hash",
+    "denominator",
+    "evaluation_version",
+    "evaluations",
+    "expected_rank",
+    "failure_reasons",
+    "failure_stage",
+    "false_culprit",
+    "findings",
+    "findings_count",
+    "generated_at",
+    "kind",
+    "metrics",
+    "mode",
+    "mrr_contribution",
+    "numerator",
+    "passed_trials",
+    "path",
+    "per_case",
+    "random_baselines",
+    "rate",
+    "raw_inputs_included",
+    "reason",
+    "reason_codes",
+    "runner_version",
+    "sample",
+    "stage_counts",
+    "top1_hit",
+    "top3_hit",
+    "total_trials",
+    "truncation",
+    "unsupported_rca",
+    "value",
+}
+_DYNAMIC_KEYS_BY_PATH = {
+    "$.evaluations[].contract": _CONTRACT_KEYS,
+    "$.evaluations[].failure_reasons": _REASON_CODES,
+    "$.evaluations[].metrics": _METRIC_NAMES,
+    "$.evaluations[].random_baselines": _RANDOM_BASELINE_KEYS,
+    "$.evaluations[].stage_counts": _STAGE_NAMES,
 }
 
 _SNAKE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -62,6 +186,11 @@ _HASH_KEYS = {"dataset_hash"}
 _MODE_KEYS = {"mode"}
 _TRUNCATION_KEYS = {"mrr_truncation", "truncation"}
 _ANON_ID_KEYS = {"case_id", "service_id", "alert_id", "runbook_id", "incident_id", "dashboard_id"}
+_BENCHMARK_KEYS = {"benchmark_name"}
+_CONTEXT_KEYS = {"context_available"}
+_CASE_CLASS_KEYS = {"case_class"}
+_STAGE_KEYS = {"failure_stage"}
+_REASON_CODE_KEYS = {"reason_codes"}
 
 
 def evaluation_results_dir() -> Path:
@@ -122,25 +251,26 @@ def build_evaluation_summary(
 ) -> dict[str, Any]:
     """Build the exportable evaluation summary section.
 
-    Keeps the latest result per benchmark name. Entries that fail privacy
-    validation are dropped (fail closed) rather than exported.
+    Keeps the latest result per benchmark and dataset identity. Entries that
+    fail privacy validation are dropped (fail closed) rather than exported.
     """
     if results is None:
         results = load_evaluation_results(directory)
 
-    latest: dict[str, dict[str, Any]] = {}
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
     for result in results:
         for entry in _entries_from_result(result):
             name = str(entry.get("benchmark_name", ""))
             if not name:
                 continue
-            previous = latest.get(name)
+            identity = _evaluation_identity(entry)
+            previous = latest.get(identity)
             if previous is None or str(entry.get("generated_at", "")) >= str(previous.get("generated_at", "")):
-                latest[name] = entry
+                latest[identity] = entry
 
     evaluations = []
-    for name in sorted(latest):
-        entry = latest[name]
+    for identity in sorted(latest):
+        entry = latest[identity]
         validation = validate_evaluation_summary({"evaluation_version": EVALUATION_VERSION, "evaluations": [entry]})
         if validation["passed"]:
             evaluations.append(entry)
@@ -187,10 +317,27 @@ def _entries_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
     if "benchmark_contract" in result and "metrics" in result:
         entry = summarize_ranking_report(result)
         return [entry] if entry else []
+    if "benchmark_contract" in result and isinstance(result.get("after"), dict):
+        entry = summarize_lift_report(result)
+        return [entry] if entry else []
     if {"positive_useful_rate", "negative_correct_rate", "worst_prompt_rate"} <= result.keys():
         entry = summarize_prompt_variation_report(result)
         return [entry] if entry else []
     return []
+
+
+def summarize_lift_report(report: dict[str, Any]) -> dict[str, Any] | None:
+    """Summarize contextual ranking lift harness reports from their after result."""
+    after = report.get("after") or {}
+    contract = report.get("benchmark_contract") or {}
+    if not isinstance(after, dict) or not contract or not after.get("metrics"):
+        return None
+
+    merged = dict(after)
+    merged["benchmark"] = str(report.get("benchmark", after.get("benchmark", "")))
+    merged["version"] = str(report.get("version", after.get("version", "")) or "lift_v1")
+    merged["benchmark_contract"] = contract
+    return summarize_ranking_report(merged)
 
 
 def summarize_ranking_report(report: dict[str, Any]) -> dict[str, Any] | None:
@@ -210,7 +357,8 @@ def summarize_ranking_report(report: dict[str, Any]) -> dict[str, Any] | None:
 
     positive_rows = report.get("positive_cases") or []
     false_culprits = set(report.get("false_culprits") or [])
-    unsupported_cases = {str(item.get("case", "")) for item in report.get("unsupported_rca") or []}
+    unsupported_entries = [item for item in report.get("unsupported_rca") or [] if isinstance(item, dict)]
+    unsupported_cases = {str(item.get("case", "")) for item in unsupported_entries}
 
     case_ids = sorted(str(case_id) for case_id in (report.get("results") or {}).keys())
     if not case_ids:
@@ -267,8 +415,8 @@ def summarize_ranking_report(report: dict[str, Any]) -> dict[str, Any] | None:
         failure_reasons["top3_missed"] = top3_missed
     if false_culprits:
         failure_reasons["false_culprit"] = len(false_culprits)
-    if unsupported_cases:
-        failure_reasons["unsupported_rca"] = len(unsupported_cases)
+    if unsupported_entries:
+        failure_reasons["unsupported_rca"] = len(unsupported_entries)
 
     negative_passed = negative - len(false_culprits)
     stage_counts = {
@@ -303,7 +451,7 @@ def summarize_ranking_report(report: dict[str, Any]) -> dict[str, Any] | None:
             "value": _float(metrics_in.get("false_culprit_rate")),
         },
         "unsupported_rca_rate": {
-            "numerator": len(unsupported_cases),
+            "numerator": len(unsupported_entries),
             "denominator": int(denominators.get("unsupported_rca_rate", total_cases)),
             "value": _float(metrics_in.get("unsupported_rca_rate")),
         },
@@ -444,7 +592,7 @@ def _walk_validate(value: Any, path: str, findings: list[dict[str, str]], key: s
     if isinstance(value, dict):
         for child_key, item in value.items():
             child_key = str(child_key)
-            if not _SNAKE_RE.match(child_key):
+            if not _key_is_allowed(path, child_key):
                 findings.append({"path": f"{path}.<key>", "kind": "forbidden_key", "sample": "<redacted_key>"})
                 continue
             _walk_validate(item, f"{path}.{child_key}", findings, key=child_key)
@@ -459,6 +607,8 @@ def _walk_validate(value: Any, path: str, findings: list[dict[str, str]], key: s
 def _string_is_allowed(key: str, value: str) -> bool:
     if _contains_leakage(value):
         return False
+    if value == "":
+        return True
     if key in _ANON_ID_KEYS:
         return bool(_ANON_ID_RE.match(value))
     if key in _FREE_TEXT_KEYS:
@@ -473,7 +623,27 @@ def _string_is_allowed(key: str, value: str) -> bool:
         return value in EVALUATION_MODES
     if key in _TRUNCATION_KEYS:
         return value in MRR_TRUNCATIONS
-    return bool(_SNAKE_RE.match(value))
+    if key in _BENCHMARK_KEYS:
+        return value in _BENCHMARK_NAMES
+    if key in _CONTEXT_KEYS:
+        return value in _CONTEXT_VALUES
+    if key in _CASE_CLASS_KEYS:
+        return value in _CASE_CLASSES
+    if key in _STAGE_KEYS:
+        return value in _STAGE_NAMES
+    if key in _REASON_CODE_KEYS:
+        return value in _REASON_CODES
+    return False
+
+
+def _key_is_allowed(path: str, key: str) -> bool:
+    if not _SNAKE_RE.match(key):
+        return False
+    normalized_path = re.sub(r"\[\d+\]", "[]", path)
+    dynamic_keys = _DYNAMIC_KEYS_BY_PATH.get(normalized_path)
+    if dynamic_keys is not None:
+        return key in dynamic_keys
+    return key in _SCHEMA_KEYS
 
 
 def _contains_leakage(value: str) -> bool:
@@ -491,6 +661,14 @@ def _dataset_hash(contract: dict[str, Any]) -> str:
     """Hash the benchmark dataset contract, never raw private artifact contents."""
     canonical = json.dumps(contract, sort_keys=True, separators=(",", ":"), default=str)
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _evaluation_identity(entry: dict[str, Any]) -> tuple[str, str]:
+    name = str(entry.get("benchmark_name", ""))
+    dataset_hash = str(entry.get("dataset_hash", ""))
+    if not dataset_hash and isinstance(entry.get("contract"), dict):
+        dataset_hash = _dataset_hash(entry["contract"])
+    return name, dataset_hash
 
 
 def _float(value: Any) -> float:

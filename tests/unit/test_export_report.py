@@ -167,9 +167,7 @@ def test_anonymous_export_writes_safe_bundle_files(tmp_path: Path, fake_stores):
                 assert sensitive not in text
 
 
-def test_anonymous_export_includes_evaluation_summary_when_results_exist(
-    tmp_path: Path, fake_stores, monkeypatch
-):
+def test_anonymous_export_includes_evaluation_summary_when_results_exist(tmp_path: Path, fake_stores, monkeypatch):
     from tests.eval.contextual_culprit_ranking_harness import evaluate
 
     evaluation_dir = tmp_path / "evaluations"
