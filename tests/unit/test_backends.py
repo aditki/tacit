@@ -588,7 +588,7 @@ def test_grafana_backend_list_dashboards_paginates_search_results():
     }
     assert mock_client._get.call_args_list[1].kwargs["params"] == {
         "type": "dash-db",
-        "limit": 1,
+        "limit": GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE,
         "page": 2,
     }
     print("[PASS] test_grafana_backend_list_dashboards_paginates_search_results")

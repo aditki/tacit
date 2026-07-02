@@ -156,6 +156,11 @@ def test_anonymous_export_writes_safe_bundle_files(tmp_path: Path, fake_stores):
         assert metadata["collection"]["investigations"]["row_limit"] == 10000
         assert metadata["collection"]["ingested_dashboards"]["truncated"] is True
         assert metadata["collection"]["ingested_dashboards"]["source_total"] == 10001
+        for member in tar.getmembers():
+            assert member.uid == 0
+            assert member.gid == 0
+            assert member.uname == ""
+            assert member.gname == ""
         members = _tar_member_texts(tar)
         for text in members.values():
             for sensitive in SENSITIVE_STRINGS:
@@ -170,6 +175,9 @@ def test_raw_export_includes_local_details(tmp_path: Path, fake_stores):
     with tarfile.open(output, "r:gz") as tar:
         names = tar.getnames()
         assert "raw_local_details.json" in names
+        metadata = json.loads(tar.extractfile("metadata.json").read().decode())
+        assert metadata["hostnames_included"] is True
+        assert metadata["emails_included"] is True
     assert result.validation_report["skipped"] is True
 
 

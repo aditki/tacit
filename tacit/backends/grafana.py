@@ -176,8 +176,8 @@ class GrafanaBackend:
         if limit <= 0:
             return out
 
+        page_limit = min(GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE, limit)
         while len(out) < limit:
-            page_limit = min(GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE, limit - len(out))
             raw = await self._client._get(
                 "/api/search",
                 params={"type": "dash-db", "limit": page_limit, "page": page},

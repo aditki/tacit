@@ -428,7 +428,11 @@ def export_assessment_report(
                 raise ValueError(f"Anonymous report failed leakage validation with {findings} finding(s)")
         with tarfile.open(output_path, "w:gz") as tar:
             for name in files:
-                tar.add(tmp_path / name, arcname=name)
+                tar.add(
+                    tmp_path / name,
+                    arcname=name,
+                    filter=_anonymous_tar_filter if anonymous else None,
+                )
     return ExportResult(output_path=output_path, validation_report=validation_report, files=list(files))
 
 
@@ -523,8 +527,8 @@ def _metadata(generated_at: str, *, anonymous: bool, collection: dict[str, Any])
         "graph_preserved": True,
         "raw_artifacts_included": not anonymous,
         "telemetry_included": False,
-        "hostnames_included": False,
-        "emails_included": False,
+        "hostnames_included": not anonymous,
+        "emails_included": not anonymous,
         "collection": collection,
     }
 
@@ -713,6 +717,15 @@ def _raw_readme() -> str:
 
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _anonymous_tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Remove local filesystem identity metadata from anonymous archive members."""
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    return info
 
 
 def _collect_recent_investigations(history_store: Any) -> list[dict[str, Any]]:
