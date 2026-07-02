@@ -252,7 +252,7 @@ class ReportAnonymizer:
             out: dict[str, Any] = {}
             key_kind = DATA_KEY_PATHS.get(path)
             for key, item in value.items():
-                safe_key = self._sanitize_key(str(key), key_kind) if key_kind else str(key)
+                safe_key = self._sanitize_key(str(key), key_kind)
                 if isinstance(item, str):
                     kind = _kind_for_key(safe_key)
                     out[safe_key] = self._sanitize_string(item, kind)
@@ -267,7 +267,9 @@ class ReportAnonymizer:
 
     def _sanitize_key(self, value: str, kind: str | None) -> str:
         if kind is None:
-            return value
+            if _schema_key_is_safe(value):
+                return value
+            return self.anonymize_value(value, _key_alias_kind(value))
         if _safe_data_key(value, kind):
             return value
         if kind == "stage_status":
@@ -964,3 +966,8 @@ def _kind_for_key(key: str) -> str:
     if "label" in normalized:
         return "label_value"
     return "value"
+
+
+def _key_alias_kind(key: str) -> str:
+    kind = _kind_for_key(key)
+    return "key" if kind == "value" else kind

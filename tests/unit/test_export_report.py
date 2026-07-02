@@ -207,6 +207,28 @@ def test_anonymizer_is_deterministic_per_kind():
     assert anonymizer.anonymize_value("checkout-api", "dashboard") == "dashboard_001"
 
 
+def test_anonymizer_sanitizes_known_and_unknown_dict_keys():
+    report = {
+        "knowledge_coverage": {
+            "backend_distribution": {"prod.internal.example.com": 1},
+        },
+        "custom_sensitive_section": {
+            "prod-us-east-1-payments-vip": {
+                "owner": "user@example.com",
+            }
+        },
+    }
+
+    anonymized = ReportAnonymizer().anonymize_report(report)
+    text = json.dumps(anonymized)
+
+    assert "prod.internal.example.com" not in text
+    assert "prod-us-east-1-payments-vip" not in text
+    assert "custom_sensitive_section" not in text
+    assert "user@example.com" not in text
+    assert anonymized["knowledge_coverage"]["backend_distribution"] == {"backend_001": 1}
+
+
 def _tar_member_texts(tar: tarfile.TarFile) -> dict[str, str]:
     out: dict[str, str] = {}
     for name in tar.getnames():
