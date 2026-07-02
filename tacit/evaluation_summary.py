@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ EVALUATION_MODES = {
 
 _BENCHMARK_MODES = {
     "alert_context_ranking_lift": "gate",
+    "artifact_learning_robustness": "artifact_robustness",
     "contextual_artifact_ranking": "gate",
     "contextual_alerts_runbooks_baseline_v1": "gate",
     "contextual_culprit_ranking": "gate",
@@ -83,9 +85,43 @@ _METRIC_NAMES = {
     "mrr",
     "false_culprit_rate",
     "unsupported_rca_rate",
+    "evidence_attribution",
+    "negative_correctness",
+    "abstention_on_insufficient",
+    "contextual_top3_only_recall",
+    "contextual_top3_only_not_top1",
     "positive_useful_rate",
     "negative_correct_rate",
     "worst_prompt_rate",
+    "top1_delta",
+    "top3_delta",
+    "mrr_delta",
+    "false_culprit_delta",
+    "unsupported_rca_delta",
+    "alert_contribution_rate",
+    "alert_tie_break_rate",
+    "alert_noise_rate",
+    "runbook_contribution_rate",
+    "runbook_tie_break_rate",
+    "runbook_noise_rate",
+    "indeterminate_requirement_rate",
+    "incident_contribution_rate",
+    "incident_tie_break_rate",
+    "incident_noise_rate",
+    "ignored_causal_claim_count",
+    "rca_suppression_recall",
+    "rca_precision",
+    "noise_scenarios",
+    "noise_worst_mrr_delta",
+    "contradictory_artifacts_passed",
+    "canonical_evidence_recall",
+    "prefixed_evidence_recall",
+    "canonical_dashboard_rate",
+    "prefixed_dashboard_rate",
+    "raw_dashboard_rate",
+    "false_culprit_rate_controls",
+    "control_abstention_rate",
+    "healthy_symptom_panel_recall",
 }
 _RANDOM_BASELINE_KEYS = {
     "assumption",
@@ -106,6 +142,11 @@ _CONTRACT_KEYS = {
     "positive_cases",
     "positive_denominator",
     "recall_denominator",
+    "control_cases",
+    "evidence_signal_denominator",
+    "noise_scenarios",
+    "rca_phrases",
+    "rca_precision_phrases",
     "scorable_culprit_cases",
     "source_contribution_denominator",
     "top_k",
@@ -118,6 +159,50 @@ _REASON_CODES = {
     "top1_missed",
     "top3_missed",
     "unsupported_rca",
+    "alert_context_regressed_expected_culprit_rank",
+    "alert_context_did_not_improve_top1_recall",
+    "alert_context_increased_false_culprit_rate",
+    "alert_context_increased_unsupported_rca_rate",
+    "alert_context_regressed_top3_recall",
+    "all_arm_cache_hits_are_zero",
+    "canonical_all_prompts_create_dashboard",
+    "canonical_evidence_recall_meets_gate",
+    "contradictory_artifacts_failed",
+    "control_cache_hits_are_zero",
+    "control_classes_are_balanced",
+    "control_families_are_diverse",
+    "control_sample_size_meets_gate",
+    "control_scenarios_are_distinct",
+    "evidence_absent_discovers_symptom",
+    "evidence_absent_does_not_assert_resource_culprit",
+    "false_culprit_regressed",
+    "healthy_does_not_assert_culprit",
+    "incident_benchmark_did_not_exercise_ignored_causal_claims",
+    "incident_history_did_not_improve_mrr",
+    "incident_history_did_not_improve_top1_recall",
+    "incident_history_increased_false_culprit_rate",
+    "incident_history_increased_unsupported_rca_rate",
+    "incident_history_regressed_expected_culprit_rank",
+    "incident_history_regressed_top3_recall",
+    "ignored_causal_claim_promoted_redis",
+    "mrr_regressed",
+    "noise_did_not_reach_ranker",
+    "noise_injection_failed",
+    "prefix_only_preserves_mapping_coverage",
+    "prefixed_all_prompts_bind_post_fix",
+    "prefixed_evidence_recall_meets_gate",
+    "prefixed_fails_binding_pre_fix",
+    "raw_ambiguous_binding_abstains",
+    "raw_fails_binding_pre_fix",
+    "rca_phrase_robustness_failed",
+    "rca_precision_failed",
+    "runbook_benchmark_did_not_exercise_indeterminate_requirements",
+    "runbook_context_increased_false_culprit_rate",
+    "runbook_context_increased_unsupported_rca_rate",
+    "runbook_context_regressed_expected_culprit_rank",
+    "runbook_context_regressed_top1_recall",
+    "runbook_context_regressed_top3_recall",
+    "top1_regressed",
 }
 _SCHEMA_KEYS = {
     "actual_rank",
@@ -137,6 +222,7 @@ _SCHEMA_KEYS = {
     "expected_rank",
     "failure_reasons",
     "failure_stage",
+    "failures",
     "false_culprit",
     "findings",
     "findings_count",
@@ -191,6 +277,7 @@ _CONTEXT_KEYS = {"context_available"}
 _CASE_CLASS_KEYS = {"case_class"}
 _STAGE_KEYS = {"failure_stage"}
 _REASON_CODE_KEYS = {"reason_codes"}
+_FAILURE_KEYS = {"failures"}
 
 
 def evaluation_results_dir() -> Path:
@@ -221,7 +308,7 @@ def save_evaluation_result(report: dict[str, Any], *, directory: Path | None = N
     report.setdefault("generated_at", _now_iso())
     name = str(report.get("benchmark") or report.get("benchmark_name") or "evaluation")
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    path = directory / f"{_safe_filename(name)}-{stamp}.json"
+    path = directory / f"{_safe_filename(name)}-{stamp}-{uuid.uuid4().hex[:8]}.json"
     path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
@@ -320,6 +407,12 @@ def _entries_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
     if "benchmark_contract" in result and isinstance(result.get("after"), dict):
         entry = summarize_lift_report(result)
         return [entry] if entry else []
+    if result.get("benchmark") == "artifact_learning_robustness":
+        entry = summarize_artifact_robustness_report(result)
+        return [entry] if entry else []
+    if result.get("dataset") == "gamma" and "prediction_evaluation" in result and "control_evaluation" in result:
+        entry = summarize_gamma_report(result)
+        return [entry] if entry else []
     if {"positive_useful_rate", "negative_correct_rate", "worst_prompt_rate"} <= result.keys():
         entry = summarize_prompt_variation_report(result)
         return [entry] if entry else []
@@ -336,8 +429,172 @@ def summarize_lift_report(report: dict[str, Any]) -> dict[str, Any] | None:
     merged = dict(after)
     merged["benchmark"] = str(report.get("benchmark", after.get("benchmark", "")))
     merged["version"] = str(report.get("version", after.get("version", "")) or "lift_v1")
+    merged["generated_at"] = str(report.get("generated_at", after.get("generated_at", "")))
     merged["benchmark_contract"] = contract
-    return summarize_ranking_report(merged)
+    entry = summarize_ranking_report(merged)
+    if not entry:
+        return None
+
+    deltas = report.get("deltas") or {}
+    for source, target in {
+        "top1_recall": "top1_delta",
+        "top3_recall": "top3_delta",
+        "mrr": "mrr_delta",
+        "false_culprit_rate": "false_culprit_delta",
+        "unsupported_rca_rate": "unsupported_rca_delta",
+    }.items():
+        if source in deltas:
+            entry["metrics"][target] = {"value": _float(deltas.get(source))}
+
+    metric_sections = [
+        report.get("alert_metrics") or {},
+        report.get("runbook_metrics") or {},
+        report.get("incident_metrics") or {},
+    ]
+    denominators = contract.get("metric_denominators") or {}
+    for section in metric_sections:
+        for name, value in section.items():
+            if name not in _METRIC_NAMES or not isinstance(value, int | float):
+                continue
+            metric: dict[str, Any] = {"value": _float(value)}
+            denominator = denominators.get(name)
+            if isinstance(denominator, int | float) and denominator:
+                metric["denominator"] = int(denominator)
+                metric["numerator"] = round(metric["value"] * int(denominator))
+            entry["metrics"][name] = metric
+
+    failures = [_reason_code(str(item)) for item in (report.get("gate") or {}).get("failures", [])]
+    entry["failures"] = [failure for failure in failures if failure in _REASON_CODES]
+    for failure in entry["failures"]:
+        entry["failure_reasons"][failure] = entry["failure_reasons"].get(failure, 0) + 1
+    return entry
+
+
+def summarize_artifact_robustness_report(report: dict[str, Any]) -> dict[str, Any] | None:
+    """Summarize artifact-learning robustness gates without artifact text."""
+    rca = report.get("rca_phrase_robustness") or {}
+    precision = report.get("rca_precision") or {}
+    noise = report.get("noise_injection") or {}
+    contradictory = report.get("contradictory_artifacts") or {}
+    if not rca or not precision or not noise or not contradictory:
+        return None
+
+    rca_phrases = int(rca.get("phrases", 0) or 0)
+    rca_ignored = int(rca.get("ignored_causal_claim_count", 0) or 0)
+    precision_phrases = int(precision.get("phrases", 0) or 0)
+    false_positive_suppressions = int(precision.get("false_positive_suppression_count", 0) or 0)
+    noise_rows = [row for row in noise.get("rows", []) if isinstance(row, dict)]
+    noise_mrr_deltas = [_float(row.get("mrr_delta")) for row in noise_rows]
+    failures = [_reason_code(str(item)) for item in (report.get("gate") or {}).get("failures", [])]
+    failure_reasons = _counts(failure for failure in failures if failure in _REASON_CODES)
+    contract = {
+        "total_cases": rca_phrases + precision_phrases + len(noise_rows) + 1,
+        "rca_phrases": rca_phrases,
+        "rca_precision_phrases": precision_phrases,
+        "noise_scenarios": len(noise_rows),
+    }
+
+    return {
+        "evaluation_version": EVALUATION_VERSION,
+        "available": True,
+        "benchmark_name": "artifact_learning_robustness",
+        "benchmark_version": str(report.get("version", "artifact_robustness_v1")),
+        "dataset_hash": _dataset_hash(contract),
+        "runner_version": str(report.get("runner_version", "")) or __version__,
+        "generated_at": str(report.get("generated_at", "")) or _now_iso(),
+        "mode": "artifact_robustness",
+        "context_available": ["context", "alerts", "runbooks", "incidents"],
+        "anonymous": True,
+        "raw_inputs_included": False,
+        "contract": contract,
+        "metrics": {
+            "rca_suppression_recall": _ratio(rca_ignored, rca_phrases),
+            "rca_precision": _ratio(precision_phrases - false_positive_suppressions, precision_phrases),
+            "noise_scenarios": {"value": float(len(noise_rows))},
+            "noise_worst_mrr_delta": {"value": min(noise_mrr_deltas) if noise_mrr_deltas else 0.0},
+            "contradictory_artifacts_passed": {"value": 1.0 if contradictory.get("passed") else 0.0},
+        },
+        "random_baselines": {},
+        "stage_counts": {
+            "passed": 1 if (report.get("gate") or {}).get("passed") else 0,
+            "failed": 0 if (report.get("gate") or {}).get("passed") else 1,
+            "dropped": 0,
+            "indeterminate": 0,
+        },
+        "failure_reasons": failure_reasons,
+        "failures": [failure for failure in failures if failure in _REASON_CODES],
+        "per_case": [],
+    }
+
+
+def summarize_gamma_report(report: dict[str, Any]) -> dict[str, Any] | None:
+    """Summarize GAMMA naming diagnostic reports without prompts or manifests."""
+    prediction = report.get("prediction_evaluation") or {}
+    control = report.get("control_evaluation") or {}
+    if not prediction or not control:
+        return None
+
+    prediction_counts = prediction.get("counts") or {}
+    control_counts = control.get("counts") or {}
+    dashboards = prediction_counts.get("dashboards") or {}
+    known_gaps = control.get("known_gaps") or {}
+    symptom_panel = known_gaps.get("evidence_absent_preserves_symptom_panel") or {}
+    failures = [
+        _reason_code(name)
+        for checks in (prediction.get("checks") or {}, control.get("checks") or {})
+        for name, passed in checks.items()
+        if not passed
+    ]
+    failure_reasons = _counts(failure for failure in failures if failure in _REASON_CODES)
+    control_cases = int(control_counts.get("abstention", {}).get("denominator", 0) or 0)
+    evidence_denominator = int(prediction_counts.get("canonical_evidence_recall", {}).get("denominator", 0) or 0)
+    contract = {
+        "total_cases": control_cases + sum(int(item.get("denominator", 0) or 0) for item in dashboards.values()),
+        "control_cases": control_cases,
+        "evidence_signal_denominator": evidence_denominator,
+    }
+    fingerprint = report.get("protocol_fingerprint") or {}
+    dataset_contract = {
+        "dataset": "gamma",
+        "scenario_id": report.get("scenario_id", ""),
+        "protocol_sha256": fingerprint.get("protocol_sha256", ""),
+        "control_matrix_sha256": fingerprint.get("control_matrix_sha256", ""),
+    }
+
+    return {
+        "evaluation_version": EVALUATION_VERSION,
+        "available": True,
+        "benchmark_name": "gamma",
+        "benchmark_version": "gamma_diagnostic_v1",
+        "dataset_hash": _dataset_hash(dataset_contract),
+        "runner_version": str(report.get("runner_version", "")) or __version__,
+        "generated_at": str(report.get("generated_at", "")) or _now_iso(),
+        "mode": "gamma",
+        "context_available": ["context"],
+        "anonymous": True,
+        "raw_inputs_included": False,
+        "contract": contract,
+        "metrics": {
+            "canonical_evidence_recall": _metric_from_count(prediction_counts.get("canonical_evidence_recall")),
+            "prefixed_evidence_recall": _metric_from_count(prediction_counts.get("prefixed_evidence_recall")),
+            "canonical_dashboard_rate": _metric_from_count(dashboards.get("canonical")),
+            "prefixed_dashboard_rate": _metric_from_count(dashboards.get("prefixed")),
+            "raw_dashboard_rate": _metric_from_count(dashboards.get("raw")),
+            "false_culprit_rate_controls": _metric_from_count(control_counts.get("false_culprit")),
+            "control_abstention_rate": _metric_from_count(control_counts.get("abstention")),
+            "healthy_symptom_panel_recall": _metric_from_count(symptom_panel),
+        },
+        "random_baselines": {},
+        "stage_counts": {
+            "passed": int(bool(prediction.get("passed"))) + int(bool(control.get("passed"))),
+            "failed": int(not bool(prediction.get("passed"))) + int(not bool(control.get("passed"))),
+            "dropped": 0,
+            "indeterminate": 0,
+        },
+        "failure_reasons": failure_reasons,
+        "failures": [failure for failure in failures if failure in _REASON_CODES],
+        "per_case": [],
+    }
 
 
 def summarize_ranking_report(report: dict[str, Any]) -> dict[str, Any] | None:
@@ -456,6 +713,28 @@ def summarize_ranking_report(report: dict[str, Any]) -> dict[str, Any] | None:
             "value": _float(metrics_in.get("unsupported_rca_rate")),
         },
     }
+    extra_denominators = {
+        "evidence_attribution": int(denominators.get("unsupported_rca_rate", 0) or 0),
+        "negative_correctness": int(negative),
+        "contextual_top3_only_recall": len(report.get("contextual_top3_only_cases") or []),
+        "contextual_top3_only_not_top1": len(report.get("contextual_top3_only_cases") or []),
+    }
+    for source_name, export_name in {
+        "evidence_attribution": "evidence_attribution",
+        "negative_correctness": "negative_correctness",
+        "abstention_on_insufficient": "abstention_on_insufficient",
+        "contextual_top3_only_recall": "contextual_top3_only_recall",
+        "contextual_top3_only_not_top1": "contextual_top3_only_not_top1",
+    }.items():
+        if source_name not in metrics_in:
+            continue
+        value = _float(metrics_in.get(source_name))
+        metric: dict[str, Any] = {"value": value}
+        denominator = extra_denominators.get(source_name, 0)
+        if denominator:
+            metric["denominator"] = denominator
+            metric["numerator"] = round(value * denominator)
+        metrics[export_name] = metric
 
     return {
         "evaluation_version": EVALUATION_VERSION,
@@ -600,19 +879,21 @@ def _walk_validate(value: Any, path: str, findings: list[dict[str, str]], key: s
         for index, item in enumerate(value):
             _walk_validate(item, f"{path}[{index}]", findings, key=key)
     elif isinstance(value, str):
-        if not _string_is_allowed(key, value):
+        if not _string_is_allowed(key, value, path):
             findings.append({"path": path, "kind": "forbidden_value", "sample": "<redacted_value>"})
 
 
-def _string_is_allowed(key: str, value: str) -> bool:
+def _string_is_allowed(key: str, value: str, path: str) -> bool:
     if _contains_leakage(value):
         return False
     if value == "":
         return True
     if key in _ANON_ID_KEYS:
         return bool(_ANON_ID_RE.match(value))
-    if key in _FREE_TEXT_KEYS:
-        return bool(_FREE_TEXT_RE.match(value))
+    if key == "reason":
+        return path == "$.reason" and value == UNAVAILABLE_REASON
+    if key == "assumption":
+        return bool(re.fullmatch(r"uniform random permutation over [1-9][0-9]* candidates", value))
     if key in _TIMESTAMP_KEYS:
         return bool(_TIMESTAMP_RE.match(value))
     if key in _HASH_KEYS:
@@ -632,6 +913,8 @@ def _string_is_allowed(key: str, value: str) -> bool:
     if key in _STAGE_KEYS:
         return value in _STAGE_NAMES
     if key in _REASON_CODE_KEYS:
+        return value in _REASON_CODES
+    if key in _FAILURE_KEYS:
         return value in _REASON_CODES
     return False
 
@@ -669,6 +952,39 @@ def _evaluation_identity(entry: dict[str, Any]) -> tuple[str, str]:
     if not dataset_hash and isinstance(entry.get("contract"), dict):
         dataset_hash = _dataset_hash(entry["contract"])
     return name, dataset_hash
+
+
+def _ratio(numerator: int | float, denominator: int | float) -> dict[str, Any]:
+    numerator = int(numerator or 0)
+    denominator = int(denominator or 0)
+    return {
+        "numerator": numerator,
+        "denominator": denominator,
+        "value": round(numerator / denominator, 4) if denominator else 0.0,
+    }
+
+
+def _metric_from_count(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"value": 0.0}
+    numerator = value.get("numerator", 0)
+    denominator = value.get("denominator", 0)
+    metric = _ratio(numerator, denominator)
+    if "recall" in value:
+        metric["value"] = _float(value.get("recall"))
+    return metric
+
+
+def _counts(values: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def _reason_code(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return cleaned or "unknown"
 
 
 def _float(value: Any) -> float:
