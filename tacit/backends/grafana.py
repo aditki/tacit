@@ -22,6 +22,7 @@ from tacit.validation import validate_dashboard_queries
 
 logger = structlog.get_logger()
 PROMQL_DATASOURCE_TYPES = {"prometheus", "promql", "mimir", "cortex", "thanos"}
+GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE = 500
 
 
 class GrafanaBackend:
@@ -168,25 +169,47 @@ class GrafanaBackend:
 
     async def list_dashboards(self, limit: int = 500) -> list[dict]:
         """List Grafana dashboards discoverable by the configured token."""
-        raw = await self._client._get(
-            "/api/search",
-            params={"type": "dash-db", "limit": limit},
-        )
-        dashboards = raw if isinstance(raw, list) else []
         out: list[dict] = []
-        for item in dashboards:
-            uid = item.get("uid") if isinstance(item, dict) else ""
-            if not uid:
-                continue
-            out.append(
-                {
-                    "uid": uid,
-                    "title": item.get("title", ""),
-                    "folder": item.get("folderTitle", ""),
-                    "url": item.get("url", ""),
-                    "backend": self.name,
-                }
+        seen: set[str] = set()
+        page = 1
+
+        if limit <= 0:
+            return out
+
+        page_limit = min(GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE, limit)
+        while len(out) < limit:
+            raw = await self._client._get(
+                "/api/search",
+                params={"type": "dash-db", "limit": page_limit, "page": page},
             )
+            dashboards = raw if isinstance(raw, list) else []
+            if not dashboards:
+                break
+
+            previous_count = len(out)
+            for item in dashboards:
+                uid = item.get("uid") if isinstance(item, dict) else ""
+                if not uid or uid in seen:
+                    continue
+                seen.add(uid)
+                out.append(
+                    {
+                        "uid": uid,
+                        "title": item.get("title", ""),
+                        "folder": item.get("folderTitle", ""),
+                        "url": item.get("url", ""),
+                        "backend": self.name,
+                    }
+                )
+                if len(out) >= limit:
+                    break
+
+            if len(dashboards) < page_limit:
+                break
+            if len(out) == previous_count:
+                logger.warning("grafana_dashboard_search_no_new_results", page=page, page_limit=page_limit)
+                break
+            page += 1
         return out[:limit]
 
     async def ingest_alert(self, uid: str) -> AlertFeatures:

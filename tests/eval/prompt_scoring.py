@@ -25,9 +25,7 @@ def signals(intent: Any) -> dict[str, Any]:
     words = {str(word).lower() for word in intent.keywords}
     keyword_evidence = getattr(intent, "keyword_evidence", []) or []
     preserved = {
-        str(item.get("keyword", "")).lower()
-        for item in keyword_evidence
-        if float(item.get("score", 0.0) or 0.0) < 1.0
+        str(item.get("keyword", "")).lower() for item in keyword_evidence if float(item.get("score", 0.0) or 0.0) < 1.0
     }
     summary = " ".join(re.findall(r"[a-z0-9_]+", str(intent.summary).lower()))
     padded_summary = f" {summary} "

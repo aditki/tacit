@@ -16,6 +16,7 @@ from tacit.signalfx.publisher import publish_dashboard as sfx_publish
 from tacit.validation import validate_signalflow_queries
 
 logger = structlog.get_logger()
+SIGNALFX_DASHBOARD_GROUP_PAGE_SIZE = 200
 
 
 class SignalFxBackend:
@@ -99,34 +100,57 @@ class SignalFxBackend:
 
     async def list_dashboards(self, limit: int = 500) -> list[dict]:
         """List SignalFx dashboards from dashboard groups when available."""
-        data = await self._client.list_dashboard_groups(limit=min(limit, 200))
-        groups = data.get("results", []) if isinstance(data, dict) else data
         out: list[dict] = []
-        for group in groups if isinstance(groups, list) else []:
-            if not isinstance(group, dict):
-                continue
-            dashboards = group.get("dashboardConfigs") or group.get("dashboards", [])
-            for dashboard in dashboards if isinstance(dashboards, list) else []:
-                if isinstance(dashboard, dict):
-                    uid = dashboard.get("dashboardId", "") or dashboard.get("id", "")
-                    title = (
-                        dashboard.get("name", "") or dashboard.get("dashboardName", "") or dashboard.get("title", "")
-                    )
-                else:
-                    uid = str(dashboard)
-                    title = ""
-                if not uid:
+        seen: set[str] = set()
+        offset = 0
+        page_complete = False
+        if limit <= 0:
+            return out
+
+        while len(out) < limit:
+            page_limit = max(1, min(SIGNALFX_DASHBOARD_GROUP_PAGE_SIZE, limit - len(out)))
+            data = await self._client.list_dashboard_groups(limit=page_limit, offset=offset)
+            groups = data.get("results", []) if isinstance(data, dict) else data
+            group_items = groups if isinstance(groups, list) else []
+
+            for group in group_items:
+                if not isinstance(group, dict):
                     continue
-                out.append(
-                    {
-                        "uid": uid,
-                        "title": title,
-                        "folder": group.get("name", "") if isinstance(group, dict) else "",
-                        "backend": self.name,
-                    }
-                )
-                if len(out) >= limit:
-                    return out
+                dashboards = group.get("dashboardConfigs") or group.get("dashboards", [])
+                for dashboard in dashboards if isinstance(dashboards, list) else []:
+                    if isinstance(dashboard, dict):
+                        uid = dashboard.get("dashboardId", "") or dashboard.get("id", "")
+                        title = (
+                            dashboard.get("name", "")
+                            or dashboard.get("dashboardName", "")
+                            or dashboard.get("title", "")
+                        )
+                    else:
+                        uid = str(dashboard)
+                        title = ""
+                    if not uid or uid in seen:
+                        continue
+                    seen.add(uid)
+                    out.append(
+                        {
+                            "uid": uid,
+                            "title": title,
+                            "folder": group.get("name", "") if isinstance(group, dict) else "",
+                            "backend": self.name,
+                        }
+                    )
+                    if len(out) >= limit:
+                        return out
+
+            page_complete = _signalfx_page_complete(
+                data,
+                page_count=len(group_items),
+                page_limit=page_limit,
+                total_seen=offset + len(group_items),
+            )
+            if page_complete or not group_items:
+                break
+            offset += len(group_items)
         return out
 
     async def ingest_alert(self, uid: str) -> AlertFeatures:
@@ -163,7 +187,7 @@ class SignalFxBackend:
                 )
                 if len(out) >= limit:
                     break
-            page_complete = _signalfx_detector_page_complete(
+            page_complete = _signalfx_page_complete(
                 data,
                 page_count=len(detector_items),
                 page_limit=page_limit,
@@ -377,8 +401,8 @@ def _detector_annotations(detector: dict[str, Any]) -> dict[str, str]:
     return annotations
 
 
-def _signalfx_detector_page_complete(data: Any, *, page_count: int, page_limit: int, total_seen: int) -> bool:
-    """Return true when the detector response is known to be a complete snapshot."""
+def _signalfx_page_complete(data: Any, *, page_count: int, page_limit: int, total_seen: int) -> bool:
+    """Return true when a SignalFx list response is known to be complete."""
     if not isinstance(data, dict):
         return page_count < page_limit
     if data.get("next") or data.get("nextPage") or data.get("nextPageLink"):
@@ -389,6 +413,11 @@ def _signalfx_detector_page_complete(data: Any, *, page_count: int, page_limit: 
     if isinstance(total, int):
         return total_seen >= total
     return page_count < page_limit
+
+
+def _signalfx_detector_page_complete(data: Any, *, page_count: int, page_limit: int, total_seen: int) -> bool:
+    """Return true when the detector response is known to be a complete snapshot."""
+    return _signalfx_page_complete(data, page_count=page_count, page_limit=page_limit, total_seen=total_seen)
 
 
 def _parse_signalfx_detector(detector: dict[str, Any], *, backend_name: str, realm: str) -> AlertFeatures:

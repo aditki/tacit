@@ -487,6 +487,113 @@ def test_signalfx_backend_list_dashboards_reads_dashboard_configs():
     print("[PASS] test_signalfx_backend_list_dashboards_reads_dashboard_configs")
 
 
+def test_signalfx_backend_list_dashboards_paginates_dashboard_groups():
+    from tacit.backends.signalfx import SIGNALFX_DASHBOARD_GROUP_PAGE_SIZE, SignalFxBackend
+
+    first_page = {
+        "results": [
+            {
+                "name": f"Group {i}",
+                "dashboardConfigs": [{"dashboardId": f"dash-{i}", "name": f"Dashboard {i}"}],
+            }
+            for i in range(SIGNALFX_DASHBOARD_GROUP_PAGE_SIZE)
+        ],
+        "nextPageLink": f"/v2/dashboardgroup?offset={SIGNALFX_DASHBOARD_GROUP_PAGE_SIZE}",
+    }
+    second_page = {
+        "results": [
+            {
+                "name": "Final Group",
+                "dashboardConfigs": [{"dashboardId": "dash-final", "name": "Dashboard Final"}],
+            }
+        ]
+    }
+
+    mock_client = AsyncMock()
+    mock_client.list_dashboard_groups.side_effect = [first_page, second_page]
+    backend = SignalFxBackend(client=mock_client)
+
+    dashboards = asyncio.run(backend.list_dashboards(limit=SIGNALFX_DASHBOARD_GROUP_PAGE_SIZE + 1))
+
+    assert len(dashboards) == SIGNALFX_DASHBOARD_GROUP_PAGE_SIZE + 1
+    assert dashboards[0] == {
+        "uid": "dash-0",
+        "title": "Dashboard 0",
+        "folder": "Group 0",
+        "backend": "signalfx",
+    }
+    assert dashboards[-1] == {
+        "uid": "dash-final",
+        "title": "Dashboard Final",
+        "folder": "Final Group",
+        "backend": "signalfx",
+    }
+    assert mock_client.list_dashboard_groups.call_args_list[0].kwargs == {
+        "limit": SIGNALFX_DASHBOARD_GROUP_PAGE_SIZE,
+        "offset": 0,
+    }
+    assert mock_client.list_dashboard_groups.call_args_list[1].kwargs == {
+        "limit": 1,
+        "offset": SIGNALFX_DASHBOARD_GROUP_PAGE_SIZE,
+    }
+    print("[PASS] test_signalfx_backend_list_dashboards_paginates_dashboard_groups")
+
+
+def test_grafana_backend_list_dashboards_paginates_search_results():
+    from tacit.backends.grafana import GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE, GrafanaBackend
+
+    first_page = [
+        {
+            "uid": f"dash-{i}",
+            "title": f"Dashboard {i}",
+            "folderTitle": "Ops",
+            "url": f"/d/dash-{i}",
+        }
+        for i in range(GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE)
+    ]
+    second_page = [
+        {
+            "uid": "dash-final",
+            "title": "Dashboard Final",
+            "folderTitle": "Ops",
+            "url": "/d/dash-final",
+        }
+    ]
+
+    mock_client = AsyncMock()
+    mock_client._get.side_effect = [first_page, second_page]
+    backend = GrafanaBackend(client=mock_client)
+
+    dashboards = asyncio.run(backend.list_dashboards(limit=GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE + 1))
+
+    assert len(dashboards) == GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE + 1
+    assert dashboards[0] == {
+        "uid": "dash-0",
+        "title": "Dashboard 0",
+        "folder": "Ops",
+        "url": "/d/dash-0",
+        "backend": "grafana",
+    }
+    assert dashboards[-1] == {
+        "uid": "dash-final",
+        "title": "Dashboard Final",
+        "folder": "Ops",
+        "url": "/d/dash-final",
+        "backend": "grafana",
+    }
+    assert mock_client._get.call_args_list[0].kwargs["params"] == {
+        "type": "dash-db",
+        "limit": GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE,
+        "page": 1,
+    }
+    assert mock_client._get.call_args_list[1].kwargs["params"] == {
+        "type": "dash-db",
+        "limit": GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE,
+        "page": 2,
+    }
+    print("[PASS] test_grafana_backend_list_dashboards_paginates_search_results")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 14. GrafanaBackend — discover returns empty when no searchable datasources
 # ═══════════════════════════════════════════════════════════════════════════
