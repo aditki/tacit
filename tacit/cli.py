@@ -1343,6 +1343,34 @@ def serve(host: str, port: int, reload: bool, no_slack: bool):
     )
 
 
+@cli.command("export-report")
+@click.option("--anonymous", is_flag=True, help="Create a shareable anonymized assessment bundle")
+@click.option("--output", type=click.Path(dir_okay=False, path_type=Path), default=None, help="Output tar.gz path")
+@click.option("--validate", "validate_bundle", is_flag=True, help="Fail if anonymous leakage checks find issues")
+def export_report(anonymous: bool, output: Path | None, validate_bundle: bool):
+    """Export a local or anonymous Tacit assessment bundle."""
+    _header("Export Assessment Report")
+    _load_env()
+
+    from tacit.export_report import export_assessment_report
+
+    try:
+        result = export_assessment_report(output=output, anonymous=anonymous, validate=validate_bundle)
+    except ValueError as exc:
+        _fail(str(exc))
+        raise click.ClickException(str(exc)) from exc
+
+    _success(f"Report written: {result.output_path}")
+    _info(f"Files: {len(result.files)}")
+    if anonymous:
+        _info("Anonymous bundle excludes raw artifact text and anonymization mappings.")
+    validation = result.validation_report
+    if validation.get("passed"):
+        _success("Leakage validation passed")
+    else:
+        _warn(f"Leakage validation findings: {validation.get('findings_count', 0)}")
+
+
 # ── tacit history ─────────────────────────────────────────────────────
 @cli.group()
 def history():

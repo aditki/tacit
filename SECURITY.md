@@ -72,6 +72,11 @@ Users should assume generated queries, dashboards, and integrations require care
 * Avoid storing secrets directly in repository files
 * Rotate any accidentally exposed credentials immediately
 
+For implementation-specific credential guidance, see
+[`docs/vendor-permissions.md`](docs/vendor-permissions.md). It maps each
+supported vendor integration to the least-privilege roles/scopes needed by
+Tacit CLI commands and API endpoints.
+
 ## AI / LLM Caveats
 
 Tacit uses LLMs for:

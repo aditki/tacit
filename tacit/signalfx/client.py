@@ -151,9 +151,12 @@ class SignalFxClient:
 
     # ── Dashboard Groups ─────────────────────────────────────────────────
 
-    async def list_dashboard_groups(self, limit: int = 100) -> dict[str, Any]:
+    async def list_dashboard_groups(self, limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """List dashboard groups."""
-        return cast(dict[str, Any], await self._get("/v2/dashboardgroup", params={"limit": limit}))
+        params = {"limit": limit}
+        if offset:
+            params["offset"] = offset
+        return cast(dict[str, Any], await self._get("/v2/dashboardgroup", params=params))
 
     async def create_dashboard_group(self, group_json: dict[str, Any]) -> dict[str, Any]:
         """Create a dashboard group."""
