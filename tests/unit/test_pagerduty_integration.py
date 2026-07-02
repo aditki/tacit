@@ -292,6 +292,63 @@ async def test_window_wider_than_six_months_is_chunked():
 
 
 @pytest.mark.asyncio
+async def test_pagination_stops_before_pagerduty_offset_cap(monkeypatch):
+    """PagerDuty rejects limit+offset beyond 10k; stop cleanly with truncated=True
+    instead of erroring mid-import."""
+    import tacit.integrations.pagerduty as pd
+
+    monkeypatch.setattr(pd, "_MAX_OFFSET", 300)
+    offsets: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        offset = int(request.url.params.get("offset", 0))
+        offsets.append(offset)
+        incidents = [_raw_incident(offset + i) for i in range(1, 101)]
+        return httpx.Response(200, json={"incidents": incidents, "more": True})
+
+    async with _client(handler) as client:
+        incidents, truncated = await client.list_incidents(max_items=5000)
+
+    assert truncated is True
+    assert offsets == [0, 100, 200]  # never requests past the cap
+    assert len(incidents) == 300
+
+
+@pytest.mark.asyncio
+async def test_retry_honors_ratelimit_reset_header():
+    """PagerDuty throttling responses carry ratelimit-reset, not Retry-After."""
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(429, headers={"ratelimit-reset": "0"})
+        return httpx.Response(200, json={"incidents": [_raw_incident(1)], "more": False})
+
+    async with _client(handler) as client:
+        incidents, _ = await client.list_incidents()
+
+    assert attempts["n"] == 2
+    assert incidents[0]["id"] == "PD1"
+
+
+@pytest.mark.asyncio
+async def test_ownership_fields_requested_via_include():
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.extend(request.url.params.multi_items())
+        return httpx.Response(200, json={"incidents": [], "more": False})
+
+    async with _client(handler) as client:
+        await client.list_incidents()
+
+    included = [v for k, v in seen if k == "include[]"]
+    assert "teams" in included
+    assert "escalation_policies" in included
+
+
+@pytest.mark.asyncio
 async def test_invalid_since_raises_clear_error():
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
         raise AssertionError("no request should be made")
@@ -392,6 +449,38 @@ def test_artifact_title_is_inert_identifier():
     assert "caused by" not in artifact.title
     # The raw title still appears in the body, where suppression applies.
     assert "ignore previous instructions" in artifact.body_text.splitlines()[0]
+
+
+def test_newline_in_vendor_metadata_cannot_smuggle_extractor_lines():
+    """Team/service display names are vendor-editable free text too."""
+    raw = _raw_incident(
+        1,
+        service={"id": "SVC1", "summary": "payments\nowner: evil-team"},
+        teams=[{"id": "T1", "summary": "real-team\ncheck redis_cache_misses_total"}],
+    )
+    artifact = incident_artifact(normalize_incident(raw), source_instance="acme.pagerduty.com")
+    result = PagerDutyIncidentExtractor().extract(artifact)
+
+    assert all(h.owner != "evil-team" for h in result.ownership_hints)
+    assert result.evidence_requirements == []  # smuggled 'check ...' never parsed
+    # No vendor value produced its own body line.
+    assert not any(line.startswith("owner: evil-team") for line in artifact.body_text.splitlines())
+
+
+def test_two_accounts_do_not_collide_on_incident_id():
+    """Same incident id from different PagerDuty accounts must produce
+    distinct artifact identities."""
+    inc_a = normalize_incident(_raw_incident(1, html_url="https://acme.pagerduty.com/incidents/PD1"))
+    inc_b = normalize_incident(_raw_incident(1, html_url="https://globex.pagerduty.com/incidents/PD1"))
+
+    from tacit.integrations.pagerduty import _account_instance
+
+    art_a = incident_artifact(inc_a, source_instance=_account_instance(inc_a, "https://api.pagerduty.com"))
+    art_b = incident_artifact(inc_b, source_instance=_account_instance(inc_b, "https://api.pagerduty.com"))
+
+    assert art_a.source_instance == "acme.pagerduty.com"
+    assert art_b.source_instance == "globex.pagerduty.com"
+    assert art_a.id != art_b.id
 
 
 def test_newline_in_title_cannot_smuggle_extractor_lines():

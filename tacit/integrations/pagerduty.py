@@ -29,6 +29,7 @@ import asyncio
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -46,6 +47,7 @@ logger = structlog.get_logger()
 
 _DEFAULT_TIMEOUT = 30.0
 _PAGE_LIMIT = 100  # PagerDuty API maximum per page
+_MAX_OFFSET = 10_000  # PagerDuty rejects pages where limit + offset exceeds 10k
 _MAX_WINDOW = timedelta(days=180)  # PagerDuty caps since/until ranges at six months
 _MAX_RETRIES = 3
 _MAX_RETRY_AFTER = 60.0  # cap header-provided delays so a bad proxy can't hang the CLI
@@ -169,6 +171,11 @@ class PagerDutyClient:
             # Advance by the server's returned collection length (pre-filter),
             # so the next offset matches the API's view of what was served.
             offset += len(raw_batch)
+            if offset + _PAGE_LIMIT > _MAX_OFFSET:
+                # PagerDuty rejects limit+offset beyond 10k. Stop cleanly and
+                # report truncation; callers must narrow the time window.
+                logger.warning("pagerduty_offset_cap_reached", path=path, offset=offset)
+                return items, True
 
     # ── Incidents (read-only) ────────────────────────────────────────────
 
@@ -191,7 +198,13 @@ class PagerDutyClient:
         """
         if max_items < 1:
             raise ValueError(f"max_items must be >= 1, got {max_items}")
-        base_params: dict[str, Any] = {"sort_by": "created_at:asc"}
+        base_params: dict[str, Any] = {
+            "sort_by": "created_at:asc",
+            # Ownership fields are optional in the default list response; ask
+            # for them explicitly so ownership hints don't silently vanish on
+            # accounts where the API omits team/escalation details.
+            "include[]": ["teams", "escalation_policies", "assignees"],
+        }
         if statuses:
             base_params["statuses[]"] = statuses
         if service_ids:
@@ -256,6 +269,18 @@ def _window_chunks(since: str, until: str | None) -> list[tuple[str | None, str 
     return chunks
 
 
+def _account_instance(incident: dict[str, Any], fallback: str) -> str:
+    """Account-specific source_instance for artifact identity.
+
+    The incident ``html_url`` host (e.g. ``acme.pagerduty.com``) identifies
+    the PagerDuty account; the shared API host does not. Without this, two
+    accounts imported into one Tacit store could collide on incident ids and
+    overwrite each other's learned artifacts.
+    """
+    host = urlparse(str(incident.get("html_url", ""))).netloc
+    return host or fallback
+
+
 def _inert_line(text: str) -> str:
     """Collapse free text onto one whitespace-normalized line.
 
@@ -266,19 +291,29 @@ def _inert_line(text: str) -> str:
 
 
 def _retry_after_seconds(resp: httpx.Response) -> float | None:
-    raw = resp.headers.get("Retry-After")
-    if raw is None:
-        return None
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return None
+    """Seconds to wait before retrying, from Retry-After or ratelimit-reset.
+
+    PagerDuty's documented throttling response carries ``ratelimit-reset``
+    (seconds until the window resets); ``Retry-After`` is checked first for
+    proxies/other statuses.
+    """
+    for header in ("Retry-After", "ratelimit-reset"):
+        raw = resp.headers.get(header)
+        if raw is None:
+            continue
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            continue
+    return None
 
 
 def _ref_name(obj: dict[str, Any] | None) -> str:
     if not isinstance(obj, dict):
         return ""
-    return str(obj.get("summary") or obj.get("name") or "")
+    # Inert-line display names at the source: a vendor name containing
+    # "payments\nowner: evil-team" must never split into its own body line.
+    return _inert_line(str(obj.get("summary") or obj.get("name") or ""))
 
 
 def _ref_id(obj: dict[str, Any] | None) -> str:
@@ -359,23 +394,30 @@ def incident_artifact(incident: dict[str, Any], *, source_instance: str) -> Lear
     The body is a factual, metadata-only rendering. Ownership context
     (team/escalation policy) is expressed with the ``owner:`` pattern that
     ``IncidentExtractor`` already understands; no causal language is emitted.
+    Every interpolated value is collapsed to one inert line so no vendor
+    field can smuggle its own parser-significant body line.
+
+    ``source_instance`` should be account-specific (see
+    ``_account_instance``): keying artifacts on the shared API host would
+    collide incident ids across different PagerDuty accounts.
     """
     title_line = _inert_line(str(incident.get("title", "")))
     lines = [
         f"Incident #{incident.get('incident_number') or incident.get('id')}: {title_line}",
-        f"status: {incident.get('status', '')}",
-        f"urgency: {incident.get('urgency', '')}",
+        f"status: {_inert_line(str(incident.get('status', '')))}",
+        f"urgency: {_inert_line(str(incident.get('urgency', '')))}",
     ]
-    service = incident.get("service") or ""
+    service = _inert_line(str(incident.get("service") or ""))
     if service:
         lines.append(f"service: {service}")
         owner = ", ".join(incident.get("teams") or []) or incident.get("escalation_policy") or ""
+        owner = _inert_line(str(owner))
         if owner:
             lines.append(f"owner: {owner}")
     if incident.get("created_at"):
-        lines.append(f"created at {incident['created_at']}")
+        lines.append(f"created at {_inert_line(str(incident['created_at']))}")
     if incident.get("resolved_at"):
-        lines.append(f"resolved at {incident['resolved_at']}")
+        lines.append(f"resolved at {_inert_line(str(incident['resolved_at']))}")
     # Stable PagerDuty ids as an inert reference line (survives renames).
     id_parts = [f"incident={incident.get('id', '')}"]
     if incident.get("service_id"):
@@ -426,14 +468,15 @@ async def learn_pagerduty_incidents(
     warnings: list[str] = []
     if truncated:
         warnings.append(
-            f"truncated: window contained more than max_items={max_items} incidents; "
-            "history import is incomplete — raise --limit or narrow --since/--until"
+            f"truncated: window contained more incidents than could be fetched (max_items={max_items}, "
+            "PagerDuty offset cap 10k/window); history import is incomplete — "
+            "narrow --since/--until into smaller windows"
         )
         logger.warning("pagerduty_learn_truncated", max_items=max_items, since=since, until=until)
     extractor = PagerDutyIncidentExtractor()
     learned = [
         learn_artifact(
-            incident_artifact(inc, source_instance=client.base_url),
+            incident_artifact(inc, source_instance=_account_instance(inc, client.base_url)),
             extractor,
             dry_run=dry_run,
         )

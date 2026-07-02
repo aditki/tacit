@@ -111,14 +111,19 @@ command execution, and all agent/RCA/memory/hypothesis machinery.
 - **Auth:** `Token token=<key>` with the versioned `Accept:
   application/vnd.pagerduty+json;version=2` header (REST v2 versions via Accept),
   configured via new settings `pagerduty_api_token` / `pagerduty_base_url` (secrets via
-  env/.env, consistent with existing conventions).
+  env/.env, consistent with existing conventions). Requests include
+  `include[]=teams,escalation_policies,assignees` so ownership fields are present even on
+  accounts where the default list response omits them. Throttling honors both
+  `Retry-After` and PagerDuty's documented `ratelimit-reset` header (capped at 60s).
 - **Pagination:** classic PagerDuty offset/`more` loop, page size 100, `max_items` cap
   (validated ≥ 1) — an improvement over the OpenSRE client, which fetches a single page.
   Requests pin `sort_by=created_at:asc` so offset paging is stable while incidents arrive
   mid-crawl. Windows wider than PagerDuty's six-month `since`/`until` cap are split into
-  contiguous 180-day sub-windows (deduplicated by incident id). Hitting `max_items` with
-  pages remaining returns a `truncated` flag that surfaces as a CLI warning — a capped
-  import never silently poses as complete history. Offset advances by the server's raw
+  contiguous 180-day sub-windows (deduplicated by incident id). Paging stops cleanly
+  before PagerDuty's 10k `limit+offset` ceiling instead of erroring mid-import. Hitting
+  `max_items` or the offset ceiling returns a `truncated` flag that surfaces as a CLI
+  warning (advising narrower windows) — a capped import never silently poses as complete
+  history. Offset advances by the server's raw
   batch length (pre-filter) so malformed entries cannot skew subsequent offsets.
   Non-object JSON responses yield no items; invalid JSON raises.
 - **Retries:** bounded (3), exponential backoff capped at 8s, honors `Retry-After` on
@@ -135,7 +140,8 @@ command execution, and all agent/RCA/memory/hypothesis machinery.
   no code copied verbatim.
 - **Termination:** `learn_pagerduty_incidents()` converts each incident to a
   `LearnedArtifact` (`artifact_type="incident"`, `source_vendor="pagerduty"`,
-  `source_instance=<base_url>`, `external_id=<incident id>`,
+  `source_instance=<account host from html_url>` so two PagerDuty accounts imported into
+  one store cannot collide on incident ids, `external_id=<incident id>`,
   `provenance_url=<html_url>`; stable ids also appear in an inert `pagerduty ids:` body
   line) and feeds `learn_artifact(..., PagerDutyIncidentExtractor())` — a thin wrapper
   over `IncidentExtractor` that (a) accepts ownership hints only from the
@@ -156,7 +162,7 @@ command execution, and all agent/RCA/memory/hypothesis machinery.
 
 ## 6. Tests
 
-`tests/unit/test_pagerduty_integration.py` (32 tests):
+`tests/unit/test_pagerduty_integration.py` (37 tests):
 
 - auth/config parsing (missing-token error; settings-driven token/base URL; `Token token=`
   header; versioned `Accept` header)
@@ -185,7 +191,7 @@ The sandbox has Python 3.10 only (repo targets ≥3.12; the pinned interpreter c
 downloaded there), so tests ran under 3.10 with a two-line stdlib compat shim
 (`datetime.UTC`, `enum.StrEnum`). Results:
 
-- `tests/unit/test_pagerduty_integration.py`: **32 passed**
+- `tests/unit/test_pagerduty_integration.py`: **37 passed**
 - `tests/unit/test_artifact_learning.py`: **46 passed** (no regressions)
 - broader unit suite: **559 passed**; remaining failures/errors are pre-existing sandbox
   environment gaps only (missing optional deps `openai`/`boto3`, and modules using PEP 695
