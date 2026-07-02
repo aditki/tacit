@@ -12,6 +12,7 @@ from tacit.config import Settings
 from tacit.integrations.pagerduty import (
     PagerDutyClient,
     PagerDutyConfigError,
+    PagerDutyIncidentExtractor,
     incident_artifact,
     learn_pagerduty_incidents,
     normalize_incident,
@@ -116,10 +117,60 @@ async def test_retry_on_429_honors_retry_after():
         return httpx.Response(200, json={"incidents": [_raw_incident(1)], "more": False})
 
     async with _client(handler) as client:
-        incidents = await client.list_incidents()
+        incidents = await client.list_incidents(since="2026-01-01T00:00:00Z")
 
     assert attempts["n"] == 2
     assert incidents[0]["id"] == "PD1"
+
+
+@pytest.mark.asyncio
+async def test_retry_after_is_capped(monkeypatch):
+    """A hostile/broken Retry-After must not hang the client for an hour."""
+    import tacit.integrations.pagerduty as pd
+
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(pd.asyncio, "sleep", fake_sleep)
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "3600"})
+        return httpx.Response(200, json={"incidents": [], "more": False})
+
+    async with _client(handler) as client:
+        await client.list_incidents()
+
+    assert delays == [pd._MAX_RETRY_AFTER]
+
+
+@pytest.mark.asyncio
+async def test_transport_error_raises_without_final_sleep(monkeypatch):
+    import tacit.integrations.pagerduty as pd
+
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(pd.asyncio, "sleep", fake_sleep)
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        raise httpx.ConnectError("boom", request=request)
+
+    async with _client(handler) as client:
+        with pytest.raises(httpx.ConnectError):
+            await client.list_incidents()
+
+    assert attempts["n"] == pd._MAX_RETRIES + 1
+    # No wasted sleep after the final failed attempt.
+    assert len(delays) == pd._MAX_RETRIES
 
 
 @pytest.mark.asyncio
@@ -130,6 +181,79 @@ async def test_non_retryable_error_raises():
     async with _client(handler) as client:
         with pytest.raises(httpx.HTTPStatusError):
             await client.list_incidents()
+
+
+@pytest.mark.asyncio
+async def test_multi_value_filters_use_repeated_array_params():
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.extend(request.url.params.multi_items())
+        return httpx.Response(200, json={"incidents": [], "more": False})
+
+    async with _client(handler) as client:
+        await client.list_incidents(
+            statuses=["triggered", "resolved"],
+            service_ids=["SVC1", "SVC2"],
+        )
+
+    assert seen.count(("statuses[]", "triggered")) == 1
+    assert seen.count(("statuses[]", "resolved")) == 1
+    assert seen.count(("service_ids[]", "SVC1")) == 1
+    assert seen.count(("service_ids[]", "SVC2")) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_limit", [0, -5])
+async def test_non_positive_max_items_rejected(bad_limit):
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("no request should be made")
+
+    async with _client(handler) as client:
+        with pytest.raises(ValueError):
+            await client.list_incidents(max_items=bad_limit)
+
+
+@pytest.mark.asyncio
+async def test_non_dict_json_yields_no_incidents():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2, 3])
+
+    async with _client(handler) as client:
+        assert await client.list_incidents() == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_raises():
+    import json as jsonlib
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="not json", headers={"Content-Type": "application/json"})
+
+    async with _client(handler) as client:
+        with pytest.raises(jsonlib.JSONDecodeError):
+            await client.list_incidents()
+
+
+@pytest.mark.asyncio
+async def test_pagination_offset_advances_by_raw_batch_length():
+    """Non-dict entries are filtered from results but must still advance offset."""
+    offsets: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        offsets.append(request.url.params.get("offset", "0"))
+        if request.url.params.get("offset") == "0":
+            return httpx.Response(
+                200,
+                json={"incidents": [_raw_incident(1), "malformed", _raw_incident(2)], "more": True},
+            )
+        return httpx.Response(200, json={"incidents": [_raw_incident(3)], "more": False})
+
+    async with _client(handler) as client:
+        incidents = await client.list_incidents()
+
+    assert [i["id"] for i in incidents] == ["PD1", "PD2", "PD3"]
+    assert offsets == ["0", "3"]  # raw length (3), not filtered length (2)
 
 
 # ── Normalization: metadata only ─────────────────────────────────────────
@@ -148,6 +272,24 @@ def test_normalize_incident_excludes_free_text_fields():
     assert "caused by" not in dumped
     assert normalized["service"] == "checkout-api"
     assert normalized["teams"] == ["payments-team"]
+
+
+def test_normalize_incident_preserves_stable_ids():
+    normalized = normalize_incident(_raw_incident(1))
+    assert normalized["service_id"] == "SVC1"
+    assert normalized["escalation_policy_id"] == "EP1"
+    assert normalized["team_ids"] == ["T1"]
+    assert normalized["assignee_ids"] == ["U1"]
+
+
+def test_ownership_hint_attaches_to_service_not_title():
+    artifact = incident_artifact(normalize_incident(_raw_incident(1)), source_instance="https://api.pd")
+    result = PagerDutyIncidentExtractor().extract(artifact)
+
+    assert len(result.ownership_hints) == 1
+    hint = result.ownership_hints[0]
+    assert hint.entity == "checkout-api"
+    assert hint.owner == "payments-team"
 
 
 # ── Safety: no RCA/culprit claims emitted ────────────────────────────────
@@ -219,6 +361,42 @@ async def test_dry_run_does_not_open_signal_store(monkeypatch):
     assert result["dry_run"] is True
     assert result["artifacts_discovered"] == 1
     assert result["artifacts_learned"] == 0
+
+
+# ── CLI contract ─────────────────────────────────────────────────────────
+
+
+def test_cli_requires_since():
+    from click.testing import CliRunner
+
+    from tacit.cli import cli
+
+    result = CliRunner().invoke(cli, ["learn", "pagerduty"])
+    assert result.exit_code != 0
+    assert "--since" in result.output
+
+
+def test_cli_rejects_non_positive_limit():
+    from click.testing import CliRunner
+
+    from tacit.cli import cli
+
+    result = CliRunner().invoke(cli, ["learn", "pagerduty", "--since", "2026-01-01T00:00:00Z", "--limit", "0"])
+    assert result.exit_code != 0
+    assert "--limit" in result.output
+
+
+def test_cli_exits_nonzero_on_failure(monkeypatch):
+    """Unconfigured token must produce a failing exit code, not silent success."""
+    from click.testing import CliRunner
+
+    from tacit.cli import cli
+
+    monkeypatch.delenv("PAGERDUTY_API_TOKEN", raising=False)
+    monkeypatch.setattr("tacit.config.settings.pagerduty_api_token", "")
+    result = CliRunner().invoke(cli, ["learn", "pagerduty", "--since", "2026-01-01T00:00:00Z"])
+    assert result.exit_code == 1
+    assert "PagerDuty learning failed" in result.output
 
 
 @pytest.mark.asyncio

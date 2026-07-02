@@ -110,7 +110,6 @@ class Settings(BaseSettings):
     signalfx_dashboard_group: str = "Tacit"
 
     # PagerDuty (read-only incident-metadata ingestion for artifact learning)
-    pagerduty_enabled: bool = False
     pagerduty_api_token: str = Field(default="", repr=False)
     pagerduty_base_url: str = "https://api.pagerduty.com"
 

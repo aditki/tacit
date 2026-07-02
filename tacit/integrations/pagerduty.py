@@ -26,12 +26,19 @@ docs/research/opensre-integration-review.md for license/attribution notes.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 import httpx
 import structlog
 
-from tacit.artifact_learning import IncidentExtractor, LearnedArtifact, artifact_from_text, learn_artifact
+from tacit.artifact_learning import (
+    ExtractionResult,
+    IncidentExtractor,
+    LearnedArtifact,
+    artifact_from_text,
+    learn_artifact,
+)
 from tacit.config import Settings, settings
 
 logger = structlog.get_logger()
@@ -39,6 +46,7 @@ logger = structlog.get_logger()
 _DEFAULT_TIMEOUT = 30.0
 _PAGE_LIMIT = 100  # PagerDuty API maximum per page
 _MAX_RETRIES = 3
+_MAX_RETRY_AFTER = 60.0  # cap header-provided delays so a bad proxy can't hang the CLI
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
@@ -87,17 +95,25 @@ class PagerDutyClient:
     # ── Low-level helpers ────────────────────────────────────────────────
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """GET with bounded retry on 429/5xx, honoring Retry-After."""
-        last_exc: Exception | None = None
+        """GET with bounded retry on 429/5xx, honoring (capped) Retry-After.
+
+        Returns ``{}`` for valid-JSON responses that are not objects; invalid
+        JSON raises ``json.JSONDecodeError``.
+        """
         for attempt in range(_MAX_RETRIES + 1):
             try:
                 resp = await self._client.get(path, params=params)
-            except httpx.TransportError as exc:
-                last_exc = exc
+            except httpx.TransportError:
+                if attempt >= _MAX_RETRIES:
+                    raise
                 await asyncio.sleep(min(2**attempt, 8))
                 continue
             if resp.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
-                delay = _retry_after_seconds(resp) or min(2**attempt, 8)
+                header_delay = _retry_after_seconds(resp)
+                delay = header_delay if header_delay is not None else min(2**attempt, 8)
+                if delay > _MAX_RETRY_AFTER:
+                    logger.warning("pagerduty_retry_after_clamped", path=path, requested=delay)
+                    delay = _MAX_RETRY_AFTER
                 logger.warning(
                     "pagerduty_retry",
                     path=path,
@@ -110,7 +126,7 @@ class PagerDutyClient:
             resp.raise_for_status()
             data = resp.json()
             return data if isinstance(data, dict) else {}
-        raise httpx.TransportError(f"PagerDuty request failed after retries: {path}") from last_exc
+        raise httpx.TransportError(f"PagerDuty request failed after retries: {path}")  # pragma: no cover
 
     async def _paginate(
         self,
@@ -120,17 +136,23 @@ class PagerDutyClient:
         max_items: int = 1000,
     ) -> list[dict[str, Any]]:
         """Iterate PagerDuty classic (offset/more) pagination."""
+        if max_items < 1:
+            raise ValueError(f"max_items must be >= 1, got {max_items}")
         items: list[dict[str, Any]] = []
         offset = 0
         while len(items) < max_items:
             page_params = dict(params or {})
             page_params.update({"limit": _PAGE_LIMIT, "offset": offset})
             data = await self._get(path, params=page_params)
-            batch = [item for item in data.get(collection_key, []) if isinstance(item, dict)]
-            items.extend(batch)
-            if not data.get("more") or not batch:
+            raw_batch = data.get(collection_key, [])
+            if not isinstance(raw_batch, list):
+                raw_batch = []
+            items.extend(item for item in raw_batch if isinstance(item, dict))
+            if not data.get("more") or not raw_batch:
                 break
-            offset += len(batch)
+            # Advance by the server's returned collection length (pre-filter),
+            # so the next offset matches the API's view of what was served.
+            offset += len(raw_batch)
         return items[:max_items]
 
     # ── Incidents (read-only) ────────────────────────────────────────────
@@ -174,12 +196,23 @@ def _ref_name(obj: dict[str, Any] | None) -> str:
     return str(obj.get("summary") or obj.get("name") or "")
 
 
+def _ref_id(obj: dict[str, Any] | None) -> str:
+    if not isinstance(obj, dict):
+        return ""
+    return str(obj.get("id") or "")
+
+
 def normalize_incident(inc: dict[str, Any]) -> dict[str, Any]:
     """Normalize a raw PagerDuty incident to metadata-only fields.
 
-    Field selection adapted from OpenSRE (Apache-2.0). Free-text fields such
-    as notes and log-entry messages are intentionally excluded.
+    Display names are kept for readable artifact bodies; stable PagerDuty ids
+    (``*_id`` / ``*_ids``) are kept alongside them so learned context survives
+    renames and name collisions. Field selection adapted from OpenSRE
+    (Apache-2.0). Free-text fields such as notes and log-entry messages are
+    intentionally excluded.
     """
+    assignments = [a for a in inc.get("assignments", []) if isinstance(a, dict)]
+    teams = [t for t in inc.get("teams", []) if isinstance(t, dict)]
     return {
         "id": str(inc.get("id", "")),
         "incident_number": inc.get("incident_number"),
@@ -187,17 +220,39 @@ def normalize_incident(inc: dict[str, Any]) -> dict[str, Any]:
         "status": str(inc.get("status", "")),
         "urgency": str(inc.get("urgency", "")),
         "service": _ref_name(inc.get("service")),
+        "service_id": _ref_id(inc.get("service")),
         "escalation_policy": _ref_name(inc.get("escalation_policy")),
-        "teams": [_ref_name(t) for t in inc.get("teams", []) if _ref_name(t)],
-        "assigned_to": [
-            _ref_name(a.get("assignee"))
-            for a in inc.get("assignments", [])
-            if isinstance(a, dict) and _ref_name(a.get("assignee"))
-        ],
+        "escalation_policy_id": _ref_id(inc.get("escalation_policy")),
+        "teams": [_ref_name(t) for t in teams if _ref_name(t)],
+        "team_ids": [_ref_id(t) for t in teams if _ref_id(t)],
+        "assigned_to": [_ref_name(a.get("assignee")) for a in assignments if _ref_name(a.get("assignee"))],
+        "assignee_ids": [_ref_id(a.get("assignee")) for a in assignments if _ref_id(a.get("assignee"))],
         "created_at": str(inc.get("created_at", "")),
         "resolved_at": str(inc.get("resolved_at") or ""),
         "html_url": str(inc.get("html_url", "")),
     }
+
+
+class PagerDutyIncidentExtractor(IncidentExtractor):
+    """``IncidentExtractor`` with PagerDuty-aware ownership attribution.
+
+    The base extractor attaches ownership hints to the artifact *title*, which
+    varies per incident. PagerDuty incidents carry a stable ``service:`` line
+    in the connector-generated body, so re-point ownership hints at the
+    service entity instead. No other extraction behavior changes.
+    """
+
+    _SERVICE_LINE_RE = re.compile(r"^service:\s*(?P<service>.+)$", re.M)
+
+    def extract(self, artifact: LearnedArtifact) -> ExtractionResult:
+        result = super().extract(artifact)
+        match = self._SERVICE_LINE_RE.search(artifact.body_text)
+        if match:
+            service = match.group("service").strip()
+            if service:
+                for hint in result.ownership_hints:
+                    hint.entity = service
+        return result
 
 
 def incident_artifact(incident: dict[str, Any], *, source_instance: str) -> LearnedArtifact:
@@ -222,6 +277,13 @@ def incident_artifact(incident: dict[str, Any], *, source_instance: str) -> Lear
         lines.append(f"created at {incident['created_at']}")
     if incident.get("resolved_at"):
         lines.append(f"resolved at {incident['resolved_at']}")
+    # Stable PagerDuty ids as an inert reference line (survives renames).
+    id_parts = [f"incident={incident.get('id', '')}"]
+    if incident.get("service_id"):
+        id_parts.append(f"service={incident['service_id']}")
+    if incident.get("team_ids"):
+        id_parts.append(f"teams={','.join(incident['team_ids'])}")
+    lines.append(f"pagerduty ids: {' '.join(id_parts)}")
     return artifact_from_text(
         artifact_type="incident",
         title=incident.get("title", "") or f"PagerDuty incident {incident.get('id', '')}",
@@ -252,7 +314,7 @@ async def learn_pagerduty_incidents(
         until=until,
         max_items=max_items,
     )
-    extractor = IncidentExtractor()
+    extractor = PagerDutyIncidentExtractor()
     learned = [
         learn_artifact(
             incident_artifact(inc, source_instance=client.base_url),

@@ -1031,8 +1031,13 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
 
 
 @learn.command("pagerduty")
-@click.option("--since", default=None, help="ISO8601 start of the incident window")
-@click.option("--until", default=None, help="ISO8601 end of the incident window")
+@click.option(
+    "--since",
+    required=True,
+    help="ISO8601 start of the incident window (required: without it the "
+    "PagerDuty API silently returns only its default recent window, not history)",
+)
+@click.option("--until", default=None, help="ISO8601 end of the incident window (default: now)")
 @click.option(
     "--status",
     "statuses",
@@ -1041,9 +1046,9 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
     show_default=True,
     help="Incident status filter (repeatable): triggered, acknowledged, resolved",
 )
-@click.option("--limit", default=1000, show_default=True, help="Maximum incidents to fetch")
+@click.option("--limit", default=1000, show_default=True, type=click.IntRange(min=1), help="Maximum incidents to fetch")
 @click.option("--dry-run", is_flag=True, help="Preview extraction without persisting learned context")
-def learn_pagerduty(since: str | None, until: str | None, statuses: tuple[str, ...], limit: int, dry_run: bool):
+def learn_pagerduty(since: str, until: str | None, statuses: tuple[str, ...], limit: int, dry_run: bool):
     """Learn incident metadata from PagerDuty (read-only)."""
     _header("Learn PagerDuty Incidents")
     _load_env()
@@ -1067,7 +1072,7 @@ def learn_pagerduty(since: str | None, until: str | None, statuses: tuple[str, .
         result = asyncio.run(_run())
     except Exception as e:
         _fail(f"PagerDuty learning failed: {e}")
-        return
+        raise SystemExit(1) from e
     _print_artifact_learning_summary(result)
 
 

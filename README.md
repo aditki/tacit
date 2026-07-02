@@ -156,7 +156,9 @@ no notes or causal narratives are ingested):
 tacit learn pagerduty --since 2026-01-01T00:00:00Z --dry-run
 ```
 
-Set `pagerduty_api_token` via env or `.env`. See
+`--since` is required: the PagerDuty list API otherwise returns only its
+default recent window, not full history. Set `pagerduty_api_token` via env or
+`.env`. See
 [docs/research/opensre-integration-review.md](docs/research/opensre-integration-review.md)
 for design notes.
 

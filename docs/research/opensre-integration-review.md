@@ -109,37 +109,53 @@ command execution, and all agent/RCA/memory/hypothesis machinery.
 **`tacit/integrations/pagerduty.py`** — read-only PagerDuty incident-metadata connector.
 
 - **Auth:** `Token token=<key>` (REST API v2), configured via new settings
-  `pagerduty_enabled` / `pagerduty_api_token` / `pagerduty_base_url` (secrets via env/.env,
-  consistent with existing conventions).
-- **Pagination:** classic PagerDuty offset/`more` loop, page size 100, `max_items` cap —
-  an improvement over the OpenSRE client, which fetches a single page.
+  `pagerduty_api_token` / `pagerduty_base_url` (secrets via env/.env, consistent with
+  existing conventions).
+- **Pagination:** classic PagerDuty offset/`more` loop, page size 100, `max_items` cap
+  (validated ≥ 1) — an improvement over the OpenSRE client, which fetches a single page.
+  Offset advances by the server's raw batch length (pre-filter) so malformed entries
+  cannot skew subsequent offsets. Non-object JSON responses yield no items; invalid JSON
+  raises.
 - **Retries:** bounded (3), exponential backoff capped at 8s, honors `Retry-After` on
-  429/5xx — also absent in the OpenSRE client (pattern informed by OpenSRE's incident.io
-  client).
+  429/5xx clamped to 60s (a hostile/broken header cannot hang the CLI); transport errors
+  raise immediately on the final attempt (no wasted terminal sleep). Absent in the
+  OpenSRE client (pattern informed by OpenSRE's incident.io client).
 - **Normalization:** `normalize_incident()` keeps metadata only (id, number, title, status,
-  urgency, service, escalation policy, teams, assignees, timestamps, `html_url`).
-  Free-text fields (descriptions, notes, log-entry messages) are deliberately excluded so
-  the connector cannot smuggle causal narratives into the store. Field selection adapted
-  from OpenSRE `integrations/pagerduty/client.py` (Apache-2.0) — attribution in the module
-  docstring; no code copied verbatim.
+  urgency, service, escalation policy, teams, assignees, timestamps, `html_url`), with
+  stable PagerDuty ids (`service_id`, `escalation_policy_id`, `team_ids`, `assignee_ids`)
+  preserved alongside display names so learned context survives renames. Free-text fields
+  (descriptions, notes, log-entry messages) are deliberately excluded so the connector
+  cannot smuggle causal narratives into the store. Field selection adapted from OpenSRE
+  `integrations/pagerduty/client.py` (Apache-2.0) — attribution in the module docstring;
+  no code copied verbatim.
 - **Termination:** `learn_pagerduty_incidents()` converts each incident to a
   `LearnedArtifact` (`artifact_type="incident"`, `source_vendor="pagerduty"`,
   `source_instance=<base_url>`, `external_id=<incident id>`,
-  `provenance_url=<html_url>`) and feeds `learn_artifact(..., IncidentExtractor())` — the
-  same untrusted-input path as file-based incidents, so causal-claim suppression and
-  body-text sanitization apply unchanged.
+  `provenance_url=<html_url>`; stable ids also appear in an inert `pagerduty ids:` body
+  line) and feeds `learn_artifact(..., PagerDutyIncidentExtractor())` — a thin wrapper
+  over `IncidentExtractor` that re-points ownership hints at the stable `service:` entity
+  instead of the per-incident title. Same untrusted-input path as file-based incidents,
+  so causal-claim suppression and body-text sanitization apply unchanged.
 - **Dry run:** `--dry-run` extracts and summarizes without touching the signal store.
-- **CLI:** `tacit learn pagerduty [--since --until --status --limit --dry-run]`.
+- **CLI:** `tacit learn pagerduty --since <ISO8601> [--until --status --limit --dry-run]`.
+  `--since` is required (the PagerDuty list API otherwise silently serves only its default
+  recent window); `--limit` must be ≥ 1; failures exit non-zero for CI/cron use.
 - **Write operations:** none. The client exposes GET-only methods.
 
 ## 6. Tests
 
-`tests/unit/test_pagerduty_integration.py` (12 tests):
+`tests/unit/test_pagerduty_integration.py` (25 tests):
 
 - auth/config parsing (missing-token error; settings-driven token/base URL; `Token token=` header)
-- pagination follows the `more` flag across offsets; retry honors `Retry-After` on 429;
-  non-retryable 401 raises
-- normalization excludes free-text fields (description / trigger log entries)
+- pagination follows the `more` flag across offsets and advances by raw batch length past
+  malformed entries; multi-value filters encode as repeated `statuses[]`/`service_ids[]`
+  params; non-positive `max_items` rejected; non-dict JSON yields no incidents; invalid
+  JSON raises
+- retry honors `Retry-After` on 429 and clamps hostile values to the 60s cap; transport
+  errors exhaust retries without a wasted final sleep; non-retryable 401 raises
+- normalization excludes free-text fields (description / trigger log entries) and
+  preserves stable ids; ownership hints attach to the service entity, not the title
+- CLI contract: `--since` required, `--limit` ≥ 1 enforced, failures exit non-zero
 - **safety:** causal claim leaking through an incident title is suppressed by
   `IncidentExtractor` (warning emitted, no extraction carries the claim); prompt-injection
   text is treated as inert data (no extractions produced)
@@ -152,7 +168,7 @@ The sandbox has Python 3.10 only (repo targets ≥3.12; the pinned interpreter c
 downloaded there), so tests ran under 3.10 with a two-line stdlib compat shim
 (`datetime.UTC`, `enum.StrEnum`). Results:
 
-- `tests/unit/test_pagerduty_integration.py`: **12 passed**
+- `tests/unit/test_pagerduty_integration.py`: **25 passed**
 - `tests/unit/test_artifact_learning.py`: **46 passed** (no regressions)
 - broader unit suite: **559 passed**; remaining failures/errors are pre-existing sandbox
   environment gaps only (missing optional deps `openai`/`boto3`, and modules using PEP 695
