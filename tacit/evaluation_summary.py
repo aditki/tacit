@@ -290,11 +290,7 @@ _ANON_ID_RE = re.compile(r"^[a-z][a-z0-9_]*_[0-9]{3,6}$")
 _HASH_RE = re.compile(r"^sha256:[0-9a-f]{16,64}$")
 _TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 _VERSION_RE = re.compile(
-    r"^(?:"
-    r"v?\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.]+)?"
-    r"|version_hash_[0-9a-f]{16}"
-    r"|[0-9a-f]{7,40}"
-    r")$"
+    r"^(?:" r"v?\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.]+)?" r"|version_hash_[0-9a-f]{16}" r"|[0-9a-f]{7,40}" r")$"
 )
 _FREE_TEXT_RE = re.compile(r"^[A-Za-z0-9 .,()\-]{1,200}$")
 
