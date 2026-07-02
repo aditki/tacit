@@ -1364,11 +1364,13 @@ def export_report(anonymous: bool, output: Path | None, validate_bundle: bool):
     _info(f"Files: {len(result.files)}")
     if anonymous:
         _info("Anonymous bundle excludes raw artifact text and anonymization mappings.")
-    validation = result.validation_report
-    if validation.get("passed"):
-        _success("Leakage validation passed")
+        validation = result.validation_report
+        if validation.get("passed"):
+            _success("Leakage validation passed")
+        else:
+            _warn(f"Leakage validation findings: {validation.get('findings_count', 0)}")
     else:
-        _warn(f"Leakage validation findings: {validation.get('findings_count', 0)}")
+        _info("Leakage validation skipped for raw local export.")
 
 
 # ── tacit history ─────────────────────────────────────────────────────

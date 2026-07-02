@@ -23,6 +23,8 @@ from tacit import __version__
 AssessmentReport = dict[str, Any]
 
 ASSESSMENT_VERSION = "1"
+EXPORT_ROW_LIMIT = 10_000
+EXPORT_PAGE_SIZE = 1_000
 ANONYMOUS_BUNDLE_FILES = (
     "README.txt",
     "metadata.json",
@@ -51,6 +53,172 @@ _LEAKAGE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("hostname", HOSTNAME_RE),
 )
 
+SAFE_DATA_KEYS: dict[str, set[str]] = {
+    "status": {
+        "",
+        "approved",
+        "failed",
+        "ignored",
+        "pending",
+        "rejected",
+        "skipped",
+        "success",
+        "timeout",
+    },
+    "path": {"", "archetype", "freeform"},
+    "signal_category": {
+        "",
+        "availability",
+        "errors",
+        "latency",
+        "resource",
+        "saturation",
+        "throughput",
+    },
+    "mapping_source": {
+        "",
+        "alert_ingest",
+        "artifact_learning",
+        "bootstrap",
+        "dashboard_ingest",
+        "manual",
+    },
+    "backend": {"", "grafana", "signalfx"},
+    "artifact_type": {"", "alert", "dashboard", "incident", "runbook"},
+    "datasource_type": {
+        "",
+        "cloudwatch",
+        "cortex",
+        "elasticsearch",
+        "grafana",
+        "graphite",
+        "influxdb",
+        "loki",
+        "mimir",
+        "opensearch",
+        "prometheus",
+        "signalfx",
+        "thanos",
+    },
+    "confidence_bucket": {"high_ge_0.8", "low_gt_0", "medium_ge_0.5", "none"},
+    "error_kind": {"auth", "backend_config", "llm", "not_found", "other", "timeout"},
+    "reason_code": {
+        "",
+        "backend_config",
+        "datasource_issue",
+        "invalid_syntax",
+        "metric_not_in_catalog",
+        "no_data",
+        "no_series",
+        "not_implemented",
+        "other",
+        "timeout",
+        "validation_failed",
+    },
+    "warning_kind": {
+        "datasource_issue",
+        "empty_dashboard",
+        "invalid_syntax",
+        "metric_not_in_catalog",
+        "no_series",
+        "other",
+    },
+}
+
+DATA_KEY_PATHS: dict[str, str] = {
+    "$.assessment_summary.status_counts": "status",
+    "$.assessment_summary.path_counts": "path",
+    "$.knowledge_coverage.signals_by_category": "signal_category",
+    "$.knowledge_coverage.mappings_by_source": "mapping_source",
+    "$.knowledge_coverage.dashboard_review_states": "status",
+    "$.knowledge_coverage.alert_review_states": "status",
+    "$.knowledge_coverage.learned_artifact_types": "artifact_type",
+    "$.knowledge_coverage.backend_distribution": "backend",
+    "$.artifact_stats.dashboards.by_backend": "backend",
+    "$.artifact_stats.dashboards.by_status": "status",
+    "$.artifact_stats.alerts.by_backend": "backend",
+    "$.artifact_stats.alerts.by_status": "status",
+    "$.artifact_stats.learned_artifacts.by_type": "artifact_type",
+    "$.ranking_summary.path_counts": "path",
+    "$.ranking_summary.top_archetype_counts": "archetype",
+    "$.ranking_summary.all_archetype_counts": "archetype",
+    "$.ranking_summary.top_archetype_confidence_buckets": "confidence_bucket",
+    "$.ranking_summary.datasource_type_counts": "datasource_type",
+    "$.robustness_summary.stage_status_counts": "stage_status",
+    "$.robustness_summary.reason_code_counts": "reason_code",
+    "$.robustness_summary.error_kind_counts": "error_kind",
+    "$.robustness_summary.validation_warning_counts": "warning_kind",
+    "$.warnings.validation_warnings_by_kind": "warning_kind",
+}
+
+SAFE_SCHEMA_KEYS = {
+    "alert_review_states",
+    "alerts",
+    "anonymous",
+    "artifact_stats",
+    "assessment_summary",
+    "assessment_version",
+    "avg",
+    "backend_distribution",
+    "by_backend",
+    "by_status",
+    "by_type",
+    "checks",
+    "collection",
+    "count",
+    "dashboard_review_states",
+    "dashboards",
+    "emails_included",
+    "error_kind_counts",
+    "export_warnings",
+    "feedback",
+    "feedback_analysis_status",
+    "feedback_recommendation_count",
+    "findings",
+    "findings_count",
+    "generated_at",
+    "graph_preserved",
+    "hostnames_included",
+    "ingested_alerts",
+    "ingested_dashboards",
+    "investigations",
+    "knowledge_coverage",
+    "learned_artifact_types",
+    "learned_artifacts",
+    "learning",
+    "mapping_included",
+    "mappings_by_source",
+    "max",
+    "metadata",
+    "min",
+    "panel_count",
+    "passed",
+    "path_counts",
+    "ranking_summary",
+    "raw_artifacts_included",
+    "reason_code_counts",
+    "robustness_summary",
+    "row_limit",
+    "rows_exported",
+    "scope",
+    "signal_types",
+    "signals_by_category",
+    "signals_inferred",
+    "source_total",
+    "stage_status_counts",
+    "status_counts",
+    "stale",
+    "tacit_version",
+    "telemetry_included",
+    "top_archetype_confidence_buckets",
+    "top_archetype_counts",
+    "truncated",
+    "validation_report",
+    "validation_warning_counts",
+    "validation_warnings_by_kind",
+    "warnings",
+}
+
 
 @dataclass
 class ExportResult:
@@ -70,7 +238,7 @@ class ReportAnonymizer:
         self._counters: dict[str, int] = defaultdict(int)
 
     def anonymize_report(self, report: AssessmentReport) -> AssessmentReport:
-        return self._walk(report)
+        return self._walk(report, "$")
 
     def anonymize_value(self, value: str, kind: str) -> str:
         key = (kind, value)
@@ -79,21 +247,35 @@ class ReportAnonymizer:
             self._mapping[key] = f"{kind}_{self._counters[kind]:03d}"
         return self._mapping[key]
 
-    def _walk(self, value: Any) -> Any:
+    def _walk(self, value: Any, path: str) -> Any:
         if isinstance(value, dict):
             out: dict[str, Any] = {}
+            key_kind = DATA_KEY_PATHS.get(path)
             for key, item in value.items():
+                safe_key = self._sanitize_key(str(key), key_kind) if key_kind else str(key)
                 if isinstance(item, str):
-                    kind = _kind_for_key(str(key))
-                    out[key] = self._sanitize_string(item, kind)
+                    kind = _kind_for_key(safe_key)
+                    out[safe_key] = self._sanitize_string(item, kind)
                 else:
-                    out[key] = self._walk(item)
+                    out[safe_key] = self._walk(item, f"{path}.{safe_key}")
             return out
         if isinstance(value, list):
-            return [self._walk(item) for item in value]
+            return [self._walk(item, f"{path}[]") for item in value]
         if isinstance(value, str):
             return self._sanitize_string(value, "value")
         return value
+
+    def _sanitize_key(self, value: str, kind: str | None) -> str:
+        if kind is None:
+            return value
+        if _safe_data_key(value, kind):
+            return value
+        if kind == "stage_status":
+            stage, _sep, status = value.partition(":")
+            safe_stage = stage if stage in _safe_stage_names() else self.anonymize_value(stage, "stage")
+            safe_status = status if _safe_data_key(status, "status") else self.anonymize_value(status, "status")
+            return f"{safe_stage}:{safe_status}" if status else safe_stage
+        return self.anonymize_value(value, kind)
 
     def _sanitize_string(self, value: str, kind: str) -> str:
         if not value:
@@ -139,17 +321,25 @@ def build_assessment_report(*, anonymous: bool) -> AssessmentReport:
     feedback_store = get_feedback_store()
     signal_store = get_signal_store()
 
-    investigations = history_store.list_recent(limit=10_000)
+    investigations = _collect_recent_investigations(history_store)
     history_stats = history_store.stats()
     feedback_stats = feedback_store.get_aggregate_stats()
     feedback_analysis = feedback_store.analyze()
     signal_stats = signal_store.stats()
-    dashboards = signal_store.list_ingested_dashboards(limit=10_000)
-    alerts = signal_store.list_ingested_alerts(limit=10_000)
-    learned_artifacts = signal_store.list_learned_artifacts(limit=10_000)
+    dashboards = signal_store.list_ingested_dashboards(limit=EXPORT_ROW_LIMIT)
+    alerts = signal_store.list_ingested_alerts(limit=EXPORT_ROW_LIMIT)
+    learned_artifacts = signal_store.list_learned_artifacts(limit=EXPORT_ROW_LIMIT)
+    collection = _collection_metadata(
+        investigations=investigations,
+        history_stats=history_stats,
+        dashboards=dashboards,
+        alerts=alerts,
+        learned_artifacts=learned_artifacts,
+        signal_stats=signal_stats,
+    )
 
     report: AssessmentReport = {
-        "metadata": _metadata(generated_at, anonymous=anonymous),
+        "metadata": _metadata(generated_at, anonymous=anonymous, collection=collection),
         "assessment_summary": _assessment_summary(
             investigations=investigations,
             history_stats=history_stats,
@@ -187,12 +377,10 @@ def export_assessment_report(
     report = build_assessment_report(anonymous=anonymous)
     if anonymous:
         report = ReportAnonymizer().anonymize_report(report)
-
-    validation_report = validate_report_for_leakage(report if anonymous else _anonymous_projection(report))
+        validation_report = _pending_validation_report()
+    else:
+        validation_report = _skipped_validation_report()
     report["validation_report"] = validation_report
-    if anonymous and validate and not validation_report["passed"]:
-        findings = validation_report["findings_count"]
-        raise ValueError(f"Anonymous report failed leakage validation with {findings} finding(s)")
 
     output_path = output or default_report_path(anonymous=anonymous)
     output_path = output_path.expanduser().resolve()
@@ -201,6 +389,16 @@ def export_assessment_report(
     with tempfile.TemporaryDirectory(prefix="tacit-assessment-") as tmp:
         tmp_path = Path(tmp)
         files = _write_report_files(tmp_path, report, anonymous=anonymous)
+        if anonymous:
+            validation_report = validate_report_files_for_leakage(tmp_path, files)
+            report["validation_report"] = validation_report
+            _write_json(tmp_path / "validation_report.json", validation_report)
+            validation_report = validate_report_files_for_leakage(tmp_path, files)
+            report["validation_report"] = validation_report
+            _write_json(tmp_path / "validation_report.json", validation_report)
+            if validate and not validation_report["passed"]:
+                findings = validation_report["findings_count"]
+                raise ValueError(f"Anonymous report failed leakage validation with {findings} finding(s)")
         with tarfile.open(output_path, "w:gz") as tar:
             for name in files:
                 tar.add(tmp_path / name, arcname=name)
@@ -216,7 +414,7 @@ def default_report_path(*, anonymous: bool) -> Path:
 def validate_report_for_leakage(report: AssessmentReport) -> dict[str, Any]:
     """Scan exported anonymous content for obvious leakage patterns."""
     findings: list[dict[str, str]] = []
-    for path, value in _iter_strings(report):
+    for path, value, location in _iter_strings(report):
         if _path_is_allowed_for_validation(path):
             continue
         for kind, pattern in _LEAKAGE_PATTERNS:
@@ -225,8 +423,9 @@ def validate_report_for_leakage(report: AssessmentReport) -> dict[str, Any]:
                 findings.append(
                     {
                         "path": path,
+                        "location": location,
                         "kind": kind,
-                        "sample": _sample(match.group(0)),
+                        "sample": _sample(kind),
                     }
                 )
     return {
@@ -237,7 +436,41 @@ def validate_report_for_leakage(report: AssessmentReport) -> dict[str, Any]:
     }
 
 
-def _metadata(generated_at: str, *, anonymous: bool) -> dict[str, Any]:
+def validate_report_files_for_leakage(root: Path, files: tuple[str, ...] | list[str]) -> dict[str, Any]:
+    """Scan the exact staged files that will be added to the anonymous archive."""
+    findings: list[dict[str, str]] = []
+    for filename in files:
+        path = root / filename
+        text = path.read_text(encoding="utf-8")
+        if filename.endswith(".json"):
+            try:
+                validation = validate_report_for_leakage(json.loads(text))
+            except json.JSONDecodeError:
+                findings.append(
+                    {
+                        "path": filename,
+                        "location": "file",
+                        "kind": "invalid_json",
+                        "sample": "<redacted>",
+                    }
+                )
+                continue
+            for finding in validation["findings"]:
+                finding = dict(finding)
+                finding["path"] = f"{filename}:{finding['path']}"
+                findings.append(finding)
+        else:
+            findings.extend(_scan_text(text, path=filename, location="file"))
+    return {
+        "passed": not findings,
+        "findings_count": len(findings),
+        "findings": findings[:100],
+        "checks": [kind for kind, _pattern in _LEAKAGE_PATTERNS],
+        "scope": "staged_archive_files",
+    }
+
+
+def _metadata(generated_at: str, *, anonymous: bool, collection: dict[str, Any]) -> dict[str, Any]:
     return {
         "tacit_version": __version__,
         "assessment_version": ASSESSMENT_VERSION,
@@ -249,6 +482,7 @@ def _metadata(generated_at: str, *, anonymous: bool) -> dict[str, Any]:
         "telemetry_included": False,
         "hostnames_included": False,
         "emails_included": False,
+        "collection": collection,
     }
 
 
@@ -403,22 +637,6 @@ def _raw_local_details(
     }
 
 
-def _anonymous_projection(report: AssessmentReport) -> AssessmentReport:
-    return {
-        key: value
-        for key, value in report.items()
-        if key in {
-            "metadata",
-            "assessment_summary",
-            "knowledge_coverage",
-            "artifact_stats",
-            "ranking_summary",
-            "robustness_summary",
-            "warnings",
-        }
-    }
-
-
 def _write_report_files(root: Path, report: AssessmentReport, *, anonymous: bool) -> tuple[str, ...]:
     readme = _anonymous_readme() if anonymous else _raw_readme()
     (root / "README.txt").write_text(readme, encoding="utf-8")
@@ -458,6 +676,86 @@ def _raw_readme() -> str:
 
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _collect_recent_investigations(history_store: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    offset = 0
+    while len(out) < EXPORT_ROW_LIMIT:
+        limit = min(EXPORT_PAGE_SIZE, EXPORT_ROW_LIMIT - len(out))
+        page = history_store.list_recent(limit=limit, offset=offset)
+        if not page:
+            break
+        out.extend(page)
+        if len(page) < limit:
+            break
+        offset += len(page)
+    return out
+
+
+def _collection_metadata(
+    *,
+    investigations: list[dict[str, Any]],
+    history_stats: dict[str, Any],
+    dashboards: list[dict[str, Any]],
+    alerts: list[dict[str, Any]],
+    learned_artifacts: list[dict[str, Any]],
+    signal_stats: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "investigations": _collection_entry(
+            rows_exported=len(investigations),
+            source_total=history_stats.get("total"),
+            row_limit=None,
+        ),
+        "ingested_dashboards": _collection_entry(
+            rows_exported=len(dashboards),
+            source_total=signal_stats.get("ingested_dashboards"),
+            row_limit=EXPORT_ROW_LIMIT,
+        ),
+        "ingested_alerts": _collection_entry(
+            rows_exported=len(alerts),
+            source_total=signal_stats.get("ingested_alerts"),
+            row_limit=EXPORT_ROW_LIMIT,
+        ),
+        "learned_artifacts": _collection_entry(
+            rows_exported=len(learned_artifacts),
+            source_total=signal_stats.get("learned_artifacts"),
+            row_limit=EXPORT_ROW_LIMIT,
+        ),
+    }
+
+
+def _collection_entry(*, rows_exported: int, source_total: Any, row_limit: int | None) -> dict[str, Any]:
+    total = int(source_total or rows_exported)
+    return {
+        "rows_exported": rows_exported,
+        "source_total": total,
+        "row_limit": row_limit,
+        "truncated": rows_exported < total,
+    }
+
+
+def _pending_validation_report() -> dict[str, Any]:
+    return {
+        "passed": False,
+        "findings_count": 0,
+        "findings": [],
+        "checks": [kind for kind, _pattern in _LEAKAGE_PATTERNS],
+        "scope": "pending_staged_archive_files",
+    }
+
+
+def _skipped_validation_report() -> dict[str, Any]:
+    return {
+        "passed": None,
+        "skipped": True,
+        "reason": "raw_local_export",
+        "findings_count": 0,
+        "findings": [],
+        "checks": [],
+        "scope": "not_applicable",
+    }
 
 
 def _safe_numbers(value: dict[str, Any]) -> dict[str, Any]:
@@ -546,12 +844,13 @@ def _export_warnings(*, anonymous: bool) -> list[str]:
 def _iter_strings(value: Any, path: str = "$"):
     if isinstance(value, dict):
         for key, item in value.items():
-            yield from _iter_strings(item, f"{path}.{key}")
+            yield f"{path}.<key>", str(key), "key"
+            yield from _iter_strings(item, f"{path}.{key}" if _schema_key_is_safe(str(key)) else f"{path}.<key>")
     elif isinstance(value, list):
         for index, item in enumerate(value):
             yield from _iter_strings(item, f"{path}[{index}]")
     elif isinstance(value, str):
-        yield path, value
+        yield path, value, "value"
 
 
 def _path_is_allowed_for_validation(path: str) -> bool:
@@ -563,8 +862,75 @@ def _path_is_allowed_for_validation(path: str) -> bool:
     return path in allowed
 
 
-def _sample(value: str) -> str:
-    return value[:4] + "..." if len(value) > 4 else value
+def _scan_text(text: str, *, path: str, location: str) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+    for kind, pattern in _LEAKAGE_PATTERNS:
+        if pattern.search(text):
+            findings.append(
+                {
+                    "path": path,
+                    "location": location,
+                    "kind": kind,
+                    "sample": _sample(kind),
+                }
+            )
+    return findings
+
+
+def _sample(kind: str) -> str:
+    return f"<redacted_{kind}>"
+
+
+def _schema_key_is_safe(key: str) -> bool:
+    return key in SAFE_SCHEMA_KEYS
+
+
+def _safe_data_key(value: str, kind: str) -> bool:
+    normalized = value.lower()
+    if normalized != value:
+        return False
+    safe_values = SAFE_DATA_KEYS.get(kind)
+    if safe_values is not None:
+        return normalized in safe_values
+    if kind == "archetype":
+        return bool(re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value)) and value in _safe_archetype_names()
+    return False
+
+
+def _contains_sensitive_shape(value: str) -> bool:
+    return any(pattern.search(value) for _kind, pattern in _LEAKAGE_PATTERNS)
+
+
+def _safe_stage_names() -> set[str]:
+    return {
+        "",
+        "archetypes",
+        "completion",
+        "context",
+        "discovery",
+        "evidence",
+        "freeform",
+        "intent",
+        "publish",
+        "ranking",
+        "validation",
+    }
+
+
+def _safe_archetype_names() -> set[str]:
+    return {
+        "database_slowdown",
+        "deployment_regression",
+        "downstream_outage",
+        "error_spike",
+        "general",
+        "golden_signals",
+        "latency_investigation",
+        "network_instability",
+        "pod_instability",
+        "queue_lag",
+        "resource_saturation",
+    }
 
 
 def _kind_for_key(key: str) -> str:
