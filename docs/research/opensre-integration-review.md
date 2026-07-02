@@ -138,7 +138,8 @@ command execution, and all agent/RCA/memory/hypothesis machinery.
   so causal-claim suppression and body-text sanitization apply unchanged.
 - **Dry run:** `--dry-run` extracts and summarizes without touching the signal store.
 - **CLI:** `tacit learn pagerduty --since <ISO8601> [--until --status --limit --dry-run]`.
-  `--since` is required (the PagerDuty list API otherwise silently serves only its default
+  `--since` is required at both the CLI and library level (`learn_pagerduty_incidents`
+  raises without it — the PagerDuty list API otherwise silently serves only its default
   recent window); `--limit` must be ≥ 1; failures exit non-zero for CI/cron use.
 - **Write operations:** none. The client exposes GET-only methods.
 

@@ -100,13 +100,16 @@ class PagerDutyClient:
         Returns ``{}`` for valid-JSON responses that are not objects; invalid
         JSON raises ``json.JSONDecodeError``.
         """
-        for attempt in range(_MAX_RETRIES + 1):
+        attempt = 0
+        while True:
             try:
                 resp = await self._client.get(path, params=params)
             except httpx.TransportError:
+                # Terminal path: the final attempt's error propagates as-is.
                 if attempt >= _MAX_RETRIES:
                     raise
                 await asyncio.sleep(min(2**attempt, 8))
+                attempt += 1
                 continue
             if resp.status_code in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
                 header_delay = _retry_after_seconds(resp)
@@ -122,11 +125,12 @@ class PagerDutyClient:
                     delay=delay,
                 )
                 await asyncio.sleep(delay)
+                attempt += 1
                 continue
+            # Terminal path: retries exhausted or non-retryable status.
             resp.raise_for_status()
             data = resp.json()
             return data if isinstance(data, dict) else {}
-        raise httpx.TransportError(f"PagerDuty request failed after retries: {path}")  # pragma: no cover
 
     async def _paginate(
         self,
@@ -298,16 +302,20 @@ def incident_artifact(incident: dict[str, Any], *, source_instance: str) -> Lear
 async def learn_pagerduty_incidents(
     client: PagerDutyClient,
     *,
+    since: str,
     statuses: list[str] | None = None,
-    since: str | None = None,
     until: str | None = None,
     max_items: int = 1000,
     dry_run: bool = False,
 ) -> dict[str, object]:
     """Fetch PagerDuty incident metadata and learn it as incident artifacts.
 
-    ``dry_run=True`` extracts and reports without persisting anything.
+    ``since`` (ISO8601) is required for all callers: without an explicit window
+    the PagerDuty list API silently serves only its default recent window, not
+    history. ``dry_run=True`` extracts and reports without persisting anything.
     """
+    if not since:
+        raise ValueError("since is required: an explicit ISO8601 window start prevents silent partial ingestion")
     incidents = await client.list_incidents(
         statuses=statuses or ["resolved"],
         since=since,

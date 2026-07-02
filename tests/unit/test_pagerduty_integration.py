@@ -55,18 +55,19 @@ def test_missing_token_raises_config_error():
         PagerDutyClient(runtime_settings=empty)
 
 
-def test_token_and_base_url_from_settings():
+@pytest.mark.asyncio
+async def test_token_and_base_url_from_settings():
     cfg = Settings(
         pagerduty_api_token="settings-token",
         pagerduty_base_url="https://api.eu.pagerduty.com/",
         _env_file=None,
     )
-    client = PagerDutyClient(
+    async with PagerDutyClient(
         runtime_settings=cfg,
         transport=httpx.MockTransport(lambda request: httpx.Response(200)),
-    )
-    assert client.api_token == "settings-token"
-    assert client.base_url == "https://api.eu.pagerduty.com"
+    ) as client:
+        assert client.api_token == "settings-token"
+        assert client.base_url == "https://api.eu.pagerduty.com"
 
 
 @pytest.mark.asyncio
@@ -356,11 +357,23 @@ async def test_dry_run_does_not_open_signal_store(monkeypatch):
         return httpx.Response(200, json={"incidents": [_raw_incident(1)], "more": False})
 
     async with _client(handler) as client:
-        result = await learn_pagerduty_incidents(client, dry_run=True)
+        result = await learn_pagerduty_incidents(client, since="2026-01-01T00:00:00Z", dry_run=True)
 
     assert result["dry_run"] is True
     assert result["artifacts_discovered"] == 1
     assert result["artifacts_learned"] == 0
+
+
+@pytest.mark.asyncio
+async def test_learn_requires_since():
+    """The history-safety contract holds for programmatic callers, not just the CLI."""
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("no request should be made")
+
+    async with _client(handler) as client:
+        with pytest.raises(ValueError, match="since is required"):
+            await learn_pagerduty_incidents(client, since="")
 
 
 # ── CLI contract ─────────────────────────────────────────────────────────
@@ -410,7 +423,7 @@ async def test_learn_persists_artifacts_with_provenance(tmp_path, monkeypatch):
         return httpx.Response(200, json={"incidents": [_raw_incident(1)], "more": False})
 
     async with _client(handler) as client:
-        result = await learn_pagerduty_incidents(client)
+        result = await learn_pagerduty_incidents(client, since="2026-01-01T00:00:00Z")
 
     assert result["artifacts_learned"] == 1
     learned = result["learned"][0]
