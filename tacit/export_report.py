@@ -583,9 +583,7 @@ def _artifact_stats(
             "by_status": dict(Counter(str(item.get("status", "")) for item in dashboards)),
             "panel_count": _numeric_summary([item.get("panel_count", 0) for item in dashboards]),
             "metrics_found": _numeric_summary([len(item.get("metrics_found", []) or []) for item in dashboards]),
-            "signals_inferred": _numeric_summary(
-                [len(item.get("signals_inferred", []) or []) for item in dashboards]
-            ),
+            "signals_inferred": _numeric_summary([len(item.get("signals_inferred", []) or []) for item in dashboards]),
         },
         "alerts": {
             "count": len(alerts),
@@ -622,11 +620,7 @@ def _ranking_summary(investigations: list[dict[str, Any]]) -> dict[str, Any]:
         "all_archetype_counts": dict(archetype_counts),
         "top_archetype_confidence_buckets": dict(confidence_buckets),
         "datasource_type_counts": dict(
-            Counter(
-                str(ds)
-                for inv in investigations
-                for ds in (inv.get("datasource_types", []) or [])
-            )
+            Counter(str(ds) for inv in investigations for ds in (inv.get("datasource_types", []) or []))
         ),
         "metrics_catalog_size": _numeric_summary([inv.get("metrics_catalog_size", 0) for inv in investigations]),
         "metrics_ranked_size": _numeric_summary([inv.get("metrics_ranked_size", 0) for inv in investigations]),
