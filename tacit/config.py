@@ -109,6 +109,11 @@ class Settings(BaseSettings):
     signalfx_realm: str = "us1"  # us0, us1, us2, eu0, jp0, au0
     signalfx_dashboard_group: str = "Tacit"
 
+    # PagerDuty (read-only incident-metadata ingestion for artifact learning)
+    pagerduty_enabled: bool = False
+    pagerduty_api_token: str = Field(default="", repr=False)
+    pagerduty_base_url: str = "https://api.pagerduty.com"
+
     # Slack
     slack_bot_token: str = Field(default="", repr=False)
     slack_app_token: str = Field(default="", repr=False)
