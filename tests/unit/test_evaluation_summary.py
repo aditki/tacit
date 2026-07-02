@@ -218,6 +218,44 @@ def test_adapters_hash_private_slug_versions_before_export():
     assert "checkout-api" not in json.dumps(summary)
 
 
+def test_adapters_hash_private_snake_case_version_slugs_before_export():
+    report = evaluate()
+    report["version"] = "checkout_api_v1"
+    report["runner_version"] = "prod_payments_v2"
+
+    summary = build_evaluation_summary([report])
+    evaluation = summary["evaluations"][0]
+
+    assert evaluation["benchmark_version"].startswith("version_hash_")
+    assert evaluation["runner_version"].startswith("version_hash_")
+    assert "checkout_api_v1" not in json.dumps(summary)
+    assert "prod_payments_v2" not in json.dumps(summary)
+
+
+def test_preshaped_summary_rejects_private_snake_case_version_slugs():
+    raw_entry = {
+        "benchmark_name": "contextual_culprit_ranking",
+        "benchmark_version": "checkout_api_v1",
+        "dataset_hash": "sha256:0123456789abcdef",
+        "runner_version": "prod_payments_v2",
+        "generated_at": "2026-07-02T04:15:00Z",
+        "mode": "gate",
+        "context_available": [],
+        "anonymous": True,
+        "raw_inputs_included": False,
+        "contract": {},
+        "metrics": {},
+        "random_baselines": {},
+        "stage_counts": {},
+        "failure_reasons": {},
+        "per_case": [],
+    }
+
+    summary = build_evaluation_summary([{"evaluations": [raw_entry]}])
+
+    assert summary["available"] is False
+
+
 def test_non_finite_metric_values_are_coerced_or_rejected():
     report = evaluate()
     report["metrics"]["mrr"] = "nan"
@@ -253,6 +291,41 @@ def test_non_finite_metric_values_are_coerced_or_rejected():
         ],
     }
     assert validate_evaluation_summary(preshaped)["passed"] is False
+
+
+def test_preshaped_summary_rejects_invalid_privacy_booleans():
+    raw_entry = {
+        "benchmark_name": "contextual_culprit_ranking",
+        "benchmark_version": "2",
+        "dataset_hash": "sha256:0123456789abcdef",
+        "runner_version": "0.1.0",
+        "generated_at": "2026-07-02T04:15:00Z",
+        "mode": "gate",
+        "context_available": [],
+        "anonymous": False,
+        "raw_inputs_included": True,
+        "contract": {},
+        "metrics": {},
+        "random_baselines": {},
+        "stage_counts": {},
+        "failure_reasons": {},
+        "per_case": [],
+    }
+
+    summary = build_evaluation_summary([{"evaluations": [raw_entry]}])
+
+    assert summary["available"] is False
+
+
+def test_malformed_cached_result_is_skipped_without_blocking_valid_result():
+    malformed = {"benchmark_contract": {"scorable_cases": "not-a-number"}, "metrics": {"top1_recall": 1.0}}
+    valid = evaluate()
+
+    summary = build_evaluation_summary([malformed, valid])
+
+    assert summary["available"] is True
+    assert len(summary["evaluations"]) == 1
+    assert summary["evaluations"][0]["benchmark_name"] == "contextual_culprit_ranking"
 
 
 def test_evaluation_summary_validator_rejects_unknown_metric_keys():
@@ -302,6 +375,17 @@ def test_unsupported_rca_metric_counts_entries_not_distinct_cases():
     assert metric["denominator"] == denominator
     assert metric["value"] == round(metric["numerator"] / metric["denominator"], 4)
     assert summary["evaluations"][0]["failure_reasons"]["unsupported_rca"] == 2
+
+
+def test_ranking_gate_failures_are_preserved():
+    report = evaluate()
+    report["gate"] = {"passed": False, "failures": ["stability failed", "counterfactual_sensitivity failed"]}
+
+    summary = build_evaluation_summary([report])
+    evaluation = summary["evaluations"][0]
+
+    assert evaluation["failures"] == ["other", "other"]
+    assert evaluation["failure_reasons"]["other"] == 2
 
 
 def test_prompt_variation_summary_preserves_distinct_corpora():

@@ -56,6 +56,12 @@ _BENCHMARK_MODES = {
 }
 
 _BENCHMARK_NAMES = set(_BENCHMARK_MODES)
+_PUBLIC_VERSION_LABELS = {
+    "artifact_robustness_v1",
+    "gamma_diagnostic_v1",
+    "offline_gate_v1",
+    "prompt_variation_v1",
+}
 _CONTEXT_VALUES = {
     "alerts",
     "context",
@@ -286,7 +292,6 @@ _TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|
 _VERSION_RE = re.compile(
     r"^(?:"
     r"v?\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.]+)?"
-    r"|[a-z][a-z0-9_]{0,48}_v\d+"
     r"|version_hash_[0-9a-f]{16}"
     r"|[0-9a-f]{7,40}"
     r")$"
@@ -306,6 +311,8 @@ _CASE_CLASS_KEYS = {"case_class"}
 _STAGE_KEYS = {"failure_stage"}
 _REASON_CODE_KEYS = {"reason_codes"}
 _FAILURE_KEYS = {"failures"}
+_TRUE_BOOL_KEYS = {"anonymous"}
+_FALSE_BOOL_KEYS = {"raw_inputs_included"}
 
 
 def evaluation_results_dir() -> Path:
@@ -374,7 +381,11 @@ def build_evaluation_summary(
 
     latest: dict[tuple[str, str], dict[str, Any]] = {}
     for result in results:
-        for entry in _entries_from_result(result):
+        try:
+            entries = _entries_from_result(result)
+        except Exception:
+            continue
+        for entry in entries:
             name = str(entry.get("benchmark_name", ""))
             if not name:
                 continue
@@ -771,6 +782,9 @@ def summarize_ranking_report(report: dict[str, Any]) -> dict[str, Any] | None:
         failure_reasons["false_culprit"] = len(false_culprits)
     if unsupported_entries:
         failure_reasons["unsupported_rca"] = len(unsupported_entries)
+    failures = _safe_failure_codes((report.get("gate") or {}).get("failures", []))
+    for failure in failures:
+        failure_reasons[failure] = failure_reasons.get(failure, 0) + 1
 
     negative_passed = negative - len(false_culprits)
     stage_counts = {
@@ -867,6 +881,7 @@ def summarize_ranking_report(report: dict[str, Any]) -> dict[str, Any] | None:
         },
         "stage_counts": stage_counts,
         "failure_reasons": failure_reasons,
+        "failures": failures,
         "per_case": per_case,
     }
 
@@ -984,6 +999,11 @@ def _walk_validate(value: Any, path: str, findings: list[dict[str, str]], key: s
     elif isinstance(value, int | float) and not isinstance(value, bool):
         if not math.isfinite(float(value)):
             findings.append({"path": path, "kind": "non_finite_number", "sample": "<redacted_value>"})
+    elif isinstance(value, bool):
+        if key in _TRUE_BOOL_KEYS and value is not True:
+            findings.append({"path": path, "kind": "invalid_boolean", "sample": "<redacted_value>"})
+        if key in _FALSE_BOOL_KEYS and value is not False:
+            findings.append({"path": path, "kind": "invalid_boolean", "sample": "<redacted_value>"})
 
 
 def _string_is_allowed(key: str, value: str, path: str) -> bool:
@@ -1002,7 +1022,7 @@ def _string_is_allowed(key: str, value: str, path: str) -> bool:
     if key in _HASH_KEYS:
         return bool(_HASH_RE.match(value))
     if key in _VERSION_KEYS:
-        return bool(_VERSION_RE.match(value))
+        return bool(_VERSION_RE.match(value)) or value in _PUBLIC_VERSION_LABELS
     if key in _MODE_KEYS:
         return value in EVALUATION_MODES
     if key in _TRUNCATION_KEYS:
@@ -1119,7 +1139,7 @@ def _offline_gate_failure_code(value: str) -> str:
 
 def _safe_version(value: Any, *, default: str) -> str:
     candidate = str(value or default)
-    if _VERSION_RE.match(candidate):
+    if _VERSION_RE.match(candidate) or candidate in _PUBLIC_VERSION_LABELS:
         return candidate
     digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:16]
     return f"version_hash_{digest}"
