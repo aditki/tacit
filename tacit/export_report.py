@@ -1048,11 +1048,7 @@ def _packaged_archetype_ids() -> set[str]:
     archetypes = data.get("archetypes", [])
     if not isinstance(archetypes, list):
         return set()
-    return {
-        str(spec.get("id", "")).lower()
-        for spec in archetypes
-        if isinstance(spec, dict) and spec.get("id")
-    }
+    return {str(spec.get("id", "")).lower() for spec in archetypes if isinstance(spec, dict) and spec.get("id")}
 
 
 def _load_packaged_yaml(name: str) -> dict[str, Any]:
