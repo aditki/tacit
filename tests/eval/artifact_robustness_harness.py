@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -313,6 +314,7 @@ def evaluate_artifact_robustness(path: Path = FIXTURE_PATH) -> dict[str, Any]:
         failures.append("contradictory_artifacts_failed")
     return {
         "benchmark": "artifact_learning_robustness",
+        "fixture_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "rca_phrase_robustness": rca,
         "rca_precision": rca_precision,
         "noise_injection": noise,

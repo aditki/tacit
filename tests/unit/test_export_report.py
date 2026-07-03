@@ -167,6 +167,35 @@ def test_anonymous_export_writes_safe_bundle_files(tmp_path: Path, fake_stores):
                 assert sensitive not in text
 
 
+def test_anonymous_export_includes_evaluation_summary_when_results_exist(tmp_path: Path, fake_stores, monkeypatch):
+    from tests.eval.contextual_culprit_ranking_harness import evaluate
+
+    evaluation_dir = tmp_path / "evaluations"
+    evaluation_dir.mkdir()
+    (evaluation_dir / "ranking.json").write_text(json.dumps(evaluate()), encoding="utf-8")
+    monkeypatch.setenv("TACIT_EVALUATION_RESULTS_DIR", str(evaluation_dir))
+    output = tmp_path / "bundle.tar.gz"
+
+    result = export_assessment_report(output=output, anonymous=True, validate=True)
+
+    assert result.validation_report["passed"] is True
+    with tarfile.open(output, "r:gz") as tar:
+        names = tar.getnames()
+        assert "evaluation_summary.json" in names
+        evaluation_summary = json.loads(tar.extractfile("evaluation_summary.json").read().decode())
+        validation_report = json.loads(tar.extractfile("validation_report.json").read().decode())
+    evaluation = evaluation_summary["evaluations"][0]
+    assert evaluation_summary["available"] is True
+    assert evaluation["benchmark_name"] == "contextual_culprit_ranking"
+    assert evaluation["contract"]["total_cases"] == 47
+    assert evaluation["contract"]["mrr_truncation"] == "untruncated"
+    assert evaluation["random_baselines"]["mrr"] == 0.4567
+    assert validation_report["passed"] is True
+    text = json.dumps(evaluation_summary)
+    assert "checkout-api" not in text
+    assert "redis-cart" not in text
+
+
 def test_raw_export_includes_local_details(tmp_path: Path, fake_stores):
     output = tmp_path / "raw.tar.gz"
 

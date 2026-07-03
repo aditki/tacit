@@ -147,6 +147,11 @@ class Settings(BaseSettings):
     # archetype into TACIT_ARCHETYPES_PATH and hot-reloads (compounding).
     learning_auto_register_archetype: bool = False
 
+    # Local benchmark result storage. Raw result files may contain fixture
+    # content; anonymous exports include only sanitized summaries derived from
+    # this directory.
+    evaluation_results_dir: str = ""
+
     # HTTP API auth
     api_auth_enabled: bool = False  # set True to require API key
     api_auth_key: str = Field(default="", repr=False)

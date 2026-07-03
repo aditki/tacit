@@ -299,6 +299,11 @@ feedback summaries, validation warnings, and failure categories while excluding
 raw dashboards, raw runbooks, raw incidents, raw alert bodies, logs, telemetry,
 secrets, and anonymization mappings.
 
+Anonymous bundles include an `evaluation_summary.json` when benchmark results
+are available. This file preserves benchmark contracts, denominators,
+anonymized per-case outcomes, and safety metrics without exporting raw prompts,
+artifact text, or operational identifiers.
+
 Use this when you want to send maintainers useful adoption feedback without
 shipping operational details.
 
