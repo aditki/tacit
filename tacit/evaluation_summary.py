@@ -137,6 +137,7 @@ _METRIC_NAMES = {
     "learned_resolution_recall",
     "learned_selection_rate",
 }
+_COUNT_METRICS = {"ignored_causal_claim_count", "noise_scenarios"}
 _RANDOM_BASELINE_KEYS = {
     "assumption",
     "mrr",
@@ -322,6 +323,8 @@ _STRING_ONLY_KEYS = (
     | _STAGE_KEYS
     | _REASON_CODE_KEYS
     | _FAILURE_KEYS
+    | _TRUE_BOOL_KEYS
+    | _FALSE_BOOL_KEYS
     | {"reason", "assumption"}
 )
 
@@ -405,7 +408,7 @@ def build_evaluation_summary(
                 continue
             identity = _evaluation_identity(entry)
             previous = latest.get(identity)
-            if previous is None or str(entry.get("generated_at", "")) >= str(previous.get("generated_at", "")):
+            if previous is None or _generated_at_sort_key(entry) >= _generated_at_sort_key(previous):
                 latest[identity] = entry
 
     evaluations = []
@@ -511,7 +514,7 @@ def summarize_lift_report(report: dict[str, Any]) -> dict[str, Any] | None:
                 continue
             metric: dict[str, Any] = {"value": _float(value)}
             denominator = denominators.get(name)
-            if isinstance(denominator, int | float) and denominator:
+            if name not in _COUNT_METRICS and isinstance(denominator, int | float) and denominator:
                 metric["denominator"] = int(denominator)
                 metric["numerator"] = round(metric["value"] * int(denominator))
             entry["metrics"][name] = metric
@@ -863,7 +866,7 @@ def summarize_ranking_report(report: dict[str, Any]) -> dict[str, Any] | None:
         "available": True,
         "benchmark_name": benchmark_name,
         "benchmark_version": _safe_version(report.get("version"), default="version_hash_0000000000000000"),
-        "dataset_hash": _dataset_hash(contract_in),
+        "dataset_hash": _ranking_dataset_hash(report, contract_in, benchmark_name),
         "runner_version": _safe_version(report.get("runner_version"), default=__version__),
         "generated_at": str(report.get("generated_at", "")) or _now_iso(),
         "mode": _BENCHMARK_MODES.get(benchmark_name, "gate"),
@@ -1089,6 +1092,37 @@ def _evaluation_identity(entry: dict[str, Any]) -> tuple[str, str]:
     if not dataset_hash and isinstance(entry.get("contract"), dict):
         dataset_hash = _dataset_hash(entry["contract"])
     return name, dataset_hash
+
+
+def _generated_at_sort_key(entry: dict[str, Any]) -> datetime:
+    value = str(entry.get("generated_at", ""))
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=UTC)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _ranking_dataset_hash(report: dict[str, Any], contract: dict[str, Any], benchmark_name: str) -> str:
+    raw_case_ids = sorted(str(case_id) for case_id in (report.get("results") or {}).keys())
+    positive_ids = sorted(str(row.get("id", "")) for row in (report.get("positive_cases") or []))
+    content = {
+        "benchmark_name": benchmark_name,
+        "benchmark_version": str(report.get("version", "")),
+        "contract": contract,
+        "case_count": int(report.get("case_count", contract.get("total_cases", 0)) or 0),
+        "case_ids_sha256": _private_list_digest(raw_case_ids or positive_ids),
+        "positive_ids_sha256": _private_list_digest(positive_ids),
+        "contextual_top3_only_sha256": _private_list_digest(report.get("contextual_top3_only_cases") or []),
+    }
+    return _dataset_hash(content)
+
+
+def _private_list_digest(values: Any) -> str:
+    canonical = json.dumps([str(value) for value in values], sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _prompt_corpus_fingerprint(rows: list[dict[str, Any]]) -> str:

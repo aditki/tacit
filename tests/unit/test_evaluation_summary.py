@@ -317,6 +317,30 @@ def test_preshaped_summary_rejects_invalid_privacy_booleans():
     assert summary["available"] is False
 
 
+def test_preshaped_summary_rejects_numeric_privacy_flags():
+    raw_entry = {
+        "benchmark_name": "contextual_culprit_ranking",
+        "benchmark_version": "2",
+        "dataset_hash": "sha256:0123456789abcdef",
+        "runner_version": "0.1.0",
+        "generated_at": "2026-07-02T04:15:00Z",
+        "mode": "gate",
+        "context_available": [],
+        "anonymous": 0,
+        "raw_inputs_included": 1,
+        "contract": {},
+        "metrics": {},
+        "random_baselines": {},
+        "stage_counts": {},
+        "failure_reasons": {},
+        "per_case": [],
+    }
+
+    summary = build_evaluation_summary([{"evaluations": [raw_entry]}])
+
+    assert summary["available"] is False
+
+
 def test_preshaped_summary_rejects_numeric_ids():
     raw_entry = {
         "benchmark_name": "contextual_culprit_ranking",
@@ -377,6 +401,34 @@ def test_invalid_newer_candidate_does_not_replace_older_valid_summary():
 
     assert summary["available"] is True
     assert summary["evaluations"][0]["generated_at"] == "2026-07-02T04:15:00Z"
+
+
+def test_latest_selection_uses_parsed_timestamp_offsets():
+    older_in_utc = {
+        "benchmark_name": "contextual_culprit_ranking",
+        "benchmark_version": "2",
+        "dataset_hash": "sha256:0123456789abcdef",
+        "runner_version": "0.1.0",
+        "generated_at": "2026-07-03T00:30:00+14:00",
+        "mode": "gate",
+        "context_available": [],
+        "anonymous": True,
+        "raw_inputs_included": False,
+        "contract": {},
+        "metrics": {"top1": {"numerator": 1, "denominator": 1, "value": 1.0}},
+        "random_baselines": {},
+        "stage_counts": {},
+        "failure_reasons": {},
+        "per_case": [],
+    }
+    newer_in_utc = dict(older_in_utc)
+    newer_in_utc["generated_at"] = "2026-07-02T12:00:00Z"
+    newer_in_utc["metrics"] = {"top1": {"numerator": 2, "denominator": 2, "value": 1.0}}
+
+    summary = build_evaluation_summary([{"evaluations": [older_in_utc]}, {"evaluations": [newer_in_utc]}])
+
+    assert summary["evaluations"][0]["generated_at"] == "2026-07-02T12:00:00Z"
+    assert summary["evaluations"][0]["metrics"]["top1"]["denominator"] == 2
 
 
 def test_evaluation_summary_validator_rejects_unknown_metric_keys():
@@ -513,6 +565,22 @@ def test_prompt_variation_dataset_hash_uses_prompt_content_fingerprint():
     assert "second private prompt" not in json.dumps(summary)
 
 
+def test_ranking_dataset_hash_includes_private_case_identity_fingerprint():
+    first = evaluate()
+    second = evaluate()
+    first["generated_at"] = "2026-07-02T04:15:00Z"
+    second["generated_at"] = "2026-07-02T04:16:00Z"
+    first["results"] = {"case_a": next(iter(first["results"].values()))}
+    second["results"] = {"case_b": next(iter(second["results"].values()))}
+
+    summary = build_evaluation_summary([first, second])
+
+    assert len(summary["evaluations"]) == 2
+    assert len({evaluation["dataset_hash"] for evaluation in summary["evaluations"]}) == 2
+    assert "case_a" not in json.dumps(summary)
+    assert "case_b" not in json.dumps(summary)
+
+
 def test_lift_harness_reports_are_summarized_from_after_metrics():
     from tests.eval.alert_context_ranking_harness import evaluate_alert_lift
 
@@ -533,6 +601,16 @@ def test_lift_harness_reports_are_summarized_from_after_metrics():
     assert evaluation["failures"] == ["alert_context_did_not_improve_top1_recall", "other"]
     assert evaluation["failure_reasons"]["other"] == 1
     assert evaluation["random_baselines"]["mrr"] == 0.4567
+
+
+def test_lift_count_metrics_do_not_derive_bogus_numerators():
+    from tests.eval.incident_context_ranking_harness import evaluate_incident_lift
+
+    report = evaluate_incident_lift()
+    summary = build_evaluation_summary([report])
+    metric = summary["evaluations"][0]["metrics"]["ignored_causal_claim_count"]
+
+    assert metric == {"value": 1.0}
 
 
 def test_lift_harness_latest_selection_uses_top_level_timestamp():
