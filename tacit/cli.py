@@ -23,7 +23,11 @@ def _get_version() -> str:
     try:
         from importlib.metadata import version
 
-        return version("tacit")
+        for distribution in ("tacit-ai", "tacit"):
+            try:
+                return version(distribution)
+            except Exception:
+                pass
     except Exception:
         pass
     # 2. Fallback: parse pyproject.toml directly (running from source)

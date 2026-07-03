@@ -75,7 +75,13 @@ def compose_up(root: Path, *, echo: Echo, build: bool = True) -> None:
     if build:
         cmd.append("--build")
     echo(f"$ {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=root)
+    try:
+        result = subprocess.run(cmd, cwd=root)
+    except FileNotFoundError as exc:
+        raise DemoError(
+            "docker compose failed. Is Docker installed and on PATH? "
+            "Install Docker Desktop or the docker CLI, then re-run `tacit demo`."
+        ) from exc
     if result.returncode != 0:
         raise DemoError(
             "docker compose failed. Is Docker running? "

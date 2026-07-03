@@ -128,6 +128,18 @@ def test_llm_zero_key_mode_only_downgrades_key_based_providers():
         assert _llm_zero_key_mode() is False
 
 
+def test_cli_version_uses_renamed_distribution_metadata():
+    from tacit.cli import _get_version
+
+    def fake_version(distribution: str) -> str:
+        if distribution == "tacit-ai":
+            return "1.2.3"
+        raise RuntimeError(distribution)
+
+    with patch("importlib.metadata.version", side_effect=fake_version):
+        assert _get_version() == "1.2.3"
+
+
 def test_check_llm_openai_compatible_base_without_key_is_configured():
     from tacit.cli import _check_llm
 

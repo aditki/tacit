@@ -111,20 +111,30 @@ class PipelineRecorder:
             )
 
     def validation(self, warnings: list[str], *, panels_before: int, final_panel_count: int) -> None:
+        panels_dropped = max(panels_before - final_panel_count, 0)
+        if final_panel_count and panels_dropped:
+            status = "partial"
+            reason = "some_panels_rejected"
+        elif final_panel_count:
+            status = "passed"
+            reason = "queries_validated"
+        else:
+            status = "failed"
+            reason = "queries_validated"
         emit_progress(
             "validation",
-            "passed" if final_panel_count else "failed",
-            "queries_validated",
+            status,
+            reason,
             panels_before=panels_before,
             final_panel_count=final_panel_count,
-            panels_dropped=max(panels_before - final_panel_count, 0),
+            panels_dropped=panels_dropped,
             warnings=warnings,
         )
         try:
             self.history.record_validation(
                 self.investigation_id,
                 warnings=warnings,
-                panels_dropped=max(panels_before - final_panel_count, 0),
+                panels_dropped=panels_dropped,
                 final_panel_count=final_panel_count,
             )
         except Exception:

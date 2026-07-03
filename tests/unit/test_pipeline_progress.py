@@ -89,3 +89,17 @@ class TestRecorderEmitsProgress:
         finally:
             reset_progress_callback(token)
         assert events and events[0]["stage"] == "binding"
+
+    def test_validation_with_dropped_panels_emits_partial(self):
+        events: list[dict] = []
+        recorder = PipelineRecorder(MagicMock(), "inv-1")
+        token = set_progress_callback(events.append)
+        try:
+            recorder.validation(["Panel dropped"], panels_before=4, final_panel_count=2)
+        finally:
+            reset_progress_callback(token)
+
+        assert events and events[0]["stage"] == "validation"
+        assert events[0]["status"] == "partial"
+        assert events[0]["reason"] == "some_panels_rejected"
+        assert events[0]["details"]["panels_dropped"] == 2
