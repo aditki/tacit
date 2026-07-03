@@ -1,13 +1,14 @@
 name: Release (PyPI + ghcr)
 
 # Publishes on version tags (v0.2.0, v1.0.0, ...):
-#   1. sdist + wheel → PyPI, so `pip install tacit` / `uvx tacit` work
+#   1. sdist + wheel → PyPI, so `pip install tacit-ai` /
+#      `uvx --from tacit-ai tacit` work
 #   2. multi-arch Docker image → ghcr.io/<owner>/tacit, so the demo stack
 #      runs without a local build
 #
 # One-time setup:
-#   - PyPI: add a "trusted publisher" for this repo/workflow at
-#     https://pypi.org/manage/project/tacit/settings/publishing/
+#   - PyPI: add a pending trusted publisher for project `tacit-ai` at
+#     https://pypi.org/manage/account/publishing/
 #     (no API token secret needed — uses OIDC).
 #   - ghcr: works out of the box with GITHUB_TOKEN; make the package public
 #     in the repo's Packages settings after the first push.
@@ -44,7 +45,9 @@ jobs:
   publish-pypi:
     needs: build-dist
     runs-on: ubuntu-latest
-    environment: pypi
+    environment:
+      name: pypi
+      url: https://pypi.org/project/tacit-ai/
     permissions:
       id-token: write  # OIDC trusted publishing
     steps:
@@ -56,6 +59,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
 
   publish-ghcr:
+    needs: build-dist
     runs-on: ubuntu-latest
     permissions:
       contents: read

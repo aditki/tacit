@@ -152,12 +152,28 @@ _DOMAIN_BY_ARCHETYPE = {
 
 # Compound tokens that look like service names but are operational vocabulary.
 _SERVICE_STOPLIST = {
+    "api",
+    "app",
+    "cpu",
+    "db",
+    "disk",
     "error_rate",
     "error-rate",
+    "errors",
+    "grafana",
+    "heap",
+    "latency",
+    "last",
+    "memory",
+    "minutes",
+    "prometheus",
     "queue_depth",
     "queue-depth",
     "connection_pool",
     "connection-pool",
+    "requests",
+    "service",
+    "throttling",
     "third-party",
     "rate-limit",
     "rate_limit",
@@ -168,6 +184,12 @@ _SERVICE_STOPLIST = {
 }
 
 _SERVICE_TOKEN = re.compile(r"\b[a-z][a-z0-9]*(?:[-_][a-z0-9]+)+\b")
+_SERVICE_PHRASE = re.compile(r"\b([a-z][a-z0-9]{2,})\s+service\b", re.IGNORECASE)
+_SERVICE_PREPOSITION = re.compile(
+    r"\b(?:on|for|in|with|from|to|of)\s+(?:the\s+)?([a-z][a-z0-9]{2,})(?:\s+service)?"
+    r"(?=\s*(?:$|[,.?!;:]|\b(?:and|during|for|in|last|over|past|since|with)\b))",
+    re.IGNORECASE,
+)
 
 _TIMERANGE = re.compile(
     r"(?:last|past)\s+(\d+)\s*(m(?:in(?:ute)?s?)?|h(?:(?:ou)?rs?)?|d(?:ays?)?)\b",
@@ -190,13 +212,23 @@ def _match_archetypes(text: str) -> list[ArchetypeMatch]:
         hits = sum(1 for pattern in patterns if re.search(pattern, text, re.IGNORECASE))
         if hits:
             scored.append((archetype, hits))
-    scored.sort(key=lambda item: item[1], reverse=True)
+    specificity = {
+        "resource_saturation": 0,
+        "memory_leak_investigation": 2,
+        "rate_limiting_investigation": 2,
+    }
+    scored.sort(key=lambda item: (item[1], specificity.get(item[0], 1)), reverse=True)
     return [ArchetypeMatch(type=archetype, confidence=min(0.95, 0.55 + 0.15 * hits)) for archetype, hits in scored[:4]]
 
 
 def _extract_services(text: str) -> list[str]:
     services: list[str] = []
-    for token in _SERVICE_TOKEN.findall(text.lower()):
+    candidates = [
+        *_SERVICE_TOKEN.findall(text.lower()),
+        *[match.lower() for match in _SERVICE_PHRASE.findall(text)],
+        *[match.lower() for match in _SERVICE_PREPOSITION.findall(text)],
+    ]
+    for token in candidates:
         if token in _SERVICE_STOPLIST or token in services:
             continue
         services.append(token)

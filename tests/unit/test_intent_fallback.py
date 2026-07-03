@@ -53,6 +53,22 @@ class TestHeuristicIntent:
         intent = heuristic_intent(DEMO_PROMPT)
         assert "checkout-service" in intent.services
 
+    def test_single_word_service_phrase_extraction(self):
+        intent = heuristic_intent("checkout service is throwing 500s")
+        assert intent.services == ["checkout"]
+
+    def test_single_word_service_preposition_extraction(self):
+        intent = heuristic_intent("high CPU on checkout in the last 30 minutes")
+        assert "checkout" in intent.services
+
+    def test_single_word_service_extraction_ignores_timerange_word(self):
+        intent = heuristic_intent("high CPU in the last 30 minutes")
+        assert "last" not in intent.services
+
+    def test_specific_archetype_wins_over_generic_resource_tie(self):
+        assert heuristic_intent("memory leak in checkout").archetypes[0].type == "memory_leak_investigation"
+        assert heuristic_intent("API throttling on checkout").archetypes[0].type == "rate_limiting_investigation"
+
     def test_timerange_extraction(self):
         intent = heuristic_intent("high CPU on checkout in the last 30 minutes")
         assert intent.timerange == "30m"
@@ -94,7 +110,15 @@ class TestClassifyIntentFallbackRouting:
             async def chat_json(self, *args, **kwargs):  # pragma: no cover
                 raise AssertionError("LLM must not be called in zero-key mode")
 
-        intent, usage = asyncio.run(classify_intent(DEMO_PROMPT, provider=UnconfiguredProvider()))
+        runtime_settings = SimpleNamespace(
+            intent_fallback_enabled=True,
+            llm_provider="openai",
+            llm_api_key="",
+            llm_api_base="",
+        )
+        intent, usage = asyncio.run(
+            classify_intent(DEMO_PROMPT, provider=UnconfiguredProvider(), runtime_settings=runtime_settings)
+        )
         assert usage.total_tokens == 0
         assert intent.archetypes
         assert "checkout-service" in intent.services
@@ -102,7 +126,16 @@ class TestClassifyIntentFallbackRouting:
     def test_provider_init_failure_routes_to_heuristic(self):
         from tacit.agents.intent import classify_intent
 
-        with patch("tacit.agents.llm.get_provider", side_effect=ValueError("boom")):
+        fake_settings = SimpleNamespace(
+            intent_fallback_enabled=True,
+            llm_provider="openai",
+            llm_api_key="",
+            llm_api_base="",
+        )
+        with (
+            patch("tacit.config.settings", fake_settings),
+            patch("tacit.agents.llm.get_provider", side_effect=ValueError("boom")),
+        ):
             intent, usage = asyncio.run(classify_intent("high cpu on checkout"))
         assert usage.total_tokens == 0
         assert intent.archetypes[0].type == "resource_saturation"

@@ -238,7 +238,7 @@ async def test_intent_stage_zero_key_skips_provider_construction_for_key_based_p
         prompt="checkout latency",
         user_id="u1",
         deps=PipelineDependencies(
-            settings=Settings(llm_provider="openai", llm_api_key="", intent_fallback_enabled=True),
+            settings=Settings(llm_provider="openai", llm_api_key="", llm_api_base="", intent_fallback_enabled=True),
             backend_factory=lambda: [],
             history_store_factory=lambda: FakeHistoryStore(),
             feedback_store_factory=lambda: FakeFeedbackStore(),

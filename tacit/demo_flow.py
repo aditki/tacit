@@ -61,6 +61,15 @@ def _compose_command(root: Path) -> list[str]:
     return ["docker", "compose", "-f", str(root / "docker-compose.dev.yml")]
 
 
+def load_demo_env(root: Path) -> None:
+    """Load repo-local demo secrets so CLI requests match compose env_file."""
+    env_file = root / ".env"
+    if env_file.exists():
+        from dotenv import load_dotenv
+
+        load_dotenv(env_file, override=False)
+
+
 def compose_up(root: Path, *, echo: Echo, build: bool = True) -> None:
     cmd = [*_compose_command(root), "up", "-d"]
     if build:

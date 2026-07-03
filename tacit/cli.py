@@ -569,9 +569,14 @@ def _check_llm() -> bool:
     try:
         from tacit.config import settings
 
-        provider = settings.llm_provider
+        provider = settings.llm_provider.lower()
         api_key = settings.llm_api_key
         model = settings.llm_model
+        api_base = settings.llm_api_base
+
+        if provider == "openai" and api_base:
+            _success(f"LLM: {provider} / {model} at {api_base} (OpenAI-compatible endpoint configured)")
+            return True
 
         if not api_key and provider not in ("ollama", "bedrock"):
             if settings.intent_fallback_enabled:
@@ -932,6 +937,7 @@ def demo(tear_down: bool, no_build: bool, skip_generate: bool, open_browser: boo
     _header("Tacit demo — checkout incident in a box")
     _info(f"Using checkout at {root}")
     _info("This stack uses intentionally unsafe local Grafana defaults. Keep it local-only.")
+    demo_flow.load_demo_env(root)
 
     try:
         # 1. Boot the stack
