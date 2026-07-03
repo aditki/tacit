@@ -107,6 +107,52 @@ def test_dashboard_prometheus_target_no_cloudwatch_fields():
 # ── CLI _check_llm bedrock assume-role tests ───────────────────────────────
 
 
+def test_llm_zero_key_mode_only_downgrades_key_based_providers():
+    from tacit.cli import _llm_zero_key_mode
+
+    with patch("tacit.config.settings") as mock_settings:
+        mock_settings.intent_fallback_enabled = True
+        mock_settings.llm_provider = "openai"
+        mock_settings.llm_api_key = ""
+        mock_settings.llm_api_base = ""
+        assert _llm_zero_key_mode() is True
+
+        mock_settings.llm_api_base = "http://localhost:8001/v1"
+        assert _llm_zero_key_mode() is False
+
+        mock_settings.llm_api_base = ""
+        mock_settings.llm_provider = "ollama"
+        assert _llm_zero_key_mode() is False
+
+        mock_settings.llm_provider = "bedrock"
+        assert _llm_zero_key_mode() is False
+
+
+def test_cli_version_uses_renamed_distribution_metadata():
+    from tacit.cli import _get_version
+
+    def fake_version(distribution: str) -> str:
+        if distribution == "tacit-ai":
+            return "1.2.3"
+        raise RuntimeError(distribution)
+
+    with patch("importlib.metadata.version", side_effect=fake_version):
+        assert _get_version() == "1.2.3"
+
+
+def test_check_llm_openai_compatible_base_without_key_is_configured():
+    from tacit.cli import _check_llm
+
+    with patch("tacit.config.settings") as mock_settings:
+        mock_settings.llm_provider = "openai"
+        mock_settings.llm_api_key = ""
+        mock_settings.llm_api_base = "http://localhost:8001/v1"
+        mock_settings.llm_model = "gpt-4o-mini"
+        mock_settings.intent_fallback_enabled = True
+
+        assert _check_llm() is True
+
+
 def test_check_llm_bedrock_with_role_arn_calls_assume_role():
     """When llm_bedrock_role_arn is set, _check_llm must call sts.assume_role
     before declaring success — not just get_caller_identity on the base session."""

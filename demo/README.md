@@ -8,7 +8,14 @@ It is built around a checkout-service incident because it tells a recognizable o
 
 ## Run It
 
-Start the local dev stack:
+The fastest path is the single command (boots the stack, teaches Tacit,
+generates the dashboard, opens the browser — zero API keys needed):
+
+```bash
+uv run tacit demo
+```
+
+Or drive it manually. Start the local dev stack:
 
 ```bash
 docker compose -f docker-compose.dev.yml up -d --build

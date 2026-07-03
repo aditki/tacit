@@ -23,6 +23,10 @@ llm:
 # ── Grafana ──────────────────────────────────────────────────────────────────
 grafana:
   url: http://localhost:3000
+  # public_url: browser-facing base for generated dashboard links. Set when
+  # `url` is only reachable from Tacit's network (e.g. http://grafana:3000
+  # inside Docker). Empty = use `url`.
+  # public_url: http://localhost:3000
   org_id: 1
   # api_key: use GRAFANA_API_KEY env var
 

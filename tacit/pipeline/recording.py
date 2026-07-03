@@ -9,6 +9,7 @@ import structlog
 from tacit.backends.base import PublishResult
 from tacit.errors import HistoryWriteFailed
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry, SignalType
+from tacit.pipeline.progress import emit_progress
 
 logger = structlog.get_logger()
 
@@ -21,9 +22,20 @@ class PipelineRecorder:
         self.investigation_id = investigation_id
 
     def stage(self, stage: str, status: str, reason_code: str, **details: Any) -> None:
+        emit_progress(stage, status, reason_code, **details)
         record_stage(self.history, self.investigation_id, stage, status, reason_code, **details)
 
     def intent(self, intent: Intent) -> None:
+        emit_progress(
+            "intent",
+            "passed",
+            "intent_classified",
+            summary=intent.summary,
+            domain=intent.domain,
+            services=intent.services,
+            archetypes=[{"type": a.type, "confidence": a.confidence} for a in intent.archetypes],
+            timerange=intent.timerange,
+        )
         try:
             self.history.record_intent(
                 self.investigation_id,
@@ -52,6 +64,14 @@ class PipelineRecorder:
         record_selected_intent(self.history, self.investigation_id, intent, ranked_archetypes, learned_archetypes)
 
     def discovery(self, catalog_discovery: Any) -> None:
+        emit_progress(
+            "discovery",
+            "passed",
+            "metrics_discovered",
+            datasources_found=len(catalog_discovery.datasource_types),
+            datasource_types=catalog_discovery.datasource_types,
+            metrics_catalog_size=len(catalog_discovery.metric_catalog),
+        )
         try:
             self.history.record_discovery(
                 self.investigation_id,
@@ -67,6 +87,13 @@ class PipelineRecorder:
             )
 
     def queries(self, dashboard_spec: DashboardSpec, *, path_used: str) -> None:
+        emit_progress(
+            "queries",
+            "passed",
+            "queries_recorded",
+            panel_count=len(dashboard_spec.panels),
+            path_used=path_used,
+        )
         try:
             queries_for_history, metrics_for_history = query_history_payload(dashboard_spec)
             self.history.record_queries(
@@ -84,11 +111,30 @@ class PipelineRecorder:
             )
 
     def validation(self, warnings: list[str], *, panels_before: int, final_panel_count: int) -> None:
+        panels_dropped = max(panels_before - final_panel_count, 0)
+        if final_panel_count and panels_dropped:
+            status = "partial"
+            reason = "some_panels_rejected"
+        elif final_panel_count:
+            status = "passed"
+            reason = "queries_validated"
+        else:
+            status = "failed"
+            reason = "queries_validated"
+        emit_progress(
+            "validation",
+            status,
+            reason,
+            panels_before=panels_before,
+            final_panel_count=final_panel_count,
+            panels_dropped=panels_dropped,
+            warnings=warnings,
+        )
         try:
             self.history.record_validation(
                 self.investigation_id,
                 warnings=warnings,
-                panels_dropped=max(panels_before - final_panel_count, 0),
+                panels_dropped=panels_dropped,
                 final_panel_count=final_panel_count,
             )
         except Exception:

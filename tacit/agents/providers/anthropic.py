@@ -36,6 +36,10 @@ class AnthropicProvider(LLMProvider):
         self._settings = runtime_settings or settings
         self._client = anthropic.AsyncAnthropic(api_key=self._settings.llm_api_key)
 
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._settings.llm_api_key)
+
     def _extract_usage(self, response) -> TokenUsage:
         usage = getattr(response, "usage", None)
         if usage:

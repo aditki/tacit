@@ -17,13 +17,19 @@ request_json() {
   local method="$1"
   local path="$2"
   local body="${3:-}"
+  local auth_args=()
+
+  if [[ -n "${API_AUTH_KEY:-}" ]]; then
+    auth_args=(-H "X-API-Key: $API_AUTH_KEY")
+  fi
 
   if [[ -n "$body" ]]; then
     curl -fsS -X "$method" "$API_URL$path" \
       -H "Content-Type: application/json" \
+      "${auth_args[@]}" \
       --data-binary "$body"
   else
-    curl -fsS -X "$method" "$API_URL$path"
+    curl -fsS -X "$method" "$API_URL$path" "${auth_args[@]}"
   fi
 }
 

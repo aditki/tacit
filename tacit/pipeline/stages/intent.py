@@ -8,11 +8,27 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from tacit.agents.intent_fallback import zero_key_mode
 from tacit.agents.providers.base import LLMProvider, TokenUsage
 from tacit.context.base import ContextProvider
 from tacit.dependencies import PipelineDependencies
 from tacit.logging import stage_log
 from tacit.models.schemas import Intent
+
+
+class _ZeroKeyProvider(LLMProvider):
+    @property
+    def is_configured(self) -> bool:
+        return False
+
+    async def chat_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.2):
+        raise RuntimeError("zero-key fallback provider must not be called")
+
+    async def chat_text(self, system_prompt: str, user_prompt: str, temperature: float = 0.3):
+        raise RuntimeError("zero-key fallback provider must not be called")
+
+
+_ZERO_KEY_PROVIDER = _ZeroKeyProvider()
 
 
 @dataclass(frozen=True)
@@ -35,9 +51,17 @@ async def run_intent_stage(
 ) -> IntentStageResult:
     """Classify the prompt and fetch optional context chunks."""
     t0 = time.monotonic()
-    if "provider" in inspect.signature(classify).parameters:
-        classify_provider = classify_provider_factory() if classify_provider_factory else None
-        intent, intent_usage = await classify(prompt, provider=classify_provider)
+    classify_parameters = inspect.signature(classify).parameters
+    if "provider" in classify_parameters:
+        classify_provider: LLMProvider | None
+        if deps.settings.intent_fallback_enabled and zero_key_mode(deps.settings):
+            classify_provider = _ZERO_KEY_PROVIDER
+        else:
+            classify_provider = classify_provider_factory() if classify_provider_factory else None
+        classify_kwargs: dict[str, Any] = {"provider": classify_provider}
+        if "runtime_settings" in classify_parameters:
+            classify_kwargs["runtime_settings"] = deps.settings
+        intent, intent_usage = await classify(prompt, **classify_kwargs)
     else:
         intent, intent_usage = await classify(prompt)
     timings["intent"] = time.monotonic() - t0

@@ -1,6 +1,12 @@
 # Tacit
 
+[![CI](https://github.com/aditki/tacit/actions/workflows/ci.yml/badge.svg)](https://github.com/aditki/tacit/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
+
 **Incident prompt to evidence-backed investigation artifact.**
+
+![Tacit demo — incident prompt to validated Grafana dashboard](docs/media/demo.gif)
 
 Tacit helps on-call engineers answer the hardest question in an incident:
 
@@ -64,31 +70,74 @@ artifacts.
 
 ## Quick Start
 
-Install locally:
+### One command, zero API keys
 
 ```bash
-pip install -e .
-tacit init
-tacit doctor
-tacit test
+git clone https://github.com/aditki/tacit && cd tacit
+uv sync
+uv run tacit demo
+```
+
+`tacit demo` boots the local Grafana + Prometheus + fake checkout-metrics
+stack, teaches Tacit from a known-good incident dashboard, generates a fresh
+investigation dashboard from a plain-English incident prompt, and opens it in
+your browser.
+
+No LLM API key is required: in zero-key mode Tacit classifies the incident
+deterministically and compiles the dashboard through the archetype engine.
+Configure a key later to unlock LLM intent classification and the freeform
+query path. Tear the stack down with `tacit demo --down`.
+
+### Your own environment
+
+```bash
+uv sync
+uv run tacit init
+uv run tacit doctor    # readiness checklist: Grafana, LLM, learned knowledge
+uv run tacit test
 ```
 
 Start the API and Web UI:
 
 ```bash
-tacit serve
+uv run tacit serve
 ```
+
+No uv? `pip install -e .` works too, and prebuilt binaries ship with each
+[release](https://github.com/aditki/tacit/releases).
 
 Open:
 
-- Web UI: [localhost:8000](http://localhost:8000)
+- Web UI: [localhost:8000](http://localhost:8000) — watch pipeline stages stream live as dashboards are built
 - Swagger: [localhost:8000/docs](http://localhost:8000/docs)
 - ReDoc: [localhost:8000/redoc](http://localhost:8000/redoc)
 
-For the fastest end-to-end walkthrough, run the
-[checkout incident demo](demo/README.md). It uploads a known-good Grafana
-dashboard, lets Tacit infer reusable signals, approves those signals, and then
-generates a fresh investigation dashboard from one incident prompt.
+The [checkout incident demo](demo/README.md) documents the same flow
+`tacit demo` automates, step by step.
+
+## Assess Your Operational Knowledge
+
+`tacit assess` is a deterministic, zero-key scorecard of what Tacit has
+ingested, extracted, resolved, and failed to resolve:
+
+```text
+Operational Knowledge Assessment
+
+  Services known:            64
+  Dashboards ingested:       187
+  Alerts ingested:           91
+  Runbooks learned:          12
+  Knowledge coverage:        74%
+  Missing ownership:         11
+  Duplicate dashboard groups: 6
+  Alerts without owners:     23
+  Investigation Readiness:   Medium (55/100)
+```
+
+Every number comes from local SQLite stores — no LLM calls, no vendor API
+calls. Add `--llm` for an optional narrative (what this means, what to fix
+first), `--json` for machine-readable output, and share results safely with
+`tacit export-report --anonymous`.
 
 ## Local Demo Stack
 
@@ -200,6 +249,16 @@ Typical response:
 }
 ```
 
+Watch the pipeline work in real time with the SSE streaming variant — it emits
+a `stage` event per pipeline step (intent, discovery, compilation, validation,
+ranking, publish) and a final `result` event:
+
+```bash
+curl -N -X POST http://localhost:8000/api/v1/chart/stream \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "high CPU on checkout in the last 30 minutes"}'
+```
+
 For non-local deployments, enable Tacit's API key auth:
 
 ```bash
@@ -265,6 +324,43 @@ Known incident shapes use deterministic archetypes, which reduces hallucination
 risk and avoids unnecessary query-generation calls. Freeform paths still use the
 LLM, but selected metrics and generated queries are validated before publishing.
 
+## Why Not Just Ask an LLM for PromQL?
+
+A chat model will happily write a plausible query for a metric that does not
+exist in your environment. Tacit is built around three things a raw LLM call
+cannot do:
+
+1. **Live validation.** Every generated query is executed against your real
+   datasources before publishing. Panels with no data are dropped, and
+   fully-empty dashboards are blocked, so the artifact you open during an
+   incident contains evidence, not guesses.
+2. **Your telemetry vocabulary.** Tacit learns signal mappings from the
+   dashboards, alerts, and runbooks your team already trusts, so "checkout
+   latency" resolves to *your* metric names — reviewable and approvable before
+   they influence anything.
+3. **Deterministic paths.** Known incident shapes compile through YAML
+   archetype templates with zero LLM involvement — faster, reproducible, and
+   immune to hallucination. In zero-key mode this path runs entirely without
+   an LLM.
+
+## Benchmark Results
+
+Tacit ships a public 100-prompt validation suite
+([docs/evaluation.md](docs/evaluation.md)) covering latency, error, saturation,
+database, Kubernetes, and deployment incidents across three simulated services:
+
+| Metric | Result |
+|---|---:|
+| Archetype accuracy (top-1 / any match) | 90% / 95% |
+| Average critical metric recall | 85.2% |
+| Average signal-to-noise ratio | 71.3% |
+| Pipeline success | 98/100 |
+| Average panels per dashboard | 6.2 |
+| Average pipeline latency | 3.4s |
+
+These are public-beta benchmarks on a synthetic dataset — read them as a
+regression gate, not a production guarantee.
+
 ## Current Fit
 
 Tacit is a good fit for:
@@ -284,12 +380,13 @@ Tacit is not yet a good fit for:
 
 ## Adoption Path
 
-1. Run the local checkout demo.
+1. Run `tacit demo` (zero API keys needed).
 2. Connect a non-production Grafana or SignalFx account.
 3. Ingest a few dashboards your team already trusts.
-4. Review and approve the inferred signal mappings.
-5. Generate dashboards from real incident-style prompts.
-6. Add Slack or API integration only after the generated evidence is useful.
+4. Run `tacit assess` to see coverage, gaps, and investigation readiness.
+5. Review and approve the inferred signal mappings.
+6. Generate dashboards from real incident-style prompts.
+7. Add Slack or API integration only after the generated evidence is useful.
 
 ## Share Feedback Safely
 
