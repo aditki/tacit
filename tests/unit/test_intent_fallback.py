@@ -19,8 +19,8 @@ DEMO_PROMPT = (
 )
 
 
-def _settings(provider: str, key: str) -> SimpleNamespace:
-    return SimpleNamespace(llm_provider=provider, llm_api_key=key)
+def _settings(provider: str, key: str, api_base: str = "") -> SimpleNamespace:
+    return SimpleNamespace(llm_provider=provider, llm_api_key=key, llm_api_base=api_base)
 
 
 class TestZeroKeyMode:
@@ -35,6 +35,9 @@ class TestZeroKeyMode:
     def test_local_and_iam_providers_never_zero_key(self):
         assert zero_key_mode(_settings("ollama", "")) is False
         assert zero_key_mode(_settings("bedrock", "")) is False
+
+    def test_openai_compatible_base_is_not_zero_key(self):
+        assert zero_key_mode(_settings("openai", "", "http://localhost:8001/v1")) is False
 
 
 class TestHeuristicIntent:
@@ -111,6 +114,7 @@ class TestClassifyIntentFallbackRouting:
             intent_fallback_enabled=True,
             llm_provider="ollama",
             llm_api_key="",
+            llm_api_base="",
         )
         with (
             patch("tacit.config.settings", fake_settings),
@@ -118,3 +122,35 @@ class TestClassifyIntentFallbackRouting:
         ):
             with pytest.raises(ValueError, match="ollama offline"):
                 asyncio.run(classify_intent("high cpu on checkout"))
+
+    def test_runtime_zero_key_settings_enable_fallback_even_when_globals_do_not(self):
+        from tacit.agents.intent import classify_intent
+
+        class UnconfiguredProvider:
+            is_configured = False
+
+            async def chat_json(self, *args, **kwargs):  # pragma: no cover
+                raise AssertionError("zero-key sentinel must not be called")
+
+        runtime_settings = SimpleNamespace(
+            intent_fallback_enabled=True,
+            llm_provider="openai",
+            llm_api_key="",
+            llm_api_base="",
+        )
+        global_settings = SimpleNamespace(
+            intent_fallback_enabled=False,
+            llm_provider="openai",
+            llm_api_key="sk-real",
+            llm_api_base="",
+        )
+        with patch("tacit.config.settings", global_settings):
+            intent, usage = asyncio.run(
+                classify_intent(
+                    "high cpu on checkout",
+                    provider=UnconfiguredProvider(),
+                    runtime_settings=runtime_settings,
+                )
+            )
+        assert usage.total_tokens == 0
+        assert intent.archetypes[0].type == "resource_saturation"

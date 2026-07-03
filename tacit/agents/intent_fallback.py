@@ -13,6 +13,7 @@ low-confidence ``golden_signals`` overview instead of guessing.
 from __future__ import annotations
 
 import re
+from typing import Any, cast
 
 import structlog
 
@@ -176,7 +177,11 @@ _TIMERANGE = re.compile(
 
 def zero_key_mode(settings: Settings) -> bool:
     """True when the configured LLM provider cannot work without an API key."""
-    return settings.llm_provider.lower() in _KEY_REQUIRED_PROVIDERS and not settings.llm_api_key
+    provider = settings.llm_provider.lower()
+    api_base = getattr(cast(Any, settings), "llm_api_base", "")
+    if provider == "openai" and api_base:
+        return False
+    return provider in _KEY_REQUIRED_PROVIDERS and not settings.llm_api_key
 
 
 def _match_archetypes(text: str) -> list[ArchetypeMatch]:

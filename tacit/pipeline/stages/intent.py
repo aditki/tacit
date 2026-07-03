@@ -51,13 +51,17 @@ async def run_intent_stage(
 ) -> IntentStageResult:
     """Classify the prompt and fetch optional context chunks."""
     t0 = time.monotonic()
-    if "provider" in inspect.signature(classify).parameters:
+    classify_parameters = inspect.signature(classify).parameters
+    if "provider" in classify_parameters:
         classify_provider: LLMProvider | None
         if deps.settings.intent_fallback_enabled and zero_key_mode(deps.settings):
             classify_provider = _ZERO_KEY_PROVIDER
         else:
             classify_provider = classify_provider_factory() if classify_provider_factory else None
-        intent, intent_usage = await classify(prompt, provider=classify_provider)
+        classify_kwargs: dict[str, Any] = {"provider": classify_provider}
+        if "runtime_settings" in classify_parameters:
+            classify_kwargs["runtime_settings"] = deps.settings
+        intent, intent_usage = await classify(prompt, **classify_kwargs)
     else:
         intent, intent_usage = await classify(prompt)
     timings["intent"] = time.monotonic() - t0

@@ -13,19 +13,24 @@ echo
 echo "Teaching Tacit the known-good real-telemetry investigation..."
 python3 - "$API_URL" "$GRAFANA_URL" "$PROMPT" "$LEARNING_DASHBOARD" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 from urllib.request import Request, urlopen
 
 api_url, grafana_url, prompt, dashboard_path = sys.argv[1:]
+api_auth_key = os.environ.get("API_AUTH_KEY", "")
 
 
 def post(path, payload=None):
     body = json.dumps(payload).encode() if payload is not None else b""
+    headers = {"Content-Type": "application/json"}
+    if api_auth_key:
+        headers["X-API-Key"] = api_auth_key
     request = Request(
         f"{api_url}{path}",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     with urlopen(request, timeout=180) as response:

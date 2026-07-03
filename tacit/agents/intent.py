@@ -7,6 +7,7 @@ import structlog
 from tacit.agents.llm import call_llm
 from tacit.agents.providers.base import LLMProvider, TokenUsage
 from tacit.agents.synonyms import expand_operational_terms, operational_evidence
+from tacit.config import Settings
 from tacit.models.schemas import Intent
 
 logger = structlog.get_logger()
@@ -114,7 +115,12 @@ def _resolve_provider(provider: LLMProvider | None) -> LLMProvider | None:
         return None
 
 
-async def classify_intent(prompt: str, *, provider: LLMProvider | None = None) -> tuple[Intent, TokenUsage]:
+async def classify_intent(
+    prompt: str,
+    *,
+    provider: LLMProvider | None = None,
+    runtime_settings: Settings | None = None,
+) -> tuple[Intent, TokenUsage]:
     logger.info("intent_agent_start", prompt=prompt[:120])
 
     # Zero-key mode applies only to providers that require LLM_API_KEY. Local
@@ -122,10 +128,11 @@ async def classify_intent(prompt: str, *, provider: LLMProvider | None = None) -
     from tacit.agents.intent_fallback import zero_key_mode
     from tacit.config import settings
 
+    active_settings = runtime_settings or settings
     resolved = _resolve_provider(provider)
     if (
-        settings.intent_fallback_enabled
-        and zero_key_mode(settings)
+        active_settings.intent_fallback_enabled
+        and zero_key_mode(active_settings)
         and (resolved is None or not resolved.is_configured)
     ):
         from tacit.agents.intent_fallback import heuristic_intent

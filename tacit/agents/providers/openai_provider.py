@@ -25,16 +25,16 @@ class OpenAIProvider(LLMProvider):
         self._settings = runtime_settings or settings
         runtime_settings = self._settings
         self._client = None
-        if not runtime_settings.llm_api_key:
+        if not runtime_settings.llm_api_key and not runtime_settings.llm_api_base:
             return
-        kwargs: dict = {"api_key": runtime_settings.llm_api_key}
+        kwargs: dict = {"api_key": runtime_settings.llm_api_key or "tacit-local-openai-compatible"}
         if runtime_settings.llm_api_base:
             kwargs["base_url"] = runtime_settings.llm_api_base
         self._client = openai.AsyncOpenAI(**kwargs)
 
     @property
     def is_configured(self) -> bool:
-        return bool(self._settings.llm_api_key)
+        return bool(self._settings.llm_api_key or self._settings.llm_api_base)
 
     async def chat_json(
         self,

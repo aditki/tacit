@@ -96,6 +96,11 @@ def wait_for_http(url: str, *, timeout_s: float = 240.0, echo: Echo) -> None:
     raise DemoError(f"Timed out waiting for {url} ({last_error}). Check `docker compose logs`.")
 
 
+def _auth_headers() -> dict[str, str]:
+    api_key = os.environ.get("API_AUTH_KEY", "")
+    return {"X-API-Key": api_key} if api_key else {}
+
+
 def _request(client: httpx.Client, method: str, path: str, payload: dict | None = None) -> dict:
     response = client.request(method, path, json=payload)
     response.raise_for_status()
@@ -105,7 +110,7 @@ def _request(client: httpx.Client, method: str, path: str, payload: dict | None 
 def run_learning_flow(api_url: str, dashboard_json: Path, *, echo: Echo) -> str:
     """Upload + approve the known-good incident dashboard. Returns its UID."""
     dashboard = json.loads(dashboard_json.read_text())
-    with httpx.Client(base_url=api_url, timeout=60.0) as client:
+    with httpx.Client(base_url=api_url, timeout=60.0, headers=_auth_headers()) as client:
         _request(client, "GET", "/healthz")
         echo("Health check passed")
 
@@ -132,7 +137,7 @@ def run_learning_flow(api_url: str, dashboard_json: Path, *, echo: Echo) -> str:
 
 def run_generation(api_url: str, prompt: str, *, echo: Echo) -> dict:
     """Generate the investigation dashboard from *prompt*."""
-    with httpx.Client(base_url=api_url, timeout=180.0) as client:
+    with httpx.Client(base_url=api_url, timeout=180.0, headers=_auth_headers()) as client:
         echo("Generating investigation dashboard (this can take 15-60s)...")
         return _request(
             client,
@@ -145,7 +150,7 @@ def run_generation(api_url: str, prompt: str, *, echo: Echo) -> dict:
 def record_demo_feedback(api_url: str, dashboard_uid: str) -> None:
     """Best-effort demo feedback so the improvement loop shows up in history."""
     try:
-        with httpx.Client(base_url=api_url, timeout=30.0) as client:
+        with httpx.Client(base_url=api_url, timeout=30.0, headers=_auth_headers()) as client:
             _request(
                 client,
                 "POST",

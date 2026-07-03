@@ -494,23 +494,35 @@
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buf = '', result = null;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf('\n\n')) >= 0) {
-          const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
-          const evMatch = frame.match(/^event: (.+)$/m);
-          const dataMatch = frame.match(/^data: (.+)$/m);
-          if (!evMatch || !dataMatch) continue;
-          const data = JSON.parse(dataMatch[1]);
-          if (evMatch[1] === 'stage') onStage(data);
-          else if (evMatch[1] === 'result') result = data;
-          else if (evMatch[1] === 'error') throw new PipelineStreamError(data.detail || 'Pipeline failed');
+      let workStarted = false;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buf.indexOf('\n\n')) >= 0) {
+            const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+            const evMatch = frame.match(/^event: (.+)$/m);
+            const dataMatch = frame.match(/^data: (.+)$/m);
+            if (!evMatch || !dataMatch) continue;
+            const data = JSON.parse(dataMatch[1]);
+            if (evMatch[1] === 'stage') {
+              workStarted = true;
+              onStage(data);
+            }
+            else if (evMatch[1] === 'result') result = data;
+            else if (evMatch[1] === 'error') throw new PipelineStreamError(data.detail || 'Pipeline failed');
+          }
         }
+      } catch (e) {
+        if (workStarted) throw new PipelineStreamError(e.message || 'Stream failed after pipeline started');
+        throw e;
       }
-      if (!result) throw new Error('Stream ended without a result');
+      if (!result) {
+        if (workStarted) throw new PipelineStreamError('Stream ended without a result');
+        throw new Error('Stream ended without a result');
+      }
       return result;
     }
 
