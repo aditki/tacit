@@ -310,6 +310,23 @@ _REASON_CODE_KEYS = {"reason_codes"}
 _FAILURE_KEYS = {"failures"}
 _TRUE_BOOL_KEYS = {"anonymous"}
 _FALSE_BOOL_KEYS = {"raw_inputs_included"}
+_REQUIRED_EVALUATION_ENTRY_KEYS = {
+    "benchmark_name",
+    "benchmark_version",
+    "dataset_hash",
+    "runner_version",
+    "generated_at",
+    "mode",
+    "context_available",
+    "anonymous",
+    "raw_inputs_included",
+    "contract",
+    "metrics",
+    "random_baselines",
+    "stage_counts",
+    "failure_reasons",
+    "per_case",
+}
 _STRING_ONLY_KEYS = (
     _ANON_ID_KEYS
     | _VERSION_KEYS
@@ -435,6 +452,7 @@ def validate_evaluation_summary(summary: dict[str, Any]) -> dict[str, Any]:
     """
     findings: list[dict[str, str]] = []
     _walk_validate(summary, "$", findings)
+    _validate_summary_shape(summary, findings)
     return {
         "passed": not findings,
         "findings_count": len(findings),
@@ -449,8 +467,12 @@ def validate_evaluation_summary(summary: dict[str, Any]) -> dict[str, Any]:
 
 def _entries_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(result.get("evaluations"), list):
-        return [dict(entry) for entry in result["evaluations"] if isinstance(entry, dict)]
-    if "benchmark_name" in result:
+        return [
+            dict(entry)
+            for entry in result["evaluations"]
+            if isinstance(entry, dict) and _has_required_evaluation_fields(entry)
+        ]
+    if "benchmark_name" in result and _has_required_evaluation_fields(result):
         return [dict(result)]
     if "benchmark_contract" in result and "metrics" in result:
         entry = summarize_ranking_report(result)
@@ -549,13 +571,18 @@ def summarize_artifact_robustness_report(report: dict[str, Any]) -> dict[str, An
         "rca_precision_phrases": precision_phrases,
         "noise_scenarios": len(noise_rows),
     }
+    dataset_identity = {
+        "contract": contract,
+        "fixture_sha256": str(report.get("fixture_sha256") or ""),
+        "artifact_report_sha256": _artifact_report_fingerprint(report),
+    }
 
     return {
         "evaluation_version": EVALUATION_VERSION,
         "available": True,
         "benchmark_name": "artifact_learning_robustness",
         "benchmark_version": _safe_version(report.get("version"), default="artifact_robustness_v1"),
-        "dataset_hash": _dataset_hash(contract),
+        "dataset_hash": _dataset_hash(dataset_identity),
         "runner_version": _safe_version(report.get("runner_version"), default=__version__),
         "generated_at": str(report.get("generated_at", "")) or _now_iso(),
         "mode": "artifact_robustness",
@@ -913,6 +940,7 @@ def summarize_prompt_variation_report(report: dict[str, Any]) -> dict[str, Any] 
     negative_trials = sum(int(row.get("trials", trials_per_prompt) or 0) for row in negative)
     positive_passed = sum(int(row.get("passed", 0) or 0) for row in positive)
     negative_passed = sum(int(row.get("passed", 0) or 0) for row in negative)
+    gate_threshold = _float(report.get("gate", 1.0)) or 1.0
 
     per_case = []
     failure_reasons: dict[str, int] = {}
@@ -922,7 +950,7 @@ def summarize_prompt_variation_report(report: dict[str, Any]) -> dict[str, Any] 
         passed = int(row.get("passed", 0) or 0)
         rate = round(passed / trials, 4) if trials else 0.0
         prompt_rates.append(rate)
-        case_failed = passed < trials
+        case_failed = rate < gate_threshold
         if case_failed:
             failure_reasons["prompt_intent_mismatch"] = failure_reasons.get("prompt_intent_mismatch", 0) + 1
         per_case.append(
@@ -997,6 +1025,38 @@ def summarize_prompt_variation_report(report: dict[str, Any]) -> dict[str, Any] 
 # ---------------------------------------------------------------------------
 
 
+def _validate_summary_shape(summary: dict[str, Any], findings: list[dict[str, str]]) -> None:
+    evaluations = summary.get("evaluations")
+    if evaluations is None:
+        return
+    if not isinstance(evaluations, list):
+        findings.append({"path": "$.evaluations", "kind": "invalid_type", "sample": "<redacted_value>"})
+        return
+    for index, entry in enumerate(evaluations):
+        path = f"$.evaluations[{index}]"
+        if not isinstance(entry, dict):
+            findings.append({"path": path, "kind": "invalid_type", "sample": "<redacted_value>"})
+            continue
+        missing = sorted(_REQUIRED_EVALUATION_ENTRY_KEYS - set(entry))
+        if missing:
+            findings.append({"path": path, "kind": "missing_required_field", "sample": "<redacted_key>"})
+        for key in ("contract", "metrics", "random_baselines", "stage_counts", "failure_reasons"):
+            if key in entry and not isinstance(entry[key], dict):
+                findings.append({"path": f"{path}.{key}", "kind": "invalid_type", "sample": "<redacted_value>"})
+        for key in ("context_available", "per_case"):
+            if key in entry and not isinstance(entry[key], list):
+                findings.append({"path": f"{path}.{key}", "kind": "invalid_type", "sample": "<redacted_value>"})
+        for key in ("contract", "metrics"):
+            if isinstance(entry.get(key), dict) and not entry[key]:
+                findings.append(
+                    {"path": f"{path}.{key}", "kind": "empty_required_object", "sample": "<redacted_value>"}
+                )
+
+
+def _has_required_evaluation_fields(entry: dict[str, Any]) -> bool:
+    return not (_REQUIRED_EVALUATION_ENTRY_KEYS - set(entry))
+
+
 def _walk_validate(value: Any, path: str, findings: list[dict[str, str]], key: str = "") -> None:
     if isinstance(value, dict):
         for child_key, item in value.items():
@@ -1023,6 +1083,8 @@ def _walk_validate(value: Any, path: str, findings: list[dict[str, str]], key: s
             findings.append({"path": path, "kind": "invalid_boolean", "sample": "<redacted_value>"})
         if key in _FALSE_BOOL_KEYS and value is not False:
             findings.append({"path": path, "kind": "invalid_boolean", "sample": "<redacted_value>"})
+    elif key != "failure_stage" and (key in _STRING_ONLY_KEYS or key in _TRUE_BOOL_KEYS or key in _FALSE_BOOL_KEYS):
+        findings.append({"path": path, "kind": "invalid_type", "sample": "<redacted_value>"})
 
 
 def _string_is_allowed(key: str, value: str, path: str) -> bool:
@@ -1151,6 +1213,17 @@ def _offline_gate_row_fingerprint(report: dict[str, Any]) -> str:
             if isinstance(row, dict)
         ]
         for section in ("classification", "cold_resolution", "learned_resolution", "learned_selection")
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _artifact_report_fingerprint(report: dict[str, Any]) -> str:
+    payload = {
+        "rca_phrases": (report.get("rca_phrase_robustness") or {}).get("phrases", 0),
+        "rca_precision_phrases": (report.get("rca_precision") or {}).get("phrases", 0),
+        "noise_rows": (report.get("noise_injection") or {}).get("rows", []),
+        "baseline_metrics": (report.get("noise_injection") or {}).get("baseline_metrics", {}),
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

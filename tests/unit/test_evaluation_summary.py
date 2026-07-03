@@ -143,7 +143,7 @@ def test_evaluation_summary_rejects_unknown_snake_case_passthrough_strings():
         "context_available": [],
         "anonymous": True,
         "raw_inputs_included": False,
-        "contract": {},
+        "contract": {"total_cases": 1},
         "metrics": {},
         "random_baselines": {},
         "stage_counts": {},
@@ -168,7 +168,7 @@ def test_evaluation_summary_rejects_free_form_reason_in_preshaped_entry():
         "context_available": [],
         "anonymous": True,
         "raw_inputs_included": False,
-        "contract": {},
+        "contract": {"total_cases": 1},
         "metrics": {},
         "random_baselines": {},
         "stage_counts": {},
@@ -193,7 +193,7 @@ def test_evaluation_summary_rejects_private_slug_versions_in_preshaped_entry():
         "context_available": [],
         "anonymous": True,
         "raw_inputs_included": False,
-        "contract": {},
+        "contract": {"total_cases": 1},
         "metrics": {},
         "random_baselines": {},
         "stage_counts": {},
@@ -244,7 +244,7 @@ def test_preshaped_summary_rejects_private_snake_case_version_slugs():
         "context_available": [],
         "anonymous": True,
         "raw_inputs_included": False,
-        "contract": {},
+        "contract": {"total_cases": 1},
         "metrics": {},
         "random_baselines": {},
         "stage_counts": {},
@@ -414,6 +414,40 @@ def test_preshaped_summary_rejects_raw_snake_case_ids_with_numeric_suffixes():
     assert summary["available"] is False
 
 
+def test_incomplete_preshaped_evaluation_entry_is_skipped():
+    summary = build_evaluation_summary([{"benchmark_name": "contextual_culprit_ranking"}])
+
+    assert summary == {
+        "evaluation_version": "1",
+        "available": False,
+        "reason": UNAVAILABLE_REASON,
+    }
+
+
+def test_preshaped_summary_rejects_null_privacy_fields():
+    raw_entry = {
+        "benchmark_name": "contextual_culprit_ranking",
+        "benchmark_version": "2",
+        "dataset_hash": "sha256:0123456789abcdef",
+        "runner_version": "0.1.0",
+        "generated_at": "2026-07-02T04:15:00Z",
+        "mode": "gate",
+        "context_available": [],
+        "anonymous": None,
+        "raw_inputs_included": None,
+        "contract": {"total_cases": 1},
+        "metrics": {"top1": {"numerator": 1, "denominator": 1, "value": 1.0}},
+        "random_baselines": {},
+        "stage_counts": {"passed": 1, "failed": 0, "dropped": 0, "indeterminate": 0},
+        "failure_reasons": {},
+        "per_case": [],
+    }
+
+    summary = build_evaluation_summary([{"evaluations": [raw_entry]}])
+
+    assert summary["available"] is False
+
+
 def test_non_utf8_cached_evaluation_file_is_skipped(tmp_path):
     (tmp_path / "bad.json").write_bytes(b"\xff\xfe{")
     (tmp_path / "good.json").write_text(
@@ -449,7 +483,7 @@ def test_invalid_newer_candidate_does_not_replace_older_valid_summary():
         "context_available": [],
         "anonymous": True,
         "raw_inputs_included": False,
-        "contract": {},
+        "contract": {"total_cases": 1},
         "metrics": {"top1": {"numerator": 1, "denominator": 1, "value": 1.0}},
         "random_baselines": {},
         "stage_counts": {},
@@ -476,7 +510,7 @@ def test_latest_selection_uses_parsed_timestamp_offsets():
         "context_available": [],
         "anonymous": True,
         "raw_inputs_included": False,
-        "contract": {},
+        "contract": {"total_cases": 1},
         "metrics": {"top1": {"numerator": 1, "denominator": 1, "value": 1.0}},
         "random_baselines": {},
         "stage_counts": {},
@@ -741,6 +775,42 @@ def test_artifact_robustness_rca_rates_are_phrase_based():
     assert metrics["rca_precision"] == {"numerator": 1, "denominator": 2, "value": 0.5}
 
 
+def test_artifact_robustness_dataset_hash_includes_fixture_fingerprint():
+    def report(fixture_sha256: str) -> dict:
+        return {
+            "benchmark": "artifact_learning_robustness",
+            "fixture_sha256": fixture_sha256,
+            "rca_phrase_robustness": {
+                "phrases": 1,
+                "ignored_causal_claim_count": 1,
+                "failures": [],
+                "passed": True,
+            },
+            "rca_precision": {
+                "phrases": 1,
+                "false_positive_suppression_count": 0,
+                "failures": [],
+                "passed": True,
+            },
+            "noise_injection": {
+                "baseline_metrics": {"top1_recall": 1.0},
+                "rows": [{"artifact_count": 10, "noise_level": 0, "mrr_delta": 0.0}],
+                "failures": [],
+                "passed": True,
+            },
+            "contradictory_artifacts": {"failures": [], "passed": True},
+            "gate": {"passed": True, "failures": []},
+        }
+
+    summary = build_evaluation_summary([report("a" * 64), report("b" * 64)])
+
+    assert [evaluation["benchmark_name"] for evaluation in summary["evaluations"]] == [
+        "artifact_learning_robustness",
+        "artifact_learning_robustness",
+    ]
+    assert len({evaluation["dataset_hash"] for evaluation in summary["evaluations"]}) == 2
+
+
 def test_gamma_report_is_summarized_without_prompts_or_model():
     report = {
         "dataset": "gamma",
@@ -975,6 +1045,40 @@ def test_prompt_variation_rates_are_derived_from_exported_counts():
     assert evaluation["metrics"]["positive_useful_rate"] == {"numerator": 0, "denominator": 5, "value": 0.0}
     assert evaluation["metrics"]["worst_prompt_rate"] == {"value": 0.0}
     assert evaluation["per_case"][0]["rate"] == 0.0
+
+
+def test_prompt_variation_per_case_failures_use_gate_rate():
+    report = {
+        "corpus": "clickstack_prompts.json",
+        "role": "dev",
+        "prompts": 1,
+        "trials_per_prompt": 10,
+        "positive_useful_rate": 0.9,
+        "negative_correct_rate": 1.0,
+        "worst_prompt_rate": 0.9,
+        "gate": 0.85,
+        "passed": True,
+        "results": [
+            {
+                "prompt_index": 1,
+                "class": "reworded",
+                "polarity": "positive",
+                "prompt": "checkout-api latency is high",
+                "passed": 9,
+                "trials": 10,
+                "rate": 0.9,
+                "failures": [{"error": "raw model output"}],
+            }
+        ],
+    }
+
+    summary = build_evaluation_summary([report])
+    evaluation = summary["evaluations"][0]
+
+    assert evaluation["metrics"]["positive_useful_rate"] == {"numerator": 9, "denominator": 10, "value": 0.9}
+    assert evaluation["stage_counts"] == {"passed": 1, "failed": 0, "dropped": 0, "indeterminate": 0}
+    assert evaluation["failure_reasons"] == {}
+    assert evaluation["per_case"][0]["failure_stage"] is None
 
 
 def test_prompt_variation_empty_negative_class_is_vacuously_passing():
