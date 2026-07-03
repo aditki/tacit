@@ -96,10 +96,19 @@ class Settings(BaseSettings):
     llm_bedrock_role_arn: str = ""  # Optional IAM role ARN to assume (cross-account)
     llm_aws_access_key_id: str = Field(default="", repr=False)  # Optional explicit AWS key
     llm_aws_secret_access_key: str = Field(default="", repr=False)  # Optional explicit AWS secret
+    # Zero-key mode: when the configured provider has no API key, fall back to
+    # deterministic keyword-based intent classification instead of failing.
+    # The archetype engine then compiles the dashboard without any LLM calls.
+    intent_fallback_enabled: bool = True
 
     # Grafana
     grafana_enabled: bool = True
     grafana_url: str = "http://localhost:3000"
+    # Browser-facing base URL for generated dashboard links. Set this when the
+    # API URL above is only reachable from Tacit's network (e.g. Docker's
+    # http://grafana:3000) but users open dashboards at a different address.
+    # Empty = use grafana_url.
+    grafana_public_url: str = ""
     grafana_api_key: str = Field(default="", repr=False)
     grafana_org_id: int = 1
 

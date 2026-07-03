@@ -173,7 +173,11 @@ async def publish_dashboard(
     result = await client.create_dashboard(dashboard_json, folder_uid)
 
     uid = result.get("uid", "")
-    url = f"{config.grafana_url.rstrip('/')}{result.get('url', f'/d/{uid}')}"
+    # User-facing links use the browser-reachable URL. In containerized setups
+    # the API URL (e.g. http://grafana:3000 on the Docker network) is not
+    # resolvable from the user's browser, so grafana_public_url overrides it.
+    public_base = (config.grafana_public_url or config.grafana_url).rstrip("/")
+    url = f"{public_base}{result.get('url', f'/d/{uid}')}"
 
     logger.info("dashboard_published", uid=uid, url=url, panels=len(spec.panels))
     return url, uid

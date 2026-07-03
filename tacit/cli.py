@@ -382,14 +382,27 @@ def doctor():
 
     grafana_ok = network_results.get("grafana", False)
 
+    # Zero-key mode downgrades a missing LLM key from fatal to warning:
+    # deterministic intent + the archetype engine still produce dashboards.
+    llm_zero_key = False
+    try:
+        from tacit.config import settings as _llm_settings
+
+        llm_zero_key = _llm_settings.intent_fallback_enabled and not _llm_settings.llm_api_key
+    except Exception:
+        pass
+
     checks_total += len(network_checks)
     for name, ok in network_results.items():
         if ok:
             checks_passed += 1
+        elif name == "llm" and llm_zero_key:
+            warnings.append("llm (zero-key mode)")
         else:
             fatal_failures.append(name)
 
     # 4. Datasource discovery (depends on Grafana — sequential)
+    ds_ok = False
     if grafana_ok:
         checks_total += 1
         ds_ok = _check_datasources()
@@ -398,22 +411,88 @@ def doctor():
         else:
             warnings.append("datasources")
 
-    # ── Summary with classified failures ──────────────────────────────
+    # 5. Operational knowledge inventory (local stores — instant)
+    knowledge = {"dashboards": 0, "alerts": 0, "runbooks": 0, "incidents": 0}
+    readiness_level = ""
+    try:
+        from tacit.assess import build_assessment
+
+        _report = build_assessment()
+        _inv = _report["inventory"]
+        knowledge = {
+            "dashboards": _inv["dashboards_ingested"],
+            "alerts": _inv["alerts_ingested"],
+            "runbooks": _inv["runbooks"],
+            "incidents": _inv["incidents"],
+        }
+        readiness_level = _report["readiness"]["level"]
+    except Exception:
+        _warn("Knowledge inventory unavailable (stores not initialized yet)")
+
+    # ── Readiness checklist ───────────────────────────────────────────
     console.print()
-    if checks_passed == checks_total:
-        _success(f"All {checks_total} checks passed!")
+    _header("Readiness")
+
+    def _check_row(label: str, ok: bool, detail: str, fix: str = "") -> None:
+        if ok:
+            _success(f"{label:<14} {detail}")
+        else:
+            _fail(f"{label:<14} {detail}" + (f" — {fix}" if fix else ""))
+
+    _check_row("Grafana", grafana_ok, "connected" if grafana_ok else "not connected", "tacit connect grafana")
+    if grafana_ok:
+        _check_row("Datasources", ds_ok, "discovered" if ds_ok else "none found", "check Grafana datasources")
+    llm_ok = network_results.get("llm", False)
+    if llm_ok:
+        _check_row("LLM", True, "configured")
+    elif llm_zero_key:
+        _warn(f"{'LLM':<14} zero-key mode (deterministic fallback active)")
     else:
-        _warn(f"{checks_passed}/{checks_total} checks passed")
-        if fatal_failures:
-            _fail(f"Fatal: {', '.join(fatal_failures)}")
-        if warnings:
-            _warn(f"Warnings: {', '.join(warnings)}")
+        _check_row("LLM", False, "not configured", "set LLM_API_KEY in ~/.tacit/.env")
+    if sfx_enabled:
+        _check_row("SignalFx", network_results.get("signalfx", False), "connected", "tacit connect signalfx")
+    _check_row(
+        "Dashboards",
+        knowledge["dashboards"] > 0,
+        f"{knowledge['dashboards']} learned" if knowledge["dashboards"] else "none learned",
+        "tacit learn grafana",
+    )
+    _check_row(
+        "Alerts",
+        knowledge["alerts"] > 0,
+        f"{knowledge['alerts']} learned" if knowledge["alerts"] else "none learned",
+        "tacit learn alerts",
+    )
+    _check_row(
+        "Runbooks",
+        knowledge["runbooks"] > 0,
+        f"{knowledge['runbooks']} learned" if knowledge["runbooks"] else "none learned",
+        "tacit learn runbooks --dir <path>",
+    )
+    _check_row(
+        "Incidents",
+        knowledge["incidents"] > 0,
+        f"{knowledge['incidents']} learned" if knowledge["incidents"] else "none learned",
+        "tacit learn incidents / tacit learn pagerduty",
+    )
+
+    console.print()
+    ready = not fatal_failures
+    if ready:
+        verdict = "Ready" + (f" — investigation readiness: {readiness_level}" if readiness_level else "")
+        _success(f"Assessment: {verdict}")
+        _info("Deep-dive with: tacit assess")
+    else:
+        _fail(f"Assessment: Not ready ({checks_passed}/{checks_total} checks passed)")
+        _fail(f"Fatal: {', '.join(fatal_failures)}")
         if "grafana" in fatal_failures:
             _info("Run `tacit connect grafana` to fix Grafana connection")
         if "signalfx" in fatal_failures:
             _info("Run `tacit connect signalfx` to fix SignalFx connection")
         if "llm" in fatal_failures:
             _info("Check your LLM_API_KEY in ~/.tacit/.env")
+    if warnings:
+        _warn(f"Warnings: {', '.join(warnings)}")
 
 
 def _load_env():
@@ -490,7 +569,13 @@ def _check_llm() -> bool:
         model = settings.llm_model
 
         if not api_key and provider not in ("ollama", "bedrock"):
-            _warn(f"LLM: no API key for {provider}")
+            if settings.intent_fallback_enabled:
+                _warn(
+                    f"LLM: no API key for {provider} — zero-key mode active "
+                    "(deterministic intent + archetype engine only)"
+                )
+            else:
+                _warn(f"LLM: no API key for {provider}")
             return False
 
         # Light validation — don't actually call the API
@@ -531,7 +616,7 @@ def _check_llm() -> bool:
                 _success(f"LLM: bedrock / {model_id} (AWS account {account}, region {settings.llm_bedrock_region})")
                 return True
             except ImportError:
-                _fail("LLM: bedrock requires boto3 — pip install 'tacit[bedrock]'")
+                _fail("LLM: bedrock requires boto3 — uv sync --extra bedrock (or pip install 'tacit[bedrock]')")
                 return False
             except Exception as be:
                 _fail(f"LLM: bedrock AWS auth failed — {be}")
@@ -805,6 +890,196 @@ def test_run(prompt: str | None, open_browser: bool):
     except Exception as e:
         _fail(f"Pipeline error: {e}")
         _info("Run `tacit doctor` to check your setup")
+
+
+# ── tacit demo ───────────────────────────────────────────────────────────
+@cli.command()
+@click.option("--down", "tear_down", is_flag=True, help="Tear down the demo stack and exit")
+@click.option("--no-build", is_flag=True, help="Skip docker image rebuild (faster restarts)")
+@click.option("--skip-generate", is_flag=True, help="Run only the learning flow, skip dashboard generation")
+@click.option("--open-browser/--no-open-browser", default=True, help="Open the generated dashboard")
+@click.option("--prompt", "-p", default=None, help="Custom incident prompt for generation")
+def demo(tear_down: bool, no_build: bool, skip_generate: bool, open_browser: bool, prompt: str | None):
+    """Run the checkout-incident demo end to end with one command.
+
+    Boots the local Grafana + Prometheus + fake-metrics stack, teaches Tacit
+    from a known-good incident dashboard, then generates a fresh investigation
+    dashboard from a plain-English prompt.
+
+    Works with ZERO API keys: without an LLM key Tacit classifies the incident
+    deterministically and compiles the dashboard through the archetype engine.
+    """
+    from tacit import demo_flow
+
+    root = demo_flow.find_repo_root()
+    if root is None:
+        _fail("Could not find the Tacit demo stack (docker-compose.dev.yml + demo/).")
+        _info("Run this from a Tacit checkout, or set TACIT_REPO=/path/to/tacit:")
+        _info("  git clone https://github.com/aditki/tacit && cd tacit && tacit demo")
+        raise SystemExit(1)
+
+    if tear_down:
+        _header("Tearing down demo stack")
+        demo_flow.compose_down(root, echo=_info)
+        _success("Demo stack stopped")
+        return
+
+    _header("Tacit demo — checkout incident in a box")
+    _info(f"Using checkout at {root}")
+    _info("This stack uses intentionally unsafe local Grafana defaults. Keep it local-only.")
+
+    try:
+        # 1. Boot the stack
+        _header("1/4 Starting local stack (Grafana, Prometheus, fake metrics, Tacit)")
+        demo_flow.compose_up(root, echo=_info, build=not no_build)
+        _info("Waiting for services to become healthy...")
+        demo_flow.wait_for_http(f"{demo_flow.DEFAULT_GRAFANA_URL}/api/health", echo=_info)
+        _success("Grafana is up")
+        demo_flow.wait_for_http(f"{demo_flow.DEFAULT_API_URL}/healthz", echo=_info)
+        _success("Tacit API is up")
+
+        # 2. Learning flow
+        _header("2/4 Teaching Tacit from a known-good incident dashboard")
+        dashboard_json = root / "demo" / "checkout-service-incident.grafana.json"
+        demo_flow.run_learning_flow(demo_flow.DEFAULT_API_URL, dashboard_json, echo=_success)
+
+        if skip_generate:
+            _header("Done (generation skipped)")
+            _info(f"Web UI:  {demo_flow.DEFAULT_API_URL}")
+            _info(f"Grafana: {demo_flow.DEFAULT_GRAFANA_URL}")
+            return
+
+        # 3. Generate an investigation dashboard
+        _header("3/4 Generating a fresh investigation dashboard from plain English")
+        incident_prompt = prompt or demo_flow.DEMO_PROMPT
+        _info(f'Prompt: "{incident_prompt[:100]}..."')
+        result = demo_flow.run_generation(demo_flow.DEFAULT_API_URL, incident_prompt, echo=_info)
+
+        dashboard_url = result.get("dashboard_url", "")
+        if not dashboard_url:
+            _fail("Pipeline completed but returned no dashboard URL.")
+            _info(f"Summary: {result.get('summary', 'n/a')}")
+            raise SystemExit(1)
+
+        _success(f"Dashboard created: {result.get('panel_count', '?')} validated panels")
+        _info(dashboard_url)
+        demo_flow.record_demo_feedback(demo_flow.DEFAULT_API_URL, result.get("dashboard_uid", ""))
+
+        # 4. Wrap up
+        _header("4/4 Demo complete")
+        _info(f"Dashboard: {dashboard_url}")
+        _info(f"Web UI:    {demo_flow.DEFAULT_API_URL} (watch the live pipeline stages)")
+        _info(f"History:   {demo_flow.DEFAULT_API_URL} → History tab")
+        _info("Tear down anytime with: tacit demo --down")
+        if open_browser:
+            webbrowser.open(dashboard_url)
+
+    except demo_flow.DemoError as exc:
+        _fail(str(exc))
+        raise SystemExit(1)
+
+
+# ── tacit assess ─────────────────────────────────────────────────────────
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Emit the raw assessment as JSON")
+@click.option("--llm", "with_llm", is_flag=True, help="Add an LLM narrative on top of the deterministic report")
+def assess(as_json: bool, with_llm: bool):
+    """Operational knowledge assessment — fully deterministic, zero API keys.
+
+    Reports what Tacit has ingested, extracted, resolved, and failed to
+    resolve: counts, coverage, staleness, unresolved entities, artifact
+    yield, duplicate dashboards, alerts without owners, runbooks without
+    matching signals, and investigation activity.
+
+    Add --llm for an optional narrative (requires a configured LLM key).
+    """
+    _load_env()
+    from tacit.assess import build_assessment
+
+    report = build_assessment()
+
+    if as_json:
+        import json as json_module
+
+        click.echo(json_module.dumps(report, indent=2, default=str))
+        return
+
+    inventory = report["inventory"]
+    services = report["services"]
+    coverage = report["coverage"]
+    quality = report["quality"]
+    activity = report["activity"]
+    readiness = report["readiness"]
+
+    _header("Operational Knowledge Assessment")
+
+    def _row(label: str, value: Any) -> None:
+        console.print(f"  {label:<38} {value}")
+
+    console.print("\n  [bold]Inventory[/]" if Table else "\n  Inventory")
+    _row("Services known:", services["known"])
+    _row("Dashboards ingested:", inventory["dashboards_ingested"])
+    _row("Alerts ingested:", inventory["alerts_ingested"])
+    _row("Runbooks learned:", inventory["runbooks"])
+    _row("Incidents learned:", inventory["incidents"])
+    _row("Signal types:", inventory["signal_types"])
+    _row("Metric mappings:", inventory["metric_mappings"])
+
+    console.print("\n  [bold]Coverage & Trust[/]" if Table else "\n  Coverage & Trust")
+    _row("Knowledge coverage:", f"{coverage['knowledge_coverage_pct']}%")
+    _row(
+        "Signals with trusted mappings:",
+        f"{coverage['signal_types_with_trusted_mapping']}/{coverage['signal_types_total']}",
+    )
+    _row("Signals stuck at candidate:", coverage["signal_types_candidate_only"])
+    _row("Missing ownership:", services["missing_ownership"])
+
+    console.print("\n  [bold]Knowledge Quality[/]" if Table else "\n  Knowledge Quality")
+    _row("Duplicate dashboard groups:", quality["duplicate_groups"])
+    _row("Alerts without owner attribution:", quality["alerts_without_owner_attribution"])
+    _row("Runbooks without matching signals:", quality["runbooks_without_matching_signals"])
+    _row("Incident RCA claims rejected/ignored:", quality["incident_rca_claims_rejected_or_ignored"])
+    _row("RCA claims unreviewed >30d:", quality["incident_rca_claims_unreviewed_over_30d"])
+    _row("Unresolved evidence claims:", quality["unresolved_evidence_claims"])
+    _row("Stale artifacts / alerts:", f"{inventory['artifacts_stale']} / {inventory['alerts_stale']}")
+    _row("Artifacts with zero extractions:", quality["artifacts_with_zero_extractions"])
+    _row("Avg extractions per artifact:", quality["avg_extractions_per_artifact"])
+
+    console.print("\n  [bold]Activity[/]" if Table else "\n  Activity")
+    _row("Investigations run:", activity["investigations_total"])
+    _row("Success rate:", f"{activity['success_rate_pct']}%")
+    _row("Archetype vs freeform path:", f"{activity['archetype_path']} / {activity['freeform_path']}")
+
+    console.print()
+    level = readiness["level"]
+    color = {"High": "green", "Medium": "yellow", "Low": "red"}.get(level, "white")
+    if Table:
+        console.print(f"  [bold]Investigation Readiness:[/] [bold {color}]{level}[/] ({readiness['score']}/100)")
+    else:
+        console.print(f"  Investigation Readiness: {level} ({readiness['score']}/100)")
+    for reason in readiness["reasons"]:
+        _info(reason)
+
+    console.print()
+    _info("Share safely with: tacit export-report --anonymous")
+
+    if with_llm:
+        from tacit.agents.intent_fallback import zero_key_mode
+        from tacit.config import settings as runtime_settings
+
+        if zero_key_mode(runtime_settings):
+            _warn("--llm requires a configured LLM API key; the deterministic report above is complete without it.")
+            return
+        _header("LLM Narrative")
+        import asyncio
+
+        from tacit.assess import narrate_assessment
+
+        try:
+            narrative = asyncio.run(narrate_assessment(report))
+            console.print(f"  {narrative}")
+        except Exception as exc:
+            _fail(f"LLM narrative failed: {exc}")
 
 
 # ── tacit learn ──────────────────────────────────────────────────────────

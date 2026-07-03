@@ -33,6 +33,15 @@ class LLMResult:
 class LLMProvider(ABC):
     """Interface every LLM backend must implement."""
 
+    @property
+    def is_configured(self) -> bool:
+        """False when the provider is missing required credentials.
+
+        Providers that need an API key override this; local providers
+        (Ollama) and IAM-based providers (Bedrock) stay True.
+        """
+        return True
+
     @abstractmethod
     async def chat_json(
         self,

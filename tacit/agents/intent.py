@@ -102,8 +102,31 @@ SECURITY RULES (never violate these):
 """
 
 
+def _resolve_provider(provider: LLMProvider | None) -> LLMProvider | None:
+    """Resolve the provider classify_intent will use, tolerating init failures."""
+    if provider is not None:
+        return provider
+    try:
+        from tacit.agents import llm as llm_module
+
+        return llm_module.get_provider()
+    except Exception:
+        return None
+
+
 async def classify_intent(prompt: str, *, provider: LLMProvider | None = None) -> tuple[Intent, TokenUsage]:
     logger.info("intent_agent_start", prompt=prompt[:120])
+
+    # Zero-key mode: when the configured provider has no API key, classify
+    # deterministically so the archetype path still produces a dashboard.
+    from tacit.config import settings
+
+    resolved = _resolve_provider(provider)
+    if settings.intent_fallback_enabled and (resolved is None or not resolved.is_configured):
+        from tacit.agents.intent_fallback import heuristic_intent
+
+        return heuristic_intent(prompt), TokenUsage()
+
     intent, usage = await call_llm(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=prompt,

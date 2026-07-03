@@ -29,6 +29,10 @@ class OpenAIProvider(LLMProvider):
             kwargs["base_url"] = runtime_settings.llm_api_base
         self._client = openai.AsyncOpenAI(**kwargs)
 
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._settings.llm_api_key)
+
     async def chat_json(
         self,
         system_prompt: str,
@@ -99,6 +103,10 @@ class AzureOpenAIProvider(LLMProvider):
             deployment=self._deployment,
             api_version=runtime_settings.llm_azure_api_version,
         )
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._settings.llm_api_key)
 
     async def chat_json(
         self,

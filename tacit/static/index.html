@@ -129,6 +129,24 @@
     }
     .rec-item strong { color: #fbbf24; }
 
+    /* Live pipeline stage timeline */
+    .stage-timeline {
+      background: #0f1117; border: 1px solid #2d3040; border-radius: 8px;
+      padding: 0.75rem 1rem; margin-bottom: 0.75rem;
+    }
+    .stage-item {
+      display: flex; gap: 0.6rem; align-items: baseline;
+      padding: 0.3rem 0; font-size: 0.82rem; color: #9ca3af;
+      border-bottom: 1px solid #1a1d27;
+    }
+    .stage-item:last-child { border-bottom: none; }
+    .stage-icon { width: 1.1rem; text-align: center; flex-shrink: 0; }
+    .stage-passed .stage-icon { color: #34d399; }
+    .stage-failed .stage-icon { color: #fca5a5; }
+    .stage-partial .stage-icon, .stage-skipped .stage-icon { color: #fbbf24; }
+    .stage-name { color: #c7d2fe; font-weight: 600; min-width: 7.5rem; flex-shrink: 0; }
+    .stage-detail { color: #6b7280; word-break: break-word; }
+
     /* Archetype list */
     .arch-card {
       background: #0f1117; border: 1px solid #2d3040; border-radius: 8px;
@@ -412,7 +430,83 @@
 
     function fill(el) { document.getElementById('prompt').value = el.textContent; }
 
-    /* ── Generate ──────────────────────────────────────────────── */
+    /* ── Generate (streams live pipeline stages over SSE) ──────── */
+    const STAGE_LABELS = {
+      intent: 'Intent', discovery: 'Discovery', binding: 'Binding',
+      compilation: 'Compilation', validation: 'Validation', ranking: 'Ranking',
+      queries: 'Queries', publish: 'Publish', evidence: 'Evidence',
+    };
+    const STAGE_ICONS = { passed: '&#10003;', failed: '&#10007;', partial: '&#9888;', skipped: '&#9675;', started: '&#8987;', info: '&#8226;' };
+
+    function stageDetailText(ev) {
+      const d = ev.details || {};
+      switch (ev.stage) {
+        case 'intent': {
+          const archs = (d.archetypes || []).map(a => `${a.type} (${Number(a.confidence).toFixed(2)})`).join(', ');
+          const svc = (d.services || []).join(', ');
+          return [archs && `matched ${archs}`, svc && `services: ${svc}`].filter(Boolean).join(' — ');
+        }
+        case 'discovery':
+          return `${d.metrics_catalog_size ?? '?'} metrics across ${d.datasources_found ?? '?'} datasource(s)`;
+        case 'compilation':
+          return `${d.query_count ?? '?'} queries for ${d.panel_count ?? '?'} panels (${d.path || ''} path)`;
+        case 'validation': {
+          if (d.final_panel_count !== undefined) {
+            const dropped = d.panels_dropped ? `, dropped ${d.panels_dropped} with no data` : '';
+            return `${d.final_panel_count}/${d.panels_before} panels have live data${dropped}`;
+          }
+          return ev.reason || '';
+        }
+        case 'publish':
+          return ev.status === 'passed' ? `published ${d.panel_count ?? '?'} panels` : 'publishing...';
+        default:
+          return (ev.reason || '').replace(/_/g, ' ');
+      }
+    }
+
+    function renderStages(stages) {
+      const rows = stages.map(ev => `
+        <div class="stage-item stage-${esc(ev.status)}">
+          <span class="stage-icon">${STAGE_ICONS[ev.status] || STAGE_ICONS.info}</span>
+          <span class="stage-name">${esc(STAGE_LABELS[ev.stage] || ev.stage)}</span>
+          <span class="stage-detail">${esc(stageDetailText(ev))}</span>
+        </div>`).join('');
+      return `<div class="stage-timeline">${rows}</div>`;
+    }
+
+    async function streamChart(payload, onStage) {
+      const resp = await fetch(`${BASE}/api/v1/chart/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok || !resp.body) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+        throw new Error(errMsg(err, `HTTP ${resp.status}`));
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '', result = null;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          const evMatch = frame.match(/^event: (.+)$/m);
+          const dataMatch = frame.match(/^data: (.+)$/m);
+          if (!evMatch || !dataMatch) continue;
+          const data = JSON.parse(dataMatch[1]);
+          if (evMatch[1] === 'stage') onStage(data);
+          else if (evMatch[1] === 'result') result = data;
+          else if (evMatch[1] === 'error') throw new Error(data.detail || 'Pipeline failed');
+        }
+      }
+      if (!result) throw new Error('Stream ended without a result');
+      return result;
+    }
+
     async function submitPrompt() {
       const prompt = document.getElementById('prompt').value.trim();
       if (!prompt) return;
@@ -420,25 +514,42 @@
       const result = document.getElementById('result');
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span>Generating...';
-      result.innerHTML = '<div class="status"><span class="spinner"></span>Running pipeline &mdash; this takes 15-30s...</div>';
+      result.innerHTML = '<div class="status"><span class="spinner"></span>Starting investigation pipeline...</div>';
+
+      const payload = { prompt, user_id: 'web-ui', channel_id: 'web' };
+      const stages = [];
+      const onStage = (ev) => {
+        // Collapse repeat events for the same stage (e.g. publish started → passed)
+        const existing = stages.findIndex(s => s.stage === ev.stage);
+        if (existing >= 0) stages[existing] = ev; else stages.push(ev);
+        result.innerHTML = renderStages(stages) +
+          '<div class="status"><span class="spinner"></span>Building investigation...</div>';
+      };
 
       try {
-        const resp = await fetch(`${BASE}/api/v1/chart`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt, user_id: 'web-ui', channel_id: 'web' }),
-        });
-        if (!resp.ok) {
-          const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-          throw new Error(errMsg(err, `HTTP ${resp.status}`));
+        let data;
+        try {
+          data = await streamChart(payload, onStage);
+        } catch (streamErr) {
+          // Fall back to the non-streaming endpoint (older servers / proxies)
+          console.warn('SSE stream failed, falling back to /api/v1/chart:', streamErr);
+          const resp = await fetch(`${BASE}/api/v1/chart`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+            throw new Error(errMsg(err, `HTTP ${resp.status}`));
+          }
+          data = await resp.json();
         }
-        const data = await resp.json();
         lastDashboardUid = data.dashboard_uid;
         const dashUrl = data.dashboard_url ? data.dashboard_url.replace('http://localhost:3000', 'http://' + window.location.hostname + ':3000') : '';
         const grafanaLink = dashUrl ? `<div class="result-url"><a href="${esc(dashUrl)}" target="_blank">${esc(data.dashboard_uid)} &mdash; Open in Grafana &rarr;</a></div>` : '';
         const sfxLink = data.signalfx_url ? `<div class="result-url" style="margin-top:4px"><a href="${esc(data.signalfx_url)}" target="_blank">Open in SignalFx &rarr;</a></div>` : '';
 
-        result.innerHTML = `
+        result.innerHTML = (stages.length ? renderStages(stages) : '') + `
           <div class="result-card success">
             <div class="result-label">Dashboard created</div>
             ${grafanaLink}
@@ -466,7 +577,7 @@
             </div>
           </div>`;
       } catch (e) {
-        result.innerHTML = `
+        result.innerHTML = (stages.length ? renderStages(stages) : '') + `
           <div class="result-card error">
             <div class="result-label">Error</div>
             <div class="result-meta" style="color:#fca5a5">${esc(e.message)}</div>

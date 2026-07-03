@@ -9,6 +9,7 @@ from tacit.backends.base import DashboardBackend, PublishResult
 from tacit.dependencies import PipelineDependencies
 from tacit.logging import stage_log
 from tacit.models.schemas import CulpritRanking, DashboardSpec, DashRequest, DashResponse, Intent, MetricEntry
+from tacit.pipeline.progress import emit_progress
 from tacit.pipeline.recording import (
     PipelineRecorder,
     dashboard_summary,
@@ -37,7 +38,15 @@ async def complete_pipeline(
     started_at: float,
 ) -> DashResponse:
     """Publish a validated dashboard and record completion/provenance."""
+    emit_progress("publish", "started", "publishing_dashboard", backends=[b.name for b in backends])
     publish_results = await publish_dashboard(backends=backends, dashboard_spec=dashboard_spec, timings=timings)
+    emit_progress(
+        "publish",
+        "passed",
+        "dashboard_published",
+        backends={name: bool(result.url) for name, result in publish_results.items()},
+        panel_count=len(dashboard_spec.panels),
+    )
 
     grafana_result = publish_results.get("grafana", PublishResult())
     sfx_result = publish_results.get("signalfx", PublishResult())
