@@ -39,8 +39,8 @@ _ARCHETYPE_TRIGGERS: dict[str, list[str]] = {
         r"response time",
     ],
     "error_spike": [
-        r"\b5\d\d\b",
-        r"\b5xx\b",
+        r"\b5\d\ds?\b",
+        r"\b5xxs?\b",
         r"\berrors?\b",
         r"error rate",
         r"\bfail(?:ed|ing|ures?)\b",
@@ -160,6 +160,12 @@ _SERVICE_STOPLIST = {
     "error_rate",
     "error-rate",
     "errors",
+    "cache-hit",
+    "cache-miss",
+    "cache-stampede",
+    "cache_hit",
+    "cache_miss",
+    "cache_stampede",
     "grafana",
     "heap",
     "latency",
@@ -224,9 +230,9 @@ def _match_archetypes(text: str) -> list[ArchetypeMatch]:
 def _extract_services(text: str) -> list[str]:
     services: list[str] = []
     candidates = [
-        *_SERVICE_TOKEN.findall(text.lower()),
         *[match.lower() for match in _SERVICE_PHRASE.findall(text)],
         *[match.lower() for match in _SERVICE_PREPOSITION.findall(text)],
+        *_SERVICE_TOKEN.findall(text.lower()),
     ]
     for token in candidates:
         if token in _SERVICE_STOPLIST or token in services:

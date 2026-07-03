@@ -110,9 +110,21 @@ def _auth_headers() -> dict[str, str]:
     return {"X-API-Key": api_key} if api_key else {}
 
 
+def _raise_demo_http_error(exc: httpx.HTTPStatusError) -> None:
+    response = exc.response
+    method = response.request.method
+    url = response.request.url
+    body = response.text.strip()
+    detail = body[:500] if body else response.reason_phrase
+    raise DemoError(f"Demo API request failed: {method} {url} returned HTTP {response.status_code}: {detail}") from exc
+
+
 def _request(client: httpx.Client, method: str, path: str, payload: dict | None = None) -> dict:
     response = client.request(method, path, json=payload)
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _raise_demo_http_error(exc)
     return response.json() if response.content else {}
 
 

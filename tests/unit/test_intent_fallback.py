@@ -57,9 +57,18 @@ class TestHeuristicIntent:
         intent = heuristic_intent("checkout service is throwing 500s")
         assert intent.services == ["checkout"]
 
+    def test_plural_http_error_codes_match_error_spike(self):
+        assert heuristic_intent("checkout service is throwing 500s").archetypes[0].type == "error_spike"
+        assert heuristic_intent("checkout service is throwing 5xxs").archetypes[0].type == "error_spike"
+
     def test_single_word_service_preposition_extraction(self):
         intent = heuristic_intent("high CPU on checkout in the last 30 minutes")
         assert "checkout" in intent.services
+
+    def test_operational_hyphen_terms_do_not_outrank_real_service(self):
+        intent = heuristic_intent("cache-miss spikes on checkout")
+        assert intent.services[0] == "checkout"
+        assert "cache-miss" not in intent.services
 
     def test_single_word_service_extraction_ignores_timerange_word(self):
         intent = heuristic_intent("high CPU in the last 30 minutes")
