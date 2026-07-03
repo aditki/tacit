@@ -341,4 +341,5 @@ async def narrate_assessment(report: dict[str, Any]) -> str:
         "next action the team should take. Be concrete and reference the "
         "numbers. No markdown headers, no bullet symbols other than dashes."
     )
-    return await call_llm_text(system_prompt, json.dumps(report, default=str))
+    narrative, _usage = await call_llm_text(system_prompt, json.dumps(report, default=str))
+    return narrative
