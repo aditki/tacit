@@ -37,6 +37,7 @@ ANONYMOUS_BUNDLE_FILES = (
     "artifact_stats.json",
     "ranking_summary.json",
     "robustness_summary.json",
+    "evaluation_summary.json",
     "warnings.json",
     "validation_report.json",
 )
@@ -109,6 +110,31 @@ SAFE_DATA_KEYS: dict[str, set[str]] = {
     },
     "confidence_bucket": {"high_ge_0.8", "low_gt_0", "medium_ge_0.5", "none"},
     "error_kind": {"auth", "backend_config", "llm", "not_found", "other", "timeout"},
+    "eval_metric": {
+        "top1",
+        "top3",
+        "mrr",
+        "false_culprit_rate",
+        "unsupported_rca_rate",
+        "evidence_attribution",
+        "negative_correctness",
+        "abstention_on_insufficient",
+        "positive_useful_rate",
+        "negative_correct_rate",
+        "worst_prompt_rate",
+    },
+    "eval_stage": {
+        "passed",
+        "failed",
+        "dropped",
+        "indeterminate",
+        "intent_parsed",
+        "evidence_requirements_created",
+        "evidence_resolved",
+        "queries_built",
+        "queries_validated",
+        "panels_created",
+    },
     "reason_code": {
         "",
         "backend_config",
@@ -463,6 +489,9 @@ def export_assessment_report(
     report = build_assessment_report(anonymous=anonymous)
     if anonymous:
         report = ReportAnonymizer().anonymize_report(report)
+        from tacit.evaluation_summary import build_evaluation_summary
+
+        report["evaluation_summary"] = build_evaluation_summary()
         validation_report = _pending_validation_report()
     else:
         validation_report = _skipped_validation_report()
@@ -753,7 +782,12 @@ def _anonymous_readme() -> str:
         "Tacit anonymous assessment export\n\n"
         "This bundle is designed for sharing with Tacit maintainers or evaluators.\n"
         "It contains aggregate counts, review-state summaries, ranking diagnostics,\n"
-        "failure summaries, and leakage-validation results.\n\n"
+        "failure summaries, benchmark evaluation summaries when available, and\n"
+        "leakage-validation results.\n\n"
+        "Anonymous bundles include an evaluation_summary.json when benchmark results\n"
+        "are available. This file preserves benchmark contracts, denominators,\n"
+        "anonymized per-case outcomes, and safety metrics without exporting raw\n"
+        "prompts, artifact text, or operational identifiers.\n\n"
         "It intentionally excludes raw dashboards, raw runbooks, raw incidents,\n"
         "raw alert bodies, raw telemetry, raw logs, secret values, and the\n"
         "anonymization mapping table.\n"
@@ -770,7 +804,7 @@ def _raw_readme() -> str:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _anonymous_tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo:
