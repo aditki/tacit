@@ -384,13 +384,7 @@ def doctor():
 
     # Zero-key mode downgrades a missing LLM key from fatal to warning:
     # deterministic intent + the archetype engine still produce dashboards.
-    llm_zero_key = False
-    try:
-        from tacit.config import settings as _llm_settings
-
-        llm_zero_key = _llm_settings.intent_fallback_enabled and not _llm_settings.llm_api_key
-    except Exception:
-        pass
+    llm_zero_key = _llm_zero_key_mode()
 
     checks_total += len(network_checks)
     for name, ok in network_results.items():
@@ -505,6 +499,17 @@ def _load_env():
 
     if CONFIG_FILE.exists() and not os.environ.get("TACIT_CONFIG"):
         os.environ["TACIT_CONFIG"] = str(CONFIG_FILE)
+
+
+def _llm_zero_key_mode() -> bool:
+    """True only when deterministic fallback applies to a key-based provider."""
+    try:
+        from tacit.agents.intent_fallback import zero_key_mode
+        from tacit.config import settings
+
+        return settings.intent_fallback_enabled and zero_key_mode(settings)
+    except Exception:
+        return False
 
 
 def _check_grafana() -> bool:

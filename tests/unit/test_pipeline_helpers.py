@@ -218,6 +218,80 @@ async def test_intent_stage_defers_provider_construction_for_legacy_hooks():
     assert calls == 0
 
 
+async def test_intent_stage_zero_key_skips_provider_construction_for_key_based_provider():
+    calls = 0
+
+    async def classify(prompt: str, *, provider=None):
+        assert provider is not None
+        assert provider.is_configured is False
+        return _intent(), TokenUsage()
+
+    async def enrich(intent: Intent):
+        return []
+
+    def provider_factory():
+        nonlocal calls
+        calls += 1
+        raise AssertionError("provider should not be constructed in zero-key mode")
+
+    result = await run_intent_stage(
+        prompt="checkout latency",
+        user_id="u1",
+        deps=PipelineDependencies(
+            settings=Settings(llm_provider="openai", llm_api_key="", intent_fallback_enabled=True),
+            backend_factory=lambda: [],
+            history_store_factory=lambda: FakeHistoryStore(),
+            feedback_store_factory=lambda: FakeFeedbackStore(),
+            llm_cache={},
+            cache_key_factory=lambda *parts: ":".join(parts),
+        ),
+        classify=classify,
+        enrich=enrich,
+        classify_provider_factory=provider_factory,
+        context_provider_factory=None,
+        timings={},
+    )
+
+    assert result.intent.summary == "checkout latency"
+    assert calls == 0
+
+
+async def test_intent_stage_does_not_skip_provider_construction_for_ollama_without_key():
+    calls = 0
+
+    async def classify(prompt: str, *, provider=None):
+        assert provider is not None
+        return _intent(), TokenUsage()
+
+    async def enrich(intent: Intent):
+        return []
+
+    def provider_factory():
+        nonlocal calls
+        calls += 1
+        return FakeProvider()
+
+    await run_intent_stage(
+        prompt="checkout latency",
+        user_id="u1",
+        deps=PipelineDependencies(
+            settings=Settings(llm_provider="ollama", llm_api_key="", intent_fallback_enabled=True),
+            backend_factory=lambda: [],
+            history_store_factory=lambda: FakeHistoryStore(),
+            feedback_store_factory=lambda: FakeFeedbackStore(),
+            llm_cache={},
+            cache_key_factory=lambda *parts: ":".join(parts),
+        ),
+        classify=classify,
+        enrich=enrich,
+        classify_provider_factory=provider_factory,
+        context_provider_factory=None,
+        timings={},
+    )
+
+    assert calls == 1
+
+
 async def test_pipeline_dependencies_cache_and_close_runtime_providers(monkeypatch):
     providers = [FakeProvider(), FakeProvider()]
     context_providers = [FakeContextProvider(), FakeContextProvider()]

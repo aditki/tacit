@@ -30,6 +30,44 @@ def test_azure_provider_requires_api_base():
     print("[PASS] test_azure_provider_requires_api_base")
 
 
+def test_azure_provider_without_key_does_not_construct_sdk_client():
+    """Zero-key fallback must be able to inspect configuration before SDK init."""
+    with (
+        patch("tacit.agents.providers.openai_provider.settings") as mock_settings,
+        patch("tacit.agents.providers.openai_provider.openai") as mock_openai,
+    ):
+        mock_settings.llm_api_base = ""
+        mock_settings.llm_api_key = ""
+        mock_settings.llm_azure_deployment = ""
+        mock_settings.llm_model = "gpt-4o"
+
+        from tacit.agents.providers.openai_provider import AzureOpenAIProvider
+
+        provider = AzureOpenAIProvider()
+        assert provider.is_configured is False
+        mock_openai.AsyncAzureOpenAI.assert_not_called()
+
+    print("[PASS] test_azure_provider_without_key_does_not_construct_sdk_client")
+
+
+def test_openai_provider_without_key_does_not_construct_sdk_client():
+    """OpenAI zero-key fallback must not be blocked by SDK construction."""
+    with (
+        patch("tacit.agents.providers.openai_provider.settings") as mock_settings,
+        patch("tacit.agents.providers.openai_provider.openai") as mock_openai,
+    ):
+        mock_settings.llm_api_key = ""
+        mock_settings.llm_api_base = ""
+
+        from tacit.agents.providers.openai_provider import OpenAIProvider
+
+        provider = OpenAIProvider()
+        assert provider.is_configured is False
+        mock_openai.AsyncOpenAI.assert_not_called()
+
+    print("[PASS] test_openai_provider_without_key_does_not_construct_sdk_client")
+
+
 def test_azure_deployment_fallback_to_model():
     """When llm_azure_deployment is empty, should use llm_model."""
     with (

@@ -24,6 +24,9 @@ class OpenAIProvider(LLMProvider):
     def __init__(self, runtime_settings: Settings | None = None):
         self._settings = runtime_settings or settings
         runtime_settings = self._settings
+        self._client = None
+        if not runtime_settings.llm_api_key:
+            return
         kwargs: dict = {"api_key": runtime_settings.llm_api_key}
         if runtime_settings.llm_api_base:
             kwargs["base_url"] = runtime_settings.llm_api_base
@@ -39,6 +42,8 @@ class OpenAIProvider(LLMProvider):
         user_prompt: str,
         temperature: float = 0.2,
     ) -> LLMResult:
+        if self._client is None:
+            raise ValueError("OpenAI requires LLM_API_KEY")
         response = await self._client.chat.completions.create(
             model=self._settings.llm_model,
             messages=[
@@ -58,6 +63,8 @@ class OpenAIProvider(LLMProvider):
         user_prompt: str,
         temperature: float = 0.3,
     ) -> LLMResult:
+        if self._client is None:
+            raise ValueError("OpenAI requires LLM_API_KEY")
         response = await self._client.chat.completions.create(
             model=self._settings.llm_model,
             messages=[
@@ -69,7 +76,8 @@ class OpenAIProvider(LLMProvider):
         return LLMResult(text=response.choices[0].message.content or "", usage=_extract_openai_usage(response))
 
     async def close(self) -> None:
-        await self._client.close()
+        if self._client is not None:
+            await self._client.close()
 
 
 class AzureOpenAIProvider(LLMProvider):
@@ -85,11 +93,18 @@ class AzureOpenAIProvider(LLMProvider):
     def __init__(self, runtime_settings: Settings | None = None):
         self._settings = runtime_settings or settings
         runtime_settings = self._settings
+        self._client = None
         if not runtime_settings.llm_api_base:
+            if not runtime_settings.llm_api_key:
+                self._deployment = runtime_settings.llm_azure_deployment or runtime_settings.llm_model
+                return
             raise ValueError(
                 "Azure OpenAI requires llm_api_base (azure_endpoint). "
                 "Set LLM_API_BASE=https://<resource>.openai.azure.com"
             )
+        if not runtime_settings.llm_api_key:
+            self._deployment = runtime_settings.llm_azure_deployment or runtime_settings.llm_model
+            return
         self._deployment = runtime_settings.llm_azure_deployment or runtime_settings.llm_model
         self._client = openai.AsyncAzureOpenAI(
             api_key=runtime_settings.llm_api_key,
@@ -114,6 +129,8 @@ class AzureOpenAIProvider(LLMProvider):
         user_prompt: str,
         temperature: float = 0.2,
     ) -> LLMResult:
+        if self._client is None:
+            raise ValueError("Azure OpenAI requires LLM_API_KEY")
         response = await self._client.chat.completions.create(
             model=self._deployment,
             messages=[
@@ -133,6 +150,8 @@ class AzureOpenAIProvider(LLMProvider):
         user_prompt: str,
         temperature: float = 0.3,
     ) -> LLMResult:
+        if self._client is None:
+            raise ValueError("Azure OpenAI requires LLM_API_KEY")
         response = await self._client.chat.completions.create(
             model=self._deployment,
             messages=[
@@ -144,4 +163,5 @@ class AzureOpenAIProvider(LLMProvider):
         return LLMResult(text=response.choices[0].message.content or "", usage=_extract_openai_usage(response))
 
     async def close(self) -> None:
-        await self._client.close()
+        if self._client is not None:
+            await self._client.close()

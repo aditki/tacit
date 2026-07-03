@@ -6,6 +6,8 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from tacit.agents.intent_fallback import (
     heuristic_intent,
     zero_key_mode,
@@ -101,3 +103,18 @@ class TestClassifyIntentFallbackRouting:
             intent, usage = asyncio.run(classify_intent("high cpu on checkout"))
         assert usage.total_tokens == 0
         assert intent.archetypes[0].type == "resource_saturation"
+
+    def test_provider_init_failure_does_not_hide_ollama_errors(self):
+        from tacit.agents.intent import classify_intent
+
+        fake_settings = SimpleNamespace(
+            intent_fallback_enabled=True,
+            llm_provider="ollama",
+            llm_api_key="",
+        )
+        with (
+            patch("tacit.config.settings", fake_settings),
+            patch("tacit.agents.llm.get_provider", side_effect=ValueError("ollama offline")),
+        ):
+            with pytest.raises(ValueError, match="ollama offline"):
+                asyncio.run(classify_intent("high cpu on checkout"))

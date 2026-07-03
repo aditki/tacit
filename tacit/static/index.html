@@ -447,7 +447,7 @@
           return [archs && `matched ${archs}`, svc && `services: ${svc}`].filter(Boolean).join(' — ');
         }
         case 'discovery':
-          return `${d.metrics_catalog_size ?? '?'} metrics across ${d.datasources_found ?? '?'} datasource(s)`;
+          return `${d.metrics_catalog_size ?? d.metric_count ?? '?'} metrics across ${d.datasources_found ?? d.datasource_count ?? '?'} datasource(s)`;
         case 'compilation':
           return `${d.query_count ?? '?'} queries for ${d.panel_count ?? '?'} panels (${d.path || ''} path)`;
         case 'validation': {
@@ -472,6 +472,13 @@
           <span class="stage-detail">${esc(stageDetailText(ev))}</span>
         </div>`).join('');
       return `<div class="stage-timeline">${rows}</div>`;
+    }
+
+    class PipelineStreamError extends Error {
+      constructor(message) {
+        super(message);
+        this.name = 'PipelineStreamError';
+      }
     }
 
     async function streamChart(payload, onStage) {
@@ -500,7 +507,7 @@
           const data = JSON.parse(dataMatch[1]);
           if (evMatch[1] === 'stage') onStage(data);
           else if (evMatch[1] === 'result') result = data;
-          else if (evMatch[1] === 'error') throw new Error(data.detail || 'Pipeline failed');
+          else if (evMatch[1] === 'error') throw new PipelineStreamError(data.detail || 'Pipeline failed');
         }
       }
       if (!result) throw new Error('Stream ended without a result');
@@ -531,6 +538,7 @@
         try {
           data = await streamChart(payload, onStage);
         } catch (streamErr) {
+          if (streamErr instanceof PipelineStreamError) throw streamErr;
           // Fall back to the non-streaming endpoint (older servers / proxies)
           console.warn('SSE stream failed, falling back to /api/v1/chart:', streamErr);
           const resp = await fetch(`${BASE}/api/v1/chart`, {

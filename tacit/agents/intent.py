@@ -117,12 +117,17 @@ def _resolve_provider(provider: LLMProvider | None) -> LLMProvider | None:
 async def classify_intent(prompt: str, *, provider: LLMProvider | None = None) -> tuple[Intent, TokenUsage]:
     logger.info("intent_agent_start", prompt=prompt[:120])
 
-    # Zero-key mode: when the configured provider has no API key, classify
-    # deterministically so the archetype path still produces a dashboard.
+    # Zero-key mode applies only to providers that require LLM_API_KEY. Local
+    # Ollama and IAM-backed Bedrock must surface real connectivity/auth errors.
+    from tacit.agents.intent_fallback import zero_key_mode
     from tacit.config import settings
 
     resolved = _resolve_provider(provider)
-    if settings.intent_fallback_enabled and (resolved is None or not resolved.is_configured):
+    if (
+        settings.intent_fallback_enabled
+        and zero_key_mode(settings)
+        and (resolved is None or not resolved.is_configured)
+    ):
         from tacit.agents.intent_fallback import heuristic_intent
 
         return heuristic_intent(prompt), TokenUsage()
@@ -132,7 +137,7 @@ async def classify_intent(prompt: str, *, provider: LLMProvider | None = None) -
         user_prompt=prompt,
         response_model=Intent,
         temperature=0.1,
-        provider=provider,
+        provider=resolved if resolved is not None else provider,
     )
 
     # Operational-vocabulary normalization, two tiers:
