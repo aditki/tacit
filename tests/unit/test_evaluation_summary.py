@@ -317,6 +317,30 @@ def test_preshaped_summary_rejects_invalid_privacy_booleans():
     assert summary["available"] is False
 
 
+def test_preshaped_summary_rejects_numeric_ids():
+    raw_entry = {
+        "benchmark_name": "contextual_culprit_ranking",
+        "benchmark_version": "2",
+        "dataset_hash": "sha256:0123456789abcdef",
+        "runner_version": "0.1.0",
+        "generated_at": "2026-07-02T04:15:00Z",
+        "mode": "gate",
+        "context_available": [],
+        "anonymous": True,
+        "raw_inputs_included": False,
+        "contract": {},
+        "metrics": {},
+        "random_baselines": {},
+        "stage_counts": {},
+        "failure_reasons": {},
+        "per_case": [{"case_id": 123, "case_class": "scorable"}],
+    }
+
+    summary = build_evaluation_summary([{"evaluations": [raw_entry]}])
+
+    assert summary["available"] is False
+
+
 def test_malformed_cached_result_is_skipped_without_blocking_valid_result():
     malformed = {"benchmark_contract": {"scorable_cases": "not-a-number"}, "metrics": {"top1_recall": 1.0}}
     valid = evaluate()
@@ -326,6 +350,33 @@ def test_malformed_cached_result_is_skipped_without_blocking_valid_result():
     assert summary["available"] is True
     assert len(summary["evaluations"]) == 1
     assert summary["evaluations"][0]["benchmark_name"] == "contextual_culprit_ranking"
+
+
+def test_invalid_newer_candidate_does_not_replace_older_valid_summary():
+    older = {
+        "benchmark_name": "contextual_culprit_ranking",
+        "benchmark_version": "2",
+        "dataset_hash": "sha256:0123456789abcdef",
+        "runner_version": "0.1.0",
+        "generated_at": "2026-07-02T04:15:00Z",
+        "mode": "gate",
+        "context_available": [],
+        "anonymous": True,
+        "raw_inputs_included": False,
+        "contract": {},
+        "metrics": {"top1": {"numerator": 1, "denominator": 1, "value": 1.0}},
+        "random_baselines": {},
+        "stage_counts": {},
+        "failure_reasons": {},
+        "per_case": [],
+    }
+    newer = dict(older)
+    newer["generated_at"] = "not-a-timestamp"
+
+    summary = build_evaluation_summary([{"evaluations": [older]}, {"evaluations": [newer]}])
+
+    assert summary["available"] is True
+    assert summary["evaluations"][0]["generated_at"] == "2026-07-02T04:15:00Z"
 
 
 def test_evaluation_summary_validator_rejects_unknown_metric_keys():
@@ -426,6 +477,40 @@ def test_prompt_variation_summary_preserves_distinct_corpora():
         "prompt_variation",
     ]
     assert len({evaluation["dataset_hash"] for evaluation in summary["evaluations"]}) == 2
+
+
+def test_prompt_variation_dataset_hash_uses_prompt_content_fingerprint():
+    def report(prompt: str) -> dict:
+        return {
+            "corpus": "same_name.json",
+            "role": "dev",
+            "prompts": 1,
+            "trials_per_prompt": 5,
+            "positive_useful_rate": 1.0,
+            "negative_correct_rate": 1.0,
+            "worst_prompt_rate": 1.0,
+            "generated_at": "2026-07-02T04:15:00Z",
+            "results": [
+                {
+                    "prompt_index": 1,
+                    "class": "reworded",
+                    "polarity": "positive",
+                    "prompt": prompt,
+                    "passed": 5,
+                    "trials": 5,
+                    "rate": 1.0,
+                    "failures": [],
+                }
+            ],
+        }
+
+    summary = build_evaluation_summary([report("first private prompt"), report("second private prompt")])
+
+    assert summary["available"] is True
+    assert len(summary["evaluations"]) == 2
+    assert len({evaluation["dataset_hash"] for evaluation in summary["evaluations"]}) == 2
+    assert "first private prompt" not in json.dumps(summary)
+    assert "second private prompt" not in json.dumps(summary)
 
 
 def test_lift_harness_reports_are_summarized_from_after_metrics():

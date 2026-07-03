@@ -309,6 +309,21 @@ _REASON_CODE_KEYS = {"reason_codes"}
 _FAILURE_KEYS = {"failures"}
 _TRUE_BOOL_KEYS = {"anonymous"}
 _FALSE_BOOL_KEYS = {"raw_inputs_included"}
+_STRING_ONLY_KEYS = (
+    _ANON_ID_KEYS
+    | _VERSION_KEYS
+    | _TIMESTAMP_KEYS
+    | _HASH_KEYS
+    | _MODE_KEYS
+    | _TRUNCATION_KEYS
+    | _BENCHMARK_KEYS
+    | _CONTEXT_KEYS
+    | _CASE_CLASS_KEYS
+    | _STAGE_KEYS
+    | _REASON_CODE_KEYS
+    | _FAILURE_KEYS
+    | {"reason", "assumption"}
+)
 
 
 def evaluation_results_dir() -> Path:
@@ -385,6 +400,9 @@ def build_evaluation_summary(
             name = str(entry.get("benchmark_name", ""))
             if not name:
                 continue
+            validation = validate_evaluation_summary({"evaluation_version": EVALUATION_VERSION, "evaluations": [entry]})
+            if not validation["passed"]:
+                continue
             identity = _evaluation_identity(entry)
             previous = latest.get(identity)
             if previous is None or str(entry.get("generated_at", "")) >= str(previous.get("generated_at", "")):
@@ -392,10 +410,7 @@ def build_evaluation_summary(
 
     evaluations = []
     for identity in sorted(latest):
-        entry = latest[identity]
-        validation = validate_evaluation_summary({"evaluation_version": EVALUATION_VERSION, "evaluations": [entry]})
-        if validation["passed"]:
-            evaluations.append(entry)
+        evaluations.append(latest[identity])
 
     if not evaluations:
         return {
@@ -939,6 +954,7 @@ def summarize_prompt_variation_report(report: dict[str, Any]) -> dict[str, Any] 
                 "role": report.get("role", ""),
                 "prompts": int(report.get("prompts", len(rows)) or 0),
                 "trials_per_prompt": trials_per_prompt,
+                "corpus_content_sha256": _prompt_corpus_fingerprint(rows),
             }
         ),
         "runner_version": _safe_version(report.get("runner_version"), default=__version__),
@@ -993,6 +1009,8 @@ def _walk_validate(value: Any, path: str, findings: list[dict[str, str]], key: s
         if not _string_is_allowed(key, value, path):
             findings.append({"path": path, "kind": "forbidden_value", "sample": "<redacted_value>"})
     elif isinstance(value, int | float) and not isinstance(value, bool):
+        if key in _STRING_ONLY_KEYS:
+            findings.append({"path": path, "kind": "invalid_type", "sample": "<redacted_value>"})
         if not math.isfinite(float(value)):
             findings.append({"path": path, "kind": "non_finite_number", "sample": "<redacted_value>"})
     elif isinstance(value, bool):
@@ -1071,6 +1089,19 @@ def _evaluation_identity(entry: dict[str, Any]) -> tuple[str, str]:
     if not dataset_hash and isinstance(entry.get("contract"), dict):
         dataset_hash = _dataset_hash(entry["contract"])
     return name, dataset_hash
+
+
+def _prompt_corpus_fingerprint(rows: list[dict[str, Any]]) -> str:
+    payload = [
+        {
+            "class": row.get("class", ""),
+            "polarity": row.get("polarity", ""),
+            "prompt": row.get("prompt", ""),
+        }
+        for row in rows
+    ]
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _ratio(numerator: int | float, denominator: int | float) -> dict[str, Any]:
