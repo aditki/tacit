@@ -287,7 +287,7 @@ _DYNAMIC_KEYS_BY_PATH = {
 }
 
 _SNAKE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_ANON_ID_RE = re.compile(r"^[a-z][a-z0-9_]*_[0-9]{3,6}$")
+_ANON_ID_RE = re.compile(r"^(?:case|service|alert|runbook|incident|dashboard)_[0-9]{3,6}$")
 _HASH_RE = re.compile(r"^sha256:[0-9a-f]{16,64}$")
 _TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 _VERSION_RE = re.compile(
@@ -323,8 +323,6 @@ _STRING_ONLY_KEYS = (
     | _STAGE_KEYS
     | _REASON_CODE_KEYS
     | _FAILURE_KEYS
-    | _TRUE_BOOL_KEYS
-    | _FALSE_BOOL_KEYS
     | {"reason", "assumption"}
 )
 
@@ -371,7 +369,7 @@ def load_evaluation_results(directory: Path | None = None) -> list[dict[str, Any
     for path in sorted(directory.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         if not isinstance(data, dict):
             continue
@@ -537,9 +535,9 @@ def summarize_artifact_robustness_report(report: dict[str, Any]) -> dict[str, An
 
     rca_phrases = int(rca.get("phrases", 0) or 0)
     precision_phrases = int(precision.get("phrases", 0) or 0)
-    rca_failed_phrases = len(rca.get("failures", []) or [])
+    rca_failed_phrases = _distinct_phrase_failures(rca.get("failures", []) or [])
     rca_passed_phrases = max(rca_phrases - rca_failed_phrases, 0)
-    precision_failed_phrases = len(precision.get("failures", []) or [])
+    precision_failed_phrases = _distinct_phrase_failures(precision.get("failures", []) or [])
     precision_passed_phrases = max(precision_phrases - precision_failed_phrases, 0)
     noise_rows = [row for row in noise.get("rows", []) if isinstance(row, dict)]
     noise_mrr_deltas = [_float(row.get("mrr_delta")) for row in noise_rows]
@@ -1014,11 +1012,13 @@ def _walk_validate(value: Any, path: str, findings: list[dict[str, str]], key: s
         if not _string_is_allowed(key, value, path):
             findings.append({"path": path, "kind": "forbidden_value", "sample": "<redacted_value>"})
     elif isinstance(value, int | float) and not isinstance(value, bool):
-        if key in _STRING_ONLY_KEYS:
+        if key in _STRING_ONLY_KEYS or key in _TRUE_BOOL_KEYS or key in _FALSE_BOOL_KEYS:
             findings.append({"path": path, "kind": "invalid_type", "sample": "<redacted_value>"})
         if not math.isfinite(float(value)):
             findings.append({"path": path, "kind": "non_finite_number", "sample": "<redacted_value>"})
     elif isinstance(value, bool):
+        if key in _STRING_ONLY_KEYS:
+            findings.append({"path": path, "kind": "invalid_type", "sample": "<redacted_value>"})
         if key in _TRUE_BOOL_KEYS and value is not True:
             findings.append({"path": path, "kind": "invalid_boolean", "sample": "<redacted_value>"})
         if key in _FALSE_BOOL_KEYS and value is not False:
@@ -1189,6 +1189,25 @@ def _counts(values: Any) -> dict[str, int]:
     for value in values:
         counts[value] = counts.get(value, 0) + 1
     return counts
+
+
+def _distinct_phrase_failures(failures: Any) -> int:
+    seen: set[str] = set()
+    fallback_index = 0
+    for failure in failures:
+        if isinstance(failure, dict):
+            phrase = (
+                failure.get("phrase_id")
+                or failure.get("phrase_index")
+                or failure.get("phrase")
+                or failure.get("case_id")
+            )
+            if phrase is not None:
+                seen.add(str(phrase))
+                continue
+        fallback_index += 1
+        seen.add(f"failure_{fallback_index}")
+    return len(seen)
 
 
 def _safe_failure_codes(values: Any) -> list[str]:

@@ -8,6 +8,7 @@ from tacit.evaluation_summary import (
     MRR_UNTRUNCATED,
     UNAVAILABLE_REASON,
     build_evaluation_summary,
+    load_evaluation_results,
     save_evaluation_result,
     validate_evaluation_summary,
 )
@@ -365,6 +366,67 @@ def test_preshaped_summary_rejects_numeric_ids():
     assert summary["available"] is False
 
 
+def test_preshaped_summary_rejects_booleans_in_string_fields():
+    raw_entry = {
+        "benchmark_name": True,
+        "benchmark_version": "2",
+        "dataset_hash": "sha256:0123456789abcdef",
+        "runner_version": "0.1.0",
+        "generated_at": "2026-07-02T04:15:00Z",
+        "mode": "gate",
+        "context_available": [],
+        "anonymous": True,
+        "raw_inputs_included": False,
+        "contract": {},
+        "metrics": {},
+        "random_baselines": {},
+        "stage_counts": {},
+        "failure_reasons": {},
+        "per_case": [],
+    }
+
+    summary = build_evaluation_summary([{"evaluations": [raw_entry]}])
+
+    assert summary["available"] is False
+
+
+def test_preshaped_summary_rejects_raw_snake_case_ids_with_numeric_suffixes():
+    raw_entry = {
+        "benchmark_name": "contextual_culprit_ranking",
+        "benchmark_version": "2",
+        "dataset_hash": "sha256:0123456789abcdef",
+        "runner_version": "0.1.0",
+        "generated_at": "2026-07-02T04:15:00Z",
+        "mode": "gate",
+        "context_available": [],
+        "anonymous": True,
+        "raw_inputs_included": False,
+        "contract": {},
+        "metrics": {},
+        "random_baselines": {},
+        "stage_counts": {},
+        "failure_reasons": {},
+        "per_case": [{"case_id": "checkout_api_001", "case_class": "scorable"}],
+    }
+
+    summary = build_evaluation_summary([{"evaluations": [raw_entry]}])
+
+    assert summary["available"] is False
+
+
+def test_non_utf8_cached_evaluation_file_is_skipped(tmp_path):
+    (tmp_path / "bad.json").write_bytes(b"\xff\xfe{")
+    (tmp_path / "good.json").write_text(
+        json.dumps({"benchmark_name": "contextual_culprit_ranking"}),
+        encoding="utf-8",
+    )
+
+    results = load_evaluation_results(tmp_path)
+
+    assert len(results) == 1
+    assert results[0]["benchmark_name"] == "contextual_culprit_ranking"
+
+
 def test_malformed_cached_result_is_skipped_without_blocking_valid_result():
     malformed = {"benchmark_contract": {"scorable_cases": "not-a-number"}, "metrics": {"top1_recall": 1.0}}
     valid = evaluate()
@@ -652,13 +714,19 @@ def test_artifact_robustness_rca_rates_are_phrase_based():
         "rca_phrase_robustness": {
             "phrases": 2,
             "ignored_causal_claim_count": 3,
-            "failures": [{"reason": "missing_ignored_causal_claim_warning"}],
+            "failures": [
+                {"phrase": "artifact one", "reason": "emitted_operational_ir"},
+                {"phrase": "artifact one", "reason": "missing_ignored_causal_claim_warning"},
+            ],
             "passed": False,
         },
         "rca_precision": {
             "phrases": 2,
             "false_positive_suppression_count": 3,
-            "failures": [{"reason": "false_positive_causal_suppression"}],
+            "failures": [
+                {"phrase": "artifact two", "reason": "false_positive_causal_suppression"},
+                {"phrase": "artifact two", "reason": "emitted_operational_ir"},
+            ],
             "passed": False,
         },
         "noise_injection": {"rows": [], "failures": [], "passed": True},
