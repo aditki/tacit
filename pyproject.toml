@@ -74,6 +74,9 @@ warn_unused_ignores = true
 no_implicit_optional = true
 check_untyped_defs = true
 
+[tool.hatch.build.targets.wheel]
+packages = ["tacit"]
+
 [tool.hatch.build.targets.wheel.force-include]
 # Ship runtime YAML as package data so installed CLIs and PyInstaller binaries
 # load the same bootstrap resources without depending on the working directory.
