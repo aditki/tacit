@@ -536,9 +536,11 @@ def summarize_artifact_robustness_report(report: dict[str, Any]) -> dict[str, An
         return None
 
     rca_phrases = int(rca.get("phrases", 0) or 0)
-    rca_ignored = int(rca.get("ignored_causal_claim_count", 0) or 0)
     precision_phrases = int(precision.get("phrases", 0) or 0)
-    false_positive_suppressions = int(precision.get("false_positive_suppression_count", 0) or 0)
+    rca_failed_phrases = len(rca.get("failures", []) or [])
+    rca_passed_phrases = max(rca_phrases - rca_failed_phrases, 0)
+    precision_failed_phrases = len(precision.get("failures", []) or [])
+    precision_passed_phrases = max(precision_phrases - precision_failed_phrases, 0)
     noise_rows = [row for row in noise.get("rows", []) if isinstance(row, dict)]
     noise_mrr_deltas = [_float(row.get("mrr_delta")) for row in noise_rows]
     failures = _safe_failure_codes((report.get("gate") or {}).get("failures", []))
@@ -564,8 +566,8 @@ def summarize_artifact_robustness_report(report: dict[str, Any]) -> dict[str, An
         "raw_inputs_included": False,
         "contract": contract,
         "metrics": {
-            "rca_suppression_recall": _ratio(rca_ignored, rca_phrases),
-            "rca_precision": _ratio(precision_phrases - false_positive_suppressions, precision_phrases),
+            "rca_suppression_recall": _ratio(rca_passed_phrases, rca_phrases),
+            "rca_precision": _ratio(precision_passed_phrases, precision_phrases),
             "noise_scenarios": {"value": float(len(noise_rows))},
             "noise_worst_mrr_delta": {"value": min(noise_mrr_deltas) if noise_mrr_deltas else 0.0},
             "contradictory_artifacts_passed": {"value": 1.0 if contradictory.get("passed") else 0.0},
@@ -690,7 +692,7 @@ def summarize_offline_gate_report(report: dict[str, Any]) -> dict[str, Any] | No
         "available": True,
         "benchmark_name": "offline_gate",
         "benchmark_version": _safe_version(report.get("version"), default="offline_gate_v1"),
-        "dataset_hash": _dataset_hash(contract),
+        "dataset_hash": _dataset_hash({**contract, "row_identity_sha256": _offline_gate_row_fingerprint(report)}),
         "runner_version": _safe_version(report.get("runner_version"), default=__version__),
         "generated_at": str(report.get("generated_at", "")) or _now_iso(),
         "mode": "gate",
@@ -971,12 +973,12 @@ def summarize_prompt_variation_report(report: dict[str, Any]) -> dict[str, Any] 
             "positive_useful_rate": {
                 "numerator": positive_passed,
                 "denominator": positive_trials,
-                "value": _ratio_value(positive_passed, positive_trials),
+                "value": _ratio_value(positive_passed, positive_trials, empty_value=1.0),
             },
             "negative_correct_rate": {
                 "numerator": negative_passed,
                 "denominator": negative_trials,
-                "value": _ratio_value(negative_passed, negative_trials),
+                "value": _ratio_value(negative_passed, negative_trials, empty_value=1.0),
             },
             "worst_prompt_rate": {"value": min(prompt_rates) if prompt_rates else 0.0},
         },
@@ -1138,6 +1140,22 @@ def _prompt_corpus_fingerprint(rows: list[dict[str, Any]]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _offline_gate_row_fingerprint(report: dict[str, Any]) -> str:
+    payload = {
+        section: [
+            {
+                "dataset": row.get("dataset", ""),
+                "role": row.get("role", ""),
+            }
+            for row in (report.get(section, []) or [])
+            if isinstance(row, dict)
+        ]
+        for section in ("classification", "cold_resolution", "learned_resolution", "learned_selection")
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _ratio(numerator: int | float, denominator: int | float) -> dict[str, Any]:
     numerator = int(numerator or 0)
     denominator = int(denominator or 0)
@@ -1148,10 +1166,10 @@ def _ratio(numerator: int | float, denominator: int | float) -> dict[str, Any]:
     }
 
 
-def _ratio_value(numerator: int | float, denominator: int | float) -> float:
+def _ratio_value(numerator: int | float, denominator: int | float, *, empty_value: float = 0.0) -> float:
     denominator = float(denominator or 0)
     if not denominator:
-        return 0.0
+        return empty_value
     return round(float(numerator or 0) / denominator, 4)
 
 

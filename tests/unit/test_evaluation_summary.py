@@ -646,6 +646,33 @@ def test_artifact_robustness_report_is_summarized_without_raw_artifacts():
     assert "checkout-db" not in text
 
 
+def test_artifact_robustness_rca_rates_are_phrase_based():
+    report = {
+        "benchmark": "artifact_learning_robustness",
+        "rca_phrase_robustness": {
+            "phrases": 2,
+            "ignored_causal_claim_count": 3,
+            "failures": [{"reason": "missing_ignored_causal_claim_warning"}],
+            "passed": False,
+        },
+        "rca_precision": {
+            "phrases": 2,
+            "false_positive_suppression_count": 3,
+            "failures": [{"reason": "false_positive_causal_suppression"}],
+            "passed": False,
+        },
+        "noise_injection": {"rows": [], "failures": [], "passed": True},
+        "contradictory_artifacts": {"failures": [], "passed": True},
+        "gate": {"passed": False, "failures": ["rca_phrase_robustness_failed", "rca_precision_failed"]},
+    }
+
+    summary = build_evaluation_summary([report])
+    metrics = summary["evaluations"][0]["metrics"]
+
+    assert metrics["rca_suppression_recall"] == {"numerator": 1, "denominator": 2, "value": 0.5}
+    assert metrics["rca_precision"] == {"numerator": 1, "denominator": 2, "value": 0.5}
+
+
 def test_gamma_report_is_summarized_without_prompts_or_model():
     report = {
         "dataset": "gamma",
@@ -757,6 +784,44 @@ def test_offline_gate_report_is_summarized_without_fixture_details():
     assert "checkout_latency_seconds" not in text
 
 
+def test_offline_gate_dataset_hash_includes_row_identity():
+    def report(dataset: str) -> dict:
+        return {
+            "classification": [
+                {
+                    "dataset": dataset,
+                    "role": "holdout",
+                    "tp": 1,
+                    "fp": 0,
+                    "fn": 0,
+                    "tn": 0,
+                    "labeled_signal_metrics": 1,
+                    "precision": 1.0,
+                    "recall": 1.0,
+                    "coverage": 1.0,
+                    "misclassified": [],
+                    "uncovered": [],
+                }
+            ],
+            "cold_resolution": [
+                {"dataset": dataset, "role": "holdout", "resolved": 1, "total": 1, "recall": 1.0, "misses": []}
+            ],
+            "learned_resolution": [
+                {"dataset": dataset, "role": "holdout", "resolved": 1, "total": 1, "recall": 1.0, "misses": []}
+            ],
+            "learned_selection": [{"dataset": dataset, "selected": "learned", "expected": "learned", "passed": True}],
+            "gate": {"passed": True, "failures": []},
+        }
+
+    summary = build_evaluation_summary([report("fixture_a"), report("fixture_b")])
+
+    assert summary["available"] is True
+    assert len(summary["evaluations"]) == 2
+    assert len({evaluation["dataset_hash"] for evaluation in summary["evaluations"]}) == 2
+    assert "fixture_a" not in json.dumps(summary)
+    assert "fixture_b" not in json.dumps(summary)
+
+
 def test_save_evaluation_result_uses_unique_paths_for_same_second(tmp_path, monkeypatch):
     monkeypatch.setattr("tacit.evaluation_summary.datetime", FrozenDateTime)
 
@@ -842,3 +907,32 @@ def test_prompt_variation_rates_are_derived_from_exported_counts():
     assert evaluation["metrics"]["positive_useful_rate"] == {"numerator": 0, "denominator": 5, "value": 0.0}
     assert evaluation["metrics"]["worst_prompt_rate"] == {"value": 0.0}
     assert evaluation["per_case"][0]["rate"] == 0.0
+
+
+def test_prompt_variation_empty_negative_class_is_vacuously_passing():
+    report = {
+        "corpus": "clickstack_prompts.json",
+        "role": "dev",
+        "prompts": 1,
+        "trials_per_prompt": 5,
+        "positive_useful_rate": 1.0,
+        "negative_correct_rate": 1.0,
+        "worst_prompt_rate": 1.0,
+        "results": [
+            {
+                "prompt_index": 1,
+                "class": "reworded",
+                "polarity": "positive",
+                "prompt": "checkout-api latency is high",
+                "passed": 5,
+                "trials": 5,
+                "rate": 1.0,
+                "failures": [],
+            }
+        ],
+    }
+
+    summary = build_evaluation_summary([report])
+    evaluation = summary["evaluations"][0]
+
+    assert evaluation["metrics"]["negative_correct_rate"] == {"numerator": 0, "denominator": 0, "value": 1.0}
