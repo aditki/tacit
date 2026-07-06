@@ -248,6 +248,114 @@ def test_shared_promql_metric_does_not_route_to_unrelated_default_datasource():
     assert dashboard.panels[0].queries[0].datasource_uid == "tenant-a-prom"
 
 
+def test_split_multi_metric_query_stays_on_fallback_target():
+    archetype = InvestigationArchetype(
+        id="split-ratio",
+        name="Split ratio",
+        problem_types=["errors"],
+        required_metrics=["errors_total", "requests_total"],
+        panels=[
+            PanelTemplate(
+                title="Error ratio",
+                queries=[QueryTemplate(expr="errors_total / requests_total")],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="error ratio",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["errors"],
+        timerange="1h",
+        problem_type="errors",
+        archetypes=[ArchetypeMatch(type="errors", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name="unrelated_metric",
+            datasource_uid="default-prom",
+            datasource_name="Default Prometheus",
+            datasource_type="prometheus",
+            datasource_is_default=True,
+            query_language="promql",
+        ),
+        MetricEntry(
+            name="errors_total",
+            datasource_uid="errors-prom",
+            datasource_name="Errors",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+        MetricEntry(
+            name="requests_total",
+            datasource_uid="requests-prom",
+            datasource_name="Requests",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    assert dashboard.panels[0].queries[0].datasource_uid == "default-prom"
+
+
+def test_native_query_routes_to_metric_owner_before_unrelated_default_datasource():
+    archetype = InvestigationArchetype(
+        id="learned-cloudwatch",
+        name="Learned CloudWatch",
+        problem_types=["elb-errors"],
+        required_metrics=["AWS/ApplicationELB/HTTPCode_ELB_5XX"],
+        panels=[
+            PanelTemplate(
+                title="ELB errors",
+                queries=[
+                    QueryTemplate(
+                        expr="HTTPCode_ELB_5XX",
+                        query_language="cloudwatch",
+                        datasource_type="cloudwatch",
+                        cloudwatch_namespace="AWS/ApplicationELB",
+                    )
+                ],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="elb errors",
+        domain="infrastructure",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["elb", "errors"],
+        timerange="1h",
+        problem_type="elb-errors",
+        archetypes=[ArchetypeMatch(type="elb-errors", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name="AWS/ApplicationELB/HealthyHostCount",
+            datasource_uid="default-cw",
+            datasource_name="Default CloudWatch",
+            datasource_type="cloudwatch",
+            datasource_is_default=True,
+            query_language="cloudwatch",
+        ),
+        MetricEntry(
+            name="AWS/ApplicationELB/HTTPCode_ELB_5XX",
+            datasource_uid="target-cw",
+            datasource_name="Target CloudWatch",
+            datasource_type="cloudwatch",
+            query_language="cloudwatch",
+        ),
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    query = dashboard.panels[0].queries[0]
+    assert query.datasource_uid == "target-cw"
+    assert query.datasource_type == "cloudwatch"
+
+
 def test_service_owner_must_cover_every_metric_in_query():
     archetype = InvestigationArchetype(
         id="cache-ratio",

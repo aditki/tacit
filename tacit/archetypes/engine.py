@@ -229,8 +229,36 @@ def _resolve_promql_query_target(
             for entry in candidates:
                 if entry.datasource_is_default and entry.datasource_uid in common_owners:
                     return QueryTarget.from_metric(entry)
-            return QueryTarget.from_metric(candidates[0])
+            if common_owners:
+                owner_entry = next(entry for entry in candidates if entry.datasource_uid in common_owners)
+                return QueryTarget.from_metric(owner_entry)
     return default_target
+
+
+def _resolve_native_query_target(
+    catalog: list[MetricEntry],
+    datasource_type: str,
+    query_language: str,
+    metric_names: set[str],
+) -> QueryTarget:
+    """Route native datasource queries to a datasource that owns the metric."""
+    candidates = [
+        entry
+        for entry in catalog
+        if entry.name in metric_names
+        and _datasource_type_matches(entry.datasource_type, datasource_type)
+        and (not query_language or (entry.query_language or "").lower() == query_language)
+    ]
+    for entry in candidates:
+        if entry.datasource_is_default:
+            return QueryTarget.from_metric(entry)
+    if candidates:
+        return QueryTarget.from_metric(candidates[0])
+    return _resolve_query_target(
+        catalog,
+        datasource_type,
+        query_language,
+    )
 
 
 def _resolve_rate_interval(intent: Intent) -> str:
@@ -851,10 +879,14 @@ def compile_archetype(
                     query_datasource_type = _datasource_type_for_language(qt_language, default_target.datasource_type)
                 else:
                     query_datasource_type = qt.datasource_type
-                query_target = _resolve_query_target(
+                native_metric_names = {expr}
+                if qt.cloudwatch_namespace and not expr.startswith(f"{qt.cloudwatch_namespace}/"):
+                    native_metric_names.add(f"{qt.cloudwatch_namespace}/{expr}")
+                query_target = _resolve_native_query_target(
                     catalog,
                     query_datasource_type,
                     qt_language,
+                    native_metric_names,
                 )
 
             panel_queries.append(
