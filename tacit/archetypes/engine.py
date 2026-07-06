@@ -224,6 +224,12 @@ def _resolve_promql_query_target(
         if len(complete_service_owners) == 1:
             owner = next(iter(complete_service_owners))
             return QueryTarget.from_metric(next(entry for entry in service_candidates if entry.datasource_uid == owner))
+        if owners_by_metric and all(owners_by_metric.values()):
+            common_owners = set.intersection(*owners_by_metric.values())
+            for entry in candidates:
+                if entry.datasource_is_default and entry.datasource_uid in common_owners:
+                    return QueryTarget.from_metric(entry)
+            return QueryTarget.from_metric(candidates[0])
     return default_target
 
 

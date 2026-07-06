@@ -195,6 +195,59 @@ def test_shared_promql_metric_prefers_grafana_default_datasource():
     assert dashboard.panels[0].queries[0].datasource_uid == "default-prom"
 
 
+def test_shared_promql_metric_does_not_route_to_unrelated_default_datasource():
+    archetype = InvestigationArchetype(
+        id="resource-saturation",
+        name="Resource saturation",
+        problem_types=["resource_saturation"],
+        required_metrics=["container_cpu_usage_seconds_total"],
+        panels=[
+            PanelTemplate(
+                title="CPU",
+                queries=[QueryTemplate(expr="rate(container_cpu_usage_seconds_total[5m])")],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="cpu overview",
+        domain="infrastructure",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["cpu"],
+        timerange="1h",
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name="unrelated_metric",
+            datasource_uid="default-prom",
+            datasource_name="Default Prometheus",
+            datasource_type="prometheus",
+            datasource_is_default=True,
+            query_language="promql",
+        ),
+        MetricEntry(
+            name="container_cpu_usage_seconds_total",
+            datasource_uid="tenant-a-prom",
+            datasource_name="Tenant A",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+        MetricEntry(
+            name="container_cpu_usage_seconds_total",
+            datasource_uid="tenant-b-prom",
+            datasource_name="Tenant B",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    assert dashboard.panels[0].queries[0].datasource_uid == "tenant-a-prom"
+
+
 def test_service_owner_must_cover_every_metric_in_query():
     archetype = InvestigationArchetype(
         id="cache-ratio",
