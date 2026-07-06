@@ -149,6 +149,52 @@ def test_multi_metric_query_routes_when_one_datasource_owns_all_metrics():
     assert dashboard.panels[0].queries[0].datasource_uid == "service-prom"
 
 
+def test_shared_promql_metric_prefers_grafana_default_datasource():
+    archetype = InvestigationArchetype(
+        id="resource-saturation",
+        name="Resource saturation",
+        problem_types=["resource_saturation"],
+        required_metrics=["container_cpu_usage_seconds_total"],
+        panels=[
+            PanelTemplate(
+                title="CPU",
+                queries=[QueryTemplate(expr="rate(container_cpu_usage_seconds_total[5m])")],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="cpu overview using default prometheus datasource",
+        domain="infrastructure",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["cpu"],
+        timerange="1h",
+        problem_type="resource_saturation",
+        archetypes=[ArchetypeMatch(type="resource_saturation", confidence=1.0)],
+    )
+    catalog = [
+        MetricEntry(
+            name="container_cpu_usage_seconds_total",
+            datasource_uid="classic-prom",
+            datasource_name="Classic Prometheus",
+            datasource_type="prometheus",
+            query_language="promql",
+        ),
+        MetricEntry(
+            name="container_cpu_usage_seconds_total",
+            datasource_uid="default-prom",
+            datasource_name="Default Prometheus",
+            datasource_type="prometheus",
+            datasource_is_default=True,
+            query_language="promql",
+        ),
+    ]
+
+    dashboard = compile_archetype(archetype, intent, catalog)
+
+    assert dashboard.panels[0].queries[0].datasource_uid == "default-prom"
+
+
 def test_service_owner_must_cover_every_metric_in_query():
     archetype = InvestigationArchetype(
         id="cache-ratio",

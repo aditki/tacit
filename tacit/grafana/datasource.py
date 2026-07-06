@@ -112,10 +112,14 @@ async def discover_all_metrics(
             return []
         async with sem:
             try:
-                return await asyncio.wait_for(
+                entries = await asyncio.wait_for(
                     adapter.discover_metrics(client, ds, keywords),
                     timeout=timeout,
                 )
+                return [
+                    entry.model_copy(update={"datasource_is_default": ds.is_default})
+                    for entry in entries
+                ]
             except TimeoutError:
                 logger.warning("adapter_timeout", datasource=ds.name, type=ds.type, timeout=timeout)
                 return []

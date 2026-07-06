@@ -145,21 +145,36 @@ def _resolve_query_target(
     """Resolve datasource identity as one object, preferring matching catalog entries."""
     query_language = query_language.lower()
     datasource_type = datasource_type.lower()
+    matched_entries: list[MetricEntry] = []
     for entry in catalog:
         if datasource_type and not _datasource_type_matches(entry.datasource_type, datasource_type):
             continue
         if query_language and (entry.query_language or "").lower() != query_language:
             continue
-        return QueryTarget.from_metric(entry)
+        matched_entries.append(entry)
+    for entry in matched_entries:
+        if entry.datasource_is_default:
+            return QueryTarget.from_metric(entry)
+    if matched_entries:
+        return QueryTarget.from_metric(matched_entries[0])
+    type_matched_entries: list[MetricEntry] = []
     for entry in catalog:
         if datasource_type and _datasource_type_matches(entry.datasource_type, datasource_type):
+            type_matched_entries.append(entry)
+    for entry in type_matched_entries:
+        if entry.datasource_is_default:
             return QueryTarget.from_metric(entry)
+    if type_matched_entries:
+        return QueryTarget.from_metric(type_matched_entries[0])
     if datasource_type or query_language:
         return QueryTarget(
             datasource_uid=fallback_uid,
             datasource_type=datasource_type or _datasource_type_for_language(query_language, ""),
             query_language=query_language,
         )
+    for entry in catalog:
+        if entry.datasource_is_default:
+            return QueryTarget.from_metric(entry)
     if catalog:
         return QueryTarget.from_metric(catalog[0])
     return QueryTarget(
