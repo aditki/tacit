@@ -105,6 +105,7 @@ class GrafanaBackend:
                     datasource_uid=ds.uid,
                     datasource_name=ds.name,
                     datasource_type=ds.type,
+                    datasource_is_default=ds.is_default,
                     query_language=adapter.query_language,
                 )
             )

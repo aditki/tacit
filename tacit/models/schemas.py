@@ -132,6 +132,10 @@ class MetricEntry(BaseModel):
     datasource_uid: str
     datasource_name: str
     datasource_type: str = Field(description="Grafana datasource type")
+    datasource_is_default: bool = Field(
+        default=False,
+        description="Whether Grafana marks this metric's datasource as the default datasource.",
+    )
     query_language: str = Field(
         description="Query language: promql, logql, cloudwatch, elasticsearch, graphite, influxql, flux, signalflow"
     )

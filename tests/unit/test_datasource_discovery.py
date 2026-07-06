@@ -1,5 +1,7 @@
-from tacit.grafana.datasource import _cap_metric_results
-from tacit.models.schemas import MetricEntry
+import asyncio
+
+from tacit.grafana.datasource import _cap_metric_results, discover_all_metrics
+from tacit.models.schemas import DatasourceInfo, MetricEntry
 
 
 def _metric(name: str, datasource_uid: str) -> MetricEntry:
@@ -37,3 +39,28 @@ def test_metric_catalog_cap_preserves_small_catalog_order():
     capped = _cap_metric_results(results, 4)
 
     assert [entry.name for entry in capped] == ["synthetic", "real"]
+
+
+def test_discover_all_metrics_marks_default_datasource(monkeypatch):
+    class Adapter:
+        async def discover_metrics(self, client, datasource, keywords):
+            return [
+                MetricEntry(
+                    name=f"{datasource.uid}_metric",
+                    datasource_uid=datasource.uid,
+                    datasource_name=datasource.name,
+                    datasource_type=datasource.type,
+                    query_language="promql",
+                )
+            ]
+
+    monkeypatch.setattr("tacit.grafana.datasource.get_adapter", lambda datasource: Adapter())
+    datasources = [
+        DatasourceInfo(uid="classic-prom", name="Classic Prometheus", type="prometheus"),
+        DatasourceInfo(uid="default-prom", name="Default Prometheus", type="prometheus", is_default=True),
+    ]
+
+    entries = asyncio.run(discover_all_metrics(client=object(), datasources=datasources, keywords=[]))
+
+    defaults_by_uid = {entry.datasource_uid: entry.datasource_is_default for entry in entries}
+    assert defaults_by_uid == {"classic-prom": False, "default-prom": True}

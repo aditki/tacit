@@ -145,21 +145,36 @@ def _resolve_query_target(
     """Resolve datasource identity as one object, preferring matching catalog entries."""
     query_language = query_language.lower()
     datasource_type = datasource_type.lower()
+    matched_entries: list[MetricEntry] = []
     for entry in catalog:
         if datasource_type and not _datasource_type_matches(entry.datasource_type, datasource_type):
             continue
         if query_language and (entry.query_language or "").lower() != query_language:
             continue
-        return QueryTarget.from_metric(entry)
+        matched_entries.append(entry)
+    for entry in matched_entries:
+        if entry.datasource_is_default:
+            return QueryTarget.from_metric(entry)
+    if matched_entries:
+        return QueryTarget.from_metric(matched_entries[0])
+    type_matched_entries: list[MetricEntry] = []
     for entry in catalog:
         if datasource_type and _datasource_type_matches(entry.datasource_type, datasource_type):
+            type_matched_entries.append(entry)
+    for entry in type_matched_entries:
+        if entry.datasource_is_default:
             return QueryTarget.from_metric(entry)
+    if type_matched_entries:
+        return QueryTarget.from_metric(type_matched_entries[0])
     if datasource_type or query_language:
         return QueryTarget(
             datasource_uid=fallback_uid,
             datasource_type=datasource_type or _datasource_type_for_language(query_language, ""),
             query_language=query_language,
         )
+    for entry in catalog:
+        if entry.datasource_is_default:
+            return QueryTarget.from_metric(entry)
     if catalog:
         return QueryTarget.from_metric(catalog[0])
     return QueryTarget(
@@ -209,7 +224,41 @@ def _resolve_promql_query_target(
         if len(complete_service_owners) == 1:
             owner = next(iter(complete_service_owners))
             return QueryTarget.from_metric(next(entry for entry in service_candidates if entry.datasource_uid == owner))
+        if owners_by_metric and all(owners_by_metric.values()):
+            common_owners = set.intersection(*owners_by_metric.values())
+            for entry in candidates:
+                if entry.datasource_is_default and entry.datasource_uid in common_owners:
+                    return QueryTarget.from_metric(entry)
+            if common_owners:
+                owner_entry = next(entry for entry in candidates if entry.datasource_uid in common_owners)
+                return QueryTarget.from_metric(owner_entry)
     return default_target
+
+
+def _resolve_native_query_target(
+    catalog: list[MetricEntry],
+    datasource_type: str,
+    query_language: str,
+    metric_names: set[str],
+) -> QueryTarget:
+    """Route native datasource queries to a datasource that owns the metric."""
+    candidates = [
+        entry
+        for entry in catalog
+        if entry.name in metric_names
+        and _datasource_type_matches(entry.datasource_type, datasource_type)
+        and (not query_language or (entry.query_language or "").lower() == query_language)
+    ]
+    for entry in candidates:
+        if entry.datasource_is_default:
+            return QueryTarget.from_metric(entry)
+    if candidates:
+        return QueryTarget.from_metric(candidates[0])
+    return _resolve_query_target(
+        catalog,
+        datasource_type,
+        query_language,
+    )
 
 
 def _resolve_rate_interval(intent: Intent) -> str:
@@ -830,10 +879,14 @@ def compile_archetype(
                     query_datasource_type = _datasource_type_for_language(qt_language, default_target.datasource_type)
                 else:
                     query_datasource_type = qt.datasource_type
-                query_target = _resolve_query_target(
+                native_metric_names = {expr}
+                if qt.cloudwatch_namespace and not expr.startswith(f"{qt.cloudwatch_namespace}/"):
+                    native_metric_names.add(f"{qt.cloudwatch_namespace}/{expr}")
+                query_target = _resolve_native_query_target(
                     catalog,
                     query_datasource_type,
                     qt_language,
+                    native_metric_names,
                 )
 
             panel_queries.append(
