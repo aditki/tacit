@@ -16,12 +16,11 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 RUN apk upgrade --no-cache
 
 ARG TACIT_UID=999
-ARG TACIT_GID=999
+ARG TACIT_GID=10001
 
-# Preserve the original Debian system-user identity for existing /app/data volumes.
-RUN tacit_group="$(awk -F: -v gid="${TACIT_GID}" '$3 == gid { print $1; exit }' /etc/group)" \
-    && if [ -z "${tacit_group}" ]; then addgroup -S -g "${TACIT_GID}" tacit && tacit_group=tacit; fi \
-    && adduser -S -u "${TACIT_UID}" -G "${tacit_group}" -h /app -s /sbin/nologin tacit \
+# Preserve the legacy volume-owning UID while avoiding Alpine's reserved GID 999.
+RUN addgroup -S -g "${TACIT_GID}" tacit \
+    && adduser -S -u "${TACIT_UID}" -G tacit -h /app -s /sbin/nologin tacit \
     && mkdir -p /app/data \
     && chown -R "${TACIT_UID}:${TACIT_GID}" /app
 

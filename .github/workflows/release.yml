@@ -58,8 +58,44 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
 
-  publish-ghcr:
+  scan-ghcr-image:
     needs: build-dist
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.platform }} image for vulnerability scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=docker,dest=/tmp/tacit-release-scan-${{ matrix.arch }}.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run Trivy vulnerability scan for ${{ matrix.platform }}
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          input: /tmp/tacit-release-scan-${{ matrix.arch }}.tar
+          scanners: vuln
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+
+  publish-ghcr:
+    needs:
+      - build-dist
+      - scan-ghcr-image
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -74,34 +110,36 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Classify release tag
+        id: release_tag
+        shell: python
+        run: |
+          import os
+          import re
+
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          ref = os.environ.get("GITHUB_REF", "")
+          version = tag[1:] if tag.startswith("v") else tag
+          pep440_prerelease = re.compile(
+              r"(?:^|[0-9._-])(?:a|alpha|b|beta|c|rc|pre|preview|dev)\.?\d*",
+              re.IGNORECASE,
+          )
+          is_stable_tag = ref.startswith("refs/tags/v") and not pep440_prerelease.search(version)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"is_stable_tag={str(is_stable_tag).lower()}\n")
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/tacit
+          flavor: |
+            latest=false
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=pep440,pattern={{version}}
+            type=pep440,pattern={{major}}.{{minor}}
             type=ref,event=branch,enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
-      - name: Build image for vulnerability scan
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          load: true
-          tags: tacit:release-scan
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Run Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: tacit:release-scan
-          scanners: vuln
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: HIGH,CRITICAL
+            type=raw,value=latest,enable=${{ steps.release_tag.outputs.is_stable_tag == 'true' }}
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
