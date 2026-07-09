@@ -1,3 +1,3 @@
-"""Tacit – Natural language to Grafana dashboards."""
+"""Tacit - evidence-grounded incident investigation across observability tools."""
 
 __version__ = "0.1.1-rc.1"
