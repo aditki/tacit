@@ -3,7 +3,9 @@
 .mypy_cache
 .pytest_cache
 .ruff_cache
+.uv-cache
 .venv
+.smoke-venv
 __pycache__
 *.py[cod]
 *.egg-info

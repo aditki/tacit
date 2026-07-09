@@ -2,7 +2,7 @@
 
 FROM ghcr.io/astral-sh/uv:0.5.31 AS uv
 
-FROM python:3.12.8-slim-bookworm AS runtime
+FROM python:3.12.13-alpine3.22 AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -13,15 +13,21 @@ WORKDIR /app
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
-RUN groupadd --system tacit \
-    && useradd --system --gid tacit --home-dir /app --shell /usr/sbin/nologin tacit \
-    && mkdir -p /app/data \
-    && chown -R tacit:tacit /app
+RUN apk upgrade --no-cache
 
-COPY --chown=tacit:tacit pyproject.toml uv.lock* ./
+ARG TACIT_UID=999
+ARG TACIT_GID=10001
+
+# Preserve the legacy volume-owning UID while avoiding Alpine's reserved GID 999.
+RUN addgroup -S -g "${TACIT_GID}" tacit \
+    && adduser -S -u "${TACIT_UID}" -G tacit -h /app -s /sbin/nologin tacit \
+    && mkdir -p /app/data \
+    && chown -R "${TACIT_UID}:${TACIT_GID}" /app
+
+COPY --chown=${TACIT_UID}:${TACIT_GID} pyproject.toml uv.lock* ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY --chown=tacit:tacit . .
+COPY --chown=${TACIT_UID}:${TACIT_GID} . .
 RUN uv sync --frozen --no-dev \
     && find /app -type d -name __pycache__ -prune -exec rm -rf {} +
 
