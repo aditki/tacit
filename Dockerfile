@@ -2,7 +2,7 @@
 
 FROM ghcr.io/astral-sh/uv:0.5.31 AS uv
 
-FROM python:3.12.8-slim-bookworm AS runtime
+FROM python:3.12.13-alpine3.22 AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -13,8 +13,10 @@ WORKDIR /app
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
-RUN groupadd --system tacit \
-    && useradd --system --gid tacit --home-dir /app --shell /usr/sbin/nologin tacit \
+RUN apk upgrade --no-cache
+
+RUN addgroup -S tacit \
+    && adduser -S -G tacit -h /app -s /sbin/nologin tacit \
     && mkdir -p /app/data \
     && chown -R tacit:tacit /app
 
