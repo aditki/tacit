@@ -24,7 +24,7 @@ router = APIRouter()
     "/api/v1/chart",
     response_model=DashResponse,
     dependencies=[Depends(verify_api_key)],
-    tags=["Dashboard Generation"],
+    tags=["Investigation Generation"],
     summary="Generate a dashboard",
     response_description="Published dashboard URL, UID, panel count, and summary",
 )
@@ -50,7 +50,7 @@ def _sse_frame(event: str, data: dict) -> str:
 @router.post(
     "/api/v1/chart/stream",
     dependencies=[Depends(verify_api_key)],
-    tags=["Dashboard Generation"],
+    tags=["Investigation Generation"],
     summary="Generate a dashboard with live stage streaming (SSE)",
     response_description="Server-Sent Events: `stage` events while the pipeline runs, "
     "then one `result` (or `error`) event.",

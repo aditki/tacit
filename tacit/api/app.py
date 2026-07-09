@@ -15,9 +15,9 @@ LifespanFactory = Any
 
 OPENAPI_TAGS = [
     {
-        "name": "Dashboard Generation",
-        "description": "Generate Grafana dashboards from natural-language prompts. "
-        "The pipeline: Intent Classification → Metric Discovery → Query Building → Dashboard Publishing.",
+        "name": "Investigation Generation",
+        "description": "Generate evidence-grounded observability investigations from natural-language prompts. "
+        "The pipeline: Intent Classification → Metric Discovery → Query Building → Artifact Publishing.",
     },
     {
         "name": "Feedback",
@@ -43,7 +43,7 @@ OPENAPI_TAGS = [
     },
     {
         "name": "Learning",
-        "description": "Learn operational patterns from existing Grafana dashboards. "
+        "description": "Learn operational patterns from trusted dashboards and alerts. "
         "Ingests dashboards, extracts metric co-occurrence, panel groupings, "
         "and aggregation patterns, then infers signal mappings.",
     },
@@ -54,13 +54,15 @@ OPENAPI_TAGS = [
 ]
 
 DESCRIPTION = (
-    "## Natural Language → Grafana Dashboards\n\n"
-    "Tacit is a multi-agent pipeline that converts plain-English incident descriptions "
-    "into ready-to-use Grafana dashboards. It supports 10+ datasource types (Prometheus, "
-    "CloudWatch, Loki, Elasticsearch, Graphite, InfluxDB, etc.) and uses LLM-powered "
-    "intent classification, cross-datasource metric discovery, and deterministic query building.\n\n"
+    "## Evidence-Grounded Incident Investigation\n\n"
+    "Tacit is a multi-agent pipeline that turns plain-English incident descriptions "
+    "and trusted operational context into validated observability investigations. "
+    "It supports Grafana and SignalFx outputs, works across common datasource types "
+    "(Prometheus, CloudWatch, Loki, Elasticsearch, Graphite, InfluxDB, etc.), and uses "
+    "LLM-powered intent classification, cross-datasource metric discovery, and "
+    "deterministic query building.\n\n"
     "### Key capabilities\n"
-    "- **Dashboard generation** — describe what you need, get a published Grafana dashboard\n"
+    "- **Investigation generation** — describe the incident, get validated evidence artifacts\n"
     "- **Feedback loop** — rate dashboards, and the system automatically improves metric selection\n"
     "- **Archetype management** — edit investigation templates via YAML, hot-reload without restart\n\n"
     "### Authentication\n"
@@ -69,7 +71,7 @@ DESCRIPTION = (
     "### Interactive docs\n"
     "- **Swagger UI** — you are here (`/docs`)\n"
     "- **ReDoc** — alternative view at [`/redoc`](/redoc)\n"
-    "- **Web UI** — interactive dashboard generator at [`/`](/)\n"
+    "- **Web UI** — interactive investigation workspace at [`/`](/)\n"
 )
 
 
