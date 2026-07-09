@@ -15,15 +15,20 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 
 RUN apk upgrade --no-cache
 
-RUN addgroup -S tacit \
-    && adduser -S -G tacit -h /app -s /sbin/nologin tacit \
-    && mkdir -p /app/data \
-    && chown -R tacit:tacit /app
+ARG TACIT_UID=999
+ARG TACIT_GID=999
 
-COPY --chown=tacit:tacit pyproject.toml uv.lock* ./
+# Preserve the original Debian system-user identity for existing /app/data volumes.
+RUN tacit_group="$(awk -F: -v gid="${TACIT_GID}" '$3 == gid { print $1; exit }' /etc/group)" \
+    && if [ -z "${tacit_group}" ]; then addgroup -S -g "${TACIT_GID}" tacit && tacit_group=tacit; fi \
+    && adduser -S -u "${TACIT_UID}" -G "${tacit_group}" -h /app -s /sbin/nologin tacit \
+    && mkdir -p /app/data \
+    && chown -R "${TACIT_UID}:${TACIT_GID}" /app
+
+COPY --chown=${TACIT_UID}:${TACIT_GID} pyproject.toml uv.lock* ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY --chown=tacit:tacit . .
+COPY --chown=${TACIT_UID}:${TACIT_GID} . .
 RUN uv sync --frozen --no-dev \
     && find /app -type d -name __pycache__ -prune -exec rm -rf {} +
 
