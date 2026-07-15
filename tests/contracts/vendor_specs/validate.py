@@ -33,7 +33,13 @@ def _has_pydantic_model(module_name: str) -> bool:
 
 
 def _generated_modules(root: Path) -> set[str]:
-    return {path.stem.removesuffix("_models") for path in root.glob("*_models.py")}
+    generated_files = {path.stem.removesuffix("_models") for path in root.glob("*_models.py")}
+    generated_packages = {
+        path.name.removesuffix("_models")
+        for path in root.glob("*_models")
+        if path.is_dir() and (path / "__init__.py").is_file()
+    }
+    return generated_files | generated_packages
 
 
 def validate(vendors: list[str], *, allow_empty: bool) -> None:
