@@ -185,6 +185,30 @@ def apply_counterfactual(
         candidates.append(candidate)
     candidates.sort(key=lambda candidate: (-candidate.score, candidate.rank, candidate.suspect_type, candidate.suspect))
     candidates = [candidate.model_copy(update={"rank": rank}) for rank, candidate in enumerate(candidates, start=1)]
+    supported_requirements = {
+        observation.requirement_id
+        for observation in observations
+        if observation.outcome == EvidenceObservationOutcome.SUPPORTED_OBSERVATION
+    }
+    has_candidate_support = any(
+        supported_requirements.intersection(candidate.supporting_requirement_ids) for candidate in candidates
+    )
+    abstained = snapshot.culprit_ranking.abstained or not candidates or not has_candidate_support
+    abstention_reason = snapshot.culprit_ranking.abstention_reason
+    if abstained and not abstention_reason:
+        abstention_reason = "counterfactual_removed_runtime_support"
+    culprit_ranking = snapshot.culprit_ranking.model_copy(
+        update={
+            "candidates": candidates,
+            "abstained": abstained,
+            "abstention_reason": abstention_reason,
+            "telemetry_status": (
+                snapshot.culprit_ranking.telemetry_status
+                if has_candidate_support
+                else "counterfactual_evidence_removed"
+            ),
+        }
+    )
     removed_context_refs = set(changes.remove_context_refs)
     stale_context_refs = set(changes.stale_context_refs)
     context_chunks = []
@@ -210,7 +234,7 @@ def apply_counterfactual(
         update={
             "evidence_resolutions": resolutions,
             "evidence_observations": observations,
-            "culprit_ranking": snapshot.culprit_ranking.model_copy(update={"candidates": candidates}),
+            "culprit_ranking": culprit_ranking,
             "context_chunks": context_chunks,
         }
     )

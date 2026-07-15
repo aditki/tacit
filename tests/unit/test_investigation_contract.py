@@ -4,8 +4,10 @@ import asyncio
 import json
 import sqlite3
 import tarfile
+import threading
 import time
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -332,6 +334,8 @@ def test_captured_input_replay_rebuilds_and_counterfactual_creates_revision(tmp_
     assert counterfactual.evidence_resolutions[0].status == "unresolved"
     assert counterfactual.candidate_rankings[0].score == 0.4
     assert counterfactual.artifact_contributions[0].artifact_ref == "runbook:new"
+    assert counterfactual.grounding.abstained is True
+    assert counterfactual.grounding.maximum_trustworthy_conclusion["causal_status"] == "insufficient_evidence"
 
 
 def test_counterfactual_replay_resorts_candidates_after_score_changes(tmp_path):
@@ -393,6 +397,12 @@ def test_counterfactual_observation_removal_records_an_explicit_gap(tmp_path):
     assert replayed.observations[0].value["rejection_reason"] == "counterfactual_observation_removed"
     assert replayed.grounding.missing_observation_refs == ["obs_01"]
     assert replayed.grounding.status == GroundingStatus.INSUFFICIENT_EVIDENCE
+    assert replayed.grounding.abstained is True
+    assert replayed.grounding.unsafe_conclusions == []
+    assert replayed.grounding.maximum_trustworthy_conclusion == {
+        "text": "No culprit is supported by the captured evidence.",
+        "causal_status": "insufficient_evidence",
+    }
 
 
 def test_counterfactual_context_changes_preserve_original_provenance_ids(tmp_path):
@@ -565,6 +575,39 @@ def test_candidate_review_updates_provenance_state(tmp_path, approved, expected_
     assert reloaded.provenance.review_state == expected_state
 
 
+def test_overlapping_candidate_reviews_preserve_the_first_terminal_decision(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    candidate = store.create_knowledge_candidate(
+        investigation_id,
+        revision=1,
+        correction_text="Cache was saturated.",
+    )
+    assert candidate is not None
+    barrier = threading.Barrier(2)
+
+    def review(approved):
+        barrier.wait()
+        return store.review_knowledge_candidate(
+            investigation_id,
+            candidate.id,
+            approved=approved,
+            reviewed_by=f"reviewer-{approved}",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(review, [True, False]))
+
+    assert all(result is not None for result in results)
+    returned_states = {result.status.value for result in results if result is not None}
+    assert len(returned_states) == 1
+    stored = store.list_knowledge_candidates(investigation_id)[0]
+    assert stored.status.value in {"approved", "rejected"}
+    assert stored.status.value in returned_states
+    assert stored.provenance.review_state == stored.status.value
+
+
 def test_candidate_application_rolls_back_revision_if_candidate_transition_fails(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?")
@@ -577,12 +620,10 @@ def test_candidate_application_rolls_back_revision_if_candidate_transition_fails
     assert candidate is not None
     store.review_knowledge_candidate(investigation_id, candidate.id, approved=True, reviewed_by="reviewer")
     with store._conn() as conn:
-        conn.execute(
-            """CREATE TRIGGER fail_candidate_application
+        conn.execute("""CREATE TRIGGER fail_candidate_application
                BEFORE UPDATE ON knowledge_candidates
                WHEN NEW.status = 'applied'
-               BEGIN SELECT RAISE(ABORT, 'candidate transition failed'); END"""
-        )
+               BEGIN SELECT RAISE(ABORT, 'candidate transition failed'); END""")
 
     with pytest.raises(sqlite3.IntegrityError, match="candidate transition failed"):
         store.apply_knowledge_candidate(investigation_id, candidate.id)
@@ -599,6 +640,40 @@ def test_candidate_application_rolls_back_revision_if_candidate_transition_fails
     assert corrected is not None
     assert corrected.investigation.revision == 2
     assert store.apply_knowledge_candidate(investigation_id, candidate.id) == corrected
+
+
+def test_expiry_does_not_overwrite_applied_or_rejected_candidate_states(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    applied_candidate = store.create_knowledge_candidate(
+        investigation_id,
+        revision=1,
+        correction_text="Cache was saturated.",
+    )
+    rejected_candidate = store.create_knowledge_candidate(
+        investigation_id,
+        revision=1,
+        correction_text="Checkout was healthy.",
+    )
+    assert applied_candidate is not None and rejected_candidate is not None
+    store.review_knowledge_candidate(investigation_id, applied_candidate.id, approved=True, reviewed_by="reviewer")
+    store.review_knowledge_candidate(investigation_id, rejected_candidate.id, approved=False, reviewed_by="reviewer")
+    corrected = store.apply_knowledge_candidate(investigation_id, applied_candidate.id)
+    assert corrected is not None
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE knowledge_candidates SET expires_at=? WHERE id IN (?, ?)",
+            (time.time() - 60, applied_candidate.id, rejected_candidate.id),
+        )
+
+    assert store.apply_knowledge_candidate(investigation_id, applied_candidate.id) == corrected
+    assert store.apply_knowledge_candidate(investigation_id, rejected_candidate.id) is None
+    candidates = {candidate.id: candidate for candidate in store.list_knowledge_candidates(investigation_id)}
+    assert candidates[applied_candidate.id].status.value == "applied"
+    assert candidates[applied_candidate.id].provenance.review_state == "applied"
+    assert candidates[rejected_candidate.id].status.value == "rejected"
+    assert candidates[rejected_candidate.id].provenance.review_state == "rejected"
 
 
 def test_legacy_migration_and_assessment_bundle_are_portable(tmp_path):
@@ -1627,3 +1702,39 @@ def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch
     assert received["deps"] is deps
     assert received["investigation_id"] == investigation_id
     assert received["run_type"] == InvestigationRunType.REFRESH
+
+
+def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    deps = PipelineDependencies(
+        settings=object(),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    async def failed_refresh(request, supplied_deps=None, **kwargs):
+        return DashResponse(
+            dashboard_url="http://grafana/published-but-stale",
+            dashboard_uid="published-but-stale",
+            panel_count=1,
+            summary="Dashboard published; revision persistence failed.",
+            investigation_id=investigation_id,
+            investigation_revision=None,
+        )
+
+    monkeypatch.setattr("tacit.api.routes.history.run_pipeline", failed_refresh)
+    app = create_app()
+    app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
+
+    response = TestClient(app).post(f"/api/v1/investigations/{investigation_id}/refresh")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["message"] == "Refresh did not create an authoritative investigation revision."
+    assert detail["investigation_id"] == investigation_id
+    assert detail["dashboard_url"] == "http://grafana/published-but-stale"

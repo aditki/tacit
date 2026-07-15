@@ -251,6 +251,16 @@ async def refresh_investigation(
         investigation_id=investigation_id,
         run_type=InvestigationRunType.REFRESH,
     )
+    if response.investigation_revision is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Refresh did not create an authoritative investigation revision.",
+                "investigation_id": investigation_id,
+                "dashboard_url": response.dashboard_url,
+                "dashboard_uid": response.dashboard_uid,
+            },
+        )
     return response.model_dump(mode="json")
 
 

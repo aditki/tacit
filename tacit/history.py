@@ -1052,6 +1052,7 @@ class InvestigationStore:
     ) -> KnowledgeCandidate | None:
         now = utc_now()
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM knowledge_candidates WHERE id=? AND investigation_id=?",
                 (candidate_id, investigation_id),
@@ -1063,11 +1064,26 @@ class InvestigationStore:
                 return candidate
             status = KnowledgeCandidateStatus.APPROVED if approved else KnowledgeCandidateStatus.REJECTED
             provenance = candidate.provenance.model_copy(update={"review_state": status.value})
-            conn.execute(
+            updated = conn.execute(
                 """UPDATE knowledge_candidates
-                   SET status=?, reviewed_by=?, reviewed_at=?, provenance_json=? WHERE id=?""",
-                (status.value, reviewed_by, now.timestamp(), provenance.model_dump_json(), candidate_id),
+                   SET status=?, reviewed_by=?, reviewed_at=?, provenance_json=?
+                   WHERE id=? AND investigation_id=? AND status=?""",
+                (
+                    status.value,
+                    reviewed_by,
+                    now.timestamp(),
+                    provenance.model_dump_json(),
+                    candidate_id,
+                    investigation_id,
+                    KnowledgeCandidateStatus.PENDING_REVIEW.value,
+                ),
             )
+            if updated.rowcount != 1:
+                current_row = conn.execute(
+                    "SELECT * FROM knowledge_candidates WHERE id=? AND investigation_id=?",
+                    (candidate_id, investigation_id),
+                ).fetchone()
+                return self._candidate_from_row(current_row) if current_row is not None else None
         return candidate.model_copy(
             update={
                 "status": status,
@@ -1090,16 +1106,26 @@ class InvestigationStore:
         if row is None:
             return None
         candidate = self._candidate_from_row(row)
-        if candidate.expires_at and candidate.expires_at <= utc_now():
-            with self._conn() as conn:
-                conn.execute(
-                    "UPDATE knowledge_candidates SET status=? WHERE id=?",
-                    (KnowledgeCandidateStatus.EXPIRED.value, candidate_id),
-                )
-            return None
         if candidate.status == KnowledgeCandidateStatus.APPLIED and candidate.applied_revision is not None:
             return self.get_contract(candidate.investigation_id, candidate.applied_revision)
         if candidate.status != KnowledgeCandidateStatus.APPROVED:
+            return None
+        if candidate.expires_at and candidate.expires_at <= utc_now():
+            provenance = candidate.provenance.model_copy(
+                update={"review_state": KnowledgeCandidateStatus.EXPIRED.value}
+            )
+            with self._conn() as conn:
+                conn.execute(
+                    """UPDATE knowledge_candidates SET status=?, provenance_json=?
+                       WHERE id=? AND investigation_id=? AND status=?""",
+                    (
+                        KnowledgeCandidateStatus.EXPIRED.value,
+                        provenance.model_dump_json(),
+                        candidate_id,
+                        investigation_id,
+                        KnowledgeCandidateStatus.APPROVED.value,
+                    ),
+                )
             return None
         contract = self.get_contract(candidate.investigation_id)
         if contract is None or contract.investigation.revision != candidate.revision:
