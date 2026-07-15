@@ -22,6 +22,7 @@ from tacit.models.schemas import (
     DashboardSpec,
     DashRequest,
     EvidenceObservation,
+    EvidenceObservationOutcome,
     EvidenceRequirement,
     EvidenceResolution,
     EvidenceResolutionStatus,
@@ -143,12 +144,24 @@ def apply_counterfactual(
     snapshot: InvestigationReplaySnapshot,
     changes: CounterfactualChanges,
 ) -> InvestigationReplaySnapshot:
-    observations = [
-        observation
-        for index, observation in enumerate(snapshot.evidence_observations, start=1)
-        if f"obs_{index:02d}" not in changes.remove_observation_ids
-        and observation.requirement_id not in changes.reject_requirement_ids
-    ]
+    removed_observation_ids = set(changes.remove_observation_ids)
+    rejected_requirement_ids = set(changes.reject_requirement_ids)
+    observations = []
+    for index, observation in enumerate(snapshot.evidence_observations, start=1):
+        if observation.requirement_id in rejected_requirement_ids:
+            continue
+        if f"obs_{index:02d}" in removed_observation_ids:
+            observation = observation.model_copy(
+                update={
+                    "outcome": EvidenceObservationOutcome.MISSING_EVIDENCE,
+                    "query": "",
+                    "valid_query": False,
+                    "non_empty": False,
+                    "survived": False,
+                    "rejection_reason": "counterfactual_observation_removed",
+                }
+            )
+        observations.append(observation)
     resolutions = [
         (
             resolution.model_copy(
@@ -157,7 +170,7 @@ def apply_counterfactual(
                     "reason_code": "counterfactual_binding_rejected",
                 }
             )
-            if resolution.requirement_id in changes.reject_requirement_ids
+            if resolution.requirement_id in rejected_requirement_ids
             else resolution
         )
         for resolution in snapshot.evidence_resolutions
@@ -170,6 +183,8 @@ def apply_counterfactual(
         if candidate_ref in changes.candidate_score_overrides:
             candidate = candidate.model_copy(update={"score": changes.candidate_score_overrides[candidate_ref]})
         candidates.append(candidate)
+    candidates.sort(key=lambda candidate: (-candidate.score, candidate.rank, candidate.suspect_type, candidate.suspect))
+    candidates = [candidate.model_copy(update={"rank": rank}) for rank, candidate in enumerate(candidates, start=1)]
     context_chunks = [
         (
             chunk.model_copy(update={"metadata": {**chunk.metadata, "stale": True}})

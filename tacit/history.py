@@ -55,6 +55,18 @@ class StaleRevisionError(ValueError):
     """Raised when a revision-scoped operation no longer targets the current revision."""
 
 
+class ReplayError(ValueError):
+    """Base error for a replay request that cannot produce its promised result."""
+
+
+class ReplayInputsUnavailableError(ReplayError):
+    """Raised when an evaluative replay has no captured inputs to rebuild."""
+
+
+class ExactReplayMismatchError(ReplayError):
+    """Raised when captured inputs no longer rebuild the persisted exact output."""
+
+
 def _db_path() -> Path:
     custom = getattr(settings, "history_db_path", None)
     path = Path(custom) if custom else _DEFAULT_DB_PATH
@@ -799,6 +811,28 @@ class InvestigationStore:
             base_revision=contract.investigation.revision,
         )
         if snapshot is None:
+            if mode != ReplayMode.EXACT:
+                detail = (
+                    f"Captured replay inputs are unavailable for investigation {investigation_id} "
+                    f"revision {contract.investigation.revision}; {mode.value} replay cannot be evaluated"
+                )
+                self.append_event(
+                    investigation_id,
+                    run_id,
+                    "replay_inputs_unavailable",
+                    {
+                        "revision": contract.investigation.revision,
+                        "mode": mode.value,
+                        "captured_inputs_available": False,
+                    },
+                )
+                self.complete_run(
+                    run_id,
+                    status="failed",
+                    error_code="replay_inputs_unavailable",
+                    error_detail=detail,
+                )
+                raise ReplayInputsUnavailableError(detail)
             self.append_event(
                 investigation_id,
                 run_id,
@@ -823,6 +857,19 @@ class InvestigationStore:
             },
         )
         if mode == ReplayMode.EXACT:
+            if rebuilt.runtime.output_fingerprint != contract.runtime.output_fingerprint:
+                detail = (
+                    f"Exact replay output fingerprint does not match investigation {investigation_id} "
+                    f"revision {contract.investigation.revision}"
+                )
+                self.complete_run(
+                    run_id,
+                    status="failed",
+                    error_code="exact_replay_output_mismatch",
+                    error_detail=detail,
+                    runtime_manifest=rebuilt.runtime.model_dump(mode="json"),
+                )
+                raise ExactReplayMismatchError(detail)
             self.complete_run(run_id, status="completed", runtime_manifest=rebuilt.runtime.model_dump(mode="json"))
             return rebuilt
         reason = "current-engine-replay" if mode == ReplayMode.CURRENT_ENGINE else "counterfactual-replay"

@@ -153,7 +153,7 @@ async def replay_investigation(
             mode=replay_request.mode,
             changes=replay_request.changes,
         )
-    except history_mod.StaleRevisionError as exc:
+    except (history_mod.StaleRevisionError, history_mod.ReplayError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")

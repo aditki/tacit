@@ -154,7 +154,17 @@ async def _run_pipeline_inner(
         run_id=run_id,
         record_investigation_updates=investigation_id is None,
     )
-    backends = deps.backend_factory()
+    try:
+        backends = deps.backend_factory()
+    except Exception as exc:
+        recorder.finish(
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}",
+            timings=timings,
+            total_time=time.monotonic() - t_start,
+        )
+        await deps.close_resources()
+        raise
     if not backends:
         recorder.finish(
             status="failed",
@@ -162,6 +172,7 @@ async def _run_pipeline_inner(
             timings={},
             total_time=time.monotonic() - t_start,
         )
+        await deps.close_resources()
         return PipelineFailureFactory.no_backends().model_copy(update={"investigation_id": inv_id})
 
     primary = backends[0]  # determines query language for compilation

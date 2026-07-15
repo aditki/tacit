@@ -20,7 +20,12 @@ from tacit.api.dependencies import get_pipeline_dependencies
 from tacit.backends.base import PublishResult
 from tacit.dependencies import PipelineDependencies
 from tacit.grounding_benchmark import run_acceptance_corpus, run_grounding_benchmark
-from tacit.history import InvestigationStore, StaleRevisionError
+from tacit.history import (
+    ExactReplayMismatchError,
+    InvestigationStore,
+    ReplayInputsUnavailableError,
+    StaleRevisionError,
+)
 from tacit.investigation_bundle import build_investigation_bundle
 from tacit.investigation_contract import (
     SCHEMA_ID,
@@ -322,6 +327,102 @@ def test_captured_input_replay_rebuilds_and_counterfactual_creates_revision(tmp_
     assert counterfactual.artifact_contributions[0].artifact_ref == "runbook:new"
 
 
+def test_counterfactual_replay_resorts_candidates_after_score_changes(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    ranking = CulpritRanking(
+        abstained=False,
+        telemetry_status="evidenced",
+        candidates=[
+            CulpritCandidate(
+                rank=1,
+                suspect="checkout",
+                suspect_type="service",
+                score=0.8,
+                supporting_requirement_ids=["er_01"],
+            ),
+            CulpritCandidate(
+                rank=2,
+                suspect="shared-cache",
+                suspect_type="cache",
+                score=0.6,
+                supporting_requirement_ids=["er_01"],
+            ),
+        ],
+    )
+    draft = _draft_contract(investigation_id, culprit_ranking=ranking)
+    snapshot = _snapshot_for(draft).model_copy(update={"culprit_ranking": ranking})
+    store.persist_contract_revision(draft, snapshot=snapshot)
+
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.COUNTERFACTUAL,
+        changes=CounterfactualChanges(candidate_score_overrides={"service:checkout": 0.2}),
+    )
+
+    assert replayed is not None
+    assert [(candidate.candidate_ref, candidate.rank) for candidate in replayed.candidate_rankings] == [
+        ("cache:shared-cache", 1),
+        ("service:checkout", 2),
+    ]
+    assert replayed.grounding.maximum_trustworthy_conclusion["text"].startswith("cache:shared-cache")
+
+
+def test_counterfactual_observation_removal_records_an_explicit_gap(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    draft = _draft_contract(investigation_id)
+    store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.COUNTERFACTUAL,
+        changes=CounterfactualChanges(remove_observation_ids=["obs_01"]),
+    )
+
+    assert replayed is not None
+    assert replayed.observations[0].id == "obs_01"
+    assert replayed.observations[0].status == "missing"
+    assert replayed.observations[0].value["rejection_reason"] == "counterfactual_observation_removed"
+    assert replayed.grounding.missing_observation_refs == ["obs_01"]
+    assert replayed.grounding.status == GroundingStatus.INSUFFICIENT_EVIDENCE
+
+
+def test_non_exact_replay_requires_captured_inputs(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Legacy investigation", user_id="sdet")
+    persisted = store.persist_contract_revision(_draft_contract(investigation_id))
+
+    assert store.replay_contract(investigation_id, mode=ReplayMode.EXACT) == persisted
+    with pytest.raises(ReplayInputsUnavailableError, match="Captured replay inputs are unavailable"):
+        store.replay_contract(
+            investigation_id,
+            mode=ReplayMode.COUNTERFACTUAL,
+            changes=CounterfactualChanges(candidate_score_overrides={"service:checkout": 0.1}),
+        )
+
+    assert store.list_runs(investigation_id)[-1]["status"] == "failed"
+    assert len(store.list_revisions(investigation_id)) == 1
+
+
+def test_exact_replay_fails_when_the_rebuilt_output_diverges(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    draft = _draft_contract(investigation_id)
+    mismatched_ranking = _snapshot_for(draft).culprit_ranking.model_copy(
+        update={"candidates": [_snapshot_for(draft).culprit_ranking.candidates[0].model_copy(update={"score": 0.1})]}
+    )
+    snapshot = _snapshot_for(draft).model_copy(update={"culprit_ranking": mismatched_ranking})
+    store.persist_contract_revision(draft, snapshot=snapshot)
+
+    with pytest.raises(ExactReplayMismatchError, match="output fingerprint does not match"):
+        store.replay_contract(investigation_id, mode=ReplayMode.EXACT)
+
+    replay_run = store.list_runs(investigation_id)[-1]
+    assert replay_run["status"] == "failed"
+    assert replay_run["error_code"] == "exact_replay_output_mismatch"
+
+
 def test_non_exact_replay_rejects_a_stale_base_revision(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?")
@@ -504,6 +605,41 @@ async def test_failed_refresh_does_not_overwrite_current_investigation_row(tmp_p
     assert current["dashboard_url"] == "http://grafana/current"
     assert current["current_revision"] == 1
     assert store.list_runs(investigation_id)[-1]["status"] == "failed"
+
+
+async def test_backend_factory_failure_completes_the_pipeline_run(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    resources_closed = False
+
+    def failing_backend_factory():
+        raise RuntimeError("backend configuration is invalid")
+
+    async def close_resources():
+        nonlocal resources_closed
+        resources_closed = True
+
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(pipeline_max_concurrent=1, pipeline_timeout_seconds=5),
+        backend_factory=failing_backend_factory,
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+        resource_cleanup=close_resources,
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    with pytest.raises(RuntimeError, match="backend configuration is invalid"):
+        await run_pipeline(DashRequest(prompt="Investigate checkout", user_id="api"), deps)
+
+    investigation = store.list_recent()[0]
+    run = store.list_runs(investigation["id"])[0]
+    assert investigation["status"] == "failed"
+    assert run["status"] == "failed"
+    assert run["error_code"] == "pipeline_failed"
+    assert "backend configuration is invalid" in run["error_detail"]
+    assert resources_closed is True
 
 
 async def test_refresh_persistence_rejects_a_base_that_advanced_during_the_run(tmp_path):
@@ -962,6 +1098,22 @@ def test_packaged_schema_matches_contract_model():
 
     with pytest.raises(ValueError, match="Unsupported investigation schema version"):
         load_investigation_contract_schema("../../secrets")
+
+
+def test_contract_api_rejects_non_exact_replay_without_captured_inputs(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Legacy investigation", user_id="api")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
+
+    response = TestClient(create_app()).post(
+        f"/api/v1/investigations/{investigation_id}/replay",
+        json={"mode": "counterfactual", "changes": {"remove_observation_ids": ["obs_01"]}},
+    )
+
+    assert response.status_code == 409
+    assert "captured replay inputs are unavailable" in response.json()["detail"].lower()
+    assert store.list_runs(investigation_id)[-1]["status"] == "failed"
 
 
 def test_contract_api_routes_expose_revision_replay_and_correction_candidate(tmp_path, monkeypatch):
