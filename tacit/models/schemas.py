@@ -361,6 +361,9 @@ class CulpritCandidate(BaseModel):
     contextual_reasons: list[str] = Field(default_factory=list)
     runtime_evidence: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
+    supporting_requirement_ids: list[str] = Field(default_factory=list)
+    contradicting_requirement_ids: list[str] = Field(default_factory=list)
+    missing_requirement_ids: list[str] = Field(default_factory=list)
 
 
 class CulpritRanking(BaseModel):

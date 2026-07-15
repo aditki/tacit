@@ -5,6 +5,7 @@ from tacit.models.schemas import (
     CulpritRankingMode,
     DashboardSpec,
     EvidenceObservation,
+    EvidenceObservationOutcome,
     EvidenceRequirement,
     EvidenceResolution,
     EvidenceResolutionStatus,
@@ -110,6 +111,7 @@ def test_ranking_becomes_telemetry_evidenced_when_observation_survives():
     assert ranking.candidates[0].runtime_evidence == [
         "Observed db_query_latency via db_query_duration_seconds in 'DB latency'"
     ]
+    assert ranking.candidates[0].supporting_requirement_ids == [requirement.id]
 
 
 def test_ranking_abstains_when_only_contextual_or_missing_evidence_exists():
@@ -139,6 +141,36 @@ def test_ranking_abstains_when_only_contextual_or_missing_evidence_exists():
     assert ranking.candidates[0].suspect == "checkout"
     assert ranking.candidates[0].runtime_evidence == []
     assert any("no_compatible_live_signal" in item for item in ranking.candidates[1].missing_evidence)
+    assert ranking.candidates[1].missing_requirement_ids == [requirement.id]
+
+
+def test_ranking_tracks_contradicted_requirement_ids():
+    requirement = _requirement()
+    resolution = EvidenceResolution(
+        requirement_id=requirement.id,
+        status=EvidenceResolutionStatus.RESOLVED,
+        reason_code="live_signal_resolved",
+        metric="db_query_duration_seconds",
+    )
+    observation = EvidenceObservation(
+        requirement_id=requirement.id,
+        outcome=EvidenceObservationOutcome.NEGATIVE_EVIDENCE,
+        resolution_metric="db_query_duration_seconds",
+        rejection_reason="negative_correlation",
+    )
+
+    ranking = rank_culprits(
+        intent=_intent(),
+        dashboard_spec=_dashboard(),
+        ranked_archetypes=[(_archetype(), 0.9)],
+        evidence_requirements=[requirement],
+        evidence_resolutions=[resolution],
+        evidence_observations=[observation],
+    )
+
+    database = next(candidate for candidate in ranking.candidates if candidate.suspect_type == "datastore")
+    assert database.contradicting_requirement_ids == [requirement.id]
+    assert database.supporting_requirement_ids == []
 
 
 def test_ranking_skips_when_there_are_no_candidates():

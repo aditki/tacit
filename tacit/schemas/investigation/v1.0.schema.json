@@ -833,11 +833,13 @@
     "SchemaInfo": {
       "properties": {
         "name": {
+          "const": "tacit.investigation",
           "default": "tacit.investigation",
           "title": "Name",
           "type": "string"
         },
         "version": {
+          "const": "1.0",
           "default": "1.0",
           "title": "Version",
           "type": "string"

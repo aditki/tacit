@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import tomllib
 from datetime import UTC, datetime
@@ -122,6 +123,7 @@ def _draft_contract(
                     score=0.66,
                     contextual_reasons=["Checkout owns the affected request path."],
                     runtime_evidence=["request_latency"],
+                    supporting_requirement_ids=["er_01"],
                 )
             ],
         )
@@ -194,6 +196,18 @@ def test_contract_rejects_broken_ranking_references():
         InvestigationContract.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("name", "tacit.unknown"), ("version", "2.0")],
+)
+def test_contract_rejects_unsupported_schema_identity(field, value):
+    payload = _draft_contract().model_dump(mode="json", by_alias=True)
+    payload["schema"][field] = value
+
+    with pytest.raises(ValidationError):
+        InvestigationContract.model_validate(payload)
+
+
 def test_observation_references_its_matching_query():
     first_query = "rate(http_requests_total[5m])"
     second_query = "rate(http_request_errors_total[5m])"
@@ -243,6 +257,32 @@ def test_grounding_uses_observation_ids_for_missing_evidence():
     assert contract.grounding.status == GroundingStatus.INSUFFICIENT_EVIDENCE
 
 
+def test_supported_observation_suppresses_duplicate_missing_observation():
+    observations = [
+        EvidenceObservation(
+            requirement_id="er_01",
+            outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+            valid_query=True,
+            non_empty=True,
+            survived=True,
+        ),
+        EvidenceObservation(
+            requirement_id="er_01",
+            outcome=EvidenceObservationOutcome.MISSING_EVIDENCE,
+            valid_query=False,
+            non_empty=False,
+            survived=False,
+            rejection_reason="query_rejected_by_validation",
+        ),
+    ]
+
+    contract = _draft_contract(evidence_observations=observations)
+
+    assert [observation.status for observation in contract.observations] == ["observed", "missing"]
+    assert contract.grounding.status == GroundingStatus.SUPPORTED
+    assert contract.grounding.missing_observation_refs == []
+
+
 def test_negative_evidence_marks_grounding_and_candidate_as_contradicted():
     observation = EvidenceObservation(
         requirement_id="er_01",
@@ -260,6 +300,79 @@ def test_negative_evidence_marks_grounding_and_candidate_as_contradicted():
     assert contract.grounding.status == GroundingStatus.CONTRADICTED
     assert contract.grounding.contradicted_claims == ["obs_01"]
     assert contract.candidate_rankings[0].contradicting_observation_refs == ["obs_01"]
+
+
+def test_candidate_observation_refs_are_scoped_to_declared_evidence():
+    requirements = [
+        EvidenceRequirement(id="er_latency", evidence_type="metric", signal_type="request_latency"),
+        EvidenceRequirement(id="er_database", evidence_type="metric", signal_type="db_query_latency"),
+    ]
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirement.id,
+            status=EvidenceResolutionStatus.RESOLVED,
+            reason_code="metadata_inference",
+            metric=requirement.signal_type,
+        )
+        for requirement in requirements
+    ]
+    observations = [
+        EvidenceObservation(
+            requirement_id="er_latency",
+            outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+            valid_query=True,
+            non_empty=True,
+            survived=True,
+        ),
+        EvidenceObservation(
+            requirement_id="er_database",
+            outcome=EvidenceObservationOutcome.NEGATIVE_EVIDENCE,
+            rejection_reason="negative_correlation",
+        ),
+    ]
+    ranking = CulpritRanking(
+        abstained=False,
+        candidates=[
+            CulpritCandidate(
+                rank=1,
+                suspect="checkout",
+                suspect_type="service",
+                score=0.8,
+                runtime_evidence=["Observed request_latency via http_request_duration_seconds"],
+                supporting_requirement_ids=["er_latency"],
+            ),
+            CulpritCandidate(
+                rank=2,
+                suspect="checkout database",
+                suspect_type="datastore",
+                score=0.6,
+                missing_evidence=["db_query_latency: negative_correlation"],
+                contradicting_requirement_ids=["er_database"],
+            ),
+            CulpritCandidate(
+                rank=3,
+                suspect="checkout cache",
+                suspect_type="cache",
+                score=0.3,
+                contextual_reasons=["Mentioned by a runbook"],
+            ),
+        ],
+    )
+
+    contract = _draft_contract(
+        evidence_requirements=requirements,
+        evidence_resolutions=resolutions,
+        evidence_observations=observations,
+        culprit_ranking=ranking,
+    )
+
+    service, database, contextual = contract.candidate_rankings
+    assert service.supporting_observation_refs == ["obs_01"]
+    assert service.contradicting_observation_refs == []
+    assert database.supporting_observation_refs == []
+    assert database.contradicting_observation_refs == ["obs_02"]
+    assert contextual.supporting_observation_refs == []
+    assert contextual.contradicting_observation_refs == []
 
 
 def test_missing_observation_prevents_supported_grounding_after_resolution():
@@ -334,9 +447,7 @@ def test_output_fingerprint_preserves_external_observation_timestamps():
     )
     first = stamp_fingerprints(contract.model_copy(update={"provenance": [*contract.provenance, external]}))
     changed_external = external.model_copy(update={"observed_at": datetime(2026, 1, 2, tzinfo=UTC)})
-    second = stamp_fingerprints(
-        contract.model_copy(update={"provenance": [*contract.provenance, changed_external]})
-    )
+    second = stamp_fingerprints(contract.model_copy(update={"provenance": [*contract.provenance, changed_external]}))
 
     assert first.runtime.output_fingerprint != second.runtime.output_fingerprint
 
@@ -460,3 +571,24 @@ def test_contract_api_routes_expose_revision_replay_and_correction_candidate(tmp
     body = correction_response.json()
     assert body["status"] == "pending_review"
     assert body["provenance"]["source_type"] == "human_correction"
+
+
+def test_contract_api_rejects_unsupported_schema_in_history(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    persisted = store.persist_contract_revision(_draft_contract(investigation_id))
+    payload = persisted.model_dump(mode="json", by_alias=True)
+    payload["schema"]["version"] = "2.0"
+    with store._conn() as conn:
+        conn.execute(
+            """UPDATE investigation_revisions
+               SET schema_version=?, contract_json=?
+               WHERE investigation_id=? AND revision=?""",
+            ("2.0", json.dumps(payload), investigation_id, persisted.investigation.revision),
+        )
+    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
+
+    assert store.get_contract(investigation_id) is None
+    response = TestClient(create_app()).get(f"/api/v1/investigations/{investigation_id}/contract")
+
+    assert response.status_code == 404

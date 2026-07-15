@@ -11,7 +11,7 @@ import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from importlib.resources import files
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -85,8 +85,8 @@ class CausalStatus(StrEnum):
 
 
 class SchemaInfo(BaseModel):
-    name: str = SCHEMA_NAME
-    version: str = SCHEMA_VERSION
+    name: Literal["tacit.investigation"] = "tacit.investigation"
+    version: Literal["1.0"] = "1.0"
 
 
 class TimeWindow(BaseModel):
@@ -325,6 +325,11 @@ def _require_known_refs(refs: list[str], known: set[str], subject: str) -> None:
     missing = [ref for ref in refs if ref not in known]
     if missing:
         raise ValueError(f"{subject} references unknown ids: {missing}")
+
+
+def _observation_requirement_ref(observation: ObservationContract) -> str:
+    requirement_ref = observation.value.get("requirement_ref", "")
+    return str(requirement_ref) if requirement_ref else observation.id
 
 
 def utc_now() -> datetime:
@@ -649,27 +654,38 @@ class InvestigationContractAssembler:
         observations: list[ObservationContract],
         requirements: list[EvidenceRequirementContract],
     ) -> list[CandidateRankingContract]:
-        supported_obs = [obs.id for obs in observations if obs.status == "observed"]
-        contradicted_obs = [obs.id for obs in observations if obs.status == "contradicted"]
-        missing_requirements = [
-            req.id for req in requirements if req.resolution_status != EvidenceResolutionStatus.RESOLVED
-        ]
         records: list[CandidateRankingContract] = []
+        known_requirement_refs = {requirement.id for requirement in requirements}
         for candidate in ranking.candidates:
-            candidate_missing = [
-                req.id
-                for req in requirements
-                if any(req.concept and req.concept in missing for missing in candidate.missing_evidence)
-            ] or missing_requirements
+            supporting_requirement_refs = set(candidate.supporting_requirement_ids) & known_requirement_refs
+            contradicting_requirement_refs = set(candidate.contradicting_requirement_ids) & known_requirement_refs
+            missing_requirement_refs = set(candidate.missing_requirement_ids) & known_requirement_refs
+            tied_requirement_refs = (
+                supporting_requirement_refs | contradicting_requirement_refs | missing_requirement_refs
+            )
+            supporting_observation_refs = [
+                observation.id
+                for observation in observations
+                if observation.status == "observed"
+                and _observation_requirement_ref(observation) in supporting_requirement_refs
+            ]
+            contradicting_observation_refs = [
+                observation.id
+                for observation in observations
+                if observation.status == "contradicted"
+                and _observation_requirement_ref(observation) in tied_requirement_refs
+            ]
             records.append(
                 CandidateRankingContract(
                     candidate_ref=f"{candidate.suspect_type}:{candidate.suspect}",
                     rank=candidate.rank,
                     score=candidate.score,
                     causal_status=CausalStatus.SUSPECT_NOT_PROVEN,
-                    supporting_observation_refs=supported_obs,
-                    contradicting_observation_refs=contradicted_obs,
-                    missing_requirement_refs=candidate_missing,
+                    supporting_observation_refs=supporting_observation_refs,
+                    contradicting_observation_refs=contradicting_observation_refs,
+                    missing_requirement_refs=[
+                        requirement.id for requirement in requirements if requirement.id in missing_requirement_refs
+                    ],
                     contextual_reasons=candidate.contextual_reasons,
                     runtime_evidence=candidate.runtime_evidence,
                 )
@@ -683,11 +699,46 @@ class InvestigationContractAssembler:
         requirements: list[EvidenceRequirementContract],
         rankings: list[CandidateRankingContract],
     ) -> GroundingContract:
-        supported = [obs.id for obs in observations if obs.status == "observed"]
-        contradicted = [obs.id for obs in observations if obs.status == "contradicted"]
-        missing = [obs.id for obs in observations if obs.status == "missing"]
-        ambiguous = [obs.id for obs in observations if obs.status == "inferred"]
-        unresolved = [req.id for req in requirements if req.resolution_status != EvidenceResolutionStatus.RESOLVED]
+        supported_requirements = {
+            _observation_requirement_ref(observation)
+            for observation in observations
+            if observation.status == "observed"
+        }
+        supported = [observation.id for observation in observations if observation.status == "observed"]
+        contradicted = [
+            observation.id
+            for observation in observations
+            if observation.status == "contradicted"
+            and _observation_requirement_ref(observation) not in supported_requirements
+        ]
+        contradicted_requirements = {
+            _observation_requirement_ref(observation)
+            for observation in observations
+            if observation.id in contradicted
+        }
+        decisive_requirements = supported_requirements | contradicted_requirements
+        ambiguous = [
+            observation.id
+            for observation in observations
+            if observation.status == "inferred"
+            and _observation_requirement_ref(observation) not in decisive_requirements
+        ]
+        ambiguous_requirements = {
+            _observation_requirement_ref(observation) for observation in observations if observation.id in ambiguous
+        }
+        missing = [
+            observation.id
+            for observation in observations
+            if observation.status == "missing"
+            and _observation_requirement_ref(observation)
+            not in decisive_requirements | ambiguous_requirements
+        ]
+        unresolved = [
+            requirement.id
+            for requirement in requirements
+            if requirement.resolution_status != EvidenceResolutionStatus.RESOLVED
+            and requirement.id not in supported_requirements
+        ]
         if contradicted:
             status = GroundingStatus.CONTRADICTED
         elif ranking.abstained or not rankings:
