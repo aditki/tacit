@@ -404,6 +404,8 @@ class DashResponse(BaseModel):
     dashboard_uid: str = Field(description="Unique Grafana dashboard UID")
     panel_count: int = Field(description="Number of panels in the generated dashboard")
     summary: str = Field(description="Human-readable summary of what was generated")
+    investigation_id: str = Field(default="", description="Stable investigation identifier")
+    investigation_revision: int | None = Field(default=None, description="Immutable investigation contract revision")
     signalfx_url: str = Field(default="", description="SignalFx dashboard URL (when signalfx_enabled)")
     signalfx_dashboard_id: str = Field(default="", description="SignalFx dashboard ID (when signalfx_enabled)")
     culprit_ranking: CulpritRanking | None = Field(

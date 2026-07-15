@@ -1,0 +1,981 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacit:schema:investigation:1.0",
+  "$defs": {
+    "ArtifactContributionContract": {
+      "properties": {
+        "artifact_ref": {
+          "title": "Artifact Ref",
+          "type": "string"
+        },
+        "contribution_type": {
+          "title": "Contribution Type",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "provenance_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provenance Refs",
+          "type": "array"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "score_delta": {
+          "default": 0.0,
+          "title": "Score Delta",
+          "type": "number"
+        },
+        "status": {
+          "default": "supported",
+          "title": "Status",
+          "type": "string"
+        },
+        "target_ref": {
+          "title": "Target Ref",
+          "type": "string"
+        },
+        "used_for": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Used For",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "artifact_ref",
+        "target_ref",
+        "contribution_type",
+        "provenance_refs"
+      ],
+      "title": "ArtifactContributionContract",
+      "type": "object"
+    },
+    "CandidateRankingContract": {
+      "properties": {
+        "candidate_ref": {
+          "title": "Candidate Ref",
+          "type": "string"
+        },
+        "causal_status": {
+          "$ref": "#/$defs/CausalStatus",
+          "default": "suspect_not_proven"
+        },
+        "contextual_reasons": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Contextual Reasons",
+          "type": "array"
+        },
+        "contradicting_observation_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Contradicting Observation Refs",
+          "type": "array"
+        },
+        "contribution_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Contribution Refs",
+          "type": "array"
+        },
+        "missing_requirement_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Missing Requirement Refs",
+          "type": "array"
+        },
+        "rank": {
+          "minimum": 1,
+          "title": "Rank",
+          "type": "integer"
+        },
+        "runtime_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Runtime Evidence",
+          "type": "array"
+        },
+        "score": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Score",
+          "type": "number"
+        },
+        "supporting_observation_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Supporting Observation Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "candidate_ref",
+        "rank",
+        "score"
+      ],
+      "title": "CandidateRankingContract",
+      "type": "object"
+    },
+    "CausalStatus": {
+      "enum": [
+        "proven",
+        "suspect_not_proven",
+        "contradicted",
+        "insufficient_evidence",
+        "indeterminate"
+      ],
+      "title": "CausalStatus",
+      "type": "string"
+    },
+    "CorrectionReference": {
+      "properties": {
+        "applied_in_revision": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Applied In Revision"
+        },
+        "correction_ref": {
+          "title": "Correction Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "correction_ref"
+      ],
+      "title": "CorrectionReference",
+      "type": "object"
+    },
+    "DecisionLogEntry": {
+      "properties": {
+        "action": {
+          "title": "Action",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "inputs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Inputs",
+          "type": "array"
+        },
+        "mechanism": {
+          "additionalProperties": true,
+          "title": "Mechanism",
+          "type": "object"
+        },
+        "output_ref": {
+          "default": "",
+          "title": "Output Ref",
+          "type": "string"
+        },
+        "output_status": {
+          "default": "",
+          "title": "Output Status",
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "reason_code": {
+          "default": "",
+          "title": "Reason Code",
+          "type": "string"
+        },
+        "score_after": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Score After"
+        },
+        "score_before": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Score Before"
+        },
+        "sequence": {
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "stage": {
+          "title": "Stage",
+          "type": "string"
+        },
+        "subject_ref": {
+          "default": "",
+          "title": "Subject Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "sequence",
+        "stage",
+        "action"
+      ],
+      "title": "DecisionLogEntry",
+      "type": "object"
+    },
+    "EvidenceRequirementContract": {
+      "properties": {
+        "concept": {
+          "default": "",
+          "title": "Concept",
+          "type": "string"
+        },
+        "entity_ref": {
+          "default": "",
+          "title": "Entity Ref",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "priority": {
+          "default": "required",
+          "title": "Priority",
+          "type": "string"
+        },
+        "provenance_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provenance Refs",
+          "type": "array"
+        },
+        "required_for": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required For",
+          "type": "array"
+        },
+        "resolution_status": {
+          "default": "unknown",
+          "title": "Resolution Status",
+          "type": "string"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type"
+      ],
+      "title": "EvidenceRequirementContract",
+      "type": "object"
+    },
+    "EvidenceResolutionContract": {
+      "properties": {
+        "backend": {
+          "default": "",
+          "title": "Backend",
+          "type": "string"
+        },
+        "binding": {
+          "additionalProperties": true,
+          "title": "Binding",
+          "type": "object"
+        },
+        "confidence": {
+          "default": "unknown",
+          "title": "Confidence",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "provenance_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provenance Refs",
+          "type": "array"
+        },
+        "requirement_ref": {
+          "title": "Requirement Ref",
+          "type": "string"
+        },
+        "resolution_method": {
+          "default": "",
+          "title": "Resolution Method",
+          "type": "string"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "requirement_ref",
+        "status"
+      ],
+      "title": "EvidenceResolutionContract",
+      "type": "object"
+    },
+    "GroundingContract": {
+      "properties": {
+        "confidence": {
+          "additionalProperties": true,
+          "title": "Confidence",
+          "type": "object"
+        },
+        "contradicted_claims": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Contradicted Claims",
+          "type": "array"
+        },
+        "maximum_trustworthy_conclusion": {
+          "additionalProperties": true,
+          "title": "Maximum Trustworthy Conclusion",
+          "type": "object"
+        },
+        "migration_notes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Migration Notes",
+          "type": "array"
+        },
+        "missing_observation_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Missing Observation Refs",
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/$defs/GroundingStatus",
+          "default": "indeterminate"
+        },
+        "supported_claims": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Supported Claims",
+          "type": "array"
+        },
+        "unsafe_conclusions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Unsafe Conclusions",
+          "type": "array"
+        },
+        "unsafe_to_conclude": {
+          "default": true,
+          "title": "Unsafe To Conclude",
+          "type": "boolean"
+        },
+        "unsupported_claims": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Unsupported Claims",
+          "type": "array"
+        }
+      },
+      "title": "GroundingContract",
+      "type": "object"
+    },
+    "GroundingStatus": {
+      "enum": [
+        "supported",
+        "partially_supported",
+        "insufficient_evidence",
+        "contradicted",
+        "indeterminate"
+      ],
+      "title": "GroundingStatus",
+      "type": "string"
+    },
+    "InvestigationLifecycleStatus": {
+      "enum": [
+        "created",
+        "resolving",
+        "observing",
+        "ranking",
+        "grounding",
+        "completed",
+        "failed_resolution",
+        "failed_observation",
+        "failed_ranking",
+        "failed_validation",
+        "cancelled"
+      ],
+      "title": "InvestigationLifecycleStatus",
+      "type": "string"
+    },
+    "InvestigationMetadata": {
+      "properties": {
+        "completed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Completed At"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "parent_revision": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Revision"
+        },
+        "revision": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/InvestigationLifecycleStatus",
+          "default": "created"
+        }
+      },
+      "required": [
+        "id",
+        "created_at"
+      ],
+      "title": "InvestigationMetadata",
+      "type": "object"
+    },
+    "InvestigationRequestContract": {
+      "properties": {
+        "normalized_intent": {
+          "default": "",
+          "title": "Normalized Intent",
+          "type": "string"
+        },
+        "question": {
+          "title": "Question",
+          "type": "string"
+        },
+        "requester": {
+          "default": "",
+          "title": "Requester",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/InvestigationScope"
+        },
+        "time_window": {
+          "$ref": "#/$defs/TimeWindow"
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "title": "InvestigationRequestContract",
+      "type": "object"
+    },
+    "InvestigationScope": {
+      "properties": {
+        "environments": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Environments",
+          "type": "array"
+        },
+        "regions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Regions",
+          "type": "array"
+        },
+        "service_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Service Ids",
+          "type": "array"
+        },
+        "services": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Services",
+          "type": "array"
+        }
+      },
+      "title": "InvestigationScope",
+      "type": "object"
+    },
+    "ObservationContract": {
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "provenance_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provenance Refs",
+          "type": "array"
+        },
+        "query_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Query Refs",
+          "type": "array"
+        },
+        "statement": {
+          "default": "",
+          "title": "Statement",
+          "type": "string"
+        },
+        "status": {
+          "default": "missing",
+          "title": "Status",
+          "type": "string"
+        },
+        "subject_ref": {
+          "default": "",
+          "title": "Subject Ref",
+          "type": "string"
+        },
+        "time_window": {
+          "$ref": "#/$defs/TimeWindow"
+        },
+        "type": {
+          "default": "",
+          "title": "Type",
+          "type": "string"
+        },
+        "value": {
+          "additionalProperties": true,
+          "title": "Value",
+          "type": "object"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "ObservationContract",
+      "type": "object"
+    },
+    "OperationalIR": {
+      "properties": {
+        "archetypes": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Archetypes",
+          "type": "array"
+        },
+        "domain": {
+          "default": "",
+          "title": "Domain",
+          "type": "string"
+        },
+        "keywords": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Keywords",
+          "type": "array"
+        },
+        "problem_type": {
+          "default": "",
+          "title": "Problem Type",
+          "type": "string"
+        },
+        "services": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Services",
+          "type": "array"
+        },
+        "signals": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Signals",
+          "type": "array"
+        },
+        "summary": {
+          "default": "",
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "title": "OperationalIR",
+      "type": "object"
+    },
+    "ProvenanceRecord": {
+      "properties": {
+        "freshness": {
+          "additionalProperties": true,
+          "title": "Freshness",
+          "type": "object"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "ingested_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ingested At"
+        },
+        "locator": {
+          "additionalProperties": true,
+          "title": "Locator",
+          "type": "object"
+        },
+        "observed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Observed At"
+        },
+        "review_state": {
+          "default": "unreviewed",
+          "title": "Review State",
+          "type": "string"
+        },
+        "source_ref": {
+          "title": "Source Ref",
+          "type": "string"
+        },
+        "source_type": {
+          "title": "Source Type",
+          "type": "string"
+        },
+        "source_version": {
+          "default": "",
+          "title": "Source Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source_type",
+        "source_ref"
+      ],
+      "title": "ProvenanceRecord",
+      "type": "object"
+    },
+    "QueryRecord": {
+      "properties": {
+        "backend": {
+          "default": "",
+          "title": "Backend",
+          "type": "string"
+        },
+        "execution": {
+          "additionalProperties": true,
+          "title": "Execution",
+          "type": "object"
+        },
+        "expression": {
+          "default": "",
+          "title": "Expression",
+          "type": "string"
+        },
+        "generated_by": {
+          "default": "evidence_resolver",
+          "title": "Generated By",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "language": {
+          "default": "",
+          "title": "Language",
+          "type": "string"
+        },
+        "validation": {
+          "additionalProperties": true,
+          "title": "Validation",
+          "type": "object"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "QueryRecord",
+      "type": "object"
+    },
+    "RuntimeManifest": {
+      "properties": {
+        "engine_version": {
+          "default": "0.1.1-rc.1",
+          "title": "Engine Version",
+          "type": "string"
+        },
+        "input_fingerprint": {
+          "default": "",
+          "title": "Input Fingerprint",
+          "type": "string"
+        },
+        "model": {
+          "additionalProperties": true,
+          "title": "Model",
+          "type": "object"
+        },
+        "output_fingerprint": {
+          "default": "",
+          "title": "Output Fingerprint",
+          "type": "string"
+        },
+        "policy_version": {
+          "default": "investigation-contract-v1",
+          "title": "Policy Version",
+          "type": "string"
+        },
+        "ranking_version": {
+          "default": "culprit-ranking-v1",
+          "title": "Ranking Version",
+          "type": "string"
+        },
+        "vocabulary_version": {
+          "default": "investigation-lifecycle-v1",
+          "title": "Vocabulary Version",
+          "type": "string"
+        }
+      },
+      "title": "RuntimeManifest",
+      "type": "object"
+    },
+    "SchemaInfo": {
+      "properties": {
+        "name": {
+          "default": "tacit.investigation",
+          "title": "Name",
+          "type": "string"
+        },
+        "version": {
+          "default": "1.0",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "title": "SchemaInfo",
+      "type": "object"
+    },
+    "TimeWindow": {
+      "properties": {
+        "end": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End"
+        },
+        "label": {
+          "default": "",
+          "title": "Label",
+          "type": "string"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
+        }
+      },
+      "title": "TimeWindow",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "artifact_contributions": {
+      "items": {
+        "$ref": "#/$defs/ArtifactContributionContract"
+      },
+      "title": "Artifact Contributions",
+      "type": "array"
+    },
+    "candidate_rankings": {
+      "items": {
+        "$ref": "#/$defs/CandidateRankingContract"
+      },
+      "title": "Candidate Rankings",
+      "type": "array"
+    },
+    "corrections": {
+      "items": {
+        "$ref": "#/$defs/CorrectionReference"
+      },
+      "title": "Corrections",
+      "type": "array"
+    },
+    "decision_log": {
+      "items": {
+        "$ref": "#/$defs/DecisionLogEntry"
+      },
+      "title": "Decision Log",
+      "type": "array"
+    },
+    "evidence_requirements": {
+      "items": {
+        "$ref": "#/$defs/EvidenceRequirementContract"
+      },
+      "title": "Evidence Requirements",
+      "type": "array"
+    },
+    "evidence_resolutions": {
+      "items": {
+        "$ref": "#/$defs/EvidenceResolutionContract"
+      },
+      "title": "Evidence Resolutions",
+      "type": "array"
+    },
+    "grounding": {
+      "$ref": "#/$defs/GroundingContract"
+    },
+    "investigation": {
+      "$ref": "#/$defs/InvestigationMetadata"
+    },
+    "observations": {
+      "items": {
+        "$ref": "#/$defs/ObservationContract"
+      },
+      "title": "Observations",
+      "type": "array"
+    },
+    "operational_ir": {
+      "$ref": "#/$defs/OperationalIR"
+    },
+    "provenance": {
+      "items": {
+        "$ref": "#/$defs/ProvenanceRecord"
+      },
+      "title": "Provenance",
+      "type": "array"
+    },
+    "queries": {
+      "items": {
+        "$ref": "#/$defs/QueryRecord"
+      },
+      "title": "Queries",
+      "type": "array"
+    },
+    "renderings": {
+      "additionalProperties": true,
+      "title": "Renderings",
+      "type": "object"
+    },
+    "request": {
+      "$ref": "#/$defs/InvestigationRequestContract"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeManifest"
+    },
+    "schema": {
+      "$ref": "#/$defs/SchemaInfo"
+    }
+  },
+  "required": [
+    "investigation",
+    "request"
+  ],
+  "title": "InvestigationContract",
+  "type": "object"
+}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import webbrowser
 from collections.abc import Callable
@@ -857,6 +858,58 @@ def _update_env(updates: dict):
 
 
 # ── tacit test ───────────────────────────────────────────────────────────
+@cli.command("investigate")
+@click.argument("prompt", required=False)
+@click.option("--json", "json_output", is_flag=True, help="Print the canonical Investigation Contract JSON")
+@click.option("--open-browser/--no-open-browser", default=False, help="Open dashboard rendering in browser")
+def investigate(prompt: str | None, json_output: bool, open_browser: bool):
+    """Run an investigation and render the versioned contract."""
+    _load_env()
+    if prompt is None:
+        prompt = "High latency on the checkout service in the last hour"
+
+    import asyncio
+
+    async def _run():
+        from tacit.history import get_investigation_store
+        from tacit.models.schemas import DashRequest
+        from tacit.pipeline import run_pipeline
+
+        result = await run_pipeline(DashRequest(prompt=prompt, user_id="cli"))
+        contract = None
+        if result.investigation_id:
+            contract = get_investigation_store().get_contract(result.investigation_id, result.investigation_revision)
+        return result, contract
+
+    try:
+        result, contract = asyncio.run(_run())
+    except Exception as e:
+        _fail(f"Investigation error: {e}")
+        _info("Run `tacit doctor` to check your setup")
+        raise SystemExit(1) from e
+
+    if json_output:
+        if contract is None:
+            _fail("Investigation completed without a persisted contract")
+            raise SystemExit(1)
+        click.echo(json.dumps(contract.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True))
+        return
+
+    _header("Investigation Complete")
+    if result.dashboard_url:
+        _success(f"Dashboard rendering: {result.dashboard_url}")
+    else:
+        _warn("No dashboard rendering URL returned")
+    if result.investigation_id and result.investigation_revision is not None:
+        _info(f"Investigation: {result.investigation_id} revision {result.investigation_revision}")
+    _info(f"Panels: {result.panel_count}")
+    if contract is not None:
+        _info(f"Grounding: {contract.grounding.status.value}")
+        _info(f"Conclusion: {contract.grounding.maximum_trustworthy_conclusion.get('text', '')}")
+    if open_browser and result.dashboard_url:
+        webbrowser.open(result.dashboard_url)
+
+
 @cli.command("test")
 @click.option("--prompt", "-p", default=None, help="Custom test prompt")
 @click.option("--open-browser/--no-open-browser", default=True, help="Open dashboard in browser")

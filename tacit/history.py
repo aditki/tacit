@@ -16,12 +16,22 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import structlog
 
 from tacit.config import settings
+from tacit.investigation_contract import (
+    InvestigationContract,
+    InvestigationRunType,
+    KnowledgeCandidate,
+    ProvenanceRecord,
+    fingerprint,
+    stamp_fingerprints,
+    utc_now,
+)
 
 logger = structlog.get_logger()
 
@@ -42,6 +52,7 @@ CREATE TABLE IF NOT EXISTS investigations (
     prompt          TEXT NOT NULL,
     user_id         TEXT NOT NULL DEFAULT '',
     channel_id      TEXT NOT NULL DEFAULT '',
+    current_revision INTEGER NOT NULL DEFAULT 0,
 
     -- Intent
     intent_summary  TEXT NOT NULL DEFAULT '',
@@ -93,6 +104,73 @@ CREATE INDEX IF NOT EXISTS idx_inv_status ON investigations(status);
 CREATE INDEX IF NOT EXISTS idx_inv_user ON investigations(user_id);
 CREATE INDEX IF NOT EXISTS idx_inv_started ON investigations(started_at);
 CREATE INDEX IF NOT EXISTS idx_inv_dashboard ON investigations(dashboard_uid);
+
+CREATE TABLE IF NOT EXISTS investigation_revisions (
+    investigation_id   TEXT NOT NULL,
+    revision           INTEGER NOT NULL,
+    parent_revision    INTEGER,
+    schema_version     TEXT NOT NULL,
+    contract_json      TEXT NOT NULL,
+    input_fingerprint  TEXT NOT NULL,
+    output_fingerprint TEXT NOT NULL,
+    engine_version     TEXT NOT NULL,
+    created_at         REAL NOT NULL,
+    reason             TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (investigation_id, revision),
+    FOREIGN KEY (investigation_id) REFERENCES investigations(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_inv_revisions_created
+    ON investigation_revisions(investigation_id, created_at);
+
+CREATE TABLE IF NOT EXISTS investigation_runs (
+    run_id                TEXT PRIMARY KEY,
+    investigation_id      TEXT NOT NULL,
+    base_revision         INTEGER,
+    run_type              TEXT NOT NULL,
+    status                TEXT NOT NULL,
+    started_at            REAL NOT NULL,
+    completed_at          REAL,
+    error_code            TEXT NOT NULL DEFAULT '',
+    error_detail          TEXT NOT NULL DEFAULT '',
+    runtime_manifest_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (investigation_id) REFERENCES investigations(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_inv_runs_investigation
+    ON investigation_runs(investigation_id, started_at);
+
+CREATE TABLE IF NOT EXISTS investigation_events (
+    event_id         TEXT PRIMARY KEY,
+    investigation_id TEXT NOT NULL,
+    run_id           TEXT NOT NULL,
+    sequence         INTEGER NOT NULL,
+    event_type       TEXT NOT NULL,
+    payload_json     TEXT NOT NULL DEFAULT '{}',
+    created_at       REAL NOT NULL,
+    FOREIGN KEY (investigation_id) REFERENCES investigations(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_inv_events_run
+    ON investigation_events(run_id, sequence);
+
+CREATE TABLE IF NOT EXISTS knowledge_candidates (
+    id               TEXT PRIMARY KEY,
+    investigation_id TEXT NOT NULL,
+    revision         INTEGER NOT NULL,
+    correction_text  TEXT NOT NULL,
+    target_ref       TEXT NOT NULL DEFAULT '',
+    candidate_type   TEXT NOT NULL DEFAULT 'human_correction',
+    status           TEXT NOT NULL DEFAULT 'pending_review',
+    created_by       TEXT NOT NULL DEFAULT '',
+    created_at       REAL NOT NULL,
+    expires_at       REAL,
+    provenance_json  TEXT NOT NULL,
+    FOREIGN KEY (investigation_id) REFERENCES investigations(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_investigation
+    ON knowledge_candidates(investigation_id, revision);
 """
 
 
@@ -124,6 +202,8 @@ class InvestigationStore:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
             if "stage_outcomes" not in columns:
                 conn.execute("ALTER TABLE investigations ADD COLUMN stage_outcomes TEXT NOT NULL DEFAULT '{}'")
+            if "current_revision" not in columns:
+                conn.execute("ALTER TABLE investigations ADD COLUMN current_revision INTEGER NOT NULL DEFAULT 0")
         logger.info("investigation_store_init", db_path=str(self._db_path))
 
     # ── Write operations ──────────────────────────────────────────────────
@@ -316,6 +396,273 @@ class InvestigationStore:
                     inv_id,
                 ),
             )
+
+    # ── Contract revisions ───────────────────────────────────────────────
+
+    def persist_contract_revision(
+        self,
+        contract: InvestigationContract,
+        *,
+        reason: str = "initial",
+        run_type: InvestigationRunType = InvestigationRunType.INITIAL,
+    ) -> InvestigationContract:
+        """Persist an immutable Investigation Contract revision.
+
+        The store assigns the next revision number inside one transaction, then
+        stamps fingerprints on the exact persisted document.
+        """
+        investigation_id = contract.investigation.id
+        now = time.time()
+        run_id = uuid.uuid4().hex
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(revision), 0) AS current FROM investigation_revisions WHERE investigation_id=?",
+                (investigation_id,),
+            ).fetchone()
+            current = int(row["current"] or 0)
+            revision = current + 1
+            parent_revision = current or None
+            investigation = contract.investigation.model_copy(
+                update={"revision": revision, "parent_revision": parent_revision}
+            )
+            stamped = stamp_fingerprints(contract.model_copy(update={"investigation": investigation}))
+            payload = stamped.model_dump(mode="json", by_alias=True)
+            conn.execute(
+                """INSERT INTO investigation_runs (
+                   run_id, investigation_id, base_revision, run_type, status,
+                   started_at, completed_at, runtime_manifest_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    investigation_id,
+                    parent_revision,
+                    run_type.value,
+                    "completed",
+                    now,
+                    now,
+                    json.dumps(payload["runtime"], sort_keys=True),
+                ),
+            )
+            conn.execute(
+                """INSERT INTO investigation_revisions (
+                   investigation_id, revision, parent_revision, schema_version,
+                   contract_json, input_fingerprint, output_fingerprint,
+                   engine_version, created_at, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    investigation_id,
+                    revision,
+                    parent_revision,
+                    stamped.schema_.version,
+                    json.dumps(payload, sort_keys=True),
+                    stamped.runtime.input_fingerprint,
+                    stamped.runtime.output_fingerprint,
+                    stamped.runtime.engine_version,
+                    now,
+                    reason,
+                ),
+            )
+            conn.execute(
+                "UPDATE investigations SET current_revision=? WHERE id=?",
+                (revision, investigation_id),
+            )
+            conn.execute(
+                """INSERT INTO investigation_events (
+                   event_id, investigation_id, run_id, sequence, event_type, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    uuid.uuid4().hex,
+                    investigation_id,
+                    run_id,
+                    1,
+                    "revision_persisted",
+                    json.dumps(
+                        {
+                            "revision": revision,
+                            "input_fingerprint": stamped.runtime.input_fingerprint,
+                            "output_fingerprint": stamped.runtime.output_fingerprint,
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+        return stamped
+
+    def list_revisions(self, investigation_id: str) -> list[dict[str, Any]]:
+        """List immutable contract revisions for one investigation."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT investigation_id, revision, parent_revision, schema_version,
+                          input_fingerprint, output_fingerprint, engine_version, created_at, reason
+                   FROM investigation_revisions
+                   WHERE investigation_id=?
+                   ORDER BY revision ASC""",
+                (investigation_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_contract(self, investigation_id: str, revision: int | None = None) -> InvestigationContract | None:
+        """Load a contract by revision, or the current revision when omitted."""
+        with self._conn() as conn:
+            if revision is None:
+                row = conn.execute(
+                    """SELECT contract_json FROM investigation_revisions
+                       WHERE investigation_id=?
+                       ORDER BY revision DESC LIMIT 1""",
+                    (investigation_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT contract_json FROM investigation_revisions
+                       WHERE investigation_id=? AND revision=?""",
+                    (investigation_id, revision),
+                ).fetchone()
+        if row is None:
+            return None
+        try:
+            return InvestigationContract.model_validate_json(row["contract_json"])
+        except Exception:
+            logger.warning(
+                "investigation_contract_deserialize_failed",
+                investigation_id=investigation_id,
+                exc_info=True,
+            )
+            return None
+
+    def replay_contract(self, investigation_id: str, revision: int | None = None) -> InvestigationContract | None:
+        """Record an exact replay run and return the captured historical contract.
+
+        Exact replay deliberately does not contact external systems. It loads
+        the persisted contract and records that replay was attempted from those
+        captured inputs.
+        """
+        contract = self.get_contract(investigation_id, revision)
+        if contract is None:
+            return None
+        now = time.time()
+        run_id = uuid.uuid4().hex
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO investigation_runs (
+                   run_id, investigation_id, base_revision, run_type, status,
+                   started_at, completed_at, runtime_manifest_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    investigation_id,
+                    contract.investigation.revision,
+                    InvestigationRunType.REPLAY.value,
+                    "completed",
+                    now,
+                    now,
+                    json.dumps(contract.runtime.model_dump(mode="json"), sort_keys=True),
+                ),
+            )
+            conn.execute(
+                """INSERT INTO investigation_events (
+                   event_id, investigation_id, run_id, sequence, event_type, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    uuid.uuid4().hex,
+                    investigation_id,
+                    run_id,
+                    1,
+                    "replay_loaded_captured_inputs",
+                    json.dumps(
+                        {
+                            "revision": contract.investigation.revision,
+                            "input_fingerprint": contract.runtime.input_fingerprint,
+                            "output_fingerprint": contract.runtime.output_fingerprint,
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+        return contract
+
+    def compare_revisions(self, investigation_id: str, left: int, right: int) -> dict[str, Any] | None:
+        left_contract = self.get_contract(investigation_id, left)
+        right_contract = self.get_contract(investigation_id, right)
+        if left_contract is None or right_contract is None:
+            return None
+        left_payload = left_contract.model_dump(mode="json", by_alias=True)
+        right_payload = right_contract.model_dump(mode="json", by_alias=True)
+        changed_sections = [
+            key
+            for key in left_payload
+            if key not in {"investigation", "runtime"} and left_payload.get(key) != right_payload.get(key)
+        ]
+        return {
+            "investigation_id": investigation_id,
+            "left_revision": left,
+            "right_revision": right,
+            "same_input": left_contract.runtime.input_fingerprint == right_contract.runtime.input_fingerprint,
+            "same_output": left_contract.runtime.output_fingerprint == right_contract.runtime.output_fingerprint,
+            "left_output_fingerprint": left_contract.runtime.output_fingerprint,
+            "right_output_fingerprint": right_contract.runtime.output_fingerprint,
+            "changed_sections": changed_sections,
+        }
+
+    def create_knowledge_candidate(
+        self,
+        investigation_id: str,
+        *,
+        revision: int | None,
+        correction_text: str,
+        target_ref: str = "",
+        created_by: str = "",
+        expires_at: datetime | None = None,
+    ) -> KnowledgeCandidate | None:
+        """Store a human correction as a reviewable knowledge candidate."""
+        contract = self.get_contract(investigation_id, revision)
+        if contract is None:
+            return None
+        now = utc_now()
+        candidate_id = f"kc_{uuid.uuid4().hex[:16]}"
+        provenance = ProvenanceRecord(
+            id=f"prov_{candidate_id}",
+            source_type="human_correction",
+            source_ref=created_by or "anonymous",
+            source_version=fingerprint({"correction_text": correction_text, "target_ref": target_ref}),
+            ingested_at=now,
+            observed_at=now,
+            freshness={"status": "candidate", "last_verified_at": now.isoformat()},
+            review_state="pending_review",
+        )
+        candidate = KnowledgeCandidate(
+            id=candidate_id,
+            investigation_id=investigation_id,
+            revision=contract.investigation.revision,
+            correction_text=correction_text,
+            target_ref=target_ref,
+            created_by=created_by,
+            created_at=now,
+            expires_at=expires_at,
+            provenance=provenance,
+        )
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO knowledge_candidates (
+                   id, investigation_id, revision, correction_text, target_ref,
+                   candidate_type, status, created_by, created_at, expires_at, provenance_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    candidate.id,
+                    candidate.investigation_id,
+                    candidate.revision,
+                    candidate.correction_text,
+                    candidate.target_ref,
+                    candidate.candidate_type,
+                    candidate.status,
+                    candidate.created_by,
+                    candidate.created_at.timestamp(),
+                    candidate.expires_at.timestamp() if candidate.expires_at else None,
+                    json.dumps(candidate.provenance.model_dump(mode="json"), sort_keys=True),
+                ),
+            )
+        return candidate
 
     # ── Read operations ──────────────────────────────────────────────────
 
