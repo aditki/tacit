@@ -78,10 +78,36 @@ jobs:
             local input_path
             input_path="$(mktemp)"
             curl -fsSL "${url}" -o "${input_path}"
-            uvx --from datamodel-code-generator datamodel-codegen \
+
+            local model_file="${output_dir}/${vendor}_models.py"
+            local model_package="${output_dir}/${vendor}_models"
+            local generator_log
+            generator_log="$(mktemp)"
+
+            rm -rf "${model_file}" "${model_package}"
+
+            if uvx --from datamodel-code-generator datamodel-codegen \
               --input "${input_path}" \
-              --output "${output_dir}/${vendor}_models.py" \
-              --output-model-type pydantic_v2.BaseModel
+              --output "${model_file}" \
+              --output-model-type pydantic_v2.BaseModel \
+              --formatters black isort >"${generator_log}" 2>&1; then
+              cat "${generator_log}"
+            else
+              local generator_status=$?
+              cat "${generator_log}"
+              if ! grep -Fq "Modular references require an output directory, not a file" "${generator_log}"; then
+                return "${generator_status}"
+              fi
+
+              echo "Retrying ${vendor} contract generation as a package because the spec uses modular references."
+              rm -f "${model_file}"
+              uvx --from datamodel-code-generator datamodel-codegen \
+                --input "${input_path}" \
+                --output "${model_package}" \
+                --output-model-type pydantic_v2.BaseModel \
+                --formatters black isort
+            fi
+
             generated_vendors+=("${vendor}")
           }
 

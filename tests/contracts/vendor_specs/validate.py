@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import inspect
+import pkgutil
 from pathlib import Path
 
 from pydantic import BaseModel, RootModel
@@ -24,16 +25,29 @@ ACTIVE_CONTRACT_MODULES = {
 
 def _has_pydantic_model(module_name: str) -> bool:
     module = importlib.import_module(module_name)
-    for _, value in inspect.getmembers(module, inspect.isclass):
-        if value.__module__ != module_name:
-            continue
-        if issubclass(value, (BaseModel, RootModel)):
-            return True
+
+    modules = [module]
+    if hasattr(module, "__path__"):
+        modules.extend(
+            importlib.import_module(child.name)
+            for child in pkgutil.walk_packages(module.__path__, prefix=f"{module_name}.")
+        )
+
+    for candidate in modules:
+        for _, value in inspect.getmembers(candidate, inspect.isclass):
+            if value.__module__ == candidate.__name__ and issubclass(value, (BaseModel, RootModel)):
+                return True
     return False
 
 
 def _generated_modules(root: Path) -> set[str]:
-    return {path.stem.removesuffix("_models") for path in root.glob("*_models.py")}
+    generated_files = {path.stem.removesuffix("_models") for path in root.glob("*_models.py")}
+    generated_packages = {
+        path.name.removesuffix("_models")
+        for path in root.glob("*_models")
+        if path.is_dir() and (path / "__init__.py").is_file()
+    }
+    return generated_files | generated_packages
 
 
 def validate(vendors: list[str], *, allow_empty: bool) -> None:
