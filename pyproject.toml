@@ -1,6 +1,6 @@
 [project]
 name = "tacit-ai"
-version = "0.1.1-rc.3"
+version = "0.1.1-rc.4"
 description = "CLI for evidence-grounded incident investigation across observability tools."
 readme = "README-PYPI.md"
 requires-python = ">=3.12"
