@@ -712,9 +712,7 @@ class InvestigationContractAssembler:
             and _observation_requirement_ref(observation) not in supported_requirements
         ]
         contradicted_requirements = {
-            _observation_requirement_ref(observation)
-            for observation in observations
-            if observation.id in contradicted
+            _observation_requirement_ref(observation) for observation in observations if observation.id in contradicted
         }
         decisive_requirements = supported_requirements | contradicted_requirements
         ambiguous = [
@@ -730,8 +728,7 @@ class InvestigationContractAssembler:
             observation.id
             for observation in observations
             if observation.status == "missing"
-            and _observation_requirement_ref(observation)
-            not in decisive_requirements | ambiguous_requirements
+            and _observation_requirement_ref(observation) not in decisive_requirements | ambiguous_requirements
         ]
         unresolved = [
             requirement.id
