@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 
 import tacit.history as history_mod
 from tacit.api.security import verify_api_key
+from tacit.investigation_bundle import build_investigation_bundle
+from tacit.investigation_contract import InvestigationRunType
+from tacit.investigation_replay import CounterfactualChanges, ReplayMode
+from tacit.models.schemas import DashRequest
+from tacit.pipeline import run_pipeline
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 
@@ -16,6 +21,16 @@ class CorrectionCandidateRequest(BaseModel):
     target_ref: str = Field(default="", description="Optional contract object reference the correction applies to")
     revision: int | None = Field(default=None, description="Contract revision being corrected; defaults to current")
     created_by: str = Field(default="", description="Reviewer or user identifier")
+
+
+class ReplayRequest(BaseModel):
+    mode: ReplayMode = ReplayMode.EXACT
+    changes: CounterfactualChanges = Field(default_factory=CounterfactualChanges)
+
+
+class CorrectionReviewRequest(BaseModel):
+    approved: bool
+    reviewed_by: str = Field(min_length=1)
 
 
 @router.get(
@@ -63,6 +78,32 @@ async def list_investigation_revisions(investigation_id: str):
 
 
 @router.get(
+    "/api/v1/investigations/{investigation_id}/runs",
+    tags=["History"],
+    summary="List investigation runs and lifecycle status",
+)
+async def list_investigation_runs(investigation_id: str):
+    store = history_mod.get_investigation_store()
+    runs = store.list_runs(investigation_id)
+    if not runs and store.get(investigation_id) is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    return {"count": len(runs), "runs": runs}
+
+
+@router.get(
+    "/api/v1/investigations/{investigation_id}/events",
+    tags=["History"],
+    summary="List append-only investigation lifecycle events",
+)
+async def list_investigation_events(investigation_id: str, run_id: str | None = None):
+    store = history_mod.get_investigation_store()
+    events = store.list_events(investigation_id, run_id)
+    if not events and store.get(investigation_id) is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    return {"count": len(events), "events": events}
+
+
+@router.get(
     "/api/v1/investigations/{investigation_id}/contract",
     tags=["History"],
     summary="Get an investigation contract revision",
@@ -96,13 +137,23 @@ async def compare_investigation_revisions(investigation_id: str, left: int, righ
     summary="Replay from captured inputs",
     response_description="Stored contract loaded through exact replay without external refetch",
 )
-async def replay_investigation(investigation_id: str, revision: int | None = None):
+async def replay_investigation(
+    investigation_id: str,
+    request: ReplayRequest | None = None,
+    revision: int | None = None,
+):
     store = history_mod.get_investigation_store()
-    contract = store.replay_contract(investigation_id, revision)
+    replay_request = request or ReplayRequest()
+    contract = store.replay_contract(
+        investigation_id,
+        revision,
+        mode=replay_request.mode,
+        changes=replay_request.changes,
+    )
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
     return {
-        "mode": "exact",
+        "mode": replay_request.mode.value,
         "refetched_external_systems": False,
         "contract": contract.model_dump(mode="json", by_alias=True),
     }
@@ -126,6 +177,103 @@ async def create_correction_candidate(investigation_id: str, request: Correction
     if candidate is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
     return candidate.model_dump(mode="json")
+
+
+@router.get(
+    "/api/v1/investigations/{investigation_id}/corrections",
+    tags=["History"],
+    summary="List correction candidates",
+)
+async def list_correction_candidates(investigation_id: str):
+    store = history_mod.get_investigation_store()
+    candidates = store.list_knowledge_candidates(investigation_id)
+    if not candidates and store.get(investigation_id) is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    return {"count": len(candidates), "candidates": [item.model_dump(mode="json") for item in candidates]}
+
+
+@router.post(
+    "/api/v1/investigations/{investigation_id}/corrections/{candidate_id}/review",
+    tags=["History"],
+    summary="Review a correction candidate",
+)
+async def review_correction_candidate(
+    investigation_id: str,
+    candidate_id: str,
+    request: CorrectionReviewRequest,
+):
+    store = history_mod.get_investigation_store()
+    candidate = store.review_knowledge_candidate(
+        candidate_id,
+        approved=request.approved,
+        reviewed_by=request.reviewed_by,
+    )
+    if candidate is None or candidate.investigation_id != investigation_id:
+        raise HTTPException(status_code=404, detail="Correction candidate not found")
+    return candidate.model_dump(mode="json")
+
+
+@router.post(
+    "/api/v1/investigations/{investigation_id}/corrections/{candidate_id}/apply",
+    tags=["History"],
+    summary="Apply an approved correction as a new revision",
+)
+async def apply_correction_candidate(investigation_id: str, candidate_id: str):
+    store = history_mod.get_investigation_store()
+    contract = store.apply_knowledge_candidate(candidate_id)
+    if contract is None or contract.investigation.id != investigation_id:
+        raise HTTPException(status_code=409, detail="Correction must exist, be approved, and not be expired")
+    return contract.model_dump(mode="json", by_alias=True)
+
+
+@router.post(
+    "/api/v1/investigations/{investigation_id}/refresh",
+    tags=["History"],
+    summary="Refresh an investigation from current external inputs",
+)
+async def refresh_investigation(investigation_id: str):
+    store = history_mod.get_investigation_store()
+    contract = store.get_contract(investigation_id)
+    if contract is None:
+        raise HTTPException(status_code=404, detail="Investigation contract not found")
+    response = await run_pipeline(
+        DashRequest(prompt=contract.request.question, user_id=contract.request.requester),
+        investigation_id=investigation_id,
+        run_type=InvestigationRunType.REFRESH,
+    )
+    return response.model_dump(mode="json")
+
+
+@router.post(
+    "/api/v1/investigations/{investigation_id}/migrate",
+    tags=["History"],
+    summary="Migrate a legacy history record to Investigation Contract v1",
+)
+async def migrate_investigation(investigation_id: str):
+    store = history_mod.get_investigation_store()
+    contract = store.migrate_legacy_investigation(investigation_id)
+    if contract is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    return contract.model_dump(mode="json", by_alias=True)
+
+
+@router.get(
+    "/api/v1/investigations/{investigation_id}/assessment-bundle",
+    tags=["History"],
+    summary="Export a portable investigation assessment bundle",
+)
+async def export_investigation_assessment_bundle(investigation_id: str, revision: int | None = None):
+    store = history_mod.get_investigation_store()
+    try:
+        content = build_investigation_bundle(store, investigation_id, revision=revision)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    filename = f"tacit-investigation-{investigation_id}.tar.gz"
+    return Response(
+        content=content,
+        media_type="application/gzip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get(

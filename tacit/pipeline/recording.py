@@ -17,13 +17,33 @@ logger = structlog.get_logger()
 class PipelineRecorder:
     """Centralize best-effort history writes and diagnostic stage recording."""
 
-    def __init__(self, history: Any, investigation_id: str):
+    def __init__(self, history: Any, investigation_id: str, run_id: str | None = None):
         self.history = history
         self.investigation_id = investigation_id
+        self.run_id = run_id
 
     def stage(self, stage: str, status: str, reason_code: str, **details: Any) -> None:
         emit_progress(stage, status, reason_code, **details)
         record_stage(self.history, self.investigation_id, stage, status, reason_code, **details)
+        if self.run_id and hasattr(self.history, "append_event"):
+            try:
+                self.history.append_event(
+                    self.investigation_id,
+                    self.run_id,
+                    "stage_completed",
+                    {"stage": stage, "status": status, "reason_code": reason_code, "details": details},
+                )
+            except Exception:
+                logger.warning("history_append_event_failed", stage=stage, exc_info=True)
+
+    def event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Best-effort append of a typed reconstruction event."""
+        if not self.run_id or not hasattr(self.history, "append_event"):
+            return
+        try:
+            self.history.append_event(self.investigation_id, self.run_id, event_type, payload)
+        except Exception:
+            logger.warning("history_append_event_failed", event_type=event_type, exc_info=True)
 
     def intent(self, intent: Intent) -> None:
         emit_progress(
@@ -153,6 +173,20 @@ class PipelineRecorder:
                 error_type=HistoryWriteFailed.__name__,
                 exc_info=True,
             )
+        if self.run_id and hasattr(self.history, "complete_run"):
+            try:
+                pipeline_status = str(kwargs.get("status", "success"))
+                succeeded = pipeline_status == "success"
+                self.history.complete_run(
+                    self.run_id,
+                    status="completed" if succeeded else "failed",
+                    error_code=""
+                    if succeeded
+                    else ("pipeline_timeout" if pipeline_status == "timeout" else "pipeline_failed"),
+                    error_detail=str(kwargs.get("error", "")),
+                )
+            except Exception:
+                logger.warning("history_complete_run_failed", exc_info=True)
 
 
 def record_stage(history: Any, inv_id: str, stage: str, status: str, reason_code: str, **details: Any) -> None:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import tarfile
 import time
 import tomllib
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -15,7 +17,9 @@ from tacit.agents.providers.base import TokenUsage
 from tacit.api.app import create_app
 from tacit.backends.base import PublishResult
 from tacit.dependencies import PipelineDependencies
+from tacit.grounding_benchmark import run_acceptance_corpus, run_grounding_benchmark
 from tacit.history import InvestigationStore
+from tacit.investigation_bundle import build_investigation_bundle
 from tacit.investigation_contract import (
     SCHEMA_ID,
     GroundingStatus,
@@ -25,7 +29,13 @@ from tacit.investigation_contract import (
     load_investigation_contract_schema,
     stamp_fingerprints,
 )
+from tacit.investigation_replay import (
+    CounterfactualChanges,
+    InvestigationReplaySnapshot,
+    ReplayMode,
+)
 from tacit.models.schemas import (
+    ContextChunk,
     CulpritCandidate,
     CulpritRanking,
     DashboardSpec,
@@ -52,6 +62,7 @@ def _draft_contract(
     evidence_resolutions: list[EvidenceResolution] | None = None,
     evidence_observations: list[EvidenceObservation] | None = None,
     culprit_ranking: CulpritRanking | None = None,
+    context_chunks: list[ContextChunk] | None = None,
 ) -> InvestigationContract:
     if dashboard_spec is None:
         dashboard_spec = DashboardSpec(
@@ -146,8 +157,97 @@ def _draft_contract(
         evidence_resolutions=evidence_resolutions,
         evidence_observations=evidence_observations,
         culprit_ranking=culprit_ranking,
+        context_chunks=context_chunks,
         dashboard_url="http://grafana/d/checkout",
         dashboard_uid="checkout",
+    )
+
+
+def _snapshot_for(contract: InvestigationContract) -> InvestigationReplaySnapshot:
+    return InvestigationReplaySnapshot(
+        investigation_id=contract.investigation.id,
+        created_at=contract.investigation.created_at,
+        completed_at=contract.investigation.completed_at,
+        request=DashRequest(prompt="Why did checkout latency increase?", user_id="sdet"),
+        intent=Intent(
+            summary="Investigate checkout latency",
+            domain="application",
+            services=["checkout"],
+            signals=[SignalType.METRICS],
+            keywords=["latency"],
+            timerange="30m",
+            problem_type="latency_investigation",
+        ),
+        dashboard_spec=DashboardSpec(
+            title="Checkout latency",
+            panels=[
+                PanelSpec(
+                    title="p95 latency",
+                    queries=[
+                        PanelQuery(
+                            expr="histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+                            datasource_uid="prom",
+                            datasource_type="prometheus",
+                            query_language="promql",
+                            validation_status="passed",
+                            validation_has_data=True,
+                        )
+                    ],
+                )
+            ],
+        ),
+        evidence_requirements=[
+            EvidenceRequirement(
+                id="er_01",
+                evidence_type="metric",
+                signal_type="request_latency",
+                priority="critical",
+                service_scope=["checkout"],
+                source="symptom_confirmation",
+            )
+        ],
+        evidence_resolutions=[
+            EvidenceResolution(
+                requirement_id="er_01",
+                status=EvidenceResolutionStatus.RESOLVED,
+                reason_code="metadata_inference",
+                metric="http_request_duration_seconds_bucket",
+                datasource_uid="prom",
+                datasource_type="prometheus",
+                query_language="promql",
+                semantic_score=0.92,
+            )
+        ],
+        evidence_observations=[
+            EvidenceObservation(
+                requirement_id="er_01",
+                outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                resolution_metric="http_request_duration_seconds_bucket",
+                panel_title="p95 latency",
+                query="histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+                datasource_uid="prom",
+                valid_query=True,
+                non_empty=True,
+                survived=True,
+            )
+        ],
+        culprit_ranking=CulpritRanking(
+            abstained=False,
+            telemetry_status="evidenced",
+            candidates=[
+                CulpritCandidate(
+                    rank=1,
+                    suspect="checkout",
+                    suspect_type="service",
+                    score=0.66,
+                    contextual_reasons=["Checkout owns the affected request path."],
+                    runtime_evidence=["request_latency"],
+                    supporting_requirement_ids=["er_01"],
+                )
+            ],
+        ),
+        renderings=contract.renderings,
+        runtime=contract.runtime,
     )
 
 
@@ -186,6 +286,92 @@ def test_exact_replay_records_run_without_changing_revision(tmp_path):
 
     assert replayed == persisted
     assert len(store.list_revisions(investigation_id)) == 1
+
+
+def test_captured_input_replay_rebuilds_and_counterfactual_creates_revision(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    draft = _draft_contract(investigation_id)
+    persisted = store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+
+    exact = store.replay_contract(investigation_id, mode=ReplayMode.EXACT)
+    assert exact is not None
+    assert exact.runtime.output_fingerprint == persisted.runtime.output_fingerprint
+    assert len(store.list_revisions(investigation_id)) == 1
+
+    counterfactual = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.COUNTERFACTUAL,
+        changes=CounterfactualChanges(
+            remove_observation_ids=["obs_01"],
+            add_context_chunks=[
+                ContextChunk(content="New runbook evidence", source="runbook:new", relevance_score=0.7)
+            ],
+            candidate_score_overrides={"service:checkout": 0.4},
+        ),
+    )
+    assert counterfactual is not None
+    assert counterfactual.investigation.revision == 2
+    assert counterfactual.observations == []
+    assert counterfactual.candidate_rankings[0].score == 0.4
+    assert counterfactual.artifact_contributions[0].artifact_ref == "runbook:new"
+
+
+def test_approved_correction_creates_provenance_bearing_revision(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    draft = _draft_contract(investigation_id)
+    store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+    candidate = store.create_knowledge_candidate(
+        investigation_id,
+        revision=None,
+        correction_text="The shared cache was saturated.",
+        target_ref="cache:shared-cache",
+        created_by="reviewer",
+    )
+    assert candidate is not None
+    reviewed = store.review_knowledge_candidate(candidate.id, approved=True, reviewed_by="approver")
+    assert reviewed is not None and reviewed.status.value == "approved"
+
+    corrected = store.apply_knowledge_candidate(candidate.id)
+
+    assert corrected is not None
+    assert corrected.investigation.revision == 2
+    assert corrected.corrections[-1].correction_ref == candidate.id
+    assert corrected.corrections[-1].applied_in_revision == 2
+    assert corrected.provenance[-1].source_type == "human_correction"
+    assert store.list_knowledge_candidates(investigation_id)[0].status.value == "applied"
+    replayed = store.replay_contract(investigation_id, mode=ReplayMode.EXACT)
+    assert replayed is not None
+    assert replayed.runtime.output_fingerprint == corrected.runtime.output_fingerprint
+
+
+def test_legacy_migration_and_assessment_bundle_are_portable(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Legacy checkout investigation", user_id="sdet")
+    store.finish(investigation_id, status="success", dashboard_uid="legacy", dashboard_url="http://grafana/legacy")
+
+    migrated = store.migrate_legacy_investigation(investigation_id)
+
+    assert migrated is not None
+    assert migrated.grounding.status == GroundingStatus.INDETERMINATE
+    assert migrated.grounding.migration_notes
+    assert migrated.provenance == []
+    bundle = build_investigation_bundle(store, investigation_id)
+    with tarfile.open(fileobj=BytesIO(bundle), mode="r:gz") as archive:
+        names = set(archive.getnames())
+    assert {"manifest.json", "contract.json", "expected_outcomes.json", "revisions.json"} <= names
+
+
+def test_grounding_benchmark_v1_gate():
+    result = run_grounding_benchmark()
+
+    acceptance = run_acceptance_corpus()
+    assert acceptance["cases"] == 10
+    assert acceptance["passed"] is True
+    assert result["cases"] == 40
+    assert result["unsafe_assertion_rate"] == 0
+    assert result["passed"] is True
 
 
 def test_contract_rejects_broken_ranking_references():
@@ -452,6 +638,19 @@ def test_output_fingerprint_preserves_external_observation_timestamps():
     assert first.runtime.output_fingerprint != second.runtime.output_fingerprint
 
 
+def test_context_content_affects_input_but_generated_timestamps_do_not_affect_output(monkeypatch):
+    context = ContextChunk(content="Check cache saturation", source="runbook:checkout", relevance_score=0.8)
+    monkeypatch.setattr("tacit.investigation_contract.utc_now", lambda: datetime(2026, 1, 1, tzinfo=UTC))
+    first = _draft_contract(context_chunks=[context])
+    monkeypatch.setattr("tacit.investigation_contract.utc_now", lambda: datetime(2026, 1, 2, tzinfo=UTC))
+    second = _draft_contract(context_chunks=[context])
+    changed = _draft_contract(context_chunks=[context.model_copy(update={"content": "Check database saturation"})])
+
+    assert first.runtime.output_fingerprint == second.runtime.output_fingerprint
+    assert first.runtime.input_fingerprint == second.runtime.input_fingerprint
+    assert second.runtime.input_fingerprint != changed.runtime.input_fingerprint
+
+
 def test_contract_records_current_package_version():
     contract = _draft_contract()
     pyproject = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
@@ -545,7 +744,8 @@ def test_packaged_schema_matches_contract_model():
 def test_contract_api_routes_expose_revision_replay_and_correction_candidate(tmp_path, monkeypatch):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="api")
-    persisted = store.persist_contract_revision(_draft_contract(investigation_id))
+    draft = _draft_contract(investigation_id)
+    persisted = store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
     monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
 
     client = TestClient(create_app())
@@ -571,6 +771,25 @@ def test_contract_api_routes_expose_revision_replay_and_correction_candidate(tmp
     body = correction_response.json()
     assert body["status"] == "pending_review"
     assert body["provenance"]["source_type"] == "human_correction"
+
+    review_response = client.post(
+        f"/api/v1/investigations/{investigation_id}/corrections/{body['id']}/review",
+        json={"approved": True, "reviewed_by": "approver"},
+    )
+    assert review_response.status_code == 200
+    assert review_response.json()["status"] == "approved"
+
+    apply_response = client.post(f"/api/v1/investigations/{investigation_id}/corrections/{body['id']}/apply")
+    assert apply_response.status_code == 200
+    assert apply_response.json()["investigation"]["revision"] == 2
+
+    runs_response = client.get(f"/api/v1/investigations/{investigation_id}/runs")
+    events_response = client.get(f"/api/v1/investigations/{investigation_id}/events")
+    bundle_response = client.get(f"/api/v1/investigations/{investigation_id}/assessment-bundle")
+    assert runs_response.status_code == 200 and runs_response.json()["count"] >= 3
+    assert events_response.status_code == 200 and events_response.json()["count"] >= 3
+    assert bundle_response.status_code == 200
+    assert bundle_response.headers["content-type"] == "application/gzip"
 
 
 def test_contract_api_rejects_unsupported_schema_in_history(tmp_path, monkeypatch):

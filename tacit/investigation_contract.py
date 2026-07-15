@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from tacit import __version__
 from tacit.models.schemas import (
+    ContextChunk,
     CulpritRanking,
     DashboardSpec,
     DashRequest,
@@ -76,6 +77,15 @@ class InvestigationRunType(StrEnum):
     MIGRATION = "migration"
 
 
+class KnowledgeCandidateStatus(StrEnum):
+    PENDING_REVIEW = "pending_review"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    SUPERSEDED = "superseded"
+    EXPIRED = "expired"
+    APPLIED = "applied"
+
+
 class CausalStatus(StrEnum):
     PROVEN = "proven"
     SUSPECT_NOT_PROVEN = "suspect_not_proven"
@@ -127,6 +137,7 @@ class OperationalIR(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     problem_type: str = ""
     archetypes: list[dict[str, Any]] = Field(default_factory=list)
+    context_refs: list[str] = Field(default_factory=list)
 
 
 class EvidenceRequirementContract(BaseModel):
@@ -146,6 +157,7 @@ class EvidenceResolutionContract(BaseModel):
     status: str
     backend: str = ""
     binding: dict[str, Any] = Field(default_factory=dict)
+    rejected_bindings: list[dict[str, Any]] = Field(default_factory=list)
     resolution_method: str = ""
     confidence: str = "unknown"
     provenance_refs: list[str] = Field(default_factory=list)
@@ -159,6 +171,7 @@ class QueryRecord(BaseModel):
     generated_by: str = "evidence_resolver"
     validation: dict[str, Any] = Field(default_factory=dict)
     execution: dict[str, Any] = Field(default_factory=dict)
+    provenance_refs: list[str] = Field(default_factory=list)
 
 
 class ObservationContract(BaseModel):
@@ -209,6 +222,8 @@ class GroundingContract(BaseModel):
     unsafe_conclusions: list[str] = Field(default_factory=list)
     maximum_trustworthy_conclusion: dict[str, Any] = Field(default_factory=dict)
     migration_notes: list[str] = Field(default_factory=list)
+    abstained: bool = True
+    reason: str = ""
 
 
 class DecisionLogEntry(BaseModel):
@@ -269,6 +284,7 @@ class InvestigationContract(BaseModel):
     provenance: list[ProvenanceRecord] = Field(default_factory=list)
     queries: list[QueryRecord] = Field(default_factory=list)
     corrections: list[CorrectionReference] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     renderings: dict[str, Any] = Field(default_factory=dict)
     runtime: RuntimeManifest = Field(default_factory=RuntimeManifest)
 
@@ -282,6 +298,9 @@ class InvestigationContract(BaseModel):
         provenance_ids = {p.id for p in self.provenance}
         query_ids = {q.id for q in self.queries}
 
+        _require_known_refs(self.operational_ir.context_refs, provenance_ids, "operational_ir")
+        for requirement in self.evidence_requirements:
+            _require_known_refs(requirement.provenance_refs, provenance_ids, f"requirement {requirement.id}")
         for resolution in self.evidence_resolutions:
             if resolution.requirement_ref not in requirement_ids:
                 raise ValueError(f"resolution {resolution.id} references unknown requirement")
@@ -289,11 +308,33 @@ class InvestigationContract(BaseModel):
         for observation in self.observations:
             _require_known_refs(observation.query_refs, query_ids, f"observation {observation.id}")
             _require_known_refs(observation.provenance_refs, provenance_ids, f"observation {observation.id}")
+            if observation.status == "observed":
+                if not observation.value.get("valid_query") or not observation.value.get("non_empty"):
+                    raise ValueError(f"observation {observation.id} cannot be observed without successful telemetry")
+                for query_ref in observation.query_refs:
+                    query = next(query for query in self.queries if query.id == query_ref)
+                    if query.execution.get("status") in {"failed", "empty"}:
+                        raise ValueError(f"observation {observation.id} references unsuccessful query {query_ref}")
+        for query in self.queries:
+            _require_known_refs(query.provenance_refs, provenance_ids, f"query {query.id}")
         _require_known_refs(self.grounding.missing_observation_refs, observation_ids, "grounding")
+        _require_known_refs(self.grounding.supported_claims, observation_ids, "grounding supported_claims")
+        _require_known_refs(self.grounding.contradicted_claims, observation_ids, "grounding contradicted_claims")
+        if self.grounding.status == GroundingStatus.SUPPORTED and (
+            self.grounding.missing_observation_refs or self.grounding.contradicted_claims
+        ):
+            raise ValueError("supported grounding cannot contain missing or contradicted evidence")
         for contribution in self.artifact_contributions:
             if not contribution.provenance_refs:
                 raise ValueError(f"contribution {contribution.id} must include provenance")
             _require_known_refs(contribution.provenance_refs, provenance_ids, f"contribution {contribution.id}")
+            contribution_provenance = [p for p in self.provenance if p.id in contribution.provenance_refs]
+            if contribution.status == "stale" and not any(
+                p.freshness.get("status") == "stale" for p in contribution_provenance
+            ):
+                raise ValueError(f"stale contribution {contribution.id} must expose stale provenance")
+            if contribution.status == "rejected" and (contribution.used_for or contribution.score_delta != 0):
+                raise ValueError(f"rejected contribution {contribution.id} cannot influence the investigation")
         for ranking in self.candidate_rankings:
             _require_known_refs(ranking.supporting_observation_refs, observation_ids, ranking.candidate_ref)
             _require_known_refs(ranking.contradicting_observation_refs, observation_ids, ranking.candidate_ref)
@@ -304,6 +345,11 @@ class InvestigationContract(BaseModel):
         sequences = [entry.sequence for entry in self.decision_log]
         if sequences != sorted(sequences):
             raise ValueError("decision_log sequence must be ordered")
+        conclusion = str(self.grounding.maximum_trustworthy_conclusion.get("text", "")).lower()
+        if self.grounding.unsafe_to_conclude and any(
+            phrase in conclusion for phrase in (" caused ", " root cause", "proven cause")
+        ):
+            raise ValueError("maximum trustworthy conclusion contains unsafe causal language")
         return self
 
 
@@ -314,11 +360,14 @@ class KnowledgeCandidate(BaseModel):
     correction_text: str
     target_ref: str = ""
     candidate_type: str = "human_correction"
-    status: str = "pending_review"
+    status: KnowledgeCandidateStatus = KnowledgeCandidateStatus.PENDING_REVIEW
     created_by: str = ""
     created_at: datetime
     expires_at: datetime | None = None
     provenance: ProvenanceRecord
+    reviewed_by: str = ""
+    reviewed_at: datetime | None = None
+    applied_revision: int | None = None
 
 
 def _require_known_refs(refs: list[str], known: set[str], subject: str) -> None:
@@ -346,6 +395,19 @@ def fingerprint(value: Any) -> str:
 
 def input_fingerprint(contract: InvestigationContract) -> str:
     data = contract.model_dump(mode="json", by_alias=True)
+    captured_provenance = [
+        {
+            "id": record["id"],
+            "source_type": record["source_type"],
+            "source_ref": record["source_ref"],
+            "source_version": record["source_version"],
+            "locator": record["locator"],
+            "freshness_status": record.get("freshness", {}).get("status"),
+            "review_state": record["review_state"],
+        }
+        for record in data["provenance"]
+        if record["source_type"] not in {"request", "runtime"}
+    ]
     return fingerprint(
         {
             "request": data["request"],
@@ -353,6 +415,8 @@ def input_fingerprint(contract: InvestigationContract) -> str:
             "evidence_requirements": data["evidence_requirements"],
             "evidence_resolutions": data["evidence_resolutions"],
             "queries": data["queries"],
+            "observations": data["observations"],
+            "captured_provenance": captured_provenance,
             "policy_version": data["runtime"]["policy_version"],
             "ranking_version": data["runtime"]["ranking_version"],
             "vocabulary_version": data["runtime"]["vocabulary_version"],
@@ -372,8 +436,11 @@ def normalized_output_payload(contract: InvestigationContract) -> dict[str, Any]
     data["investigation"]["parent_revision"] = None
     data["investigation"]["created_at"] = ""
     data["investigation"]["completed_at"] = ""
+    dashboard_references = data.get("renderings", {}).get("dashboard", {}).get("references", {})
+    if isinstance(dashboard_references, dict):
+        dashboard_references["revision"] = 0
     for provenance in data["provenance"]:
-        if provenance["source_type"] not in {"request", "runtime"}:
+        if provenance["source_type"] not in {"request", "runtime"} and not provenance["id"].startswith("prov_context_"):
             continue
         provenance["ingested_at"] = None
         provenance["observed_at"] = None
@@ -394,6 +461,82 @@ def stamp_fingerprints(contract: InvestigationContract) -> InvestigationContract
 class InvestigationContractAssembler:
     """Normalize current pipeline outputs into the stable v1 contract."""
 
+    def from_legacy_history(self, record: dict[str, Any]) -> InvestigationContract:
+        """Migrate legacy history without inventing evidence or provenance."""
+        started = datetime.fromtimestamp(float(record.get("started_at") or 0), tz=UTC)
+        finished_raw = record.get("finished_at")
+        finished = datetime.fromtimestamp(float(finished_raw), tz=UTC) if finished_raw else None
+        status = (
+            InvestigationLifecycleStatus.COMPLETED
+            if record.get("status") == "success"
+            else InvestigationLifecycleStatus.FAILED_VALIDATION
+        )
+        contract = InvestigationContract(
+            investigation=InvestigationMetadata(
+                id=str(record["id"]),
+                created_at=started,
+                completed_at=finished,
+                status=status,
+            ),
+            request=InvestigationRequestContract(
+                question=str(record.get("prompt", "")),
+                normalized_intent=str(record.get("problem_type", "")),
+                requester=str(record.get("user_id") or record.get("channel_id") or ""),
+                time_window=TimeWindow(label=str(record.get("timerange", ""))),
+                scope=InvestigationScope(services=list(record.get("intent_services") or [])),
+            ),
+            operational_ir=OperationalIR(
+                summary=str(record.get("intent_summary", "")),
+                domain=str(record.get("intent_domain", "")),
+                services=list(record.get("intent_services") or []),
+                signals=list(record.get("intent_signals") or []),
+                keywords=list(record.get("intent_keywords") or []),
+                problem_type=str(record.get("problem_type", "")),
+                archetypes=list(record.get("archetypes") or []),
+            ),
+            grounding=GroundingContract(
+                status=GroundingStatus.INDETERMINATE,
+                abstained=True,
+                reason="Legacy history did not capture sufficient evidence for grounding.",
+                migration_notes=[
+                    "Migrated from pre-contract history; missing evidence, provenance, "
+                    "and replay inputs were not fabricated."
+                ],
+                maximum_trustworthy_conclusion={
+                    "text": "This migrated record preserves historical metadata only.",
+                    "causal_status": CausalStatus.INDETERMINATE,
+                },
+            ),
+            warnings=["Legacy history did not capture structured evidence or replay inputs."],
+            decision_log=[
+                DecisionLogEntry(
+                    id="decision_01",
+                    sequence=1,
+                    stage="migration",
+                    action="migrated_legacy_history",
+                    reason_code="legacy_history_adapter",
+                    reason="Mapped available legacy fields without inferring absent evidence.",
+                    mechanism={"type": "migration", "version": "legacy-history-v1"},
+                    output_status="indeterminate",
+                )
+            ],
+            renderings={
+                "dashboard": {
+                    "dashboard_url": str(record.get("dashboard_url", "")),
+                    "dashboard_uid": str(record.get("dashboard_uid", "")),
+                    "panel_count": int(record.get("panel_count") or 0),
+                    "references": {
+                        "investigation_id": str(record["id"]),
+                        "revision": 0,
+                        "requirement_refs": [],
+                        "query_refs": [],
+                        "observation_refs": [],
+                    },
+                }
+            },
+        )
+        return stamp_fingerprints(contract)
+
     def from_pipeline(
         self,
         *,
@@ -407,18 +550,26 @@ class InvestigationContractAssembler:
         evidence_resolutions: list[EvidenceResolution],
         evidence_observations: list[EvidenceObservation],
         culprit_ranking: CulpritRanking,
+        context_chunks: list[ContextChunk] | None = None,
+        warnings: list[str] | None = None,
         dashboard_url: str,
         dashboard_uid: str,
         signalfx_url: str = "",
         signalfx_dashboard_id: str = "",
         created_at: datetime | None = None,
         completed_at: datetime | None = None,
+        runtime_manifest: RuntimeManifest | None = None,
     ) -> InvestigationContract:
         now = utc_now()
         created_at = created_at or now
         completed_at = completed_at or now
-        provenance = self._provenance(requester=request.user_id or request.channel_id or "pipeline", observed_at=now)
-        queries = self._queries(dashboard_spec)
+        context_chunks = context_chunks or []
+        provenance = self._provenance(
+            requester=request.user_id or request.channel_id or "pipeline",
+            observed_at=completed_at,
+            context_chunks=context_chunks,
+        )
+        queries = self._queries(dashboard_spec, provenance[1].id)
         requirements = self._requirements(evidence_requirements, evidence_resolutions, provenance[1].id)
         resolutions = self._resolutions(evidence_resolutions, provenance[1].id)
         observations = self._observations(
@@ -431,6 +582,8 @@ class InvestigationContractAssembler:
         rankings = self._rankings(culprit_ranking, observations, requirements)
         grounding = self._grounding(culprit_ranking, observations, requirements, rankings)
         decision_log = self._decision_log(resolutions, rankings, grounding, dashboard_uid)
+        context_provenance = provenance[2:]
+        contributions = self._artifact_contributions(context_chunks, context_provenance)
 
         contract = InvestigationContract(
             investigation=InvestigationMetadata(
@@ -459,31 +612,48 @@ class InvestigationContractAssembler:
                 keywords=intent.keywords,
                 problem_type=intent.problem_type,
                 archetypes=[a.model_dump(mode="json") for a in intent.archetypes],
+                context_refs=[record.id for record in context_provenance],
             ),
             evidence_requirements=requirements,
             evidence_resolutions=resolutions,
             observations=observations,
             candidate_rankings=rankings,
+            artifact_contributions=contributions,
             grounding=grounding,
             decision_log=decision_log,
             provenance=provenance,
             queries=queries,
+            warnings=warnings or [],
             renderings={
                 "dashboard": {
                     "dashboard_url": dashboard_url,
                     "dashboard_uid": dashboard_uid,
                     "panel_count": len(dashboard_spec.panels),
+                    "references": {
+                        "investigation_id": investigation_id,
+                        "revision": revision,
+                        "requirement_refs": [requirement.id for requirement in requirements],
+                        "query_refs": [query.id for query in queries],
+                        "observation_refs": [observation.id for observation in observations],
+                    },
                 },
                 "signalfx": {
                     "dashboard_url": signalfx_url,
                     "dashboard_id": signalfx_dashboard_id,
                 },
             },
+            runtime=runtime_manifest or RuntimeManifest(),
         )
         return stamp_fingerprints(contract)
 
-    def _provenance(self, *, requester: str, observed_at: datetime) -> list[ProvenanceRecord]:
-        return [
+    def _provenance(
+        self,
+        *,
+        requester: str,
+        observed_at: datetime,
+        context_chunks: list[ContextChunk],
+    ) -> list[ProvenanceRecord]:
+        records = [
             ProvenanceRecord(
                 id="prov_request",
                 source_type="request",
@@ -502,6 +672,56 @@ class InvestigationContractAssembler:
                 review_state="system_generated",
             ),
         ]
+        for index, chunk in enumerate(context_chunks, start=1):
+            freshness_status = str(chunk.metadata.get("freshness_status", "unknown"))
+            if chunk.metadata.get("stale") is True:
+                freshness_status = "stale"
+            records.append(
+                ProvenanceRecord(
+                    id=f"prov_context_{index:02d}",
+                    source_type=str(chunk.metadata.get("source_type", "artifact")),
+                    source_ref=chunk.source or f"context:{index}",
+                    source_version=fingerprint(
+                        {"content": chunk.content, "source": chunk.source, "metadata": chunk.metadata}
+                    ),
+                    locator={key: value for key, value in chunk.metadata.items() if key != "content"},
+                    ingested_at=observed_at,
+                    observed_at=observed_at,
+                    freshness={"status": freshness_status, "last_verified_at": observed_at.isoformat()},
+                    review_state=str(chunk.metadata.get("review_state", "unreviewed")),
+                )
+            )
+        return records
+
+    def _artifact_contributions(
+        self,
+        context_chunks: list[ContextChunk],
+        provenance: list[ProvenanceRecord],
+    ) -> list[ArtifactContributionContract]:
+        contributions: list[ArtifactContributionContract] = []
+        for index, (chunk, record) in enumerate(zip(context_chunks, provenance, strict=True), start=1):
+            rejected = record.review_state == "rejected"
+            status = "rejected" if rejected else str(record.freshness.get("status", "unknown"))
+            if status not in {"rejected", "stale"}:
+                status = "supported"
+            contributions.append(
+                ArtifactContributionContract(
+                    id=f"contribution_{index:02d}",
+                    artifact_ref=record.source_ref,
+                    target_ref="operational_ir",
+                    contribution_type="retrieved_context",
+                    used_for=[] if rejected else ["intent_enrichment"],
+                    score_delta=0.0,
+                    status=status,
+                    reason=(
+                        "Artifact was rejected during review and did not influence the investigation."
+                        if rejected
+                        else f"Retrieved context was supplied with relevance {chunk.relevance_score:.3f}."
+                    ),
+                    provenance_refs=[record.id],
+                )
+            )
+        return contributions
 
     def _requirements(
         self,
@@ -552,6 +772,17 @@ class InvestigationContractAssembler:
                         "datasource_uid": resolution.datasource_uid,
                         "query_language": resolution.query_language,
                     },
+                    rejected_bindings=(
+                        []
+                        if resolution.status == EvidenceResolutionStatus.RESOLVED or not resolution.metric
+                        else [
+                            {
+                                "metric": resolution.metric,
+                                "datasource_uid": resolution.datasource_uid,
+                                "reason_code": resolution.reason_code,
+                            }
+                        ]
+                    ),
                     resolution_method=resolution.reason_code,
                     confidence=confidence,
                     provenance_refs=[provenance_ref],
@@ -559,12 +790,20 @@ class InvestigationContractAssembler:
             )
         return records
 
-    def _queries(self, dashboard_spec: DashboardSpec) -> list[QueryRecord]:
+    def _queries(self, dashboard_spec: DashboardSpec, provenance_ref: str) -> list[QueryRecord]:
         records: list[QueryRecord] = []
         counter = 1
         for panel in dashboard_spec.panels:
             for query in panel.queries:
                 status = query.validation_status or ("passed" if query.validation_has_data else "unknown")
+                if query.validation_has_data:
+                    execution_status = "succeeded"
+                elif status.lower() in {"failed", "rejected", "error", "invalid"}:
+                    execution_status = "failed"
+                elif status.lower() in {"passed", "ok", "empty"}:
+                    execution_status = "empty"
+                else:
+                    execution_status = "not_captured"
                 records.append(
                     QueryRecord(
                         id=f"query_{counter:02d}",
@@ -573,9 +812,15 @@ class InvestigationContractAssembler:
                         expression=query.expr,
                         validation={"status": status},
                         execution={
-                            "status": "succeeded" if query.validation_has_data else "not_captured",
-                            "result_fingerprint": "",
+                            "status": execution_status,
+                            "result_fingerprint": fingerprint(
+                                {
+                                    "validation_status": status,
+                                    "has_data": query.validation_has_data,
+                                }
+                            ),
                         },
+                        provenance_refs=[provenance_ref],
                     )
                 )
                 counter += 1
@@ -767,6 +1012,8 @@ class InvestigationContractAssembler:
                 "text": conclusion,
                 "causal_status": CausalStatus.SUSPECT_NOT_PROVEN if leading else CausalStatus.INSUFFICIENT_EVIDENCE,
             },
+            abstained=ranking.abstained or not rankings,
+            reason=ranking.abstention_reason or ("No ranked candidate was produced." if not rankings else ""),
         )
 
     def _decision_log(

@@ -959,6 +959,17 @@ def test_run(prompt: str | None, open_browser: bool):
         _info("Run `tacit doctor` to check your setup")
 
 
+@cli.command("benchmark-grounding")
+def benchmark_grounding():
+    """Run the deterministic Grounding Benchmark v1 quality gate."""
+    from tacit.grounding_benchmark import run_grounding_benchmark
+
+    result = run_grounding_benchmark()
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
+    if not result["passed"]:
+        raise SystemExit(1)
+
+
 # ── tacit demo ───────────────────────────────────────────────────────────
 @cli.command()
 @click.option("--down", "tear_down", is_flag=True, help="Tear down the demo stack and exit")
@@ -1903,6 +1914,78 @@ def history_show(investigation_id: str):
     if inv.get("dashboard_url"):
         console.print()
         _success(f"Dashboard: {inv['dashboard_url']}")
+
+
+@history.command("contract")
+@click.argument("investigation_id")
+@click.option("--revision", type=int, default=None)
+def history_contract(investigation_id: str, revision: int | None):
+    """Print the canonical contract for an investigation."""
+    _load_env()
+    from tacit.history import get_investigation_store
+
+    contract = get_investigation_store().get_contract(investigation_id, revision)
+    if contract is None:
+        raise click.ClickException("Investigation contract not found")
+    click.echo(json.dumps(contract.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True))
+
+
+@history.command("replay")
+@click.argument("investigation_id")
+@click.option("--revision", type=int, default=None)
+@click.option("--mode", type=click.Choice(["exact", "current_engine", "counterfactual"]), default="exact")
+def history_replay(investigation_id: str, revision: int | None, mode: str):
+    """Replay an investigation from captured inputs without external refetch."""
+    _load_env()
+    from tacit.history import get_investigation_store
+    from tacit.investigation_replay import ReplayMode
+
+    contract = get_investigation_store().replay_contract(
+        investigation_id,
+        revision,
+        mode=ReplayMode(mode),
+    )
+    if contract is None:
+        raise click.ClickException("Investigation or captured inputs not found")
+    click.echo(json.dumps(contract.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True))
+
+
+@history.command("compare")
+@click.argument("investigation_id")
+@click.argument("left", type=int)
+@click.argument("right", type=int)
+def history_compare(investigation_id: str, left: int, right: int):
+    """Compare two immutable investigation revisions."""
+    _load_env()
+    from tacit.history import get_investigation_store
+
+    comparison = get_investigation_store().compare_revisions(investigation_id, left, right)
+    if comparison is None:
+        raise click.ClickException("Investigation revision not found")
+    click.echo(json.dumps(comparison, indent=2, sort_keys=True))
+
+
+@history.command("export")
+@click.argument("investigation_id")
+@click.option("--revision", type=int, default=None)
+@click.option("--output", type=click.Path(dir_okay=False, path_type=Path), default=None)
+def history_export(investigation_id: str, revision: int | None, output: Path | None):
+    """Export one investigation as a portable Assessment Bundle."""
+    _load_env()
+    from tacit.history import get_investigation_store
+    from tacit.investigation_bundle import export_investigation_bundle
+
+    target = output or Path(f"tacit-investigation-{investigation_id}.tar.gz")
+    try:
+        export_investigation_bundle(
+            get_investigation_store(),
+            investigation_id,
+            target,
+            revision=revision,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _success(f"Assessment Bundle written: {target}")
 
 
 @history.command("stats")
