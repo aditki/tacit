@@ -30,6 +30,7 @@ def load_grounding_corpus() -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
     for family in data["adversarial_families"]:
         for index, prompt in enumerate(family["prompts"], start=1):
+            entities = family.get("entities", [])
             cases.append(
                 {
                     "id": f"{family['id']}-{index:02d}",
@@ -39,6 +40,7 @@ def load_grounding_corpus() -> list[dict[str, Any]]:
                     "expected_abstained": family["expected_abstained"],
                     "family": family["id"],
                     "fixture": family["fixture"],
+                    "entity": entities[index - 1] if index <= len(entities) else "checkout",
                 }
             )
     return cases
@@ -51,8 +53,10 @@ def load_acceptance_corpus() -> list[dict[str, Any]]:
 
 def _contract_for_case(case: dict[str, Any]):
     kind = str(case["kind"])
+    service = str(case.get("entity") or "checkout")
+    fixture = dict(case.get("fixture") or {})
     requirements = [
-        EvidenceRequirement(id="er_01", evidence_type="metric", signal_type="latency", service_scope=["checkout"])
+        EvidenceRequirement(id="er_01", evidence_type="metric", signal_type="latency", service_scope=[service])
     ]
     resolutions = [
         EvidenceResolution(
@@ -80,7 +84,7 @@ def _contract_for_case(case: dict[str, Any]):
     candidates = [
         CulpritCandidate(
             rank=1,
-            suspect="checkout",
+            suspect=service,
             suspect_type="service",
             score=0.7,
             supporting_requirement_ids=["er_01"],
@@ -88,6 +92,24 @@ def _contract_for_case(case: dict[str, Any]):
     ]
     ranking = CulpritRanking(abstained=False, candidates=candidates, telemetry_status="evidenced")
     context_chunks: list[ContextChunk] = []
+    if fixture.get("context_available"):
+        context_chunks.append(
+            ContextChunk(
+                content=f"Operational context is available for {service}, but it contains no live telemetry.",
+                source=f"runbook:{service}",
+                relevance_score=0.8,
+                metadata={"source_type": "runbook", "claim_type": "context_only"},
+            )
+        )
+    if context_entity := fixture.get("context_implicates"):
+        context_chunks.append(
+            ContextChunk(
+                content=f"Historical operational context implicates {context_entity}.",
+                source=f"incident-history:{context_entity}",
+                relevance_score=0.85,
+                metadata={"source_type": "incident_history", "claim_type": "suspect_context"},
+            )
+        )
 
     if kind in {"partial", "conflicting", "missing_critical"}:
         requirements.append(EvidenceRequirement(id="er_02", evidence_type="metric", signal_type="errors"))
@@ -203,7 +225,7 @@ def _contract_for_case(case: dict[str, Any]):
         revision=0,
         parent_revision=None,
         request=DashRequest(prompt=str(case["prompt"]), user_id="grounding-benchmark"),
-        intent=Intent(summary=str(case["prompt"]), domain="application", services=["checkout"]),
+        intent=Intent(summary=str(case["prompt"]), domain="application", services=[service]),
         dashboard_spec=dashboard,
         evidence_requirements=requirements,
         evidence_resolutions=resolutions,

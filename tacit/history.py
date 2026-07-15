@@ -546,6 +546,7 @@ class InvestigationStore:
         snapshot: InvestigationReplaySnapshot | None = None,
         run_id: str | None = None,
         expected_parent_revision: int | None = None,
+        applied_candidate_id: str | None = None,
     ) -> InvestigationContract:
         """Persist an immutable Investigation Contract revision.
 
@@ -565,6 +566,22 @@ class InvestigationStore:
                 raise StaleRevisionError(
                     f"expected parent revision {expected_parent_revision}, current revision is {current}"
                 )
+            candidate_row = None
+            if applied_candidate_id is not None:
+                candidate_row = conn.execute(
+                    """SELECT * FROM knowledge_candidates
+                       WHERE id=? AND investigation_id=? AND revision=? AND status=?""",
+                    (
+                        applied_candidate_id,
+                        investigation_id,
+                        current,
+                        KnowledgeCandidateStatus.APPROVED.value,
+                    ),
+                ).fetchone()
+                if candidate_row is None:
+                    raise StaleRevisionError(
+                        f"knowledge candidate {applied_candidate_id} is no longer approved for revision {current}"
+                    )
             revision = current + 1
             parent_revision = current or None
             investigation = contract.investigation.model_copy(
@@ -640,6 +657,26 @@ class InvestigationStore:
                 "UPDATE investigations SET current_revision=? WHERE id=?",
                 (revision, investigation_id),
             )
+            if candidate_row is not None:
+                candidate_provenance = ProvenanceRecord.model_validate_json(
+                    candidate_row["provenance_json"]
+                ).model_copy(update={"review_state": KnowledgeCandidateStatus.APPLIED.value})
+                updated = conn.execute(
+                    """UPDATE knowledge_candidates
+                       SET status=?, applied_revision=?, provenance_json=?
+                       WHERE id=? AND investigation_id=? AND revision=? AND status=?""",
+                    (
+                        KnowledgeCandidateStatus.APPLIED.value,
+                        revision,
+                        candidate_provenance.model_dump_json(),
+                        applied_candidate_id,
+                        investigation_id,
+                        current,
+                        KnowledgeCandidateStatus.APPROVED.value,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise StaleRevisionError(f"knowledge candidate {applied_candidate_id} changed during application")
             if snapshot is not None:
                 persisted_snapshot = snapshot.model_copy(
                     update={
@@ -1025,11 +1062,20 @@ class InvestigationStore:
             if candidate.status != KnowledgeCandidateStatus.PENDING_REVIEW:
                 return candidate
             status = KnowledgeCandidateStatus.APPROVED if approved else KnowledgeCandidateStatus.REJECTED
+            provenance = candidate.provenance.model_copy(update={"review_state": status.value})
             conn.execute(
-                "UPDATE knowledge_candidates SET status=?, reviewed_by=?, reviewed_at=? WHERE id=?",
-                (status.value, reviewed_by, now.timestamp(), candidate_id),
+                """UPDATE knowledge_candidates
+                   SET status=?, reviewed_by=?, reviewed_at=?, provenance_json=? WHERE id=?""",
+                (status.value, reviewed_by, now.timestamp(), provenance.model_dump_json(), candidate_id),
             )
-        return candidate.model_copy(update={"status": status, "reviewed_by": reviewed_by, "reviewed_at": now})
+        return candidate.model_copy(
+            update={
+                "status": status,
+                "reviewed_by": reviewed_by,
+                "reviewed_at": now,
+                "provenance": provenance,
+            }
+        )
 
     def apply_knowledge_candidate(
         self,
@@ -1051,6 +1097,8 @@ class InvestigationStore:
                     (KnowledgeCandidateStatus.EXPIRED.value, candidate_id),
                 )
             return None
+        if candidate.status == KnowledgeCandidateStatus.APPLIED and candidate.applied_revision is not None:
+            return self.get_contract(candidate.investigation_id, candidate.applied_revision)
         if candidate.status != KnowledgeCandidateStatus.APPROVED:
             return None
         contract = self.get_contract(candidate.investigation_id)
@@ -1093,14 +1141,22 @@ class InvestigationStore:
                 run_type=InvestigationRunType.CORRECTION_APPLICATION,
                 snapshot=snapshot,
                 expected_parent_revision=candidate.revision,
+                applied_candidate_id=candidate.id,
             )
         except StaleRevisionError:
+            with self._conn() as conn:
+                current_row = conn.execute(
+                    "SELECT * FROM knowledge_candidates WHERE id=? AND investigation_id=?",
+                    (candidate_id, investigation_id),
+                ).fetchone()
+            if current_row is not None:
+                current_candidate = self._candidate_from_row(current_row)
+                if (
+                    current_candidate.status == KnowledgeCandidateStatus.APPLIED
+                    and current_candidate.applied_revision is not None
+                ):
+                    return self.get_contract(investigation_id, current_candidate.applied_revision)
             return None
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE knowledge_candidates SET status=?, applied_revision=? WHERE id=?",
-                (KnowledgeCandidateStatus.APPLIED.value, persisted.investigation.revision, candidate_id),
-            )
         return persisted
 
     def migrate_legacy_investigation(self, investigation_id: str) -> InvestigationContract | None:

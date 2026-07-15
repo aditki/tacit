@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import tarfile
 import time
 import tomllib
@@ -20,7 +21,12 @@ from tacit.api.app import create_app
 from tacit.api.dependencies import get_pipeline_dependencies
 from tacit.backends.base import PublishResult
 from tacit.dependencies import PipelineDependencies
-from tacit.grounding_benchmark import run_acceptance_corpus, run_grounding_benchmark
+from tacit.grounding_benchmark import (
+    _contract_for_case,
+    load_grounding_corpus,
+    run_acceptance_corpus,
+    run_grounding_benchmark,
+)
 from tacit.history import (
     ExactReplayMismatchError,
     InvestigationStore,
@@ -389,6 +395,37 @@ def test_counterfactual_observation_removal_records_an_explicit_gap(tmp_path):
     assert replayed.grounding.status == GroundingStatus.INSUFFICIENT_EVIDENCE
 
 
+def test_counterfactual_context_changes_preserve_original_provenance_ids(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    context_chunks = [
+        ContextChunk(content="First runbook", source="runbook:first", relevance_score=0.8),
+        ContextChunk(content="Second runbook", source="runbook:second", relevance_score=0.7),
+    ]
+    draft = _draft_contract(investigation_id, context_chunks=context_chunks)
+    snapshot = _snapshot_for(draft).model_copy(update={"context_chunks": context_chunks})
+    store.persist_contract_revision(draft, snapshot=snapshot)
+
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.COUNTERFACTUAL,
+        changes=CounterfactualChanges(
+            remove_context_refs=["prov_context_01"],
+            stale_context_refs=["prov_context_02"],
+        ),
+    )
+
+    assert replayed is not None
+    context_provenance = [record for record in replayed.provenance if record.id.startswith("prov_context_")]
+    assert [record.id for record in context_provenance] == ["prov_context_02"]
+    assert context_provenance[0].source_ref == "runbook:second"
+    assert context_provenance[0].freshness["status"] == "stale"
+    assert replayed.artifact_contributions[0].provenance_refs == ["prov_context_02"]
+    persisted_snapshot = store.get_snapshot(investigation_id, replayed.investigation.revision)
+    assert persisted_snapshot is not None
+    assert persisted_snapshot.context_chunks[0].metadata["provenance_id"] == "prov_context_02"
+
+
 def test_non_exact_replay_requires_captured_inputs(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Legacy investigation", user_id="sdet")
@@ -483,6 +520,7 @@ def test_approved_correction_creates_provenance_bearing_revision(tmp_path):
         reviewed_by="approver",
     )
     assert reviewed is not None and reviewed.status.value == "approved"
+    assert reviewed.provenance.review_state == "approved"
 
     corrected = store.apply_knowledge_candidate(investigation_id, candidate.id)
 
@@ -491,10 +529,76 @@ def test_approved_correction_creates_provenance_bearing_revision(tmp_path):
     assert corrected.corrections[-1].correction_ref == candidate.id
     assert corrected.corrections[-1].applied_in_revision == 2
     assert corrected.provenance[-1].source_type == "human_correction"
-    assert store.list_knowledge_candidates(investigation_id)[0].status.value == "applied"
+    applied_candidate = store.list_knowledge_candidates(investigation_id)[0]
+    assert applied_candidate.status.value == "applied"
+    assert applied_candidate.provenance.review_state == "applied"
+    assert store.apply_knowledge_candidate(investigation_id, candidate.id) == corrected
     replayed = store.replay_contract(investigation_id, mode=ReplayMode.EXACT)
     assert replayed is not None
     assert replayed.runtime.output_fingerprint == corrected.runtime.output_fingerprint
+
+
+@pytest.mark.parametrize(("approved", "expected_state"), [(True, "approved"), (False, "rejected")])
+def test_candidate_review_updates_provenance_state(tmp_path, approved, expected_state):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    candidate = store.create_knowledge_candidate(
+        investigation_id,
+        revision=1,
+        correction_text="Cache was saturated.",
+    )
+    assert candidate is not None
+
+    reviewed = store.review_knowledge_candidate(
+        investigation_id,
+        candidate.id,
+        approved=approved,
+        reviewed_by="reviewer",
+    )
+
+    assert reviewed is not None
+    assert reviewed.status.value == expected_state
+    assert reviewed.provenance.review_state == expected_state
+    reloaded = store.list_knowledge_candidates(investigation_id)[0]
+    assert reloaded.status.value == expected_state
+    assert reloaded.provenance.review_state == expected_state
+
+
+def test_candidate_application_rolls_back_revision_if_candidate_transition_fails(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    candidate = store.create_knowledge_candidate(
+        investigation_id,
+        revision=1,
+        correction_text="Cache was saturated.",
+    )
+    assert candidate is not None
+    store.review_knowledge_candidate(investigation_id, candidate.id, approved=True, reviewed_by="reviewer")
+    with store._conn() as conn:
+        conn.execute(
+            """CREATE TRIGGER fail_candidate_application
+               BEFORE UPDATE ON knowledge_candidates
+               WHEN NEW.status = 'applied'
+               BEGIN SELECT RAISE(ABORT, 'candidate transition failed'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="candidate transition failed"):
+        store.apply_knowledge_candidate(investigation_id, candidate.id)
+
+    assert len(store.list_revisions(investigation_id)) == 1
+    assert store.get(investigation_id)["current_revision"] == 1
+    unchanged = store.list_knowledge_candidates(investigation_id)[0]
+    assert unchanged.status.value == "approved"
+    assert unchanged.applied_revision is None
+    with store._conn() as conn:
+        conn.execute("DROP TRIGGER fail_candidate_application")
+
+    corrected = store.apply_knowledge_candidate(investigation_id, candidate.id)
+    assert corrected is not None
+    assert corrected.investigation.revision == 2
+    assert store.apply_knowledge_candidate(investigation_id, candidate.id) == corrected
 
 
 def test_legacy_migration_and_assessment_bundle_are_portable(tmp_path):
@@ -916,6 +1020,28 @@ def test_grounding_benchmark_v1_gate():
     assert result["cases"] == 40
     assert result["unsafe_assertion_rate"] == 0
     assert result["passed"] is True
+
+
+def test_grounding_benchmark_preserves_unknown_entities_and_context_fixtures():
+    cases = load_grounding_corpus()
+    unknown = next(case for case in cases if case["family"] == "unknown-service")
+    no_runtime = next(case for case in cases if case["family"] == "no-runtime-telemetry")
+    contradicted = next(case for case in cases if case["family"] == "telemetry-contradicts-context")
+
+    unknown_contract = _contract_for_case(unknown)
+    assert unknown_contract.operational_ir.services == ["zephyr-one"]
+    assert unknown_contract.request.scope.services == ["zephyr-one"]
+    assert unknown_contract.evidence_requirements[0].entity_ref == "service:zephyr-one"
+
+    no_runtime_contract = _contract_for_case(no_runtime)
+    assert no_runtime_contract.artifact_contributions
+    assert any(record.source_ref == "runbook:checkout" for record in no_runtime_contract.provenance)
+    assert no_runtime_contract.grounding.status == GroundingStatus.INSUFFICIENT_EVIDENCE
+
+    contradicted_contract = _contract_for_case(contradicted)
+    assert contradicted_contract.artifact_contributions
+    assert any(record.source_ref == "incident-history:cache" for record in contradicted_contract.provenance)
+    assert contradicted_contract.grounding.status == GroundingStatus.CONTRADICTED
 
 
 def test_grounding_benchmark_counts_suspect_output_as_unsafe_when_abstention_is_expected(monkeypatch):

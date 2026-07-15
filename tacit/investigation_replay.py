@@ -185,16 +185,27 @@ def apply_counterfactual(
         candidates.append(candidate)
     candidates.sort(key=lambda candidate: (-candidate.score, candidate.rank, candidate.suspect_type, candidate.suspect))
     candidates = [candidate.model_copy(update={"rank": rank}) for rank, candidate in enumerate(candidates, start=1)]
-    context_chunks = [
-        (
-            chunk.model_copy(update={"metadata": {**chunk.metadata, "stale": True}})
-            if f"prov_context_{index:02d}" in changes.stale_context_refs
-            else chunk
-        )
-        for index, chunk in enumerate(snapshot.context_chunks, start=1)
-        if f"prov_context_{index:02d}" not in changes.remove_context_refs
-    ]
-    context_chunks.extend(changes.add_context_chunks)
+    removed_context_refs = set(changes.remove_context_refs)
+    stale_context_refs = set(changes.stale_context_refs)
+    context_chunks = []
+    used_context_refs: set[str] = set()
+    for index, chunk in enumerate(snapshot.context_chunks, start=1):
+        provenance_id = str(chunk.metadata.get("provenance_id") or f"prov_context_{index:02d}")
+        used_context_refs.add(provenance_id)
+        if provenance_id in removed_context_refs:
+            continue
+        metadata = {**chunk.metadata, "provenance_id": provenance_id}
+        if provenance_id in stale_context_refs:
+            metadata["stale"] = True
+        context_chunks.append(chunk.model_copy(update={"metadata": metadata}))
+    next_context_index = len(snapshot.context_chunks) + 1
+    for chunk in changes.add_context_chunks:
+        provenance_id = str(chunk.metadata.get("provenance_id", ""))
+        while not provenance_id or provenance_id in used_context_refs:
+            provenance_id = f"prov_context_{next_context_index:02d}"
+            next_context_index += 1
+        used_context_refs.add(provenance_id)
+        context_chunks.append(chunk.model_copy(update={"metadata": {**chunk.metadata, "provenance_id": provenance_id}}))
     return snapshot.model_copy(
         update={
             "evidence_resolutions": resolutions,

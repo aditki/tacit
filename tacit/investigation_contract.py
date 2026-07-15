@@ -673,18 +673,20 @@ class InvestigationContractAssembler:
             ),
         ]
         for index, chunk in enumerate(context_chunks, start=1):
+            provenance_id = str(chunk.metadata.get("provenance_id") or f"prov_context_{index:02d}")
+            source_metadata = {key: value for key, value in chunk.metadata.items() if key != "provenance_id"}
             freshness_status = str(chunk.metadata.get("freshness_status", "unknown"))
             if chunk.metadata.get("stale") is True:
                 freshness_status = "stale"
             records.append(
                 ProvenanceRecord(
-                    id=f"prov_context_{index:02d}",
+                    id=provenance_id,
                     source_type=str(chunk.metadata.get("source_type", "artifact")),
                     source_ref=chunk.source or f"context:{index}",
                     source_version=fingerprint(
-                        {"content": chunk.content, "source": chunk.source, "metadata": chunk.metadata}
+                        {"content": chunk.content, "source": chunk.source, "metadata": source_metadata}
                     ),
-                    locator={key: value for key, value in chunk.metadata.items() if key != "content"},
+                    locator={key: value for key, value in source_metadata.items() if key != "content"},
                     ingested_at=observed_at,
                     observed_at=observed_at,
                     freshness={"status": freshness_status, "last_verified_at": observed_at.isoformat()},

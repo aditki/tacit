@@ -58,6 +58,7 @@
       "expected_grounding": "insufficient_evidence",
       "expected_abstained": true,
       "fixture": {"withheld": ["artifacts", "entity_mapping", "telemetry"], "unknown_entity": true},
+      "entities": ["zephyr-one", "atlas-edge", "nova-pay", "cedar-api", "amber-job", "polar-events", "lunar-search", "cobalt-web"],
       "prompts": [
         "Investigate service zephyr-one.", "Why is the unknown atlas-edge service slow?",
         "Diagnose errors in unregistered service nova-pay.", "Inspect latency for missing service cedar-api.",
