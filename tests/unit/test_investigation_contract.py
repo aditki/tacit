@@ -7,6 +7,7 @@ import tomllib
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,7 +20,7 @@ from tacit.api.dependencies import get_pipeline_dependencies
 from tacit.backends.base import PublishResult
 from tacit.dependencies import PipelineDependencies
 from tacit.grounding_benchmark import run_acceptance_corpus, run_grounding_benchmark
-from tacit.history import InvestigationStore
+from tacit.history import InvestigationStore, StaleRevisionError
 from tacit.investigation_bundle import build_investigation_bundle
 from tacit.investigation_contract import (
     SCHEMA_ID,
@@ -306,7 +307,6 @@ def test_captured_input_replay_rebuilds_and_counterfactual_creates_revision(tmp_
         investigation_id,
         mode=ReplayMode.COUNTERFACTUAL,
         changes=CounterfactualChanges(
-            remove_observation_ids=["obs_01"],
             reject_requirement_ids=["er_01"],
             add_context_chunks=[
                 ContextChunk(content="New runbook evidence", source="runbook:new", relevance_score=0.7)
@@ -320,6 +320,24 @@ def test_captured_input_replay_rebuilds_and_counterfactual_creates_revision(tmp_
     assert counterfactual.evidence_resolutions[0].status == "unresolved"
     assert counterfactual.candidate_rankings[0].score == 0.4
     assert counterfactual.artifact_contributions[0].artifact_ref == "runbook:new"
+
+
+def test_non_exact_replay_rejects_a_stale_base_revision(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    draft = _draft_contract(investigation_id)
+    first = store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+    store.persist_contract_revision(_draft_contract(investigation_id), reason="refresh")
+
+    with pytest.raises(StaleRevisionError):
+        store.replay_contract(
+            investigation_id,
+            revision=first.investigation.revision,
+            mode=ReplayMode.CURRENT_ENGINE,
+        )
+
+    assert len(store.list_revisions(investigation_id)) == 2
+    assert store.list_runs(investigation_id)[-1]["status"] == "failed"
 
 
 def test_approved_correction_creates_provenance_bearing_revision(tmp_path):
@@ -446,6 +464,126 @@ def test_run_completed_event_follows_revision_events(tmp_path):
     after_completion = [event["event_type"] for event in store.list_events(investigation_id, run_id)]
     assert after_completion[-1] == "run_completed"
     assert after_completion.index("revision_persisted") < after_completion.index("run_completed")
+    runtime_manifest = store.list_runs(investigation_id)[0]["runtime_manifest"]
+    assert runtime_manifest["engine_version"] == __version__
+
+
+async def test_failed_refresh_does_not_overwrite_current_investigation_row(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    store.finish(
+        investigation_id,
+        status="success",
+        dashboard_uid="current",
+        dashboard_url="http://grafana/current",
+    )
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(pipeline_max_concurrent=1, pipeline_timeout_seconds=5),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    response = await run_pipeline(
+        DashRequest(prompt="Refresh checkout", user_id="api"),
+        deps,
+        investigation_id=investigation_id,
+        run_type=InvestigationRunType.REFRESH,
+    )
+
+    current = store.get(investigation_id)
+    assert response.investigation_id == investigation_id
+    assert current is not None
+    assert current["status"] == "success"
+    assert current["dashboard_uid"] == "current"
+    assert current["dashboard_url"] == "http://grafana/current"
+    assert current["current_revision"] == 1
+    assert store.list_runs(investigation_id)[-1]["status"] == "failed"
+
+
+async def test_refresh_persistence_rejects_a_base_that_advanced_during_the_run(tmp_path):
+    class PublishedBackend:
+        name = "grafana"
+        query_language = "promql"
+
+        async def publish(self, dashboard_spec):
+            return PublishResult(url="http://grafana/stale-refresh", uid="stale-refresh", backend_name=self.name)
+
+    class FeedbackStore:
+        def record_provenance(self, **kwargs):
+            return None
+
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    store.finish(
+        investigation_id,
+        status="success",
+        dashboard_uid="current",
+        dashboard_url="http://grafana/current",
+    )
+    run_id = store.start_run(
+        investigation_id,
+        run_type=InvestigationRunType.REFRESH,
+        base_revision=1,
+    )
+    store.persist_contract_revision(_draft_contract(investigation_id), reason="concurrent-correction")
+    recorder = PipelineRecorder(
+        store,
+        investigation_id,
+        run_id=run_id,
+        record_investigation_updates=False,
+    )
+    dashboard = DashboardSpec(
+        title="Refresh",
+        panels=[PanelSpec(title="Traffic", queries=[PanelQuery(expr="up", datasource_uid="prom")])],
+    )
+    deps = PipelineDependencies(
+        settings=object(),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: store,
+        feedback_store_factory=FeedbackStore,
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    response = await complete_pipeline(
+        request=DashRequest(prompt="Refresh checkout", user_id="api"),
+        deps=deps,
+        backends=[PublishedBackend()],
+        dashboard_spec=dashboard,
+        intent=Intent(summary="Refresh checkout", domain="application", services=["checkout"]),
+        metric_catalog=[],
+        datasource_catalog=[],
+        ranked_archetypes_present=False,
+        validation_warnings=[],
+        panels_before=1,
+        evidence_requirements=[],
+        evidence_resolutions=[],
+        evidence_observations=[],
+        culprit_ranking=CulpritRanking(),
+        run_type=InvestigationRunType.REFRESH,
+        base_revision=1,
+        timings={},
+        recorder=recorder,
+        token_usage=TokenUsage(),
+        started_at=time.monotonic(),
+    )
+
+    current = store.get(investigation_id)
+    assert response.dashboard_url == "http://grafana/stale-refresh"
+    assert response.investigation_revision is None
+    assert len(store.list_revisions(investigation_id)) == 2
+    assert current is not None
+    assert current["status"] == "success"
+    assert current["dashboard_uid"] == "current"
+    refresh_run = next(run for run in store.list_runs(investigation_id) if run["run_id"] == run_id)
+    assert refresh_run["status"] == "failed"
 
 
 def test_grounding_benchmark_v1_gate():

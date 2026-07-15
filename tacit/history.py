@@ -495,18 +495,25 @@ class InvestigationStore:
             row = conn.execute("SELECT investigation_id FROM investigation_runs WHERE run_id=?", (run_id,)).fetchone()
             if row is None:
                 return
-            conn.execute(
-                """UPDATE investigation_runs SET status=?, completed_at=?, error_code=?,
-                   error_detail=?, runtime_manifest_json=? WHERE run_id=?""",
-                (
-                    status,
-                    time.time(),
-                    error_code,
-                    error_detail,
-                    json.dumps(runtime_manifest or {}, sort_keys=True),
-                    run_id,
-                ),
-            )
+            if runtime_manifest is None:
+                conn.execute(
+                    """UPDATE investigation_runs SET status=?, completed_at=?, error_code=?,
+                       error_detail=? WHERE run_id=?""",
+                    (status, time.time(), error_code, error_detail, run_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE investigation_runs SET status=?, completed_at=?, error_code=?,
+                       error_detail=?, runtime_manifest_json=? WHERE run_id=?""",
+                    (
+                        status,
+                        time.time(),
+                        error_code,
+                        error_detail,
+                        json.dumps(runtime_manifest, sort_keys=True),
+                        run_id,
+                    ),
+                )
             investigation_id = str(row["investigation_id"])
         self.append_event(
             investigation_id,
@@ -824,13 +831,23 @@ class InvestigationStore:
             if mode == ReplayMode.COUNTERFACTUAL
             else snapshot
         )
-        persisted = self.persist_contract_revision(
-            rebuilt,
-            reason=reason,
-            run_type=InvestigationRunType.REPLAY,
-            snapshot=persisted_snapshot,
-            run_id=run_id,
-        )
+        try:
+            persisted = self.persist_contract_revision(
+                rebuilt,
+                reason=reason,
+                run_type=InvestigationRunType.REPLAY,
+                snapshot=persisted_snapshot,
+                run_id=run_id,
+                expected_parent_revision=contract.investigation.revision,
+            )
+        except StaleRevisionError as exc:
+            self.complete_run(
+                run_id,
+                status="failed",
+                error_code="stale_base_revision",
+                error_detail=str(exc),
+            )
+            raise
         self.complete_run(run_id, status="completed", runtime_manifest=persisted.runtime.model_dump(mode="json"))
         return persisted
 

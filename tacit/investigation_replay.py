@@ -147,6 +147,7 @@ def apply_counterfactual(
         observation
         for index, observation in enumerate(snapshot.evidence_observations, start=1)
         if f"obs_{index:02d}" not in changes.remove_observation_ids
+        and observation.requirement_id not in changes.reject_requirement_ids
     ]
     resolutions = [
         (

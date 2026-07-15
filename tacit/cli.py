@@ -1937,14 +1937,17 @@ def history_contract(investigation_id: str, revision: int | None):
 def history_replay(investigation_id: str, revision: int | None, mode: str):
     """Replay an investigation from captured inputs without external refetch."""
     _load_env()
-    from tacit.history import get_investigation_store
+    from tacit.history import StaleRevisionError, get_investigation_store
     from tacit.investigation_replay import ReplayMode
 
-    contract = get_investigation_store().replay_contract(
-        investigation_id,
-        revision,
-        mode=ReplayMode(mode),
-    )
+    try:
+        contract = get_investigation_store().replay_contract(
+            investigation_id,
+            revision,
+            mode=ReplayMode(mode),
+        )
+    except StaleRevisionError as exc:
+        raise click.ClickException(str(exc)) from exc
     if contract is None:
         raise click.ClickException("Investigation or captured inputs not found")
     click.echo(json.dumps(contract.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True))

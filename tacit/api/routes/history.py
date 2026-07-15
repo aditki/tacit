@@ -146,12 +146,15 @@ async def replay_investigation(
 ):
     store = history_mod.get_investigation_store()
     replay_request = request or ReplayRequest()
-    contract = store.replay_contract(
-        investigation_id,
-        revision,
-        mode=replay_request.mode,
-        changes=replay_request.changes,
-    )
+    try:
+        contract = store.replay_contract(
+            investigation_id,
+            revision,
+            mode=replay_request.mode,
+            changes=replay_request.changes,
+        )
+    except history_mod.StaleRevisionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
     return {

@@ -55,6 +55,7 @@ async def complete_pipeline(
     context_chunks: list[ContextChunk] | None = None,
     run_type: InvestigationRunType = InvestigationRunType.INITIAL,
     revision_reason: str = "initial",
+    base_revision: int | None = None,
     timings: dict[str, float],
     recorder: PipelineRecorder,
     token_usage: TokenUsage,
@@ -196,6 +197,7 @@ async def complete_pipeline(
             run_type=run_type,
             snapshot=snapshot,
             run_id=recorder.run_id,
+            expected_parent_revision=(base_revision if run_type == InvestigationRunType.REFRESH else None),
         )
     except Exception:
         logger.warning(
@@ -205,12 +207,15 @@ async def complete_pipeline(
             exc_info=True,
         )
 
+    refresh_persist_failed = run_type == InvestigationRunType.REFRESH and persisted_contract is None
     recorder.finish(
-        status="success",
+        status="failed" if refresh_persist_failed else "success",
         dashboard_uid=effective_uid,
         dashboard_url=effective_url,
+        error="Refresh did not produce a new revision." if refresh_persist_failed else "",
         timings=timings_rounded,
         total_time=total_s,
+        persist_record=(run_type != InvestigationRunType.REFRESH or persisted_contract is not None),
     )
 
     return DashResponse(

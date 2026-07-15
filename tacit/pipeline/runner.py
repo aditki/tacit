@@ -148,7 +148,12 @@ async def _run_pipeline_inner(
             run_id = history.start_run(inv_id, run_type=run_type, base_revision=base_revision)
         except Exception:
             logger.warning("investigation_run_start_failed", investigation_id=inv_id, exc_info=True)
-    recorder = PipelineRecorder(history, inv_id, run_id=run_id)
+    recorder = PipelineRecorder(
+        history,
+        inv_id,
+        run_id=run_id,
+        record_investigation_updates=investigation_id is None,
+    )
     backends = deps.backend_factory()
     if not backends:
         recorder.finish(
@@ -370,6 +375,7 @@ async def _run_pipeline_inner(
             context_chunks=context_chunks,
             run_type=run_type,
             revision_reason="refresh" if run_type == InvestigationRunType.REFRESH else "initial",
+            base_revision=base_revision,
             timings=runtime.timings,
             recorder=runtime.recorder,
             token_usage=runtime.token_usage,
