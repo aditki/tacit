@@ -4,11 +4,24 @@ from __future__ import annotations
 
 import time
 
+import structlog
+
 from tacit.agents.providers.base import TokenUsage
 from tacit.backends.base import DashboardBackend, PublishResult
 from tacit.dependencies import PipelineDependencies
+from tacit.investigation_contract import InvestigationContractAssembler
 from tacit.logging import stage_log
-from tacit.models.schemas import CulpritRanking, DashboardSpec, DashRequest, DashResponse, Intent, MetricEntry
+from tacit.models.schemas import (
+    CulpritRanking,
+    DashboardSpec,
+    DashRequest,
+    DashResponse,
+    EvidenceObservation,
+    EvidenceRequirement,
+    EvidenceResolution,
+    Intent,
+    MetricEntry,
+)
 from tacit.pipeline.progress import emit_progress
 from tacit.pipeline.recording import (
     PipelineRecorder,
@@ -17,6 +30,8 @@ from tacit.pipeline.recording import (
 )
 from tacit.pipeline.side_effects import safe_record_provenance
 from tacit.pipeline.stages.publish import publish_dashboard
+
+logger = structlog.get_logger()
 
 
 async def complete_pipeline(
@@ -31,6 +46,9 @@ async def complete_pipeline(
     ranked_archetypes_present: bool,
     validation_warnings: list[str],
     panels_before: int,
+    evidence_requirements: list[EvidenceRequirement],
+    evidence_resolutions: list[EvidenceResolution],
+    evidence_observations: list[EvidenceObservation],
     culprit_ranking: CulpritRanking,
     timings: dict[str, float],
     recorder: PipelineRecorder,
@@ -101,11 +119,42 @@ async def complete_pipeline(
         path_used=path_used,
     )
 
+    persisted_contract = None
+    try:
+        persisted_contract = recorder.history.persist_contract_revision(
+            InvestigationContractAssembler().from_pipeline(
+                investigation_id=recorder.investigation_id,
+                revision=0,
+                parent_revision=None,
+                request=request,
+                intent=intent,
+                dashboard_spec=dashboard_spec,
+                evidence_requirements=evidence_requirements,
+                evidence_resolutions=evidence_resolutions,
+                evidence_observations=evidence_observations,
+                culprit_ranking=culprit_ranking,
+                dashboard_url=effective_url,
+                dashboard_uid=effective_uid,
+                signalfx_url=sfx_result.url,
+                signalfx_dashboard_id=sfx_result.uid,
+            ),
+            reason="initial",
+        )
+    except Exception:
+        logger.warning(
+            "investigation_contract_persist_failed",
+            investigation_id=recorder.investigation_id,
+            dashboard_uid=effective_uid,
+            exc_info=True,
+        )
+
     return DashResponse(
         dashboard_url=grafana_result.url,
         dashboard_uid=effective_uid,
         panel_count=len(dashboard_spec.panels),
         summary=summary,
+        investigation_id=recorder.investigation_id,
+        investigation_revision=(persisted_contract.investigation.revision if persisted_contract else None),
         signalfx_url=sfx_result.url,
         signalfx_dashboard_id=sfx_result.uid,
         culprit_ranking=culprit_ranking,

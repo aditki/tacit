@@ -33,6 +33,9 @@ class _CandidateAccumulator:
     contextual_reasons: list[str] = field(default_factory=list)
     runtime_evidence: list[str] = field(default_factory=list)
     missing_evidence: list[str] = field(default_factory=list)
+    supporting_requirement_ids: list[str] = field(default_factory=list)
+    contradicting_requirement_ids: list[str] = field(default_factory=list)
+    missing_requirement_ids: list[str] = field(default_factory=list)
 
 
 _DATASTORE_SIGNALS = {"db_query_latency", "db_connection_pool"}
@@ -166,10 +169,15 @@ def rank_culprits(
             metric = observation.resolution_metric or (resolution.metric if resolution else "")
             panel = f" in '{observation.panel_title}'" if observation.panel_title else ""
             _add_unique(candidate.runtime_evidence, f"Observed {signal_label} via {metric}{panel}".strip())
+            _add_unique(candidate.supporting_requirement_ids, requirement.id)
             candidate.score += 0.45 if requirement.priority == "critical" else 0.25
         elif resolution is not None:
             reason = observation.rejection_reason if observation is not None else resolution.reason_code
             _add_unique(candidate.missing_evidence, f"{signal_label}: {reason}")
+            if record.final_status == EvidenceLifecycleStatus.NEGATIVE_EVIDENCE:
+                _add_unique(candidate.contradicting_requirement_ids, requirement.id)
+            else:
+                _add_unique(candidate.missing_requirement_ids, requirement.id)
             if resolution.status.value == "resolved":
                 candidate.score += 0.1
 
@@ -199,6 +207,9 @@ def rank_culprits(
             contextual_reasons=candidate.contextual_reasons,
             runtime_evidence=candidate.runtime_evidence,
             missing_evidence=candidate.missing_evidence,
+            supporting_requirement_ids=candidate.supporting_requirement_ids,
+            contradicting_requirement_ids=candidate.contradicting_requirement_ids,
+            missing_requirement_ids=candidate.missing_requirement_ids,
         )
         for index, candidate in enumerate(ranked_accumulators, start=1)
     ]

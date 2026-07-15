@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -23,6 +23,54 @@ lifecycle), and ADR-017 (Operational IR) all point at the same conclusion withou
 
 Investigation is the primary product. Dashboards, the CLI, Slack, the REST API, MCP, and future
 agent protocols (A2A) are renderers or consumers of a versioned **Investigation Contract**.
+
+Canonical vocabulary:
+
+- **Investigation**: the persistent logical investigation, identified by a stable ID such as `inv_123`.
+- **Investigation Contract**: the versioned, machine-consumable product document for one revision.
+- **Investigation Record**: the durable storage record that links the logical investigation to its current revision.
+- **Investigation Revision**: an immutable version of the contract, identified by `(investigation_id, revision)`.
+- **Investigation Run**: one execution attempt; it may fail before producing a valid revision.
+- **Replay**: recomputation from captured historical inputs without contacting external systems.
+- **Refresh**: rerun resolution against current or newly available external data.
+- **Correction**: human feedback scoped to an investigation revision.
+- **Knowledge Candidate**: a provenance-bearing correction candidate awaiting review; it is not truth by default.
+- **Assessment Bundle**: a portable package containing an investigation, captured inputs, expected outcomes, and comparison metadata.
+- **Grounding**: the explicit classification of observed, inferred, contradicted, missing, and unsafe claims.
+- **Decision Log**: ordered runtime decisions with reason codes, inputs, outputs, and mechanisms.
+- **Artifact Contribution**: an explicit additive or negative contribution from an operational artifact to a contract field.
+
+Canonical lifecycle states:
+
+- `created`
+- `resolving`
+- `observing`
+- `ranking`
+- `grounding`
+- `completed`
+- `failed_resolution`
+- `failed_observation`
+- `failed_ranking`
+- `failed_validation`
+- `cancelled`
+
+Completion does not imply root cause proof. Completed investigations classify their grounding as:
+
+- `supported`
+- `partially_supported`
+- `insufficient_evidence`
+- `contradicted`
+- `indeterminate`
+
+Run types are:
+
+- `initial`
+- `replay`
+- `refresh`
+- `correction_application`
+- `migration`
+
+These values are represented as typed enums in `tacit/investigation_contract.py`.
 
 The contract is a contract, not merely a schema: it carries guarantees consumers may rely on.
 An Investigation MUST contain:
@@ -123,16 +171,23 @@ Existing building blocks validated against the current repository:
 - `tacit/evidence.py`, `tacit/culprit_ranking.py`: produce the observations and ranked suspects the
   contract requires.
 
-TODO:
+Implemented:
 
-- Author the `investigation.v1` contract document (guarantees, field semantics, versioning policy)
-  and generate JSON Schema from the Pydantic model.
-- Add `tacit investigate --json` as the first renderer; keep `tacit test` as the human-friendly view.
-- Return the investigation object (or a link to it) from `/api/v1/chart` alongside `DashResponse`.
+- `tacit/investigation_contract.py` defines `tacit.investigation` schema version `1.0`, typed lifecycle enums,
+  structural grounding, decision log, normalized provenance, queries, corrections, renderings, and runtime
+  fingerprints.
+- `tacit/schemas/investigation/v1.0.schema.json` is generated from the Pydantic model and packaged as a
+  runtime resource. Future contract families and versions follow `tacit/schemas/{family}/v{version}.schema.json`.
+- `tacit investigate --json` is the first contract renderer; `tacit test` remains the human-friendly dashboard path.
+- `/api/v1/chart` remains backward compatible while returning `investigation_id` and `investigation_revision`.
+- `/api/v1/investigations/{id}/contract`, `/revisions`, `/compare`, `/replay`, and `/corrections` expose inspect,
+  compare, exact replay, and correction-candidate workflows.
+- `InvestigationStore` persists append-only revisions, replay runs, events, and knowledge candidates.
+
+Remaining:
+
 - Implement Grounding Benchmark v1 as specified in
   [docs/evaluation-grounding-benchmark-v1.md](../evaluation-grounding-benchmark-v1.md):
   five adversarial-insufficiency case families scored against expected grounding status, with
   unsafe assertion rate as a release gate.
-- Add the `grounding` block to the contract model, populated from the existing evidence
-  observation and abstention-reason machinery (`tacit/evidence.py`, `tacit/culprit_ranking.py`).
 - Specify per-consumer auth/audit requirements before exposing the contract to autonomous agents.

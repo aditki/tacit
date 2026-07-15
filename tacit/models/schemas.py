@@ -361,6 +361,9 @@ class CulpritCandidate(BaseModel):
     contextual_reasons: list[str] = Field(default_factory=list)
     runtime_evidence: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
+    supporting_requirement_ids: list[str] = Field(default_factory=list)
+    contradicting_requirement_ids: list[str] = Field(default_factory=list)
+    missing_requirement_ids: list[str] = Field(default_factory=list)
 
 
 class CulpritRanking(BaseModel):
@@ -404,6 +407,8 @@ class DashResponse(BaseModel):
     dashboard_uid: str = Field(description="Unique Grafana dashboard UID")
     panel_count: int = Field(description="Number of panels in the generated dashboard")
     summary: str = Field(description="Human-readable summary of what was generated")
+    investigation_id: str = Field(default="", description="Stable investigation identifier")
+    investigation_revision: int | None = Field(default=None, description="Immutable investigation contract revision")
     signalfx_url: str = Field(default="", description="SignalFx dashboard URL (when signalfx_enabled)")
     signalfx_dashboard_id: str = Field(default="", description="SignalFx dashboard ID (when signalfx_enabled)")
     culprit_ranking: CulpritRanking | None = Field(
