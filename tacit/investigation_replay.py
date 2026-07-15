@@ -24,6 +24,7 @@ from tacit.models.schemas import (
     EvidenceObservation,
     EvidenceRequirement,
     EvidenceResolution,
+    EvidenceResolutionStatus,
     Intent,
 )
 
@@ -148,14 +149,16 @@ def apply_counterfactual(
         if f"obs_{index:02d}" not in changes.remove_observation_ids
     ]
     resolutions = [
-        resolution.model_copy(
-            update={
-                "status": "unresolved",
-                "reason_code": "counterfactual_binding_rejected",
-            }
+        (
+            resolution.model_copy(
+                update={
+                    "status": EvidenceResolutionStatus.UNRESOLVED,
+                    "reason_code": "counterfactual_binding_rejected",
+                }
+            )
+            if resolution.requirement_id in changes.reject_requirement_ids
+            else resolution
         )
-        if resolution.requirement_id in changes.reject_requirement_ids
-        else resolution
         for resolution in snapshot.evidence_resolutions
     ]
     candidates = []

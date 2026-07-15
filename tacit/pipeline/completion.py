@@ -106,14 +106,6 @@ async def complete_pipeline(
         timings=timings_rounded,
     )
 
-    recorder.finish(
-        status="success",
-        dashboard_uid=effective_uid,
-        dashboard_url=effective_url,
-        timings=timings_rounded,
-        total_time=total_s,
-    )
-
     safe_record_provenance(
         feedback_store_factory=deps.feedback_store_factory,
         dashboard_uid=effective_uid,
@@ -212,6 +204,14 @@ async def complete_pipeline(
             dashboard_uid=effective_uid,
             exc_info=True,
         )
+
+    recorder.finish(
+        status="success",
+        dashboard_uid=effective_uid,
+        dashboard_url=effective_url,
+        timings=timings_rounded,
+        total_time=total_s,
+    )
 
     return DashResponse(
         dashboard_url=grafana_result.url,

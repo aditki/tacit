@@ -180,9 +180,9 @@ class PipelineRecorder:
                 self.history.complete_run(
                     self.run_id,
                     status="completed" if succeeded else "failed",
-                    error_code=""
-                    if succeeded
-                    else ("pipeline_timeout" if pipeline_status == "timeout" else "pipeline_failed"),
+                    error_code=(
+                        "" if succeeded else ("pipeline_timeout" if pipeline_status == "timeout" else "pipeline_failed")
+                    ),
                     error_detail=str(kwargs.get("error", "")),
                 )
             except Exception:

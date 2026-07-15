@@ -6,7 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 
 import tacit.history as history_mod
+from tacit.api.dependencies import get_pipeline_dependencies
 from tacit.api.security import verify_api_key
+from tacit.dependencies import PipelineDependencies
 from tacit.investigation_bundle import build_investigation_bundle
 from tacit.investigation_contract import InvestigationRunType
 from tacit.investigation_replay import CounterfactualChanges, ReplayMode
@@ -204,11 +206,12 @@ async def review_correction_candidate(
 ):
     store = history_mod.get_investigation_store()
     candidate = store.review_knowledge_candidate(
+        investigation_id,
         candidate_id,
         approved=request.approved,
         reviewed_by=request.reviewed_by,
     )
-    if candidate is None or candidate.investigation_id != investigation_id:
+    if candidate is None:
         raise HTTPException(status_code=404, detail="Correction candidate not found")
     return candidate.model_dump(mode="json")
 
@@ -220,8 +223,8 @@ async def review_correction_candidate(
 )
 async def apply_correction_candidate(investigation_id: str, candidate_id: str):
     store = history_mod.get_investigation_store()
-    contract = store.apply_knowledge_candidate(candidate_id)
-    if contract is None or contract.investigation.id != investigation_id:
+    contract = store.apply_knowledge_candidate(investigation_id, candidate_id)
+    if contract is None:
         raise HTTPException(status_code=409, detail="Correction must exist, be approved, and not be expired")
     return contract.model_dump(mode="json", by_alias=True)
 
@@ -231,13 +234,17 @@ async def apply_correction_candidate(investigation_id: str, candidate_id: str):
     tags=["History"],
     summary="Refresh an investigation from current external inputs",
 )
-async def refresh_investigation(investigation_id: str):
-    store = history_mod.get_investigation_store()
+async def refresh_investigation(
+    investigation_id: str,
+    deps: PipelineDependencies = Depends(get_pipeline_dependencies),
+):
+    store = deps.history_store_factory()
     contract = store.get_contract(investigation_id)
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
     response = await run_pipeline(
         DashRequest(prompt=contract.request.question, user_id=contract.request.requester),
+        deps,
         investigation_id=investigation_id,
         run_type=InvestigationRunType.REFRESH,
     )

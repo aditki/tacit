@@ -51,6 +51,10 @@ _DEFAULT_DB_PATH = Path("data/tacit_history.db")
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 
+class StaleRevisionError(ValueError):
+    """Raised when a revision-scoped operation no longer targets the current revision."""
+
+
 def _db_path() -> Path:
     custom = getattr(settings, "history_db_path", None)
     path = Path(custom) if custom else _DEFAULT_DB_PATH
@@ -519,6 +523,7 @@ class InvestigationStore:
         run_type: InvestigationRunType = InvestigationRunType.INITIAL,
         snapshot: InvestigationReplaySnapshot | None = None,
         run_id: str | None = None,
+        expected_parent_revision: int | None = None,
     ) -> InvestigationContract:
         """Persist an immutable Investigation Contract revision.
 
@@ -534,15 +539,21 @@ class InvestigationStore:
                 (investigation_id,),
             ).fetchone()
             current = int(row["current"] or 0)
+            if expected_parent_revision is not None and current != expected_parent_revision:
+                raise StaleRevisionError(
+                    f"expected parent revision {expected_parent_revision}, current revision is {current}"
+                )
             revision = current + 1
             parent_revision = current or None
             investigation = contract.investigation.model_copy(
                 update={"revision": revision, "parent_revision": parent_revision}
             )
             corrections = [
-                correction.model_copy(update={"applied_in_revision": revision})
-                if correction.applied_in_revision is None
-                else correction
+                (
+                    correction.model_copy(update={"applied_in_revision": revision})
+                    if correction.applied_in_revision is None
+                    else correction
+                )
                 for correction in contract.corrections
             ]
             renderings = contract.renderings.copy()
@@ -581,9 +592,8 @@ class InvestigationStore:
                 )
             else:
                 conn.execute(
-                    """UPDATE investigation_runs SET status='completed', completed_at=?,
-                       runtime_manifest_json=? WHERE run_id=?""",
-                    (now, json.dumps(payload["runtime"], sort_keys=True), run_id),
+                    "UPDATE investigation_runs SET runtime_manifest_json=? WHERE run_id=?",
+                    (json.dumps(payload["runtime"], sort_keys=True), run_id),
                 )
             conn.execute(
                 """INSERT INTO investigation_revisions (
@@ -655,6 +665,21 @@ class InvestigationStore:
                     now,
                 ),
             )
+            if existing_run is None:
+                conn.execute(
+                    """INSERT INTO investigation_events (
+                       event_id, investigation_id, run_id, sequence, event_type, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        uuid.uuid4().hex,
+                        investigation_id,
+                        run_id,
+                        event_sequence + 1,
+                        "run_completed",
+                        json.dumps({"status": "completed"}, sort_keys=True),
+                        now,
+                    ),
+                )
         return stamped
 
     def get_snapshot(self, investigation_id: str, revision: int | None = None) -> InvestigationReplaySnapshot | None:
@@ -799,13 +824,15 @@ class InvestigationStore:
             if mode == ReplayMode.COUNTERFACTUAL
             else snapshot
         )
-        return self.persist_contract_revision(
+        persisted = self.persist_contract_revision(
             rebuilt,
             reason=reason,
             run_type=InvestigationRunType.REPLAY,
             snapshot=persisted_snapshot,
             run_id=run_id,
         )
+        self.complete_run(run_id, status="completed", runtime_manifest=persisted.runtime.model_dump(mode="json"))
+        return persisted
 
     def compare_revisions(self, investigation_id: str, left: int, right: int) -> dict[str, Any] | None:
         left_contract = self.get_contract(investigation_id, left)
@@ -899,6 +926,7 @@ class InvestigationStore:
 
     def review_knowledge_candidate(
         self,
+        investigation_id: str,
         candidate_id: str,
         *,
         approved: bool,
@@ -906,7 +934,10 @@ class InvestigationStore:
     ) -> KnowledgeCandidate | None:
         now = utc_now()
         with self._conn() as conn:
-            row = conn.execute("SELECT * FROM knowledge_candidates WHERE id=?", (candidate_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM knowledge_candidates WHERE id=? AND investigation_id=?",
+                (candidate_id, investigation_id),
+            ).fetchone()
             if row is None:
                 return None
             candidate = self._candidate_from_row(row)
@@ -919,9 +950,16 @@ class InvestigationStore:
             )
         return candidate.model_copy(update={"status": status, "reviewed_by": reviewed_by, "reviewed_at": now})
 
-    def apply_knowledge_candidate(self, candidate_id: str) -> InvestigationContract | None:
+    def apply_knowledge_candidate(
+        self,
+        investigation_id: str,
+        candidate_id: str,
+    ) -> InvestigationContract | None:
         with self._conn() as conn:
-            row = conn.execute("SELECT * FROM knowledge_candidates WHERE id=?", (candidate_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM knowledge_candidates WHERE id=? AND investigation_id=?",
+                (candidate_id, investigation_id),
+            ).fetchone()
         if row is None:
             return None
         candidate = self._candidate_from_row(row)
@@ -935,7 +973,7 @@ class InvestigationStore:
         if candidate.status != KnowledgeCandidateStatus.APPROVED:
             return None
         contract = self.get_contract(candidate.investigation_id)
-        if contract is None:
+        if contract is None or contract.investigation.revision != candidate.revision:
             return None
         provenance = candidate.provenance.model_copy(update={"review_state": "approved"})
         decision = DecisionLogEntry(
@@ -967,12 +1005,16 @@ class InvestigationStore:
                     "additional_decisions": [*snapshot.additional_decisions, decision],
                 }
             )
-        persisted = self.persist_contract_revision(
-            revised,
-            reason=f"correction:{candidate.id}",
-            run_type=InvestigationRunType.CORRECTION_APPLICATION,
-            snapshot=snapshot,
-        )
+        try:
+            persisted = self.persist_contract_revision(
+                revised,
+                reason=f"correction:{candidate.id}",
+                run_type=InvestigationRunType.CORRECTION_APPLICATION,
+                snapshot=snapshot,
+                expected_parent_revision=candidate.revision,
+            )
+        except StaleRevisionError:
+            return None
         with self._conn() as conn:
             conn.execute(
                 "UPDATE knowledge_candidates SET status=?, applied_revision=? WHERE id=?",

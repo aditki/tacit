@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from tacit import __version__
 from tacit.agents.providers.base import TokenUsage
 from tacit.api.app import create_app
+from tacit.api.dependencies import get_pipeline_dependencies
 from tacit.backends.base import PublishResult
 from tacit.dependencies import PipelineDependencies
 from tacit.grounding_benchmark import run_acceptance_corpus, run_grounding_benchmark
@@ -25,6 +26,7 @@ from tacit.investigation_contract import (
     GroundingStatus,
     InvestigationContract,
     InvestigationContractAssembler,
+    InvestigationRunType,
     ProvenanceRecord,
     load_investigation_contract_schema,
     stamp_fingerprints,
@@ -40,6 +42,7 @@ from tacit.models.schemas import (
     CulpritRanking,
     DashboardSpec,
     DashRequest,
+    DashResponse,
     EvidenceObservation,
     EvidenceObservationOutcome,
     EvidenceRequirement,
@@ -304,6 +307,7 @@ def test_captured_input_replay_rebuilds_and_counterfactual_creates_revision(tmp_
         mode=ReplayMode.COUNTERFACTUAL,
         changes=CounterfactualChanges(
             remove_observation_ids=["obs_01"],
+            reject_requirement_ids=["er_01"],
             add_context_chunks=[
                 ContextChunk(content="New runbook evidence", source="runbook:new", relevance_score=0.7)
             ],
@@ -313,6 +317,7 @@ def test_captured_input_replay_rebuilds_and_counterfactual_creates_revision(tmp_
     assert counterfactual is not None
     assert counterfactual.investigation.revision == 2
     assert counterfactual.observations == []
+    assert counterfactual.evidence_resolutions[0].status == "unresolved"
     assert counterfactual.candidate_rankings[0].score == 0.4
     assert counterfactual.artifact_contributions[0].artifact_ref == "runbook:new"
 
@@ -330,10 +335,15 @@ def test_approved_correction_creates_provenance_bearing_revision(tmp_path):
         created_by="reviewer",
     )
     assert candidate is not None
-    reviewed = store.review_knowledge_candidate(candidate.id, approved=True, reviewed_by="approver")
+    reviewed = store.review_knowledge_candidate(
+        investigation_id,
+        candidate.id,
+        approved=True,
+        reviewed_by="approver",
+    )
     assert reviewed is not None and reviewed.status.value == "approved"
 
-    corrected = store.apply_knowledge_candidate(candidate.id)
+    corrected = store.apply_knowledge_candidate(investigation_id, candidate.id)
 
     assert corrected is not None
     assert corrected.investigation.revision == 2
@@ -361,6 +371,81 @@ def test_legacy_migration_and_assessment_bundle_are_portable(tmp_path):
     with tarfile.open(fileobj=BytesIO(bundle), mode="r:gz") as archive:
         names = set(archive.getnames())
     assert {"manifest.json", "contract.json", "expected_outcomes.json", "revisions.json"} <= names
+
+
+def test_correction_ownership_is_checked_before_mutation(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    owner_id = store.start("Owner investigation")
+    wrong_id = store.start("Wrong investigation")
+    store.persist_contract_revision(_draft_contract(owner_id))
+    candidate = store.create_knowledge_candidate(
+        owner_id,
+        revision=None,
+        correction_text="Cache was saturated.",
+    )
+    assert candidate is not None
+
+    assert (
+        store.review_knowledge_candidate(
+            wrong_id,
+            candidate.id,
+            approved=True,
+            reviewed_by="reviewer",
+        )
+        is None
+    )
+    assert store.list_knowledge_candidates(owner_id)[0].status.value == "pending_review"
+    approved = store.review_knowledge_candidate(
+        owner_id,
+        candidate.id,
+        approved=True,
+        reviewed_by="reviewer",
+    )
+    assert approved is not None
+
+    assert store.apply_knowledge_candidate(wrong_id, candidate.id) is None
+    assert len(store.list_revisions(owner_id)) == 1
+    assert store.list_knowledge_candidates(owner_id)[0].status.value == "approved"
+
+
+def test_stale_correction_is_not_applied_to_a_newer_revision(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    candidate = store.create_knowledge_candidate(
+        investigation_id,
+        revision=1,
+        correction_text="Cache was saturated.",
+    )
+    assert candidate is not None
+    approved = store.review_knowledge_candidate(
+        investigation_id,
+        candidate.id,
+        approved=True,
+        reviewed_by="reviewer",
+    )
+    assert approved is not None
+    store.persist_contract_revision(_draft_contract(investigation_id), reason="refresh")
+
+    assert store.apply_knowledge_candidate(investigation_id, candidate.id) is None
+    assert len(store.list_revisions(investigation_id)) == 2
+    assert store.list_knowledge_candidates(investigation_id)[0].status.value == "approved"
+
+
+def test_run_completed_event_follows_revision_events(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    run_id = store.start_run(investigation_id, run_type=InvestigationRunType.INITIAL)
+    store.persist_contract_revision(_draft_contract(investigation_id), run_id=run_id)
+
+    before_completion = [event["event_type"] for event in store.list_events(investigation_id, run_id)]
+    assert before_completion[-1] == "revision_persisted"
+    assert "run_completed" not in before_completion
+
+    store.complete_run(run_id, status="completed")
+    after_completion = [event["event_type"] for event in store.list_events(investigation_id, run_id)]
+    assert after_completion[-1] == "run_completed"
+    assert after_completion.index("revision_persisted") < after_completion.index("run_completed")
 
 
 def test_grounding_benchmark_v1_gate():
@@ -744,6 +829,7 @@ def test_packaged_schema_matches_contract_model():
 def test_contract_api_routes_expose_revision_replay_and_correction_candidate(tmp_path, monkeypatch):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    wrong_investigation_id = store.start("Different investigation", user_id="api")
     draft = _draft_contract(investigation_id)
     persisted = store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
     monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
@@ -772,12 +858,26 @@ def test_contract_api_routes_expose_revision_replay_and_correction_candidate(tmp
     assert body["status"] == "pending_review"
     assert body["provenance"]["source_type"] == "human_correction"
 
+    wrong_review_response = client.post(
+        f"/api/v1/investigations/{wrong_investigation_id}/corrections/{body['id']}/review",
+        json={"approved": True, "reviewed_by": "approver"},
+    )
+    assert wrong_review_response.status_code == 404
+    assert store.list_knowledge_candidates(investigation_id)[0].status.value == "pending_review"
+
     review_response = client.post(
         f"/api/v1/investigations/{investigation_id}/corrections/{body['id']}/review",
         json={"approved": True, "reviewed_by": "approver"},
     )
     assert review_response.status_code == 200
     assert review_response.json()["status"] == "approved"
+
+    wrong_apply_response = client.post(
+        f"/api/v1/investigations/{wrong_investigation_id}/corrections/{body['id']}/apply"
+    )
+    assert wrong_apply_response.status_code == 409
+    assert len(store.list_revisions(investigation_id)) == 1
+    assert store.list_knowledge_candidates(investigation_id)[0].status.value == "approved"
 
     apply_response = client.post(f"/api/v1/investigations/{investigation_id}/corrections/{body['id']}/apply")
     assert apply_response.status_code == 200
@@ -811,3 +911,46 @@ def test_contract_api_rejects_unsupported_schema_in_history(tmp_path, monkeypatc
     response = TestClient(create_app()).get(f"/api/v1/investigations/{investigation_id}/contract")
 
     assert response.status_code == 404
+
+
+def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+
+    class FeedbackStore:
+        pass
+
+    deps = PipelineDependencies(
+        settings=object(),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: store,
+        feedback_store_factory=FeedbackStore,
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+    received: dict[str, object] = {}
+
+    async def fake_run_pipeline(request, supplied_deps=None, **kwargs):
+        received["request"] = request
+        received["deps"] = supplied_deps
+        received.update(kwargs)
+        return DashResponse(
+            dashboard_url="http://grafana/refreshed",
+            dashboard_uid="refreshed",
+            panel_count=1,
+            summary="Refreshed",
+            investigation_id=investigation_id,
+            investigation_revision=2,
+        )
+
+    monkeypatch.setattr("tacit.api.routes.history.run_pipeline", fake_run_pipeline)
+    app = create_app()
+    app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
+
+    response = TestClient(app).post(f"/api/v1/investigations/{investigation_id}/refresh")
+
+    assert response.status_code == 200
+    assert received["deps"] is deps
+    assert received["investigation_id"] == investigation_id
+    assert received["run_type"] == InvestigationRunType.REFRESH
