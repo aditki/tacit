@@ -198,12 +198,19 @@ class PipelineRecorder:
             try:
                 pipeline_status = str(kwargs.get("status", "success"))
                 succeeded = pipeline_status == "success"
+                cancelled = pipeline_status == "cancelled"
+                if succeeded:
+                    run_status, error_code = "completed", ""
+                elif cancelled:
+                    run_status, error_code = "cancelled", "pipeline_cancelled"
+                elif pipeline_status == "timeout":
+                    run_status, error_code = "failed", "pipeline_timeout"
+                else:
+                    run_status, error_code = "failed", "pipeline_failed"
                 self.history.complete_run(
                     self.run_id,
-                    status="completed" if succeeded else "failed",
-                    error_code=(
-                        "" if succeeded else ("pipeline_timeout" if pipeline_status == "timeout" else "pipeline_failed")
-                    ),
+                    status=run_status,
+                    error_code=error_code,
                     error_detail=str(kwargs.get("error", "")),
                 )
             except Exception:

@@ -78,9 +78,10 @@ check_untyped_defs = true
 packages = ["tacit"]
 
 [tool.hatch.build.targets.wheel.force-include]
-# Ship runtime YAML as package data so installed CLIs and PyInstaller binaries
+# Ship runtime resources as package data so installed CLIs and PyInstaller binaries
 # load the same bootstrap resources without depending on the working directory.
 "tacit/data/archetypes.yaml" = "tacit/data/archetypes.yaml"
+"tacit/data/grounding_benchmark_v1.json" = "tacit/data/grounding_benchmark_v1.json"
 "tacit/data/signals.yaml" = "tacit/data/signals.yaml"
 
 [tool.hatch.build.targets.sdist]

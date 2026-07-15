@@ -527,10 +527,13 @@ class InvestigationStore:
                     ),
                 )
             investigation_id = str(row["investigation_id"])
+        event_type = (
+            "run_completed" if status == "completed" else "run_cancelled" if status == "cancelled" else "run_failed"
+        )
         self.append_event(
             investigation_id,
             run_id,
-            "run_completed" if status == "completed" else "run_failed",
+            event_type,
             {"status": status, "error_code": error_code, "error_detail": error_detail},
         )
 
@@ -845,40 +848,44 @@ class InvestigationStore:
                 runtime_manifest=contract.runtime.model_dump(mode="json"),
             )
             return contract
-        rebuilt = rebuild_contract(snapshot, mode=mode, changes=changes)
-        self.append_event(
-            investigation_id,
-            run_id,
-            "replay_rebuilt_captured_inputs",
-            {
-                "revision": contract.investigation.revision,
-                "mode": mode.value,
-                "matched_output": rebuilt.runtime.output_fingerprint == contract.runtime.output_fingerprint,
-            },
-        )
-        if mode == ReplayMode.EXACT:
-            if rebuilt.runtime.output_fingerprint != contract.runtime.output_fingerprint:
-                detail = (
-                    f"Exact replay output fingerprint does not match investigation {investigation_id} "
-                    f"revision {contract.investigation.revision}"
-                )
+        try:
+            rebuilt = rebuild_contract(snapshot, mode=mode, changes=changes)
+            self.append_event(
+                investigation_id,
+                run_id,
+                "replay_rebuilt_captured_inputs",
+                {
+                    "revision": contract.investigation.revision,
+                    "mode": mode.value,
+                    "matched_output": rebuilt.runtime.output_fingerprint == contract.runtime.output_fingerprint,
+                },
+            )
+            if mode == ReplayMode.EXACT:
+                if rebuilt.runtime.output_fingerprint != contract.runtime.output_fingerprint:
+                    detail = (
+                        f"Exact replay output fingerprint does not match investigation {investigation_id} "
+                        f"revision {contract.investigation.revision}"
+                    )
+                    self.complete_run(
+                        run_id,
+                        status="failed",
+                        error_code="exact_replay_output_mismatch",
+                        error_detail=detail,
+                        runtime_manifest=rebuilt.runtime.model_dump(mode="json"),
+                    )
+                    raise ExactReplayMismatchError(detail)
                 self.complete_run(
                     run_id,
-                    status="failed",
-                    error_code="exact_replay_output_mismatch",
-                    error_detail=detail,
+                    status="completed",
                     runtime_manifest=rebuilt.runtime.model_dump(mode="json"),
                 )
-                raise ExactReplayMismatchError(detail)
-            self.complete_run(run_id, status="completed", runtime_manifest=rebuilt.runtime.model_dump(mode="json"))
-            return rebuilt
-        reason = "current-engine-replay" if mode == ReplayMode.CURRENT_ENGINE else "counterfactual-replay"
-        persisted_snapshot = (
-            apply_counterfactual(snapshot, changes or CounterfactualChanges())
-            if mode == ReplayMode.COUNTERFACTUAL
-            else snapshot
-        )
-        try:
+                return rebuilt
+            reason = "current-engine-replay" if mode == ReplayMode.CURRENT_ENGINE else "counterfactual-replay"
+            persisted_snapshot = (
+                apply_counterfactual(snapshot, changes or CounterfactualChanges())
+                if mode == ReplayMode.COUNTERFACTUAL
+                else snapshot
+            )
             persisted = self.persist_contract_revision(
                 rebuilt,
                 reason=reason,
@@ -887,6 +894,10 @@ class InvestigationStore:
                 run_id=run_id,
                 expected_parent_revision=contract.investigation.revision,
             )
+            self.complete_run(run_id, status="completed", runtime_manifest=persisted.runtime.model_dump(mode="json"))
+            return persisted
+        except ExactReplayMismatchError:
+            raise
         except StaleRevisionError as exc:
             self.complete_run(
                 run_id,
@@ -895,8 +906,14 @@ class InvestigationStore:
                 error_detail=str(exc),
             )
             raise
-        self.complete_run(run_id, status="completed", runtime_manifest=persisted.runtime.model_dump(mode="json"))
-        return persisted
+        except Exception as exc:
+            self.complete_run(
+                run_id,
+                status="failed",
+                error_code="replay_failed",
+                error_detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
 
     def compare_revisions(self, investigation_id: str, left: int, right: int) -> dict[str, Any] | None:
         left_contract = self.get_contract(investigation_id, left)
@@ -1175,6 +1192,7 @@ class InvestigationStore:
                     SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as succeeded,
                     SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) as failed,
                     SUM(CASE WHEN status='timeout' THEN 1 ELSE 0 END) as timed_out,
+                    SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) as cancelled,
                     AVG(total_time) as avg_time,
                     AVG(panel_count) as avg_panels,
                     AVG(metrics_catalog_size) as avg_catalog_size,

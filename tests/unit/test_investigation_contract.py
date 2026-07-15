@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tarfile
 import time
@@ -423,6 +424,27 @@ def test_exact_replay_fails_when_the_rebuilt_output_diverges(tmp_path):
     assert replay_run["error_code"] == "exact_replay_output_mismatch"
 
 
+def test_replay_rebuild_failure_closes_the_run(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    draft = _draft_contract(investigation_id)
+    store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+
+    def fail_rebuild(*args, **kwargs):
+        raise ValueError("snapshot is incompatible with the current assembler")
+
+    monkeypatch.setattr("tacit.history.rebuild_contract", fail_rebuild)
+
+    with pytest.raises(ValueError, match="snapshot is incompatible"):
+        store.replay_contract(investigation_id, mode=ReplayMode.EXACT)
+
+    replay_run = store.list_runs(investigation_id)[-1]
+    assert replay_run["status"] == "failed"
+    assert replay_run["error_code"] == "replay_failed"
+    assert "ValueError: snapshot is incompatible" in replay_run["error_detail"]
+    assert store.list_events(investigation_id, replay_run["run_id"])[-1]["event_type"] == "run_failed"
+
+
 def test_non_exact_replay_rejects_a_stale_base_revision(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?")
@@ -642,6 +664,84 @@ async def test_backend_factory_failure_completes_the_pipeline_run(tmp_path):
     assert resources_closed is True
 
 
+async def test_caller_cancellation_records_cancelled_not_timeout(tmp_path, monkeypatch):
+    class WaitingBackend:
+        name = "grafana"
+        query_language = "promql"
+
+        async def close(self):
+            return None
+
+    started = asyncio.Event()
+
+    async def waiting_classify(prompt):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("tacit.pipeline.classify_intent", waiting_classify)
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(pipeline_max_concurrent=1, pipeline_timeout_seconds=5),
+        backend_factory=lambda: [WaitingBackend()],
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    task = asyncio.create_task(run_pipeline(DashRequest(prompt="Investigate checkout", user_id="api"), deps))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    investigation = store.list_recent()[0]
+    run = store.list_runs(investigation["id"])[0]
+    assert investigation["status"] == "cancelled"
+    assert investigation["error"] == "Pipeline cancelled by caller"
+    assert run["status"] == "cancelled"
+    assert run["error_code"] == "pipeline_cancelled"
+    assert store.list_events(investigation["id"], run["run_id"])[-1]["event_type"] == "run_cancelled"
+    assert store.stats()["cancelled"] == 1
+    assert store.stats()["timed_out"] == 0
+
+
+async def test_pipeline_deadline_still_records_timeout(tmp_path, monkeypatch):
+    class WaitingBackend:
+        name = "grafana"
+        query_language = "promql"
+
+        async def close(self):
+            return None
+
+    async def waiting_classify(prompt):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("tacit.pipeline.classify_intent", waiting_classify)
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(pipeline_max_concurrent=1, pipeline_timeout_seconds=0.01),
+        backend_factory=lambda: [WaitingBackend()],
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    response = await run_pipeline(DashRequest(prompt="Investigate checkout", user_id="api"), deps)
+
+    investigation = store.list_recent()[0]
+    run = store.list_runs(investigation["id"])[0]
+    assert "timed out" in response.summary
+    assert investigation["status"] == "timeout"
+    assert run["status"] == "failed"
+    assert run["error_code"] == "pipeline_timeout"
+
+
 async def test_successful_refresh_only_advances_the_legacy_row_revision_pointer(tmp_path):
     class PublishedBackend:
         name = "grafana"
@@ -836,7 +936,8 @@ def test_grounding_benchmark_counts_suspect_output_as_unsafe_when_abstention_is_
     result = run_grounding_benchmark()
 
     assert result["unsafe_assertion_rate"] == 1
-    assert result["trustworthy_answer_rate"] < 1
+    assert result["trustworthy_answer_rate"] == 0
+    assert 0 <= result["trustworthy_answer_rate"] <= 1
     assert result["passed"] is False
 
 
@@ -1166,6 +1267,13 @@ def test_contract_records_current_package_version():
     assert __version__ == pyproject["project"]["version"]
     assert contract.runtime.engine_version == __version__
     assert next(record for record in contract.provenance if record.id == "prov_runtime").source_version == __version__
+
+
+def test_wheel_configuration_includes_the_grounding_benchmark_corpus():
+    pyproject = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
+    force_include = pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
+
+    assert force_include["tacit/data/grounding_benchmark_v1.json"] == "tacit/data/grounding_benchmark_v1.json"
 
 
 async def test_published_dashboard_succeeds_when_contract_persistence_fails():

@@ -177,6 +177,7 @@
     .badge-success { background: #064e3b; color: #34d399; }
     .badge-failed { background: #450a0a; color: #fca5a5; }
     .badge-timeout { background: #451a03; color: #fbbf24; }
+    .badge-cancelled { background: #27272a; color: #d4d4d8; }
     .badge-running { background: #1e1b4b; color: #a5b4fc; }
     .hist-detail { background: #0f1117; border: 1px solid #2d3040; border-radius: 8px; padding: 1rem; margin-top: 0.75rem; }
     .hist-detail h4 { font-size: 0.8rem; color: #6b7280; text-transform: uppercase; margin: 0.75rem 0 0.3rem; letter-spacing: 0.04em; }
@@ -899,6 +900,7 @@
             <div class="stat-card"><div class="stat-value" style="color:#34d399">${s.succeeded || 0}</div><div class="stat-label">Succeeded</div></div>
             <div class="stat-card"><div class="stat-value" style="color:#fca5a5">${s.failed || 0}</div><div class="stat-label">Failed</div></div>
             <div class="stat-card"><div class="stat-value" style="color:#fbbf24">${s.timed_out || 0}</div><div class="stat-label">Timed out</div></div>
+            <div class="stat-card"><div class="stat-value">${s.cancelled || 0}</div><div class="stat-label">Cancelled</div></div>
             <div class="stat-card"><div class="stat-value">${s.avg_time ? s.avg_time.toFixed(1) + 's' : '—'}</div><div class="stat-label">Avg time</div></div>
             <div class="stat-card"><div class="stat-value">${s.avg_panels ? s.avg_panels.toFixed(1) : '—'}</div><div class="stat-label">Avg panels</div></div>
             <div class="stat-card"><div class="stat-value">${s.avg_catalog_size ? Math.round(s.avg_catalog_size) : '—'}</div><div class="stat-label">Avg catalog size</div></div>
@@ -910,7 +912,7 @@
     }
 
     function statusBadge(status) {
-      const cls = { success: 'badge-success', failed: 'badge-failed', timeout: 'badge-timeout', running: 'badge-running' }[status] || 'badge-running';
+      const cls = { success: 'badge-success', failed: 'badge-failed', timeout: 'badge-timeout', cancelled: 'badge-cancelled', running: 'badge-running' }[status] || 'badge-running';
       return `<span class="badge ${cls}">${status}</span>`;
     }
 

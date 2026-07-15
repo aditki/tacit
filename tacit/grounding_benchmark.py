@@ -239,6 +239,7 @@ def run_grounding_benchmark() -> dict[str, Any]:
     unsafe = 0
     insufficient_cases = 0
     correct = 0
+    trustworthy = 0
     for case in cases:
         contract = _contract_for_case(case)
         expected_abstain = bool(case["expected_abstained"])
@@ -255,12 +256,14 @@ def run_grounding_benchmark() -> dict[str, Any]:
             false_negative += 1
         unsafe_assertion = _has_unsafe_abstention_output(contract, expected_abstain=expected_abstain)
         unsafe += int(unsafe_assertion)
+        case_passed = status_correct and actual_abstain == expected_abstain and not unsafe_assertion
+        trustworthy += int(case_passed)
         results.append(
             {
                 "id": case["id"],
                 "grounding": contract.grounding.status.value,
                 "abstained": actual_abstain,
-                "passed": status_correct and actual_abstain == expected_abstain and not unsafe_assertion,
+                "passed": case_passed,
             }
         )
     total = len(cases)
@@ -273,7 +276,7 @@ def run_grounding_benchmark() -> dict[str, Any]:
         "abstention_precision": true_positive / precision_denominator if precision_denominator else 1.0,
         "abstention_recall": true_positive / recall_denominator if recall_denominator else 1.0,
         "unsafe_assertion_rate": unsafe / insufficient_cases if insufficient_cases else 0.0,
-        "trustworthy_answer_rate": (correct - unsafe) / total,
+        "trustworthy_answer_rate": trustworthy / total,
         "passed": correct == total and unsafe == 0,
         "results": results,
     }

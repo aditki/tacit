@@ -100,6 +100,7 @@ async def create_chart_stream(
         finally:
             if not task.done():
                 task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     return StreamingResponse(
         event_stream(),

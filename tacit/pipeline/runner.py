@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import suppress
+from dataclasses import dataclass
 
 import structlog
 
@@ -56,6 +58,12 @@ _pipeline_semaphore: asyncio.Semaphore | None = None
 _pipeline_semaphore_limit: int | None = None
 
 
+@dataclass
+class _PipelineCancellation:
+    status: str = "cancelled"
+    error: str = "Pipeline cancelled"
+
+
 def _default_dependencies() -> PipelineDependencies:
     """Build default dependencies through pipeline-level patch points.
 
@@ -93,17 +101,29 @@ async def run_pipeline(
     sem = _get_semaphore(runtime_settings.pipeline_max_concurrent)
     try:
         async with sem:
+            cancellation = _PipelineCancellation()
+            pipeline_task = asyncio.create_task(
+                _run_pipeline_inner(
+                    request,
+                    deps,
+                    investigation_id=investigation_id,
+                    run_type=run_type,
+                    cancellation=cancellation,
+                )
+            )
             try:
-                return await asyncio.wait_for(
-                    _run_pipeline_inner(
-                        request,
-                        deps,
-                        investigation_id=investigation_id,
-                        run_type=run_type,
-                    ),
+                done, _ = await asyncio.wait(
+                    {pipeline_task},
                     timeout=runtime_settings.pipeline_timeout_seconds,
                 )
-            except TimeoutError:
+                if pipeline_task in done:
+                    return pipeline_task.result()
+
+                cancellation.status = "timeout"
+                cancellation.error = "Pipeline timed out"
+                pipeline_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pipeline_task
                 logger.error(
                     "pipeline_timeout",
                     user=request.user_id,
@@ -116,6 +136,14 @@ async def run_pipeline(
                     summary=f"Pipeline timed out after {runtime_settings.pipeline_timeout_seconds}s. "
                     "Try a more specific query or check datasource connectivity.",
                 )
+            except asyncio.CancelledError:
+                cancellation.status = "cancelled"
+                cancellation.error = "Pipeline cancelled by caller"
+                if not pipeline_task.done():
+                    pipeline_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pipeline_task
+                raise
     finally:
         unbind_request_id()
 
@@ -126,6 +154,7 @@ async def _run_pipeline_inner(
     *,
     investigation_id: str | None = None,
     run_type: InvestigationRunType = InvestigationRunType.INITIAL,
+    cancellation: _PipelineCancellation | None = None,
 ) -> DashResponse:
     """Inner pipeline logic (wrapped with timeout + semaphore above).
 
@@ -394,9 +423,10 @@ async def _run_pipeline_inner(
         )
 
     except asyncio.CancelledError:
+        cancellation = cancellation or _PipelineCancellation()
         runtime.recorder.finish(
-            status="timeout",
-            error="Pipeline timed out",
+            status=cancellation.status,
+            error=cancellation.error,
             timings=runtime.timings,
             total_time=time.monotonic() - runtime.started_at,
         )
