@@ -992,7 +992,7 @@ class InvestigationContractAssembler:
         else:
             status = GroundingStatus.INDETERMINATE
 
-        leading = rankings[0] if rankings else None
+        leading = rankings[0] if rankings and not ranking.abstained else None
         conclusion = "No culprit is supported by the captured evidence."
         unsafe_conclusions: list[str] = []
         if leading:

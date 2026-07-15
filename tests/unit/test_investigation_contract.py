@@ -642,6 +642,91 @@ async def test_backend_factory_failure_completes_the_pipeline_run(tmp_path):
     assert resources_closed is True
 
 
+async def test_successful_refresh_only_advances_the_legacy_row_revision_pointer(tmp_path):
+    class PublishedBackend:
+        name = "grafana"
+        query_language = "promql"
+
+        async def publish(self, dashboard_spec):
+            return PublishResult(url="http://grafana/refreshed", uid="refreshed", backend_name=self.name)
+
+    class FeedbackStore:
+        def record_provenance(self, **kwargs):
+            return None
+
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Original prompt", user_id="api")
+    store.record_intent(investigation_id, summary="Original intent", services=["legacy-service"])
+    store.record_queries(
+        investigation_id,
+        metrics_selected=["legacy_metric"],
+        generated_queries=[{"expr": "legacy_metric"}],
+        panel_count=1,
+        path_used="archetype",
+    )
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    store.finish(
+        investigation_id,
+        status="success",
+        dashboard_uid="original",
+        dashboard_url="http://grafana/original",
+    )
+    run_id = store.start_run(investigation_id, run_type=InvestigationRunType.REFRESH, base_revision=1)
+    recorder = PipelineRecorder(
+        store,
+        investigation_id,
+        run_id=run_id,
+        record_investigation_updates=False,
+    )
+    refreshed_dashboard = DashboardSpec(
+        title="Refreshed dashboard",
+        panels=[PanelSpec(title="New traffic", queries=[PanelQuery(expr="new_metric", datasource_uid="prom")])],
+    )
+    deps = PipelineDependencies(
+        settings=object(),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: store,
+        feedback_store_factory=FeedbackStore,
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    response = await complete_pipeline(
+        request=DashRequest(prompt="Refreshed prompt", user_id="api"),
+        deps=deps,
+        backends=[PublishedBackend()],
+        dashboard_spec=refreshed_dashboard,
+        intent=Intent(summary="Refreshed intent", domain="application", services=["new-service"]),
+        metric_catalog=[],
+        datasource_catalog=[],
+        ranked_archetypes_present=False,
+        validation_warnings=["new warning"],
+        panels_before=1,
+        evidence_requirements=[],
+        evidence_resolutions=[],
+        evidence_observations=[],
+        culprit_ranking=CulpritRanking(),
+        run_type=InvestigationRunType.REFRESH,
+        base_revision=1,
+        timings={},
+        recorder=recorder,
+        token_usage=TokenUsage(),
+        started_at=time.monotonic(),
+    )
+
+    legacy = store.get(investigation_id)
+    assert response.investigation_revision == 2
+    assert legacy is not None
+    assert legacy["current_revision"] == 2
+    assert legacy["prompt"] == "Original prompt"
+    assert legacy["intent_summary"] == "Original intent"
+    assert legacy["generated_queries"] == [{"expr": "legacy_metric"}]
+    assert legacy["validation_warnings"] == []
+    assert legacy["dashboard_uid"] == "original"
+    assert legacy["dashboard_url"] == "http://grafana/original"
+    assert store.list_runs(investigation_id)[-1]["status"] == "completed"
+
+
 async def test_refresh_persistence_rejects_a_base_that_advanced_during_the_run(tmp_path):
     class PublishedBackend:
         name = "grafana"
@@ -731,6 +816,28 @@ def test_grounding_benchmark_v1_gate():
     assert result["cases"] == 40
     assert result["unsafe_assertion_rate"] == 0
     assert result["passed"] is True
+
+
+def test_grounding_benchmark_counts_suspect_output_as_unsafe_when_abstention_is_expected(monkeypatch):
+    contract = _draft_contract()
+    unsafe_grounding = contract.grounding.model_copy(
+        update={
+            "abstained": True,
+            "unsafe_conclusions": ["service:checkout caused the incident."],
+            "maximum_trustworthy_conclusion": {
+                "text": "service:checkout is the leading suspect, but causality is not proven.",
+                "causal_status": "suspect_not_proven",
+            },
+        }
+    )
+    unsafe_contract = contract.model_copy(update={"grounding": unsafe_grounding})
+    monkeypatch.setattr("tacit.grounding_benchmark._contract_for_case", lambda case: unsafe_contract)
+
+    result = run_grounding_benchmark()
+
+    assert result["unsafe_assertion_rate"] == 1
+    assert result["trustworthy_answer_rate"] < 1
+    assert result["passed"] is False
 
 
 def test_contract_rejects_broken_ranking_references():
@@ -845,6 +952,48 @@ def test_negative_evidence_marks_grounding_and_candidate_as_contradicted():
     assert contract.grounding.status == GroundingStatus.CONTRADICTED
     assert contract.grounding.contradicted_claims == ["obs_01"]
     assert contract.candidate_rankings[0].contradicting_observation_refs == ["obs_01"]
+
+
+def test_abstained_grounding_does_not_surface_a_leading_suspect():
+    ranking = CulpritRanking(
+        abstained=True,
+        abstention_reason="no_supported_runtime_evidence",
+        candidates=[
+            CulpritCandidate(
+                rank=1,
+                suspect="checkout",
+                suspect_type="service",
+                score=0.7,
+                contextual_reasons=["Checkout owns the request path."],
+            )
+        ],
+    )
+    contract = _draft_contract(
+        evidence_resolutions=[
+            EvidenceResolution(
+                requirement_id="er_01",
+                status=EvidenceResolutionStatus.UNRESOLVED,
+                reason_code="no_runtime_telemetry",
+            )
+        ],
+        evidence_observations=[
+            EvidenceObservation(
+                requirement_id="er_01",
+                outcome=EvidenceObservationOutcome.MISSING_EVIDENCE,
+                rejection_reason="no_runtime_telemetry",
+            )
+        ],
+        culprit_ranking=ranking,
+    )
+
+    assert contract.candidate_rankings[0].candidate_ref == "service:checkout"
+    assert contract.grounding.abstained is True
+    assert contract.grounding.status == GroundingStatus.INSUFFICIENT_EVIDENCE
+    assert contract.grounding.unsafe_conclusions == []
+    assert contract.grounding.maximum_trustworthy_conclusion == {
+        "text": "No culprit is supported by the captured evidence.",
+        "causal_status": "insufficient_evidence",
+    }
 
 
 def test_candidate_observation_refs_are_scoped_to_declared_evidence():

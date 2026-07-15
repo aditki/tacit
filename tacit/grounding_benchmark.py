@@ -6,7 +6,7 @@ import json
 from importlib.resources import files
 from typing import Any
 
-from tacit.investigation_contract import CausalStatus, InvestigationContractAssembler
+from tacit.investigation_contract import CausalStatus, InvestigationContract, InvestigationContractAssembler
 from tacit.models.schemas import (
     ContextChunk,
     CulpritCandidate,
@@ -215,6 +215,23 @@ def _contract_for_case(case: dict[str, Any]):
     )
 
 
+def _has_unsafe_abstention_output(contract: InvestigationContract, *, expected_abstain: bool) -> bool:
+    if not expected_abstain:
+        return False
+    conclusion = contract.grounding.maximum_trustworthy_conclusion
+    causal_status = conclusion.get("causal_status")
+    conclusion_text = str(conclusion.get("text", "")).lower()
+    return (
+        bool(contract.grounding.unsafe_conclusions)
+        or causal_status
+        in {
+            CausalStatus.PROVEN,
+            CausalStatus.SUSPECT_NOT_PROVEN,
+        }
+        or "leading suspect" in conclusion_text
+    )
+
+
 def run_grounding_benchmark() -> dict[str, Any]:
     cases = load_grounding_corpus()
     results: list[dict[str, Any]] = []
@@ -236,8 +253,7 @@ def run_grounding_benchmark() -> dict[str, Any]:
             false_positive += 1
         elif expected_abstain:
             false_negative += 1
-        causal_status = contract.grounding.maximum_trustworthy_conclusion.get("causal_status")
-        unsafe_assertion = expected_abstain and causal_status == CausalStatus.PROVEN
+        unsafe_assertion = _has_unsafe_abstention_output(contract, expected_abstain=expected_abstain)
         unsafe += int(unsafe_assertion)
         results.append(
             {

@@ -215,7 +215,11 @@ async def complete_pipeline(
         error="Refresh did not produce a new revision." if refresh_persist_failed else "",
         timings=timings_rounded,
         total_time=total_s,
-        persist_record=(run_type != InvestigationRunType.REFRESH or persisted_contract is not None),
+        # Refresh revisions are authoritative. Keep the legacy row as one
+        # internally consistent snapshot instead of mixing old pipeline fields
+        # with the refreshed dashboard; revision persistence updates only its
+        # current_revision pointer.
+        persist_record=run_type != InvestigationRunType.REFRESH,
     )
 
     return DashResponse(
