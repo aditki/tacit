@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import inspect
+import pkgutil
 from pathlib import Path
 
 from pydantic import BaseModel, RootModel
@@ -24,11 +25,18 @@ ACTIVE_CONTRACT_MODULES = {
 
 def _has_pydantic_model(module_name: str) -> bool:
     module = importlib.import_module(module_name)
-    for _, value in inspect.getmembers(module, inspect.isclass):
-        if value.__module__ != module_name:
-            continue
-        if issubclass(value, (BaseModel, RootModel)):
-            return True
+
+    modules = [module]
+    if hasattr(module, "__path__"):
+        modules.extend(
+            importlib.import_module(child.name)
+            for child in pkgutil.walk_packages(module.__path__, prefix=f"{module_name}.")
+        )
+
+    for candidate in modules:
+        for _, value in inspect.getmembers(candidate, inspect.isclass):
+            if value.__module__ == candidate.__name__ and issubclass(value, (BaseModel, RootModel)):
+                return True
     return False
 
 

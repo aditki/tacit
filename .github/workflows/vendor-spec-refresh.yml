@@ -88,7 +88,6 @@ jobs:
 
             if uvx --from datamodel-code-generator datamodel-codegen \
               --input "${input_path}" \
-              --input-file-type openapi \
               --output "${model_file}" \
               --output-model-type pydantic_v2.BaseModel \
               --formatters black isort >"${generator_log}" 2>&1; then
@@ -104,7 +103,6 @@ jobs:
               rm -f "${model_file}"
               uvx --from datamodel-code-generator datamodel-codegen \
                 --input "${input_path}" \
-                --input-file-type openapi \
                 --output "${model_package}" \
                 --output-model-type pydantic_v2.BaseModel \
                 --formatters black isort
