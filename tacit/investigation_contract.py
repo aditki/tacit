@@ -289,6 +289,7 @@ class InvestigationContract(BaseModel):
         for observation in self.observations:
             _require_known_refs(observation.query_refs, query_ids, f"observation {observation.id}")
             _require_known_refs(observation.provenance_refs, provenance_ids, f"observation {observation.id}")
+        _require_known_refs(self.grounding.missing_observation_refs, observation_ids, "grounding")
         for contribution in self.artifact_contributions:
             if not contribution.provenance_refs:
                 raise ValueError(f"contribution {contribution.id} must include provenance")
@@ -356,13 +357,26 @@ def input_fingerprint(contract: InvestigationContract) -> str:
 
 
 def output_fingerprint(contract: InvestigationContract) -> str:
+    return fingerprint(normalized_output_payload(contract))
+
+
+def normalized_output_payload(contract: InvestigationContract) -> dict[str, Any]:
+    """Return contract output with revision-local timestamps removed."""
     data = contract.model_dump(mode="json", by_alias=True)
     data["investigation"]["revision"] = 0
     data["investigation"]["parent_revision"] = None
     data["investigation"]["created_at"] = ""
     data["investigation"]["completed_at"] = ""
+    for provenance in data["provenance"]:
+        if provenance["source_type"] not in {"request", "runtime"}:
+            continue
+        provenance["ingested_at"] = None
+        provenance["observed_at"] = None
+        freshness = provenance.get("freshness")
+        if isinstance(freshness, dict) and "last_verified_at" in freshness:
+            freshness["last_verified_at"] = ""
     data["runtime"]["output_fingerprint"] = ""
-    return fingerprint(data)
+    return data
 
 
 def stamp_fingerprints(contract: InvestigationContract) -> InvestigationContract:
@@ -400,10 +414,15 @@ class InvestigationContractAssembler:
         completed_at = completed_at or now
         provenance = self._provenance(requester=request.user_id or request.channel_id or "pipeline", observed_at=now)
         queries = self._queries(dashboard_spec)
-        query_refs = [query.id for query in queries]
         requirements = self._requirements(evidence_requirements, evidence_resolutions, provenance[1].id)
         resolutions = self._resolutions(evidence_resolutions, provenance[1].id)
-        observations = self._observations(evidence_observations, intent, query_refs, provenance[1].id)
+        observations = self._observations(
+            evidence_observations,
+            intent,
+            dashboard_spec,
+            queries,
+            provenance[1].id,
+        )
         rankings = self._rankings(culprit_ranking, observations, requirements)
         grounding = self._grounding(culprit_ranking, observations, requirements, rankings)
         decision_log = self._decision_log(resolutions, rankings, grounding, dashboard_uid)
@@ -561,10 +580,24 @@ class InvestigationContractAssembler:
         self,
         observations: list[EvidenceObservation],
         intent: Intent,
-        query_refs: list[str],
+        dashboard_spec: DashboardSpec,
+        queries: list[QueryRecord],
         provenance_ref: str,
     ) -> list[ObservationContract]:
         entity = f"service:{intent.services[0]}" if intent.services else ""
+        exact_query_refs: dict[tuple[str, str, str], str] = {}
+        datasource_query_refs: dict[tuple[str, str], str] = {}
+        expression_query_refs: dict[str, str] = {}
+        query_index = 0
+        for panel in dashboard_spec.panels:
+            for panel_query in panel.queries:
+                query_record = queries[query_index]
+                expression = panel_query.expr.strip()
+                exact_query_refs.setdefault((panel.title, expression, panel_query.datasource_uid), query_record.id)
+                datasource_query_refs.setdefault((expression, panel_query.datasource_uid), query_record.id)
+                expression_query_refs.setdefault(expression, query_record.id)
+                query_index += 1
+
         records: list[ObservationContract] = []
         for index, observation in enumerate(observations, start=1):
             if observation.outcome == EvidenceObservationOutcome.SUPPORTED_OBSERVATION:
@@ -579,9 +612,15 @@ class InvestigationContractAssembler:
             else:
                 status = "missing"
                 statement = f"Evidence requirement {observation.requirement_id} is missing validated telemetry."
-            query_ref = []
-            if observation.query and query_refs:
-                query_ref = query_refs[:1]
+            query_ref: list[str] = []
+            if observation.query:
+                expression = observation.query.strip()
+                matched_ref = exact_query_refs.get(
+                    (observation.panel_title, expression, observation.datasource_uid)
+                ) or datasource_query_refs.get((expression, observation.datasource_uid))
+                matched_ref = matched_ref or expression_query_refs.get(expression)
+                if matched_ref:
+                    query_ref = [matched_ref]
             records.append(
                 ObservationContract(
                     id=f"obs_{index:02d}",
@@ -611,6 +650,7 @@ class InvestigationContractAssembler:
         requirements: list[EvidenceRequirementContract],
     ) -> list[CandidateRankingContract]:
         supported_obs = [obs.id for obs in observations if obs.status == "observed"]
+        contradicted_obs = [obs.id for obs in observations if obs.status == "contradicted"]
         missing_requirements = [
             req.id for req in requirements if req.resolution_status != EvidenceResolutionStatus.RESOLVED
         ]
@@ -628,6 +668,7 @@ class InvestigationContractAssembler:
                     score=candidate.score,
                     causal_status=CausalStatus.SUSPECT_NOT_PROVEN,
                     supporting_observation_refs=supported_obs,
+                    contradicting_observation_refs=contradicted_obs,
                     missing_requirement_refs=candidate_missing,
                     contextual_reasons=candidate.contextual_reasons,
                     runtime_evidence=candidate.runtime_evidence,
@@ -643,11 +684,16 @@ class InvestigationContractAssembler:
         rankings: list[CandidateRankingContract],
     ) -> GroundingContract:
         supported = [obs.id for obs in observations if obs.status == "observed"]
-        missing = [req.id for req in requirements if req.resolution_status != EvidenceResolutionStatus.RESOLVED]
-        if ranking.abstained or not rankings:
+        contradicted = [obs.id for obs in observations if obs.status == "contradicted"]
+        missing = [obs.id for obs in observations if obs.status == "missing"]
+        ambiguous = [obs.id for obs in observations if obs.status == "inferred"]
+        unresolved = [req.id for req in requirements if req.resolution_status != EvidenceResolutionStatus.RESOLVED]
+        if contradicted:
+            status = GroundingStatus.CONTRADICTED
+        elif ranking.abstained or not rankings:
             status = GroundingStatus.INSUFFICIENT_EVIDENCE
-        elif missing:
-            status = GroundingStatus.PARTIALLY_SUPPORTED
+        elif missing or ambiguous or unresolved:
+            status = GroundingStatus.PARTIALLY_SUPPORTED if supported else GroundingStatus.INSUFFICIENT_EVIDENCE
         elif supported:
             status = GroundingStatus.SUPPORTED
         else:
@@ -664,7 +710,8 @@ class InvestigationContractAssembler:
             status=status,
             confidence={"level": ranking.mode.value if rankings else "none", "score": None},
             supported_claims=supported,
-            unsupported_claims=[] if supported else ["culprit_identified"],
+            unsupported_claims=ambiguous or ([] if supported else ["culprit_identified"]),
+            contradicted_claims=contradicted,
             missing_observation_refs=missing,
             unsafe_to_conclude=status != GroundingStatus.SUPPORTED or bool(rankings),
             unsafe_conclusions=unsafe_conclusions,

@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import time
+import tomllib
+from datetime import UTC, datetime
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from tacit import __version__
+from tacit.agents.providers.base import TokenUsage
 from tacit.api.app import create_app
+from tacit.backends.base import PublishResult
+from tacit.dependencies import PipelineDependencies
 from tacit.history import InvestigationStore
 from tacit.investigation_contract import (
     SCHEMA_ID,
+    GroundingStatus,
     InvestigationContract,
     InvestigationContractAssembler,
+    ProvenanceRecord,
     load_investigation_contract_schema,
+    stamp_fingerprints,
 )
 from tacit.models.schemas import (
     CulpritCandidate,
@@ -27,24 +39,21 @@ from tacit.models.schemas import (
     PanelSpec,
     SignalType,
 )
+from tacit.pipeline.completion import complete_pipeline
+from tacit.pipeline.recording import PipelineRecorder
 
 
-def _draft_contract(investigation_id: str = "inv_contract_test") -> InvestigationContract:
-    return InvestigationContractAssembler().from_pipeline(
-        investigation_id=investigation_id,
-        revision=0,
-        parent_revision=None,
-        request=DashRequest(prompt="Why did checkout latency increase?", user_id="sdet"),
-        intent=Intent(
-            summary="Investigate checkout latency",
-            domain="application",
-            services=["checkout"],
-            signals=[SignalType.METRICS],
-            keywords=["latency"],
-            timerange="30m",
-            problem_type="latency_investigation",
-        ),
-        dashboard_spec=DashboardSpec(
+def _draft_contract(
+    investigation_id: str = "inv_contract_test",
+    *,
+    dashboard_spec: DashboardSpec | None = None,
+    evidence_requirements: list[EvidenceRequirement] | None = None,
+    evidence_resolutions: list[EvidenceResolution] | None = None,
+    evidence_observations: list[EvidenceObservation] | None = None,
+    culprit_ranking: CulpritRanking | None = None,
+) -> InvestigationContract:
+    if dashboard_spec is None:
+        dashboard_spec = DashboardSpec(
             title="Checkout latency",
             panels=[
                 PanelSpec(
@@ -61,8 +70,9 @@ def _draft_contract(investigation_id: str = "inv_contract_test") -> Investigatio
                     ],
                 )
             ],
-        ),
-        evidence_requirements=[
+        )
+    if evidence_requirements is None:
+        evidence_requirements = [
             EvidenceRequirement(
                 id="er_01",
                 evidence_type="metric",
@@ -71,8 +81,9 @@ def _draft_contract(investigation_id: str = "inv_contract_test") -> Investigatio
                 service_scope=["checkout"],
                 source="symptom_confirmation",
             )
-        ],
-        evidence_resolutions=[
+        ]
+    if evidence_resolutions is None:
+        evidence_resolutions = [
             EvidenceResolution(
                 requirement_id="er_01",
                 status=EvidenceResolutionStatus.RESOLVED,
@@ -83,8 +94,9 @@ def _draft_contract(investigation_id: str = "inv_contract_test") -> Investigatio
                 query_language="promql",
                 semantic_score=0.92,
             )
-        ],
-        evidence_observations=[
+        ]
+    if evidence_observations is None:
+        evidence_observations = [
             EvidenceObservation(
                 requirement_id="er_01",
                 outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
@@ -96,8 +108,9 @@ def _draft_contract(investigation_id: str = "inv_contract_test") -> Investigatio
                 non_empty=True,
                 survived=True,
             )
-        ],
-        culprit_ranking=CulpritRanking(
+        ]
+    if culprit_ranking is None:
+        culprit_ranking = CulpritRanking(
             abstained=False,
             abstention_reason="",
             telemetry_status="evidenced",
@@ -111,7 +124,26 @@ def _draft_contract(investigation_id: str = "inv_contract_test") -> Investigatio
                     runtime_evidence=["request_latency"],
                 )
             ],
+        )
+    return InvestigationContractAssembler().from_pipeline(
+        investigation_id=investigation_id,
+        revision=0,
+        parent_revision=None,
+        request=DashRequest(prompt="Why did checkout latency increase?", user_id="sdet"),
+        intent=Intent(
+            summary="Investigate checkout latency",
+            domain="application",
+            services=["checkout"],
+            signals=[SignalType.METRICS],
+            keywords=["latency"],
+            timerange="30m",
+            problem_type="latency_investigation",
         ),
+        dashboard_spec=dashboard_spec,
+        evidence_requirements=evidence_requirements,
+        evidence_resolutions=evidence_resolutions,
+        evidence_observations=evidence_observations,
+        culprit_ranking=culprit_ranking,
         dashboard_url="http://grafana/d/checkout",
         dashboard_uid="checkout",
     )
@@ -160,6 +192,232 @@ def test_contract_rejects_broken_ranking_references():
 
     with pytest.raises(ValidationError):
         InvestigationContract.model_validate(payload)
+
+
+def test_observation_references_its_matching_query():
+    first_query = "rate(http_requests_total[5m])"
+    second_query = "rate(http_request_errors_total[5m])"
+    dashboard = DashboardSpec(
+        title="Checkout health",
+        panels=[
+            PanelSpec(title="Traffic", queries=[PanelQuery(expr=first_query, datasource_uid="prom")]),
+            PanelSpec(title="Errors", queries=[PanelQuery(expr=second_query, datasource_uid="prom")]),
+        ],
+    )
+    observation = EvidenceObservation(
+        requirement_id="er_01",
+        outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+        panel_title="Errors",
+        query=second_query,
+        datasource_uid="prom",
+        valid_query=True,
+        non_empty=True,
+        survived=True,
+    )
+
+    contract = _draft_contract(dashboard_spec=dashboard, evidence_observations=[observation])
+
+    assert contract.observations[0].query_refs == ["query_02"]
+
+
+def test_grounding_uses_observation_ids_for_missing_evidence():
+    requirement = EvidenceRequirement(id="er_missing", evidence_type="metric", signal_type="errors")
+    resolution = EvidenceResolution(
+        requirement_id="er_missing",
+        status=EvidenceResolutionStatus.UNRESOLVED,
+        reason_code="metric_not_found",
+    )
+    observation = EvidenceObservation(
+        requirement_id="er_missing",
+        outcome=EvidenceObservationOutcome.MISSING_EVIDENCE,
+        rejection_reason="metric_not_found",
+    )
+
+    contract = _draft_contract(
+        evidence_requirements=[requirement],
+        evidence_resolutions=[resolution],
+        evidence_observations=[observation],
+    )
+
+    assert contract.grounding.missing_observation_refs == ["obs_01"]
+    assert contract.grounding.status == GroundingStatus.INSUFFICIENT_EVIDENCE
+
+
+def test_negative_evidence_marks_grounding_and_candidate_as_contradicted():
+    observation = EvidenceObservation(
+        requirement_id="er_01",
+        outcome=EvidenceObservationOutcome.NEGATIVE_EVIDENCE,
+        panel_title="p95 latency",
+        query="histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+        datasource_uid="prom",
+        valid_query=True,
+        non_empty=True,
+        survived=True,
+    )
+
+    contract = _draft_contract(evidence_observations=[observation])
+
+    assert contract.grounding.status == GroundingStatus.CONTRADICTED
+    assert contract.grounding.contradicted_claims == ["obs_01"]
+    assert contract.candidate_rankings[0].contradicting_observation_refs == ["obs_01"]
+
+
+def test_missing_observation_prevents_supported_grounding_after_resolution():
+    requirements = [
+        EvidenceRequirement(id="er_supported", evidence_type="metric", signal_type="latency"),
+        EvidenceRequirement(id="er_empty", evidence_type="metric", signal_type="errors"),
+    ]
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirement.id,
+            status=EvidenceResolutionStatus.RESOLVED,
+            reason_code="metadata_inference",
+            metric=requirement.signal_type,
+            datasource_uid="prom",
+        )
+        for requirement in requirements
+    ]
+    observations = [
+        EvidenceObservation(
+            requirement_id="er_supported",
+            outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+            valid_query=True,
+            non_empty=True,
+            survived=True,
+        ),
+        EvidenceObservation(
+            requirement_id="er_empty",
+            outcome=EvidenceObservationOutcome.MISSING_EVIDENCE,
+            valid_query=True,
+            non_empty=False,
+            survived=False,
+            rejection_reason="empty_result",
+        ),
+    ]
+
+    contract = _draft_contract(
+        evidence_requirements=requirements,
+        evidence_resolutions=resolutions,
+        evidence_observations=observations,
+    )
+
+    assert contract.grounding.status == GroundingStatus.PARTIALLY_SUPPORTED
+    assert contract.grounding.missing_observation_refs == ["obs_02"]
+
+
+def test_output_comparison_ignores_per_run_provenance_timestamps(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    monkeypatch.setattr("tacit.investigation_contract.utc_now", lambda: datetime(2026, 1, 1, tzinfo=UTC))
+    first = store.persist_contract_revision(_draft_contract(investigation_id))
+    monkeypatch.setattr("tacit.investigation_contract.utc_now", lambda: datetime(2026, 1, 2, tzinfo=UTC))
+    second = store.persist_contract_revision(_draft_contract(investigation_id))
+
+    comparison = store.compare_revisions(
+        investigation_id,
+        first.investigation.revision,
+        second.investigation.revision,
+    )
+
+    assert comparison is not None
+    assert comparison["same_output"] is True
+    assert comparison["changed_sections"] == []
+
+
+def test_output_fingerprint_preserves_external_observation_timestamps():
+    contract = _draft_contract()
+    external = ProvenanceRecord(
+        id="prov_telemetry",
+        source_type="telemetry",
+        source_ref="prometheus:checkout",
+        observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    first = stamp_fingerprints(contract.model_copy(update={"provenance": [*contract.provenance, external]}))
+    changed_external = external.model_copy(update={"observed_at": datetime(2026, 1, 2, tzinfo=UTC)})
+    second = stamp_fingerprints(
+        contract.model_copy(update={"provenance": [*contract.provenance, changed_external]})
+    )
+
+    assert first.runtime.output_fingerprint != second.runtime.output_fingerprint
+
+
+def test_contract_records_current_package_version():
+    contract = _draft_contract()
+    pyproject = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert __version__ == pyproject["project"]["version"]
+    assert contract.runtime.engine_version == __version__
+    assert next(record for record in contract.provenance if record.id == "prov_runtime").source_version == __version__
+
+
+async def test_published_dashboard_succeeds_when_contract_persistence_fails():
+    class PublishedBackend:
+        name = "grafana"
+        query_language = "promql"
+
+        async def publish(self, dashboard_spec):
+            return PublishResult(url="http://grafana/d/published", uid="published", backend_name=self.name)
+
+    class FailingContractHistory:
+        def __init__(self):
+            self.finished: list[dict] = []
+
+        def finish(self, investigation_id, **kwargs):
+            self.finished.append({"investigation_id": investigation_id, **kwargs})
+
+        def persist_contract_revision(self, contract, *, reason):
+            raise RuntimeError("database is locked")
+
+    class FeedbackStore:
+        def record_provenance(self, **kwargs):
+            return None
+
+    history = FailingContractHistory()
+    recorder = PipelineRecorder(history, "inv-published")
+    dashboard = DashboardSpec(
+        title="Published dashboard",
+        panels=[PanelSpec(title="Traffic", queries=[PanelQuery(expr="up", datasource_uid="prom")])],
+    )
+    deps = PipelineDependencies(
+        settings=object(),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: history,
+        feedback_store_factory=FeedbackStore,
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    response = await complete_pipeline(
+        request=DashRequest(prompt="checkout latency", user_id="sdet"),
+        deps=deps,
+        backends=[PublishedBackend()],
+        dashboard_spec=dashboard,
+        intent=Intent(
+            summary="checkout latency",
+            domain="application",
+            services=["checkout"],
+            signals=[SignalType.METRICS],
+        ),
+        metric_catalog=[],
+        datasource_catalog=[],
+        ranked_archetypes_present=True,
+        validation_warnings=[],
+        panels_before=1,
+        evidence_requirements=[],
+        evidence_resolutions=[],
+        evidence_observations=[],
+        culprit_ranking=CulpritRanking(),
+        timings={},
+        recorder=recorder,
+        token_usage=TokenUsage(),
+        started_at=time.monotonic(),
+    )
+
+    assert response.dashboard_url == "http://grafana/d/published"
+    assert response.dashboard_uid == "published"
+    assert response.investigation_id == "inv-published"
+    assert response.investigation_revision is None
+    assert history.finished[0]["status"] == "success"
 
 
 def test_packaged_schema_matches_contract_model():

@@ -29,6 +29,7 @@ from tacit.investigation_contract import (
     KnowledgeCandidate,
     ProvenanceRecord,
     fingerprint,
+    normalized_output_payload,
     stamp_fingerprints,
     utc_now,
 )
@@ -587,8 +588,8 @@ class InvestigationStore:
         right_contract = self.get_contract(investigation_id, right)
         if left_contract is None or right_contract is None:
             return None
-        left_payload = left_contract.model_dump(mode="json", by_alias=True)
-        right_payload = right_contract.model_dump(mode="json", by_alias=True)
+        left_payload = normalized_output_payload(left_contract)
+        right_payload = normalized_output_payload(right_contract)
         changed_sections = [
             key
             for key in left_payload

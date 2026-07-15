@@ -792,7 +792,7 @@
     "RuntimeManifest": {
       "properties": {
         "engine_version": {
-          "default": "0.1.1-rc.1",
+          "default": "0.1.1-rc.3",
           "title": "Engine Version",
           "type": "string"
         },
