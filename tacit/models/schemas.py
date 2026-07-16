@@ -395,7 +395,7 @@ class DashRequest(BaseModel):
     channel_id: str = Field(default="", description="Slack channel ID (set automatically by Slack integration)")
     user_id: str = Field(default="", description="User identifier for provenance tracking")
     thread_ts: str = Field(default="", description="Slack thread timestamp (set automatically by Slack integration)")
-    tenant_id: str = Field(default="default", description="Organization scope for Operational Knowledge isolation")
+    tenant_id: str = Field(default="", description="Organization scope for Operational Knowledge isolation")
 
     model_config = {
         "json_schema_extra": {

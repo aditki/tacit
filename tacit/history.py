@@ -905,9 +905,12 @@ class InvestigationStore:
                 from tacit.knowledge.service import get_knowledge_service
 
                 knowledge_service = get_knowledge_service()
+                tenant_id = (
+                    snapshot.request.tenant_id or getattr(settings, "knowledge_tenant_id", "default") or "default"
+                )
                 knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(
                     KnowledgeScope(
-                        tenant_id=snapshot.request.tenant_id,
+                        tenant_id=tenant_id,
                         service_refs=[f"entity:service:{service}" for service in snapshot.intent.services],
                     )
                 )
@@ -915,10 +918,12 @@ class InvestigationStore:
                     knowledge_usage,
                     snapshot.evidence_observations,
                 )
+                baseline_ranking = snapshot.baseline_culprit_ranking or snapshot.culprit_ranking
                 replay_snapshot = snapshot.model_copy(
                     update={
+                        "request": snapshot.request.model_copy(update={"tenant_id": tenant_id}),
                         "culprit_ranking": knowledge_service.apply_to_ranking(
-                            snapshot.culprit_ranking,
+                            baseline_ranking,
                             knowledge_usage,
                         ),
                         "knowledge_snapshot_ref": knowledge_snapshot.id,

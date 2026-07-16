@@ -13,6 +13,7 @@ from tacit.api.security import (
     require_knowledge_permission,
     verify_api_key,
 )
+from tacit.knowledge.entities import normalize_entity
 from tacit.knowledge.enums import CorrectionType, EntityBindingMethod, EntityKind, ReviewState
 from tacit.knowledge.models import Entity, EntityAlias, KnowledgeScope
 from tacit.knowledge.repository import get_knowledge_repository
@@ -232,7 +233,7 @@ async def create_alias(payload: AliasRequest, request: Request):
         id=payload.id,
         tenant_id=tenant_id,
         raw_value=payload.raw_value,
-        normalized_value=payload.raw_value.casefold().strip(),
+        normalized_value=normalize_entity(payload.raw_value),
         entity_ref=payload.entity_ref,
         scope=payload.scope.model_copy(update={"tenant_id": tenant_id}),
         method=payload.method,

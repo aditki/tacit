@@ -227,7 +227,7 @@ def _run_case(service: KnowledgeService, case: dict[str, Any]) -> tuple[bool, st
         family_two = SourceFamily.RUNBOOK if case_id == "copied-source" else SourceFamily.DASHBOARD
         lineage = LineageKind.COPIED_FROM if case_id == "copied-source" else LineageKind.INDEPENDENT
         for index, family in enumerate((SourceFamily.RUNBOOK, family_two), 1):
-            service.create_candidate(
+            candidate = service.create_candidate(
                 kind=KnowledgeKind.DEPENDENCY,
                 payload_ref=f"{case_id}:{index}",
                 typed_payload={},
@@ -244,6 +244,7 @@ def _run_case(service: KnowledgeService, case: dict[str, Any]) -> tuple[bool, st
                 ],
                 provenance_refs=[f"benchmark:{index}"],
             )
+            service.review_candidate(candidate.id, approved=True, reviewer="benchmark")
         candidate = service.repository.list_candidates(kind=KnowledgeKind.DEPENDENCY.value)[0]
         summary, _ = service.corroboration.analyze("default", candidate.proposition.proposition_key)
         return summary.status.value == case["expected"], summary.status.value

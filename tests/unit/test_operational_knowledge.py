@@ -67,13 +67,17 @@ def _dependency(
     payload_ref: str,
     family: SourceFamily,
     lineage_group: str,
+    lineage_kind: LineageKind = LineageKind.INDEPENDENT,
     tenant_id: str = "default",
     predicate: str = "depends_on",
+    object_ref: str = "entity:datastore:redis-session",
+    version_constraints: list[str] | None = None,
 ):
     scope = KnowledgeScope(
         tenant_id=tenant_id,
         environment_refs=["environment:production"],
         service_refs=["entity:service:checkout"],
+        version_constraints=version_constraints or [],
     )
     return service.create_candidate(
         kind=KnowledgeKind.DEPENDENCY,
@@ -82,7 +86,7 @@ def _dependency(
         proposition={
             "subject_ref": "entity:service:checkout",
             "predicate": predicate,
-            "object_ref": "entity:datastore:redis-session",
+            "object_ref": object_ref,
         },
         scope=scope,
         evidence=[
@@ -91,7 +95,7 @@ def _dependency(
                 evidence_role=EvidenceRole.SUPPORTING,
                 source_family=family,
                 lineage_group=lineage_group,
-                lineage_kind=LineageKind.INDEPENDENT,
+                lineage_kind=lineage_kind,
                 provenance_refs=[f"provenance:{payload_ref}"],
             )
         ],
@@ -100,22 +104,30 @@ def _dependency(
     )
 
 
-def _promoted_dependency(service: KnowledgeService, tenant_id: str = "default"):
+def _promoted_dependency(
+    service: KnowledgeService,
+    tenant_id: str = "default",
+    *,
+    version_constraints: list[str] | None = None,
+):
     first = _dependency(
         service,
         payload_ref="runbook",
         family=SourceFamily.RUNBOOK,
         lineage_group="runbook:1",
         tenant_id=tenant_id,
+        version_constraints=version_constraints,
     )
-    _dependency(
+    second = _dependency(
         service,
         payload_ref="dashboard",
         family=SourceFamily.DASHBOARD,
         lineage_group="dashboard:1",
         tenant_id=tenant_id,
+        version_constraints=version_constraints,
     )
     service.review_candidate(first.id, approved=True, reviewer="reviewer", tenant_id=tenant_id)
+    service.review_candidate(second.id, approved=True, reviewer="reviewer", tenant_id=tenant_id)
     decision, revision = service.evaluate_candidate(first.id, tenant_id=tenant_id)
     assert decision.decision.value == "promote"
     assert revision is not None
@@ -191,13 +203,181 @@ def test_duplicate_lineage_does_not_inflate_corroboration(tmp_path: Path):
         lineage_group="same-document",
     )
     copied = second.evidence.items[0].model_copy(update={"lineage_kind": LineageKind.COPIED_FROM})
-    service.repository.save_candidate(
-        second.model_copy(update={"evidence": second.evidence.model_copy(update={"items": [copied]})})
-    )
+    second = second.model_copy(update={"evidence": second.evidence.model_copy(update={"items": [copied]})})
+    service.repository.save_candidate(second)
+    service.review_candidate(first.id, approved=True, reviewer="reviewer")
+    service.review_candidate(second.id, approved=True, reviewer="reviewer")
     summary, _ = service.corroboration.analyze("default", first.proposition.proposition_key)
     assert summary.raw_source_count == 2
     assert summary.independent_source_count == 1
     assert summary.duplicate_source_count == 1
+
+
+def test_rejected_and_pending_candidates_do_not_corroborate(tmp_path: Path):
+    service = _service(tmp_path)
+    first = _dependency(
+        service,
+        payload_ref="approved-runbook",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="runbook:approved",
+    )
+    rejected = _dependency(
+        service,
+        payload_ref="rejected-dashboard",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="dashboard:rejected",
+    )
+    _dependency(
+        service,
+        payload_ref="pending-incident",
+        family=SourceFamily.INCIDENT,
+        lineage_group="incident:pending",
+    )
+    service.review_candidate(first.id, approved=True, reviewer="reviewer")
+    service.review_candidate(rejected.id, approved=False, reviewer="reviewer")
+
+    decision, revision = service.evaluate_candidate(first.id)
+
+    assert revision is None
+    assert decision.decision.value == "retain_candidate"
+    assert decision.resulting_eligibility == KnowledgeEligibility.INELIGIBLE
+    assert decision.reason_codes == ["insufficient_independent_sources"]
+
+
+def test_scope_matching_requires_version_constraints(tmp_path: Path):
+    service = _service(tmp_path)
+    _promoted_dependency(service, version_constraints=["version:2026.07"])
+
+    _, usage_without_version = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        )
+    )
+    _, usage_with_version = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+            version_constraints=["version:2026.07"],
+        )
+    )
+
+    assert usage_without_version[0].disposition.value == "rejected_by_scope"
+    assert usage_with_version[0].disposition.value == "applied"
+
+
+def test_proposition_keys_canonicalize_scope_list_order(tmp_path: Path):
+    service = _service(tmp_path)
+    first = service.create_candidate(
+        kind=KnowledgeKind.DEPENDENCY,
+        payload_ref="scope-a",
+        typed_payload={},
+        proposition={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "depends_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout", "entity:service:api"],
+        ),
+        evidence=[
+            KnowledgeEvidenceReference(
+                evidence_ref="evidence:scope-a",
+                evidence_role=EvidenceRole.SUPPORTING,
+                source_family=SourceFamily.RUNBOOK,
+                lineage_group="scope-a",
+                lineage_kind=LineageKind.INDEPENDENT,
+                provenance_refs=["provenance:scope-a"],
+            )
+        ],
+        provenance_refs=["provenance:scope-a"],
+    )
+    second = service.create_candidate(
+        kind=KnowledgeKind.DEPENDENCY,
+        payload_ref="scope-b",
+        typed_payload={},
+        proposition={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "depends_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:api", "entity:service:checkout"],
+        ),
+        evidence=[
+            KnowledgeEvidenceReference(
+                evidence_ref="evidence:scope-b",
+                evidence_role=EvidenceRole.SUPPORTING,
+                source_family=SourceFamily.DASHBOARD,
+                lineage_group="scope-b",
+                lineage_kind=LineageKind.INDEPENDENT,
+                provenance_refs=["provenance:scope-b"],
+            )
+        ],
+        provenance_refs=["provenance:scope-b"],
+    )
+
+    assert first.proposition.proposition_key == second.proposition.proposition_key
+
+
+def test_direct_negation_conflicts_require_matching_objects(tmp_path: Path):
+    service = _service(tmp_path)
+    service.register_entity(
+        Entity(
+            id="entity:datastore:postgres",
+            kind=EntityKind.DATASTORE,
+            tenant_id="default",
+            canonical_name="postgres",
+            scope=KnowledgeScope(),
+            provenance_refs=["catalog:datastore"],
+        )
+    )
+    positive = _dependency(
+        service,
+        payload_ref="depends-redis",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="runbook:redis",
+        object_ref="entity:datastore:redis-session",
+    )
+    _dependency(
+        service,
+        payload_ref="not-postgres",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="dashboard:postgres",
+        predicate="does_not_depend_on",
+        object_ref="entity:datastore:postgres",
+    )
+
+    conflicts = service.conflicts.analyze("default", positive.proposition.proposition_key)
+
+    assert conflicts == []
+
+
+def test_migrated_dependency_scope_uses_source_service(tmp_path: Path):
+    service = _service(tmp_path)
+    created = migrate_artifact_extractions(
+        artifact_id="artifact-1",
+        artifact_type="runbook",
+        rows={
+            "dependency_hints": [
+                {
+                    "id": "dep-1",
+                    "source_entity": "checkout",
+                    "target_entity": "redis-session",
+                    "direction": "depends_on",
+                    "source_excerpt": "checkout depends on redis-session",
+                }
+            ]
+        },
+        service=service,
+    )
+
+    candidate = service.repository.get_candidate(created[0])
+
+    assert candidate is not None
+    assert candidate.scope.service_refs == ["entity:service:checkout"]
 
 
 def test_correction_creates_candidate_revision_and_impact(tmp_path: Path):
@@ -319,6 +499,37 @@ def test_api_queue_tenant_and_permissions(tmp_path: Path, monkeypatch: pytest.Mo
         ).status_code
         == 403
     )
+
+
+def test_api_aliases_use_resolver_normalization(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path, "tenant-a")
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    app = create_app(
+        runtime_settings=Settings(
+            api_auth_enabled=False,
+            knowledge_tenant_id="tenant-a",
+            knowledge_permissions="knowledge.read,knowledge.review",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/knowledge/aliases",
+        json={
+            "id": "alias_checkout_api",
+            "raw_value": "Checkout API",
+            "entity_ref": "entity:service:checkout",
+            "method": "exact_alias",
+            "review_state": "approved",
+            "provenance_refs": ["operator:alias"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["normalized_value"] == "checkout-api"
 
 
 def test_cli_exposes_phase_three_commands():

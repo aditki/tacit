@@ -44,7 +44,7 @@ from tacit.knowledge.models import (
     PromotionDecision,
     utc_now,
 )
-from tacit.knowledge.normalization import PropositionNormalizer, stable_fingerprint
+from tacit.knowledge.normalization import PropositionNormalizer, canonical_scope_payload, stable_fingerprint
 from tacit.knowledge.policies import default_policies
 from tacit.knowledge.repository import KnowledgeRepository, get_knowledge_repository
 
@@ -328,7 +328,7 @@ class KnowledgeService:
         semantic = stable_fingerprint(
             {
                 "proposition": candidate.proposition.model_dump(mode="json"),
-                "scope": candidate.scope.model_dump(mode="json"),
+                "scope": canonical_scope_payload(candidate.scope),
                 "state": state.model_dump(mode="json"),
                 "policy": [policy.policy_id, policy.version],
                 "conflicts": sorted(conflict.id for conflict in conflicts),

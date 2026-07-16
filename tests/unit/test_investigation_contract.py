@@ -51,6 +51,8 @@ from tacit.investigation_replay import (
     InvestigationReplaySnapshot,
     ReplayMode,
 )
+from tacit.knowledge.enums import KnowledgeUsageDisposition
+from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
 from tacit.models.schemas import (
     ContextChunk,
     CulpritCandidate,
@@ -338,6 +340,33 @@ def test_captured_input_replay_rebuilds_and_counterfactual_creates_revision(tmp_
     assert counterfactual.grounding.maximum_trustworthy_conclusion["causal_status"] == "insufficient_evidence"
 
 
+def test_chart_route_uses_configured_tenant_when_request_omits_it(monkeypatch):
+    captured: dict[str, DashRequest] = {}
+
+    async def fake_run_pipeline(request: DashRequest, deps):
+        captured["request"] = request
+        return DashResponse(
+            dashboard_url="http://grafana/d/test",
+            dashboard_uid="test",
+            panel_count=1,
+            summary="ok",
+        )
+
+    import tacit.api.routes.dashboard as dashboard_routes
+
+    monkeypatch.setattr(dashboard_routes, "run_pipeline", fake_run_pipeline)
+    app = create_app(runtime_settings=SimpleNamespace(api_auth_enabled=False, knowledge_tenant_id="tenant-a"))
+    app.dependency_overrides[get_pipeline_dependencies] = lambda: SimpleNamespace(
+        settings=SimpleNamespace(knowledge_tenant_id="tenant-a")
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/v1/chart", json={"prompt": "Investigate checkout latency"})
+
+    assert response.status_code == 200
+    assert captured["request"].tenant_id == "tenant-a"
+
+
 def test_counterfactual_replay_resorts_candidates_after_score_changes(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
@@ -508,6 +537,96 @@ def test_non_exact_replay_rejects_a_stale_base_revision(tmp_path):
 
     assert len(store.list_revisions(investigation_id)) == 2
     assert store.list_runs(investigation_id)[-1]["status"] == "failed"
+
+
+def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    draft = _draft_contract(investigation_id)
+    baseline = CulpritRanking(
+        abstained=False,
+        telemetry_status="evidenced",
+        candidates=[
+            CulpritCandidate(
+                rank=1,
+                suspect="checkout",
+                suspect_type="service",
+                score=0.40,
+                contextual_reasons=["runtime baseline"],
+                runtime_evidence=["request_latency"],
+                supporting_requirement_ids=["er_01"],
+            )
+        ],
+    )
+    historical = baseline.model_copy(
+        update={
+            "candidates": [
+                baseline.candidates[0].model_copy(
+                    update={
+                        "score": 0.70,
+                        "contextual_reasons": ["runtime baseline", "old operational knowledge"],
+                    }
+                )
+            ]
+        }
+    )
+    snapshot = _snapshot_for(draft).model_copy(
+        update={"baseline_culprit_ranking": baseline, "culprit_ranking": historical}
+    )
+    store.persist_contract_revision(draft, snapshot=snapshot)
+
+    class FakeKnowledgeService:
+        seen_score: float | None = None
+
+        def create_snapshot(self, scope):
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_current",
+                tenant_id=scope.tenant_id,
+                items=[],
+                fingerprint="sha256:current",
+            ), [
+                KnowledgeUsage(
+                    tenant_id=scope.tenant_id,
+                    knowledge_ref="knowledge_current",
+                    knowledge_revision=1,
+                    disposition=KnowledgeUsageDisposition.APPLIED,
+                    used_for=["ranking_context"],
+                    target_ref="entity:service:checkout",
+                    score_delta=0.10,
+                    decision_ref="decision_current",
+                )
+            ]
+
+        def reconcile_live_observations(self, usage, observations):
+            return usage
+
+        def apply_to_ranking(self, ranking, usage):
+            self.seen_score = ranking.candidates[0].score
+            return ranking.model_copy(
+                update={
+                    "candidates": [
+                        ranking.candidates[0].model_copy(
+                            update={
+                                "score": ranking.candidates[0].score + 0.10,
+                                "contextual_reasons": [
+                                    *ranking.candidates[0].contextual_reasons,
+                                    "fresh operational knowledge",
+                                ],
+                            }
+                        )
+                    ]
+                }
+            )
+
+    fake = FakeKnowledgeService()
+    monkeypatch.setattr("tacit.knowledge.service.get_knowledge_service", lambda: fake)
+
+    replayed = store.replay_contract(investigation_id, mode=ReplayMode.CURRENT_ENGINE)
+
+    assert fake.seen_score == 0.40
+    assert replayed.candidate_rankings[0].score == 0.50
+    assert "old operational knowledge" not in replayed.candidate_rankings[0].contextual_reasons
+    assert "fresh operational knowledge" in replayed.candidate_rankings[0].contextual_reasons
 
 
 def test_concurrent_revision_writers_report_a_stale_parent(tmp_path):

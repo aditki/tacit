@@ -6,7 +6,10 @@ from tacit.knowledge.enums import (
     ConflictKind,
     ConflictResolutionStatus,
     CorroborationStatus,
+    EvidenceRole,
     KnowledgeKind,
+    LineageKind,
+    ReviewState,
     SourceFamily,
 )
 from tacit.knowledge.models import (
@@ -24,10 +27,26 @@ class CorroborationService:
         self.repository = repository
 
     def analyze(self, tenant_id: str, proposition_key: str) -> tuple[CorroborationSummary, str]:
-        candidates = self.repository.candidates_for_proposition(tenant_id, proposition_key)
-        evidence = [item for candidate in candidates for item in candidate.evidence.items]
+        candidates = [
+            candidate
+            for candidate in self.repository.candidates_for_proposition(tenant_id, proposition_key)
+            if candidate.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
+        ]
+        evidence = [
+            item
+            for candidate in candidates
+            for item in candidate.evidence.items
+            if item.evidence_role == EvidenceRole.SUPPORTING
+        ]
         lineage_groups: dict[str, KnowledgeEvidenceReference] = {}
         for item in evidence:
+            if item.lineage_kind in {
+                LineageKind.COPIED_FROM,
+                LineageKind.GENERATED_FROM,
+                LineageKind.SAME_VENDOR_EXPORT,
+                LineageKind.SAME_SOURCE_REVISION,
+            }:
+                continue
             group = item.lineage_group or item.evidence_ref
             lineage_groups.setdefault(group, item)
         independent = list(lineage_groups.values())
@@ -84,6 +103,10 @@ class ConflictDetectionService:
             predicates = {current["predicate"], other["predicate"]}
             directly_negated = predicates == {"depends_on", "does_not_depend_on"}
             if current["predicate"] != other["predicate"] and not directly_negated:
+                continue
+            if directly_negated and (
+                current["object_ref"] != other["object_ref"] or current["concept_ref"] != other["concept_ref"]
+            ):
                 continue
             if (
                 not directly_negated

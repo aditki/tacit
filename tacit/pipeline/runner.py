@@ -369,6 +369,7 @@ async def _run_pipeline_inner(
             evidence_resolutions=evidence_resolutions,
             evidence_observations=validation_result.evidence_observations,
         )
+        baseline_culprit_ranking = culprit_ranking
         knowledge_snapshot = None
         knowledge_usage: list[KnowledgeUsage] = []
         try:
@@ -438,6 +439,7 @@ async def _run_pipeline_inner(
             evidence_resolutions=evidence_resolutions,
             evidence_observations=validation_result.evidence_observations,
             culprit_ranking=culprit_ranking,
+            baseline_culprit_ranking=baseline_culprit_ranking,
             context_chunks=context_chunks,
             knowledge_snapshot=knowledge_snapshot,
             knowledge_usage=knowledge_usage,

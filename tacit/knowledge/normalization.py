@@ -44,6 +44,24 @@ def normalize_ref(value: str) -> str:
     return value.strip().casefold().replace(" ", "-")
 
 
+SCOPE_LIST_FIELDS = (
+    "environment_refs",
+    "region_refs",
+    "cluster_refs",
+    "namespace_refs",
+    "service_refs",
+    "archetype_refs",
+    "version_constraints",
+)
+
+
+def canonical_scope_payload(scope: KnowledgeScope) -> dict:
+    payload = scope.model_dump(mode="json", exclude={"valid_from", "valid_until"})
+    for field_name in SCOPE_LIST_FIELDS:
+        payload[field_name] = sorted(set(payload.get(field_name) or []))
+    return payload
+
+
 class PropositionNormalizer:
     def normalize_predicate(self, value: str | Predicate) -> Predicate:
         if isinstance(value, Predicate):
@@ -86,7 +104,7 @@ class PropositionNormalizer:
                 "predicate": proposition.predicate.value,
                 "object_ref": proposition.object_ref,
                 "concept_ref": proposition.concept_ref,
-                "scope": scope.model_dump(mode="json", exclude={"valid_from", "valid_until"}),
+                "scope": canonical_scope_payload(scope),
                 "valid_from": scope.valid_from,
                 "valid_until": scope.valid_until,
             }
