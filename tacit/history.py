@@ -918,6 +918,7 @@ class InvestigationStore:
                     knowledge_usage,
                     snapshot.evidence_observations,
                 )
+                knowledge_snapshot = knowledge_service.snapshot_from_usage(tenant_id, knowledge_usage)
                 baseline_ranking = snapshot.baseline_culprit_ranking or snapshot.culprit_ranking
                 replay_snapshot = snapshot.model_copy(
                     update={
@@ -975,6 +976,12 @@ class InvestigationStore:
                 run_id=run_id,
                 expected_parent_revision=contract.investigation.revision,
             )
+            if mode == ReplayMode.CURRENT_ENGINE and persisted.knowledge_usage:
+                knowledge_service.persist_usage(
+                    persisted.knowledge_usage,
+                    investigation_id=persisted.investigation.id,
+                    investigation_revision=persisted.investigation.revision,
+                )
             self.complete_run(run_id, status="completed", runtime_manifest=persisted.runtime.model_dump(mode="json"))
             return persisted
         except ExactReplayMismatchError:

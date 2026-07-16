@@ -1356,7 +1356,8 @@ def _print_artifact_learning_summary(result: dict):
     "--dir", "dir_path", type=click.Path(exists=True, file_okay=False, path_type=Path), help="Runbook directory"
 )
 @click.option("--dry-run", is_flag=True, help="Preview extraction without persisting learned context")
-def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool, tenant: str | None):
     """Learn operational candidates from runbook artifacts."""
     _header("Learn Runbooks")
     _load_env()
@@ -1364,14 +1365,15 @@ def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool)
         _fail("Pass exactly one of --file or --dir.")
         return
     try:
+        tenant_id = _knowledge_tenant(tenant)
         if file_path:
             from tacit.artifact_learning import learn_runbook_file
 
-            result = learn_runbook_file(file_path, dry_run=dry_run)
+            result = learn_runbook_file(file_path, dry_run=dry_run, tenant_id=tenant_id)
         else:
             from tacit.artifact_learning import learn_runbook_dir
 
-            result = learn_runbook_dir(dir_path, dry_run=dry_run)  # type: ignore[arg-type]
+            result = learn_runbook_dir(dir_path, dry_run=dry_run, tenant_id=tenant_id)  # type: ignore[arg-type]
     except Exception as e:
         _fail(f"Runbook learning failed: {e}")
         return
@@ -1384,7 +1386,8 @@ def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool)
     "--dir", "dir_path", type=click.Path(exists=True, file_okay=False, path_type=Path), help="Incident directory"
 )
 @click.option("--dry-run", is_flag=True, help="Preview extraction without persisting learned context")
-def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool, tenant: str | None):
     """Learn operational IR candidates from incident history artifacts."""
     _header("Learn Incidents")
     _load_env()
@@ -1392,14 +1395,15 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
         _fail("Pass exactly one of --file or --dir.")
         return
     try:
+        tenant_id = _knowledge_tenant(tenant)
         if file_path:
             from tacit.artifact_learning import learn_incident_file
 
-            result = learn_incident_file(file_path, dry_run=dry_run)
+            result = learn_incident_file(file_path, dry_run=dry_run, tenant_id=tenant_id)
         else:
             from tacit.artifact_learning import learn_incident_dir
 
-            result = learn_incident_dir(dir_path, dry_run=dry_run)  # type: ignore[arg-type]
+            result = learn_incident_dir(dir_path, dry_run=dry_run, tenant_id=tenant_id)  # type: ignore[arg-type]
     except Exception as e:
         _fail(f"Incident learning failed: {e}")
         return
@@ -1424,10 +1428,19 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
 )
 @click.option("--limit", default=1000, show_default=True, type=click.IntRange(min=1), help="Maximum incidents to fetch")
 @click.option("--dry-run", is_flag=True, help="Preview extraction without persisting learned context")
-def learn_pagerduty(since: str, until: str | None, statuses: tuple[str, ...], limit: int, dry_run: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_pagerduty(
+    since: str,
+    until: str | None,
+    statuses: tuple[str, ...],
+    limit: int,
+    dry_run: bool,
+    tenant: str | None,
+):
     """Learn incident metadata from PagerDuty (read-only)."""
     _header("Learn PagerDuty Incidents")
     _load_env()
+    tenant_id = _knowledge_tenant(tenant)
 
     import asyncio
 
@@ -1442,6 +1455,7 @@ def learn_pagerduty(since: str, until: str | None, statuses: tuple[str, ...], li
                 until=until,
                 max_items=limit,
                 dry_run=dry_run,
+                tenant_id=tenant_id,
             )
 
     try:
@@ -1952,6 +1966,8 @@ def knowledge_review(
     permissions = {value.strip() for value in settings.knowledge_permissions.split(",") if value.strip()}
     if permission not in permissions:
         raise click.ClickException(f"missing permission: {permission}")
+    if (authoritative_source or live_verified) and "knowledge.override" not in permissions:
+        raise click.ClickException("missing permission: knowledge.override")
     try:
         candidate = service.review_candidate(
             candidate_id,

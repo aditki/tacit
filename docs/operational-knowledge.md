@@ -29,7 +29,8 @@ Trust is a separate privileged action using `--trust`. The web workspace contain
 queue. REST clients use `/api/v1/knowledge`; configured permissions are `knowledge.read`, `knowledge.review`,
 `knowledge.trust`, `knowledge.reject`, `knowledge.correct`, `knowledge.export`, and `knowledge.override`.
 The override permission is required to assert authoritative-source or live-verification policy inputs during
-review.
+review, including authoritative correction reviews. When `knowledge_tenant_id` is `*`, artifact-learning CLI
+commands require `--tenant <tenant-id>` so governed candidates cannot be written to a wildcard scope.
 
 ## Evaluation
 

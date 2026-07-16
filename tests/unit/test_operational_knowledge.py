@@ -11,6 +11,8 @@ from tacit.api.app import create_app
 from tacit.cli import cli
 from tacit.config import Settings
 from tacit.knowledge.enums import (
+    ConflictResolutionStatus,
+    EntityBindingMethod,
     EntityKind,
     EvidenceRole,
     KnowledgeEligibility,
@@ -23,6 +25,7 @@ from tacit.knowledge.enums import (
 from tacit.knowledge.migration import migrate_artifact_extractions
 from tacit.knowledge.models import (
     Entity,
+    EntityAlias,
     KnowledgeEvidenceReference,
     KnowledgeScope,
     KnowledgeState,
@@ -387,6 +390,61 @@ def test_positive_dependencies_with_different_objects_do_not_conflict(tmp_path: 
     assert service.conflicts.analyze("default", redis.proposition.proposition_key) == []
 
 
+def test_rejected_propositions_do_not_create_conflicts(tmp_path: Path):
+    service = _service(tmp_path)
+    positive = _dependency(
+        service,
+        payload_ref="accepted-positive",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="positive",
+    )
+    rejected = _dependency(
+        service,
+        payload_ref="rejected-negative",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="negative",
+        predicate="does_not_depend_on",
+    )
+    service.review_candidate(positive.id, approved=True, reviewer="reviewer")
+    service.review_candidate(rejected.id, approved=False, reviewer="reviewer")
+
+    assert service.conflicts.analyze("default", positive.proposition.proposition_key) == []
+
+
+def test_conflict_scope_analysis_includes_services(tmp_path: Path):
+    service = _service(tmp_path)
+    first = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="checkout-signal",
+        typed_payload={},
+        proposition={
+            "subject_ref": "concept:latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:checkout_latency_seconds",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["catalog:checkout"],
+    )
+    service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="payment-signal",
+        typed_payload={},
+        proposition={
+            "subject_ref": "concept:latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:payment_latency_seconds",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:payment"]),
+        provenance_refs=["catalog:payment"],
+    )
+
+    conflicts = service.conflicts.analyze("default", first.proposition.proposition_key)
+
+    assert len(conflicts) == 1
+    assert conflicts[0].resolution_status == ConflictResolutionStatus.RESOLVED_BY_SCOPE
+    assert conflicts[0].scope_analysis["reason_code"] == "service_specific_difference"
+
+
 def test_canonical_entity_names_use_resolver_normalization(tmp_path: Path):
     service = _service(tmp_path)
     service.register_entity(
@@ -491,6 +549,7 @@ def test_correction_creates_candidate_revision_and_impact(tmp_path: Path):
         correction.id,
         approved=True,
         reviewer="reviewer",
+        authoritative=True,
     )
     assert reviewed.review_state == ReviewState.APPROVED
     assert candidate.id == correction.knowledge_candidate_ref
@@ -498,6 +557,39 @@ def test_correction_creates_candidate_revision_and_impact(tmp_path: Path):
     assert service.repository.get_revision(original.knowledge_id).state.lifecycle_status == LifecycleStatus.SUPERSEDED
     assert service.repository.get_revision(original.knowledge_id, 1) == original
     assert service.impact(original.knowledge_id).recommended_action == "replay_current"
+
+
+def test_correction_without_target_keeps_conflict_unresolved(tmp_path: Path):
+    service = _service(tmp_path)
+    _, original = _promoted_dependency(service)
+    correction, _ = service.create_correction(
+        investigation_id="inv_no_target",
+        investigation_revision=1,
+        correction_type="dependency",
+        proposed={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "does_not_depend_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        ),
+        explanation="The relationship is disputed, but no replacement target was selected.",
+        created_by="operator",
+    )
+
+    _, replacement = service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="reviewer",
+        authoritative=True,
+    )
+
+    conflicts = service.repository.list_conflicts("default", unresolved_only=True)
+    assert replacement is None
+    assert len(conflicts) == 1
+    assert service.repository.get_revision(original.knowledge_id).state.lifecycle_status == LifecycleStatus.ACTIVE
 
 
 def test_migration_preserves_payload_review_and_provenance(tmp_path: Path):
@@ -618,6 +710,36 @@ def test_api_aliases_use_resolver_normalization(tmp_path: Path, monkeypatch: pyt
     assert response.json()["normalized_value"] == "checkout-api"
 
 
+def test_alias_upsert_updates_lookup_columns(tmp_path: Path):
+    service = _service(tmp_path)
+    first = EntityAlias(
+        id="alias-checkout",
+        tenant_id="default",
+        raw_value="Checkout API",
+        normalized_value="checkout-api",
+        entity_ref="entity:service:checkout",
+        scope=KnowledgeScope(),
+        method=EntityBindingMethod.HUMAN_CORRECTION,
+        review_state=ReviewState.APPROVED,
+        provenance_refs=["operator:first"],
+    )
+    service.register_alias(first)
+    service.register_alias(
+        first.model_copy(
+            update={
+                "raw_value": "Checkout Service",
+                "normalized_value": "checkout-service",
+                "provenance_refs": ["operator:corrected"],
+            }
+        )
+    )
+
+    assert service.repository.find_aliases("default", "checkout-api") == []
+    corrected = service.repository.find_aliases("default", "checkout-service")
+    assert len(corrected) == 1
+    assert corrected[0].raw_value == "Checkout Service"
+
+
 def test_api_policy_overrides_require_privileged_permission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     service = _service(tmp_path, "tenant-a")
     candidate = _dependency(
@@ -654,6 +776,73 @@ def test_api_policy_overrides_require_privileged_permission(tmp_path: Path, monk
     assert service.repository.get_candidate(candidate.id, "tenant-a").state.review_state == ReviewState.CANDIDATE
 
 
+def test_api_correction_authority_requires_override_permission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path, "tenant-a")
+    correction, candidate = service.create_correction(
+        investigation_id="inv-api-correction",
+        investigation_revision=1,
+        correction_type="dependency",
+        proposed={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "does_not_depend_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=KnowledgeScope(tenant_id="tenant-a", service_refs=["entity:service:checkout"]),
+        explanation="Operator correction",
+        created_by="operator",
+        tenant_id="tenant-a",
+    )
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    app = create_app(
+        runtime_settings=Settings(
+            api_auth_enabled=False,
+            knowledge_tenant_id="tenant-a",
+            knowledge_permissions="knowledge.read,knowledge.review",
+        )
+    )
+
+    response = TestClient(app).post(
+        f"/api/v1/knowledge/corrections/{correction.id}/review",
+        json={"decision": "approve", "reviewer": "operator", "authoritative": True},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.override"
+    assert service.repository.get_candidate(candidate.id, "tenant-a").state.review_state == ReviewState.CANDIDATE
+
+
+def test_cli_policy_overrides_require_privileged_permission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref="cli-override",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="cli-override",
+    )
+    monkeypatch.setattr("tacit.knowledge.service.get_knowledge_service", lambda: service)
+    monkeypatch.setattr("tacit.config.settings.knowledge_permissions", "knowledge.read,knowledge.review")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "knowledge",
+            "review",
+            candidate.id,
+            "--approve",
+            "--reviewer",
+            "operator",
+            "--authoritative-source",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "missing permission: knowledge.override" in result.output
+    assert service.repository.get_candidate(candidate.id).state.review_state == ReviewState.CANDIDATE
+
+
 def test_cli_exposes_phase_three_commands():
     runner = CliRunner()
     assert runner.invoke(cli, ["knowledge", "--help"]).exit_code == 0
@@ -661,6 +850,9 @@ def test_cli_exposes_phase_three_commands():
     assert output.exit_code == 0
     assert "--approve" in output.output
     assert runner.invoke(cli, ["learn", "status", "--help"]).exit_code == 0
+    assert "--tenant" in runner.invoke(cli, ["learn", "runbooks", "--help"]).output
+    assert "--tenant" in runner.invoke(cli, ["learn", "incidents", "--help"]).output
+    assert "--tenant" in runner.invoke(cli, ["learn", "pagerduty", "--help"]).output
 
 
 def test_operational_learning_benchmark_is_packaged_and_safe():

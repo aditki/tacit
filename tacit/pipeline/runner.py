@@ -103,7 +103,9 @@ async def run_pipeline(
     deps = deps or _default_dependencies()
     runtime_settings = deps.settings
     configured_tenant = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
-    tenant_id = (request.tenant_id or "default") if configured_tenant == "*" else configured_tenant
+    if configured_tenant == "*" and not request.tenant_id:
+        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
+    tenant_id = request.tenant_id if configured_tenant == "*" else configured_tenant
     request = request.model_copy(update={"tenant_id": tenant_id})
     bind_request_id()
     sem = _get_semaphore(runtime_settings.pipeline_max_concurrent)

@@ -427,6 +427,36 @@ async def test_direct_pipeline_stamps_configured_fallback_tenant(monkeypatch):
     assert captured["request"].tenant_id == "tenant-a"
 
 
+async def test_direct_pipeline_requires_tenant_for_wildcard_configuration(monkeypatch):
+    from tacit.pipeline import run_pipeline
+
+    called = False
+
+    async def fake_inner(request, deps, **kwargs):
+        nonlocal called
+        called = True
+        return DashResponse(dashboard_url="", dashboard_uid="", panel_count=0, summary="unexpected")
+
+    monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", fake_inner)
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_tenant_id="*",
+        ),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    with pytest.raises(ValueError, match="tenant_id is required"):
+        await run_pipeline(DashRequest(prompt="Investigate checkout"), deps)
+
+    assert called is False
+
+
 def test_counterfactual_replay_resorts_candidates_after_score_changes(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
@@ -637,6 +667,7 @@ def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, m
 
     class FakeKnowledgeService:
         seen_score: float | None = None
+        persisted_usage: tuple[str, int, list[KnowledgeUsage]] | None = None
 
         def create_snapshot(self, scope):
             return KnowledgeSnapshot(
@@ -660,6 +691,14 @@ def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, m
         def reconcile_live_observations(self, usage, observations):
             return usage
 
+        def snapshot_from_usage(self, tenant_id, usage):
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_reconciled",
+                tenant_id=tenant_id,
+                items=[],
+                fingerprint="sha256:reconciled",
+            )
+
         def apply_to_ranking(self, ranking, usage):
             self.seen_score = ranking.candidates[0].score
             return ranking.model_copy(
@@ -678,6 +717,10 @@ def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, m
                 }
             )
 
+        def persist_usage(self, usage, *, investigation_id, investigation_revision):
+            self.persisted_usage = (investigation_id, investigation_revision, usage)
+            return usage
+
     fake = FakeKnowledgeService()
     monkeypatch.setattr("tacit.knowledge.service.get_knowledge_service", lambda: fake)
 
@@ -685,8 +728,72 @@ def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, m
 
     assert fake.seen_score == 0.40
     assert replayed.candidate_rankings[0].score == 0.50
+    assert replayed.knowledge_snapshot_ref == "knowledge_snapshot_reconciled"
     assert "old operational knowledge" not in replayed.candidate_rankings[0].contextual_reasons
     assert "fresh operational knowledge" in replayed.candidate_rankings[0].contextual_reasons
+    assert fake.persisted_usage is not None
+    assert fake.persisted_usage[0] == investigation_id
+    assert fake.persisted_usage[1] == replayed.investigation.revision
+    assert fake.persisted_usage[2][0].knowledge_ref == "knowledge_current"
+
+
+def test_current_engine_replay_snapshots_reconciled_knowledge_usage(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    draft = _draft_contract(investigation_id)
+    store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+
+    class ContradictingKnowledgeService:
+        persisted = False
+
+        def create_snapshot(self, scope):
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_before_reconciliation",
+                tenant_id=scope.tenant_id,
+                items=[],
+                fingerprint="sha256:before",
+            ), [
+                KnowledgeUsage(
+                    tenant_id=scope.tenant_id,
+                    knowledge_ref="knowledge_contradicted",
+                    knowledge_revision=1,
+                    disposition=KnowledgeUsageDisposition.APPLIED,
+                )
+            ]
+
+        def reconcile_live_observations(self, usage, observations):
+            return [
+                usage[0].model_copy(
+                    update={"disposition": KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION}
+                )
+            ]
+
+        def snapshot_from_usage(self, tenant_id, usage):
+            assert usage[0].disposition == KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_after_reconciliation",
+                tenant_id=tenant_id,
+                items=[],
+                fingerprint="sha256:after",
+            )
+
+        def apply_to_ranking(self, ranking, usage):
+            return ranking
+
+        def persist_usage(self, usage, *, investigation_id, investigation_revision):
+            self.persisted = True
+            assert investigation_revision == 2
+            assert usage[0].disposition == KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION
+            return usage
+
+    fake = ContradictingKnowledgeService()
+    monkeypatch.setattr("tacit.knowledge.service.get_knowledge_service", lambda: fake)
+
+    replayed = store.replay_contract(investigation_id, mode=ReplayMode.CURRENT_ENGINE)
+
+    assert replayed.knowledge_snapshot_ref == "knowledge_snapshot_after_reconciliation"
+    assert replayed.knowledge_usage[0].disposition == KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION
+    assert fake.persisted is True
 
 
 def test_concurrent_revision_writers_report_a_stale_parent(tmp_path):

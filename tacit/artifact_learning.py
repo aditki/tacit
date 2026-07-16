@@ -185,9 +185,12 @@ def _artifact_id(
     return f"{artifact_type}:{_fingerprint(stable)[:20]}"
 
 
+def _normalized_line(line: str) -> str:
+    return BULLET_PREFIX_RE.sub("", line.strip(), count=1).strip()
+
+
 def _clean_line(line: str) -> str:
-    cleaned = BULLET_PREFIX_RE.sub("", line.strip(), count=1).strip()
-    return cleaned[:MAX_SOURCE_EXCERPT_LENGTH]
+    return _normalized_line(line)[:MAX_SOURCE_EXCERPT_LENGTH]
 
 
 def _normalize_entity_token(value: str) -> str:
@@ -204,12 +207,12 @@ def _is_causal_heading(line: str) -> bool:
 
 
 def _is_causal_section_label(line: str) -> bool:
-    cleaned = _clean_line(line).strip()
+    cleaned = _normalized_line(line)
     return cleaned.endswith(":") and bool(CAUSAL_CLAIM_RE.search(cleaned))
 
 
 def _starts_causal_claim(line: str) -> bool:
-    cleaned = _clean_line(line).strip().lower()
+    cleaned = _normalized_line(line).lower()
     return bool(LEADING_CAUSAL_CLAIM_RE.search(cleaned))
 
 
@@ -333,19 +336,20 @@ class RunbookExtractor:
             if maybe_section:
                 section = "suppressed_causal" if maybe_section == "resolution" else maybe_section
                 continue
-            line = _clean_line(raw)
+            scan_line = _normalized_line(raw)
+            line = scan_line[:MAX_SOURCE_EXCERPT_LENGTH]
             if not line:
                 continue
             if section == "suppressed_causal":
                 result.warnings.append(f"ignored_causal_claim:{line}")
                 continue
-            if _is_causal_section_label(line):
+            if _is_causal_section_label(scan_line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
                 section = "suppressed_causal"
                 continue
-            if CAUSAL_CLAIM_RE.search(line):
+            if CAUSAL_CLAIM_RE.search(scan_line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
-                if _starts_causal_claim(line):
+                if _starts_causal_claim(scan_line):
                     section = "suppressed_causal"
                 continue
             if section == "symptoms":
@@ -480,19 +484,20 @@ class IncidentExtractor:
             if maybe_section:
                 section = "suppressed_causal" if maybe_section == "resolution" else maybe_section
                 continue
-            line = _clean_line(raw)
+            scan_line = _normalized_line(raw)
+            line = scan_line[:MAX_SOURCE_EXCERPT_LENGTH]
             if not line:
                 continue
             if section == "suppressed_causal":
                 result.warnings.append(f"ignored_causal_claim:{line}")
                 continue
-            if _is_causal_section_label(line):
+            if _is_causal_section_label(scan_line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
                 section = "suppressed_causal"
                 continue
-            if CAUSAL_CLAIM_RE.search(line):
+            if CAUSAL_CLAIM_RE.search(scan_line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
-                if _starts_causal_claim(line):
+                if _starts_causal_claim(scan_line):
                     section = "suppressed_causal"
                 continue
 
@@ -725,6 +730,12 @@ def learn_artifact(
     dry_run: bool = False,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
+    if tenant_id is None:
+        from tacit.config import settings
+
+        tenant_id = settings.knowledge_tenant_id
+    if tenant_id == "*":
+        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
     result = extractor.extract(artifact)
     evidence_rows = _as_store_rows(result.evidence_requirements)
     ownership_rows = _as_store_rows(result.ownership_hints)
@@ -734,10 +745,6 @@ def learn_artifact(
     indexed_context_rows = 0
     mappings_created = 0
     governed_candidate_ids: list[str] = []
-    if tenant_id is None:
-        from tacit.config import settings
-
-        tenant_id = settings.knowledge_tenant_id
     if not dry_run:
         store = get_signal_store()
         change_state = store.record_learned_artifact(
@@ -871,8 +878,13 @@ def learn_artifact(
     }
 
 
-def learn_runbook_file(path: Path, *, dry_run: bool = False) -> dict[str, object]:
-    return learn_artifact(runbook_from_file(path), RunbookExtractor(), dry_run=dry_run)
+def learn_runbook_file(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    tenant_id: str | None = None,
+) -> dict[str, object]:
+    return learn_artifact(runbook_from_file(path), RunbookExtractor(), dry_run=dry_run, tenant_id=tenant_id)
 
 
 def incident_from_file(path: Path) -> LearnedArtifact:
@@ -889,13 +901,23 @@ def incident_from_file(path: Path) -> LearnedArtifact:
     )
 
 
-def learn_incident_file(path: Path, *, dry_run: bool = False) -> dict[str, object]:
-    return learn_artifact(incident_from_file(path), IncidentExtractor(), dry_run=dry_run)
+def learn_incident_file(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    tenant_id: str | None = None,
+) -> dict[str, object]:
+    return learn_artifact(incident_from_file(path), IncidentExtractor(), dry_run=dry_run, tenant_id=tenant_id)
 
 
-def learn_incident_dir(path: Path, *, dry_run: bool = False) -> dict[str, object]:
+def learn_incident_dir(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    tenant_id: str | None = None,
+) -> dict[str, object]:
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
-    learned = [learn_incident_file(file, dry_run=dry_run) for file in files]
+    learned = [learn_incident_file(file, dry_run=dry_run, tenant_id=tenant_id) for file in files]
 
     def _count(key: str) -> int:
         total = 0
@@ -934,9 +956,14 @@ def learn_incident_dir(path: Path, *, dry_run: bool = False) -> dict[str, object
     }
 
 
-def learn_runbook_dir(path: Path, *, dry_run: bool = False) -> dict[str, object]:
+def learn_runbook_dir(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    tenant_id: str | None = None,
+) -> dict[str, object]:
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
-    learned = [learn_runbook_file(file, dry_run=dry_run) for file in files]
+    learned = [learn_runbook_file(file, dry_run=dry_run, tenant_id=tenant_id) for file in files]
 
     def _count(key: str) -> int:
         total = 0
