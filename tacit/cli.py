@@ -534,7 +534,7 @@ def _check_grafana() -> bool:
         resp = httpx.get(f"{url}/api/org", headers=headers, timeout=10)
         if resp.status_code == 200:
             org = resp.json()
-            _success(f"Grafana: connected to \"{org.get('name', 'unknown')}\" at {url}")
+            _success(f'Grafana: connected to "{org.get("name", "unknown")}" at {url}')
             return True
         else:
             _fail(f"Grafana: HTTP {resp.status_code} from {url}/api/org")
@@ -737,7 +737,7 @@ def connect_grafana(url: str | None, api_key: str | None):
             _fail(f"Connection failed: HTTP {resp.status_code}")
             return
         org = resp.json()
-        _success(f"Connected to \"{org.get('name', 'unknown')}\" at {url}")
+        _success(f'Connected to "{org.get("name", "unknown")}" at {url}')
     except Exception as e:
         _fail(f"Connection failed: {e}")
         return
@@ -965,6 +965,17 @@ def benchmark_grounding():
     from tacit.grounding_benchmark import run_grounding_benchmark
 
     result = run_grounding_benchmark()
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
+    if not result["passed"]:
+        raise SystemExit(1)
+
+
+@cli.command("benchmark-learning")
+def benchmark_learning():
+    """Run the deterministic Operational Learning v1 quality gate."""
+    from tacit.operational_learning_benchmark import run_operational_learning_benchmark
+
+    result = run_operational_learning_benchmark()
     click.echo(json.dumps(result, indent=2, sort_keys=True))
     if not result["passed"]:
         raise SystemExit(1)
@@ -1229,6 +1240,17 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool):
                 _info(f"    {item['reason']}")
     if auto_approve:
         _info(f"Mappings created: {result.get('mappings_created', 0)}")
+
+
+@learn.command("status")
+@click.option("--tenant", default=None, help="Knowledge tenant (defaults to configured tenant)")
+def learn_status(tenant: str | None):
+    """Show governed learning inventory and review status."""
+    _load_env()
+    from tacit.knowledge.repository import get_knowledge_repository
+
+    tenant_id = _knowledge_tenant(tenant)
+    click.echo(json.dumps(get_knowledge_repository().stats(tenant_id), indent=2, sort_keys=True))
 
 
 def _print_bulk_learning_summary(result: dict):
@@ -1771,6 +1793,215 @@ def export_report(anonymous: bool, output: Path | None, validate_bundle: bool):
             _warn(f"Leakage validation findings: {validation.get('findings_count', 0)}")
     else:
         _info("Leakage validation skipped for raw local export.")
+
+
+# ── tacit knowledge ───────────────────────────────────────────────────
+@cli.group()
+def knowledge():
+    """Review and audit governed Operational Knowledge."""
+    pass
+
+
+def _knowledge_tenant(tenant: str | None) -> str:
+    from tacit.config import settings
+
+    configured = settings.knowledge_tenant_id or "default"
+    if configured == "*" and not tenant:
+        raise click.ClickException("--tenant is required when the configured tenant is '*'")
+    requested = tenant or configured
+    if configured != "*" and requested != configured:
+        raise click.ClickException("tenant access denied")
+    return requested
+
+
+def _knowledge_json(value: Any) -> None:
+    if isinstance(value, list):
+        value = [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in value]
+    elif hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    click.echo(json.dumps(value, indent=2, sort_keys=True))
+
+
+@knowledge.command("status")
+@click.option("--tenant", default=None)
+def knowledge_status(tenant: str | None):
+    """Show lifecycle counts and pending work."""
+    _load_env()
+    from tacit.knowledge.repository import get_knowledge_repository
+
+    _knowledge_json(get_knowledge_repository().stats(_knowledge_tenant(tenant)))
+
+
+@knowledge.command("list")
+@click.option("--tenant", default=None)
+@click.option("--kind", default=None)
+@click.option("--status", default=None)
+def knowledge_list(tenant: str | None, kind: str | None, status: str | None):
+    """List current knowledge revisions."""
+    _load_env()
+    from tacit.knowledge.repository import get_knowledge_repository
+
+    values = get_knowledge_repository().list_current_revisions(_knowledge_tenant(tenant))
+    if kind:
+        values = [item for item in values if item.proposition.kind.value == kind]
+    if status:
+        values = [item for item in values if item.state.lifecycle_status.value == status]
+    _knowledge_json(values)
+
+
+@knowledge.command("candidates")
+@click.option("--tenant", default=None)
+@click.option("--kind", default=None)
+@click.option("--review-state", default=None)
+@click.option("--limit", default=200, type=click.IntRange(1, 500))
+def knowledge_candidates(tenant: str | None, kind: str | None, review_state: str | None, limit: int):
+    """List extracted candidates awaiting governance."""
+    _load_env()
+    from tacit.knowledge.repository import get_knowledge_repository
+
+    _knowledge_json(
+        get_knowledge_repository().list_candidates(
+            _knowledge_tenant(tenant), kind=kind, review_state=review_state, limit=limit
+        )
+    )
+
+
+@knowledge.command("show")
+@click.argument("knowledge_id")
+@click.option("--revision", type=int, default=None)
+@click.option("--tenant", default=None)
+def knowledge_show(knowledge_id: str, revision: int | None, tenant: str | None):
+    """Show one immutable knowledge revision."""
+    _load_env()
+    from tacit.knowledge.repository import get_knowledge_repository
+
+    value = get_knowledge_repository().get_revision(
+        knowledge_id, revision=revision, tenant_id=_knowledge_tenant(tenant)
+    )
+    if value is None:
+        raise click.ClickException("knowledge item not found")
+    _knowledge_json(value)
+
+
+@knowledge.command("explain")
+@click.argument("knowledge_id")
+@click.option("--tenant", default=None)
+def knowledge_explain(knowledge_id: str, tenant: str | None):
+    """Explain provenance, policy, conflicts, and investigation use."""
+    _load_env()
+    from tacit.knowledge.service import get_knowledge_service
+
+    try:
+        _knowledge_json(get_knowledge_service().explain(knowledge_id, _knowledge_tenant(tenant)))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@knowledge.command("conflicts")
+@click.option("--tenant", default=None)
+@click.option("--unresolved-only", is_flag=True)
+def knowledge_conflicts(tenant: str | None, unresolved_only: bool):
+    """List proposition conflicts."""
+    _load_env()
+    from tacit.knowledge.repository import get_knowledge_repository
+
+    _knowledge_json(
+        get_knowledge_repository().list_conflicts(_knowledge_tenant(tenant), unresolved_only=unresolved_only)
+    )
+
+
+@knowledge.command("review")
+@click.argument("candidate_id")
+@click.option("--decision", type=click.Choice(["approve", "reject", "trust"]), default=None)
+@click.option("--approve", is_flag=True, help="Approve the candidate")
+@click.option("--reject", is_flag=True, help="Reject the candidate")
+@click.option("--trust", is_flag=True, help="Trust the candidate (privileged)")
+@click.option("--reviewer", required=True)
+@click.option("--tenant", default=None)
+@click.option("--authoritative-source", is_flag=True)
+@click.option("--live-verified", is_flag=True)
+def knowledge_review(
+    candidate_id: str,
+    decision: str | None,
+    approve: bool,
+    reject: bool,
+    trust: bool,
+    reviewer: str,
+    tenant: str | None,
+    authoritative_source: bool,
+    live_verified: bool,
+):
+    """Review a candidate and evaluate it for promotion."""
+    _load_env()
+    from tacit.config import settings
+    from tacit.knowledge.service import get_knowledge_service
+
+    tenant_id = _knowledge_tenant(tenant)
+    service = get_knowledge_service()
+    selected = [value for value, enabled in (("approve", approve), ("reject", reject), ("trust", trust)) if enabled]
+    if decision:
+        selected.append(decision)
+    if len(set(selected)) != 1:
+        raise click.ClickException("choose exactly one of --approve, --reject, --trust, or --decision")
+    decision = selected[0]
+    permission = {
+        "approve": "knowledge.review",
+        "reject": "knowledge.reject",
+        "trust": "knowledge.trust",
+    }[decision]
+    permissions = {value.strip() for value in settings.knowledge_permissions.split(",") if value.strip()}
+    if permission not in permissions:
+        raise click.ClickException(f"missing permission: {permission}")
+    try:
+        candidate = service.review_candidate(
+            candidate_id,
+            approved=decision != "reject",
+            reviewer=reviewer,
+            tenant_id=tenant_id,
+            trust=decision == "trust",
+            can_trust=decision == "trust",
+        )
+        promotion = revision = None
+        if decision != "reject":
+            promotion, revision = service.evaluate_candidate(
+                candidate_id,
+                tenant_id=tenant_id,
+                authoritative_source=authoritative_source,
+                live_verified=live_verified,
+            )
+    except (ValueError, PermissionError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    _knowledge_json(
+        {
+            "candidate": candidate.model_dump(mode="json"),
+            "promotion_decision": promotion.model_dump(mode="json") if promotion else None,
+            "knowledge_revision": revision.model_dump(mode="json") if revision else None,
+        }
+    )
+
+
+@knowledge.command("history")
+@click.argument("knowledge_id")
+@click.option("--tenant", default=None)
+def knowledge_history(knowledge_id: str, tenant: str | None):
+    """List immutable revisions for one knowledge item."""
+    _load_env()
+    from tacit.knowledge.repository import get_knowledge_repository
+
+    _knowledge_json(get_knowledge_repository().list_revisions(knowledge_id, _knowledge_tenant(tenant)))
+
+
+@knowledge.command("usage")
+@click.argument("knowledge_id")
+@click.option("--tenant", default=None)
+def knowledge_usage(knowledge_id: str, tenant: str | None):
+    """List investigations that considered a knowledge item."""
+    _load_env()
+    from tacit.knowledge.repository import get_knowledge_repository
+
+    _knowledge_json(
+        get_knowledge_repository().list_usage(tenant_id=_knowledge_tenant(tenant), knowledge_id=knowledge_id)
+    )
 
 
 # ── tacit history ─────────────────────────────────────────────────────

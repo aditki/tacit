@@ -259,11 +259,12 @@
 </head>
 <body>
   <h1>Tacit</h1>
-  <p class="subtitle">Natural language &rarr; Grafana dashboards</p>
+  <p class="subtitle">Operational investigations with evidence and governed knowledge</p>
 
   <div class="tabs">
     <div class="tab active" onclick="switchTab('generate')">Generate</div>
     <div class="tab" onclick="switchTab('learning')">Learning</div>
+    <div class="tab" onclick="switchTab('knowledge')">Knowledge</div>
     <div class="tab" onclick="switchTab('signals')">Signals</div>
     <div class="tab" onclick="switchTab('insights')">Insights</div>
     <div class="tab" onclick="switchTab('archetypes')">Archetypes</div>
@@ -333,6 +334,18 @@
       <hr class="section-divider">
       <div class="result-label">Ingested Dashboards</div>
       <div id="ingested-list"><div class="status">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Knowledge tab -->
+  <div class="tab-content" id="tab-knowledge">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+        <div class="result-label" style="margin:0">Knowledge Review Queue</div>
+        <button class="btn-secondary btn-sm" onclick="loadKnowledgeQueue()" title="Refresh review queue">&#8635;</button>
+      </div>
+      <div id="knowledge-status" style="font-size:0.75rem;color:#6b7280;margin-bottom:0.75rem"></div>
+      <div id="knowledge-queue"><div class="status">Loading...</div></div>
     </div>
   </div>
 
@@ -411,10 +424,11 @@
   </div>
 
   <script>
-    const BASE = window.location.origin;
+    const LOCAL_API_BASE = 'http://127.0.0.1:8010';
+    const BASE = window.location.protocol === 'file:' ? LOCAL_API_BASE : window.location.origin;
     let lastDashboardUid = null;
 
-    const TAB_ORDER = ['generate','learning','signals','insights','archetypes','history'];
+    const TAB_ORDER = ['generate','learning','knowledge','signals','insights','archetypes','history'];
 
     /* ── Tabs ──────────────────────────────────────────────────── */
     function switchTab(name) {
@@ -426,6 +440,7 @@
       if (name === 'archetypes') loadArchetypes();
       if (name === 'history') loadHistory();
       if (name === 'learning') loadIngestedDashboards();
+      if (name === 'knowledge') loadKnowledgeQueue();
       if (name === 'signals') loadSignals();
     }
 
@@ -1164,6 +1179,73 @@
       return reviewDashboard(uid, 'approve', backend);
     }
 
+    /* ── Knowledge tab ────────────────────────────────────────── */
+    async function loadKnowledgeQueue() {
+      const content = document.getElementById('knowledge-queue');
+      const status = document.getElementById('knowledge-status');
+      content.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      try {
+        const [queueResp, statusResp] = await Promise.all([
+          fetch(`${BASE}/api/v1/knowledge/review-queue`),
+          fetch(`${BASE}/api/v1/knowledge/status`),
+        ]);
+        if (!queueResp.ok || !statusResp.ok) throw new Error(`HTTP ${queueResp.status || statusResp.status}`);
+        const queue = await queueResp.json();
+        const stats = await statusResp.json();
+        const pending = queue.candidates || [];
+        const conflicts = queue.unresolved_conflicts || [];
+        status.textContent = `${pending.length} pending · ${conflicts.length} unresolved conflicts · tenant ${stats.tenant_id}`;
+        if (!pending.length) {
+          content.innerHTML = '<div class="status">No candidates pending review.</div>';
+          return;
+        }
+        let html = `<table class="hist-table"><thead><tr>
+          <th style="width:18%">Kind</th><th>Proposition</th><th style="width:25%">Policy</th><th style="width:25%">Review</th>
+        </tr></thead><tbody>`;
+        for (const candidate of pending) {
+          const proposition = candidate.proposition || {};
+          const state = candidate.state || {};
+          const policy = candidate.policy || {};
+          const scope = candidate.scope || {};
+          const corroboration = candidate.corroboration || {};
+          const relation = [proposition.subject_ref, proposition.predicate, proposition.object_ref || proposition.concept_ref]
+            .filter(Boolean).join(' ');
+          const reasonCodes = (policy.eligibility_reason_codes || []).join(', ') || state.eligibility || 'not evaluated';
+          const priorityReasons = (candidate.review_priority_reasons || []).join(', ');
+          const scopeText = ['environment_refs','region_refs','service_refs'].flatMap(key => scope[key] || []).join(', ') || 'tenant-wide';
+          const sourceText = `${corroboration.independent_source_count || 0} independent · ${(corroboration.source_families || []).join(', ') || 'unclassified'}`;
+          html += `<tr>
+            <td>${esc(candidate.kind || '')}<br><span style="color:#6b7280">${esc(priorityReasons)}</span></td>
+            <td class="arch-cell">${esc(relation)}<br><span style="color:#6b7280">Scope: ${esc(scopeText)}</span></td>
+            <td class="arch-cell">${esc(policy.promotion_policy_ref || 'not evaluated')}<br><span style="color:#6b7280">${esc(reasonCodes)} · ${esc(sourceText)}</span></td>
+            <td>
+              <button class="btn-sm btn-success knowledge-review-btn" data-candidate-id="${escAttr(candidate.id)}" data-decision="approve">Approve</button>
+              <button class="btn-sm btn-secondary knowledge-review-btn" data-candidate-id="${escAttr(candidate.id)}" data-decision="reject">Reject</button>
+            </td>
+          </tr>`;
+        }
+        content.innerHTML = html + '</tbody></table>';
+      } catch (error) {
+        const detail = window.location.protocol === 'file:'
+          ? `Unable to reach Tacit API at ${BASE}. Start the local server or open ${BASE}/.`
+          : error.message;
+        content.innerHTML = `<div class="status" style="color:#ef4444">${esc(detail)}</div>`;
+      }
+    }
+
+    async function reviewKnowledgeCandidate(candidateId, decision) {
+      const response = await fetch(`${BASE}/api/v1/knowledge/candidates/${encodeURIComponent(candidateId)}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision, reviewer: 'web-ui', evaluate: true }),
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: response.statusText }));
+        throw new Error(errMsg(error, `HTTP ${response.status}`));
+      }
+      await loadKnowledgeQueue();
+    }
+
     /* ── Signals tab ──────────────────────────────────────────── */
     async function loadSignals() {
       const el = document.getElementById('signals-content');
@@ -1302,6 +1384,18 @@
       const btn = e.target.closest('.review-dashboard-btn');
       if (btn && btn.dataset.dashboardUid) {
         reviewDashboard(btn.dataset.dashboardUid, btn.dataset.dashboardAction || 'approve', btn.dataset.dashboardBackend || '');
+      }
+    });
+
+    document.getElementById('knowledge-queue').addEventListener('click', async (e) => {
+      const btn = e.target.closest('.knowledge-review-btn');
+      if (!btn || !btn.dataset.candidateId) return;
+      btn.disabled = true;
+      try {
+        await reviewKnowledgeCandidate(btn.dataset.candidateId, btn.dataset.decision || 'approve');
+      } catch (error) {
+        document.getElementById('knowledge-status').textContent = error.message;
+        btn.disabled = false;
       }
     });
 

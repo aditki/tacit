@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 
 from fastapi import HTTPException, Request, Security
@@ -10,6 +11,7 @@ from fastapi.security import APIKeyHeader
 from tacit.config import settings
 
 MAX_PROMPT_LENGTH = 2000
+MAX_TENANT_LENGTH = 128
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -27,3 +29,34 @@ def sanitize_prompt(prompt: str) -> str:
     """Basic prompt sanitization — length cap and control char removal."""
     cleaned = "".join(c for c in prompt if c == "\n" or (c.isprintable() and ord(c) < 0x10000))
     return cleaned[:MAX_PROMPT_LENGTH].strip()
+
+
+def knowledge_tenant(request: Request) -> str:
+    """Resolve a tenant without allowing a request to cross the configured boundary."""
+    runtime_settings = getattr(request.app.state, "settings", settings)
+    configured = runtime_settings.knowledge_tenant_id.strip() or "default"
+    header_value = request.headers.get("X-Tacit-Tenant")
+    if configured == "*" and not header_value:
+        raise HTTPException(status_code=400, detail="Knowledge tenant header is required")
+    requested = (header_value or configured).strip()
+    if not requested or len(requested) > MAX_TENANT_LENGTH or re.fullmatch(r"[A-Za-z0-9_.:-]+", requested) is None:
+        raise HTTPException(status_code=400, detail="Invalid knowledge tenant")
+    if configured != "*" and requested != configured:
+        raise HTTPException(status_code=403, detail="Tenant access denied")
+    return requested
+
+
+def require_knowledge_permission(permission: str):
+    """Build a dependency backed by server-side permission configuration."""
+
+    async def dependency(request: Request) -> None:
+        assert_knowledge_permission(request, permission)
+
+    return dependency
+
+
+def assert_knowledge_permission(request: Request, permission: str) -> None:
+    runtime_settings = getattr(request.app.state, "settings", settings)
+    permissions = {value.strip() for value in runtime_settings.knowledge_permissions.split(",") if value.strip()}
+    if permission not in permissions:
+        raise HTTPException(status_code=403, detail=f"Missing permission: {permission}")

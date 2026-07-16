@@ -6,6 +6,7 @@ import asyncio
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -28,6 +29,9 @@ from tacit.pipeline.discovery import (
     discovery_keywords,
     semantic_mapping_diagnostics,
 )
+
+if TYPE_CHECKING:
+    from tacit.knowledge.models import KnowledgeUsage
 from tacit.pipeline.failures import PipelineFailureFactory, handle_empty_catalog
 from tacit.pipeline.recording import (
     PipelineRecorder,
@@ -365,6 +369,26 @@ async def _run_pipeline_inner(
             evidence_resolutions=evidence_resolutions,
             evidence_observations=validation_result.evidence_observations,
         )
+        knowledge_snapshot = None
+        knowledge_usage: list[KnowledgeUsage] = []
+        try:
+            from tacit.knowledge.models import KnowledgeScope
+            from tacit.knowledge.service import get_knowledge_service
+
+            tenant_id = request.tenant_id or getattr(runtime_settings, "knowledge_tenant_id", "default")
+            knowledge_scope = KnowledgeScope(
+                tenant_id=tenant_id,
+                service_refs=[f"entity:service:{service}" for service in intent.services],
+            )
+            knowledge_service = get_knowledge_service()
+            knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(knowledge_scope)
+            knowledge_usage = knowledge_service.reconcile_live_observations(
+                knowledge_usage,
+                validation_result.evidence_observations,
+            )
+            culprit_ranking = knowledge_service.apply_to_ranking(culprit_ranking, knowledge_usage)
+        except Exception:
+            logger.warning("operational_knowledge_selection_failed", exc_info=True)
         ranking_status = "passed" if culprit_ranking.candidates else "skipped"
         ranking_reason = (
             culprit_ranking.abstention_reason
@@ -415,6 +439,8 @@ async def _run_pipeline_inner(
             evidence_observations=validation_result.evidence_observations,
             culprit_ranking=culprit_ranking,
             context_chunks=context_chunks,
+            knowledge_snapshot=knowledge_snapshot,
+            knowledge_usage=knowledge_usage,
             run_type=run_type,
             revision_reason="refresh" if run_type == InvestigationRunType.REFRESH else "initial",
             base_revision=base_revision,

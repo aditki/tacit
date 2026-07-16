@@ -17,6 +17,9 @@ from typing import Any, Protocol
 
 from tacit.signals import get_signal_store as _default_get_signal_store
 
+MAX_ARTIFACT_BODY_LENGTH = 200_000
+MAX_SOURCE_EXCERPT_LENGTH = 2_000
+
 
 def get_signal_store():
     """Resolve through the package facade for test isolation."""
@@ -183,7 +186,8 @@ def _artifact_id(
 
 
 def _clean_line(line: str) -> str:
-    return BULLET_PREFIX_RE.sub("", line.strip(), count=1).strip()
+    cleaned = BULLET_PREFIX_RE.sub("", line.strip(), count=1).strip()
+    return cleaned[:MAX_SOURCE_EXCERPT_LENGTH]
 
 
 def _normalize_entity_token(value: str) -> str:
@@ -623,6 +627,8 @@ def artifact_from_text(
     source_instance: str | None = None,
     provenance_url: str | None = None,
 ) -> LearnedArtifact:
+    if len(body_text) > MAX_ARTIFACT_BODY_LENGTH:
+        raise ValueError(f"artifact body exceeds {MAX_ARTIFACT_BODY_LENGTH} characters")
     now = _now()
     return LearnedArtifact(
         id=_artifact_id(artifact_type, external_id, source_instance or "", source_vendor or ""),
@@ -717,6 +723,7 @@ def learn_artifact(
     extractor: ArtifactExtractor,
     *,
     dry_run: bool = False,
+    tenant_id: str | None = None,
 ) -> dict[str, object]:
     result = extractor.extract(artifact)
     evidence_rows = _as_store_rows(result.evidence_requirements)
@@ -726,6 +733,11 @@ def learn_artifact(
     change_state = "dry_run"
     indexed_context_rows = 0
     mappings_created = 0
+    governed_candidate_ids: list[str] = []
+    if tenant_id is None:
+        from tacit.config import settings
+
+        tenant_id = settings.knowledge_tenant_id
     if not dry_run:
         store = get_signal_store()
         change_state = store.record_learned_artifact(
@@ -811,8 +823,26 @@ def learn_artifact(
                 dependency_hints=index_dependency_rows,
                 signal_mapping_candidates=index_signal_rows,
             )
+        from tacit.knowledge.migration import migrate_artifact_extractions
+        from tacit.knowledge.repository import KnowledgeRepository
+        from tacit.knowledge.service import KnowledgeService
+
+        governed_candidate_ids = migrate_artifact_extractions(
+            artifact_id=artifact.id,
+            artifact_type=artifact.artifact_type,
+            rows={
+                "evidence_requirements": evidence_rows,
+                "ownership_hints": ownership_rows,
+                "dependency_hints": dependency_rows,
+                "signal_mapping_candidates": signal_rows,
+            },
+            service=KnowledgeService(KnowledgeRepository(store._db_path)),
+            tenant_id=tenant_id,
+        )
+    artifact_summary = asdict(artifact)
+    artifact_summary.pop("body_text", None)
     return {
-        "artifact": asdict(artifact),
+        "artifact": artifact_summary,
         "artifact_id": artifact.id,
         "artifact_type": artifact.artifact_type,
         "title": artifact.title,
@@ -825,6 +855,7 @@ def learn_artifact(
         "warnings": result.warnings,
         "indexed_context_rows": indexed_context_rows,
         "mappings_created": mappings_created,
+        "knowledge_candidate_ids": governed_candidate_ids,
         "summary": {
             "artifact_type": artifact.artifact_type,
             "learned": 0 if dry_run else 1,

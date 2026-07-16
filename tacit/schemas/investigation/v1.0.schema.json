@@ -583,10 +583,114 @@
           },
           "title": "Services",
           "type": "array"
+        },
+        "tenant_id": {
+          "default": "default",
+          "title": "Tenant Id",
+          "type": "string"
         }
       },
       "title": "InvestigationScope",
       "type": "object"
+    },
+    "KnowledgeUsage": {
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "decision_ref": {
+          "default": "",
+          "title": "Decision Ref",
+          "type": "string"
+        },
+        "disposition": {
+          "$ref": "#/$defs/KnowledgeUsageDisposition"
+        },
+        "investigation_id": {
+          "default": "",
+          "title": "Investigation Id",
+          "type": "string"
+        },
+        "investigation_revision": {
+          "default": 0,
+          "title": "Investigation Revision",
+          "type": "integer"
+        },
+        "knowledge_ref": {
+          "title": "Knowledge Ref",
+          "type": "string"
+        },
+        "knowledge_revision": {
+          "minimum": 1,
+          "title": "Knowledge Revision",
+          "type": "integer"
+        },
+        "provenance_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provenance Refs",
+          "type": "array"
+        },
+        "reason_codes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Reason Codes",
+          "type": "array"
+        },
+        "score_delta": {
+          "default": 0.0,
+          "title": "Score Delta",
+          "type": "number"
+        },
+        "target_ref": {
+          "default": "",
+          "title": "Target Ref",
+          "type": "string"
+        },
+        "tenant_id": {
+          "default": "default",
+          "title": "Tenant Id",
+          "type": "string"
+        },
+        "usage_id": {
+          "default": "",
+          "title": "Usage Id",
+          "type": "string"
+        },
+        "used_for": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Used For",
+          "type": "array"
+        }
+      },
+      "required": [
+        "knowledge_ref",
+        "knowledge_revision",
+        "disposition"
+      ],
+      "title": "KnowledgeUsage",
+      "type": "object"
+    },
+    "KnowledgeUsageDisposition": {
+      "enum": [
+        "applied",
+        "considered_not_applied",
+        "rejected_by_scope",
+        "rejected_as_stale",
+        "rejected_by_conflict",
+        "rejected_by_review_state",
+        "rejected_by_eligibility",
+        "contradicted_by_observation",
+        "unresolved_entity"
+      ],
+      "title": "KnowledgeUsageDisposition",
+      "type": "string"
     },
     "ObservationContract": {
       "properties": {
@@ -966,6 +1070,18 @@
     },
     "investigation": {
       "$ref": "#/$defs/InvestigationMetadata"
+    },
+    "knowledge_snapshot_ref": {
+      "default": "",
+      "title": "Knowledge Snapshot Ref",
+      "type": "string"
+    },
+    "knowledge_usage": {
+      "items": {
+        "$ref": "#/$defs/KnowledgeUsage"
+      },
+      "title": "Knowledge Usage",
+      "type": "array"
     },
     "observations": {
       "items": {

@@ -48,6 +48,10 @@ OPENAPI_TAGS = [
         "and aggregation patterns, then infers signal mappings.",
     },
     {
+        "name": "Operational Knowledge",
+        "description": "Review, promote, explain, revise, and audit governed operational knowledge.",
+    },
+    {
         "name": "System",
         "description": "Health checks and system status.",
     },

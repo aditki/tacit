@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi import Path as PathParam
 
 import tacit.signals as signals_mod
-from tacit.api.security import verify_api_key
+from tacit.api.security import knowledge_tenant, verify_api_key
 from tacit.models.schemas import (
     LearnAlertRequest,
     LearnDashboardRequest,
@@ -135,7 +135,7 @@ async def learn_from_alert(request: Request, payload: LearnAlertRequest):
     summary="Learn from a runbook artifact",
     response_description="Extracted operational IR candidates with provenance",
 )
-async def learn_from_runbook(payload: LearnRunbookRequest):
+async def learn_from_runbook(payload: LearnRunbookRequest, request: Request):
     """Learn operational candidates from a markdown/plain-text runbook."""
     from tacit.artifact_learning import RunbookExtractor, artifact_from_text, learn_artifact
 
@@ -149,7 +149,12 @@ async def learn_from_runbook(payload: LearnRunbookRequest):
             source_instance=payload.source_instance,
             provenance_url=payload.provenance_url,
         )
-        return learn_artifact(artifact, RunbookExtractor(), dry_run=payload.dry_run)
+        return learn_artifact(
+            artifact,
+            RunbookExtractor(),
+            dry_run=payload.dry_run,
+            tenant_id=knowledge_tenant(request),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
@@ -163,7 +168,7 @@ async def learn_from_runbook(payload: LearnRunbookRequest):
     summary="Learn from an incident-history artifact",
     response_description="Extracted operational IR candidates with provenance",
 )
-async def learn_from_incident(payload: LearnIncidentRequest):
+async def learn_from_incident(payload: LearnIncidentRequest, request: Request):
     """Learn operational candidates from an incident-history record."""
     from tacit.artifact_learning import IncidentExtractor, artifact_from_text, learn_artifact
 
@@ -177,7 +182,12 @@ async def learn_from_incident(payload: LearnIncidentRequest):
             source_instance=payload.source_instance,
             provenance_url=payload.provenance_url,
         )
-        return learn_artifact(artifact, IncidentExtractor(), dry_run=payload.dry_run)
+        return learn_artifact(
+            artifact,
+            IncidentExtractor(),
+            dry_run=payload.dry_run,
+            tenant_id=knowledge_tenant(request),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
