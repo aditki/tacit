@@ -6,7 +6,7 @@ from typing import Any
 
 from tacit.knowledge.enums import EvidenceRole, KnowledgeKind, LineageKind, Predicate, ReviewState
 from tacit.knowledge.models import KnowledgeEvidenceReference, KnowledgeScope, MigrationProvenance
-from tacit.knowledge.normalization import stable_fingerprint
+from tacit.knowledge.normalization import normalize_ref, stable_fingerprint
 from tacit.knowledge.service import KnowledgeService, _source_family
 
 
@@ -37,9 +37,10 @@ def migrate_artifact_extractions(
                 lineage_kind=LineageKind.INDEPENDENT,
                 provenance_refs=[f"prov_artifact:{artifact_id}"],
             )
+            scope_service = row.get("source_entity") if kind == KnowledgeKind.DEPENDENCY else row.get("target_entity")
             scope = KnowledgeScope(
                 tenant_id=tenant_id,
-                service_refs=[f"entity:service:{row['target_entity']}"] if row.get("target_entity") else [],
+                service_refs=[_service_ref(str(scope_service))] if scope_service else [],
             )
             semantic_id = stable_fingerprint(
                 {
@@ -113,6 +114,11 @@ def migrate_signal_mapping(
         )
         service.repository.save_candidate(candidate)
     return candidate.id
+
+
+def _service_ref(value: str) -> str:
+    normalized = normalize_ref(value)
+    return normalized if normalized.startswith("entity:") else f"entity:service:{normalized}"
 
 
 def _proposition(kind: KnowledgeKind, row: dict[str, Any]) -> dict[str, Any]:

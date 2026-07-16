@@ -55,6 +55,7 @@ class KnowledgeScope(BaseModel):
             "namespace_refs",
             "service_refs",
             "archetype_refs",
+            "version_constraints",
         ):
             required = set(getattr(self, field_name))
             actual = set(getattr(other, field_name))

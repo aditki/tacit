@@ -20,6 +20,10 @@ logger = structlog.get_logger()
 router = APIRouter()
 
 
+def _configured_tenant(request: DashRequest, deps: PipelineDependencies) -> str:
+    return request.tenant_id or getattr(deps.settings, "knowledge_tenant_id", "default") or "default"
+
+
 @router.post(
     "/api/v1/chart",
     response_model=DashResponse,
@@ -33,7 +37,9 @@ async def create_chart(
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     """Generate a Grafana dashboard from a natural-language prompt."""
-    request = request.model_copy(update={"prompt": sanitize_prompt(request.prompt)})
+    request = request.model_copy(
+        update={"prompt": sanitize_prompt(request.prompt), "tenant_id": _configured_tenant(request, deps)}
+    )
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
     try:
@@ -65,7 +71,9 @@ async def create_chart_stream(
     ranking, publish, ...) as the investigation is built, followed by a final
     `result` event containing the standard DashResponse JSON.
     """
-    request = request.model_copy(update={"prompt": sanitize_prompt(request.prompt)})
+    request = request.model_copy(
+        update={"prompt": sanitize_prompt(request.prompt), "tenant_id": _configured_tenant(request, deps)}
+    )
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 

@@ -10,7 +10,7 @@
     {"id": "proposition-equivalent", "family": "normalization", "expected": "merge"},
     {"id": "proposition-reversed", "family": "normalization", "expected": "distinct"},
     {"id": "proposition-scope", "family": "normalization", "expected": "distinct"},
-    {"id": "copied-source", "family": "corroboration", "expected": "single_source"},
+    {"id": "copied-source", "family": "corroboration", "expected": "uncorroborated"},
     {"id": "independent-families", "family": "corroboration", "expected": "multi_family"},
     {"id": "scope-conflict", "family": "conflict", "expected": "resolved_by_scope"},
     {"id": "rejected-promotion", "family": "promotion", "expected": "blocked"},

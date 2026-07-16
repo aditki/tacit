@@ -77,6 +77,7 @@ class InvestigationReplaySnapshot(BaseModel):
     resolution_candidates: list[dict[str, Any]] = Field(default_factory=list)
     evidence_observations: list[EvidenceObservation] = Field(default_factory=list)
     culprit_ranking: CulpritRanking = Field(default_factory=CulpritRanking)
+    baseline_culprit_ranking: CulpritRanking | None = None
     context_chunks: list[ContextChunk] = Field(default_factory=list)
     renderings: dict[str, Any] = Field(default_factory=dict)
     external_errors: list[dict[str, Any]] = Field(default_factory=list)
