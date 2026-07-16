@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from tacit.dependencies import PipelineDependencies
+from tacit.investigation_contract import InvestigationRunType
+from tacit.models.schemas import DashRequest, DashResponse
 from tacit.pipeline import runner as _runner
 from tacit.pipeline.discovery import discovery_keywords as _discovery_keywords
 from tacit.pipeline.discovery import semantic_mapping_diagnostics as _semantic_mapping_diagnostics
@@ -22,10 +25,23 @@ def _sync_patch_points() -> None:
     _runner.get_investigation_store = get_investigation_store
 
 
-async def run_pipeline(request, deps=None):
+async def run_pipeline(
+    request: DashRequest,
+    deps: PipelineDependencies | None = None,
+    *,
+    investigation_id: str | None = None,
+    run_type: InvestigationRunType = InvestigationRunType.INITIAL,
+    base_revision: int | None = None,
+) -> DashResponse:
     """Run the pipeline, honoring package-level monkeypatch compatibility."""
     _sync_patch_points()
-    return await _runner.run_pipeline(request, deps)
+    return await _runner.run_pipeline(
+        request,
+        deps,
+        investigation_id=investigation_id,
+        run_type=run_type,
+        base_revision=base_revision,
+    )
 
 
 __all__ = [

@@ -1512,7 +1512,7 @@ wheels = [
 
 [[package]]
 name = "tacit-ai"
-version = "0.1.1rc4"
+version = "0.1.1rc5"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },

@@ -43,6 +43,36 @@ def _build_action_buttons(response) -> list[dict]:
     return buttons
 
 
+def _contract_text(response, contract) -> str:
+    """Render the canonical grounding result without upgrading it to a causal claim."""
+    if contract is None:
+        return response.summary
+    conclusion = contract.grounding.maximum_trustworthy_conclusion.get("text", "")
+    revision = contract.investigation.revision
+    return (
+        f"{response.summary}\n"
+        f"*Grounding:* `{contract.grounding.status.value}`\n"
+        f"*Maximum trustworthy conclusion:* {conclusion}\n"
+        f"*Investigation:* `{contract.investigation.id}` revision `{revision}`"
+    )
+
+
+def _load_contract(deps: PipelineDependencies | None, response):
+    if not response.investigation_id:
+        return None
+    try:
+        if deps is not None:
+            store = deps.history_store_factory()
+        else:
+            from tacit.history import get_investigation_store
+
+            store = get_investigation_store()
+        return store.get_contract(response.investigation_id, response.investigation_revision)
+    except Exception:
+        logger.warning("slack_contract_load_failed", investigation_id=response.investigation_id, exc_info=True)
+        return None
+
+
 async def handle_mention(
     event: dict,
     say,
@@ -74,7 +104,9 @@ async def handle_mention(
             user_id=user,
             thread_ts=thread_ts,
         )
-        response = await run_pipeline(request, deps_factory() if deps_factory else None)
+        deps = deps_factory() if deps_factory else None
+        response = await run_pipeline(request, deps)
+        contract_text = _contract_text(response, _load_contract(deps, response))
 
         if response.dashboard_url:
             blocks = [
@@ -82,12 +114,12 @@ async def handle_mention(
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"✅ *Dashboard ready!*\n{response.summary}",
+                        "text": f"✅ *Investigation complete*\n{contract_text}",
                     },
                 },
                 {"type": "actions", "elements": _build_action_buttons(response)},
             ]
-            await say(blocks=blocks, text=response.summary, thread_ts=thread_ts)
+            await say(blocks=blocks, text=contract_text, thread_ts=thread_ts)
         else:
             await say(text=f"⚠️ {response.summary}", thread_ts=thread_ts)
 
@@ -113,7 +145,7 @@ async def handle_slash_command(
 
     if not prompt:
         await say(
-            text="Usage: `/tacit <problem statement>`\n" "Example: `/tacit high error rate on payments API since 2pm`",
+            text="Usage: `/tacit <problem statement>`\nExample: `/tacit high error rate on payments API since 2pm`",
         )
         return
 
@@ -121,7 +153,9 @@ async def handle_slash_command(
 
     try:
         request = DashRequest(prompt=prompt, channel_id=channel, user_id=user)
-        response = await run_pipeline(request, deps_factory() if deps_factory else None)
+        deps = deps_factory() if deps_factory else None
+        response = await run_pipeline(request, deps)
+        contract_text = _contract_text(response, _load_contract(deps, response))
 
         if response.dashboard_url:
             blocks = [
@@ -129,12 +163,12 @@ async def handle_slash_command(
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"✅ *Dashboard ready!*\n{response.summary}",
+                        "text": f"✅ *Investigation complete*\n{contract_text}",
                     },
                 },
                 {"type": "actions", "elements": _build_action_buttons(response)},
             ]
-            await say(blocks=blocks, text=response.summary)
+            await say(blocks=blocks, text=contract_text)
         else:
             await say(text=f"⚠️ {response.summary}")
 

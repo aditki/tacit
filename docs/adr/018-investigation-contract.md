@@ -158,36 +158,38 @@ Taken together with the prior ADRs, this completes Tacit's operating philosophy:
 
 ## Implementation Notes
 
-Implementation status: not implemented (decision record).
-
-Existing building blocks validated against the current repository:
-
-- `tacit/models/schemas.py`: Intent, EvidenceRequirement/Resolution/Observation, CulpritRanking
-  (with abstention reason codes) already model most contract fields.
-- `tacit/history.py` + `tacit/pipeline/recording.py`: investigation records already persist intent,
-  stages, queries, validation, and provenance per run.
-- `tacit/pipeline/progress.py` + `/api/v1/chart/stream`: stage events already stream; the final SSE
-  `result` event is the natural place to emit the contract object.
-- `tacit/evidence.py`, `tacit/culprit_ranking.py`: produce the observations and ranked suspects the
-  contract requires.
+Implementation status: implemented for the repository's pipeline, REST, CLI, web, and Slack surfaces.
 
 Implemented:
 
 - `tacit/investigation_contract.py` defines `tacit.investigation` schema version `1.0`, typed lifecycle enums,
-  structural grounding, decision log, normalized provenance, queries, corrections, renderings, and runtime
-  fingerprints.
+  explicit abstention, structural grounding, artifact contributions, decision log, provenance, queries,
+  corrections, rendering references, validation invariants, and normalized runtime fingerprints.
 - `tacit/schemas/investigation/v1.0.schema.json` is generated from the Pydantic model and packaged as a
   runtime resource. Future contract families and versions follow `tacit/schemas/{family}/v{version}.schema.json`.
-- `tacit investigate --json` is the first contract renderer; `tacit test` remains the human-friendly dashboard path.
+- Successful pipeline runs persist typed captured-input snapshots. Exact, current-engine, and controlled
+  counterfactual replay rebuild from those snapshots without external refetch. Legacy revisions are explicitly
+  labeled as load-only when no snapshot exists.
+- SQLite stores immutable revisions, snapshots, runs, append-only lifecycle events, and reviewable correction
+  candidates. Failed and timed-out pipeline attempts close their run records even when no revision is produced.
+- Refresh reuses the logical investigation ID and resolves current external inputs into a subsequent revision.
+  Approved corrections create provenance-bearing revisions; pending or rejected candidates never become truth.
+- The legacy adapter migrates historical rows without fabricating absent evidence or provenance and records a
+  migration note with indeterminate grounding.
+- `tacit investigate --json` renders the full contract. `tacit history contract|compare|replay|export` provides
+  local inspection, comparison, offline replay, and per-investigation Assessment Bundle export.
 - `/api/v1/chart` remains backward compatible while returning `investigation_id` and `investigation_revision`.
-- `/api/v1/investigations/{id}/contract`, `/revisions`, `/compare`, `/replay`, and `/corrections` expose inspect,
-  compare, exact replay, and correction-candidate workflows.
-- `InvestigationStore` persists append-only revisions, replay runs, events, and knowledge candidates.
+- Investigation REST resources expose contracts, revisions, comparison, replay modes, refresh, migration,
+  correction review/application, runs, events, and portable Assessment Bundles.
+- Slack and web render grounding status, maximum trustworthy conclusion, and investigation revision from the
+  canonical contract while retaining dashboard actions.
+- The frozen ten-case acceptance corpus covers supported, partial, negative-control, contradictory, missing,
+  unresolved-entity, failed-query, stale-artifact, no-culprit, and multiple-suspect investigations.
+- Grounding Benchmark v1 contains 40 deterministic cases across five adversarial insufficiency families and is
+  release-gated on zero unsafe assertions through `tacit benchmark-grounding`.
 
 Remaining:
 
-- Implement Grounding Benchmark v1 as specified in
-  [docs/evaluation-grounding-benchmark-v1.md](../evaluation-grounding-benchmark-v1.md):
-  five adversarial-insufficiency case families scored against expected grounding status, with
-  unsafe assertion rate as a release gate.
-- Specify per-consumer auth/audit requirements before exposing the contract to autonomous agents.
+- This repository does not contain an MCP or A2A server. Any future protocol adapter must consume schema v1
+  rather than define a parallel investigation shape.
+- Specify per-consumer identity and authorization before exposing contracts to autonomous external agents.

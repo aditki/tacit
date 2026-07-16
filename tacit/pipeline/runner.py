@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import suppress
+from dataclasses import dataclass
 
 import structlog
 
@@ -14,6 +16,7 @@ from tacit.context.enrichment import enrich_context
 from tacit.culprit_ranking import rank_culprits
 from tacit.dependencies import PipelineDependencies, _get_feedback_store, build_pipeline_dependencies
 from tacit.history import get_investigation_store
+from tacit.investigation_contract import InvestigationRunType
 from tacit.logging import bind_request_id, stage_log, unbind_request_id
 from tacit.models.schemas import (
     DashRequest,
@@ -32,7 +35,7 @@ from tacit.pipeline.recording import (
     history_archetypes,
     history_signals,
 )
-from tacit.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history
+from tacit.pipeline.side_effects import safe_close_backends
 from tacit.pipeline.stages.archetypes import compile_selected_archetypes, select_archetypes
 from tacit.pipeline.stages.discovery import run_discovery_stage
 from tacit.pipeline.stages.evidence import run_evidence_stage
@@ -53,6 +56,12 @@ _semantic_mapping_diagnostics = semantic_mapping_diagnostics
 # Concurrency gate — prevents thundering-herd on LLM + Grafana APIs
 _pipeline_semaphore: asyncio.Semaphore | None = None
 _pipeline_semaphore_limit: int | None = None
+
+
+@dataclass
+class _PipelineCancellation:
+    status: str = "cancelled"
+    error: str = "Pipeline cancelled"
 
 
 def _default_dependencies() -> PipelineDependencies:
@@ -78,7 +87,14 @@ def _get_semaphore(max_concurrent: int) -> asyncio.Semaphore:
     return _pipeline_semaphore
 
 
-async def run_pipeline(request: DashRequest, deps: PipelineDependencies | None = None) -> DashResponse:
+async def run_pipeline(
+    request: DashRequest,
+    deps: PipelineDependencies | None = None,
+    *,
+    investigation_id: str | None = None,
+    run_type: InvestigationRunType = InvestigationRunType.INITIAL,
+    base_revision: int | None = None,
+) -> DashResponse:
     """End-to-end: natural language → Grafana dashboard URL."""
     deps = deps or _default_dependencies()
     runtime_settings = deps.settings
@@ -86,21 +102,34 @@ async def run_pipeline(request: DashRequest, deps: PipelineDependencies | None =
     sem = _get_semaphore(runtime_settings.pipeline_max_concurrent)
     try:
         async with sem:
+            cancellation = _PipelineCancellation()
+            pipeline_task = asyncio.create_task(
+                _run_pipeline_inner(
+                    request,
+                    deps,
+                    investigation_id=investigation_id,
+                    run_type=run_type,
+                    base_revision=base_revision,
+                    cancellation=cancellation,
+                )
+            )
             try:
-                return await asyncio.wait_for(
-                    _run_pipeline_inner(request, deps),
+                done, _ = await asyncio.wait(
+                    {pipeline_task},
                     timeout=runtime_settings.pipeline_timeout_seconds,
                 )
-            except TimeoutError:
+                if pipeline_task in done:
+                    return pipeline_task.result()
+
+                cancellation.status = "timeout"
+                cancellation.error = "Pipeline timed out"
+                pipeline_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pipeline_task
                 logger.error(
                     "pipeline_timeout",
                     user=request.user_id,
                     timeout=runtime_settings.pipeline_timeout_seconds,
-                )
-                safe_finish_timeout_history(
-                    history_store_factory=deps.history_store_factory,
-                    request=request,
-                    timeout_seconds=runtime_settings.pipeline_timeout_seconds,
                 )
                 return DashResponse(
                     dashboard_url="",
@@ -109,11 +138,27 @@ async def run_pipeline(request: DashRequest, deps: PipelineDependencies | None =
                     summary=f"Pipeline timed out after {runtime_settings.pipeline_timeout_seconds}s. "
                     "Try a more specific query or check datasource connectivity.",
                 )
+            except asyncio.CancelledError:
+                cancellation.status = "cancelled"
+                cancellation.error = "Pipeline cancelled by caller"
+                if not pipeline_task.done():
+                    pipeline_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pipeline_task
+                raise
     finally:
         unbind_request_id()
 
 
-async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) -> DashResponse:
+async def _run_pipeline_inner(
+    request: DashRequest,
+    deps: PipelineDependencies,
+    *,
+    investigation_id: str | None = None,
+    run_type: InvestigationRunType = InvestigationRunType.INITIAL,
+    base_revision: int | None = None,
+    cancellation: _PipelineCancellation | None = None,
+) -> DashResponse:
     """Inner pipeline logic (wrapped with timeout + semaphore above).
 
     Uses the backend adapter pattern: each enabled vendor (Grafana, SignalFx,
@@ -121,17 +166,47 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
     for discovery, validation, and publishing — zero vendor-specific if/else.
     """
     runtime_settings = deps.settings
-    backends = deps.backend_factory()
-    if not backends:
-        return PipelineFailureFactory.no_backends()
-
-    primary = backends[0]  # determines query language for compilation
-
     t_start = time.monotonic()
     timings: dict[str, float] = {}
     history = deps.history_store_factory()
-    inv_id = history.start(request.prompt, request.user_id or "", request.channel_id or "")
-    recorder = PipelineRecorder(history, inv_id)
+    inv_id = investigation_id or history.start(request.prompt, request.user_id or "", request.channel_id or "")
+    if base_revision is None and investigation_id and hasattr(history, "get_contract"):
+        current_contract = history.get_contract(investigation_id)
+        base_revision = current_contract.investigation.revision if current_contract else None
+    run_id = None
+    if hasattr(history, "start_run"):
+        try:
+            run_id = history.start_run(inv_id, run_type=run_type, base_revision=base_revision)
+        except Exception:
+            logger.warning("investigation_run_start_failed", investigation_id=inv_id, exc_info=True)
+    recorder = PipelineRecorder(
+        history,
+        inv_id,
+        run_id=run_id,
+        record_investigation_updates=investigation_id is None,
+    )
+    try:
+        backends = deps.backend_factory()
+    except Exception as exc:
+        recorder.finish(
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}",
+            timings=timings,
+            total_time=time.monotonic() - t_start,
+        )
+        await deps.close_resources()
+        raise
+    if not backends:
+        recorder.finish(
+            status="failed",
+            error="No dashboard backends are enabled",
+            timings={},
+            total_time=time.monotonic() - t_start,
+        )
+        await deps.close_resources()
+        return PipelineFailureFactory.no_backends().model_copy(update={"investigation_id": inv_id})
+
+    primary = backends[0]  # determines query language for compilation
     runtime = PipelineRunContext(
         request=request,
         deps=deps,
@@ -339,12 +414,33 @@ async def _run_pipeline_inner(request: DashRequest, deps: PipelineDependencies) 
             evidence_resolutions=evidence_resolutions,
             evidence_observations=validation_result.evidence_observations,
             culprit_ranking=culprit_ranking,
+            context_chunks=context_chunks,
+            run_type=run_type,
+            revision_reason="refresh" if run_type == InvestigationRunType.REFRESH else "initial",
+            base_revision=base_revision,
             timings=runtime.timings,
             recorder=runtime.recorder,
             token_usage=runtime.token_usage,
             started_at=runtime.started_at,
         )
 
+    except asyncio.CancelledError:
+        cancellation = cancellation or _PipelineCancellation()
+        runtime.recorder.finish(
+            status=cancellation.status,
+            error=cancellation.error,
+            timings=runtime.timings,
+            total_time=time.monotonic() - runtime.started_at,
+        )
+        raise
+    except Exception as exc:
+        runtime.recorder.finish(
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}",
+            timings=runtime.timings,
+            total_time=time.monotonic() - runtime.started_at,
+        )
+        raise
     finally:
         await safe_close_backends(backends)
         await deps.close_resources()

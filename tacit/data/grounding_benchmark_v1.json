@@ -1,0 +1,83 @@
+{
+  "schema": "tacit.grounding-benchmark/1.0",
+  "acceptance_cases": [
+    {"id": "supported", "kind": "supported", "prompt": "Why is checkout slow?", "expected_grounding": "supported", "expected_abstained": false},
+    {"id": "partial", "kind": "partial", "prompt": "Why is checkout slow and erroring?", "expected_grounding": "partially_supported", "expected_abstained": false},
+    {"id": "negative-control", "kind": "negative_control", "prompt": "Prove checkout caused an unrelated DNS event", "expected_grounding": "insufficient_evidence", "expected_abstained": true},
+    {"id": "contradictory", "kind": "contradictory", "prompt": "Did checkout latency increase?", "expected_grounding": "contradicted", "expected_abstained": false},
+    {"id": "missing", "kind": "missing", "prompt": "Inspect unavailable checkout telemetry", "expected_grounding": "insufficient_evidence", "expected_abstained": true},
+    {"id": "unresolved-entity", "kind": "unresolved_entity", "prompt": "Inspect the unnamed service", "expected_grounding": "insufficient_evidence", "expected_abstained": true},
+    {"id": "failed-query", "kind": "failed_query", "prompt": "Inspect checkout with a rejected query", "expected_grounding": "insufficient_evidence", "expected_abstained": true},
+    {"id": "stale-artifact", "kind": "stale_artifact", "prompt": "Use an old runbook to diagnose checkout", "expected_grounding": "insufficient_evidence", "expected_abstained": true},
+    {"id": "no-culprit", "kind": "no_culprit", "prompt": "Summarize telemetry without naming a culprit", "expected_grounding": "insufficient_evidence", "expected_abstained": true},
+    {"id": "multiple-plausible", "kind": "multiple_plausible", "prompt": "Rank checkout and cache suspects", "expected_grounding": "supported", "expected_abstained": false}
+  ],
+  "adversarial_families": [
+    {
+      "id": "no-runtime-telemetry",
+      "kind": "no_runtime",
+      "expected_grounding": "insufficient_evidence",
+      "expected_abstained": true,
+      "fixture": {"withheld": ["all_runtime_telemetry"], "context_available": true},
+      "prompts": [
+        "Why is checkout slow without live metrics?", "Investigate payments with exporters disabled.",
+        "Assess search latency using context only.", "Find the cause of API errors without telemetry.",
+        "Investigate worker saturation while metrics are offline.", "Explain queue delay with no runtime samples.",
+        "Diagnose cache health while the collector is unavailable.", "Assess database latency from runbooks alone."
+      ]
+    },
+    {
+      "id": "conflicting-evidence",
+      "kind": "conflicting",
+      "expected_grounding": "partially_supported",
+      "expected_abstained": false,
+      "fixture": {"withheld": [], "conflict": ["service_latency", "cache_latency"]},
+      "prompts": [
+        "Checkout and cache both correlate with latency.", "Payments and database have conflicting signals.",
+        "Search and indexing are both plausible suspects.", "API and gateway evidence disagree.",
+        "Worker and queue telemetry conflict.", "Cache and database each have supporting evidence.",
+        "Frontend and backend latency move together.", "Two downstream services remain equally plausible."
+      ]
+    },
+    {
+      "id": "missing-critical-observation",
+      "kind": "missing_critical",
+      "expected_grounding": "insufficient_evidence",
+      "expected_abstained": true,
+      "fixture": {"withheld": ["critical_observation"], "secondary_telemetry_available": true},
+      "prompts": [
+        "Redis miss rate is unavailable but latency exists.", "Database saturation is missing while errors are visible.",
+        "Queue depth is absent but worker latency exists.", "CPU throttling is missing while request latency exists.",
+        "Gateway retries are unavailable but 5xx metrics exist.", "Cache evictions are missing while hit rate exists.",
+        "Pod restarts are absent but memory telemetry exists.", "Trace spans are absent while request counts exist."
+      ]
+    },
+    {
+      "id": "unknown-service",
+      "kind": "unknown_service",
+      "expected_grounding": "insufficient_evidence",
+      "expected_abstained": true,
+      "fixture": {"withheld": ["artifacts", "entity_mapping", "telemetry"], "unknown_entity": true},
+      "entities": ["zephyr-one", "atlas-edge", "nova-pay", "cedar-api", "amber-job", "polar-events", "lunar-search", "cobalt-web"],
+      "prompts": [
+        "Investigate service zephyr-one.", "Why is the unknown atlas-edge service slow?",
+        "Diagnose errors in unregistered service nova-pay.", "Inspect latency for missing service cedar-api.",
+        "Find telemetry for unknown worker amber-job.", "Investigate unrecognized queue polar-events.",
+        "Assess service lunar-search with no mappings.", "Diagnose phantom service cobalt-web."
+      ]
+    },
+    {
+      "id": "telemetry-contradicts-context",
+      "kind": "context_contradicted",
+      "expected_grounding": "contradicted",
+      "expected_abstained": true,
+      "fixture": {"withheld": [], "context_implicates": "cache", "telemetry_shows_healthy": "cache"},
+      "prompts": [
+        "Runbook blames Redis but Redis is healthy.", "Incident history blames the database but telemetry disagrees.",
+        "Context implicates the queue while queue metrics are normal.", "A stale note blames CPU but CPU is healthy.",
+        "Prior history blames memory while memory is normal.", "Runbook implicates gateway retries but none occurred.",
+        "Context blames cache evictions while evictions are zero.", "Past incident blames DNS while DNS telemetry is healthy."
+      ]
+    }
+  ]
+}

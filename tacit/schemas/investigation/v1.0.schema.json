@@ -1,6 +1,4 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:tacit:schema:investigation:1.0",
   "$defs": {
     "ArtifactContributionContract": {
       "properties": {
@@ -338,6 +336,14 @@
           "title": "Provenance Refs",
           "type": "array"
         },
+        "rejected_bindings": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Rejected Bindings",
+          "type": "array"
+        },
         "requirement_ref": {
           "title": "Requirement Ref",
           "type": "string"
@@ -362,6 +368,11 @@
     },
     "GroundingContract": {
       "properties": {
+        "abstained": {
+          "default": true,
+          "title": "Abstained",
+          "type": "boolean"
+        },
         "confidence": {
           "additionalProperties": true,
           "title": "Confidence",
@@ -392,6 +403,11 @@
           },
           "title": "Missing Observation Refs",
           "type": "array"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
         },
         "status": {
           "$ref": "#/$defs/GroundingStatus",
@@ -637,6 +653,13 @@
           "title": "Archetypes",
           "type": "array"
         },
+        "context_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Context Refs",
+          "type": "array"
+        },
         "domain": {
           "default": "",
           "title": "Domain",
@@ -777,6 +800,13 @@
           "title": "Language",
           "type": "string"
         },
+        "provenance_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Provenance Refs",
+          "type": "array"
+        },
         "validation": {
           "additionalProperties": true,
           "title": "Validation",
@@ -792,7 +822,7 @@
     "RuntimeManifest": {
       "properties": {
         "engine_version": {
-          "default": "0.1.1-rc.4",
+          "default": "0.1.1-rc.5",
           "title": "Engine Version",
           "type": "string"
         },
@@ -886,6 +916,8 @@
       "type": "object"
     }
   },
+  "$id": "urn:tacit:schema:investigation:1.0",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
     "artifact_contributions": {
       "items": {
@@ -972,6 +1004,13 @@
     },
     "schema": {
       "$ref": "#/$defs/SchemaInfo"
+    },
+    "warnings": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Warnings",
+      "type": "array"
     }
   },
   "required": [

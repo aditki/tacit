@@ -1,6 +1,6 @@
 # Grounding Benchmark v1 — Evaluating Whether Tacit Is Justified in Answering
 
-Status: proposed (companion to [ADR-018](adr/018-investigation-contract.md))
+Status: implemented (companion to [ADR-018](adr/018-investigation-contract.md))
 
 ## Motivation
 
@@ -88,6 +88,19 @@ visible in the investigation record.
 
 Each family ships with at least 8 cases in v1 (≥40 total), fixture manifests describing exactly
 which evidence was withheld, and the expected grounding block.
+
+The frozen corpus lives in `tacit/data/grounding_benchmark_v1.json`. It contains eight cases for
+each family plus a separate ten-case Investigation Contract round-trip acceptance corpus. Run the
+release gate locally with:
+
+```bash
+tacit benchmark-grounding
+```
+
+The harness is deterministic and network-free: it feeds typed captured inputs through the same
+contract assembler, grounding logic, validation, and JSON round trip used by persisted revisions.
+This makes the safety gate reproducible in CI; live demo/GAMMA fixture evaluation remains a broader
+pipeline-quality layer rather than a prerequisite for the contract-level gate.
 
 ## Relationship to the Full Evaluation Framework
 
