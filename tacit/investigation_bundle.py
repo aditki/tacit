@@ -27,7 +27,9 @@ def build_investigation_bundle(
     if contract is None:
         raise ValueError("Investigation contract not found")
     snapshot = store.get_snapshot(investigation_id, contract.investigation.revision)
-    revisions = store.list_revisions(investigation_id)
+    revisions = [
+        item for item in store.list_revisions(investigation_id) if item["revision"] <= contract.investigation.revision
+    ]
     files: dict[str, bytes] = {
         "contract.json": _json_bytes(contract.model_dump(mode="json", by_alias=True)),
         "expected_outcomes.json": _json_bytes(

@@ -510,6 +510,31 @@ def test_non_exact_replay_rejects_a_stale_base_revision(tmp_path):
     assert store.list_runs(investigation_id)[-1]["status"] == "failed"
 
 
+def test_concurrent_revision_writers_report_a_stale_parent(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    barrier = threading.Barrier(2)
+
+    def persist(reason):
+        barrier.wait()
+        try:
+            revision = store.persist_contract_revision(
+                _draft_contract(investigation_id),
+                reason=reason,
+                expected_parent_revision=1,
+            )
+        except StaleRevisionError:
+            return "stale"
+        return revision.investigation.revision
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(persist, ["refresh", "replay"]))
+
+    assert sorted(results, key=str) == [2, "stale"]
+    assert [revision["revision"] for revision in store.list_revisions(investigation_id)] == [1, 2]
+
+
 def test_approved_correction_creates_provenance_bearing_revision(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
@@ -693,6 +718,23 @@ def test_legacy_migration_and_assessment_bundle_are_portable(tmp_path):
     assert {"manifest.json", "contract.json", "expected_outcomes.json", "revisions.json"} <= names
 
 
+def test_assessment_bundle_excludes_revisions_newer_than_the_export(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    store.persist_contract_revision(_draft_contract(investigation_id), reason="refresh")
+    store.persist_contract_revision(_draft_contract(investigation_id), reason="correction")
+
+    bundle = build_investigation_bundle(store, investigation_id, revision=1)
+
+    with tarfile.open(fileobj=BytesIO(bundle), mode="r:gz") as archive:
+        revisions_file = archive.extractfile("revisions.json")
+        assert revisions_file is not None
+        revisions = json.load(revisions_file)
+        assert "comparison.json" not in archive.getnames()
+    assert [item["revision"] for item in revisions] == [1]
+
+
 def test_correction_ownership_is_checked_before_mutation(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     owner_id = store.start("Owner investigation")
@@ -806,6 +848,38 @@ async def test_failed_refresh_does_not_overwrite_current_investigation_row(tmp_p
     assert current["dashboard_url"] == "http://grafana/current"
     assert current["current_revision"] == 1
     assert store.list_runs(investigation_id)[-1]["status"] == "failed"
+
+
+async def test_pipeline_preserves_a_caller_supplied_base_revision(monkeypatch):
+    from tacit.pipeline import run_pipeline
+
+    received: dict[str, object] = {}
+
+    async def fake_inner(request, deps, **kwargs):
+        received.update(kwargs)
+        return DashResponse(dashboard_url="", dashboard_uid="", panel_count=0, summary="pinned")
+
+    monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", fake_inner)
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(pipeline_max_concurrent=1, pipeline_timeout_seconds=5),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    await run_pipeline(
+        DashRequest(prompt="Refresh revision one", user_id="api"),
+        deps,
+        investigation_id="inv-pinned",
+        run_type=InvestigationRunType.REFRESH,
+        base_revision=1,
+    )
+
+    assert received["investigation_id"] == "inv-pinned"
+    assert received["run_type"] == InvestigationRunType.REFRESH
+    assert received["base_revision"] == 1
 
 
 async def test_backend_factory_failure_completes_the_pipeline_run(tmp_path):
@@ -1461,6 +1535,23 @@ def test_context_content_affects_input_but_generated_timestamps_do_not_affect_ou
     assert second.runtime.input_fingerprint != changed.runtime.input_fingerprint
 
 
+def test_context_fingerprint_normalizes_timestamps_for_stable_custom_provenance_ids(monkeypatch):
+    context = ContextChunk(
+        content="Check cache saturation",
+        source="runbook:checkout",
+        relevance_score=0.8,
+        metadata={"provenance_id": "runbook-checkout-v1", "source_type": "runbook"},
+    )
+    monkeypatch.setattr("tacit.investigation_contract.utc_now", lambda: datetime(2026, 1, 1, tzinfo=UTC))
+    first = _draft_contract(context_chunks=[context])
+    monkeypatch.setattr("tacit.investigation_contract.utc_now", lambda: datetime(2026, 1, 2, tzinfo=UTC))
+    second = _draft_contract(context_chunks=[context])
+
+    assert first.provenance[-1].id == "runbook-checkout-v1"
+    assert first.provenance[-1].observed_at != second.provenance[-1].observed_at
+    assert first.runtime.output_fingerprint == second.runtime.output_fingerprint
+
+
 def test_contract_records_current_package_version():
     contract = _draft_contract()
     pyproject = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text(encoding="utf-8"))
@@ -1702,6 +1793,7 @@ def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch
     assert received["deps"] is deps
     assert received["investigation_id"] == investigation_id
     assert received["run_type"] == InvestigationRunType.REFRESH
+    assert received["base_revision"] == 1
 
 
 def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp_path, monkeypatch):

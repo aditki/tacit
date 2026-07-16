@@ -439,8 +439,13 @@ def normalized_output_payload(contract: InvestigationContract) -> dict[str, Any]
     dashboard_references = data.get("renderings", {}).get("dashboard", {}).get("references", {})
     if isinstance(dashboard_references, dict):
         dashboard_references["revision"] = 0
+    context_provenance_refs = {
+        provenance_ref
+        for contribution in data.get("artifact_contributions", [])
+        for provenance_ref in contribution.get("provenance_refs", [])
+    }
     for provenance in data["provenance"]:
-        if provenance["source_type"] not in {"request", "runtime"} and not provenance["id"].startswith("prov_context_"):
+        if provenance["source_type"] not in {"request", "runtime"} and provenance["id"] not in context_provenance_refs:
             continue
         provenance["ingested_at"] = None
         provenance["observed_at"] = None

@@ -250,6 +250,7 @@ async def refresh_investigation(
         deps,
         investigation_id=investigation_id,
         run_type=InvestigationRunType.REFRESH,
+        base_revision=contract.investigation.revision,
     )
     if response.investigation_revision is None:
         raise HTTPException(

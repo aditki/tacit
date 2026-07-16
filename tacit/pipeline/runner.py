@@ -93,6 +93,7 @@ async def run_pipeline(
     *,
     investigation_id: str | None = None,
     run_type: InvestigationRunType = InvestigationRunType.INITIAL,
+    base_revision: int | None = None,
 ) -> DashResponse:
     """End-to-end: natural language → Grafana dashboard URL."""
     deps = deps or _default_dependencies()
@@ -108,6 +109,7 @@ async def run_pipeline(
                     deps,
                     investigation_id=investigation_id,
                     run_type=run_type,
+                    base_revision=base_revision,
                     cancellation=cancellation,
                 )
             )
@@ -154,6 +156,7 @@ async def _run_pipeline_inner(
     *,
     investigation_id: str | None = None,
     run_type: InvestigationRunType = InvestigationRunType.INITIAL,
+    base_revision: int | None = None,
     cancellation: _PipelineCancellation | None = None,
 ) -> DashResponse:
     """Inner pipeline logic (wrapped with timeout + semaphore above).
@@ -167,8 +170,7 @@ async def _run_pipeline_inner(
     timings: dict[str, float] = {}
     history = deps.history_store_factory()
     inv_id = investigation_id or history.start(request.prompt, request.user_id or "", request.channel_id or "")
-    base_revision = None
-    if investigation_id and hasattr(history, "get_contract"):
+    if base_revision is None and investigation_id and hasattr(history, "get_contract"):
         current_contract = history.get_contract(investigation_id)
         base_revision = current_contract.investigation.revision if current_contract else None
     run_id = None

@@ -557,6 +557,7 @@ class InvestigationStore:
         now = time.time()
         run_id = run_id or uuid.uuid4().hex
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT COALESCE(MAX(revision), 0) AS current FROM investigation_revisions WHERE investigation_id=?",
                 (investigation_id,),

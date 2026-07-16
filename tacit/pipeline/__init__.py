@@ -31,6 +31,7 @@ async def run_pipeline(
     *,
     investigation_id: str | None = None,
     run_type: InvestigationRunType = InvestigationRunType.INITIAL,
+    base_revision: int | None = None,
 ) -> DashResponse:
     """Run the pipeline, honoring package-level monkeypatch compatibility."""
     _sync_patch_points()
@@ -39,6 +40,7 @@ async def run_pipeline(
         deps,
         investigation_id=investigation_id,
         run_type=run_type,
+        base_revision=base_revision,
     )
 
 
