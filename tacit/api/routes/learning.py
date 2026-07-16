@@ -12,7 +12,7 @@ from fastapi import Path as PathParam
 
 import tacit.signals as signals_mod
 from tacit.api.dependencies import get_runtime_stores, get_signal_store
-from tacit.api.security import verify_api_key
+from tacit.api.security import knowledge_tenant, verify_api_key
 from tacit.models.schemas import (
     LearnAlertRequest,
     LearnDashboardRequest,
@@ -151,6 +151,7 @@ async def learn_from_alert(
     response_description="Extracted operational IR candidates with provenance",
 )
 async def learn_from_runbook(
+    request: Request,
     payload: LearnRunbookRequest,
     stores: RuntimeStores = Depends(get_runtime_stores),
 ):
@@ -168,7 +169,13 @@ async def learn_from_runbook(
             source_instance=payload.source_instance,
             provenance_url=payload.provenance_url,
         )
-        return learn_artifact(artifact, RunbookExtractor(), dry_run=payload.dry_run, store=store)
+        return learn_artifact(
+            artifact,
+            RunbookExtractor(),
+            dry_run=payload.dry_run,
+            store=store,
+            tenant_id=knowledge_tenant(request),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
@@ -183,6 +190,7 @@ async def learn_from_runbook(
     response_description="Extracted operational IR candidates with provenance",
 )
 async def learn_from_incident(
+    request: Request,
     payload: LearnIncidentRequest,
     stores: RuntimeStores = Depends(get_runtime_stores),
 ):
@@ -200,7 +208,13 @@ async def learn_from_incident(
             source_instance=payload.source_instance,
             provenance_url=payload.provenance_url,
         )
-        return learn_artifact(artifact, IncidentExtractor(), dry_run=payload.dry_run, store=store)
+        return learn_artifact(
+            artifact,
+            IncidentExtractor(),
+            dry_run=payload.dry_run,
+            store=store,
+            tenant_id=knowledge_tenant(request),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:

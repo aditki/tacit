@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from tacit.api.routes import archetypes, dashboard, feedback, history, learning, signals, system
+from tacit.api.routes import archetypes, dashboard, feedback, history, knowledge, learning, signals, system
 
 
 def include_routes(app: FastAPI) -> None:
@@ -16,3 +16,4 @@ def include_routes(app: FastAPI) -> None:
     app.include_router(history.router)
     app.include_router(signals.router)
     app.include_router(learning.router)
+    app.include_router(knowledge.router)

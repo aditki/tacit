@@ -16,6 +16,7 @@ from tacit.investigation_contract import (
     stamp_fingerprints,
     utc_now,
 )
+from tacit.knowledge.models import KnowledgeUsage
 from tacit.models.schemas import (
     ContextChunk,
     CulpritRanking,
@@ -86,6 +87,8 @@ class InvestigationReplaySnapshot(BaseModel):
     corrections: list[CorrectionReference] = Field(default_factory=list)
     additional_provenance: list[ProvenanceRecord] = Field(default_factory=list)
     additional_decisions: list[DecisionLogEntry] = Field(default_factory=list)
+    knowledge_snapshot_ref: str = ""
+    knowledge_usage: list[KnowledgeUsage] = Field(default_factory=list)
 
 
 def rebuild_contract(
@@ -128,6 +131,8 @@ def rebuild_contract(
         created_at=snapshot.created_at,
         completed_at=snapshot.completed_at,
         runtime_manifest=runtime,
+        knowledge_snapshot_ref=snapshot.knowledge_snapshot_ref,
+        knowledge_usage=snapshot.knowledge_usage,
     )
     if snapshot.corrections or snapshot.additional_provenance or snapshot.additional_decisions:
         contract = contract.model_copy(

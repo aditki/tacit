@@ -596,6 +596,16 @@ class InvestigationStore:
                 )
                 for correction in contract.corrections
             ]
+            knowledge_usage = [
+                usage.model_copy(
+                    update={
+                        "usage_id": f"usage_{investigation_id}_{revision}_{index:02d}",
+                        "investigation_id": investigation_id,
+                        "investigation_revision": revision,
+                    }
+                )
+                for index, usage in enumerate(contract.knowledge_usage, start=1)
+            ]
             renderings = contract.renderings.copy()
             dashboard_rendering = dict(renderings.get("dashboard", {}))
             references = dict(dashboard_rendering.get("references", {}))
@@ -608,6 +618,7 @@ class InvestigationStore:
                         "investigation": investigation,
                         "renderings": renderings,
                         "corrections": corrections,
+                        "knowledge_usage": knowledge_usage,
                     }
                 )
             )
@@ -685,6 +696,7 @@ class InvestigationStore:
                         "revision": revision,
                         "runtime": stamped.runtime,
                         "corrections": corrections,
+                        "knowledge_usage": knowledge_usage,
                     }
                 )
                 conn.execute(
@@ -887,7 +899,33 @@ class InvestigationStore:
             )
             return contract
         try:
-            rebuilt = rebuild_contract(snapshot, mode=mode, changes=changes)
+            replay_snapshot = snapshot
+            if mode == ReplayMode.CURRENT_ENGINE:
+                from tacit.knowledge.models import KnowledgeScope
+                from tacit.knowledge.service import get_knowledge_service
+
+                knowledge_service = get_knowledge_service()
+                knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(
+                    KnowledgeScope(
+                        tenant_id=snapshot.request.tenant_id,
+                        service_refs=[f"entity:service:{service}" for service in snapshot.intent.services],
+                    )
+                )
+                knowledge_usage = knowledge_service.reconcile_live_observations(
+                    knowledge_usage,
+                    snapshot.evidence_observations,
+                )
+                replay_snapshot = snapshot.model_copy(
+                    update={
+                        "culprit_ranking": knowledge_service.apply_to_ranking(
+                            snapshot.culprit_ranking,
+                            knowledge_usage,
+                        ),
+                        "knowledge_snapshot_ref": knowledge_snapshot.id,
+                        "knowledge_usage": knowledge_usage,
+                    }
+                )
+            rebuilt = rebuild_contract(replay_snapshot, mode=mode, changes=changes)
             self.append_event(
                 investigation_id,
                 run_id,
@@ -922,7 +960,7 @@ class InvestigationStore:
             persisted_snapshot = (
                 apply_counterfactual(snapshot, changes or CounterfactualChanges())
                 if mode == ReplayMode.COUNTERFACTUAL
-                else snapshot
+                else replay_snapshot
             )
             persisted = self.persist_contract_revision(
                 rebuilt,

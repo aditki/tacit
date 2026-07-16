@@ -50,6 +50,10 @@ OPENAPI_TAGS = [
         "Generated archetype output is quarantined and disabled by default.",
     },
     {
+        "name": "Operational Knowledge",
+        "description": "Review, promote, explain, revise, and audit governed operational knowledge.",
+    },
+    {
         "name": "System",
         "description": "Health checks and system status.",
     },
