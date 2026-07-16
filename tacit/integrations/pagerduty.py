@@ -451,6 +451,7 @@ async def learn_pagerduty_incidents(
     max_items: int = 1000,
     dry_run: bool = False,
     store: Any | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, object]:
     """Fetch PagerDuty incident metadata and learn it as incident artifacts.
 
@@ -481,6 +482,7 @@ async def learn_pagerduty_incidents(
             extractor,
             dry_run=dry_run,
             store=store,
+            tenant_id=tenant_id,
         )
         for inc in incidents
         if inc.get("id")

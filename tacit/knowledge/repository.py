@@ -532,6 +532,7 @@ class KnowledgeRepository:
                    method, review_state, lifecycle_status, alias_json, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tenant_id, alias_id) DO UPDATE SET
+                   raw_value=excluded.raw_value, normalized_value=excluded.normalized_value,
                    entity_ref=excluded.entity_ref, scope_json=excluded.scope_json, method=excluded.method,
                    review_state=excluded.review_state, lifecycle_status=excluded.lifecycle_status,
                    alias_json=excluded.alias_json, updated_at=excluded.updated_at""",
@@ -684,7 +685,13 @@ class KnowledgeRepository:
     def list_propositions(self, tenant_id: str = "default") -> list[dict[str, Any]]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM knowledge_propositions WHERE tenant_id=? ORDER BY created_at",
+                """SELECT p.* FROM knowledge_propositions p
+                   WHERE p.tenant_id=? AND EXISTS (
+                     SELECT 1 FROM proposition_candidates pc
+                     JOIN knowledge_candidates c ON c.id=pc.candidate_id AND c.tenant_id=pc.tenant_id
+                     WHERE pc.tenant_id=p.tenant_id AND pc.proposition_key=p.proposition_key
+                       AND c.review_state != 'rejected'
+                   ) ORDER BY p.created_at""",
                 (tenant_id,),
             ).fetchall()
         return [dict(row) for row in rows]

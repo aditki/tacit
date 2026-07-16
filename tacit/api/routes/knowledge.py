@@ -44,7 +44,7 @@ class CorrectionRequest(BaseModel):
 class CorrectionReviewRequest(BaseModel):
     decision: Literal["approve", "reject"]
     reviewer: str = Field(min_length=1, max_length=200)
-    authoritative: bool = True
+    authoritative: bool = False
 
 
 class EntityRequest(BaseModel):
@@ -281,6 +281,8 @@ async def create_correction(payload: CorrectionRequest, request: Request):
 )
 async def review_correction(correction_id: str, payload: CorrectionReviewRequest, request: Request):
     assert_knowledge_permission(request, "knowledge.review" if payload.decision == "approve" else "knowledge.reject")
+    if payload.authoritative:
+        assert_knowledge_permission(request, "knowledge.override")
     try:
         correction, revision = get_knowledge_service().review_correction(
             correction_id,

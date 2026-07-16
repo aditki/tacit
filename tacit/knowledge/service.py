@@ -280,11 +280,17 @@ class KnowledgeService:
         tenant_id: str = "default",
         authoritative_source: bool = False,
         live_verified: bool = False,
+        ignored_conflict_ids: set[str] | None = None,
     ) -> tuple[PromotionDecision, KnowledgeRevision | None]:
         candidate = self._require_candidate(candidate_id, tenant_id)
         summary, corroboration_ref = self.corroboration.analyze(tenant_id, candidate.proposition.proposition_key)
         conflicts = self.conflicts.analyze(tenant_id, candidate.proposition.proposition_key)
-        unresolved = [conflict for conflict in conflicts if conflict.resolution_status.value == "unresolved"]
+        ignored_conflict_ids = ignored_conflict_ids or set()
+        unresolved = [
+            conflict
+            for conflict in conflicts
+            if conflict.resolution_status.value == "unresolved" and conflict.id not in ignored_conflict_ids
+        ]
         context = PromotionContext(
             corroboration=summary,
             unresolved_conflict_count=len(unresolved),
@@ -640,11 +646,16 @@ class KnowledgeService:
         approved: bool,
         reviewer: str,
         tenant_id: str = "default",
-        authoritative: bool = True,
+        authoritative: bool = False,
     ) -> tuple[KnowledgeCorrection, KnowledgeRevision | None]:
         correction = self.repository.get_correction(correction_id, tenant_id)
         if correction is None:
             raise ValueError("knowledge correction not found")
+        target = None
+        if correction.target_ref:
+            target = self.repository.get_revision(correction.target_ref, tenant_id=tenant_id)
+            if target is None:
+                raise ValueError("correction target knowledge item not found")
         candidate = self.review_candidate(
             correction.knowledge_candidate_ref,
             approved=approved,
@@ -655,35 +666,46 @@ class KnowledgeService:
         self.repository.save_correction(correction)
         if not approved:
             return correction, None
-        for conflict in self.conflicts.analyze(tenant_id, candidate.proposition.proposition_key):
-            if conflict.resolution_status != ConflictResolutionStatus.UNRESOLVED:
-                continue
-            resolved = conflict.model_copy(
-                update={
-                    "resolution_status": ConflictResolutionStatus.RESOLVED_BY_REVIEW,
-                    "resolution_reason": "approved_human_correction",
-                    "resolved_by": reviewer,
-                    "resolved_at": utc_now(),
-                }
-            )
-            self.repository.save_conflict(resolved)
-            self.repository.append_event(
-                "conflict_resolved",
-                tenant_id=tenant_id,
-                subject_ref=resolved.id,
-                dimensions={
-                    "knowledge_kind": candidate.kind.value,
-                    "reason_code": "approved_human_correction",
-                },
-                payload={"candidate_id": candidate.id},
-            )
+        conflicts = self.conflicts.analyze(tenant_id, candidate.proposition.proposition_key)
+        replaceable_conflicts = [
+            conflict
+            for conflict in conflicts
+            if target is not None
+            and conflict.resolution_status == ConflictResolutionStatus.UNRESOLVED
+            and target.proposition.proposition_key
+            in {conflict.left_proposition_ref, conflict.right_proposition_ref}
+        ]
         _, revision = self.evaluate_candidate(
             candidate.id,
             tenant_id=tenant_id,
             authoritative_source=authoritative,
+            ignored_conflict_ids={conflict.id for conflict in replaceable_conflicts},
         )
-        if revision and correction.target_ref and correction.target_ref != revision.knowledge_id:
+        superseded = False
+        if revision and target is not None and correction.target_ref != revision.knowledge_id:
             self.supersede(correction.target_ref, candidate.id, tenant_id=tenant_id)
+            superseded = True
+        if superseded:
+            for conflict in replaceable_conflicts:
+                resolved = conflict.model_copy(
+                    update={
+                        "resolution_status": ConflictResolutionStatus.RESOLVED_BY_REVIEW,
+                        "resolution_reason": "approved_human_correction",
+                        "resolved_by": reviewer,
+                        "resolved_at": utc_now(),
+                    }
+                )
+                self.repository.save_conflict(resolved)
+                self.repository.append_event(
+                    "conflict_resolved",
+                    tenant_id=tenant_id,
+                    subject_ref=resolved.id,
+                    dimensions={
+                        "knowledge_kind": candidate.kind.value,
+                        "reason_code": "approved_human_correction",
+                    },
+                    payload={"candidate_id": candidate.id},
+                )
         return correction, revision
 
     def supersede(

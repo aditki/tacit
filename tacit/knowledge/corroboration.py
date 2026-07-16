@@ -177,6 +177,7 @@ class ConflictDetectionService:
             ("region_refs", "region_specific_difference"),
             ("cluster_refs", "cluster_specific_difference"),
             ("namespace_refs", "namespace_specific_difference"),
+            ("service_refs", "service_specific_difference"),
             ("version_constraints", "version_specific_difference"),
         ):
             left_values = set(getattr(left, field_name))

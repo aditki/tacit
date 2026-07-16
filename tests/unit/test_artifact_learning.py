@@ -102,6 +102,18 @@ def test_runbook_causal_claim_does_not_emit_dependency_hint():
     assert result.warnings == ["ignored_causal_claim:Root cause: checkout-api calls redis-cart"]
 
 
+@pytest.mark.parametrize("extractor", [RunbookExtractor(), IncidentExtractor()])
+def test_extractors_scan_full_lines_for_causal_claims_before_excerpt_truncation(extractor):
+    line = "checkout-api depends on redis-cart " + ("context " * 300) + "root cause"
+
+    result = extractor.extract(_artifact(line))
+
+    assert result.dependency_hints == []
+    assert len(result.warnings) == 1
+    assert result.warnings[0].startswith("ignored_causal_claim:checkout-api depends on redis-cart")
+    assert len(result.warnings[0].split(":", 1)[1]) == 2000
+
+
 def test_runbook_causal_claim_suppresses_continuation_dependency_hint():
     result = RunbookExtractor().extract(
         _artifact("## Notes\n- Root cause: checkout-api saturation\n- checkout-api depends on redis-cart")
@@ -311,6 +323,13 @@ def test_incident_ignored_rca_text_is_not_indexed(tmp_path, monkeypatch):
     assert result["warnings"] == ["ignored_causal_claim:Root cause: redis-cart"]
     assert store.search_learning_context("checkout_errors_total")
     assert store.search_learning_context("redis") == []
+
+
+def test_artifact_learning_requires_explicit_tenant_for_wildcard_config(monkeypatch):
+    monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
+
+    with pytest.raises(ValueError, match="tenant_id is required"):
+        learn_artifact(_artifact("## Checks\n- check Redis misses"), RunbookExtractor(), dry_run=True)
 
 
 def test_incident_resolution_section_body_is_not_indexed(tmp_path, monkeypatch):
