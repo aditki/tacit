@@ -186,6 +186,9 @@ def test_resolution_normalization_corroboration_and_promotion(tmp_path: Path):
     )
     assert contradicted[0].disposition.value == "contradicted_by_observation"
     assert contradicted[0].score_delta == 0
+    reconciled_snapshot = service.snapshot_from_usage("default", contradicted)
+    assert reconciled_snapshot.items == []
+    assert reconciled_snapshot.id != snapshot_a.id
 
 
 def test_duplicate_lineage_does_not_inflate_corroboration(tmp_path: Path):
@@ -355,6 +358,65 @@ def test_direct_negation_conflicts_require_matching_objects(tmp_path: Path):
     assert conflicts == []
 
 
+def test_positive_dependencies_with_different_objects_do_not_conflict(tmp_path: Path):
+    service = _service(tmp_path)
+    service.register_entity(
+        Entity(
+            id="entity:datastore:postgres",
+            kind=EntityKind.DATASTORE,
+            tenant_id="default",
+            canonical_name="postgres",
+            scope=KnowledgeScope(),
+            provenance_refs=["catalog:datastore"],
+        )
+    )
+    redis = _dependency(
+        service,
+        payload_ref="depends-redis",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="runbook:redis",
+    )
+    _dependency(
+        service,
+        payload_ref="depends-postgres",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="dashboard:postgres",
+        object_ref="entity:datastore:postgres",
+    )
+
+    assert service.conflicts.analyze("default", redis.proposition.proposition_key) == []
+
+
+def test_canonical_entity_names_use_resolver_normalization(tmp_path: Path):
+    service = _service(tmp_path)
+    service.register_entity(
+        Entity(
+            id="entity:service:payment-api",
+            kind=EntityKind.SERVICE,
+            tenant_id="default",
+            canonical_name="Payment API",
+            scope=KnowledgeScope(),
+            provenance_refs=["catalog:service"],
+        )
+    )
+
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.DEPENDENCY,
+        payload_ref="canonical-name",
+        typed_payload={},
+        proposition={
+            "subject_ref": "Payment API",
+            "predicate": "depends_on",
+            "object_ref": "redis-session",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:payment-api"]),
+        provenance_refs=["catalog:test"],
+    )
+
+    assert candidate.entity_resolution.status.value == "resolved"
+    assert candidate.proposition.subject_ref == "entity:service:payment-api"
+
+
 def test_migrated_dependency_scope_uses_source_service(tmp_path: Path):
     service = _service(tmp_path)
     created = migrate_artifact_extractions(
@@ -378,6 +440,30 @@ def test_migrated_dependency_scope_uses_source_service(tmp_path: Path):
 
     assert candidate is not None
     assert candidate.scope.service_refs == ["entity:service:checkout"]
+
+
+def test_migrated_signal_mapping_preserves_candidate_metric(tmp_path: Path):
+    service = _service(tmp_path)
+    created = migrate_artifact_extractions(
+        artifact_id="artifact-signals",
+        artifact_type="dashboard",
+        rows={
+            "signal_mapping_candidates": [
+                {
+                    "id": "signal-1",
+                    "source": "checkout latency",
+                    "signal_type": "latency",
+                    "candidate_metric": "http_request_duration_seconds",
+                    "source_excerpt": "Latency uses the request duration histogram",
+                }
+            ]
+        },
+        service=service,
+    )
+
+    candidate = service.repository.get_candidate(created[0])
+    assert candidate is not None
+    assert candidate.proposition.object_ref == "concept:http_request_duration_seconds"
 
 
 def test_correction_creates_candidate_revision_and_impact(tmp_path: Path):
@@ -530,6 +616,42 @@ def test_api_aliases_use_resolver_normalization(tmp_path: Path, monkeypatch: pyt
 
     assert response.status_code == 200
     assert response.json()["normalized_value"] == "checkout-api"
+
+
+def test_api_policy_overrides_require_privileged_permission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path, "tenant-a")
+    candidate = _dependency(
+        service,
+        payload_ref="override",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="override",
+        tenant_id="tenant-a",
+    )
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    app = create_app(
+        runtime_settings=Settings(
+            api_auth_enabled=False,
+            knowledge_tenant_id="tenant-a",
+            knowledge_permissions="knowledge.read,knowledge.review",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        f"/api/v1/knowledge/{candidate.id}/review",
+        json={
+            "decision": "approve",
+            "reviewer": "operator",
+            "authoritative_source": True,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.override"
+    assert service.repository.get_candidate(candidate.id, "tenant-a").state.review_state == ReviewState.CANDIDATE
 
 
 def test_cli_exposes_phase_three_commands():

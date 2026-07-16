@@ -102,6 +102,9 @@ async def run_pipeline(
     """End-to-end: natural language → Grafana dashboard URL."""
     deps = deps or _default_dependencies()
     runtime_settings = deps.settings
+    configured_tenant = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
+    tenant_id = (request.tenant_id or "default") if configured_tenant == "*" else configured_tenant
+    request = request.model_copy(update={"tenant_id": tenant_id})
     bind_request_id()
     sem = _get_semaphore(runtime_settings.pipeline_max_concurrent)
     try:
@@ -387,6 +390,7 @@ async def _run_pipeline_inner(
                 knowledge_usage,
                 validation_result.evidence_observations,
             )
+            knowledge_snapshot = knowledge_service.snapshot_from_usage(tenant_id, knowledge_usage)
             culprit_ranking = knowledge_service.apply_to_ranking(culprit_ranking, knowledge_usage)
         except Exception:
             logger.warning("operational_knowledge_selection_failed", exc_info=True)

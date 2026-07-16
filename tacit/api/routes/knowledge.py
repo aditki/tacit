@@ -166,6 +166,8 @@ async def review_candidate(candidate_id: str, payload: CandidateReviewRequest, r
         "trust": "knowledge.trust",
     }[payload.decision]
     assert_knowledge_permission(request, permission)
+    if payload.authoritative_source or payload.live_verified:
+        assert_knowledge_permission(request, "knowledge.override")
     tenant_id = _tenant(request)
     service = get_knowledge_service()
     try:

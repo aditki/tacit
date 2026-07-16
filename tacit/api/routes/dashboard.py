@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from tacit.api.dependencies import get_pipeline_dependencies
-from tacit.api.security import sanitize_prompt, verify_api_key
+from tacit.api.security import resolve_knowledge_tenant, sanitize_prompt, verify_api_key
 from tacit.dependencies import PipelineDependencies
 from tacit.models.schemas import DashRequest, DashResponse
 from tacit.pipeline import run_pipeline
@@ -21,7 +21,11 @@ router = APIRouter()
 
 
 def _configured_tenant(request: DashRequest, deps: PipelineDependencies) -> str:
-    return request.tenant_id or getattr(deps.settings, "knowledge_tenant_id", "default") or "default"
+    return resolve_knowledge_tenant(
+        getattr(deps.settings, "knowledge_tenant_id", "default"),
+        request.tenant_id,
+        reject_pinned_override=False,
+    )
 
 
 @router.post(

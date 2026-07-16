@@ -34,15 +34,29 @@ def sanitize_prompt(prompt: str) -> str:
 def knowledge_tenant(request: Request) -> str:
     """Resolve a tenant without allowing a request to cross the configured boundary."""
     runtime_settings = getattr(request.app.state, "settings", settings)
-    configured = runtime_settings.knowledge_tenant_id.strip() or "default"
-    header_value = request.headers.get("X-Tacit-Tenant")
-    if configured == "*" and not header_value:
-        raise HTTPException(status_code=400, detail="Knowledge tenant header is required")
-    requested = (header_value or configured).strip()
+    return resolve_knowledge_tenant(
+        runtime_settings.knowledge_tenant_id,
+        request.headers.get("X-Tacit-Tenant"),
+    )
+
+
+def resolve_knowledge_tenant(
+    configured_value: str,
+    requested_value: str | None,
+    *,
+    reject_pinned_override: bool = True,
+) -> str:
+    """Resolve and validate a tenant against a pinned or wildcard boundary."""
+    configured = configured_value.strip() or "default"
+    requested = (requested_value or "").strip()
+    if configured == "*" and not requested:
+        raise HTTPException(status_code=400, detail="Knowledge tenant is required")
+    if configured != "*":
+        if reject_pinned_override and requested and requested != configured:
+            raise HTTPException(status_code=403, detail="Tenant access denied")
+        requested = configured
     if not requested or len(requested) > MAX_TENANT_LENGTH or re.fullmatch(r"[A-Za-z0-9_.:-]+", requested) is None:
         raise HTTPException(status_code=400, detail="Invalid knowledge tenant")
-    if configured != "*" and requested != configured:
-        raise HTTPException(status_code=403, detail="Tenant access denied")
     return requested
 
 

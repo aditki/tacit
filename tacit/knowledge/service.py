@@ -394,15 +394,31 @@ class KnowledgeService:
                     reason_codes=reasons,
                 )
             )
+        return self._save_snapshot(scope.tenant_id, selected), usage
+
+    def snapshot_from_usage(self, tenant_id: str, usage: list[KnowledgeUsage]) -> KnowledgeSnapshot:
+        """Persist the final applied set after live-evidence reconciliation."""
+        selected = [
+            KnowledgeSnapshotItem(knowledge_ref=item.knowledge_ref, revision=item.knowledge_revision)
+            for item in usage
+            if item.disposition == KnowledgeUsageDisposition.APPLIED
+        ]
+        return self._save_snapshot(tenant_id, selected)
+
+    def _save_snapshot(
+        self,
+        tenant_id: str,
+        selected: list[KnowledgeSnapshotItem],
+    ) -> KnowledgeSnapshot:
         items = sorted(selected, key=lambda item: (item.knowledge_ref, item.revision))
         fingerprint = stable_fingerprint([item.model_dump(mode="json") for item in items])
         snapshot = KnowledgeSnapshot(
-            id=_id("knowledge_snapshot", [scope.tenant_id, fingerprint]),
-            tenant_id=scope.tenant_id,
+            id=_id("knowledge_snapshot", [tenant_id, fingerprint]),
+            tenant_id=tenant_id,
             items=items,
             fingerprint=fingerprint,
         )
-        return self.repository.save_snapshot(snapshot), usage
+        return self.repository.save_snapshot(snapshot)
 
     def apply_to_ranking(self, ranking, usage: list[KnowledgeUsage]):
         """Apply bounded contextual lift without converting context into telemetry."""

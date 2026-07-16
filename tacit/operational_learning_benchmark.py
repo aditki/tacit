@@ -249,17 +249,17 @@ def _run_case(service: KnowledgeService, case: dict[str, Any]) -> tuple[bool, st
         summary, _ = service.corroboration.analyze("default", candidate.proposition.proposition_key)
         return summary.status.value == case["expected"], summary.status.value
     if case_id == "scope-conflict":
-        # Scope-disjoint propositions are visible but deterministically resolved by scope.
+        # A scope-disjoint direct negation is visible but deterministically resolved by scope.
         propositions = []
-        for environment, target in (("production", "redis-session"), ("staging", "checkout-worker")):
+        for environment, predicate in (("production", "depends_on"), ("staging", "does_not_depend_on")):
             candidate = service.create_candidate(
                 kind=KnowledgeKind.DEPENDENCY,
                 payload_ref=f"scope:{environment}",
                 typed_payload={},
                 proposition={
                     "subject_ref": "entity:service:checkout",
-                    "predicate": "depends_on",
-                    "object_ref": f"entity:{'datastore' if target == 'redis-session' else 'service'}:{target}",
+                    "predicate": predicate,
+                    "object_ref": "entity:datastore:redis-session",
                 },
                 scope=KnowledgeScope(environment_refs=[f"environment:{environment}"]),
                 provenance_refs=[f"catalog:{environment}"],

@@ -27,7 +27,9 @@ tacit knowledge review <candidate-id> --reject --reviewer <actor>
 
 Trust is a separate privileged action using `--trust`. The web workspace contains the same focused review
 queue. REST clients use `/api/v1/knowledge`; configured permissions are `knowledge.read`, `knowledge.review`,
-`knowledge.trust`, `knowledge.reject`, `knowledge.correct`, and `knowledge.export`.
+`knowledge.trust`, `knowledge.reject`, `knowledge.correct`, `knowledge.export`, and `knowledge.override`.
+The override permission is required to assert authoritative-source or live-verification policy inputs during
+review.
 
 ## Evaluation
 

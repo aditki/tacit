@@ -366,6 +366,66 @@ def test_chart_route_uses_configured_tenant_when_request_omits_it(monkeypatch):
     assert response.status_code == 200
     assert captured["request"].tenant_id == "tenant-a"
 
+    override_response = client.post(
+        "/api/v1/chart",
+        json={"prompt": "Investigate checkout latency", "tenant_id": "tenant-b"},
+    )
+    assert override_response.status_code == 200
+    assert captured["request"].tenant_id == "tenant-a"
+
+
+def test_chart_route_allows_body_tenant_for_wildcard_configuration(monkeypatch):
+    captured: dict[str, DashRequest] = {}
+
+    async def fake_run_pipeline(request: DashRequest, deps):
+        captured["request"] = request
+        return DashResponse(dashboard_url="", dashboard_uid="test", panel_count=1, summary="ok")
+
+    import tacit.api.routes.dashboard as dashboard_routes
+
+    monkeypatch.setattr(dashboard_routes, "run_pipeline", fake_run_pipeline)
+    app = create_app(runtime_settings=SimpleNamespace(api_auth_enabled=False, knowledge_tenant_id="*"))
+    app.dependency_overrides[get_pipeline_dependencies] = lambda: SimpleNamespace(
+        settings=SimpleNamespace(knowledge_tenant_id="*")
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/chart",
+        json={"prompt": "Investigate checkout latency", "tenant_id": "tenant-b"},
+    )
+
+    assert response.status_code == 200
+    assert captured["request"].tenant_id == "tenant-b"
+
+
+async def test_direct_pipeline_stamps_configured_fallback_tenant(monkeypatch):
+    from tacit.pipeline import run_pipeline
+
+    captured: dict[str, DashRequest] = {}
+
+    async def fake_inner(request, deps, **kwargs):
+        captured["request"] = request
+        return DashResponse(dashboard_url="", dashboard_uid="", panel_count=0, summary="ok")
+
+    monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", fake_inner)
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_tenant_id="tenant-a",
+        ),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    await run_pipeline(DashRequest(prompt="Investigate checkout", tenant_id="tenant-b"), deps)
+
+    assert captured["request"].tenant_id == "tenant-a"
+
 
 def test_counterfactual_replay_resorts_candidates_after_score_changes(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")

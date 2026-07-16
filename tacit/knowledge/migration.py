@@ -139,9 +139,11 @@ def _proposition(kind: KnowledgeKind, row: dict[str, Any]) -> dict[str, Any]:
         }
     if kind == KnowledgeKind.SIGNAL_MAPPING:
         source = str(row.get("source") or row.get("symptom") or "unknown")
+        metric = str(row.get("candidate_metric") or row.get("metric_pattern") or "unknown")
         return {
             "subject_ref": f"concept:{source}",
             "predicate": Predicate.REPRESENTED_BY,
+            "object_ref": f"concept:{metric}",
             "concept_ref": f"signal:{row.get('signal_type') or source}",
             "source_wording": row.get("source_excerpt", ""),
         }

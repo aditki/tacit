@@ -166,7 +166,8 @@ class Settings(BaseSettings):
     api_auth_key: str = Field(default="", repr=False)
     knowledge_tenant_id: str = "default"
     knowledge_permissions: str = (
-        "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.correct,knowledge.export"
+        "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.correct,knowledge.export,"
+        "knowledge.override"
     )
 
     # App
