@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 
 from tacit.knowledge.enums import KnowledgeKind, Predicate
 from tacit.knowledge.models import KnowledgeProposition, KnowledgeScope
@@ -42,6 +43,10 @@ def stable_fingerprint(value) -> str:
 
 def normalize_ref(value: str) -> str:
     return value.strip().casefold().replace(" ", "-")
+
+
+def normalize_entity(value: str) -> str:
+    return re.sub(r"[^a-z0-9_.:-]+", "-", value.strip().casefold()).strip("-")
 
 
 SCOPE_LIST_FIELDS = (

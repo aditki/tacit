@@ -108,6 +108,8 @@ class ConflictDetectionService:
                 current["object_ref"] != other["object_ref"] or current["concept_ref"] != other["concept_ref"]
             ):
                 continue
+            if not directly_negated and current["kind"] == KnowledgeKind.DEPENDENCY.value:
+                continue
             if (
                 not directly_negated
                 and current["object_ref"] == other["object_ref"]

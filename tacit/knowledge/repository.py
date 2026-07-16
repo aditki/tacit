@@ -27,6 +27,7 @@ from tacit.knowledge.models import (
     OperationalKnowledgeItem,
     PromotionDecision,
 )
+from tacit.knowledge.normalization import normalize_entity
 from tacit.signals.schema import DEFAULT_DB_PATH, SQLITE_BUSY_TIMEOUT_MS
 
 logger = structlog.get_logger()
@@ -512,7 +513,7 @@ class KnowledgeRepository:
                     entity.tenant_id,
                     entity.kind.value,
                     entity.canonical_name,
-                    entity.canonical_name.strip().casefold(),
+                    normalize_entity(entity.canonical_name),
                     entity.display_name or entity.canonical_name,
                     entity.status.value,
                     entity.scope.model_dump_json(),

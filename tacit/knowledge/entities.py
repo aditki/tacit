@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import re
 from difflib import SequenceMatcher
 
 from tacit.knowledge.enums import EntityBindingMethod, EntityKind, EntityResolutionStatus
 from tacit.knowledge.models import EntityBinding, EntityResolutionResult, KnowledgeScope
+from tacit.knowledge.normalization import normalize_entity
 from tacit.knowledge.repository import KnowledgeRepository
-
-
-def normalize_entity(value: str) -> str:
-    return re.sub(r"[^a-z0-9_.:-]+", "-", value.strip().casefold()).strip("-")
 
 
 class EntityResolutionService:
