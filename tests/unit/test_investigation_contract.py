@@ -836,6 +836,61 @@ def test_current_engine_replay_snapshots_reconciled_knowledge_usage(tmp_path, mo
     assert fake.persisted is True
 
 
+def test_current_engine_replay_succeeds_when_usage_persistence_fails(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    draft = _draft_contract(investigation_id)
+    store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+
+    class FailingUsageService:
+        def create_snapshot(self, scope):
+            usage = KnowledgeUsage(
+                tenant_id=scope.tenant_id,
+                knowledge_ref="knowledge_current",
+                knowledge_revision=1,
+                disposition=KnowledgeUsageDisposition.APPLIED,
+            )
+            return (
+                KnowledgeSnapshot(
+                    id="knowledge_snapshot_current",
+                    tenant_id=scope.tenant_id,
+                    items=[],
+                    fingerprint="sha256:current",
+                ),
+                [usage],
+            )
+
+        def reconcile_live_observations(self, usage, observations):
+            return usage
+
+        def snapshot_from_usage(self, tenant_id, usage):
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_reconciled",
+                tenant_id=tenant_id,
+                items=[],
+                fingerprint="sha256:reconciled",
+            )
+
+        def apply_to_ranking(self, ranking, usage):
+            return ranking
+
+        def persist_usage(self, usage, *, investigation_id, investigation_revision):
+            raise OSError("knowledge database unavailable")
+
+    monkeypatch.setattr(
+        "tacit.knowledge.service.get_knowledge_service",
+        lambda: FailingUsageService(),
+    )
+
+    replayed = store.replay_contract(investigation_id, mode=ReplayMode.CURRENT_ENGINE)
+
+    assert replayed.investigation.revision == 2
+    assert store.get_contract(investigation_id).investigation.revision == 2
+    replay_run = store.list_runs(investigation_id)[-1]
+    assert replay_run["status"] == "completed"
+    assert replay_run["error_code"] == ""
+
+
 def test_current_engine_replay_requires_concrete_tenant_in_wildcard_mode(tmp_path, monkeypatch):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?")

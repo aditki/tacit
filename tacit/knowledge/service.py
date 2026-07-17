@@ -101,6 +101,10 @@ class KnowledgeService:
         entity = self.repository.get_entity(alias.entity_ref, alias.tenant_id)
         if entity is None:
             raise ValueError("alias target entity does not exist in the tenant")
+        if alias.scope.tenant_id != alias.tenant_id:
+            alias = alias.model_copy(
+                update={"scope": alias.scope.model_copy(update={"tenant_id": alias.tenant_id})}
+            )
         return self.repository.save_alias(alias)
 
     def create_candidate(
@@ -900,6 +904,8 @@ class KnowledgeService:
     def _object_kind(kind: KnowledgeKind) -> EntityKind | None:
         if kind == KnowledgeKind.OWNERSHIP:
             return EntityKind.TEAM
+        if kind == KnowledgeKind.DEPENDENCY:
+            return EntityKind.UNKNOWN
         return None
 
     @staticmethod

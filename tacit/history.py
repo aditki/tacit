@@ -1003,11 +1003,19 @@ class InvestigationStore:
                 expected_parent_revision=contract.investigation.revision,
             )
             if mode == ReplayMode.CURRENT_ENGINE and persisted.knowledge_usage:
-                knowledge_service.persist_usage(
-                    persisted.knowledge_usage,
-                    investigation_id=persisted.investigation.id,
-                    investigation_revision=persisted.investigation.revision,
-                )
+                try:
+                    knowledge_service.persist_usage(
+                        persisted.knowledge_usage,
+                        investigation_id=persisted.investigation.id,
+                        investigation_revision=persisted.investigation.revision,
+                    )
+                except Exception:
+                    logger.warning(
+                        "replay_knowledge_usage_persist_failed",
+                        investigation_id=persisted.investigation.id,
+                        investigation_revision=persisted.investigation.revision,
+                        exc_info=True,
+                    )
             self.complete_run(run_id, status="completed", runtime_manifest=persisted.runtime.model_dump(mode="json"))
             return persisted
         except ExactReplayMismatchError:
