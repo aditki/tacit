@@ -49,6 +49,16 @@ def normalize_entity(value: str) -> str:
     return re.sub(r"[^a-z0-9_.:-]+", "-", value.strip().casefold()).strip("-")
 
 
+def normalize_service_ref(value: str) -> str:
+    """Canonicalize service mentions to the scope reference format."""
+    normalized = normalize_entity(value)
+    if normalized.startswith("entity:"):
+        return normalized
+    if normalized.startswith("service:"):
+        return f"entity:{normalized}"
+    return f"entity:service:{normalized}"
+
+
 SCOPE_LIST_FIELDS = (
     "environment_refs",
     "region_refs",

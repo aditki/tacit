@@ -924,16 +924,18 @@ class InvestigationStore:
             replay_snapshot = snapshot
             if mode == ReplayMode.CURRENT_ENGINE:
                 from tacit.knowledge.models import KnowledgeScope
+                from tacit.knowledge.normalization import normalize_service_ref
                 from tacit.knowledge.service import get_knowledge_service
 
                 knowledge_service = get_knowledge_service()
-                tenant_id = (
-                    snapshot.request.tenant_id or getattr(settings, "knowledge_tenant_id", "default") or "default"
-                )
+                configured_tenant = str(getattr(settings, "knowledge_tenant_id", "default") or "default")
+                if not snapshot.request.tenant_id and configured_tenant == "*":
+                    raise ReplayError("tenant_id is required for current-engine replay when knowledge_tenant_id is '*'")
+                tenant_id = snapshot.request.tenant_id or configured_tenant
                 knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(
                     KnowledgeScope(
                         tenant_id=tenant_id,
-                        service_refs=[f"entity:service:{service}" for service in snapshot.intent.services],
+                        service_refs=[normalize_service_ref(service) for service in snapshot.intent.services],
                     )
                 )
                 knowledge_usage = knowledge_service.reconcile_live_observations(

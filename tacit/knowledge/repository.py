@@ -641,6 +641,11 @@ class KnowledgeRepository:
         proposition = candidate.proposition
         with self._conn() as conn:
             conn.execute(
+                """DELETE FROM proposition_candidates
+                   WHERE candidate_id=? AND tenant_id=? AND proposition_key!=?""",
+                (candidate.id, candidate.tenant_id, proposition.proposition_key),
+            )
+            conn.execute(
                 """INSERT OR IGNORE INTO knowledge_propositions (
                    proposition_key, tenant_id, kind, subject_ref, predicate, object_ref,
                    concept_ref, scope_json, proposition_json, created_at

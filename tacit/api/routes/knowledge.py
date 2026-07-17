@@ -230,6 +230,8 @@ async def create_entity(payload: EntityRequest, request: Request):
     dependencies=[Depends(require_knowledge_permission("knowledge.review"))],
 )
 async def create_alias(payload: AliasRequest, request: Request):
+    if payload.review_state == ReviewState.TRUSTED:
+        assert_knowledge_permission(request, "knowledge.trust")
     tenant_id = _tenant(request)
     alias = EntityAlias(
         id=payload.id,

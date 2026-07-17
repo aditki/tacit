@@ -32,6 +32,7 @@ from tacit.grounding_benchmark import (
 from tacit.history import (
     ExactReplayMismatchError,
     InvestigationStore,
+    ReplayError,
     ReplayInputsUnavailableError,
     StaleRevisionError,
 )
@@ -833,6 +834,22 @@ def test_current_engine_replay_snapshots_reconciled_knowledge_usage(tmp_path, mo
     assert replayed.knowledge_snapshot_ref == "knowledge_snapshot_after_reconciliation"
     assert replayed.knowledge_usage[0].disposition == KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION
     assert fake.persisted is True
+
+
+def test_current_engine_replay_requires_concrete_tenant_in_wildcard_mode(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    draft = _draft_contract(investigation_id)
+    store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+    monkeypatch.setattr("tacit.history.settings.knowledge_tenant_id", "*")
+
+    with pytest.raises(ReplayError, match="tenant_id is required"):
+        store.replay_contract(investigation_id, mode=ReplayMode.CURRENT_ENGINE)
+
+    assert len(store.list_revisions(investigation_id)) == 1
+    replay_run = store.list_runs(investigation_id)[-1]
+    assert replay_run["status"] == "failed"
+    assert replay_run["error_code"] == "replay_failed"
 
 
 def test_concurrent_revision_writers_report_a_stale_parent(tmp_path):

@@ -379,12 +379,13 @@ async def _run_pipeline_inner(
         knowledge_usage: list[KnowledgeUsage] = []
         try:
             from tacit.knowledge.models import KnowledgeScope
+            from tacit.knowledge.normalization import normalize_service_ref
             from tacit.knowledge.service import get_knowledge_service
 
             tenant_id = request.tenant_id or getattr(runtime_settings, "knowledge_tenant_id", "default")
             knowledge_scope = KnowledgeScope(
                 tenant_id=tenant_id,
-                service_refs=[f"entity:service:{service}" for service in intent.services],
+                service_refs=[normalize_service_ref(service) for service in intent.services],
             )
             knowledge_service = get_knowledge_service()
             knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(knowledge_scope)
