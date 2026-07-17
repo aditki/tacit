@@ -184,7 +184,8 @@ class KnowledgeService:
         )
         existing = self.repository.get_candidate(candidate.id, tenant_id)
         if existing is not None:
-            if existing.proposition.proposition_key != candidate.proposition.proposition_key:
+            proposition_changed = existing.proposition.proposition_key != candidate.proposition.proposition_key
+            if proposition_changed and not self._is_entity_resolution_repair(existing, candidate):
                 raise ValueError("candidate identity cannot be reused for a different proposition")
             candidate = candidate.model_copy(
                 update={
@@ -259,6 +260,7 @@ class KnowledgeService:
         if review_state == ReviewState.REJECTED:
             decision = self._state_decision(updated, PromotionDecisionType.REJECT, "rejected_by_review")
             self.repository.save_promotion_decision(decision, tenant_id)
+            self._resolve_conflicts_for_rejected_proposition(updated, reviewer)
         self.repository.append_event(
             "correction_reviewed" if candidate.kind == KnowledgeKind.ARTIFACT_QUALITY else "promotion_evaluated",
             tenant_id=tenant_id,
@@ -591,6 +593,7 @@ class KnowledgeService:
                 correction_type.value,
                 proposed,
                 scope.model_dump(mode="json"),
+                target_ref,
             ],
         )
         existing_correction = self.repository.get_correction(correction_id, tenant_id)
@@ -690,12 +693,7 @@ class KnowledgeService:
             ignored_conflict_ids={conflict.id for conflict in replaceable_conflicts},
         )
         superseded = False
-        if (
-            revision
-            and target is not None
-            and replaceable_conflicts
-            and correction.target_ref != revision.knowledge_id
-        ):
+        if revision and target is not None and replaceable_conflicts and correction.target_ref != revision.knowledge_id:
             self.supersede(correction.target_ref, candidate.id, tenant_id=tenant_id)
             superseded = True
         if superseded:
@@ -822,6 +820,60 @@ class KnowledgeService:
         return candidate
 
     @staticmethod
+    def _is_entity_resolution_repair(
+        existing: KnowledgeCandidate,
+        candidate: KnowledgeCandidate,
+    ) -> bool:
+        return (
+            existing.entity_resolution.status in {EntityResolutionStatus.UNRESOLVED, EntityResolutionStatus.AMBIGUOUS}
+            and candidate.entity_resolution.status == EntityResolutionStatus.RESOLVED
+            and existing.entity_resolution.raw_value == candidate.entity_resolution.raw_value
+            and existing.kind == candidate.kind
+            and existing.payload_ref == candidate.payload_ref
+            and existing.scope == candidate.scope
+            and existing.proposition.predicate == candidate.proposition.predicate
+            and existing.proposition.concept_ref == candidate.proposition.concept_ref
+        )
+
+    def _resolve_conflicts_for_rejected_proposition(
+        self,
+        candidate: KnowledgeCandidate,
+        reviewer: str,
+    ) -> None:
+        proposition_key = candidate.proposition.proposition_key
+        viable_candidates = [
+            item
+            for item in self.repository.candidates_for_proposition(candidate.tenant_id, proposition_key)
+            if item.state.review_state != ReviewState.REJECTED
+        ]
+        if viable_candidates:
+            return
+        for conflict in self.repository.list_conflicts(
+            candidate.tenant_id,
+            proposition_key=proposition_key,
+            unresolved_only=True,
+        ):
+            resolved = conflict.model_copy(
+                update={
+                    "resolution_status": ConflictResolutionStatus.RESOLVED_BY_REVIEW,
+                    "resolution_reason": "counter_proposition_rejected",
+                    "resolved_by": reviewer,
+                    "resolved_at": utc_now(),
+                }
+            )
+            self.repository.save_conflict(resolved)
+            self.repository.append_event(
+                "conflict_resolved",
+                tenant_id=candidate.tenant_id,
+                subject_ref=resolved.id,
+                dimensions={
+                    "knowledge_kind": candidate.kind.value,
+                    "reason_code": "counter_proposition_rejected",
+                },
+                payload={"candidate_id": candidate.id},
+            )
+
+    @staticmethod
     def _combined_resolution(subject: EntityResolutionResult, object_: EntityResolutionResult | None):
         results = [item for item in (subject, object_) if item is not None]
         if any(item.status == EntityResolutionStatus.AMBIGUOUS for item in results):
@@ -886,7 +938,7 @@ class KnowledgeService:
 
     @staticmethod
     def _score_delta(kind: KnowledgeKind) -> float:
-        return 0.08 if kind == KnowledgeKind.DEPENDENCY else 0.04 if kind == KnowledgeKind.SIGNAL_MAPPING else 0.0
+        return 0.08 if kind == KnowledgeKind.DEPENDENCY else 0.0
 
     @staticmethod
     def _candidate_ref(entity_ref: str) -> str:

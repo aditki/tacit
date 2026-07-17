@@ -30,6 +30,7 @@ from tacit.knowledge.models import (
     KnowledgeScope,
     KnowledgeState,
 )
+from tacit.knowledge.normalization import normalize_service_ref
 from tacit.knowledge.repository import KnowledgeRepository
 from tacit.knowledge.service import KnowledgeService
 from tacit.models.schemas import CulpritRanking, EvidenceObservation, EvidenceObservationOutcome
@@ -431,6 +432,33 @@ def test_rejected_propositions_do_not_create_conflicts(tmp_path: Path):
     assert service.conflicts.analyze("default", positive.proposition.proposition_key) == []
 
 
+def test_rejecting_last_candidate_resolves_existing_conflicts(tmp_path: Path):
+    service = _service(tmp_path)
+    positive = _dependency(
+        service,
+        payload_ref="accepted-positive",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="positive",
+    )
+    rejected = _dependency(
+        service,
+        payload_ref="rejected-negative",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="negative",
+        predicate="does_not_depend_on",
+    )
+    conflicts = service.conflicts.analyze("default", positive.proposition.proposition_key)
+    assert len(conflicts) == 1
+    assert conflicts[0].resolution_status == ConflictResolutionStatus.UNRESOLVED
+
+    service.review_candidate(rejected.id, approved=False, reviewer="operator")
+
+    assert service.repository.list_conflicts("default", unresolved_only=True) == []
+    resolved = service.repository.list_conflicts("default")
+    assert resolved[0].resolution_status == ConflictResolutionStatus.RESOLVED_BY_REVIEW
+    assert resolved[0].resolution_reason == "counter_proposition_rejected"
+
+
 def test_conflict_scope_analysis_includes_services(tmp_path: Path):
     service = _service(tmp_path)
     first = service.create_candidate(
@@ -495,6 +523,43 @@ def test_canonical_entity_names_use_resolver_normalization(tmp_path: Path):
     assert candidate.proposition.subject_ref == "entity:service:payment-api"
 
 
+def test_candidate_can_rebind_after_entity_resolution_is_repaired(tmp_path: Path):
+    service = _service(tmp_path)
+    kwargs = {
+        "kind": KnowledgeKind.DEPENDENCY,
+        "payload_ref": "runbook:payment-api",
+        "typed_payload": {"source": "payment-api"},
+        "proposition": {
+            "subject_ref": "Payment API",
+            "predicate": "depends_on",
+            "object_ref": "redis-session",
+        },
+        "scope": KnowledgeScope(service_refs=["entity:service:payment-api"]),
+        "provenance_refs": ["runbook:payment-api"],
+        "candidate_id": "kc_payment_api",
+    }
+    unresolved = service.create_candidate(**kwargs)
+    old_key = unresolved.proposition.proposition_key
+    assert unresolved.entity_resolution.status.value == "unresolved"
+    service.register_entity(
+        Entity(
+            id="entity:service:payment-api",
+            kind=EntityKind.SERVICE,
+            canonical_name="Payment API",
+            scope=KnowledgeScope(),
+            provenance_refs=["catalog:service"],
+        )
+    )
+
+    repaired = service.create_candidate(**kwargs)
+
+    assert repaired.id == unresolved.id
+    assert repaired.entity_resolution.status.value == "resolved"
+    assert repaired.proposition.proposition_key != old_key
+    assert service.repository.candidates_for_proposition("default", old_key) == []
+    assert service.repository.candidates_for_proposition("default", repaired.proposition.proposition_key) == [repaired]
+
+
 def test_migrated_dependency_scope_uses_source_service(tmp_path: Path):
     service = _service(tmp_path)
     created = migrate_artifact_extractions(
@@ -520,6 +585,16 @@ def test_migrated_dependency_scope_uses_source_service(tmp_path: Path):
     assert candidate.scope.service_refs == ["entity:service:checkout"]
 
 
+def test_service_scope_normalization_matches_governed_knowledge(tmp_path: Path):
+    governed_scope = KnowledgeScope(
+        service_refs=["entity:service:checkout-service"],
+    )
+    investigation_scope = KnowledgeScope(service_refs=[normalize_service_ref("Checkout Service")])
+
+    assert normalize_service_ref("Checkout Service") == "entity:service:checkout-service"
+    assert governed_scope.applies_to(investigation_scope)
+
+
 def test_migrated_signal_mapping_preserves_candidate_metric(tmp_path: Path):
     service = _service(tmp_path)
     created = migrate_artifact_extractions(
@@ -542,6 +617,32 @@ def test_migrated_signal_mapping_preserves_candidate_metric(tmp_path: Path):
     candidate = service.repository.get_candidate(created[0])
     assert candidate is not None
     assert candidate.proposition.object_ref == "concept:http_request_duration_seconds"
+
+
+def test_signal_mapping_usage_does_not_claim_unapplied_score_delta(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="signal:latency",
+        typed_payload={"metric": "http_request_duration_seconds"},
+        proposition={
+            "subject_ref": "concept:latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:http_request_duration_seconds",
+            "concept_ref": "signal:latency",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["dashboard:checkout"],
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, live_verified=True)
+    assert revision is not None
+
+    _, usage = service.create_snapshot(KnowledgeScope(service_refs=["entity:service:checkout"]))
+
+    assert usage[0].disposition.value == "applied"
+    assert usage[0].used_for == ["evidence_resolution"]
+    assert usage[0].score_delta == 0
 
 
 def test_migrated_ownership_scope_uses_owned_service(tmp_path: Path):
@@ -722,6 +823,42 @@ def test_duplicate_correction_submission_preserves_review_state(tmp_path: Path):
     assert service.repository.get_correction(correction.id).review_state == ReviewState.APPROVED
 
 
+def test_correction_identity_includes_target_ref(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate, original = _promoted_dependency(service)
+    alternate = original.model_copy(
+        update={
+            "knowledge_id": "knowledge_alternate_target",
+            "revision": 1,
+            "parent_revision": None,
+            "proposition": original.proposition.model_copy(update={"proposition_key": "sha256:alternate-target"}),
+        }
+    )
+    service.repository.persist_revision(
+        alternate,
+        candidate_id=candidate.id,
+        decision_ref=alternate.decision_ref,
+    )
+    kwargs = {
+        "investigation_id": "inv-target-identity",
+        "investigation_revision": 1,
+        "correction_type": "dependency",
+        "proposed": {
+            "subject_ref": "entity:service:checkout",
+            "predicate": "does_not_depend_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        "scope": KnowledgeScope(service_refs=["entity:service:checkout"]),
+        "explanation": "Correct the selected target.",
+        "created_by": "operator",
+    }
+
+    first, _ = service.create_correction(target_ref=original.knowledge_id, **kwargs)
+    second, _ = service.create_correction(target_ref=alternate.knowledge_id, **kwargs)
+
+    assert first.id != second.id
+
+
 def test_migration_preserves_payload_review_and_provenance(tmp_path: Path):
     service = _service(tmp_path)
     row = {
@@ -752,6 +889,35 @@ def test_migration_preserves_payload_review_and_provenance(tmp_path: Path):
         service=service,
     )
     assert service.repository.get_candidate(ids[0]).state.review_state == ReviewState.APPROVED
+
+
+def test_migration_reingest_preserves_governed_rejection(tmp_path: Path):
+    service = _service(tmp_path)
+    row = {
+        "id": "dep_rejected",
+        "source_entity": "entity:service:checkout",
+        "target_entity": "entity:datastore:redis-session",
+        "direction": "depends_on",
+        "source_excerpt": "bounded excerpt",
+        "review_state": "candidate",
+    }
+    candidate_id = migrate_artifact_extractions(
+        artifact_id="artifact_rejected",
+        artifact_type="runbook",
+        rows={"dependency_hints": [row]},
+        service=service,
+    )[0]
+    service.review_candidate(candidate_id, approved=False, reviewer="operator")
+    row["review_state"] = "approved"
+
+    migrate_artifact_extractions(
+        artifact_id="artifact_rejected",
+        artifact_type="runbook",
+        rows={"dependency_hints": [row]},
+        service=service,
+    )
+
+    assert service.repository.get_candidate(candidate_id).state.review_state == ReviewState.REJECTED
 
 
 def test_tenant_id_collision_cannot_overwrite_candidate(tmp_path: Path):
@@ -838,6 +1004,36 @@ def test_api_aliases_use_resolver_normalization(tmp_path: Path, monkeypatch: pyt
 
     assert response.status_code == 200
     assert response.json()["normalized_value"] == "checkout-api"
+
+
+def test_api_trusted_alias_requires_trust_permission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path, "tenant-a")
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    app = create_app(
+        runtime_settings=Settings(
+            api_auth_enabled=False,
+            knowledge_tenant_id="tenant-a",
+            knowledge_permissions="knowledge.read,knowledge.review",
+        )
+    )
+
+    response = TestClient(app).post(
+        "/api/v1/knowledge/aliases",
+        json={
+            "id": "alias_trusted_checkout",
+            "raw_value": "Trusted Checkout",
+            "entity_ref": "entity:service:checkout",
+            "review_state": "trusted",
+            "provenance_refs": ["operator:alias"],
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.trust"
+    assert service.repository.find_aliases("tenant-a", "trusted-checkout") == []
 
 
 def test_alias_upsert_updates_lookup_columns(tmp_path: Path):

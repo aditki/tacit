@@ -431,17 +431,17 @@ def input_fingerprint(
         usage["investigation_revision"] = 0
         usage["created_at"] = ""
     payload = {
-            "request": data["request"],
-            "operational_ir": data["operational_ir"],
-            "evidence_requirements": data["evidence_requirements"],
-            "evidence_resolutions": data["evidence_resolutions"],
-            "queries": data["queries"],
-            "observations": data["observations"],
-            "captured_provenance": captured_provenance,
-            "policy_version": data["runtime"]["policy_version"],
-            "ranking_version": data["runtime"]["ranking_version"],
-            "vocabulary_version": data["runtime"]["vocabulary_version"],
-            "model": data["runtime"]["model"],
+        "request": data["request"],
+        "operational_ir": data["operational_ir"],
+        "evidence_requirements": data["evidence_requirements"],
+        "evidence_resolutions": data["evidence_resolutions"],
+        "queries": data["queries"],
+        "observations": data["observations"],
+        "captured_provenance": captured_provenance,
+        "policy_version": data["runtime"]["policy_version"],
+        "ranking_version": data["runtime"]["ranking_version"],
+        "vocabulary_version": data["runtime"]["vocabulary_version"],
+        "model": data["runtime"]["model"],
     }
     if include_knowledge_fields:
         payload["knowledge_snapshot_ref"] = data["knowledge_snapshot_ref"]
@@ -454,9 +454,7 @@ def output_fingerprint(
     *,
     include_knowledge_fields: bool = True,
 ) -> str:
-    return fingerprint(
-        normalized_output_payload(contract, include_knowledge_fields=include_knowledge_fields)
-    )
+    return fingerprint(normalized_output_payload(contract, include_knowledge_fields=include_knowledge_fields))
 
 
 def normalized_output_payload(

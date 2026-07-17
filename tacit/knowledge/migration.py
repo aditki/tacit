@@ -6,7 +6,7 @@ from typing import Any
 
 from tacit.knowledge.enums import EvidenceRole, KnowledgeKind, LineageKind, Predicate, ReviewState
 from tacit.knowledge.models import KnowledgeEvidenceReference, KnowledgeScope, MigrationProvenance
-from tacit.knowledge.normalization import normalize_ref, stable_fingerprint
+from tacit.knowledge.normalization import normalize_service_ref, stable_fingerprint
 from tacit.knowledge.service import KnowledgeService, _source_family
 
 
@@ -59,6 +59,7 @@ def migrate_artifact_extractions(
             ).split(":", 1)[1][:10]
             tenant_prefix = "" if tenant_id == "default" else f"{tenant_id}_"
             candidate_id = f"kc_{tenant_prefix}{legacy_id}_{semantic_id}"
+            existing = service.repository.get_candidate(candidate_id, tenant_id)
             candidate = service.create_candidate(
                 kind=kind,
                 payload_ref=f"{collection}:{row['id']}",
@@ -72,7 +73,11 @@ def migrate_artifact_extractions(
                 migration_provenance=MigrationProvenance(original_record_ref=f"{collection}:{row['id']}"),
             )
             legacy_review = str(row.get("review_state", ReviewState.CANDIDATE.value))
-            if legacy_review in {state.value for state in ReviewState} and legacy_review != "candidate":
+            if (
+                existing is None
+                and legacy_review in {state.value for state in ReviewState}
+                and legacy_review != "candidate"
+            ):
                 state = candidate.state.model_copy(update={"review_state": ReviewState(legacy_review)})
                 candidate = candidate.model_copy(update={"state": state})
                 service.repository.save_candidate(candidate)
@@ -91,6 +96,8 @@ def migrate_signal_mapping(
     metric = str(row.get("metric_pattern") or row.get("candidate_metric") or "unknown")
     record_ref = str(row.get("id") or f"{signal}:{metric}")
     source_refs = [str(value) for value in row.get("source_refs", [])] or [f"signal_mapping:{record_ref}"]
+    candidate_id = f"kc_signal_{record_ref}" if tenant_id == "default" else f"kc_signal_{tenant_id}_{record_ref}"
+    existing = service.repository.get_candidate(candidate_id, tenant_id)
     candidate = service.create_candidate(
         kind=KnowledgeKind.SIGNAL_MAPPING,
         payload_ref=f"signal_mapping:{record_ref}",
@@ -103,17 +110,17 @@ def migrate_signal_mapping(
         },
         scope=KnowledgeScope(
             tenant_id=tenant_id,
-            service_refs=[str(value) for value in row.get("context_services", [])],
+            service_refs=[normalize_service_ref(str(value)) for value in row.get("context_services", [])],
             environment_refs=[str(value) for value in row.get("context_environments", [])],
             archetype_refs=[str(value) for value in row.get("context_archetypes", [])],
         ),
         provenance_refs=source_refs,
         tenant_id=tenant_id,
-        candidate_id=(f"kc_signal_{record_ref}" if tenant_id == "default" else f"kc_signal_{tenant_id}_{record_ref}"),
+        candidate_id=candidate_id,
         migration_provenance=MigrationProvenance(original_record_ref=f"signal_mapping:{record_ref}"),
     )
     review = str(row.get("review_state", ReviewState.CANDIDATE.value))
-    if review in {state.value for state in ReviewState} and review != ReviewState.CANDIDATE.value:
+    if existing is None and review in {state.value for state in ReviewState} and review != ReviewState.CANDIDATE.value:
         candidate = candidate.model_copy(
             update={"state": candidate.state.model_copy(update={"review_state": ReviewState(review)})}
         )
@@ -122,8 +129,7 @@ def migrate_signal_mapping(
 
 
 def _service_ref(value: str) -> str:
-    normalized = normalize_ref(value)
-    return normalized if normalized.startswith("entity:") else f"entity:service:{normalized}"
+    return normalize_service_ref(value)
 
 
 def _proposition(kind: KnowledgeKind, row: dict[str, Any]) -> dict[str, Any]:
