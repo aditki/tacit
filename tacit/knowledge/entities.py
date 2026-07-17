@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 
-from tacit.knowledge.enums import EntityBindingMethod, EntityKind, EntityResolutionStatus
+from tacit.knowledge.enums import EntityBindingMethod, EntityKind, EntityResolutionStatus, EntityStatus
 from tacit.knowledge.models import EntityBinding, EntityResolutionResult, KnowledgeScope
 from tacit.knowledge.normalization import normalize_entity
 from tacit.knowledge.repository import KnowledgeRepository
@@ -37,7 +37,7 @@ class EntityResolutionService:
                 candidate_id,
             )
 
-        if normalized.startswith(("concept:", "signal:")):
+        if normalized.startswith(("concept:", "signal:")) and expected_kind is None:
             return self._record(
                 EntityResolutionResult(
                     status=EntityResolutionStatus.RESOLVED,
@@ -56,9 +56,25 @@ class EntityResolutionService:
                 expected_kind,
                 candidate_id,
             )
+        if normalized.startswith(("concept:", "signal:")):
+            return self._record(
+                EntityResolutionResult(
+                    status=EntityResolutionStatus.UNRESOLVED,
+                    raw_value=raw_value,
+                    reason_codes=["raw_concept_does_not_match_expected_entity_kind"],
+                ),
+                scope,
+                expected_kind,
+                candidate_id,
+            )
 
         direct = self.repository.get_entity(normalized, tenant_id)
-        if direct and self._kind_matches(direct.kind, expected_kind) and direct.scope.applies_to(scope):
+        if (
+            direct
+            and direct.status == EntityStatus.ACTIVE
+            and self._kind_matches(direct.kind, expected_kind)
+            and direct.scope.applies_to(scope)
+        ):
             return self._resolved(
                 raw_value,
                 direct.id,
@@ -69,12 +85,17 @@ class EntityResolutionService:
                 candidate_id,
             )
 
+        expected_kind_filter = (
+            expected_kind.value
+            if expected_kind is not None and expected_kind != EntityKind.UNKNOWN
+            else None
+        )
         named = [
             entity
             for entity in self.repository.find_entities(
                 tenant_id,
                 normalized,
-                expected_kind.value if expected_kind else None,
+                expected_kind_filter,
             )
             if entity.scope.applies_to(scope)
         ]
@@ -83,6 +104,7 @@ class EntityResolutionService:
             for alias in self.repository.find_aliases(tenant_id, normalized)
             if alias.scope.applies_to(scope)
             and (entity := self.repository.get_entity(alias.entity_ref, tenant_id)) is not None
+            and entity.status == EntityStatus.ACTIVE
             and self._kind_matches(entity.kind, expected_kind)
         ]
         refs = {entity.id: EntityBindingMethod.EXACT_NAME for entity in named}
@@ -108,7 +130,11 @@ class EntityResolutionService:
 
         fuzzy = []
         for entity in self.repository.list_entities(tenant_id):
-            if not self._kind_matches(entity.kind, expected_kind) or not entity.scope.applies_to(scope):
+            if (
+                entity.status != EntityStatus.ACTIVE
+                or not self._kind_matches(entity.kind, expected_kind)
+                or not entity.scope.applies_to(scope)
+            ):
                 continue
             score = SequenceMatcher(None, normalized, normalize_entity(entity.canonical_name)).ratio()
             if score >= 0.78:

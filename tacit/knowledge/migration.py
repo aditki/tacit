@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from tacit.knowledge.enums import EvidenceRole, KnowledgeKind, LineageKind, Predicate, ReviewState
-from tacit.knowledge.models import KnowledgeEvidenceReference, KnowledgeScope, MigrationProvenance
+from tacit.knowledge.models import KnowledgeCandidate, KnowledgeEvidenceReference, KnowledgeScope, MigrationProvenance
 from tacit.knowledge.normalization import normalize_service_ref, stable_fingerprint
 from tacit.knowledge.service import KnowledgeService, _source_family
 
@@ -81,6 +81,7 @@ def migrate_artifact_extractions(
                 state = candidate.state.model_copy(update={"review_state": ReviewState(legacy_review)})
                 candidate = candidate.model_copy(update={"state": state})
                 service.repository.save_candidate(candidate)
+            _evaluate_imported_approval(service, candidate)
             created.append(candidate.id)
     return created
 
@@ -125,11 +126,22 @@ def migrate_signal_mapping(
             update={"state": candidate.state.model_copy(update={"review_state": ReviewState(review)})}
         )
         service.repository.save_candidate(candidate)
+    _evaluate_imported_approval(service, candidate)
     return candidate.id
 
 
 def _service_ref(value: str) -> str:
     return normalize_service_ref(value)
+
+
+def _evaluate_imported_approval(service: KnowledgeService, candidate: KnowledgeCandidate) -> None:
+    if candidate.state.review_state not in {ReviewState.APPROVED, ReviewState.TRUSTED}:
+        return
+    if service.repository.find_knowledge_by_proposition(
+        candidate.tenant_id,
+        candidate.proposition.proposition_key,
+    ) is None:
+        service.evaluate_candidate(candidate.id, tenant_id=candidate.tenant_id)
 
 
 def _proposition(kind: KnowledgeKind, row: dict[str, Any]) -> dict[str, Any]:

@@ -14,6 +14,7 @@ from tacit.knowledge.enums import (
     ConflictResolutionStatus,
     EntityBindingMethod,
     EntityKind,
+    EntityStatus,
     EvidenceRole,
     KnowledgeEligibility,
     KnowledgeKind,
@@ -493,6 +494,46 @@ def test_conflict_scope_analysis_includes_services(tmp_path: Path):
     assert conflicts[0].scope_analysis["reason_code"] == "service_specific_difference"
 
 
+def test_conflict_scope_analysis_includes_archetypes(tmp_path: Path):
+    service = _service(tmp_path)
+    first = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="latency-signal",
+        typed_payload={},
+        proposition={
+            "subject_ref": "concept:latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:request_latency_seconds",
+        },
+        scope=KnowledgeScope(
+            service_refs=["entity:service:checkout"],
+            archetype_refs=["archetype:http-service"],
+        ),
+        provenance_refs=["catalog:http"],
+    )
+    service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="queue-signal",
+        typed_payload={},
+        proposition={
+            "subject_ref": "concept:latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:queue_age_seconds",
+        },
+        scope=KnowledgeScope(
+            service_refs=["entity:service:checkout"],
+            archetype_refs=["archetype:queue-worker"],
+        ),
+        provenance_refs=["catalog:queue"],
+    )
+
+    conflicts = service.conflicts.analyze("default", first.proposition.proposition_key)
+
+    assert len(conflicts) == 1
+    assert conflicts[0].resolution_status == ConflictResolutionStatus.RESOLVED_BY_SCOPE
+    assert conflicts[0].scope_analysis["reason_code"] == "archetype_specific_difference"
+
+
 def test_canonical_entity_names_use_resolver_normalization(tmp_path: Path):
     service = _service(tmp_path)
     service.register_entity(
@@ -521,6 +562,87 @@ def test_canonical_entity_names_use_resolver_normalization(tmp_path: Path):
 
     assert candidate.entity_resolution.status.value == "resolved"
     assert candidate.proposition.subject_ref == "entity:service:payment-api"
+
+
+@pytest.mark.parametrize(
+    ("subject_ref", "object_ref"),
+    [
+        ("concept:checkout", "entity:datastore:redis-session"),
+        ("entity:service:checkout", "concept:redis-session"),
+    ],
+)
+def test_dependency_concepts_do_not_bypass_entity_kind_resolution(
+    tmp_path: Path,
+    subject_ref: str,
+    object_ref: str,
+):
+    service = _service(tmp_path)
+
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.DEPENDENCY,
+        payload_ref=f"concept-dependency:{subject_ref}:{object_ref}",
+        typed_payload={},
+        proposition={
+            "subject_ref": subject_ref,
+            "predicate": "depends_on",
+            "object_ref": object_ref,
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["artifact:concept-dependency"],
+    )
+
+    assert candidate.entity_resolution.status.value == "unresolved"
+    assert "raw_concept_does_not_match_expected_entity_kind" in candidate.entity_resolution.reason_codes
+
+
+def test_exact_id_resolution_rejects_inactive_entities(tmp_path: Path):
+    service = _service(tmp_path)
+    checkout = service.repository.get_entity("entity:service:checkout")
+    assert checkout is not None
+    service.register_entity(checkout.model_copy(update={"status": EntityStatus.WITHDRAWN}))
+
+    candidate = _dependency(
+        service,
+        payload_ref="withdrawn-checkout",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="withdrawn-checkout",
+    )
+
+    assert candidate.entity_resolution.status.value == "unresolved"
+
+
+def test_alias_scope_defaults_to_alias_tenant(tmp_path: Path):
+    service = _service(tmp_path, "tenant-a")
+    alias = service.register_alias(
+        EntityAlias(
+            id="alias-storefront",
+            tenant_id="tenant-a",
+            raw_value="Storefront",
+            normalized_value="storefront",
+            entity_ref="entity:service:checkout",
+            scope=KnowledgeScope(),
+            method=EntityBindingMethod.HUMAN_CORRECTION,
+            review_state=ReviewState.APPROVED,
+            provenance_refs=["operator:alias"],
+        )
+    )
+
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.DEPENDENCY,
+        payload_ref="tenant-alias",
+        typed_payload={},
+        proposition={
+            "subject_ref": "Storefront",
+            "predicate": "depends_on",
+            "object_ref": "redis-session",
+        },
+        scope=KnowledgeScope(tenant_id="tenant-a", service_refs=["entity:service:checkout"]),
+        provenance_refs=["operator:alias"],
+        tenant_id="tenant-a",
+    )
+
+    assert alias.scope.tenant_id == "tenant-a"
+    assert candidate.entity_resolution.status.value == "resolved"
 
 
 def test_candidate_can_rebind_after_entity_resolution_is_repaired(tmp_path: Path):
@@ -879,6 +1001,8 @@ def test_migration_preserves_payload_review_and_provenance(tmp_path: Path):
     assert candidate is not None
     assert candidate.typed_payload == row
     assert candidate.state.review_state == ReviewState.APPROVED
+    assert candidate.policy.promotion_policy_ref == "dependency-promotion-v1"
+    assert candidate.policy.eligibility_reason_codes == ["insufficient_independent_sources"]
     assert candidate.migration_provenance is not None
     assert candidate.migration_provenance.original_record_ref == "dependency_hints:dep_legacy"
     row["review_state"] = "candidate"
@@ -889,6 +1013,40 @@ def test_migration_preserves_payload_review_and_provenance(tmp_path: Path):
         service=service,
     )
     assert service.repository.get_candidate(ids[0]).state.review_state == ReviewState.APPROVED
+
+
+def test_approved_legacy_rows_enter_promotion_evaluation(tmp_path: Path):
+    service = _service(tmp_path)
+    base_row = {
+        "source_entity": "entity:service:checkout",
+        "target_entity": "entity:datastore:redis-session",
+        "direction": "depends_on",
+        "source_excerpt": "bounded excerpt",
+        "review_state": "approved",
+    }
+    first_ids = migrate_artifact_extractions(
+        artifact_id="artifact_runbook",
+        artifact_type="runbook",
+        rows={"dependency_hints": [{"id": "dep_runbook", **base_row}]},
+        service=service,
+    )
+    first = service.repository.get_candidate(first_ids[0])
+    assert first is not None
+    assert service.repository.find_knowledge_by_proposition(
+        "default", first.proposition.proposition_key
+    ) is None
+
+    migrate_artifact_extractions(
+        artifact_id="artifact_dashboard",
+        artifact_type="dashboard",
+        rows={"dependency_hints": [{"id": "dep_dashboard", **base_row}]},
+        service=service,
+    )
+
+    promoted = service.repository.find_knowledge_by_proposition(
+        "default", first.proposition.proposition_key
+    )
+    assert promoted is not None
 
 
 def test_migration_reingest_preserves_governed_rejection(tmp_path: Path):
