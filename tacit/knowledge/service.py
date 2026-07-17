@@ -470,7 +470,10 @@ class KnowledgeService:
                 by_ref[candidate_ref] = added
         candidates.sort(key=lambda candidate: (-candidate.score, candidate.suspect_type, candidate.suspect))
         candidates = [candidate.model_copy(update={"rank": index}) for index, candidate in enumerate(candidates, 1)]
-        return ranking.model_copy(update={"candidates": candidates})
+        update: dict[str, Any] = {"candidates": candidates}
+        if candidates and ranking.abstained:
+            update.update({"abstained": False, "abstention_reason": ""})
+        return ranking.model_copy(update=update)
 
     def reconcile_live_observations(self, usage: list[KnowledgeUsage], observations) -> list[KnowledgeUsage]:
         """Let exact negative runtime evidence veto matching contextual knowledge."""
@@ -590,6 +593,12 @@ class KnowledgeService:
                 scope.model_dump(mode="json"),
             ],
         )
+        existing_correction = self.repository.get_correction(correction_id, tenant_id)
+        if existing_correction is not None:
+            return existing_correction, self._require_candidate(
+                existing_correction.knowledge_candidate_ref,
+                tenant_id,
+            )
         original = {}
         if target_ref:
             current = self.repository.get_revision(target_ref, tenant_id=tenant_id)
@@ -629,7 +638,7 @@ class KnowledgeService:
             created_by=created_by,
             knowledge_candidate_ref=candidate.id,
         )
-        self.repository.save_correction(correction)
+        correction = self.repository.save_correction(correction)
         self.repository.append_event(
             "correction_created",
             tenant_id=tenant_id,
@@ -672,8 +681,7 @@ class KnowledgeService:
             for conflict in conflicts
             if target is not None
             and conflict.resolution_status == ConflictResolutionStatus.UNRESOLVED
-            and target.proposition.proposition_key
-            in {conflict.left_proposition_ref, conflict.right_proposition_ref}
+            and target.proposition.proposition_key in {conflict.left_proposition_ref, conflict.right_proposition_ref}
         ]
         _, revision = self.evaluate_candidate(
             candidate.id,
@@ -682,7 +690,12 @@ class KnowledgeService:
             ignored_conflict_ids={conflict.id for conflict in replaceable_conflicts},
         )
         superseded = False
-        if revision and target is not None and correction.target_ref != revision.knowledge_id:
+        if (
+            revision
+            and target is not None
+            and replaceable_conflicts
+            and correction.target_ref != revision.knowledge_id
+        ):
             self.supersede(correction.target_ref, candidate.id, tenant_id=tenant_id)
             superseded = True
         if superseded:

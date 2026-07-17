@@ -37,7 +37,12 @@ def migrate_artifact_extractions(
                 lineage_kind=LineageKind.INDEPENDENT,
                 provenance_refs=[f"prov_artifact:{artifact_id}"],
             )
-            scope_service = row.get("source_entity") if kind == KnowledgeKind.DEPENDENCY else row.get("target_entity")
+            if kind == KnowledgeKind.DEPENDENCY:
+                scope_service = row.get("source_entity")
+            elif kind == KnowledgeKind.OWNERSHIP:
+                scope_service = row.get("entity")
+            else:
+                scope_service = row.get("target_entity")
             scope = KnowledgeScope(
                 tenant_id=tenant_id,
                 service_refs=[_service_ref(str(scope_service))] if scope_service else [],

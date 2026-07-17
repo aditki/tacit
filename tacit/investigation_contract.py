@@ -405,7 +405,11 @@ def fingerprint(value: Any) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def input_fingerprint(contract: InvestigationContract) -> str:
+def input_fingerprint(
+    contract: InvestigationContract,
+    *,
+    include_knowledge_fields: bool = True,
+) -> str:
     data = contract.model_dump(mode="json", by_alias=True)
     captured_provenance = [
         {
@@ -426,30 +430,40 @@ def input_fingerprint(contract: InvestigationContract) -> str:
         usage["investigation_id"] = ""
         usage["investigation_revision"] = 0
         usage["created_at"] = ""
-    return fingerprint(
-        {
+    payload = {
             "request": data["request"],
             "operational_ir": data["operational_ir"],
             "evidence_requirements": data["evidence_requirements"],
             "evidence_resolutions": data["evidence_resolutions"],
             "queries": data["queries"],
             "observations": data["observations"],
-            "knowledge_snapshot_ref": data["knowledge_snapshot_ref"],
-            "knowledge_usage": knowledge_usage,
             "captured_provenance": captured_provenance,
             "policy_version": data["runtime"]["policy_version"],
             "ranking_version": data["runtime"]["ranking_version"],
             "vocabulary_version": data["runtime"]["vocabulary_version"],
             "model": data["runtime"]["model"],
-        }
+    }
+    if include_knowledge_fields:
+        payload["knowledge_snapshot_ref"] = data["knowledge_snapshot_ref"]
+        payload["knowledge_usage"] = knowledge_usage
+    return fingerprint(payload)
+
+
+def output_fingerprint(
+    contract: InvestigationContract,
+    *,
+    include_knowledge_fields: bool = True,
+) -> str:
+    return fingerprint(
+        normalized_output_payload(contract, include_knowledge_fields=include_knowledge_fields)
     )
 
 
-def output_fingerprint(contract: InvestigationContract) -> str:
-    return fingerprint(normalized_output_payload(contract))
-
-
-def normalized_output_payload(contract: InvestigationContract) -> dict[str, Any]:
+def normalized_output_payload(
+    contract: InvestigationContract,
+    *,
+    include_knowledge_fields: bool = True,
+) -> dict[str, Any]:
     """Return contract output with revision-local timestamps removed."""
     data = contract.model_dump(mode="json", by_alias=True)
     data["investigation"]["revision"] = 0
@@ -477,14 +491,35 @@ def normalized_output_payload(contract: InvestigationContract) -> dict[str, Any]
         usage["investigation_id"] = ""
         usage["created_at"] = ""
         usage["investigation_revision"] = 0
+    if not include_knowledge_fields:
+        data.pop("knowledge_snapshot_ref", None)
+        data.pop("knowledge_usage", None)
     data["runtime"]["output_fingerprint"] = ""
     return data
 
 
-def stamp_fingerprints(contract: InvestigationContract) -> InvestigationContract:
-    runtime = contract.runtime.model_copy(update={"input_fingerprint": input_fingerprint(contract)})
+def stamp_fingerprints(
+    contract: InvestigationContract,
+    *,
+    include_knowledge_fields: bool = True,
+) -> InvestigationContract:
+    runtime = contract.runtime.model_copy(
+        update={
+            "input_fingerprint": input_fingerprint(
+                contract,
+                include_knowledge_fields=include_knowledge_fields,
+            )
+        }
+    )
     stamped = contract.model_copy(update={"runtime": runtime})
-    runtime = stamped.runtime.model_copy(update={"output_fingerprint": output_fingerprint(stamped)})
+    runtime = stamped.runtime.model_copy(
+        update={
+            "output_fingerprint": output_fingerprint(
+                stamped,
+                include_knowledge_fields=include_knowledge_fields,
+            )
+        }
+    )
     return stamped.model_copy(update={"runtime": runtime})
 
 

@@ -32,7 +32,7 @@ from tacit.knowledge.models import (
 )
 from tacit.knowledge.repository import KnowledgeRepository
 from tacit.knowledge.service import KnowledgeService
-from tacit.models.schemas import EvidenceObservation, EvidenceObservationOutcome
+from tacit.models.schemas import CulpritRanking, EvidenceObservation, EvidenceObservationOutcome
 from tacit.operational_learning_benchmark import (
     load_operational_learning_corpus,
     run_operational_learning_benchmark,
@@ -192,6 +192,26 @@ def test_resolution_normalization_corroboration_and_promotion(tmp_path: Path):
     reconciled_snapshot = service.snapshot_from_usage("default", contradicted)
     assert reconciled_snapshot.items == []
     assert reconciled_snapshot.id != snapshot_a.id
+
+
+def test_knowledge_candidate_clears_empty_ranking_abstention(tmp_path: Path):
+    service = _service(tmp_path)
+    _promoted_dependency(service)
+    _, usage = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        )
+    )
+
+    ranking = service.apply_to_ranking(
+        CulpritRanking(abstained=True, abstention_reason="no_rankable_candidates"),
+        usage,
+    )
+
+    assert len(ranking.candidates) == 1
+    assert ranking.abstained is False
+    assert ranking.abstention_reason == ""
 
 
 def test_duplicate_lineage_does_not_inflate_corroboration(tmp_path: Path):
@@ -524,6 +544,42 @@ def test_migrated_signal_mapping_preserves_candidate_metric(tmp_path: Path):
     assert candidate.proposition.object_ref == "concept:http_request_duration_seconds"
 
 
+def test_migrated_ownership_scope_uses_owned_service(tmp_path: Path):
+    service = _service(tmp_path)
+    service.register_entity(
+        Entity(
+            id="entity:team:payments",
+            kind=EntityKind.TEAM,
+            canonical_name="payments",
+            scope=KnowledgeScope(),
+            provenance_refs=["catalog:team"],
+        )
+    )
+    created = migrate_artifact_extractions(
+        artifact_id="artifact-ownership",
+        artifact_type="runbook",
+        rows={
+            "ownership_hints": [
+                {
+                    "id": "owner-1",
+                    "entity": "checkout",
+                    "owner": "payments",
+                    "source_excerpt": "checkout is owned by payments",
+                    "review_state": "approved",
+                }
+            ]
+        },
+        service=service,
+    )
+
+    candidate = service.repository.get_candidate(created[0])
+    assert candidate is not None
+    assert candidate.scope.service_refs == ["entity:service:checkout"]
+    decision, revision = service.evaluate_candidate(candidate.id, authoritative_source=True)
+    assert decision.decision.value == "promote"
+    assert revision is not None
+
+
 def test_correction_creates_candidate_revision_and_impact(tmp_path: Path):
     service = _service(tmp_path)
     _, original = _promoted_dependency(service)
@@ -590,6 +646,80 @@ def test_correction_without_target_keeps_conflict_unresolved(tmp_path: Path):
     assert replacement is None
     assert len(conflicts) == 1
     assert service.repository.get_revision(original.knowledge_id).state.lifecycle_status == LifecycleStatus.ACTIVE
+
+
+def test_correction_does_not_supersede_an_unrelated_target(tmp_path: Path):
+    service = _service(tmp_path)
+    _, original = _promoted_dependency(service)
+    service.register_entity(
+        Entity(
+            id="entity:datastore:postgres",
+            kind=EntityKind.DATASTORE,
+            canonical_name="postgres",
+            scope=KnowledgeScope(),
+            provenance_refs=["catalog:datastore"],
+        )
+    )
+    correction, _ = service.create_correction(
+        investigation_id="inv-mistargeted",
+        investigation_revision=1,
+        correction_type="dependency",
+        target_ref=original.knowledge_id,
+        proposed={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "depends_on",
+            "object_ref": "entity:datastore:postgres",
+        },
+        scope=KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        ),
+        explanation="Add a separate dependency without replacing Redis.",
+        created_by="operator",
+    )
+
+    _, added = service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="reviewer",
+        authoritative=True,
+    )
+
+    assert added is not None
+    assert added.knowledge_id != original.knowledge_id
+    assert service.repository.get_revision(original.knowledge_id).state.lifecycle_status == LifecycleStatus.ACTIVE
+
+
+def test_duplicate_correction_submission_preserves_review_state(tmp_path: Path):
+    service = _service(tmp_path)
+    kwargs = {
+        "investigation_id": "inv-duplicate",
+        "investigation_revision": 1,
+        "correction_type": "dependency",
+        "proposed": {
+            "subject_ref": "entity:service:checkout",
+            "predicate": "depends_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        "scope": KnowledgeScope(service_refs=["entity:service:checkout"]),
+        "explanation": "Record the reviewed dependency.",
+        "created_by": "operator",
+    }
+    correction, candidate = service.create_correction(**kwargs)
+    reviewed, _ = service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="reviewer",
+        authoritative=True,
+    )
+
+    duplicate, duplicate_candidate = service.create_correction(**kwargs)
+
+    assert reviewed.review_state == ReviewState.APPROVED
+    assert duplicate.review_state == ReviewState.APPROVED
+    assert duplicate_candidate.id == candidate.id
+    assert duplicate_candidate.state.review_state == ReviewState.APPROVED
+    assert service.repository.get_correction(correction.id).review_state == ReviewState.APPROVED
 
 
 def test_migration_preserves_payload_review_and_provenance(tmp_path: Path):
@@ -853,6 +983,21 @@ def test_cli_exposes_phase_three_commands():
     assert "--tenant" in runner.invoke(cli, ["learn", "runbooks", "--help"]).output
     assert "--tenant" in runner.invoke(cli, ["learn", "incidents", "--help"]).output
     assert "--tenant" in runner.invoke(cli, ["learn", "pagerduty", "--help"]).output
+    assert "--tenant" in runner.invoke(cli, ["investigate", "--help"]).output
+    assert "--tenant" in runner.invoke(cli, ["test", "--help"]).output
+
+
+def test_wildcard_cli_pipeline_commands_require_tenant(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
+    runner = CliRunner()
+
+    investigate_result = runner.invoke(cli, ["investigate", "checkout latency"])
+    test_result = runner.invoke(cli, ["test", "--no-open-browser"])
+
+    assert investigate_result.exit_code != 0
+    assert "--tenant is required" in investigate_result.output
+    assert test_result.exit_code != 0
+    assert "--tenant is required" in test_result.output
 
 
 def test_operational_learning_benchmark_is_packaged_and_safe():
