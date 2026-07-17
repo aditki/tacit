@@ -845,6 +845,24 @@ class InvestigationStore:
             )
             return None
 
+    def _uses_legacy_v1_fingerprint(self, investigation_id: str, revision: int) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                """SELECT contract_json FROM investigation_revisions
+                   WHERE investigation_id=? AND revision=?""",
+                (investigation_id, revision),
+            ).fetchone()
+        if row is None:
+            return False
+        try:
+            payload = json.loads(row["contract_json"])
+        except (TypeError, json.JSONDecodeError):
+            return False
+        schema = payload.get("schema", {})
+        return schema.get("version") == "1.0" and (
+            "knowledge_snapshot_ref" not in payload or "knowledge_usage" not in payload
+        )
+
     def replay_contract(
         self,
         investigation_id: str,
@@ -857,6 +875,10 @@ class InvestigationStore:
         contract = self.get_contract(investigation_id, revision)
         if contract is None:
             return None
+        legacy_v1_fingerprint = self._uses_legacy_v1_fingerprint(
+            investigation_id,
+            contract.investigation.revision,
+        )
         snapshot = self.get_snapshot(investigation_id, contract.investigation.revision)
         run_id = self.start_run(
             investigation_id,
@@ -932,6 +954,8 @@ class InvestigationStore:
                     }
                 )
             rebuilt = rebuild_contract(replay_snapshot, mode=mode, changes=changes)
+            if mode == ReplayMode.EXACT and legacy_v1_fingerprint:
+                rebuilt = stamp_fingerprints(rebuilt, include_knowledge_fields=False)
             self.append_event(
                 investigation_id,
                 run_id,

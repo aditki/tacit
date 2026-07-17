@@ -65,3 +65,31 @@ async def test_slack_mention_handler_passes_runtime_dependencies(monkeypatch):
 
     assert seen_deps == [dependency_bundle]
     assert messages[-1]["text"] == "checkout latency"
+
+
+async def test_slack_mention_uses_team_as_wildcard_tenant(monkeypatch):
+    dependency_bundle = SimpleNamespace(settings=SimpleNamespace(knowledge_tenant_id="*"))
+    seen_tenant: list[str] = []
+
+    async def fake_run_pipeline(request, deps=None):
+        seen_tenant.append(request.tenant_id)
+        return DashResponse(dashboard_url="", dashboard_uid="", panel_count=0, summary=request.prompt)
+
+    async def fake_say(**kwargs):
+        return None
+
+    monkeypatch.setattr("tacit.integrations.slack.run_pipeline", fake_run_pipeline)
+
+    await handle_mention(
+        {
+            "text": "<@BOT> checkout latency",
+            "channel": "C1",
+            "user": "U1",
+            "team": "tenant-a",
+            "ts": "1.0",
+        },
+        fake_say,
+        deps_factory=lambda: dependency_bundle,
+    )
+
+    assert seen_tenant == ["tenant-a"]

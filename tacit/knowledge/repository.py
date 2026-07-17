@@ -1049,8 +1049,16 @@ class KnowledgeRepository:
                    target_ref, review_state, candidate_ref, correction_json, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(correction_id) DO UPDATE SET
-                   review_state=excluded.review_state, candidate_ref=excluded.candidate_ref,
-                   correction_json=excluded.correction_json, updated_at=excluded.updated_at""",
+                   review_state=CASE
+                     WHEN excluded.review_state='candidate' AND knowledge_corrections.review_state!='candidate'
+                     THEN knowledge_corrections.review_state ELSE excluded.review_state END,
+                   candidate_ref=CASE
+                     WHEN excluded.review_state='candidate' AND knowledge_corrections.review_state!='candidate'
+                     THEN knowledge_corrections.candidate_ref ELSE excluded.candidate_ref END,
+                   correction_json=CASE
+                     WHEN excluded.review_state='candidate' AND knowledge_corrections.review_state!='candidate'
+                     THEN knowledge_corrections.correction_json ELSE excluded.correction_json END,
+                   updated_at=excluded.updated_at""",
                 (
                     correction.id,
                     correction.tenant_id,
@@ -1065,7 +1073,11 @@ class KnowledgeRepository:
                     now,
                 ),
             )
-        return correction
+            row = conn.execute(
+                "SELECT correction_json FROM knowledge_corrections WHERE correction_id=? AND tenant_id=?",
+                (correction.id, correction.tenant_id),
+            ).fetchone()
+        return KnowledgeCorrection.model_validate_json(row["correction_json"])
 
     def get_correction(self, correction_id: str, tenant_id: str = "default") -> KnowledgeCorrection | None:
         with self._conn() as conn:

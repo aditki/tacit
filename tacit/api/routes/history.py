@@ -246,7 +246,11 @@ async def refresh_investigation(
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
     response = await run_pipeline(
-        DashRequest(prompt=contract.request.question, user_id=contract.request.requester),
+        DashRequest(
+            prompt=contract.request.question,
+            user_id=contract.request.requester,
+            tenant_id=contract.request.scope.tenant_id,
+        ),
         deps,
         investigation_id=investigation_id,
         run_type=InvestigationRunType.REFRESH,

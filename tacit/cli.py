@@ -862,11 +862,13 @@ def _update_env(updates: dict):
 @click.argument("prompt", required=False)
 @click.option("--json", "json_output", is_flag=True, help="Print the canonical Investigation Contract JSON")
 @click.option("--open-browser/--no-open-browser", default=False, help="Open dashboard rendering in browser")
-def investigate(prompt: str | None, json_output: bool, open_browser: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def investigate(prompt: str | None, json_output: bool, open_browser: bool, tenant: str | None):
     """Run an investigation and render the versioned contract."""
     _load_env()
     if prompt is None:
         prompt = "High latency on the checkout service in the last hour"
+    tenant_id = _knowledge_tenant(tenant)
 
     import asyncio
 
@@ -875,7 +877,7 @@ def investigate(prompt: str | None, json_output: bool, open_browser: bool):
         from tacit.models.schemas import DashRequest
         from tacit.pipeline import run_pipeline
 
-        result = await run_pipeline(DashRequest(prompt=prompt, user_id="cli"))
+        result = await run_pipeline(DashRequest(prompt=prompt, user_id="cli", tenant_id=tenant_id))
         contract = None
         if result.investigation_id:
             contract = get_investigation_store().get_contract(result.investigation_id, result.investigation_revision)
@@ -913,13 +915,15 @@ def investigate(prompt: str | None, json_output: bool, open_browser: bool):
 @cli.command("test")
 @click.option("--prompt", "-p", default=None, help="Custom test prompt")
 @click.option("--open-browser/--no-open-browser", default=True, help="Open dashboard in browser")
-def test_run(prompt: str | None, open_browser: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def test_run(prompt: str | None, open_browser: bool, tenant: str | None):
     """Run a sample investigation and open the resulting dashboard."""
     _header("Tacit Test Run")
     _load_env()
 
     if prompt is None:
         prompt = "High latency on the checkout service in the last hour"
+    tenant_id = _knowledge_tenant(tenant)
     _info(f'Prompt: "{prompt}"')
     console.print()
 
@@ -929,7 +933,7 @@ def test_run(prompt: str | None, open_browser: bool):
         from tacit.models.schemas import DashRequest
         from tacit.pipeline import run_pipeline
 
-        req = DashRequest(prompt=prompt)
+        req = DashRequest(prompt=prompt, tenant_id=tenant_id)
         _info("Running pipeline...")
         result = await run_pipeline(req)
         return result

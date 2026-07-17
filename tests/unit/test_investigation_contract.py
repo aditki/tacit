@@ -308,6 +308,49 @@ def test_exact_replay_records_run_without_changing_revision(tmp_path):
     assert len(store.list_revisions(investigation_id)) == 1
 
 
+def test_exact_replay_preserves_pre_knowledge_v1_fingerprints(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    draft = _draft_contract(investigation_id)
+    persisted = store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+    legacy = stamp_fingerprints(persisted, include_knowledge_fields=False)
+    contract_payload = legacy.model_dump(mode="json", by_alias=True)
+    contract_payload.pop("knowledge_snapshot_ref")
+    contract_payload.pop("knowledge_usage")
+    with store._conn() as conn:
+        snapshot_row = conn.execute(
+            """SELECT snapshot_json FROM investigation_snapshots
+               WHERE investigation_id=? AND revision=?""",
+            (investigation_id, persisted.investigation.revision),
+        ).fetchone()
+        snapshot_payload = json.loads(snapshot_row["snapshot_json"])
+        snapshot_payload.pop("knowledge_snapshot_ref", None)
+        snapshot_payload.pop("knowledge_usage", None)
+        conn.execute(
+            """UPDATE investigation_revisions
+               SET contract_json=?, input_fingerprint=?, output_fingerprint=?
+               WHERE investigation_id=? AND revision=?""",
+            (
+                json.dumps(contract_payload),
+                legacy.runtime.input_fingerprint,
+                legacy.runtime.output_fingerprint,
+                investigation_id,
+                persisted.investigation.revision,
+            ),
+        )
+        conn.execute(
+            """UPDATE investigation_snapshots SET snapshot_json=?
+               WHERE investigation_id=? AND revision=?""",
+            (json.dumps(snapshot_payload), investigation_id, persisted.investigation.revision),
+        )
+
+    replayed = store.replay_contract(investigation_id, mode=ReplayMode.EXACT)
+
+    assert replayed is not None
+    assert replayed.runtime.input_fingerprint == legacy.runtime.input_fingerprint
+    assert replayed.runtime.output_fingerprint == legacy.runtime.output_fingerprint
+
+
 def test_captured_input_replay_rebuilds_and_counterfactual_creates_revision(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
@@ -762,11 +805,7 @@ def test_current_engine_replay_snapshots_reconciled_knowledge_usage(tmp_path, mo
             ]
 
         def reconcile_live_observations(self, usage, observations):
-            return [
-                usage[0].model_copy(
-                    update={"disposition": KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION}
-                )
-            ]
+            return [usage[0].model_copy(update={"disposition": KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION})]
 
         def snapshot_from_usage(self, tenant_id, usage):
             assert usage[0].disposition == KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION
@@ -2041,7 +2080,11 @@ def test_contract_api_rejects_unsupported_schema_in_history(tmp_path, monkeypatc
 def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="api")
-    store.persist_contract_revision(_draft_contract(investigation_id))
+    draft = _draft_contract(investigation_id)
+    tenant_request = draft.request.model_copy(
+        update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}
+    )
+    store.persist_contract_revision(draft.model_copy(update={"request": tenant_request}))
 
     class FeedbackStore:
         pass
@@ -2077,6 +2120,7 @@ def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch
 
     assert response.status_code == 200
     assert received["deps"] is deps
+    assert received["request"].tenant_id == "tenant-a"
     assert received["investigation_id"] == investigation_id
     assert received["run_type"] == InvestigationRunType.REFRESH
     assert received["base_revision"] == 1
