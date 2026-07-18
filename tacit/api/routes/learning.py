@@ -96,6 +96,7 @@ async def learn_from_dashboard(
             auto_approve=payload.auto_approve,
             runtime_settings=getattr(request.app.state, "settings", settings),
             store=store,
+            tenant_id=knowledge_tenant(request) if payload.auto_approve else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -132,6 +133,7 @@ async def learn_from_alert(
             dry_run=payload.dry_run,
             runtime_settings=getattr(request.app.state, "settings", settings),
             store=store,
+            tenant_id=(knowledge_tenant(request) if payload.auto_approve and not payload.dry_run else None),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -250,6 +252,7 @@ async def learn_from_dashboard_json(
             auto_approve=payload.auto_approve,
             runtime_settings=getattr(request.app.state, "settings", settings),
             store=store,
+            tenant_id=knowledge_tenant(request) if payload.auto_approve else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -290,6 +293,7 @@ async def learn_backend(
             limit=limit,
             runtime_settings=getattr(request.app.state, "settings", settings),
             store=store,
+            tenant_id=knowledge_tenant(request) if auto_approve else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -332,6 +336,7 @@ async def learn_backend_alert_rules(
             limit=limit,
             runtime_settings=getattr(request.app.state, "settings", settings),
             store=store,
+            tenant_id=knowledge_tenant(request) if auto_approve and not dry_run else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -504,6 +509,7 @@ async def approve_ingested_dashboard(
             backend_name=backend,
             store=store,
             runtime_settings=getattr(request.app.state, "settings", settings),
+            tenant_id=knowledge_tenant(request),
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")

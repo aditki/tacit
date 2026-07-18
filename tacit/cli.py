@@ -1210,7 +1210,8 @@ def learn():
     default=False,
     help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
 )
-def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required for auto-approval in wildcard mode)")
+def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool, tenant: str | None):
     """Ingest a dashboard and show what Tacit learned."""
     _header("Learn Dashboard")
     _load_env()
@@ -1218,6 +1219,7 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool):
     import asyncio
 
     stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant) if auto_approve else None
 
     async def _run():
         from tacit.dashboard_ingest import ingest_dashboard
@@ -1228,6 +1230,7 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool):
             auto_approve=auto_approve,
             runtime_settings=stores.settings,
             store=stores.signals(),
+            tenant_id=tenant_id,
         )
 
     try:
@@ -1397,8 +1400,8 @@ def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool,
         return
     stores = _cli_runtime_stores()
     signal_store = None if dry_run else stores.signals()
+    tenant_id = _knowledge_tenant(tenant)
     try:
-        tenant_id = _knowledge_tenant(tenant)
         if file_path:
             from tacit.artifact_learning import learn_runbook_file
 
@@ -1431,8 +1434,8 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
         return
     stores = _cli_runtime_stores()
     signal_store = None if dry_run else stores.signals()
+    tenant_id = _knowledge_tenant(tenant)
     try:
-        tenant_id = _knowledge_tenant(tenant)
         if file_path:
             from tacit.artifact_learning import learn_incident_file
 
@@ -1519,7 +1522,10 @@ def learn_pagerduty(
 )
 @click.option("--dry-run", is_flag=True, help="Preview alert ingestion without persisting learned context")
 @click.option("--limit", default=500, show_default=True, help="Maximum alerts to crawl")
-def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool, limit: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required for auto-approval in wildcard mode)")
+def learn_alerts(
+    source: str, alert_uid: str, auto_approve: bool, dry_run: bool, limit: int, tenant: str | None
+):
     """Crawl or preview alert rules from a backend."""
     _header(f"Learn {source.title()} Alerts")
     _load_env()
@@ -1527,6 +1533,7 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
     import asyncio
 
     stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant) if auto_approve and not dry_run else None
 
     async def _run():
         if alert_uid:
@@ -1539,6 +1546,7 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
                 dry_run=dry_run,
                 runtime_settings=stores.settings,
                 store=stores.signals(),
+                tenant_id=tenant_id,
             )
         from tacit.alert_ingest import learn_backend_alerts
 
@@ -1549,6 +1557,7 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
             limit=limit,
             runtime_settings=stores.settings,
             store=stores.signals(),
+            tenant_id=tenant_id,
         )
 
     try:
@@ -1588,13 +1597,14 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
         _info(f"Mappings created: {result.get('mappings_created', 0)}")
 
 
-def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
+def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int, tenant: str | None):
     _header(f"Learn {backend_name.title()} Dashboards")
     _load_env()
 
     import asyncio
 
     stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant) if auto_approve else None
 
     async def _run():
         from tacit.dashboard_ingest import learn_backend_dashboards
@@ -1605,6 +1615,7 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
             limit=limit,
             runtime_settings=stores.settings,
             store=stores.signals(),
+            tenant_id=tenant_id,
         )
 
     try:
@@ -1624,9 +1635,10 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
     help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
 )
 @click.option("--limit", default=500, show_default=True, help="Maximum dashboards to crawl")
-def learn_grafana(auto_approve: bool, limit: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required for auto-approval in wildcard mode)")
+def learn_grafana(auto_approve: bool, limit: int, tenant: str | None):
     """Crawl Grafana dashboards and persist learned operational context."""
-    _run_backend_learning("grafana", auto_approve, limit)
+    _run_backend_learning("grafana", auto_approve, limit, tenant)
 
 
 @learn.command("signalfx")
@@ -1636,15 +1648,17 @@ def learn_grafana(auto_approve: bool, limit: int):
     help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
 )
 @click.option("--limit", default=500, show_default=True, help="Maximum dashboards to crawl")
-def learn_signalfx(auto_approve: bool, limit: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required for auto-approval in wildcard mode)")
+def learn_signalfx(auto_approve: bool, limit: int, tenant: str | None):
     """Crawl SignalFx dashboards and persist learned operational context."""
-    _run_backend_learning("signalfx", auto_approve, limit)
+    _run_backend_learning("signalfx", auto_approve, limit, tenant)
 
 
 @learn.command("approve")
 @click.argument("dashboard_uid")
 @click.option("--backend", default="", help="Backend name, e.g. grafana_json or signalfx")
-def learn_approve(dashboard_uid: str, backend: str):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_approve(dashboard_uid: str, backend: str, tenant: str | None):
     """Approve a pending dashboard and evaluate eligible signal mappings."""
     _header("Approve Learned Dashboard")
     _load_env()
@@ -1652,12 +1666,14 @@ def learn_approve(dashboard_uid: str, backend: str):
     from tacit.dashboard_ingest import approve_ingested_dashboard_record
 
     stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant)
     try:
         result = approve_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend or None,
             store=stores.signals(),
             runtime_settings=stores.settings,
+            tenant_id=tenant_id,
         )
     except LookupError:
         _fail("Ingested dashboard not found")

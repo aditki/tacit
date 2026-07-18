@@ -187,6 +187,9 @@ async def review_candidate(candidate_id: str, payload: CandidateReviewRequest, r
                 authoritative_source=payload.authoritative_source,
                 live_verified=payload.live_verified,
             )
+            evaluated = service.repository.get_candidate(candidate_id, tenant_id)
+            if evaluated is not None:
+                candidate = evaluated
         return {
             "candidate": _candidate_dump(candidate),
             "promotion_decision": decision.model_dump(mode="json") if decision else None,

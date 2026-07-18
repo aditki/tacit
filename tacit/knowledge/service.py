@@ -66,6 +66,8 @@ def _source_family(value: str) -> SourceFamily:
         "catalog": SourceFamily.SERVICE_CATALOG,
         "human": SourceFamily.HUMAN_CORRECTION,
         "telemetry": SourceFamily.LIVE_OBSERVATION,
+        "dashboard_ingest": SourceFamily.DASHBOARD,
+        "alert_ingest": SourceFamily.DASHBOARD,
     }
     try:
         return SourceFamily(value)
@@ -345,11 +347,7 @@ class KnowledgeService:
                 for item in contributors
                 for provenance_ref in [
                     *item.provenance_refs,
-                    *[
-                        ref
-                        for evidence in item.evidence.items
-                        for ref in evidence.provenance_refs
-                    ],
+                    *[ref for evidence in item.evidence.items for ref in evidence.provenance_refs],
                 ]
             }
         )

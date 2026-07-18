@@ -340,9 +340,12 @@
   <!-- Knowledge tab -->
   <div class="tab-content" id="tab-knowledge">
     <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem">
         <div class="result-label" style="margin:0">Knowledge Review Queue</div>
-        <button class="btn-secondary btn-sm" onclick="loadKnowledgeQueue()" title="Refresh review queue">&#8635;</button>
+        <div style="display:flex;align-items:center;gap:0.5rem">
+          <input id="knowledge-tenant" type="text" placeholder="Tenant" style="width:10rem;max-width:45vw" aria-label="Knowledge tenant">
+          <button class="btn-secondary btn-sm" onclick="loadKnowledgeQueue()" title="Refresh review queue">&#8635;</button>
+        </div>
       </div>
       <div id="knowledge-status" style="font-size:0.75rem;color:#6b7280;margin-bottom:0.75rem"></div>
       <div id="knowledge-queue"><div class="status">Loading...</div></div>
@@ -426,7 +429,14 @@
   <script>
     const LOCAL_API_BASE = 'http://127.0.0.1:8000';
     const BASE = window.location.protocol === 'file:' ? LOCAL_API_BASE : window.location.origin;
+    const KNOWLEDGE_TENANT_KEY = 'tacit.knowledgeTenant';
     let lastDashboardUid = null;
+
+    function knowledgeHeaders(extra = {}) {
+      const tenant = document.getElementById('knowledge-tenant')?.value.trim() || '';
+      if (tenant) localStorage.setItem(KNOWLEDGE_TENANT_KEY, tenant);
+      return tenant ? { ...extra, 'X-Tacit-Tenant': tenant } : extra;
+    }
 
     const TAB_ORDER = ['generate','learning','knowledge','signals','insights','archetypes','history'];
 
@@ -1186,8 +1196,8 @@
       content.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
         const [queueResp, statusResp] = await Promise.all([
-          fetch(`${BASE}/api/v1/knowledge/review-queue`),
-          fetch(`${BASE}/api/v1/knowledge/status`),
+          fetch(`${BASE}/api/v1/knowledge/review-queue`, { headers: knowledgeHeaders() }),
+          fetch(`${BASE}/api/v1/knowledge/status`, { headers: knowledgeHeaders() }),
         ]);
         if (!queueResp.ok || !statusResp.ok) throw new Error(`HTTP ${queueResp.status || statusResp.status}`);
         const queue = await queueResp.json();
@@ -1236,7 +1246,7 @@
     async function reviewKnowledgeCandidate(candidateId, decision) {
       const response = await fetch(`${BASE}/api/v1/knowledge/candidates/${encodeURIComponent(candidateId)}/review`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: knowledgeHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ decision, reviewer: 'web-ui', evaluate: true }),
       });
       if (!response.ok) {
@@ -1398,6 +1408,10 @@
         btn.disabled = false;
       }
     });
+
+    const knowledgeTenantInput = document.getElementById('knowledge-tenant');
+    knowledgeTenantInput.value = localStorage.getItem(KNOWLEDGE_TENANT_KEY) || '';
+    knowledgeTenantInput.addEventListener('change', () => loadKnowledgeQueue());
 
     // Submit on Ctrl+Enter
     document.getElementById('prompt').addEventListener('keydown', (e) => {

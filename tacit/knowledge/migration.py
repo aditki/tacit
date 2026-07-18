@@ -97,6 +97,17 @@ def migrate_signal_mapping(
     metric = str(row.get("metric_pattern") or row.get("candidate_metric") or "unknown")
     record_ref = str(row.get("id") or f"{signal}:{metric}")
     source_refs = [str(value) for value in row.get("source_refs", [])] or [f"signal_mapping:{record_ref}"]
+    evidence = [
+        KnowledgeEvidenceReference(
+            evidence_ref=f"signal_mapping:{record_ref}:{index}",
+            evidence_role=EvidenceRole.SUPPORTING,
+            source_family=_source_family(str(row.get("source_type") or "unknown")),
+            lineage_group=source_ref,
+            lineage_kind=LineageKind.INDEPENDENT,
+            provenance_refs=[source_ref],
+        )
+        for index, source_ref in enumerate(source_refs, 1)
+    ]
     candidate_id = f"kc_signal_{record_ref}" if tenant_id == "default" else f"kc_signal_{tenant_id}_{record_ref}"
     existing = service.repository.get_candidate(candidate_id, tenant_id)
     candidate = service.create_candidate(
@@ -115,6 +126,7 @@ def migrate_signal_mapping(
             environment_refs=[str(value) for value in row.get("context_environments", [])],
             archetype_refs=[str(value) for value in row.get("context_archetypes", [])],
         ),
+        evidence=evidence,
         provenance_refs=source_refs,
         tenant_id=tenant_id,
         candidate_id=candidate_id,
