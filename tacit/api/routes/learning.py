@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi import Path as PathParam
 
 import tacit.signals as signals_mod
-from tacit.api.security import knowledge_tenant, verify_api_key
+from tacit.api.security import assert_knowledge_permission, knowledge_tenant, verify_api_key
 from tacit.models.schemas import (
     LearnAlertRequest,
     LearnDashboardRequest,
@@ -31,6 +31,13 @@ class _ArtifactPayload(Protocol):
     source_vendor: str
     source_instance: str
     provenance_url: str
+
+
+def _authorize_signal_approval(request: Request, enabled: bool) -> None:
+    if not enabled:
+        return
+    assert_knowledge_permission(request, "knowledge.review")
+    assert_knowledge_permission(request, "knowledge.trust")
 
 
 def _artifact_external_id(payload: _ArtifactPayload, artifact_type: str) -> str:
@@ -87,6 +94,7 @@ async def learn_from_dashboard(request: Request, payload: LearnDashboardRequest)
     from tacit.config import settings
     from tacit.dashboard_ingest import ingest_dashboard
 
+    _authorize_signal_approval(request, payload.auto_approve)
     try:
         return await _call_ingest_dashboard(
             ingest_dashboard,
@@ -118,6 +126,7 @@ async def learn_from_alert(request: Request, payload: LearnAlertRequest):
     from tacit.alert_ingest import ingest_alert
     from tacit.config import settings
 
+    _authorize_signal_approval(request, payload.auto_approve and not payload.dry_run)
     try:
         return await _call_ingest_alert(
             ingest_alert,
@@ -216,6 +225,7 @@ async def learn_from_dashboard_json(payload: LearnDashboardUploadRequest, reques
     from tacit.dashboard_ingest import ingest_dashboard_features
     from tacit.dashboard_uploads import parse_uploaded_dashboard
 
+    _authorize_signal_approval(request, payload.auto_approve)
     try:
         features = parse_uploaded_dashboard(
             payload.dashboard,
@@ -253,6 +263,7 @@ async def learn_backend(
     from tacit.config import settings
     from tacit.dashboard_ingest import learn_backend_dashboards
 
+    _authorize_signal_approval(request, auto_approve)
     try:
         return await _call_learn_backend_dashboards(
             learn_backend_dashboards,
@@ -289,6 +300,7 @@ async def learn_backend_alert_rules(
     from tacit.alert_ingest import learn_backend_alerts
     from tacit.config import settings
 
+    _authorize_signal_approval(request, auto_approve and not dry_run)
     try:
         return await _call_learn_backend_alerts(
             learn_backend_alerts,
@@ -458,6 +470,7 @@ async def approve_ingested_dashboard(request: Request, dashboard_uid: str, backe
     """Approve a pending ingested dashboard, activating its signal mappings."""
     from tacit.dashboard_ingest import approve_ingested_dashboard_record
 
+    _authorize_signal_approval(request, True)
     try:
         return approve_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,

@@ -23,7 +23,7 @@ from tacit.knowledge.enums import (
     ReviewState,
     SourceFamily,
 )
-from tacit.knowledge.migration import migrate_artifact_extractions
+from tacit.knowledge.migration import migrate_artifact_extractions, migrate_signal_mapping
 from tacit.knowledge.models import (
     Entity,
     EntityAlias,
@@ -1174,6 +1174,43 @@ def test_migration_reingest_preserves_governed_rejection(tmp_path: Path):
     assert service.repository.get_candidate(candidate_id).state.review_state == ReviewState.REJECTED
 
 
+def test_signal_mapping_candidate_ids_are_url_safe_and_reviewable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path)
+    candidate_id = migrate_signal_mapping(
+        {
+            "id": "cloudwatch:AWS/ApplicationELB:TargetResponseTime",
+            "signal_type": "request_latency",
+            "metric_pattern": "AWS/ApplicationELB/TargetResponseTime",
+            "source_type": "alert_ingest",
+            "source_refs": ["cloudwatch:alarm:checkout-latency"],
+        },
+        service=service,
+    )
+
+    assert candidate_id.startswith("kc_signal_")
+    assert candidate_id.removeprefix("kc_signal_").isalnum()
+    candidate = service.repository.get_candidate(candidate_id)
+    assert candidate is not None
+    assert candidate.typed_payload["metric_pattern"] == "AWS/ApplicationELB/TargetResponseTime"
+
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    app = create_app(
+        runtime_settings=Settings(
+            knowledge_permissions="knowledge.read,knowledge.review",
+        )
+    )
+    response = TestClient(app).post(
+        f"/api/v1/knowledge/candidates/{candidate_id}/review",
+        json={"decision": "approve", "reviewer": "operator", "evaluate": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["candidate"]["id"] == candidate_id
+
+
 def test_tenant_id_collision_cannot_overwrite_candidate(tmp_path: Path):
     repository = KnowledgeRepository(tmp_path / "knowledge.db")
     first = _service(tmp_path, "tenant-a")
@@ -1501,6 +1538,8 @@ def test_knowledge_ui_sends_selected_tenant_header():
     assert 'id="knowledge-tenant"' in html
     assert "'X-Tacit-Tenant': tenant" in html
     assert "knowledgeHeaders({ 'Content-Type': 'application/json' })" in html
+    assert "if (tenant) payload.tenant_id = tenant" in html
+    assert "headers: knowledgeHeaders()," in html
 
 
 def test_wildcard_cli_pipeline_commands_require_tenant(monkeypatch: pytest.MonkeyPatch):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
@@ -104,6 +105,34 @@ def test_learning_dashboard_route_uses_app_scoped_backend_settings(monkeypatch):
     assert response.status_code == 200
     assert response.json()["dashboard_uid"] == "runtime-dash"
     assert seen_settings == [runtime_settings]
+
+
+@pytest.mark.parametrize(
+    ("permissions", "missing_permission"),
+    [
+        ("knowledge.read", "knowledge.review"),
+        ("knowledge.read,knowledge.review", "knowledge.trust"),
+    ],
+)
+def test_learning_auto_approval_requires_knowledge_permissions(monkeypatch, permissions, missing_permission):
+    app = create_app(runtime_settings=Settings(knowledge_permissions=permissions))
+    called = False
+
+    async def fake_ingest_dashboard(**kwargs):
+        nonlocal called
+        called = True
+        return {"dashboard_uid": kwargs["dashboard_uid"]}
+
+    monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard", fake_ingest_dashboard)
+
+    response = TestClient(app).post(
+        "/api/v1/learn/dashboard",
+        json={"dashboard_uid": "restricted-dash", "auto_approve": True},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == f"Missing permission: {missing_permission}"
+    assert called is False
 
 
 def test_learning_backend_route_uses_app_scoped_backend_settings(monkeypatch):

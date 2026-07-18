@@ -67,7 +67,7 @@ def _source_family(value: str) -> SourceFamily:
         "human": SourceFamily.HUMAN_CORRECTION,
         "telemetry": SourceFamily.LIVE_OBSERVATION,
         "dashboard_ingest": SourceFamily.DASHBOARD,
-        "alert_ingest": SourceFamily.DASHBOARD,
+        "alert_ingest": SourceFamily.ALERT,
     }
     try:
         return SourceFamily(value)
