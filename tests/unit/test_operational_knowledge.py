@@ -497,10 +497,7 @@ def test_new_candidate_reopens_conflict_resolved_by_rejection(tmp_path: Path):
     assert conflicts[0].resolution_status == ConflictResolutionStatus.UNRESOLVED
     assert conflicts[0].resolution_reason == ""
     assert service.repository.list_conflicts("default", unresolved_only=True) == conflicts
-    assert any(
-        event["event_type"] == "conflict_reopened"
-        for event in service.repository.list_events("default")
-    )
+    assert any(event["event_type"] == "conflict_reopened" for event in service.repository.list_events("default"))
 
 
 def test_conflict_scope_analysis_includes_services(tmp_path: Path):
@@ -1359,6 +1356,44 @@ def test_api_policy_overrides_require_privileged_permission(tmp_path: Path, monk
     assert service.repository.get_candidate(candidate.id, "tenant-a").state.review_state == ReviewState.CANDIDATE
 
 
+def test_api_review_returns_post_evaluation_candidate_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path, "tenant-a")
+    candidate = _dependency(
+        service,
+        payload_ref="evaluated-response",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="evaluated-response",
+        tenant_id="tenant-a",
+    )
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    app = create_app(
+        runtime_settings=Settings(
+            api_auth_enabled=False,
+            knowledge_tenant_id="tenant-a",
+            knowledge_permissions="knowledge.read,knowledge.review,knowledge.override",
+        )
+    )
+
+    response = TestClient(app).post(
+        f"/api/v1/knowledge/{candidate.id}/review",
+        json={
+            "decision": "approve",
+            "reviewer": "operator",
+            "authoritative_source": True,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["promotion_decision"]["decision"] == "promote"
+    assert body["knowledge_revision"] is not None
+    assert body["candidate"]["state"]["eligibility"] == "contextual_only"
+    assert body["candidate"]["policy"]["promotion_policy_ref"] == "dependency-promotion-v1"
+
+
 def test_api_correction_authority_requires_override_permission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     service = _service(tmp_path, "tenant-a")
     correction, candidate = service.create_correction(
@@ -1436,8 +1471,36 @@ def test_cli_exposes_phase_three_commands():
     assert "--tenant" in runner.invoke(cli, ["learn", "runbooks", "--help"]).output
     assert "--tenant" in runner.invoke(cli, ["learn", "incidents", "--help"]).output
     assert "--tenant" in runner.invoke(cli, ["learn", "pagerduty", "--help"]).output
+    assert "--tenant" in runner.invoke(cli, ["learn", "dashboard", "--help"]).output
+    assert "--tenant" in runner.invoke(cli, ["learn", "alerts", "--help"]).output
+    assert "--tenant" in runner.invoke(cli, ["learn", "approve", "--help"]).output
     assert "--tenant" in runner.invoke(cli, ["investigate", "--help"]).output
     assert "--tenant" in runner.invoke(cli, ["test", "--help"]).output
+
+
+def test_artifact_learning_cli_missing_tenant_exits_nonzero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runbook = tmp_path / "runbook.md"
+    incident = tmp_path / "incident.md"
+    runbook.write_text("Checkout depends on Redis.")
+    incident.write_text("Checkout latency increased during the incident.")
+    monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
+    runner = CliRunner()
+
+    runbook_result = runner.invoke(cli, ["learn", "runbooks", "--file", str(runbook)])
+    incident_result = runner.invoke(cli, ["learn", "incidents", "--file", str(incident)])
+
+    assert runbook_result.exit_code != 0
+    assert incident_result.exit_code != 0
+    assert "--tenant is required" in runbook_result.output
+    assert "--tenant is required" in incident_result.output
+
+
+def test_knowledge_ui_sends_selected_tenant_header():
+    html = Path("tacit/static/index.html").read_text()
+
+    assert 'id="knowledge-tenant"' in html
+    assert "'X-Tacit-Tenant': tenant" in html
+    assert "knowledgeHeaders({ 'Content-Type': 'application/json' })" in html
 
 
 def test_wildcard_cli_pipeline_commands_require_tenant(monkeypatch: pytest.MonkeyPatch):

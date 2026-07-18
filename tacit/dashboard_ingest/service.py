@@ -176,6 +176,8 @@ def persist_inferred_signal_review(
     source_ref: str,
     dashboard_uid: str,
     backend_name: str = "",
+    tenant_id: str | None = None,
+    source_type: str = "dashboard_ingest",
 ) -> bool:
     """Persist one inferred signal using the same gate for all approval paths."""
     signal_type = sig["signal_type"]
@@ -196,10 +198,17 @@ def persist_inferred_signal_review(
             signal_type=signal_type,
             metric_pattern=metric,
             confidence=confidence,
-            source_type="dashboard_ingest",
+            source_type=source_type,
             source_refs=[source_ref],
             inference_version=sig.get("inference_version", ""),
             review_state="approved" if is_heuristic else "trusted",
+        )
+        _govern_signal_mapping(
+            store=store,
+            sig=sig,
+            source_ref=source_ref,
+            source_type=source_type,
+            tenant_id=tenant_id,
         )
         return True
 
@@ -217,6 +226,40 @@ def persist_inferred_signal_review(
             backend_name=backend_name,
         )
     return False
+
+
+def _govern_signal_mapping(
+    *,
+    store: Any,
+    sig: dict[str, Any],
+    source_ref: str,
+    source_type: str,
+    tenant_id: str | None,
+) -> str:
+    configured_tenant = str(settings.knowledge_tenant_id or "default")
+    if not tenant_id and configured_tenant == "*":
+        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
+    effective_tenant = tenant_id or configured_tenant
+    from tacit.knowledge.migration import migrate_signal_mapping
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    record_ref = f"{source_ref}:{sig['signal_type']}:{sig.get('metric', '')}"
+    return migrate_signal_mapping(
+        {
+            "id": record_ref,
+            "signal_type": sig["signal_type"],
+            "metric_pattern": sig.get("metric", ""),
+            "context_services": sig.get("services", []),
+            "context_environments": sig.get("environments", []),
+            "context_archetypes": sig.get("archetypes", []),
+            "source_type": source_type,
+            "source_refs": [source_ref],
+            "review_state": "approved" if sig.get("source") == "heuristic" else "trusted",
+        },
+        service=KnowledgeService(KnowledgeRepository(store._db_path)),
+        tenant_id=effective_tenant,
+    )
 
 
 def register_generated_archetype_if_enabled(archetype_yaml: str, *, dashboard_uid: str = "") -> bool:
@@ -278,6 +321,7 @@ def approve_ingested_dashboard_record(
     dashboard_uid: str,
     backend_name: str | None = None,
     store: Any | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Approve a pending ingested dashboard and activate learned artifacts."""
     store = store or get_signal_store()
@@ -306,6 +350,7 @@ def approve_ingested_dashboard_record(
                 source_ref=source_ref,
                 dashboard_uid=dashboard_uid,
                 backend_name=ingested.get("backend_name", ""),
+                tenant_id=tenant_id,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
@@ -325,6 +370,18 @@ def approve_ingested_dashboard_record(
                             source_type="dashboard_ingest",
                             source_refs=[source_ref],
                             review_state="approved",
+                        )
+                        _govern_signal_mapping(
+                            store=store,
+                            sig={
+                                "signal_type": sig,
+                                "metric": metric,
+                                "source": "heuristic",
+                                "services": [],
+                            },
+                            source_ref=source_ref,
+                            source_type="dashboard_ingest",
+                            tenant_id=tenant_id,
                         )
                         mappings_created += 1
                         activated_pairs.add((metric, sig))
@@ -405,6 +462,7 @@ async def ingest_dashboard_features(
     *,
     auto_approve: bool = False,
     register_archetype: bool = True,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted dashboard features."""
     extracted = _features_to_dict(features)
@@ -457,6 +515,7 @@ async def ingest_dashboard_features(
                 source_ref=source_ref,
                 dashboard_uid=features.dashboard_uid,
                 backend_name=features.backend_name,
+                tenant_id=tenant_id,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
@@ -528,6 +587,7 @@ async def ingest_dashboard(
     auto_approve: bool = False,
     register_archetype: bool = True,
     runtime_settings: Settings | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Full ingestion pipeline: fetch → extract → infer signals → store.
 
@@ -587,6 +647,7 @@ async def ingest_dashboard(
             features,
             auto_approve=auto_approve,
             register_archetype=register_archetype,
+            tenant_id=tenant_id,
         )
 
     finally:
@@ -601,6 +662,7 @@ async def learn_backend_dashboards(
     auto_approve: bool = False,
     limit: int = 500,
     runtime_settings: Settings | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Crawl a backend and learn from every discoverable dashboard."""
     import asyncio
@@ -645,6 +707,7 @@ async def learn_backend_dashboards(
                         backend=backend,
                         auto_approve=auto_approve,
                         register_archetype=not auto_approve,
+                        tenant_id=tenant_id,
                     )
                 return (
                     {

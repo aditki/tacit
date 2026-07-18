@@ -45,26 +45,34 @@ def _artifact_external_id(payload: _ArtifactPayload, artifact_type: str) -> str:
 
 
 async def _call_ingest_dashboard(ingest_dashboard, **kwargs):
-    if "runtime_settings" not in inspect.signature(ingest_dashboard).parameters:
-        kwargs.pop("runtime_settings", None)
+    parameters = inspect.signature(ingest_dashboard).parameters
+    for optional in ("runtime_settings", "tenant_id"):
+        if optional not in parameters:
+            kwargs.pop(optional, None)
     return await ingest_dashboard(**kwargs)
 
 
 async def _call_learn_backend_dashboards(learn_backend_dashboards, **kwargs):
-    if "runtime_settings" not in inspect.signature(learn_backend_dashboards).parameters:
-        kwargs.pop("runtime_settings", None)
+    parameters = inspect.signature(learn_backend_dashboards).parameters
+    for optional in ("runtime_settings", "tenant_id"):
+        if optional not in parameters:
+            kwargs.pop(optional, None)
     return await learn_backend_dashboards(**kwargs)
 
 
 async def _call_ingest_alert(ingest_alert, **kwargs):
-    if "runtime_settings" not in inspect.signature(ingest_alert).parameters:
-        kwargs.pop("runtime_settings", None)
+    parameters = inspect.signature(ingest_alert).parameters
+    for optional in ("runtime_settings", "tenant_id"):
+        if optional not in parameters:
+            kwargs.pop(optional, None)
     return await ingest_alert(**kwargs)
 
 
 async def _call_learn_backend_alerts(learn_backend_alerts, **kwargs):
-    if "runtime_settings" not in inspect.signature(learn_backend_alerts).parameters:
-        kwargs.pop("runtime_settings", None)
+    parameters = inspect.signature(learn_backend_alerts).parameters
+    for optional in ("runtime_settings", "tenant_id"):
+        if optional not in parameters:
+            kwargs.pop(optional, None)
     return await learn_backend_alerts(**kwargs)
 
 
@@ -86,6 +94,7 @@ async def learn_from_dashboard(request: Request, payload: LearnDashboardRequest)
             backend_name=payload.backend,
             auto_approve=payload.auto_approve,
             runtime_settings=getattr(request.app.state, "settings", settings),
+            tenant_id=knowledge_tenant(request) if payload.auto_approve else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -117,6 +126,7 @@ async def learn_from_alert(request: Request, payload: LearnAlertRequest):
             auto_approve=payload.auto_approve,
             dry_run=payload.dry_run,
             runtime_settings=getattr(request.app.state, "settings", settings),
+            tenant_id=(knowledge_tenant(request) if payload.auto_approve and not payload.dry_run else None),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -201,22 +211,26 @@ async def learn_from_incident(payload: LearnIncidentRequest, request: Request):
     summary="Learn from uploaded dashboard JSON",
     response_description="Extracted features, inferred signals, and generated archetype YAML",
 )
-async def learn_from_dashboard_json(request: LearnDashboardUploadRequest):
+async def learn_from_dashboard_json(payload: LearnDashboardUploadRequest, request: Request):
     """Ingest an uploaded dashboard JSON export without contacting the vendor."""
     from tacit.dashboard_ingest import ingest_dashboard_features
     from tacit.dashboard_uploads import parse_uploaded_dashboard
 
     try:
         features = parse_uploaded_dashboard(
-            request.dashboard,
-            vendor=request.vendor,
-            source_name=request.source_name,
+            payload.dashboard,
+            vendor=payload.vendor,
+            source_name=payload.source_name,
         )
-        return await ingest_dashboard_features(features, auto_approve=request.auto_approve)
+        return await ingest_dashboard_features(
+            features,
+            auto_approve=payload.auto_approve,
+            tenant_id=knowledge_tenant(request) if payload.auto_approve else None,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
-        logger.exception("dashboard_json_ingest_failed", vendor=request.vendor, source_name=request.source_name)
+        logger.exception("dashboard_json_ingest_failed", vendor=payload.vendor, source_name=payload.source_name)
         raise HTTPException(
             status_code=500,
             detail="Failed to ingest uploaded dashboard JSON. Check that the file is a supported dashboard export.",
@@ -246,6 +260,7 @@ async def learn_backend(
             auto_approve=auto_approve,
             limit=limit,
             runtime_settings=getattr(request.app.state, "settings", settings),
+            tenant_id=knowledge_tenant(request) if auto_approve else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -282,6 +297,7 @@ async def learn_backend_alert_rules(
             dry_run=dry_run,
             limit=limit,
             runtime_settings=getattr(request.app.state, "settings", settings),
+            tenant_id=knowledge_tenant(request) if auto_approve and not dry_run else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -438,7 +454,7 @@ async def describe_service(
     summary="Approve an ingested dashboard",
     response_description="Approval status and signal mappings created",
 )
-async def approve_ingested_dashboard(dashboard_uid: str, backend: str | None = None):
+async def approve_ingested_dashboard(request: Request, dashboard_uid: str, backend: str | None = None):
     """Approve a pending ingested dashboard, activating its signal mappings."""
     from tacit.dashboard_ingest import approve_ingested_dashboard_record
 
@@ -447,6 +463,7 @@ async def approve_ingested_dashboard(dashboard_uid: str, backend: str | None = N
             dashboard_uid=dashboard_uid,
             backend_name=backend,
             store=signals_mod.get_signal_store(),
+            tenant_id=knowledge_tenant(request),
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")

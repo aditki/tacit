@@ -318,6 +318,7 @@ def test_exact_replay_preserves_pre_knowledge_v1_fingerprints(tmp_path):
     contract_payload = legacy.model_dump(mode="json", by_alias=True)
     contract_payload.pop("knowledge_snapshot_ref")
     contract_payload.pop("knowledge_usage")
+    contract_payload["request"]["scope"].pop("tenant_id")
     with store._conn() as conn:
         snapshot_row = conn.execute(
             """SELECT snapshot_json FROM investigation_snapshots
@@ -327,6 +328,7 @@ def test_exact_replay_preserves_pre_knowledge_v1_fingerprints(tmp_path):
         snapshot_payload = json.loads(snapshot_row["snapshot_json"])
         snapshot_payload.pop("knowledge_snapshot_ref", None)
         snapshot_payload.pop("knowledge_usage", None)
+        snapshot_payload["request"].pop("tenant_id", None)
         conn.execute(
             """UPDATE investigation_revisions
                SET contract_json=?, input_fingerprint=?, output_fingerprint=?
@@ -912,9 +914,7 @@ def test_current_engine_replay_uses_pinned_knowledge_tenant(tmp_path, monkeypatc
     investigation_id = store.start("Why did checkout latency increase?")
     draft = _draft_contract(investigation_id)
     snapshot = _snapshot_for(draft)
-    snapshot = snapshot.model_copy(
-        update={"request": snapshot.request.model_copy(update={"tenant_id": "tenant-b"})}
-    )
+    snapshot = snapshot.model_copy(update={"request": snapshot.request.model_copy(update={"tenant_id": "tenant-b"})})
     store.persist_contract_revision(draft, snapshot=snapshot)
     monkeypatch.setattr("tacit.history.settings.knowledge_tenant_id", "tenant-a")
     captured: dict[str, str] = {}
@@ -922,12 +922,15 @@ def test_current_engine_replay_uses_pinned_knowledge_tenant(tmp_path, monkeypatc
     class CapturingKnowledgeService:
         def create_snapshot(self, scope):
             captured["tenant_id"] = scope.tenant_id
-            return KnowledgeSnapshot(
-                id="knowledge_snapshot_pinned",
-                tenant_id=scope.tenant_id,
-                items=[],
-                fingerprint="sha256:pinned",
-            ), []
+            return (
+                KnowledgeSnapshot(
+                    id="knowledge_snapshot_pinned",
+                    tenant_id=scope.tenant_id,
+                    items=[],
+                    fingerprint="sha256:pinned",
+                ),
+                [],
+            )
 
         def reconcile_live_observations(self, usage, observations):
             return usage

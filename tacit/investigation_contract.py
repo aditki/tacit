@@ -430,6 +430,8 @@ def input_fingerprint(
         usage["investigation_id"] = ""
         usage["investigation_revision"] = 0
         usage["created_at"] = ""
+    if not include_knowledge_fields:
+        data["request"]["scope"].pop("tenant_id", None)
     payload = {
         "request": data["request"],
         "operational_ir": data["operational_ir"],
@@ -492,6 +494,7 @@ def normalized_output_payload(
     if not include_knowledge_fields:
         data.pop("knowledge_snapshot_ref", None)
         data.pop("knowledge_usage", None)
+        data["request"]["scope"].pop("tenant_id", None)
     data["runtime"]["output_fingerprint"] = ""
     return data
 

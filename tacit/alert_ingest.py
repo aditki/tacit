@@ -149,6 +149,7 @@ async def ingest_alert_features(
     *,
     auto_approve: bool = False,
     dry_run: bool = False,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted alert features."""
     store = get_signal_store()
@@ -177,6 +178,8 @@ async def ingest_alert_features(
                 source_ref=source_ref,
                 dashboard_uid=features.alert_uid,
                 backend_name=features.backend_name,
+                tenant_id=tenant_id,
+                source_type="alert_ingest",
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
@@ -272,6 +275,7 @@ async def ingest_alert(
     auto_approve: bool = False,
     dry_run: bool = False,
     runtime_settings: Settings | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Full alert ingestion pipeline: fetch -> extract -> infer -> persist."""
     from tacit.backends import get_active_backends
@@ -297,7 +301,12 @@ async def ingest_alert(
         if backend is None:
             raise RuntimeError("No backend selected for alert ingestion")
         features = await backend.ingest_alert(alert_uid)
-        return await ingest_alert_features(features, auto_approve=auto_approve, dry_run=dry_run)
+        return await ingest_alert_features(
+            features,
+            auto_approve=auto_approve,
+            dry_run=dry_run,
+            tenant_id=tenant_id,
+        )
     finally:
         if own_backends:
             for item in all_backends:
@@ -311,6 +320,7 @@ async def learn_backend_alerts(
     dry_run: bool = False,
     limit: int = 500,
     runtime_settings: Settings | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Crawl a backend and learn from every discoverable alert rule."""
     from tacit.backends import get_active_backends
@@ -353,6 +363,7 @@ async def learn_backend_alerts(
                         backend=backend,
                         auto_approve=auto_approve,
                         dry_run=dry_run,
+                        tenant_id=tenant_id,
                     )
                 return (
                     {

@@ -27,6 +27,8 @@ from tacit.dashboard_ingest import (
     reject_ingested_dashboard_record,
 )
 from tacit.dashboard_uploads import parse_uploaded_dashboard
+from tacit.knowledge.enums import SourceFamily
+from tacit.knowledge.repository import KnowledgeRepository
 from tacit.models.schemas import MetricEntry
 from tacit.signals import (
     SignalStore,
@@ -1231,6 +1233,10 @@ class TestIngestedDashboards:
         assert result["archetype_registered"] is True
         assert archetype_path.exists()
         assert "checkout_autoreg" in archetype_path.read_text()
+        governed = KnowledgeRepository(signal_store._db_path).list_candidates("default", kind="signal_mapping")
+        assert len(governed) == 1
+        assert governed[0].proposition.object_ref == "concept:checkout_custom_latency_ms"
+        assert governed[0].evidence.items[0].source_family == SourceFamily.DASHBOARD
 
     @pytest.mark.asyncio
     async def test_auto_approve_keeps_held_candidates_out_of_approved_context(self, signal_store, monkeypatch):

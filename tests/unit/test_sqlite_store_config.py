@@ -6,6 +6,7 @@ from tacit.alert_ingest import ingest_alert_features
 from tacit.backends.base import AlertFeatures
 from tacit.feedback import FeedbackStore
 from tacit.history import InvestigationStore
+from tacit.knowledge.repository import KnowledgeRepository
 from tacit.signals import SignalStore
 
 
@@ -234,6 +235,9 @@ async def test_unchanged_alert_recrawl_preserves_approved_status(tmp_path, monke
     assert result["status"] == "approved"
     assert row is not None
     assert row["status"] == "approved"
+    governed = KnowledgeRepository(store._db_path).list_candidates("default", kind="signal_mapping")
+    assert len(governed) == 1
+    assert governed[0].payload_ref.startswith("signal_mapping:grafana:alert:checkout-latency")
     if store._learning_index_available():
         rows = store.search_learning_context("checkout latency", service="checkout")
         assert rows
