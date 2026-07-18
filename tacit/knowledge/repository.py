@@ -28,7 +28,7 @@ from tacit.knowledge.models import (
     PromotionDecision,
 )
 from tacit.knowledge.normalization import normalize_entity
-from tacit.signals.schema import DEFAULT_DB_PATH, SQLITE_BUSY_TIMEOUT_MS
+from tacit.signals.schema import SQLITE_BUSY_TIMEOUT_MS
 
 logger = structlog.get_logger()
 
@@ -293,7 +293,12 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_events_tenant ON knowledge_events(tenan
 
 def _db_path() -> Path:
     configured = getattr(settings, "signals_db_path", None)
-    path = Path(configured) if configured else DEFAULT_DB_PATH
+    if configured:
+        path = Path(configured)
+    else:
+        from tacit.signals import get_signal_store
+
+        path = get_signal_store()._db_path
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 

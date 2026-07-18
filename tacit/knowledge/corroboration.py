@@ -8,6 +8,7 @@ from tacit.knowledge.enums import (
     CorroborationStatus,
     EvidenceRole,
     KnowledgeKind,
+    LifecycleStatus,
     LineageKind,
     ReviewState,
     SourceFamily,
@@ -104,7 +105,13 @@ class ConflictDetectionService:
     def __init__(self, repository: KnowledgeRepository):
         self.repository = repository
 
-    def analyze(self, tenant_id: str, proposition_key: str) -> list[KnowledgeConflict]:
+    def analyze(
+        self,
+        tenant_id: str,
+        proposition_key: str,
+        *,
+        candidate_id: str = "",
+    ) -> list[KnowledgeConflict]:
         rows = self.repository.list_propositions(tenant_id)
         existing_conflicts = {item.id: item for item in self.repository.list_conflicts(tenant_id)}
         current = next((row for row in rows if row["proposition_key"] == proposition_key), None)
@@ -157,10 +164,20 @@ class ConflictDetectionService:
                 resolution_reason="" if scope_compatible else scope_reason,
             )
             existing = existing_conflicts.get(conflict.id)
+            current_item = self.repository.find_knowledge_by_proposition(tenant_id, proposition_key)
+            evaluated_candidate = self.repository.get_candidate(candidate_id, tenant_id) if candidate_id else None
+            reviewed_support_for_superseded = bool(
+                existing
+                and existing.resolution_reason == "approved_human_correction"
+                and current_item
+                and current_item.status == LifecycleStatus.SUPERSEDED
+                and evaluated_candidate
+                and evaluated_candidate.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
+            )
             reopened = bool(
                 existing
                 and existing.resolution_status == ConflictResolutionStatus.RESOLVED_BY_REVIEW
-                and existing.resolution_reason == "counter_proposition_rejected"
+                and (existing.resolution_reason == "counter_proposition_rejected" or reviewed_support_for_superseded)
                 and conflict.resolution_status == ConflictResolutionStatus.UNRESOLVED
             )
             if (
@@ -175,13 +192,19 @@ class ConflictDetectionService:
             ):
                 conflict = existing
             self.repository.save_conflict(conflict)
+            if reopened and reviewed_support_for_superseded:
+                event_reason = "new_support_for_superseded_proposition"
+            elif reopened:
+                event_reason = "new_candidate_after_rejection"
+            else:
+                event_reason = kind.value
             self.repository.append_event(
                 "conflict_reopened" if reopened else "conflict_created",
                 tenant_id=tenant_id,
                 subject_ref=conflict.id,
                 dimensions={
                     "knowledge_kind": current["kind"],
-                    "reason_code": "new_candidate_after_rejection" if reopened else kind.value,
+                    "reason_code": event_reason,
                 },
                 payload=conflict.model_dump(mode="json"),
             )

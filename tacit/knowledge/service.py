@@ -290,7 +290,11 @@ class KnowledgeService:
     ) -> tuple[PromotionDecision, KnowledgeRevision | None]:
         candidate = self._require_candidate(candidate_id, tenant_id)
         summary, corroboration_ref = self.corroboration.analyze(tenant_id, candidate.proposition.proposition_key)
-        conflicts = self.conflicts.analyze(tenant_id, candidate.proposition.proposition_key)
+        conflicts = self.conflicts.analyze(
+            tenant_id,
+            candidate.proposition.proposition_key,
+            candidate_id=candidate.id,
+        )
         ignored_conflict_ids = ignored_conflict_ids or set()
         unresolved = [
             conflict
@@ -727,7 +731,11 @@ class KnowledgeService:
         self.repository.save_correction(correction)
         if not approved:
             return correction, None
-        conflicts = self.conflicts.analyze(tenant_id, candidate.proposition.proposition_key)
+        conflicts = self.conflicts.analyze(
+            tenant_id,
+            candidate.proposition.proposition_key,
+            candidate_id=candidate.id,
+        )
         replaceable_conflicts = [
             conflict
             for conflict in conflicts
