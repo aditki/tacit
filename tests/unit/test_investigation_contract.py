@@ -907,6 +907,53 @@ def test_current_engine_replay_requires_concrete_tenant_in_wildcard_mode(tmp_pat
     assert replay_run["error_code"] == "replay_failed"
 
 
+def test_current_engine_replay_uses_pinned_knowledge_tenant(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    draft = _draft_contract(investigation_id)
+    snapshot = _snapshot_for(draft)
+    snapshot = snapshot.model_copy(
+        update={"request": snapshot.request.model_copy(update={"tenant_id": "tenant-b"})}
+    )
+    store.persist_contract_revision(draft, snapshot=snapshot)
+    monkeypatch.setattr("tacit.history.settings.knowledge_tenant_id", "tenant-a")
+    captured: dict[str, str] = {}
+
+    class CapturingKnowledgeService:
+        def create_snapshot(self, scope):
+            captured["tenant_id"] = scope.tenant_id
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_pinned",
+                tenant_id=scope.tenant_id,
+                items=[],
+                fingerprint="sha256:pinned",
+            ), []
+
+        def reconcile_live_observations(self, usage, observations):
+            return usage
+
+        def snapshot_from_usage(self, tenant_id, usage):
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_pinned",
+                tenant_id=tenant_id,
+                items=[],
+                fingerprint="sha256:pinned",
+            )
+
+        def apply_to_ranking(self, ranking, usage):
+            return ranking
+
+    monkeypatch.setattr(
+        "tacit.knowledge.service.get_knowledge_service",
+        lambda: CapturingKnowledgeService(),
+    )
+
+    replayed = store.replay_contract(investigation_id, mode=ReplayMode.CURRENT_ENGINE)
+
+    assert captured["tenant_id"] == "tenant-a"
+    assert replayed.request.scope.tenant_id == "tenant-a"
+
+
 def test_concurrent_revision_writers_report_a_stale_parent(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?")

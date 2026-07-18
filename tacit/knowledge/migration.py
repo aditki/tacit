@@ -137,10 +137,13 @@ def _service_ref(value: str) -> str:
 def _evaluate_imported_approval(service: KnowledgeService, candidate: KnowledgeCandidate) -> None:
     if candidate.state.review_state not in {ReviewState.APPROVED, ReviewState.TRUSTED}:
         return
-    if service.repository.find_knowledge_by_proposition(
-        candidate.tenant_id,
-        candidate.proposition.proposition_key,
-    ) is None:
+    if (
+        service.repository.find_knowledge_by_proposition(
+            candidate.tenant_id,
+            candidate.proposition.proposition_key,
+        )
+        is None
+    ):
         service.evaluate_candidate(candidate.id, tenant_id=candidate.tenant_id)
 
 

@@ -86,9 +86,7 @@ class EntityResolutionService:
             )
 
         expected_kind_filter = (
-            expected_kind.value
-            if expected_kind is not None and expected_kind != EntityKind.UNKNOWN
-            else None
+            expected_kind.value if expected_kind is not None and expected_kind != EntityKind.UNKNOWN else None
         )
         named = [
             entity

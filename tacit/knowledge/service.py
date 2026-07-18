@@ -102,9 +102,7 @@ class KnowledgeService:
         if entity is None:
             raise ValueError("alias target entity does not exist in the tenant")
         if alias.scope.tenant_id != alias.tenant_id:
-            alias = alias.model_copy(
-                update={"scope": alias.scope.model_copy(update={"tenant_id": alias.tenant_id})}
-            )
+            alias = alias.model_copy(update={"scope": alias.scope.model_copy(update={"tenant_id": alias.tenant_id})})
         return self.repository.save_alias(alias)
 
     def create_candidate(
@@ -334,6 +332,27 @@ class KnowledgeService:
         )
         if decision.decision != PromotionDecisionType.PROMOTE:
             return decision, None
+        contributors = self.corroboration.contributing_candidates(
+            tenant_id,
+            candidate.proposition.proposition_key,
+        )
+        if candidate.id not in {item.id for item in contributors}:
+            contributors.append(candidate)
+        contributor_refs = sorted({item.id for item in contributors})
+        provenance_refs = sorted(
+            {
+                provenance_ref
+                for item in contributors
+                for provenance_ref in [
+                    *item.provenance_refs,
+                    *[
+                        ref
+                        for evidence in item.evidence.items
+                        for ref in evidence.provenance_refs
+                    ],
+                ]
+            }
+        )
         existing = self.repository.find_knowledge_by_proposition(tenant_id, candidate.proposition.proposition_key)
         knowledge_id = existing.id if existing else _id("knowledge", [tenant_id, candidate.proposition.proposition_key])
         revision_number = existing.current_revision + 1 if existing else 1
@@ -344,6 +363,8 @@ class KnowledgeService:
                 "state": state.model_dump(mode="json"),
                 "policy": [policy.policy_id, policy.version],
                 "conflicts": sorted(conflict.id for conflict in conflicts),
+                "contributors": contributor_refs,
+                "provenance": provenance_refs,
             }
         )
         revision = KnowledgeRevision(
@@ -359,8 +380,8 @@ class KnowledgeService:
             policy_id=policy.policy_id,
             policy_version=policy.version,
             decision_ref=decision.decision_id,
-            promoted_from_candidate_refs=[candidate.id],
-            provenance_refs=candidate.provenance_refs,
+            promoted_from_candidate_refs=contributor_refs,
+            provenance_refs=provenance_refs,
             revision_reason="promoted" if revision_number == 1 else "corroborated",
             semantic_fingerprint=semantic,
         )
@@ -398,9 +419,9 @@ class KnowledgeService:
                     knowledge_ref=revision.knowledge_id,
                     knowledge_revision=revision.revision,
                     disposition=disposition,
-                    used_for=self._used_for(revision.proposition.kind) if applied else [],
+                    used_for=self._used_for(revision) if applied else [],
                     target_ref=revision.proposition.object_ref or revision.proposition.subject_ref,
-                    score_delta=self._score_delta(revision.proposition.kind) if applied else 0.0,
+                    score_delta=self._score_delta(revision) if applied else 0.0,
                     decision_ref=revision.decision_ref,
                     provenance_refs=revision.provenance_refs,
                     reason_codes=reasons,
@@ -446,7 +467,11 @@ class KnowledgeService:
                 item.knowledge_revision,
                 tenant_id=item.tenant_id,
             )
-            if revision is None or revision.proposition.kind != KnowledgeKind.DEPENDENCY:
+            if (
+                revision is None
+                or revision.proposition.kind != KnowledgeKind.DEPENDENCY
+                or revision.proposition.predicate == Predicate.DOES_NOT_DEPEND_ON
+            ):
                 continue
             candidate_ref = self._candidate_ref(revision.proposition.object_ref)
             reason = (
@@ -932,7 +957,10 @@ class KnowledgeService:
         return KnowledgeKind(proposed.get("kind", KnowledgeKind.ARTIFACT_QUALITY.value))
 
     @staticmethod
-    def _used_for(kind: KnowledgeKind) -> list[str]:
+    def _used_for(revision: KnowledgeRevision) -> list[str]:
+        kind = revision.proposition.kind
+        if kind == KnowledgeKind.DEPENDENCY and revision.proposition.predicate == Predicate.DOES_NOT_DEPEND_ON:
+            return ["candidate_exclusion"]
         return {
             KnowledgeKind.DEPENDENCY: ["candidate_generation", "ranking"],
             KnowledgeKind.OWNERSHIP: ["routing", "context"],
@@ -943,8 +971,13 @@ class KnowledgeService:
         }[kind]
 
     @staticmethod
-    def _score_delta(kind: KnowledgeKind) -> float:
-        return 0.08 if kind == KnowledgeKind.DEPENDENCY else 0.0
+    def _score_delta(revision: KnowledgeRevision) -> float:
+        return (
+            0.08
+            if revision.proposition.kind == KnowledgeKind.DEPENDENCY
+            and revision.proposition.predicate != Predicate.DOES_NOT_DEPEND_ON
+            else 0.0
+        )
 
     @staticmethod
     def _candidate_ref(entity_ref: str) -> str:
