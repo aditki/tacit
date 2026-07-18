@@ -365,6 +365,7 @@ def _run_case(service: KnowledgeService, case: dict[str, Any]) -> tuple[bool, st
             ],
             provenance_refs=["benchmark:historical-incident"],
         )
+        service.review_candidate(candidate.id, approved=True, reviewer="benchmark")
         decision, revision = service.evaluate_candidate(candidate.id)
         return revision is None and decision.decision.value == "retain_candidate", decision.decision.value
     candidate = service.create_candidate(

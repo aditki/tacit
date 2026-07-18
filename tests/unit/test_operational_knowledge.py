@@ -501,6 +501,61 @@ def test_new_candidate_reopens_conflict_resolved_by_rejection(tmp_path: Path):
     assert any(event["event_type"] == "conflict_reopened" for event in service.repository.list_events("default"))
 
 
+def test_reviewed_support_reopens_conflict_resolved_by_correction(tmp_path: Path):
+    service = _service(tmp_path)
+    _, original = _promoted_dependency(service)
+    correction, _ = service.create_correction(
+        investigation_id="inv-reopen-correction",
+        investigation_revision=1,
+        correction_type="dependency",
+        target_ref=original.knowledge_id,
+        proposed={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "does_not_depend_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        ),
+        explanation="Redis is no longer a dependency.",
+        created_by="operator",
+    )
+    service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="reviewer",
+        authoritative=True,
+    )
+    resolved = service.repository.list_conflicts("default")
+    assert resolved[0].resolution_status == ConflictResolutionStatus.RESOLVED_BY_REVIEW
+    assert resolved[0].resolution_reason == "approved_human_correction"
+
+    renewed_support = _dependency(
+        service,
+        payload_ref="reviewed-renewed-support",
+        family=SourceFamily.INCIDENT,
+        lineage_group="reviewed-renewed-support",
+    )
+    service.review_candidate(renewed_support.id, approved=True, reviewer="second-reviewer")
+
+    decision, revision = service.evaluate_candidate(
+        renewed_support.id,
+        authoritative_source=True,
+    )
+
+    assert revision is None
+    assert "unresolved_conflict" in decision.reason_codes
+    reopened = service.repository.list_conflicts("default", unresolved_only=True)
+    assert len(reopened) == 1
+    assert reopened[0].resolution_reason == ""
+    events = service.repository.list_events("default")
+    assert any(
+        event["event_type"] == "conflict_reopened" and event["reason_code"] == "new_support_for_superseded_proposition"
+        for event in events
+    )
+
+
 def test_conflict_scope_analysis_includes_services(tmp_path: Path):
     service = _service(tmp_path)
     first = service.create_candidate(
@@ -1264,6 +1319,35 @@ def test_signal_mapping_candidate_ids_are_url_safe_and_reviewable(tmp_path: Path
     assert response.json()["candidate"]["id"] == candidate_id
 
 
+def test_global_knowledge_repository_uses_active_signal_store_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import tacit.knowledge.repository as repository_module
+    import tacit.signals as signals_module
+    import tacit.signals.store as signal_store_module
+
+    active_path = tmp_path / "isolated-learning.db"
+    monkeypatch.setattr(signals_module, "_DEFAULT_DB_PATH", active_path)
+    monkeypatch.setattr(signals_module, "_store", None)
+    monkeypatch.setattr(signal_store_module, "_DEFAULT_DB_PATH", active_path)
+    monkeypatch.setattr(signal_store_module, "_store", None)
+    monkeypatch.setattr(repository_module, "_repository", None)
+    signal_store = signals_module.get_signal_store()
+    candidate_id = migrate_signal_mapping(
+        {
+            "id": "isolated:request-latency",
+            "signal_type": "request_latency",
+            "metric_pattern": "isolated_request_latency_seconds",
+            "source_type": "dashboard_ingest",
+            "source_refs": ["dashboard:isolated"],
+        },
+        service=KnowledgeService(KnowledgeRepository(signal_store._db_path)),
+    )
+
+    active_repository = repository_module.get_knowledge_repository()
+
+    assert active_repository._db_path == signal_store._db_path == active_path
+    assert active_repository.get_candidate(candidate_id) is not None
+
+
 def test_tenant_id_collision_cannot_overwrite_candidate(tmp_path: Path):
     repository = KnowledgeRepository(tmp_path / "knowledge.db")
     first = _service(tmp_path, "tenant-a")
@@ -1654,3 +1738,21 @@ def test_operational_learning_benchmark_is_packaged_and_safe():
     assert report["metrics"]["unresolved_item_contribution_rate"] == 0
     assert report["metrics"]["causal_claim_leakage_rate"] == 0
     assert report["metrics"]["prompt_injection_policy_override_count"] == 0
+
+
+def test_causal_benchmark_reviews_candidate_before_evaluation(monkeypatch: pytest.MonkeyPatch):
+    observed_states: list[ReviewState] = []
+    original_evaluate = KnowledgeService.evaluate_candidate
+
+    def record_review_state(self, candidate_id, *args, **kwargs):
+        candidate = self.repository.get_candidate(candidate_id)
+        if candidate is not None and candidate.payload_ref == "historical-causal-claim":
+            observed_states.append(candidate.state.review_state)
+        return original_evaluate(self, candidate_id, *args, **kwargs)
+
+    monkeypatch.setattr(KnowledgeService, "evaluate_candidate", record_review_state)
+
+    report = run_operational_learning_benchmark()
+
+    assert report["passed"] is True
+    assert observed_states == [ReviewState.APPROVED]
