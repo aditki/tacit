@@ -191,6 +191,7 @@ def persist_inferred_signal_review(
         should_teach = bool(metric) and confidence >= 0.5
 
     if should_teach:
+        effective_tenant = _resolve_knowledge_tenant(tenant_id)
         family = sig.get("signal_family", "")
         if family:
             store.register_signal_type(signal_type=signal_type, category=family)
@@ -208,7 +209,7 @@ def persist_inferred_signal_review(
             sig=sig,
             source_ref=source_ref,
             source_type=source_type,
-            tenant_id=tenant_id,
+            tenant_id=effective_tenant,
         )
         return True
 
@@ -236,10 +237,7 @@ def _govern_signal_mapping(
     source_type: str,
     tenant_id: str | None,
 ) -> str:
-    configured_tenant = str(settings.knowledge_tenant_id or "default")
-    if not tenant_id and configured_tenant == "*":
-        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
-    effective_tenant = tenant_id or configured_tenant
+    effective_tenant = _resolve_knowledge_tenant(tenant_id)
     from tacit.knowledge.migration import migrate_signal_mapping
     from tacit.knowledge.repository import KnowledgeRepository
     from tacit.knowledge.service import KnowledgeService
@@ -260,6 +258,13 @@ def _govern_signal_mapping(
         service=KnowledgeService(KnowledgeRepository(store._db_path)),
         tenant_id=effective_tenant,
     )
+
+
+def _resolve_knowledge_tenant(tenant_id: str | None) -> str:
+    configured_tenant = str(settings.knowledge_tenant_id or "default")
+    if not tenant_id and configured_tenant == "*":
+        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
+    return tenant_id or configured_tenant
 
 
 def register_generated_archetype_if_enabled(archetype_yaml: str, *, dashboard_uid: str = "") -> bool:
@@ -363,6 +368,7 @@ def approve_ingested_dashboard_record(
             for metric in ingested.get("metrics_found", []):
                 for mapping in signal_data.get("mappings", []):
                     if _metric_matches_pattern(metric, mapping["metric_pattern"]):
+                        effective_tenant = _resolve_knowledge_tenant(tenant_id)
                         store.add_mapping(
                             signal_type=sig,
                             metric_pattern=metric,
@@ -381,7 +387,7 @@ def approve_ingested_dashboard_record(
                             },
                             source_ref=source_ref,
                             source_type="dashboard_ingest",
-                            tenant_id=tenant_id,
+                            tenant_id=effective_tenant,
                         )
                         mappings_created += 1
                         activated_pairs.add((metric, sig))

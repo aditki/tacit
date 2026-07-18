@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from tacit.knowledge.enums import (
     ConflictKind,
@@ -44,6 +44,15 @@ class KnowledgeScope(BaseModel):
     version_constraints: list[str] = Field(default_factory=list)
     valid_from: datetime | None = None
     valid_until: datetime | None = None
+
+    @field_validator("valid_from", "valid_until")
+    @classmethod
+    def normalize_validity_datetime(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
     def applies_to(self, other: KnowledgeScope) -> bool:
         if self.tenant_id != other.tenant_id:

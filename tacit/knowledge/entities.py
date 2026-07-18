@@ -24,6 +24,10 @@ class EntityResolutionService:
         candidate_id: str = "",
     ) -> EntityResolutionResult:
         normalized = normalize_entity(raw_value)
+        typed_kind, separator, typed_name = normalized.partition(":")
+        entity_kinds = {kind.value for kind in EntityKind if kind not in {EntityKind.UNKNOWN, EntityKind.SIGNAL}}
+        if separator and typed_name and typed_kind in entity_kinds:
+            normalized = f"entity:{normalized}"
         tenant_id = scope.tenant_id
         if not normalized:
             return self._record(

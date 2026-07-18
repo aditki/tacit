@@ -26,6 +26,7 @@ from tacit.dashboard_ingest import (
     parse_dashboard_json,
     reject_ingested_dashboard_record,
 )
+from tacit.dashboard_ingest.service import persist_inferred_signal_review
 from tacit.dashboard_uploads import parse_uploaded_dashboard
 from tacit.knowledge.enums import SourceFamily
 from tacit.knowledge.repository import KnowledgeRepository
@@ -46,6 +47,26 @@ def signal_store(tmp_path):
     db_path = tmp_path / "test_signals.db"
     store = SignalStore(db_path=db_path)
     return store
+
+
+def test_signal_approval_validates_wildcard_tenant_before_activation(signal_store, monkeypatch):
+    monkeypatch.setattr("tacit.dashboard_ingest.service.settings.knowledge_tenant_id", "*")
+
+    with pytest.raises(ValueError, match="tenant_id is required"):
+        persist_inferred_signal_review(
+            store=signal_store,
+            sig={
+                "signal_type": "wildcard_tenant_signal",
+                "metric": "wildcard_tenant_metric",
+                "source": "heuristic",
+                "auto_teach_eligible": True,
+                "confidence": 0.9,
+            },
+            source_ref="dashboard:wildcard-tenant",
+            dashboard_uid="wildcard-tenant",
+        )
+
+    assert signal_store.get_signal_type("wildcard_tenant_signal") is None
 
 
 @pytest.fixture
