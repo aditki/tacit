@@ -432,9 +432,14 @@
     const KNOWLEDGE_TENANT_KEY = 'tacit.knowledgeTenant';
     let lastDashboardUid = null;
 
-    function knowledgeHeaders(extra = {}) {
+    function selectedTenant() {
       const tenant = document.getElementById('knowledge-tenant')?.value.trim() || '';
       if (tenant) localStorage.setItem(KNOWLEDGE_TENANT_KEY, tenant);
+      return tenant;
+    }
+
+    function knowledgeHeaders(extra = {}) {
+      const tenant = selectedTenant();
       return tenant ? { ...extra, 'X-Tacit-Tenant': tenant } : extra;
     }
 
@@ -562,6 +567,8 @@
       result.innerHTML = '<div class="status"><span class="spinner"></span>Starting investigation pipeline...</div>';
 
       const payload = { prompt, user_id: 'web-ui', channel_id: 'web' };
+      const tenant = selectedTenant();
+      if (tenant) payload.tenant_id = tenant;
       const stages = [];
       const onStage = (ev) => {
         // Collapse repeat events for the same stage (e.g. publish started → passed)
@@ -1003,7 +1010,7 @@
         if (backend) body.backend = backend;
         const resp = await fetch(`${BASE}/api/v1/learn/dashboard`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: knowledgeHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify(body),
         });
         if (!resp.ok) {
@@ -1092,7 +1099,7 @@
         const dashboard = JSON.parse(await file.text());
         const resp = await fetch(`${BASE}/api/v1/learn/dashboard/json`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: knowledgeHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
             vendor,
             source_name: file.name,
@@ -1119,7 +1126,7 @@
       const el = document.getElementById('ingested-list');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboards`);
+        const resp = await fetch(`${BASE}/api/v1/learn/dashboards`, { headers: knowledgeHeaders() });
         const data = await resp.json();
         const dashboards = data.dashboards || [];
         if (!dashboards.length) {
@@ -1179,7 +1186,10 @@
     async function reviewDashboard(uid, action, backend = '') {
       try {
         const backendQuery = backend ? `?backend=${encodeURIComponent(backend)}` : '';
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboards/${encodeURIComponent(uid)}/${encodeURIComponent(action)}${backendQuery}`, { method: 'POST' });
+        const resp = await fetch(`${BASE}/api/v1/learn/dashboards/${encodeURIComponent(uid)}/${encodeURIComponent(action)}${backendQuery}`, {
+          method: 'POST',
+          headers: knowledgeHeaders(),
+        });
         if (!resp.ok) throw new Error(`${action} failed`);
         loadIngestedDashboards();
       } catch (e) { alert(`${action} failed: ` + e.message); }

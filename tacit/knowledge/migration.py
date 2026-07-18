@@ -108,7 +108,8 @@ def migrate_signal_mapping(
         )
         for index, source_ref in enumerate(source_refs, 1)
     ]
-    candidate_id = f"kc_signal_{record_ref}" if tenant_id == "default" else f"kc_signal_{tenant_id}_{record_ref}"
+    candidate_digest = stable_fingerprint({"tenant_id": tenant_id, "record_ref": record_ref}).split(":", 1)[1][:20]
+    candidate_id = f"kc_signal_{candidate_digest}"
     existing = service.repository.get_candidate(candidate_id, tenant_id)
     candidate = service.create_candidate(
         kind=KnowledgeKind.SIGNAL_MAPPING,
