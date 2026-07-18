@@ -17,6 +17,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_learning_index(conn)
     ensure_ingested_dashboard_backend_scope(conn)
     ensure_ingested_alert_columns(conn)
+    ensure_ingested_alert_tenant_scope(conn)
     ensure_artifact_learning_columns(conn)
     ensure_mapping_columns(conn)
 
@@ -39,7 +40,7 @@ def ensure_mapping_columns(conn: sqlite3.Connection) -> None:
 
 
 def ensure_ingested_dashboard_backend_scope(conn: sqlite3.Connection) -> None:
-    """Ensure ingested dashboard uniqueness includes backend identity."""
+    """Ensure ingested dashboard uniqueness includes tenant and backend identity."""
     columns = [row["name"] for row in conn.execute("PRAGMA table_info(ingested_dashboards)").fetchall()]
     if "backend_name" not in columns:
         conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN backend_name TEXT NOT NULL DEFAULT ''")
@@ -49,12 +50,9 @@ def ensure_ingested_dashboard_backend_scope(conn: sqlite3.Connection) -> None:
         if not index["unique"]:
             continue
         indexed_cols = [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
-        if indexed_cols == ["dashboard_uid"]:
-            rebuild_ingested_dashboards_table(conn)
+        if indexed_cols == ["tenant_id", "dashboard_uid", "backend_name"]:
             return
-
-    conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_uid_backend
-           ON ingested_dashboards(dashboard_uid, backend_name)""")
+    rebuild_ingested_dashboards_table(conn)
 
 
 def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
@@ -79,6 +77,17 @@ def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
     for name, ddl in additions.items():
         if name not in columns:
             conn.execute(f"ALTER TABLE ingested_alerts ADD COLUMN {name} {ddl}")
+
+
+def ensure_ingested_alert_tenant_scope(conn: sqlite3.Connection) -> None:
+    """Ensure ingested alert uniqueness includes tenant and backend identity."""
+    for index in conn.execute("PRAGMA index_list(ingested_alerts)").fetchall():
+        if not index["unique"]:
+            continue
+        indexed_cols = [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
+        if indexed_cols == ["tenant_id", "alert_uid", "backend_name"]:
+            return
+    rebuild_ingested_alerts_table(conn)
 
 
 def ensure_artifact_learning_columns(conn: sqlite3.Connection) -> None:
@@ -108,11 +117,14 @@ def ensure_artifact_learning_columns(conn: sqlite3.Connection) -> None:
 
 
 def rebuild_ingested_dashboards_table(conn: sqlite3.Connection) -> None:
-    """Rebuild legacy ingested dashboards table with backend-scoped uniqueness."""
+    """Rebuild legacy ingested dashboards with tenant/backend-scoped uniqueness."""
+    old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ingested_dashboards)").fetchall()}
+    tenant_select = "COALESCE(tenant_id, 'default')" if "tenant_id" in old_columns else "'default'"
     conn.execute("ALTER TABLE ingested_dashboards RENAME TO ingested_dashboards_old")
     conn.executescript("""
         CREATE TABLE ingested_dashboards (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id           TEXT NOT NULL DEFAULT 'default',
             dashboard_uid       TEXT NOT NULL,
             backend_name        TEXT NOT NULL DEFAULT '',
             dashboard_title     TEXT NOT NULL DEFAULT '',
@@ -131,23 +143,66 @@ def rebuild_ingested_dashboards_table(conn: sqlite3.Connection) -> None:
             archetype_generated TEXT NOT NULL DEFAULT '',
             created_at          REAL NOT NULL,
             reviewed_at         REAL,
-            UNIQUE(dashboard_uid, backend_name)
+            UNIQUE(tenant_id, dashboard_uid, backend_name)
         );
     """)
-    conn.execute("""INSERT INTO ingested_dashboards
-           (id, dashboard_uid, backend_name, dashboard_title, dashboard_tags,
+    conn.execute(f"""INSERT INTO ingested_dashboards
+           (id, tenant_id, dashboard_uid, backend_name, dashboard_title, dashboard_tags,
             metrics_found, panel_count, row_groups, metric_cooccurrence,
             aggregation_patterns, query_transformations, panel_titles,
             alert_links, drilldown_links, status, signals_inferred,
             archetype_generated, created_at, reviewed_at)
-           SELECT id, dashboard_uid, COALESCE(backend_name, ''), dashboard_title, dashboard_tags,
+           SELECT id, {tenant_select}, dashboard_uid, COALESCE(backend_name, ''), dashboard_title, dashboard_tags,
                   metrics_found, panel_count, row_groups, metric_cooccurrence,
                   aggregation_patterns, query_transformations, panel_titles,
                   alert_links, drilldown_links, status, signals_inferred,
                   archetype_generated, created_at, reviewed_at
            FROM ingested_dashboards_old""")
     conn.execute("DROP TABLE ingested_dashboards_old")
-    conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_uid_backend
-           ON ingested_dashboards(dashboard_uid, backend_name)""")
-    conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_uid_backend
-           ON ingested_dashboards(dashboard_uid, backend_name)""")
+    conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_tenant_uid_backend
+           ON ingested_dashboards(tenant_id, dashboard_uid, backend_name)""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_tenant_uid_backend
+           ON ingested_dashboards(tenant_id, dashboard_uid, backend_name)""")
+
+
+def rebuild_ingested_alerts_table(conn: sqlite3.Connection) -> None:
+    """Rebuild legacy ingested alerts with tenant/backend-scoped uniqueness."""
+    old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ingested_alerts)").fetchall()}
+    tenant_select = "COALESCE(tenant_id, 'default')" if "tenant_id" in old_columns else "'default'"
+    conn.execute("ALTER TABLE ingested_alerts RENAME TO ingested_alerts_old")
+    conn.executescript("""
+        CREATE TABLE ingested_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL DEFAULT 'default', alert_uid TEXT NOT NULL,
+            backend_name TEXT NOT NULL DEFAULT '', source_vendor TEXT NOT NULL DEFAULT '',
+            source_instance TEXT NOT NULL DEFAULT '', external_id TEXT NOT NULL DEFAULT '',
+            fingerprint TEXT NOT NULL DEFAULT '', alert_title TEXT NOT NULL DEFAULT '',
+            alert_tags TEXT NOT NULL DEFAULT '[]', condition TEXT NOT NULL DEFAULT '',
+            severity TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+            labels TEXT NOT NULL DEFAULT '{}', annotations TEXT NOT NULL DEFAULT '{}',
+            metrics_found TEXT NOT NULL DEFAULT '[]', query_transformations TEXT NOT NULL DEFAULT '[]',
+            service_hints TEXT NOT NULL DEFAULT '[]', dashboard_uid TEXT NOT NULL DEFAULT '',
+            panel_title TEXT NOT NULL DEFAULT '', source_url TEXT NOT NULL DEFAULT '',
+            provenance_url TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0.0,
+            stale INTEGER NOT NULL DEFAULT 0, missing_since REAL,
+            status TEXT NOT NULL DEFAULT 'pending', signals_inferred TEXT NOT NULL DEFAULT '[]',
+            first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL,
+            updated_at REAL NOT NULL, created_at REAL NOT NULL, reviewed_at REAL,
+            UNIQUE(tenant_id, alert_uid, backend_name)
+        );
+    """)
+    conn.execute(f"""INSERT INTO ingested_alerts
+           (id, tenant_id, alert_uid, backend_name, source_vendor, source_instance, external_id,
+            fingerprint, alert_title, alert_tags, condition, severity, enabled, labels, annotations,
+            metrics_found, query_transformations, service_hints, dashboard_uid, panel_title,
+            source_url, provenance_url, confidence, stale, missing_since, status, signals_inferred,
+            first_seen_at, last_seen_at, updated_at, created_at, reviewed_at)
+           SELECT id, {tenant_select}, alert_uid, backend_name, source_vendor, source_instance, external_id,
+                  fingerprint, alert_title, alert_tags, condition, severity, enabled, labels, annotations,
+                  metrics_found, query_transformations, service_hints, dashboard_uid, panel_title,
+                  source_url, provenance_url, confidence, stale, missing_since, status, signals_inferred,
+                  first_seen_at, last_seen_at, updated_at, created_at, reviewed_at
+           FROM ingested_alerts_old""")
+    conn.execute("DROP TABLE ingested_alerts_old")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_alert_tenant_uid_backend
+           ON ingested_alerts(tenant_id, alert_uid, backend_name)""")

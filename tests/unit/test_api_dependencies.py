@@ -107,6 +107,62 @@ def test_learning_dashboard_route_uses_app_scoped_backend_settings(monkeypatch):
     assert seen_settings == [runtime_settings]
 
 
+def test_pending_learning_requires_and_threads_wildcard_tenant(monkeypatch):
+    app = create_app(runtime_settings=Settings(knowledge_tenant_id="*"))
+    seen_tenants: list[str | None] = []
+
+    async def fake_ingest_dashboard(
+        dashboard_uid,
+        backend_name=None,
+        auto_approve=False,
+        runtime_settings=None,
+        tenant_id=None,
+    ):
+        seen_tenants.append(tenant_id)
+        return {"dashboard_uid": dashboard_uid, "status": "pending"}
+
+    monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard", fake_ingest_dashboard)
+    client = TestClient(app)
+
+    missing = client.post(
+        "/api/v1/learn/dashboard",
+        json={"dashboard_uid": "tenant-dash", "auto_approve": False},
+    )
+    accepted = client.post(
+        "/api/v1/learn/dashboard",
+        headers={"X-Tacit-Tenant": "tenant-a"},
+        json={"dashboard_uid": "tenant-dash", "auto_approve": False},
+    )
+
+    assert missing.status_code == 400
+    assert accepted.status_code == 200
+    assert seen_tenants == ["tenant-a"]
+
+
+def test_replay_route_uses_app_scoped_runtime_settings(monkeypatch):
+    runtime_settings = Settings(knowledge_tenant_id="tenant-a")
+    seen_settings: list[Settings] = []
+
+    class FakeContract:
+        def model_dump(self, **kwargs):
+            return {"investigation": {"id": "inv-app-replay"}}
+
+    class FakeStore:
+        def replay_contract(self, investigation_id, revision, *, mode, changes, runtime_settings):
+            seen_settings.append(runtime_settings)
+            return FakeContract()
+
+    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: FakeStore())
+
+    response = TestClient(create_app(runtime_settings=runtime_settings)).post(
+        "/api/v1/investigations/inv-app-replay/replay",
+        json={"mode": "current_engine", "changes": {}},
+    )
+
+    assert response.status_code == 200
+    assert seen_settings == [runtime_settings]
+
+
 @pytest.mark.parametrize(
     ("permissions", "missing_permission"),
     [

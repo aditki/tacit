@@ -191,7 +191,7 @@ def persist_inferred_signal_review(
         should_teach = bool(metric) and confidence >= 0.5
 
     if should_teach:
-        effective_tenant = _resolve_knowledge_tenant(tenant_id)
+        effective_tenant = resolve_learning_tenant(tenant_id)
         family = sig.get("signal_family", "")
         if family:
             store.register_signal_type(signal_type=signal_type, category=family)
@@ -237,7 +237,7 @@ def _govern_signal_mapping(
     source_type: str,
     tenant_id: str | None,
 ) -> str:
-    effective_tenant = _resolve_knowledge_tenant(tenant_id)
+    effective_tenant = resolve_learning_tenant(tenant_id)
     from tacit.knowledge.migration import migrate_signal_mapping
     from tacit.knowledge.repository import KnowledgeRepository
     from tacit.knowledge.service import KnowledgeService
@@ -260,7 +260,7 @@ def _govern_signal_mapping(
     )
 
 
-def _resolve_knowledge_tenant(tenant_id: str | None) -> str:
+def resolve_learning_tenant(tenant_id: str | None) -> str:
     configured_tenant = str(settings.knowledge_tenant_id or "default")
     if not tenant_id and configured_tenant == "*":
         raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
@@ -330,7 +330,12 @@ def approve_ingested_dashboard_record(
 ) -> dict[str, Any]:
     """Approve a pending ingested dashboard and activate learned artifacts."""
     store = store or get_signal_store()
-    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend_name)
+    effective_tenant = resolve_learning_tenant(tenant_id)
+    ingested = store.get_ingested_dashboard(
+        dashboard_uid,
+        backend_name=backend_name,
+        tenant_id=effective_tenant,
+    )
     if ingested is None:
         raise LookupError("Ingested dashboard not found")
 
@@ -355,7 +360,7 @@ def approve_ingested_dashboard_record(
                 source_ref=source_ref,
                 dashboard_uid=dashboard_uid,
                 backend_name=ingested.get("backend_name", ""),
-                tenant_id=tenant_id,
+                tenant_id=effective_tenant,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
@@ -368,7 +373,6 @@ def approve_ingested_dashboard_record(
             for metric in ingested.get("metrics_found", []):
                 for mapping in signal_data.get("mappings", []):
                     if _metric_matches_pattern(metric, mapping["metric_pattern"]):
-                        effective_tenant = _resolve_knowledge_tenant(tenant_id)
                         store.add_mapping(
                             signal_type=sig,
                             metric_pattern=metric,
@@ -397,6 +401,7 @@ def approve_ingested_dashboard_record(
         dashboard_uid,
         backend_name=backend_name,
         activated_pairs=activated_pairs,
+        tenant_id=effective_tenant,
     )
     archetype_registered = register_generated_archetype_if_enabled(
         ingested.get("archetype_generated", ""),
@@ -418,10 +423,16 @@ def reject_ingested_dashboard_record(
     dashboard_uid: str,
     backend_name: str | None = None,
     store: Any | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Reject a pending ingested dashboard and persist heuristic negatives."""
     store = store or get_signal_store()
-    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend_name)
+    effective_tenant = resolve_learning_tenant(tenant_id)
+    ingested = store.get_ingested_dashboard(
+        dashboard_uid,
+        backend_name=backend_name,
+        tenant_id=effective_tenant,
+    )
     if ingested is None:
         raise LookupError("Ingested dashboard not found")
 
@@ -451,7 +462,11 @@ def reject_ingested_dashboard_record(
             )
             rejected_candidates += 1
 
-    if not store.reject_ingested_dashboard(dashboard_uid, backend_name=backend_name):
+    if not store.reject_ingested_dashboard(
+        dashboard_uid,
+        backend_name=backend_name,
+        tenant_id=effective_tenant,
+    ):
         raise RuntimeError("Dashboard is no longer pending")
 
     return {
@@ -471,6 +486,7 @@ async def ingest_dashboard_features(
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted dashboard features."""
+    effective_tenant = resolve_learning_tenant(tenant_id)
     extracted = _features_to_dict(features)
 
     signals = infer_signals_from_metrics(
@@ -491,6 +507,7 @@ async def ingest_dashboard_features(
 
     store.record_ingested_dashboard(
         dashboard_uid=features.dashboard_uid,
+        tenant_id=effective_tenant,
         backend_name=features.backend_name,
         dashboard_title=features.dashboard_title,
         dashboard_tags=features.dashboard_tags,
@@ -521,7 +538,7 @@ async def ingest_dashboard_features(
                 source_ref=source_ref,
                 dashboard_uid=features.dashboard_uid,
                 backend_name=features.backend_name,
-                tenant_id=tenant_id,
+                tenant_id=effective_tenant,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
@@ -675,6 +692,7 @@ async def learn_backend_dashboards(
 
     from tacit.backends import get_active_backends
 
+    effective_tenant = resolve_learning_tenant(tenant_id)
     active_settings = runtime_settings or settings
     all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
     if not all_backends:
@@ -713,7 +731,7 @@ async def learn_backend_dashboards(
                         backend=backend,
                         auto_approve=auto_approve,
                         register_archetype=not auto_approve,
-                        tenant_id=tenant_id,
+                        tenant_id=effective_tenant,
                     )
                 return (
                     {

@@ -20,6 +20,7 @@ from tacit.backends.base import AlertFeatures
 from tacit.config import Settings, settings
 from tacit.dashboard_ingest import infer_signals_from_metrics, persist_inferred_signal_review
 from tacit.dashboard_ingest.reports import build_learning_impact_report, build_signal_quality_report
+from tacit.dashboard_ingest.service import resolve_learning_tenant
 from tacit.signals import get_signal_store as _default_get_signal_store
 from tacit.signals.learning_index import infer_services_for_learning
 
@@ -152,6 +153,7 @@ async def ingest_alert_features(
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted alert features."""
+    effective_tenant = tenant_id if dry_run else resolve_learning_tenant(tenant_id)
     store = get_signal_store()
     status = "approved" if auto_approve else "pending"
     panel = alert_to_panel(features)
@@ -178,7 +180,7 @@ async def ingest_alert_features(
                 source_ref=source_ref,
                 dashboard_uid=features.alert_uid,
                 backend_name=features.backend_name,
-                tenant_id=tenant_id,
+                tenant_id=effective_tenant,
                 source_type="alert_ingest",
             ):
                 mappings_created += 1
@@ -190,6 +192,7 @@ async def ingest_alert_features(
     if not dry_run:
         change_state = store.record_ingested_alert(
             alert_uid=features.alert_uid,
+            tenant_id=effective_tenant,
             backend_name=features.backend_name,
             source_vendor=features.backend_name,
             source_instance=_source_instance(features),
@@ -213,7 +216,11 @@ async def ingest_alert_features(
             signals_inferred=signals,
             status=status,
         )
-        stored_alert = store.get_ingested_alert(features.alert_uid, features.backend_name)
+        stored_alert = store.get_ingested_alert(
+            features.alert_uid,
+            features.backend_name,
+            tenant_id=effective_tenant,
+        )
         if stored_alert is not None:
             effective_status = str(stored_alert.get("status") or status)
         indexed_context_rows = store.index_alert_context(
@@ -325,6 +332,7 @@ async def learn_backend_alerts(
     """Crawl a backend and learn from every discoverable alert rule."""
     from tacit.backends import get_active_backends
 
+    effective_tenant = tenant_id if dry_run else resolve_learning_tenant(tenant_id)
     active_settings = runtime_settings or settings
     all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
     if not all_backends:
@@ -363,7 +371,7 @@ async def learn_backend_alerts(
                         backend=backend,
                         auto_approve=auto_approve,
                         dry_run=dry_run,
-                        tenant_id=tenant_id,
+                        tenant_id=effective_tenant,
                     )
                 return (
                     {
@@ -404,6 +412,7 @@ async def learn_backend_alerts(
             store = get_signal_store()
             seen_alert_uids = {str(item.get("uid", "")) for item in alerts if item.get("uid")}
             totals["stale_marked"] = store.mark_missing_alerts_stale(
+                tenant_id=effective_tenant,
                 backend_name=backend_name,
                 seen_alert_uids=seen_alert_uids,
             )

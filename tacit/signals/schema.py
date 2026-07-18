@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS rejected_signal_candidates (
 
 CREATE TABLE IF NOT EXISTS ingested_dashboards (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
     dashboard_uid       TEXT NOT NULL,
     backend_name        TEXT NOT NULL DEFAULT '',
     dashboard_title     TEXT NOT NULL DEFAULT '',
@@ -92,11 +93,12 @@ CREATE TABLE IF NOT EXISTS ingested_dashboards (
 
     created_at          REAL NOT NULL,
     reviewed_at         REAL,
-    UNIQUE(dashboard_uid, backend_name)
+    UNIQUE(tenant_id, dashboard_uid, backend_name)
 );
 
 CREATE TABLE IF NOT EXISTS ingested_alerts (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
     alert_uid           TEXT NOT NULL,
     backend_name        TEXT NOT NULL DEFAULT '',
     source_vendor       TEXT NOT NULL DEFAULT '',
@@ -132,7 +134,7 @@ CREATE TABLE IF NOT EXISTS ingested_alerts (
     updated_at          REAL NOT NULL,
     created_at          REAL NOT NULL,
     reviewed_at         REAL,
-    UNIQUE(alert_uid, backend_name)
+    UNIQUE(tenant_id, alert_uid, backend_name)
 );
 
 CREATE TABLE IF NOT EXISTS learned_artifacts (

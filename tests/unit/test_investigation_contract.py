@@ -22,6 +22,7 @@ from tacit.agents.providers.base import TokenUsage
 from tacit.api.app import create_app
 from tacit.api.dependencies import get_pipeline_dependencies
 from tacit.backends.base import PublishResult
+from tacit.config import Settings
 from tacit.dependencies import PipelineDependencies
 from tacit.grounding_benchmark import (
     _contract_for_case,
@@ -916,7 +917,7 @@ def test_current_engine_replay_uses_pinned_knowledge_tenant(tmp_path, monkeypatc
     snapshot = _snapshot_for(draft)
     snapshot = snapshot.model_copy(update={"request": snapshot.request.model_copy(update={"tenant_id": "tenant-b"})})
     store.persist_contract_revision(draft, snapshot=snapshot)
-    monkeypatch.setattr("tacit.history.settings.knowledge_tenant_id", "tenant-a")
+    monkeypatch.setattr("tacit.history.settings.knowledge_tenant_id", "default")
     captured: dict[str, str] = {}
 
     class CapturingKnowledgeService:
@@ -951,7 +952,11 @@ def test_current_engine_replay_uses_pinned_knowledge_tenant(tmp_path, monkeypatc
         lambda: CapturingKnowledgeService(),
     )
 
-    replayed = store.replay_contract(investigation_id, mode=ReplayMode.CURRENT_ENGINE)
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.CURRENT_ENGINE,
+        runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+    )
 
     assert captured["tenant_id"] == "tenant-a"
     assert replayed.request.scope.tenant_id == "tenant-a"

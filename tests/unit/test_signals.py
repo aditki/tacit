@@ -1888,9 +1888,37 @@ archetypes:
         signalfx = store.get_ingested_dashboard("shared-dash", backend_name="signalfx")
 
         assert legacy is not None
+        assert legacy["tenant_id"] == "default"
         assert signalfx is not None
         assert legacy["dashboard_title"] == "Legacy Grafana"
         assert signalfx["dashboard_title"] == "SignalFx Dashboard"
+
+    def test_pending_dashboards_are_isolated_by_tenant(self, signal_store):
+        for tenant_id, title in (("tenant-a", "Tenant A"), ("tenant-b", "Tenant B")):
+            signal_store.record_ingested_dashboard(
+                "shared-dashboard",
+                tenant_id=tenant_id,
+                backend_name="grafana",
+                dashboard_title=title,
+            )
+
+        assert (
+            signal_store.get_ingested_dashboard("shared-dashboard", "grafana", tenant_id="tenant-a")["dashboard_title"]
+            == "Tenant A"
+        )
+        assert (
+            signal_store.get_ingested_dashboard("shared-dashboard", "grafana", tenant_id="tenant-b")["dashboard_title"]
+            == "Tenant B"
+        )
+        assert signal_store.approve_ingested_dashboard("shared-dashboard", "grafana", tenant_id="tenant-b")
+        assert (
+            signal_store.get_ingested_dashboard("shared-dashboard", "grafana", tenant_id="tenant-a")["status"]
+            == "pending"
+        )
+        assert (
+            signal_store.get_ingested_dashboard("shared-dashboard", "grafana", tenant_id="tenant-b")["status"]
+            == "approved"
+        )
 
     def test_list_by_status(self, signal_store):
         signal_store.record_ingested_dashboard("d1", status="pending")
