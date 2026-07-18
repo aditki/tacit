@@ -153,6 +153,7 @@ async def replay_investigation(
     request: ReplayRequest | None = None,
     revision: int | None = None,
     store: Any = Depends(get_history_store),
+    deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     replay_request = request or ReplayRequest()
     try:
@@ -161,6 +162,7 @@ async def replay_investigation(
             revision,
             mode=replay_request.mode,
             changes=replay_request.changes,
+            runtime_settings=deps.settings,
         )
     except (history_mod.StaleRevisionError, history_mod.ReplayError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

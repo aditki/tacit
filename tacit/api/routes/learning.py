@@ -96,6 +96,7 @@ async def learn_from_dashboard(
     from tacit.dashboard_ingest import ingest_dashboard
 
     _authorize_signal_approval(request, payload.auto_approve)
+    tenant_id = knowledge_tenant(request)
     try:
         return await _call_ingest_dashboard(
             ingest_dashboard,
@@ -104,7 +105,7 @@ async def learn_from_dashboard(
             auto_approve=payload.auto_approve,
             runtime_settings=getattr(request.app.state, "settings", settings),
             store=store,
-            tenant_id=knowledge_tenant(request) if payload.auto_approve else None,
+            tenant_id=tenant_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -133,6 +134,7 @@ async def learn_from_alert(
     from tacit.config import settings
 
     _authorize_signal_approval(request, payload.auto_approve and not payload.dry_run)
+    tenant_id = None if payload.dry_run else knowledge_tenant(request)
     try:
         return await _call_ingest_alert(
             ingest_alert,
@@ -142,7 +144,7 @@ async def learn_from_alert(
             dry_run=payload.dry_run,
             runtime_settings=getattr(request.app.state, "settings", settings),
             store=store,
-            tenant_id=(knowledge_tenant(request) if payload.auto_approve and not payload.dry_run else None),
+            tenant_id=tenant_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -249,6 +251,7 @@ async def learn_from_dashboard_json(
     from tacit.dashboard_uploads import parse_uploaded_dashboard
 
     _authorize_signal_approval(request, payload.auto_approve)
+    tenant_id = knowledge_tenant(request)
     try:
         features = parse_uploaded_dashboard(
             payload.dashboard,
@@ -262,7 +265,7 @@ async def learn_from_dashboard_json(
             auto_approve=payload.auto_approve,
             runtime_settings=getattr(request.app.state, "settings", settings),
             store=store,
-            tenant_id=knowledge_tenant(request) if payload.auto_approve else None,
+            tenant_id=tenant_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -296,6 +299,7 @@ async def learn_backend(
     from tacit.dashboard_ingest import learn_backend_dashboards
 
     _authorize_signal_approval(request, auto_approve)
+    tenant_id = knowledge_tenant(request)
     try:
         return await _call_learn_backend_dashboards(
             learn_backend_dashboards,
@@ -304,7 +308,7 @@ async def learn_backend(
             limit=limit,
             runtime_settings=getattr(request.app.state, "settings", settings),
             store=store,
-            tenant_id=knowledge_tenant(request) if auto_approve else None,
+            tenant_id=tenant_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -339,6 +343,7 @@ async def learn_backend_alert_rules(
     from tacit.config import settings
 
     _authorize_signal_approval(request, auto_approve and not dry_run)
+    tenant_id = None if dry_run else knowledge_tenant(request)
     try:
         return await _call_learn_backend_alerts(
             learn_backend_alerts,
@@ -348,7 +353,7 @@ async def learn_backend_alert_rules(
             limit=limit,
             runtime_settings=getattr(request.app.state, "settings", settings),
             store=store,
-            tenant_id=knowledge_tenant(request) if auto_approve and not dry_run else None,
+            tenant_id=tenant_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -367,6 +372,7 @@ async def learn_backend_alert_rules(
     response_description="Ingested dashboards with extracted features and status",
 )
 async def list_ingested_dashboards(
+    request: Request,
     status: str | None = None,
     limit: int = 50,
     store: Any = Depends(get_signal_store),
@@ -374,7 +380,11 @@ async def list_ingested_dashboards(
     """List dashboards that have been ingested for learning."""
     from tacit.dashboard_ingest import build_learning_impact_report, build_signal_quality_report
 
-    dashboards = store.list_ingested_dashboards(status=status, limit=limit)
+    dashboards = store.list_ingested_dashboards(
+        status=status,
+        limit=limit,
+        tenant_id=knowledge_tenant(request),
+    )
     for dashboard in dashboards:
         metrics = dashboard.get("metrics_found", [])
         signals = dashboard.get("signals_inferred", [])
@@ -395,6 +405,7 @@ async def list_ingested_dashboards(
     response_description="Ingested alerts with extracted features and status",
 )
 async def list_ingested_alerts(
+    request: Request,
     status: str | None = None,
     limit: int = 50,
     store: Any = Depends(get_signal_store),
@@ -402,7 +413,11 @@ async def list_ingested_alerts(
     """List alerts that have been ingested for learning."""
     from tacit.dashboard_ingest import build_learning_impact_report, build_signal_quality_report
 
-    alerts = store.list_ingested_alerts(status=status, limit=limit)
+    alerts = store.list_ingested_alerts(
+        status=status,
+        limit=limit,
+        tenant_id=knowledge_tenant(request),
+    )
     for alert in alerts:
         metrics = alert.get("metrics_found", [])
         signals = alert.get("signals_inferred", [])
@@ -535,6 +550,7 @@ async def approve_ingested_dashboard(
     response_description="Rejection status; no signal mappings are created",
 )
 async def reject_ingested_dashboard(
+    request: Request,
     dashboard_uid: str,
     backend: str | None = None,
     store: Any = Depends(get_signal_store),
@@ -547,6 +563,7 @@ async def reject_ingested_dashboard(
             dashboard_uid=dashboard_uid,
             backend_name=backend,
             store=store,
+            tenant_id=knowledge_tenant(request),
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")
@@ -561,18 +578,20 @@ async def reject_ingested_dashboard(
     response_description="Ignored status; no signal mappings or negative examples are created",
 )
 async def ignore_ingested_dashboard(
+    request: Request,
     dashboard_uid: str,
     backend: str | None = None,
     store: Any = Depends(get_signal_store),
 ):
     """Ignore a pending ingested dashboard without creating mappings or negative examples."""
-    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend)
+    tenant_id = knowledge_tenant(request)
+    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend, tenant_id=tenant_id)
     if ingested is None:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")
     if ingested["status"] != "pending":
         return {"message": f"Dashboard already {ingested['status']}"}
 
-    if not store.ignore_ingested_dashboard(dashboard_uid, backend_name=backend):
+    if not store.ignore_ingested_dashboard(dashboard_uid, backend_name=backend, tenant_id=tenant_id):
         raise HTTPException(status_code=409, detail="Dashboard is no longer pending")
 
     return {

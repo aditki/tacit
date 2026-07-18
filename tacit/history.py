@@ -22,7 +22,7 @@ from typing import Any
 
 import structlog
 
-from tacit.config import settings
+from tacit.config import Settings, settings
 from tacit.investigation_contract import (
     CorrectionReference,
     DecisionLogEntry,
@@ -870,6 +870,7 @@ class InvestigationStore:
         *,
         mode: ReplayMode = ReplayMode.EXACT,
         changes: CounterfactualChanges | None = None,
+        runtime_settings: Settings | None = None,
     ) -> InvestigationContract | None:
         """Rebuild a contract from captured inputs without external refetch."""
         contract = self.get_contract(investigation_id, revision)
@@ -928,7 +929,8 @@ class InvestigationStore:
                 from tacit.knowledge.service import get_knowledge_service
 
                 knowledge_service = get_knowledge_service()
-                configured_tenant = str(getattr(settings, "knowledge_tenant_id", "default") or "default")
+                active_settings = runtime_settings or settings
+                configured_tenant = str(getattr(active_settings, "knowledge_tenant_id", "default") or "default")
                 if configured_tenant == "*" and not snapshot.request.tenant_id:
                     raise ReplayError("tenant_id is required for current-engine replay when knowledge_tenant_id is '*'")
                 tenant_id = snapshot.request.tenant_id if configured_tenant == "*" else configured_tenant

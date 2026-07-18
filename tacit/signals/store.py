@@ -692,6 +692,7 @@ class SignalStore:
         self,
         dashboard_uid: str,
         *,
+        tenant_id: str = "default",
         backend_name: str = "",
         dashboard_title: str = "",
         dashboard_tags: list[str] | None = None,
@@ -713,14 +714,15 @@ class SignalStore:
         with self._conn() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO ingested_dashboards
-                   (dashboard_uid, backend_name, dashboard_title, dashboard_tags,
+                   (tenant_id, dashboard_uid, backend_name, dashboard_title, dashboard_tags,
                     metrics_found, panel_count, row_groups,
                     metric_cooccurrence, aggregation_patterns,
                     query_transformations, panel_titles,
                     alert_links, drilldown_links,
                     status, signals_inferred, archetype_generated, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
+                    tenant_id,
                     dashboard_uid,
                     backend_name,
                     dashboard_title,
@@ -801,6 +803,7 @@ class SignalStore:
         self,
         alert_uid: str,
         *,
+        tenant_id: str = "default",
         backend_name: str = "",
         source_vendor: str = "",
         source_instance: str = "",
@@ -832,8 +835,8 @@ class SignalStore:
         with self._conn() as conn:
             existing = conn.execute(
                 """SELECT id, fingerprint, first_seen_at, status, stale FROM ingested_alerts
-                   WHERE alert_uid = ? AND backend_name = ?""",
-                (alert_uid, backend_name),
+                   WHERE tenant_id = ? AND alert_uid = ? AND backend_name = ?""",
+                (tenant_id, alert_uid, backend_name),
             ).fetchone()
             first_seen = existing["first_seen_at"] if existing and existing["first_seen_at"] else now
             change_state = "created"
@@ -841,15 +844,15 @@ class SignalStore:
                 change_state = "skipped" if fingerprint and existing["fingerprint"] == fingerprint else "updated"
             conn.execute(
                 """INSERT INTO ingested_alerts
-                   (alert_uid, backend_name, source_vendor, source_instance,
+                   (tenant_id, alert_uid, backend_name, source_vendor, source_instance,
                     external_id, fingerprint, alert_title, alert_tags,
                     condition, severity, enabled, labels, annotations,
                     metrics_found, query_transformations, service_hints,
                     dashboard_uid, panel_title, source_url, provenance_url,
                     confidence, stale, missing_since, status, signals_inferred, first_seen_at,
                     last_seen_at, updated_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(alert_uid, backend_name) DO UPDATE SET
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(tenant_id, alert_uid, backend_name) DO UPDATE SET
                        source_vendor = excluded.source_vendor,
                        source_instance = excluded.source_instance,
                        external_id = excluded.external_id,
@@ -886,6 +889,7 @@ class SignalStore:
                        END,
                        created_at = ingested_alerts.created_at""",
                 (
+                    tenant_id,
                     alert_uid,
                     backend_name,
                     source_vendor or backend_name,
@@ -1431,6 +1435,7 @@ class SignalStore:
     def mark_missing_alerts_stale(
         self,
         *,
+        tenant_id: str = "default",
         backend_name: str,
         seen_alert_uids: set[str],
     ) -> int:
@@ -1439,8 +1444,8 @@ class SignalStore:
         with self._conn() as conn:
             rows = conn.execute(
                 """SELECT alert_uid FROM ingested_alerts
-                   WHERE backend_name = ? AND stale = 0""",
-                (backend_name,),
+                   WHERE tenant_id = ? AND backend_name = ? AND stale = 0""",
+                (tenant_id, backend_name),
             ).fetchall()
             missing = [row["alert_uid"] for row in rows if row["alert_uid"] not in seen_alert_uids]
             if not missing:
@@ -1452,8 +1457,8 @@ class SignalStore:
                         missing_since = COALESCE(missing_since, ?),
                         status = 'stale',
                         updated_at = ?
-                    WHERE backend_name = ? AND alert_uid IN ({placeholders})""",
-                (now, now, backend_name, *missing),
+                    WHERE tenant_id = ? AND backend_name = ? AND alert_uid IN ({placeholders})""",
+                (now, now, tenant_id, backend_name, *missing),
             )
             if self._learning_index_available():
                 try:
@@ -1716,15 +1721,21 @@ class SignalStore:
             ).fetchone()
             return row is not None
 
-    def get_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> dict[str, Any] | None:
+    def get_ingested_dashboard(
+        self,
+        dashboard_uid: str,
+        backend_name: str | None = None,
+        *,
+        tenant_id: str = "default",
+    ) -> dict[str, Any] | None:
         """Get ingested dashboard record."""
         with self._conn() as conn:
             if backend_name is None:
                 rows = conn.execute(
                     """SELECT * FROM ingested_dashboards
-                       WHERE dashboard_uid = ?
+                       WHERE tenant_id = ? AND dashboard_uid = ?
                        ORDER BY created_at DESC LIMIT 2""",
-                    (dashboard_uid,),
+                    (tenant_id, dashboard_uid),
                 ).fetchall()
                 if len(rows) != 1:
                     return None
@@ -1732,54 +1743,72 @@ class SignalStore:
             else:
                 row = conn.execute(
                     """SELECT * FROM ingested_dashboards
-                       WHERE dashboard_uid = ? AND backend_name = ?""",
-                    (dashboard_uid, backend_name),
+                       WHERE tenant_id = ? AND dashboard_uid = ? AND backend_name = ?""",
+                    (tenant_id, dashboard_uid, backend_name),
                 ).fetchone()
         if row is None:
             return None
         return _deserialize_ingested(row)
 
-    def list_ingested_dashboards(self, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    def list_ingested_dashboards(
+        self,
+        status: str | None = None,
+        limit: int = 50,
+        *,
+        tenant_id: str = "default",
+    ) -> list[dict[str, Any]]:
         """List ingested dashboards, optionally filtered by status."""
         with self._conn() as conn:
             if status:
                 rows = conn.execute(
                     """SELECT * FROM ingested_dashboards
-                       WHERE status = ? ORDER BY created_at DESC LIMIT ?""",
-                    (status, limit),
+                       WHERE tenant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?""",
+                    (tenant_id, status, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     """SELECT * FROM ingested_dashboards
-                       ORDER BY created_at DESC LIMIT ?""",
-                    (limit,),
+                       WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?""",
+                    (tenant_id, limit),
                 ).fetchall()
         return [_deserialize_ingested(r) for r in rows]
 
-    def list_ingested_alerts(self, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    def list_ingested_alerts(
+        self,
+        status: str | None = None,
+        limit: int = 50,
+        *,
+        tenant_id: str = "default",
+    ) -> list[dict[str, Any]]:
         """List ingested alerts, optionally filtered by status."""
         with self._conn() as conn:
             if status:
                 rows = conn.execute(
                     """SELECT * FROM ingested_alerts
-                       WHERE status = ? ORDER BY created_at DESC LIMIT ?""",
-                    (status, limit),
+                       WHERE tenant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?""",
+                    (tenant_id, status, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     """SELECT * FROM ingested_alerts
-                       ORDER BY created_at DESC LIMIT ?""",
-                    (limit,),
+                       WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?""",
+                    (tenant_id, limit),
                 ).fetchall()
         return [_deserialize_ingested_alert(r) for r in rows]
 
-    def get_ingested_alert(self, alert_uid: str, backend_name: str = "") -> dict[str, Any] | None:
+    def get_ingested_alert(
+        self,
+        alert_uid: str,
+        backend_name: str = "",
+        *,
+        tenant_id: str = "default",
+    ) -> dict[str, Any] | None:
         """Return one ingested alert row by backend-scoped alert UID."""
         with self._conn() as conn:
             row = conn.execute(
                 """SELECT * FROM ingested_alerts
-                   WHERE alert_uid = ? AND backend_name = ?""",
-                (alert_uid, backend_name),
+                   WHERE tenant_id = ? AND alert_uid = ? AND backend_name = ?""",
+                (tenant_id, alert_uid, backend_name),
             ).fetchone()
         if row is None:
             return None
@@ -1791,12 +1820,14 @@ class SignalStore:
         status: str,
         backend_name: str | None = None,
         activated_pairs: set[tuple[str, str]] | None = None,
+        *,
+        tenant_id: str = "default",
     ) -> bool:
         """Move a pending ingested dashboard to a reviewed status."""
         if status not in {"approved", "rejected", "ignored"}:
             raise ValueError(f"unsupported ingested dashboard status: {status}")
 
-        ingested = self.get_ingested_dashboard(dashboard_uid, backend_name)
+        ingested = self.get_ingested_dashboard(dashboard_uid, backend_name, tenant_id=tenant_id)
         if ingested is None:
             return False
 
@@ -1827,6 +1858,8 @@ class SignalStore:
         dashboard_uid: str,
         backend_name: str | None = None,
         activated_pairs: set[tuple[str, str]] | None = None,
+        *,
+        tenant_id: str = "default",
     ) -> bool:
         """Approve a pending ingested dashboard (activates its signal mappings)."""
         return self.update_ingested_dashboard_status(
@@ -1834,15 +1867,20 @@ class SignalStore:
             "approved",
             backend_name,
             activated_pairs=activated_pairs,
+            tenant_id=tenant_id,
         )
 
-    def reject_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> bool:
+    def reject_ingested_dashboard(
+        self, dashboard_uid: str, backend_name: str | None = None, *, tenant_id: str = "default"
+    ) -> bool:
         """Reject a pending ingested dashboard as unsuitable for learning."""
-        return self.update_ingested_dashboard_status(dashboard_uid, "rejected", backend_name)
+        return self.update_ingested_dashboard_status(dashboard_uid, "rejected", backend_name, tenant_id=tenant_id)
 
-    def ignore_ingested_dashboard(self, dashboard_uid: str, backend_name: str | None = None) -> bool:
+    def ignore_ingested_dashboard(
+        self, dashboard_uid: str, backend_name: str | None = None, *, tenant_id: str = "default"
+    ) -> bool:
         """Ignore a pending ingested dashboard without treating it as negative signal data."""
-        return self.update_ingested_dashboard_status(dashboard_uid, "ignored", backend_name)
+        return self.update_ingested_dashboard_status(dashboard_uid, "ignored", backend_name, tenant_id=tenant_id)
 
     # ── Stats ────────────────────────────────────────────────────────────
 
