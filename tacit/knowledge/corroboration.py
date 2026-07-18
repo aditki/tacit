@@ -14,6 +14,7 @@ from tacit.knowledge.enums import (
 )
 from tacit.knowledge.models import (
     CorroborationSummary,
+    KnowledgeCandidate,
     KnowledgeConflict,
     KnowledgeEvidenceReference,
     KnowledgeScope,
@@ -27,29 +28,14 @@ class CorroborationService:
         self.repository = repository
 
     def analyze(self, tenant_id: str, proposition_key: str) -> tuple[CorroborationSummary, str]:
-        candidates = [
-            candidate
-            for candidate in self.repository.candidates_for_proposition(tenant_id, proposition_key)
-            if candidate.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
-        ]
+        candidates = self.reviewed_candidates(tenant_id, proposition_key)
         evidence = [
             item
             for candidate in candidates
             for item in candidate.evidence.items
             if item.evidence_role == EvidenceRole.SUPPORTING
         ]
-        lineage_groups: dict[str, KnowledgeEvidenceReference] = {}
-        for item in evidence:
-            if item.lineage_kind in {
-                LineageKind.COPIED_FROM,
-                LineageKind.GENERATED_FROM,
-                LineageKind.SAME_VENDOR_EXPORT,
-                LineageKind.SAME_SOURCE_REVISION,
-            }:
-                continue
-            group = item.lineage_group or item.evidence_ref
-            lineage_groups.setdefault(group, item)
-        independent = list(lineage_groups.values())
+        independent = [item for _, item in self._independent_evidence(candidates)]
         families = sorted({item.source_family for item in independent}, key=lambda family: family.value)
         live = any(item.source_family == SourceFamily.LIVE_OBSERVATION for item in independent)
         if live:
@@ -82,6 +68,38 @@ class CorroborationService:
             payload=summary.model_dump(mode="json"),
         )
         return summary, snapshot_id
+
+    def reviewed_candidates(self, tenant_id: str, proposition_key: str) -> list[KnowledgeCandidate]:
+        return [
+            candidate
+            for candidate in self.repository.candidates_for_proposition(tenant_id, proposition_key)
+            if candidate.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
+        ]
+
+    def contributing_candidates(self, tenant_id: str, proposition_key: str) -> list[KnowledgeCandidate]:
+        candidates = self.reviewed_candidates(tenant_id, proposition_key)
+        contributing_ids = {
+            candidate.id for candidate, _ in self._independent_evidence(candidates)
+        }
+        return [candidate for candidate in candidates if candidate.id in contributing_ids]
+
+    @staticmethod
+    def _independent_evidence(
+        candidates: list[KnowledgeCandidate],
+    ) -> list[tuple[KnowledgeCandidate, KnowledgeEvidenceReference]]:
+        lineage_groups: dict[str, tuple[KnowledgeCandidate, KnowledgeEvidenceReference]] = {}
+        for candidate in candidates:
+            for item in candidate.evidence.items:
+                if item.evidence_role != EvidenceRole.SUPPORTING or item.lineage_kind in {
+                    LineageKind.COPIED_FROM,
+                    LineageKind.GENERATED_FROM,
+                    LineageKind.SAME_VENDOR_EXPORT,
+                    LineageKind.SAME_SOURCE_REVISION,
+                }:
+                    continue
+                group = item.lineage_group or item.evidence_ref
+                lineage_groups.setdefault(group, (candidate, item))
+        return list(lineage_groups.values())
 
 
 class ConflictDetectionService:
@@ -141,7 +159,13 @@ class ConflictDetectionService:
                 resolution_reason="" if scope_compatible else scope_reason,
             )
             existing = existing_conflicts.get(conflict.id)
-            if existing and existing.resolution_status in {
+            reopened = bool(
+                existing
+                and existing.resolution_status == ConflictResolutionStatus.RESOLVED_BY_REVIEW
+                and existing.resolution_reason == "counter_proposition_rejected"
+                and conflict.resolution_status == ConflictResolutionStatus.UNRESOLVED
+            )
+            if existing and not reopened and existing.resolution_status in {
                 ConflictResolutionStatus.RESOLVED_BY_AUTHORITY,
                 ConflictResolutionStatus.RESOLVED_BY_REVIEW,
                 ConflictResolutionStatus.SUPERSEDED,
@@ -149,10 +173,13 @@ class ConflictDetectionService:
                 conflict = existing
             self.repository.save_conflict(conflict)
             self.repository.append_event(
-                "conflict_created",
+                "conflict_reopened" if reopened else "conflict_created",
                 tenant_id=tenant_id,
                 subject_ref=conflict.id,
-                dimensions={"knowledge_kind": current["kind"], "reason_code": kind.value},
+                dimensions={
+                    "knowledge_kind": current["kind"],
+                    "reason_code": "new_candidate_after_rejection" if reopened else kind.value,
+                },
                 payload=conflict.model_dump(mode="json"),
             )
             conflicts.append(conflict)

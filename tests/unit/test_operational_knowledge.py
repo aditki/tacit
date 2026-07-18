@@ -162,6 +162,11 @@ def test_resolution_normalization_corroboration_and_promotion(tmp_path: Path):
     assert revision.policy_id == "dependency-promotion-v1"
     assert revision.policy_version == "1"
     assert revision.state.eligibility == KnowledgeEligibility.CONTEXTUAL_ONLY
+    assert set(revision.promoted_from_candidate_refs) == {item.id for item in candidates}
+    assert set(revision.provenance_refs) == {
+        "provenance:runbook",
+        "provenance:dashboard",
+    }
     assert service.repository.get_revision(revision.knowledge_id, 1) == revision
 
     snapshot_a, usage_a = service.create_snapshot(
@@ -458,6 +463,44 @@ def test_rejecting_last_candidate_resolves_existing_conflicts(tmp_path: Path):
     resolved = service.repository.list_conflicts("default")
     assert resolved[0].resolution_status == ConflictResolutionStatus.RESOLVED_BY_REVIEW
     assert resolved[0].resolution_reason == "counter_proposition_rejected"
+
+
+def test_new_candidate_reopens_conflict_resolved_by_rejection(tmp_path: Path):
+    service = _service(tmp_path)
+    positive = _dependency(
+        service,
+        payload_ref="accepted-positive",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="positive",
+    )
+    rejected = _dependency(
+        service,
+        payload_ref="rejected-negative",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="negative",
+        predicate="does_not_depend_on",
+    )
+    service.conflicts.analyze("default", positive.proposition.proposition_key)
+    service.review_candidate(rejected.id, approved=False, reviewer="operator")
+    assert service.repository.list_conflicts("default", unresolved_only=True) == []
+    replacement = _dependency(
+        service,
+        payload_ref="replacement-negative",
+        family=SourceFamily.INCIDENT,
+        lineage_group="replacement-negative",
+        predicate="does_not_depend_on",
+    )
+
+    conflicts = service.conflicts.analyze("default", replacement.proposition.proposition_key)
+
+    assert len(conflicts) == 1
+    assert conflicts[0].resolution_status == ConflictResolutionStatus.UNRESOLVED
+    assert conflicts[0].resolution_reason == ""
+    assert service.repository.list_conflicts("default", unresolved_only=True) == conflicts
+    assert any(
+        event["event_type"] == "conflict_reopened"
+        for event in service.repository.list_events("default")
+    )
 
 
 def test_conflict_scope_analysis_includes_services(tmp_path: Path):
@@ -767,6 +810,37 @@ def test_signal_mapping_usage_does_not_claim_unapplied_score_delta(tmp_path: Pat
     assert usage[0].score_delta == 0
 
 
+def test_negative_dependency_does_not_contribute_to_ranking(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref="negative-dependency",
+        family=SourceFamily.HUMAN_CORRECTION,
+        lineage_group="negative-dependency",
+        predicate="does_not_depend_on",
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, authoritative_source=True)
+    assert revision is not None
+    _, usage = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        )
+    )
+    applied = next(item for item in usage if item.knowledge_ref == revision.knowledge_id)
+
+    ranking = service.apply_to_ranking(
+        CulpritRanking(abstained=True, abstention_reason="no_rankable_candidates"),
+        [applied.model_copy(update={"score_delta": 0.08})],
+    )
+
+    assert applied.used_for == ["candidate_exclusion"]
+    assert applied.score_delta == 0
+    assert ranking.candidates == []
+    assert ranking.abstained is True
+
+
 def test_migrated_ownership_scope_uses_owned_service(tmp_path: Path):
     service = _service(tmp_path)
     service.register_entity(
@@ -836,6 +910,35 @@ def test_correction_creates_candidate_revision_and_impact(tmp_path: Path):
     assert service.repository.get_revision(original.knowledge_id).state.lifecycle_status == LifecycleStatus.SUPERSEDED
     assert service.repository.get_revision(original.knowledge_id, 1) == original
     assert service.impact(original.knowledge_id).recommended_action == "replay_current"
+
+
+def test_authoritative_signal_correction_promotes(tmp_path: Path):
+    service = _service(tmp_path)
+    correction, _ = service.create_correction(
+        investigation_id="inv_signal_correction",
+        investigation_revision=1,
+        correction_type="signal_meaning",
+        proposed={
+            "subject_ref": "concept:checkout-latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:http_request_duration_seconds",
+            "concept_ref": "signal:latency",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        explanation="This is the operator-approved latency signal.",
+        created_by="operator",
+    )
+
+    reviewed, revision = service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="reviewer",
+        authoritative=True,
+    )
+
+    assert reviewed.review_state == ReviewState.APPROVED
+    assert revision is not None
+    assert revision.proposition.kind == KnowledgeKind.SIGNAL_MAPPING
 
 
 def test_correction_without_target_keeps_conflict_unresolved(tmp_path: Path):
@@ -1032,9 +1135,7 @@ def test_approved_legacy_rows_enter_promotion_evaluation(tmp_path: Path):
     )
     first = service.repository.get_candidate(first_ids[0])
     assert first is not None
-    assert service.repository.find_knowledge_by_proposition(
-        "default", first.proposition.proposition_key
-    ) is None
+    assert service.repository.find_knowledge_by_proposition("default", first.proposition.proposition_key) is None
 
     migrate_artifact_extractions(
         artifact_id="artifact_dashboard",
@@ -1043,9 +1144,7 @@ def test_approved_legacy_rows_enter_promotion_evaluation(tmp_path: Path):
         service=service,
     )
 
-    promoted = service.repository.find_knowledge_by_proposition(
-        "default", first.proposition.proposition_key
-    )
+    promoted = service.repository.find_knowledge_by_proposition("default", first.proposition.proposition_key)
     assert promoted is not None
 
 

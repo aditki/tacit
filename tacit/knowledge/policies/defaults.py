@@ -78,7 +78,11 @@ class ConservativePromotionPolicy:
         elif self.knowledge_kind == KnowledgeKind.SIGNAL_MAPPING:
             if not candidate.proposition.concept_ref and not candidate.proposition.object_ref:
                 return ["signal_unresolved"]
-            if not context.live_verified and corroboration.independent_source_count < 2:
+            if (
+                not context.authoritative_source
+                and not context.live_verified
+                and corroboration.independent_source_count < 2
+            ):
                 return ["live_coverage_or_repeated_resolution_required"]
         elif self.knowledge_kind == KnowledgeKind.EVIDENCE_REQUIREMENT:
             if not candidate.proposition.concept_ref and not context.authoritative_source:
