@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,7 @@ from tacit.knowledge.models import (
 from tacit.knowledge.normalization import normalize_service_ref
 from tacit.knowledge.repository import KnowledgeRepository
 from tacit.knowledge.service import KnowledgeService
-from tacit.models.schemas import CulpritRanking, EvidenceObservation, EvidenceObservationOutcome
+from tacit.models.schemas import CulpritCandidate, CulpritRanking, EvidenceObservation, EvidenceObservationOutcome
 from tacit.operational_learning_benchmark import (
     load_operational_learning_corpus,
     run_operational_learning_benchmark,
@@ -807,7 +808,7 @@ def test_signal_mapping_usage_does_not_claim_unapplied_score_delta(tmp_path: Pat
     assert usage[0].score_delta == 0
 
 
-def test_negative_dependency_does_not_contribute_to_ranking(tmp_path: Path):
+def test_negative_dependency_excludes_matching_ranked_candidate(tmp_path: Path):
     service = _service(tmp_path)
     candidate = _dependency(
         service,
@@ -828,14 +829,66 @@ def test_negative_dependency_does_not_contribute_to_ranking(tmp_path: Path):
     applied = next(item for item in usage if item.knowledge_ref == revision.knowledge_id)
 
     ranking = service.apply_to_ranking(
-        CulpritRanking(abstained=True, abstention_reason="no_rankable_candidates"),
-        [applied.model_copy(update={"score_delta": 0.08})],
+        CulpritRanking(
+            abstained=False,
+            candidates=[
+                CulpritCandidate(
+                    rank=1,
+                    suspect="redis-session",
+                    suspect_type="datastore",
+                    score=0.72,
+                )
+            ],
+        ),
+        [applied],
     )
 
     assert applied.used_for == ["candidate_exclusion"]
     assert applied.score_delta == 0
     assert ranking.candidates == []
     assert ranking.abstained is True
+    assert ranking.abstention_reason == "operational_knowledge_excluded_ranked_candidates"
+
+
+def test_scope_normalizes_naive_validity_datetimes_to_utc():
+    scope = KnowledgeScope.model_validate_json(
+        '{"valid_from":"2000-01-01T00:00:00","valid_until":"2999-01-01T00:00:00"}'
+    )
+
+    assert scope.valid_from is not None
+    assert scope.valid_until is not None
+    assert scope.valid_from.tzinfo == UTC
+    assert scope.valid_until.tzinfo == UTC
+    assert scope.applies_to(KnowledgeScope()) is True
+
+
+def test_entity_resolution_accepts_typed_entity_refs(tmp_path: Path):
+    service = _service(tmp_path)
+    service.register_entity(
+        Entity(
+            id="entity:team:payments",
+            kind=EntityKind.TEAM,
+            canonical_name="payments",
+            scope=KnowledgeScope(),
+            provenance_refs=["catalog:team"],
+        )
+    )
+
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.OWNERSHIP,
+        payload_ref="typed-entity-refs",
+        typed_payload={},
+        proposition={
+            "subject_ref": "service:checkout",
+            "predicate": "owned_by",
+            "object_ref": "team:payments",
+        },
+        provenance_refs=["operator:correction"],
+    )
+
+    assert candidate.entity_resolution.status.value == "resolved"
+    assert candidate.proposition.subject_ref == "entity:service:checkout"
+    assert candidate.proposition.object_ref == "entity:team:payments"
 
 
 def test_migrated_ownership_scope_uses_owned_service(tmp_path: Path):
@@ -1264,6 +1317,42 @@ def test_api_queue_tenant_and_permissions(tmp_path: Path, monkeypatch: pytest.Mo
         ).status_code
         == 403
     )
+
+
+def test_review_queue_prioritizes_before_applying_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path)
+    high_priority = _dependency(
+        service,
+        payload_ref="older-security-review",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="older-security-review",
+    )
+    high_priority = high_priority.model_copy(update={"security_flags": ["possible_prompt_injection"]})
+    service.repository.save_candidate(high_priority)
+    newer_low_priority = _dependency(
+        service,
+        payload_ref="newer-routine-review",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="newer-routine-review",
+    )
+    with service.repository._conn() as conn:
+        conn.execute("UPDATE knowledge_candidates SET created_at=1 WHERE id=?", (high_priority.id,))
+        conn.execute("UPDATE knowledge_candidates SET created_at=2 WHERE id=?", (newer_low_priority.id,))
+
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    app = create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read"))
+
+    response = TestClient(app).get("/api/v1/knowledge/review-queue?limit=1")
+
+    assert response.status_code == 200
+    assert [candidate["id"] for candidate in response.json()["candidates"]] == [high_priority.id]
+    assert response.json()["candidates"][0]["review_priority_reasons"] == [
+        "security_review",
+        "investigation_impact",
+    ]
 
 
 def test_api_aliases_use_resolver_normalization(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

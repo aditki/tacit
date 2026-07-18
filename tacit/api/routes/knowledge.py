@@ -119,7 +119,7 @@ async def knowledge_status(request: Request):
 async def review_queue(request: Request, limit: int = Query(default=100, ge=1, le=500)):
     tenant_id = _tenant(request)
     repository = get_knowledge_repository()
-    candidates = repository.list_candidates(tenant_id, review_state=ReviewState.CANDIDATE.value, limit=limit)
+    candidates = repository.list_candidates(tenant_id, review_state=ReviewState.CANDIDATE.value, limit=None)
     conflicts = repository.list_conflicts(tenant_id, unresolved_only=True)
     unresolved_keys = {
         proposition_ref
@@ -134,7 +134,7 @@ async def review_queue(request: Request, limit: int = Query(default=100, ge=1, l
     ]
     return {
         "tenant_id": tenant_id,
-        "candidates": _prioritize_candidates(candidates, unresolved_keys),
+        "candidates": _prioritize_candidates(candidates, unresolved_keys)[:limit],
         "unresolved_conflicts": _dump(conflicts),
         "attention_items": attention_items,
     }

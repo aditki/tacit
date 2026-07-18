@@ -478,7 +478,7 @@ class KnowledgeRepository:
         *,
         kind: str | None = None,
         review_state: str | None = None,
-        limit: int = 200,
+        limit: int | None = 200,
     ) -> list[KnowledgeCandidate]:
         clauses = ["tenant_id=?"]
         params: list[Any] = [tenant_id]
@@ -488,11 +488,14 @@ class KnowledgeRepository:
         if review_state:
             clauses.append("review_state=?")
             params.append(review_state)
-        params.append(limit)
+        limit_clause = ""
+        if limit is not None:
+            params.append(limit)
+            limit_clause = " LIMIT ?"
         with self._conn() as conn:
             rows = conn.execute(
                 f"SELECT candidate_json FROM knowledge_candidates WHERE {' AND '.join(clauses)} "
-                "ORDER BY created_at DESC LIMIT ?",
+                f"ORDER BY created_at DESC{limit_clause}",
                 params,
             ).fetchall()
         return [KnowledgeCandidate.model_validate_json(row["candidate_json"]) for row in rows]

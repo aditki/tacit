@@ -456,22 +456,37 @@ class KnowledgeService:
         from tacit.models.schemas import CulpritCandidate
 
         candidates = list(ranking.candidates)
-        by_ref = {f"{candidate.suspect_type}:{candidate.suspect}": candidate for candidate in candidates}
+        original_candidate_count = len(candidates)
+        applicable: list[tuple[KnowledgeUsage, KnowledgeRevision]] = []
         for item in usage:
-            if item.disposition != KnowledgeUsageDisposition.APPLIED or item.score_delta <= 0:
+            if item.disposition != KnowledgeUsageDisposition.APPLIED:
                 continue
             revision = self.repository.get_revision(
                 item.knowledge_ref,
                 item.knowledge_revision,
                 tenant_id=item.tenant_id,
             )
-            if (
-                revision is None
-                or revision.proposition.kind != KnowledgeKind.DEPENDENCY
-                or revision.proposition.predicate == Predicate.DOES_NOT_DEPEND_ON
-            ):
-                continue
+            if revision is not None and revision.proposition.kind == KnowledgeKind.DEPENDENCY:
+                applicable.append((item, revision))
+
+        excluded_refs = {
+            self._candidate_ref(revision.proposition.object_ref)
+            for _, revision in applicable
+            if revision.proposition.predicate == Predicate.DOES_NOT_DEPEND_ON
+        }
+        candidates = [
+            candidate
+            for candidate in candidates
+            if f"{candidate.suspect_type}:{candidate.suspect}" not in excluded_refs
+        ]
+        excluded_ranked_candidate = len(candidates) < original_candidate_count
+        by_ref = {f"{candidate.suspect_type}:{candidate.suspect}": candidate for candidate in candidates}
+        for item, revision in applicable:
             candidate_ref = self._candidate_ref(revision.proposition.object_ref)
+            if candidate_ref in excluded_refs:
+                continue
+            if item.score_delta <= 0:
+                continue
             reason = (
                 f"Operational Knowledge {revision.knowledge_id} revision {revision.revision} "
                 "provides scoped dependency context."
@@ -502,6 +517,13 @@ class KnowledgeService:
         update: dict[str, Any] = {"candidates": candidates}
         if candidates and ranking.abstained:
             update.update({"abstained": False, "abstention_reason": ""})
+        elif excluded_ranked_candidate and not candidates and not ranking.abstained:
+            update.update(
+                {
+                    "abstained": True,
+                    "abstention_reason": "operational_knowledge_excluded_ranked_candidates",
+                }
+            )
         return ranking.model_copy(update=update)
 
     def reconcile_live_observations(self, usage: list[KnowledgeUsage], observations) -> list[KnowledgeUsage]:
