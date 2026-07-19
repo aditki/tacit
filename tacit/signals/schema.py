@@ -139,6 +139,7 @@ CREATE TABLE IF NOT EXISTS ingested_alerts (
 
 CREATE TABLE IF NOT EXISTS learned_artifacts (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
     artifact_id         TEXT NOT NULL,
     artifact_type       TEXT NOT NULL,
     source_vendor       TEXT NOT NULL DEFAULT '',
@@ -154,11 +155,12 @@ CREATE TABLE IF NOT EXISTS learned_artifacts (
     last_seen_at        REAL NOT NULL,
     updated_at          REAL NOT NULL,
     created_at          REAL NOT NULL,
-    UNIQUE(artifact_id)
+    UNIQUE(tenant_id, artifact_id)
 );
 
 CREATE TABLE IF NOT EXISTS evidence_requirements (
-    id                  TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
+    id                  TEXT NOT NULL,
     artifact_id         TEXT NOT NULL,
     subject             TEXT NOT NULL DEFAULT '',
     evidence_kind       TEXT NOT NULL DEFAULT '',
@@ -173,11 +175,13 @@ CREATE TABLE IF NOT EXISTS evidence_requirements (
     review_state        TEXT NOT NULL DEFAULT 'candidate',
     observation_state   TEXT NOT NULL DEFAULT 'indeterminate',
     extraction_hash     TEXT NOT NULL DEFAULT '',
-    created_at          REAL NOT NULL
+    created_at          REAL NOT NULL,
+    PRIMARY KEY (tenant_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS ownership_hints (
-    id                  TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
+    id                  TEXT NOT NULL,
     artifact_id         TEXT NOT NULL,
     entity              TEXT NOT NULL DEFAULT '',
     owner               TEXT NOT NULL DEFAULT '',
@@ -188,11 +192,13 @@ CREATE TABLE IF NOT EXISTS ownership_hints (
     confidence_prior    REAL NOT NULL DEFAULT 0.5,
     review_state        TEXT NOT NULL DEFAULT 'candidate',
     extraction_hash     TEXT NOT NULL DEFAULT '',
-    created_at          REAL NOT NULL
+    created_at          REAL NOT NULL,
+    PRIMARY KEY (tenant_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS dependency_hints (
-    id                  TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
+    id                  TEXT NOT NULL,
     artifact_id         TEXT NOT NULL,
     source_entity       TEXT NOT NULL DEFAULT '',
     target_entity       TEXT NOT NULL DEFAULT '',
@@ -203,11 +209,13 @@ CREATE TABLE IF NOT EXISTS dependency_hints (
     confidence_prior    REAL NOT NULL DEFAULT 0.5,
     review_state        TEXT NOT NULL DEFAULT 'candidate',
     extraction_hash     TEXT NOT NULL DEFAULT '',
-    created_at          REAL NOT NULL
+    created_at          REAL NOT NULL,
+    PRIMARY KEY (tenant_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS signal_mapping_candidates (
-    id                  TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
+    id                  TEXT NOT NULL,
     artifact_id         TEXT NOT NULL,
     source              TEXT NOT NULL DEFAULT '',
     candidate_metric    TEXT NOT NULL DEFAULT '',
@@ -219,17 +227,13 @@ CREATE TABLE IF NOT EXISTS signal_mapping_candidates (
     confidence_prior    REAL NOT NULL DEFAULT 0.5,
     review_state        TEXT NOT NULL DEFAULT 'candidate',
     extraction_hash     TEXT NOT NULL DEFAULT '',
-    created_at          REAL NOT NULL
+    created_at          REAL NOT NULL,
+    PRIMARY KEY (tenant_id, id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_smm_signal ON signal_metric_mappings(signal_type);
 CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern);
 CREATE INDEX IF NOT EXISTS idx_ingested_alert_uid_backend ON ingested_alerts(alert_uid, backend_name);
-CREATE INDEX IF NOT EXISTS idx_learned_artifacts_type ON learned_artifacts(artifact_type);
-CREATE INDEX IF NOT EXISTS idx_evidence_requirements_artifact ON evidence_requirements(artifact_id);
-CREATE INDEX IF NOT EXISTS idx_ownership_hints_artifact ON ownership_hints(artifact_id);
-CREATE INDEX IF NOT EXISTS idx_dependency_hints_artifact ON dependency_hints(artifact_id);
-CREATE INDEX IF NOT EXISTS idx_signal_mapping_candidates_artifact ON signal_mapping_candidates(artifact_id);
 """
 
 FTS_SCHEMA_SQL = """

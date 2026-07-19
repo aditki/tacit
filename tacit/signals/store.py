@@ -926,6 +926,7 @@ class SignalStore:
     def record_learned_artifact(
         self,
         *,
+        tenant_id: str = "default",
         artifact_id: str,
         artifact_type: str,
         source_vendor: str = "",
@@ -944,8 +945,8 @@ class SignalStore:
         with self._conn() as conn:
             existing = conn.execute(
                 """SELECT fingerprint, first_seen_at, stale FROM learned_artifacts
-                   WHERE artifact_id = ?""",
-                (artifact_id,),
+                   WHERE tenant_id = ? AND artifact_id = ?""",
+                (tenant_id, artifact_id),
             ).fetchone()
             first_seen = existing["first_seen_at"] if existing and existing["first_seen_at"] else now
             change_state = "created"
@@ -957,11 +958,11 @@ class SignalStore:
                     change_state = "skipped" if same_fingerprint else "updated"
             conn.execute(
                 """INSERT INTO learned_artifacts
-                   (artifact_id, artifact_type, source_vendor, source_instance,
+                   (tenant_id, artifact_id, artifact_type, source_vendor, source_instance,
                     external_id, title, body_text, provenance_url, fingerprint,
                     stale, missing_since, first_seen_at, last_seen_at, updated_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)
-                   ON CONFLICT(artifact_id) DO UPDATE SET
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)
+                   ON CONFLICT(tenant_id, artifact_id) DO UPDATE SET
                        artifact_type = excluded.artifact_type,
                        source_vendor = excluded.source_vendor,
                        source_instance = excluded.source_instance,
@@ -980,6 +981,7 @@ class SignalStore:
                        END,
                        created_at = learned_artifacts.created_at""",
                 (
+                    tenant_id,
                     artifact_id,
                     artifact_type,
                     source_vendor,
@@ -1000,6 +1002,7 @@ class SignalStore:
     def replace_artifact_extractions(
         self,
         *,
+        tenant_id: str = "default",
         artifact_id: str,
         evidence_requirements: list[dict[str, Any]] | None = None,
         ownership_hints: list[dict[str, Any]] | None = None,
@@ -1009,19 +1012,32 @@ class SignalStore:
         """Replace extracted IR rows for one artifact."""
         now = time.time()
         with self._conn() as conn:
-            conn.execute("DELETE FROM evidence_requirements WHERE artifact_id = ?", (artifact_id,))
-            conn.execute("DELETE FROM ownership_hints WHERE artifact_id = ?", (artifact_id,))
-            conn.execute("DELETE FROM dependency_hints WHERE artifact_id = ?", (artifact_id,))
-            conn.execute("DELETE FROM signal_mapping_candidates WHERE artifact_id = ?", (artifact_id,))
+            conn.execute(
+                "DELETE FROM evidence_requirements WHERE tenant_id = ? AND artifact_id = ?",
+                (tenant_id, artifact_id),
+            )
+            conn.execute(
+                "DELETE FROM ownership_hints WHERE tenant_id = ? AND artifact_id = ?",
+                (tenant_id, artifact_id),
+            )
+            conn.execute(
+                "DELETE FROM dependency_hints WHERE tenant_id = ? AND artifact_id = ?",
+                (tenant_id, artifact_id),
+            )
+            conn.execute(
+                "DELETE FROM signal_mapping_candidates WHERE tenant_id = ? AND artifact_id = ?",
+                (tenant_id, artifact_id),
+            )
             for row in evidence_requirements or []:
                 conn.execute(
                     """INSERT INTO evidence_requirements
-                       (id, artifact_id, subject, evidence_kind, target_entity,
+                       (tenant_id, id, artifact_id, subject, evidence_kind, target_entity,
                         signal_hint, query_hint, priority, source_artifact_id,
                         source_excerpt, source_type, confidence_prior, review_state,
                         observation_state, extraction_hash, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
+                        tenant_id,
                         row["id"],
                         artifact_id,
                         row.get("subject", ""),
@@ -1043,11 +1059,12 @@ class SignalStore:
             for row in ownership_hints or []:
                 conn.execute(
                     """INSERT INTO ownership_hints
-                       (id, artifact_id, entity, owner, hint_kind, source_artifact_id,
+                       (tenant_id, id, artifact_id, entity, owner, hint_kind, source_artifact_id,
                         source_excerpt, source_type, confidence_prior, review_state,
                         extraction_hash, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
+                        tenant_id,
                         row["id"],
                         artifact_id,
                         row.get("entity", ""),
@@ -1065,11 +1082,12 @@ class SignalStore:
             for row in dependency_hints or []:
                 conn.execute(
                     """INSERT INTO dependency_hints
-                       (id, artifact_id, source_entity, target_entity, direction,
+                       (tenant_id, id, artifact_id, source_entity, target_entity, direction,
                         source_artifact_id, source_excerpt, source_type, confidence_prior,
                         review_state, extraction_hash, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
+                        tenant_id,
                         row["id"],
                         artifact_id,
                         row.get("source_entity", ""),
@@ -1087,11 +1105,12 @@ class SignalStore:
             for row in signal_mapping_candidates or []:
                 conn.execute(
                     """INSERT INTO signal_mapping_candidates
-                       (id, artifact_id, source, candidate_metric, symptom, signal_type,
+                       (tenant_id, id, artifact_id, source, candidate_metric, symptom, signal_type,
                         source_artifact_id, source_excerpt, query_hint, confidence_prior,
                         review_state, extraction_hash, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
+                        tenant_id,
                         row["id"],
                         artifact_id,
                         row.get("source", ""),
@@ -1257,6 +1276,7 @@ class SignalStore:
     def mark_missing_artifacts_stale(
         self,
         *,
+        tenant_id: str = "default",
         artifact_type: str,
         seen_artifact_ids: set[str],
         source_vendor: str | None = None,
@@ -1266,8 +1286,8 @@ class SignalStore:
         """Mark previously learned artifacts stale when absent from a complete crawl."""
         now = time.time()
         with self._conn() as conn:
-            clauses = ["artifact_type = ?", "stale = 0"]
-            params: list[Any] = [artifact_type]
+            clauses = ["tenant_id = ?", "artifact_type = ?", "stale = 0"]
+            params: list[Any] = [tenant_id, artifact_type]
             if source_vendor is not None:
                 clauses.append("source_vendor = ?")
                 params.append(source_vendor)
@@ -1291,8 +1311,8 @@ class SignalStore:
                     SET stale = 1,
                         missing_since = COALESCE(missing_since, ?),
                         updated_at = ?
-                    WHERE artifact_type = ? AND artifact_id IN ({placeholders})""",
-                (now, now, artifact_type, *missing),
+                    WHERE tenant_id = ? AND artifact_type = ? AND artifact_id IN ({placeholders})""",
+                (now, now, tenant_id, artifact_type, *missing),
             )
             if self._learning_index_available():
                 try:
@@ -1327,6 +1347,7 @@ class SignalStore:
     def list_learned_artifacts(
         self,
         *,
+        tenant_id: str = "default",
         artifact_type: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
@@ -1334,53 +1355,60 @@ class SignalStore:
         with self._conn() as conn:
             if artifact_type:
                 rows = conn.execute(
-                    """SELECT id, artifact_id, artifact_type, source_vendor, source_instance,
+                    """SELECT id, tenant_id, artifact_id, artifact_type, source_vendor, source_instance,
                               external_id, title, provenance_url, fingerprint,
                               stale, missing_since, first_seen_at, last_seen_at,
                               updated_at, created_at
                        FROM learned_artifacts
-                       WHERE artifact_type = ? ORDER BY updated_at DESC LIMIT ?""",
-                    (artifact_type, limit),
+                       WHERE tenant_id = ? AND artifact_type = ? ORDER BY updated_at DESC LIMIT ?""",
+                    (tenant_id, artifact_type, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT id, artifact_id, artifact_type, source_vendor, source_instance,
+                    """SELECT id, tenant_id, artifact_id, artifact_type, source_vendor, source_instance,
                               external_id, title, provenance_url, fingerprint,
                               stale, missing_since, first_seen_at, last_seen_at,
                               updated_at, created_at
-                       FROM learned_artifacts
+                       FROM learned_artifacts WHERE tenant_id = ?
                        ORDER BY updated_at DESC LIMIT ?""",
-                    (limit,),
+                    (tenant_id, limit),
                 ).fetchall()
         return [_deserialize_learned_artifact(row) for row in rows]
 
-    def get_learned_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+    def get_learned_artifact(self, artifact_id: str, *, tenant_id: str = "default") -> dict[str, Any] | None:
         """Return one learned artifact by stable artifact ID."""
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT * FROM learned_artifacts WHERE artifact_id = ?",
-                (artifact_id,),
+                "SELECT * FROM learned_artifacts WHERE tenant_id = ? AND artifact_id = ?",
+                (tenant_id, artifact_id),
             ).fetchone()
         return _deserialize_learned_artifact(row) if row else None
 
-    def list_artifact_extractions(self, artifact_id: str) -> dict[str, list[dict[str, Any]]]:
+    def list_artifact_extractions(
+        self,
+        artifact_id: str,
+        *,
+        tenant_id: str = "default",
+    ) -> dict[str, list[dict[str, Any]]]:
         """Return extracted IR rows for one artifact."""
         with self._conn() as conn:
             evidence = conn.execute(
-                "SELECT * FROM evidence_requirements WHERE artifact_id = ? ORDER BY priority, id",
-                (artifact_id,),
+                """SELECT * FROM evidence_requirements
+                   WHERE tenant_id = ? AND artifact_id = ? ORDER BY priority, id""",
+                (tenant_id, artifact_id),
             ).fetchall()
             ownership = conn.execute(
-                "SELECT * FROM ownership_hints WHERE artifact_id = ? ORDER BY id",
-                (artifact_id,),
+                "SELECT * FROM ownership_hints WHERE tenant_id = ? AND artifact_id = ? ORDER BY id",
+                (tenant_id, artifact_id),
             ).fetchall()
             dependencies = conn.execute(
-                "SELECT * FROM dependency_hints WHERE artifact_id = ? ORDER BY id",
-                (artifact_id,),
+                "SELECT * FROM dependency_hints WHERE tenant_id = ? AND artifact_id = ? ORDER BY id",
+                (tenant_id, artifact_id),
             ).fetchall()
             signal_candidates = conn.execute(
-                "SELECT * FROM signal_mapping_candidates WHERE artifact_id = ? ORDER BY id",
-                (artifact_id,),
+                """SELECT * FROM signal_mapping_candidates
+                   WHERE tenant_id = ? AND artifact_id = ? ORDER BY id""",
+                (tenant_id, artifact_id),
             ).fetchall()
         return {
             "evidence_requirements": [dict(row) for row in evidence],
@@ -1389,24 +1417,26 @@ class SignalStore:
             "signal_mapping_candidates": [dict(row) for row in signal_candidates],
         }
 
-    def artifact_extraction_counts(self, artifact_id: str) -> dict[str, int]:
+    def artifact_extraction_counts(self, artifact_id: str, *, tenant_id: str = "default") -> dict[str, int]:
         """Return structured extraction row counts for one artifact."""
         with self._conn() as conn:
             evidence = conn.execute(
-                "SELECT COUNT(*) AS count FROM evidence_requirements WHERE artifact_id = ?",
-                (artifact_id,),
+                """SELECT COUNT(*) AS count FROM evidence_requirements
+                   WHERE tenant_id = ? AND artifact_id = ?""",
+                (tenant_id, artifact_id),
             ).fetchone()
             ownership = conn.execute(
-                "SELECT COUNT(*) AS count FROM ownership_hints WHERE artifact_id = ?",
-                (artifact_id,),
+                "SELECT COUNT(*) AS count FROM ownership_hints WHERE tenant_id = ? AND artifact_id = ?",
+                (tenant_id, artifact_id),
             ).fetchone()
             dependencies = conn.execute(
-                "SELECT COUNT(*) AS count FROM dependency_hints WHERE artifact_id = ?",
-                (artifact_id,),
+                "SELECT COUNT(*) AS count FROM dependency_hints WHERE tenant_id = ? AND artifact_id = ?",
+                (tenant_id, artifact_id),
             ).fetchone()
             signal_candidates = conn.execute(
-                "SELECT COUNT(*) AS count FROM signal_mapping_candidates WHERE artifact_id = ?",
-                (artifact_id,),
+                """SELECT COUNT(*) AS count FROM signal_mapping_candidates
+                   WHERE tenant_id = ? AND artifact_id = ?""",
+                (tenant_id, artifact_id),
             ).fetchone()
         return {
             "evidence_requirements": int(evidence["count"] if evidence else 0),

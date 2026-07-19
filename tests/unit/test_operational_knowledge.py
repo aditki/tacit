@@ -77,6 +77,7 @@ def _dependency(
     tenant_id: str = "default",
     predicate: str = "depends_on",
     object_ref: str = "entity:datastore:redis-session",
+    subject_ref: str = "entity:service:checkout",
     version_constraints: list[str] | None = None,
 ):
     scope = KnowledgeScope(
@@ -90,7 +91,7 @@ def _dependency(
         payload_ref=payload_ref,
         typed_payload={"semantic": "unchanged"},
         proposition={
-            "subject_ref": "entity:service:checkout",
+            "subject_ref": subject_ref,
             "predicate": predicate,
             "object_ref": object_ref,
         },
@@ -882,6 +883,16 @@ def test_negative_dependency_excludes_matching_ranked_candidate(tmp_path: Path):
         )
     )
     applied = next(item for item in usage if item.knowledge_ref == revision.knowledge_id)
+    reconciled = service.reconcile_live_observations(
+        [applied],
+        [
+            EvidenceObservation(
+                requirement_id="redis_health",
+                resolution_metric="redis-session",
+                outcome=EvidenceObservationOutcome.NEGATIVE_EVIDENCE,
+            )
+        ],
+    )
 
     ranking = service.apply_to_ranking(
         CulpritRanking(
@@ -895,14 +906,49 @@ def test_negative_dependency_excludes_matching_ranked_candidate(tmp_path: Path):
                 )
             ],
         ),
-        [applied],
+        reconciled,
     )
 
     assert applied.used_for == ["candidate_exclusion"]
     assert applied.score_delta == 0
+    assert reconciled[0].disposition.value == "applied"
     assert ranking.candidates == []
     assert ranking.abstained is True
     assert ranking.abstention_reason == "operational_knowledge_excluded_ranked_candidates"
+
+
+def test_dependency_subject_must_match_investigation_service(tmp_path: Path):
+    service = _service(tmp_path)
+    service.register_entity(
+        Entity(
+            id="entity:service:payments",
+            kind=EntityKind.SERVICE,
+            canonical_name="payments",
+            scope=KnowledgeScope(),
+            provenance_refs=["catalog:service"],
+        )
+    )
+    candidate = _dependency(
+        service,
+        payload_ref="payments-redis",
+        family=SourceFamily.HUMAN_CORRECTION,
+        lineage_group="payments-redis",
+        subject_ref="entity:service:payments",
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, authoritative_source=True)
+    assert revision is not None
+
+    _, usage = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        )
+    )
+
+    item = next(item for item in usage if item.knowledge_ref == revision.knowledge_id)
+    assert item.disposition.value == "rejected_by_scope"
+    assert item.reason_codes == ["dependency_subject_mismatch"]
 
 
 def test_scope_normalizes_naive_validity_datetimes_to_utc():
