@@ -8,6 +8,7 @@ from tacit.api.app import create_app
 from tacit.backends.base import DashboardFeatures
 from tacit.config import Settings
 from tacit.models.schemas import DashRequest, DashResponse
+from tacit.signals import SignalStore
 
 
 def test_chart_route_uses_app_scoped_pipeline_settings(monkeypatch):
@@ -189,6 +190,45 @@ def test_learning_auto_approval_requires_knowledge_permissions(monkeypatch, perm
     assert response.status_code == 403
     assert response.json()["detail"] == f"Missing permission: {missing_permission}"
     assert called is False
+
+
+def test_dashboard_rejection_requires_knowledge_reject_permission(monkeypatch):
+    called = False
+
+    def fake_reject(**kwargs):
+        nonlocal called
+        called = True
+        return {"status": "rejected"}
+
+    monkeypatch.setattr("tacit.dashboard_ingest.reject_ingested_dashboard_record", fake_reject)
+    client = TestClient(create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read")))
+
+    response = client.post("/api/v1/learn/dashboards/restricted-dash/reject")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.reject"
+    assert called is False
+
+
+def test_artifact_lists_use_the_requested_tenant(monkeypatch, tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    for tenant_id in ("tenant-a", "tenant-b"):
+        store.record_learned_artifact(
+            tenant_id=tenant_id,
+            artifact_id="shared-runbook",
+            artifact_type="runbook",
+            title=f"{tenant_id} runbook",
+        )
+    monkeypatch.setattr("tacit.api.routes.learning.signals_mod.get_signal_store", lambda: store)
+    client = TestClient(create_app(runtime_settings=Settings(knowledge_tenant_id="*")))
+
+    missing = client.get("/api/v1/learn/runbooks")
+    tenant_a = client.get("/api/v1/learn/runbooks", headers={"X-Tacit-Tenant": "tenant-a"})
+
+    assert missing.status_code == 400
+    assert tenant_a.status_code == 200
+    assert tenant_a.json()["count"] == 1
+    assert tenant_a.json()["runbooks"][0]["title"] == "tenant-a runbook"
 
 
 def test_learning_backend_route_uses_app_scoped_backend_settings(monkeypatch):

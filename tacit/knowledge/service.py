@@ -44,7 +44,12 @@ from tacit.knowledge.models import (
     PromotionDecision,
     utc_now,
 )
-from tacit.knowledge.normalization import PropositionNormalizer, canonical_scope_payload, stable_fingerprint
+from tacit.knowledge.normalization import (
+    PropositionNormalizer,
+    canonical_scope_payload,
+    normalize_service_ref,
+    stable_fingerprint,
+)
 from tacit.knowledge.policies import default_policies
 from tacit.knowledge.repository import KnowledgeRepository, get_knowledge_repository
 
@@ -554,6 +559,9 @@ class KnowledgeService:
                 reconciled.append(item)
                 continue
             proposition = revision.proposition
+            if proposition.kind == KnowledgeKind.DEPENDENCY and proposition.predicate == Predicate.DOES_NOT_DEPEND_ON:
+                reconciled.append(item)
+                continue
             refs = {
                 value.casefold()
                 for value in (
@@ -1028,6 +1036,11 @@ class KnowledgeService:
             return KnowledgeUsageDisposition.REJECTED_BY_ELIGIBILITY, ["knowledge_ineligible"]
         if not revision.scope.applies_to(scope):
             return KnowledgeUsageDisposition.REJECTED_BY_SCOPE, ["scope_mismatch"]
+        if revision.proposition.kind == KnowledgeKind.DEPENDENCY:
+            subject_ref = normalize_service_ref(revision.proposition.subject_ref)
+            service_refs = {normalize_service_ref(value) for value in scope.service_refs}
+            if subject_ref not in service_refs:
+                return KnowledgeUsageDisposition.REJECTED_BY_SCOPE, ["dependency_subject_mismatch"]
         conflicts = self.repository.list_conflicts(
             revision.tenant_id,
             proposition_key=revision.proposition.proposition_key,

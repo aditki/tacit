@@ -711,6 +711,16 @@ def _has_missing_extractions(existing: dict[str, int], expected: dict[str, int])
     return any(existing.get(key, 0) < count for key, count in expected.items())
 
 
+def _resolve_tenant_id(tenant_id: str | None) -> str:
+    if tenant_id is None:
+        from tacit.config import settings
+
+        tenant_id = settings.knowledge_tenant_id
+    if tenant_id == "*":
+        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
+    return tenant_id
+
+
 def _preserve_review_states(rows: list[dict[str, Any]], existing_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     existing_state_by_id = {row.get("id"): row.get("review_state") for row in existing_rows if row.get("id")}
     preserved = []
@@ -730,12 +740,7 @@ def learn_artifact(
     dry_run: bool = False,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
-    if tenant_id is None:
-        from tacit.config import settings
-
-        tenant_id = settings.knowledge_tenant_id
-    if tenant_id == "*":
-        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
+    tenant_id = _resolve_tenant_id(tenant_id)
     result = extractor.extract(artifact)
     evidence_rows = _as_store_rows(result.evidence_requirements)
     ownership_rows = _as_store_rows(result.ownership_hints)
@@ -748,6 +753,7 @@ def learn_artifact(
     if not dry_run:
         store = get_signal_store()
         change_state = store.record_learned_artifact(
+            tenant_id=tenant_id,
             artifact_id=artifact.id,
             artifact_type=artifact.artifact_type,
             source_vendor=artifact.source_vendor or "",
@@ -764,7 +770,9 @@ def learn_artifact(
         index_signal_rows = signal_rows
         should_replace_extractions = change_state != "skipped"
         existing_rows = (
-            store.list_artifact_extractions(artifact.id) if change_state in {"updated", "restored", "skipped"} else None
+            store.list_artifact_extractions(artifact.id, tenant_id=tenant_id)
+            if change_state in {"updated", "restored", "skipped"}
+            else None
         )
         if change_state == "skipped":
             assert existing_rows is not None
@@ -775,7 +783,7 @@ def learn_artifact(
                 signal_rows=signal_rows,
             )
             should_replace_extractions = _has_missing_extractions(
-                store.artifact_extraction_counts(artifact.id), expected_counts
+                store.artifact_extraction_counts(artifact.id, tenant_id=tenant_id), expected_counts
             )
             if should_replace_extractions:
                 evidence_rows = _preserve_review_states(evidence_rows, existing_rows["evidence_requirements"])
@@ -806,6 +814,7 @@ def learn_artifact(
             index_signal_rows = signal_rows
         if should_replace_extractions:
             store.replace_artifact_extractions(
+                tenant_id=tenant_id,
                 artifact_id=artifact.id,
                 evidence_requirements=evidence_rows,
                 ownership_hints=ownership_rows,
@@ -916,6 +925,7 @@ def learn_incident_dir(
     dry_run: bool = False,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
+    tenant_id = _resolve_tenant_id(tenant_id)
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
     learned = [learn_incident_file(file, dry_run=dry_run, tenant_id=tenant_id) for file in files]
 
@@ -932,6 +942,7 @@ def learn_incident_dir(
         store = get_signal_store()
         seen = {str(item["artifact_id"]) for item in learned}
         stale_marked = store.mark_missing_artifacts_stale(
+            tenant_id=tenant_id,
             artifact_type="incident",
             seen_artifact_ids=seen,
             source_vendor="file",
@@ -962,6 +973,7 @@ def learn_runbook_dir(
     dry_run: bool = False,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
+    tenant_id = _resolve_tenant_id(tenant_id)
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
     learned = [learn_runbook_file(file, dry_run=dry_run, tenant_id=tenant_id) for file in files]
 
@@ -978,6 +990,7 @@ def learn_runbook_dir(
         store = get_signal_store()
         seen = {str(item["artifact_id"]) for item in learned}
         stale_marked = store.mark_missing_artifacts_stale(
+            tenant_id=tenant_id,
             artifact_type="runbook",
             seen_artifact_ids=seen,
             source_vendor="file",

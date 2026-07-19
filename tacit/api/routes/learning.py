@@ -399,13 +399,18 @@ async def list_ingested_alerts(
     response_description="Learned runbooks and extracted operational IR candidates",
 )
 async def list_learned_runbooks(
+    request: Request,
     limit: int = Query(50, ge=1, le=500),
 ):
     """List runbooks learned by Tacit Artifact Learning v1."""
     store = signals_mod.get_signal_store()
-    runbooks = store.list_learned_artifacts(artifact_type="runbook", limit=limit)
+    tenant_id = knowledge_tenant(request)
+    runbooks = store.list_learned_artifacts(tenant_id=tenant_id, artifact_type="runbook", limit=limit)
     for runbook in runbooks:
-        runbook["extractions"] = store.list_artifact_extractions(runbook["artifact_id"])
+        runbook["extractions"] = store.list_artifact_extractions(
+            runbook["artifact_id"],
+            tenant_id=tenant_id,
+        )
     return {"count": len(runbooks), "runbooks": runbooks}
 
 
@@ -416,13 +421,18 @@ async def list_learned_runbooks(
     response_description="Learned incidents and extracted operational IR candidates",
 )
 async def list_learned_incidents(
+    request: Request,
     limit: int = Query(50, ge=1, le=500),
 ):
     """List incident history learned by Tacit Artifact Learning v1."""
     store = signals_mod.get_signal_store()
-    incidents = store.list_learned_artifacts(artifact_type="incident", limit=limit)
+    tenant_id = knowledge_tenant(request)
+    incidents = store.list_learned_artifacts(tenant_id=tenant_id, artifact_type="incident", limit=limit)
     for incident in incidents:
-        incident["extractions"] = store.list_artifact_extractions(incident["artifact_id"])
+        incident["extractions"] = store.list_artifact_extractions(
+            incident["artifact_id"],
+            tenant_id=tenant_id,
+        )
     return {"count": len(incidents), "incidents": incidents}
 
 
@@ -507,6 +517,7 @@ async def reject_ingested_dashboard(request: Request, dashboard_uid: str, backen
     """Reject a pending ingested dashboard."""
     from tacit.dashboard_ingest import reject_ingested_dashboard_record
 
+    assert_knowledge_permission(request, "knowledge.reject")
     try:
         return reject_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
