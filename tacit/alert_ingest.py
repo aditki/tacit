@@ -157,7 +157,11 @@ async def ingest_alert_features(
     store = get_signal_store()
     status = "approved" if auto_approve else "pending"
     panel = alert_to_panel(features)
-    signals = infer_signals_from_metrics(features.metrics_found, [panel])
+    signals = infer_signals_from_metrics(
+        features.metrics_found,
+        [panel],
+        tenant_id=effective_tenant or "default",
+    )
     signal_quality = build_signal_quality_report(metrics=features.metrics_found, signals=signals)
     learning_impact = build_learning_impact_report(
         metrics=features.metrics_found,
@@ -224,6 +228,7 @@ async def ingest_alert_features(
         if stored_alert is not None:
             effective_status = str(stored_alert.get("status") or status)
         indexed_context_rows = store.index_alert_context(
+            tenant_id=effective_tenant,
             alert_uid=features.alert_uid,
             backend_name=features.backend_name,
             alert_title=features.alert_title,
@@ -409,6 +414,7 @@ async def learn_backend_alerts(
 
         stale_reconciliation_complete = bool(getattr(backend, "last_alert_list_complete", False))
         if not dry_run and stale_reconciliation_complete:
+            assert effective_tenant is not None
             store = get_signal_store()
             seen_alert_uids = {str(item.get("uid", "")) for item in alerts if item.get("uid")}
             totals["stale_marked"] = store.mark_missing_alerts_stale(
@@ -416,6 +422,26 @@ async def learn_backend_alerts(
                 backend_name=backend_name,
                 seen_alert_uids=seen_alert_uids,
             )
+            if totals["stale_marked"]:
+                from tacit.knowledge.repository import KnowledgeRepository
+                from tacit.knowledge.service import KnowledgeService
+
+                knowledge_service = KnowledgeService(KnowledgeRepository(store._db_path))
+                for alert in store.list_ingested_alerts(
+                    status="stale",
+                    limit=10_000,
+                    tenant_id=effective_tenant,
+                ):
+                    if alert.get("backend_name") == backend_name:
+                        knowledge_service.reconcile_source_lifecycle(
+                            provenance_ref=(
+                                f"{backend_name}:alert:{alert['alert_uid']}"
+                                if backend_name
+                                else str(alert["alert_uid"])
+                            ),
+                            tenant_id=effective_tenant,
+                            source_stale=True,
+                        )
         elif not dry_run:
             totals["stale_reconciliation_skipped"] = True
 

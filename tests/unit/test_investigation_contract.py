@@ -910,7 +910,7 @@ def test_current_engine_replay_requires_concrete_tenant_in_wildcard_mode(tmp_pat
     assert replay_run["error_code"] == "replay_failed"
 
 
-def test_current_engine_replay_uses_pinned_knowledge_tenant(tmp_path, monkeypatch):
+def test_current_engine_replay_rejects_pinned_tenant_mismatch(tmp_path, monkeypatch):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?")
     draft = _draft_contract(investigation_id)
@@ -952,14 +952,14 @@ def test_current_engine_replay_uses_pinned_knowledge_tenant(tmp_path, monkeypatc
         lambda: CapturingKnowledgeService(),
     )
 
-    replayed = store.replay_contract(
-        investigation_id,
-        mode=ReplayMode.CURRENT_ENGINE,
-        runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
-    )
+    with pytest.raises(ReplayError, match="does not match configured tenant"):
+        store.replay_contract(
+            investigation_id,
+            mode=ReplayMode.CURRENT_ENGINE,
+            runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+        )
 
-    assert captured["tenant_id"] == "tenant-a"
-    assert replayed.request.scope.tenant_id == "tenant-a"
+    assert captured == {}
 
 
 def test_concurrent_revision_writers_report_a_stale_parent(tmp_path):

@@ -49,6 +49,16 @@ def signal_store(tmp_path):
     return store
 
 
+def _metric_entry(name: str) -> MetricEntry:
+    return MetricEntry(
+        name=name,
+        datasource_uid="prometheus",
+        datasource_name="Prometheus",
+        datasource_type="prometheus",
+        query_language="promql",
+    )
+
+
 def test_signal_approval_validates_wildcard_tenant_before_activation(signal_store, monkeypatch):
     monkeypatch.setattr("tacit.dashboard_ingest.service.settings.knowledge_tenant_id", "*")
 
@@ -65,8 +75,144 @@ def test_signal_approval_validates_wildcard_tenant_before_activation(signal_stor
             source_ref="dashboard:wildcard-tenant",
             dashboard_uid="wildcard-tenant",
         )
-
     assert signal_store.get_signal_type("wildcard_tenant_signal") is None
+
+
+def test_signal_mapping_resolution_is_tenant_scoped(signal_store, monkeypatch):
+    signal_store.add_mapping(
+        "request_latency",
+        "tenant_a_latency_seconds",
+        confidence=0.9,
+        tenant_id="tenant-a",
+    )
+    signal_store.add_mapping(
+        "request_latency",
+        "tenant_b_latency_seconds",
+        confidence=0.9,
+        tenant_id="tenant-b",
+    )
+    catalog = [
+        _metric_entry("tenant_a_latency_seconds"),
+        _metric_entry("tenant_b_latency_seconds"),
+    ]
+
+    tenant_a = signal_store.resolve_signal("request_latency", catalog, tenant_id="tenant-a")
+    tenant_b = signal_store.resolve_signal("request_latency", catalog, tenant_id="tenant-b")
+
+    assert [entry.name for entry, _ in tenant_a] == ["tenant_a_latency_seconds"]
+    assert [entry.name for entry, _ in tenant_b] == ["tenant_b_latency_seconds"]
+
+    import tacit.dashboard_ingest as dashboard_ingest
+
+    monkeypatch.setattr(dashboard_ingest, "get_signal_store", lambda: signal_store)
+    inferred = infer_signals_from_metrics(
+        ["tenant_a_latency_seconds", "tenant_b_latency_seconds"],
+        tenant_id="tenant-a",
+    )
+    assert {(row["signal_type"], row["metric"]) for row in inferred if row["source"] == "taxonomy"} == {
+        ("request_latency", "tenant_a_latency_seconds")
+    }
+
+
+def test_bootstrap_signal_mappings_are_available_to_every_tenant(signal_store):
+    signal_store.add_mapping(
+        "request_latency",
+        "http_request_duration_seconds",
+        confidence=0.9,
+        source_type="bootstrap",
+    )
+    catalog = [_metric_entry("http_request_duration_seconds")]
+
+    assert signal_store.resolve_signal("request_latency", catalog, tenant_id="tenant-a")
+    assert signal_store.resolve_signal("request_latency", catalog, tenant_id="tenant-b")
+
+
+def test_approved_signal_mapping_is_written_to_the_governed_tenant(signal_store):
+    persisted = persist_inferred_signal_review(
+        store=signal_store,
+        sig={
+            "signal_type": "checkout_latency",
+            "metric": "checkout_latency_seconds",
+            "source": "heuristic",
+            "auto_teach_eligible": True,
+            "confidence": 0.9,
+        },
+        source_ref="grafana:checkout",
+        dashboard_uid="checkout",
+        tenant_id="tenant-a",
+    )
+    catalog = [_metric_entry("checkout_latency_seconds")]
+
+    assert persisted is True
+    assert signal_store.resolve_signal("checkout_latency", catalog, tenant_id="tenant-a")
+    assert signal_store.resolve_signal("checkout_latency", catalog, tenant_id="tenant-b") == []
+
+
+def test_learning_context_index_is_tenant_scoped(signal_store):
+    for tenant_id, title, metric in (
+        ("tenant-a", "Tenant A Checkout", "tenant_a_checkout_latency"),
+        ("tenant-b", "Tenant B Checkout", "tenant_b_checkout_latency"),
+    ):
+        signal_store.index_dashboard_context(
+            tenant_id=tenant_id,
+            dashboard_uid="shared-dashboard",
+            backend_name="grafana",
+            dashboard_title=title,
+            metrics_found=[metric],
+            status="approved",
+        )
+
+    tenant_a = signal_store.search_learning_context("checkout", tenant_id="tenant-a")
+    tenant_b = signal_store.search_learning_context("checkout", tenant_id="tenant-b")
+
+    assert {row["dashboard_title"] for row in tenant_a} == {"Tenant A Checkout"}
+    assert {row["dashboard_title"] for row in tenant_b} == {"Tenant B Checkout"}
+
+
+def test_legacy_mappings_and_learning_index_migrate_to_default_tenant(tmp_path):
+    db_path = tmp_path / "legacy-tenantless-signals.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE signal_types (
+                signal_type TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE signal_metric_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, signal_type TEXT NOT NULL,
+                metric_pattern TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0.5,
+                context_services TEXT NOT NULL DEFAULT '[]',
+                context_datasource_types TEXT NOT NULL DEFAULT '[]',
+                context_environments TEXT NOT NULL DEFAULT '[]', context_archetypes TEXT NOT NULL DEFAULT '[]',
+                source_type TEXT NOT NULL DEFAULT 'bootstrap', source_refs TEXT NOT NULL DEFAULT '[]',
+                inference_version TEXT NOT NULL DEFAULT '', review_state TEXT NOT NULL DEFAULT 'trusted',
+                use_count INTEGER NOT NULL DEFAULT 0, positive_feedback INTEGER NOT NULL DEFAULT 0,
+                negative_feedback INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, last_seen REAL NOT NULL,
+                UNIQUE(signal_type, metric_pattern)
+            );
+            CREATE VIRTUAL TABLE learning_context_fts USING fts5(
+                source_kind, source_id UNINDEXED, backend_name UNINDEXED, dashboard_uid UNINDEXED,
+                dashboard_title, dashboard_tags, panel_title, metric_name, query_text, service,
+                signal_type, review_state UNINDEXED, reason, provenance, indexed_at UNINDEXED
+            );
+            INSERT INTO signal_types VALUES ('latency', '', '', '', 1, 1);
+            INSERT INTO signal_metric_mappings
+                (signal_type, metric_pattern, confidence, created_at, last_seen)
+            VALUES ('latency', 'legacy_latency_seconds', 0.9, 1, 1);
+            INSERT INTO learning_context_fts
+                (source_kind, source_id, dashboard_title, metric_name, review_state, indexed_at)
+            VALUES ('dashboard_panel', 'legacy', 'Legacy Checkout', 'legacy_latency_seconds', 'approved', 1);
+        """)
+
+    store = SignalStore(db_path=db_path)
+
+    assert store.resolve_signal(
+        "latency",
+        [_metric_entry("legacy_latency_seconds")],
+        tenant_id="default",
+    )
+    assert store.search_learning_context("legacy", tenant_id="default")
+    store.add_mapping("latency", "legacy_latency_seconds", confidence=0.8, tenant_id="tenant-b")
 
 
 @pytest.fixture

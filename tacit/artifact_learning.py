@@ -721,6 +721,24 @@ def _resolve_tenant_id(tenant_id: str | None) -> str:
     return tenant_id
 
 
+def _reconcile_stale_artifact_knowledge(*, store, tenant_id: str, artifact_type: str) -> None:
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    service = KnowledgeService(KnowledgeRepository(store._db_path))
+    for artifact in store.list_learned_artifacts(
+        tenant_id=tenant_id,
+        artifact_type=artifact_type,
+        limit=10_000,
+    ):
+        if artifact.get("stale"):
+            service.reconcile_source_lifecycle(
+                provenance_ref=f"prov_artifact:{artifact['artifact_id']}",
+                tenant_id=tenant_id,
+                source_stale=True,
+            )
+
+
 def _preserve_review_states(rows: list[dict[str, Any]], existing_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     existing_state_by_id = {row.get("id"): row.get("review_state") for row in existing_rows if row.get("id")}
     preserved = []
@@ -825,11 +843,13 @@ def learn_artifact(
             change_state != "skipped"
             or should_replace_extractions
             or not store.artifact_context_indexed(
+                tenant_id=tenant_id,
                 artifact_id=artifact.id,
                 artifact_type=artifact.artifact_type,
             )
         ):
             indexed_context_rows = store.index_artifact_context(
+                tenant_id=tenant_id,
                 artifact_id=artifact.id,
                 artifact_type=artifact.artifact_type,
                 title=artifact.title,
@@ -843,17 +863,24 @@ def learn_artifact(
         from tacit.knowledge.repository import KnowledgeRepository
         from tacit.knowledge.service import KnowledgeService
 
+        service = KnowledgeService(KnowledgeRepository(store._db_path))
         governed_candidate_ids = migrate_artifact_extractions(
             artifact_id=artifact.id,
             artifact_type=artifact.artifact_type,
+            artifact_fingerprint=artifact.fingerprint,
             rows={
                 "evidence_requirements": evidence_rows,
                 "ownership_hints": ownership_rows,
                 "dependency_hints": dependency_rows,
                 "signal_mapping_candidates": signal_rows,
             },
-            service=KnowledgeService(KnowledgeRepository(store._db_path)),
+            service=service,
             tenant_id=tenant_id,
+        )
+        service.reconcile_source_lifecycle(
+            provenance_ref=f"prov_artifact:{artifact.id}",
+            tenant_id=tenant_id,
+            active_candidate_ids=set(governed_candidate_ids),
         )
     artifact_summary = asdict(artifact)
     artifact_summary.pop("body_text", None)
@@ -948,6 +975,12 @@ def learn_incident_dir(
             source_vendor="file",
             external_id_prefix=f"{path.resolve()}/",
         )
+        if stale_marked:
+            _reconcile_stale_artifact_knowledge(
+                store=store,
+                tenant_id=tenant_id,
+                artifact_type="incident",
+            )
     return {
         "artifact_type": "incident",
         "dry_run": dry_run,
@@ -996,6 +1029,12 @@ def learn_runbook_dir(
             source_vendor="file",
             external_id_prefix=f"{path.resolve()}/",
         )
+        if stale_marked:
+            _reconcile_stale_artifact_knowledge(
+                store=store,
+                tenant_id=tenant_id,
+                artifact_type="runbook",
+            )
     return {
         "artifact_type": "runbook",
         "dry_run": dry_run,

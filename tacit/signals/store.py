@@ -189,18 +189,22 @@ class SignalStore:
                 (signal_type, description, category, unit, now, now),
             )
 
-    def list_signal_types(self) -> list[dict[str, Any]]:
+    def list_signal_types(self, *, tenant_id: str = "default") -> list[dict[str, Any]]:
         """List all registered signal types with mapping counts."""
         with self._conn() as conn:
-            rows = conn.execute("""SELECT st.*, COUNT(m.id) AS mapping_count
+            rows = conn.execute(
+                """SELECT st.*, COUNT(m.id) AS mapping_count
                    FROM signal_types st
                    LEFT JOIN signal_metric_mappings m
                      ON st.signal_type = m.signal_type
+                    AND (m.tenant_id = ? OR (m.tenant_id = 'default' AND m.source_type = 'bootstrap'))
                    GROUP BY st.signal_type
-                   ORDER BY st.category, st.signal_type""").fetchall()
+                   ORDER BY st.category, st.signal_type""",
+                (tenant_id,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_signal_type(self, signal_type: str) -> dict[str, Any] | None:
+    def get_signal_type(self, signal_type: str, *, tenant_id: str = "default") -> dict[str, Any] | None:
         """Get a signal type with all its metric mappings."""
         with self._conn() as conn:
             st = conn.execute(
@@ -212,8 +216,10 @@ class SignalStore:
 
             mappings = conn.execute(
                 """SELECT * FROM signal_metric_mappings
-                   WHERE signal_type = ? ORDER BY confidence DESC""",
-                (signal_type,),
+                   WHERE signal_type = ?
+                     AND (tenant_id = ? OR (tenant_id = 'default' AND source_type = 'bootstrap'))
+                   ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END, confidence DESC""",
+                (signal_type, tenant_id, tenant_id),
             ).fetchall()
 
         result = dict(st)
@@ -236,6 +242,7 @@ class SignalStore:
         source_refs: list[str] | None = None,
         inference_version: str = "",
         review_state: str = "trusted",
+        tenant_id: str = "default",
     ) -> int:
         """Add or update a signal-to-metric mapping. Returns mapping ID.
 
@@ -274,9 +281,9 @@ class SignalStore:
                 """SELECT context_services, context_datasource_types,
                           context_environments, context_archetypes,
                           source_refs, inference_version, review_state
-                     FROM signal_metric_mappings
-                    WHERE signal_type = ? AND metric_pattern = ?""",
-                (signal_type, metric_pattern),
+                    FROM signal_metric_mappings
+                    WHERE tenant_id = ? AND signal_type = ? AND metric_pattern = ?""",
+                (tenant_id, signal_type, metric_pattern),
             ).fetchone()
 
             def _merge(provided: list[str] | None, existing_json: str | None) -> list[str]:
@@ -307,13 +314,13 @@ class SignalStore:
 
             cursor = conn.execute(
                 """INSERT INTO signal_metric_mappings
-                   (signal_type, metric_pattern, confidence,
+                   (tenant_id, signal_type, metric_pattern, confidence,
                     context_services, context_datasource_types,
                     context_environments, context_archetypes,
                     source_type, source_refs, inference_version, review_state,
                     created_at, last_seen)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(signal_type, metric_pattern) DO UPDATE SET
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(tenant_id, signal_type, metric_pattern) DO UPDATE SET
                        confidence = MAX(excluded.confidence, signal_metric_mappings.confidence),
                        inference_version = excluded.inference_version,
                        review_state = excluded.review_state,
@@ -337,6 +344,7 @@ class SignalStore:
                        last_seen = excluded.last_seen,
                        use_count = signal_metric_mappings.use_count + 1""",
                 (
+                    tenant_id,
                     signal_type,
                     metric_pattern,
                     confidence,
@@ -411,15 +419,22 @@ class SignalStore:
             out.append(d)
         return out
 
-    def record_feedback(self, signal_type: str, metric_pattern: str, positive: bool) -> None:
+    def record_feedback(
+        self,
+        signal_type: str,
+        metric_pattern: str,
+        positive: bool,
+        *,
+        tenant_id: str = "default",
+    ) -> None:
         """Record positive/negative feedback for a mapping (anti-drift)."""
         col = "positive_feedback" if positive else "negative_feedback"
         with self._conn() as conn:
             conn.execute(
                 f"""UPDATE signal_metric_mappings
                     SET {col} = {col} + 1, last_seen = ?
-                    WHERE signal_type = ? AND metric_pattern = ?""",
-                (time.time(), signal_type, metric_pattern),
+                    WHERE tenant_id = ? AND signal_type = ? AND metric_pattern = ?""",
+                (time.time(), tenant_id, signal_type, metric_pattern),
             )
 
     def get_mappings_for_signal(
@@ -431,6 +446,7 @@ class SignalStore:
         context_archetype: str = "",
         context_environment: str = "",
         include_decayed: bool = False,
+        tenant_id: str = "default",
     ) -> list[dict[str, Any]]:
         """Get all metric mappings for a signal, optionally filtered by context.
 
@@ -440,14 +456,20 @@ class SignalStore:
         with self._conn() as conn:
             rows = conn.execute(
                 """SELECT * FROM signal_metric_mappings
-                   WHERE signal_type = ? ORDER BY confidence DESC""",
-                (signal_type,),
+                   WHERE signal_type = ?
+                     AND (tenant_id = ? OR (tenant_id = 'default' AND source_type = 'bootstrap'))
+                   ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END, confidence DESC""",
+                (signal_type, tenant_id, tenant_id),
             ).fetchall()
 
         now = time.time()
         results = []
+        seen_patterns: set[str] = set()
         for row in rows:
             m = _deserialize_mapping(row)
+            if m["metric_pattern"] in seen_patterns:
+                continue
+            seen_patterns.add(m["metric_pattern"])
 
             # Context filtering
             if not _context_matches(
@@ -494,6 +516,7 @@ class SignalStore:
         context_archetype: str = "",
         context_environment: str = "",
         target_query_language: str = "",
+        tenant_id: str = "default",
     ) -> list[tuple[MetricEntry, float]]:
         """Resolve a semantic signal to actual metrics from the live catalog.
 
@@ -516,6 +539,7 @@ class SignalStore:
             context_datasource_type=context_datasource_type,
             context_archetype=context_archetype,
             context_environment=context_environment,
+            tenant_id=tenant_id,
         )
 
         if not mappings:
@@ -526,7 +550,7 @@ class SignalStore:
         matched: list[tuple[MetricEntry, float]] = []
         seen_metrics: set[tuple[str, str]] = set()
 
-        sig_type = self.get_signal_type(signal_type)
+        sig_type = self.get_signal_type(signal_type, tenant_id=tenant_id)
 
         for mapping in mappings:
             pattern = mapping["metric_pattern"]
@@ -559,6 +583,7 @@ class SignalStore:
         context_datasource_type: str = "",
         context_archetype: str = "",
         target_query_language: str = "",
+        tenant_id: str = "default",
     ) -> dict[str, str]:
         """Resolve signal bindings to metric substitutions for archetype compile.
 
@@ -603,6 +628,7 @@ class SignalStore:
                 context_datasource_type=context_datasource_type,
                 context_archetype=context_archetype,
                 target_query_language=target_query_language,
+                tenant_id=tenant_id,
             )
 
             if resolved:
@@ -746,6 +772,7 @@ class SignalStore:
     def index_dashboard_context(
         self,
         *,
+        tenant_id: str = "default",
         dashboard_uid: str,
         backend_name: str = "",
         dashboard_title: str = "",
@@ -781,18 +808,18 @@ class SignalStore:
             with self._conn() as conn:
                 conn.execute(
                     """DELETE FROM learning_context_fts
-                       WHERE source_kind = 'dashboard_panel'
+                       WHERE tenant_id = ? AND source_kind = 'dashboard_panel'
                          AND dashboard_uid = ? AND backend_name = ?""",
-                    (dashboard_uid, backend_name),
+                    (tenant_id, dashboard_uid, backend_name),
                 )
                 conn.executemany(
                     """INSERT INTO learning_context_fts
-                       (source_kind, source_id, backend_name, dashboard_uid,
+                       (tenant_id, source_kind, source_id, backend_name, dashboard_uid,
                         dashboard_title, dashboard_tags, panel_title, metric_name,
                         query_text, service, signal_type, review_state, reason,
                         provenance, indexed_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    rows,
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [(tenant_id, *row) for row in rows],
                 )
         except sqlite3.OperationalError as exc:
             logger.warning("learning_context_index_failed", error=str(exc))
@@ -1136,6 +1163,7 @@ class SignalStore:
     def index_artifact_context(
         self,
         *,
+        tenant_id: str = "default",
         artifact_id: str,
         artifact_type: str,
         title: str = "",
@@ -1256,17 +1284,18 @@ class SignalStore:
         try:
             with self._conn() as conn:
                 conn.execute(
-                    "DELETE FROM learning_context_fts WHERE source_kind = ? AND source_id = ?",
-                    (artifact_type, artifact_id),
+                    """DELETE FROM learning_context_fts
+                       WHERE tenant_id = ? AND source_kind = ? AND source_id = ?""",
+                    (tenant_id, artifact_type, artifact_id),
                 )
                 conn.executemany(
                     """INSERT INTO learning_context_fts
-                       (source_kind, source_id, backend_name, dashboard_uid,
+                       (tenant_id, source_kind, source_id, backend_name, dashboard_uid,
                         dashboard_title, dashboard_tags, panel_title, metric_name,
                         query_text, service, signal_type, review_state, reason,
                         provenance, indexed_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    rows,
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [(tenant_id, *row) for row in rows],
                 )
         except sqlite3.OperationalError as exc:
             logger.warning("artifact_context_index_failed", error=str(exc))
@@ -1318,16 +1347,16 @@ class SignalStore:
                 try:
                     conn.execute(
                         f"""DELETE FROM learning_context_fts
-                            WHERE source_kind = ?
+                            WHERE tenant_id = ? AND source_kind = ?
                               AND source_id IN ({placeholders})""",
-                        (artifact_type, *missing),
+                        (tenant_id, artifact_type, *missing),
                     )
                 except sqlite3.OperationalError as exc:
                     logger.warning("stale_artifact_context_update_failed", error=str(exc))
             mapping_rows = conn.execute(
                 """SELECT id, source_refs FROM signal_metric_mappings
-                   WHERE source_type = ?""",
-                (artifact_type,),
+                   WHERE tenant_id = ? AND source_type = ?""",
+                (tenant_id, artifact_type),
             ).fetchall()
             missing_set = set(missing)
             for mapping in mapping_rows:
@@ -1445,7 +1474,13 @@ class SignalStore:
             "signal_mapping_candidates": int(signal_candidates["count"] if signal_candidates else 0),
         }
 
-    def artifact_context_indexed(self, *, artifact_id: str, artifact_type: str) -> bool:
+    def artifact_context_indexed(
+        self,
+        *,
+        tenant_id: str = "default",
+        artifact_id: str,
+        artifact_type: str,
+    ) -> bool:
         """Return whether an artifact has rows in the optional learning index."""
         if not self._learning_index_available():
             return True
@@ -1453,9 +1488,9 @@ class SignalStore:
             with self._conn() as conn:
                 row = conn.execute(
                     """SELECT 1 FROM learning_context_fts
-                       WHERE source_kind = ? AND source_id = ?
+                       WHERE tenant_id = ? AND source_kind = ? AND source_id = ?
                        LIMIT 1""",
-                    (artifact_type, artifact_id),
+                    (tenant_id, artifact_type, artifact_id),
                 ).fetchone()
         except sqlite3.OperationalError as exc:
             logger.warning("artifact_context_index_check_failed", error=str(exc))
@@ -1497,10 +1532,10 @@ class SignalStore:
                     conn.execute(
                         f"""UPDATE learning_context_fts
                             SET review_state = 'stale'
-                            WHERE source_kind = 'alert_rule'
+                            WHERE tenant_id = ? AND source_kind = 'alert_rule'
                               AND backend_name = ?
                               AND dashboard_uid IN ({fts_placeholders})""",
-                        (backend_name, *alert_context_ids),
+                        (tenant_id, backend_name, *alert_context_ids),
                     )
                 except sqlite3.OperationalError as exc:
                     logger.warning("stale_alert_context_update_failed", error=str(exc))
@@ -1509,6 +1544,7 @@ class SignalStore:
     def index_alert_context(
         self,
         *,
+        tenant_id: str = "default",
         alert_uid: str,
         backend_name: str = "",
         alert_title: str = "",
@@ -1543,17 +1579,18 @@ class SignalStore:
             with self._conn() as conn:
                 conn.execute(
                     """DELETE FROM learning_context_fts
-                       WHERE source_kind = 'alert_rule' AND dashboard_uid = ? AND backend_name = ?""",
-                    (f"alert:{alert_uid}", backend_name),
+                       WHERE tenant_id = ? AND source_kind = 'alert_rule'
+                         AND dashboard_uid = ? AND backend_name = ?""",
+                    (tenant_id, f"alert:{alert_uid}", backend_name),
                 )
                 conn.executemany(
                     """INSERT INTO learning_context_fts
-                       (source_kind, source_id, backend_name, dashboard_uid,
+                       (tenant_id, source_kind, source_id, backend_name, dashboard_uid,
                         dashboard_title, dashboard_tags, panel_title, metric_name,
                         query_text, service, signal_type, review_state, reason,
                         provenance, indexed_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    rows,
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [(tenant_id, *row) for row in rows],
                 )
         except sqlite3.OperationalError as exc:
             logger.warning("alert_context_index_failed", error=str(exc))
@@ -1566,6 +1603,7 @@ class SignalStore:
         review_state: str,
         backend_name: str | None = None,
         activated_pairs: set[tuple[str, str]] | None = None,
+        tenant_id: str = "default",
     ) -> int:
         """Reflect dashboard approval/rejection in the retrieval index."""
         if not self._learning_index_available():
@@ -1577,47 +1615,48 @@ class SignalStore:
                     if backend_name is None:
                         cursor = conn.execute(
                             """UPDATE learning_context_fts SET review_state = 'candidate'
-                               WHERE source_kind = 'dashboard_panel' AND dashboard_uid = ?""",
-                            (dashboard_uid,),
+                               WHERE tenant_id = ? AND source_kind = 'dashboard_panel'
+                                 AND dashboard_uid = ?""",
+                            (tenant_id, dashboard_uid),
                         )
                     else:
                         cursor = conn.execute(
                             """UPDATE learning_context_fts SET review_state = 'candidate'
-                               WHERE source_kind = 'dashboard_panel'
+                               WHERE tenant_id = ? AND source_kind = 'dashboard_panel'
                                  AND dashboard_uid = ? AND backend_name = ?""",
-                            (dashboard_uid, backend),
+                            (tenant_id, dashboard_uid, backend),
                         )
                     rows_updated = cursor.rowcount
                     for metric, signal_type in activated_pairs:
                         if backend_name is None:
                             cursor = conn.execute(
                                 """UPDATE learning_context_fts SET review_state = 'approved'
-                                   WHERE source_kind = 'dashboard_panel'
+                                   WHERE tenant_id = ? AND source_kind = 'dashboard_panel'
                                      AND dashboard_uid = ? AND metric_name = ? AND signal_type = ?""",
-                                (dashboard_uid, metric, signal_type),
+                                (tenant_id, dashboard_uid, metric, signal_type),
                             )
                         else:
                             cursor = conn.execute(
                                 """UPDATE learning_context_fts SET review_state = 'approved'
-                                   WHERE source_kind = 'dashboard_panel'
+                                   WHERE tenant_id = ? AND source_kind = 'dashboard_panel'
                                      AND dashboard_uid = ? AND backend_name = ?
                                      AND metric_name = ? AND signal_type = ?""",
-                                (dashboard_uid, backend, metric, signal_type),
+                                (tenant_id, dashboard_uid, backend, metric, signal_type),
                             )
                         rows_updated += cursor.rowcount
                     return rows_updated
                 if backend_name is None:
                     cursor = conn.execute(
                         """UPDATE learning_context_fts SET review_state = ?
-                           WHERE source_kind = 'dashboard_panel' AND dashboard_uid = ?""",
-                        (review_state, dashboard_uid),
+                           WHERE tenant_id = ? AND source_kind = 'dashboard_panel' AND dashboard_uid = ?""",
+                        (review_state, tenant_id, dashboard_uid),
                     )
                 else:
                     cursor = conn.execute(
                         """UPDATE learning_context_fts SET review_state = ?
-                           WHERE source_kind = 'dashboard_panel'
+                           WHERE tenant_id = ? AND source_kind = 'dashboard_panel'
                              AND dashboard_uid = ? AND backend_name = ?""",
-                        (review_state, dashboard_uid, backend),
+                        (review_state, tenant_id, dashboard_uid, backend),
                     )
                 return cursor.rowcount
             except sqlite3.OperationalError as exc:
@@ -1631,6 +1670,7 @@ class SignalStore:
         service: str = "",
         include_candidates: bool = True,
         limit: int = 20,
+        tenant_id: str = "default",
     ) -> list[dict[str, Any]]:
         """Search the learned operational knowledge index."""
         if not self._learning_index_available():
@@ -1642,8 +1682,8 @@ class SignalStore:
         if not match_query:
             return []
 
-        clauses = ["learning_context_fts MATCH ?"]
-        params: list[Any] = [match_query]
+        clauses = ["learning_context_fts MATCH ?", "tenant_id = ?"]
+        params: list[Any] = [match_query, tenant_id]
         if service:
             clauses.append("lower(service) LIKE ?")
             params.append(f"%{service.lower()}%")
@@ -1672,6 +1712,7 @@ class SignalStore:
         *,
         include_candidates: bool = True,
         limit: int = 50,
+        tenant_id: str = "default",
     ) -> dict[str, Any]:
         """Summarize what Tacit has learned about a service."""
         rows = self.search_learning_context(
@@ -1679,6 +1720,7 @@ class SignalStore:
             service=service,
             include_candidates=include_candidates,
             limit=limit,
+            tenant_id=tenant_id,
         )
 
         dashboards: dict[str, dict[str, Any]] = {}
@@ -1878,9 +1920,15 @@ class SignalStore:
                     "approved",
                     backend_name,
                     activated_pairs=pairs,
+                    tenant_id=tenant_id,
                 )
             else:
-                self.update_learning_context_review_state(dashboard_uid, status, backend_name)
+                self.update_learning_context_review_state(
+                    dashboard_uid,
+                    status,
+                    backend_name,
+                    tenant_id=tenant_id,
+                )
         return changed
 
     def approve_ingested_dashboard(
@@ -1914,17 +1962,28 @@ class SignalStore:
 
     # ── Stats ────────────────────────────────────────────────────────────
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self, *, tenant_id: str = "default") -> dict[str, Any]:
         """Summary statistics for the signal store."""
         with self._conn() as conn:
             signal_count = conn.execute("SELECT COUNT(*) FROM signal_types").fetchone()[0]
-            mapping_count = conn.execute("SELECT COUNT(*) FROM signal_metric_mappings").fetchone()[0]
-            ingested_count = conn.execute("SELECT COUNT(*) FROM ingested_dashboards").fetchone()[0]
-            ingested_alert_count = conn.execute("SELECT COUNT(*) FROM ingested_alerts").fetchone()[0]
-            learned_artifact_count = conn.execute("SELECT COUNT(*) FROM learned_artifacts").fetchone()[0]
+            mapping_count = conn.execute(
+                "SELECT COUNT(*) FROM signal_metric_mappings WHERE tenant_id = ?", (tenant_id,)
+            ).fetchone()[0]
+            ingested_count = conn.execute(
+                "SELECT COUNT(*) FROM ingested_dashboards WHERE tenant_id = ?", (tenant_id,)
+            ).fetchone()[0]
+            ingested_alert_count = conn.execute(
+                "SELECT COUNT(*) FROM ingested_alerts WHERE tenant_id = ?", (tenant_id,)
+            ).fetchone()[0]
+            learned_artifact_count = conn.execute(
+                "SELECT COUNT(*) FROM learned_artifacts WHERE tenant_id = ?", (tenant_id,)
+            ).fetchone()[0]
 
-            by_source = conn.execute("""SELECT source_type, COUNT(*) as n
-                   FROM signal_metric_mappings GROUP BY source_type""").fetchall()
+            by_source = conn.execute(
+                """SELECT source_type, COUNT(*) as n
+                   FROM signal_metric_mappings WHERE tenant_id = ? GROUP BY source_type""",
+                (tenant_id,),
+            ).fetchall()
 
             by_category = conn.execute("""SELECT category, COUNT(*) as n
                    FROM signal_types GROUP BY category""").fetchall()

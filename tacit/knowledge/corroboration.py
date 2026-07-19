@@ -133,6 +133,11 @@ class ConflictDetectionService:
                 continue
             if not directly_negated and current["kind"] == KnowledgeKind.DEPENDENCY.value:
                 continue
+            if not directly_negated and current["kind"] not in {
+                KnowledgeKind.OWNERSHIP.value,
+                KnowledgeKind.SIGNAL_MAPPING.value,
+            }:
+                continue
             if (
                 not directly_negated
                 and current["object_ref"] == other["object_ref"]

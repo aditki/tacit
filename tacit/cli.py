@@ -1688,7 +1688,8 @@ def learn_ignore(dashboard_uid: str, backend: str):
 @click.option("--service", default="", help="Optional service/component filter")
 @click.option("--approved-only", is_flag=True, help="Only show approved/trusted context")
 @click.option("--limit", default=10, show_default=True, help="Maximum context rows")
-def learn_search(query: str, service: str, approved_only: bool, limit: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_search(query: str, service: str, approved_only: bool, limit: int, tenant: str | None):
     """Search learned dashboards, panels, metrics, and signal mappings."""
     _header("Search Learned Context")
     _load_env()
@@ -1702,6 +1703,7 @@ def learn_search(query: str, service: str, approved_only: bool, limit: int):
             service=service,
             include_candidates=not approved_only,
             limit=limit,
+            tenant_id=_knowledge_tenant(tenant),
         )
     except LearningIndexUnavailable as e:
         _fail(str(e))
@@ -1724,7 +1726,8 @@ def learn_search(query: str, service: str, approved_only: bool, limit: int):
 @click.argument("service")
 @click.option("--approved-only", is_flag=True, help="Only use approved/trusted context")
 @click.option("--limit", default=50, show_default=True, help="Maximum context rows")
-def learn_service(service: str, approved_only: bool, limit: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_service(service: str, approved_only: bool, limit: int, tenant: str | None):
     """Describe a service from learned operational context."""
     _header(f"Service Context: {service}")
     _load_env()
@@ -1736,6 +1739,7 @@ def learn_service(service: str, approved_only: bool, limit: int):
             service,
             include_candidates=not approved_only,
             limit=limit,
+            tenant_id=_knowledge_tenant(tenant),
         )
     except LearningIndexUnavailable as e:
         _fail(str(e))

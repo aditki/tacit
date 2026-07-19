@@ -145,6 +145,7 @@ def resolve_requirements_for_archetype(
     catalog: list[MetricEntry],
     *,
     target_language: str = "promql",
+    tenant_id: str = "default",
 ) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
     """Resolve one archetype's evidence needs against the live catalog."""
     from tacit.archetypes.engine import (
@@ -234,7 +235,13 @@ def resolve_requirements_for_archetype(
                 language_catalog = [
                     entry for entry in target_catalog if (entry.query_language or "").lower() == language.lower()
                 ]
-                signal_type = _legacy_metric_signal(store, default_metric, language_catalog, language)
+                signal_type = _legacy_metric_signal(
+                    store,
+                    default_metric,
+                    language_catalog,
+                    language,
+                    tenant_id,
+                )
                 if signal_type:
                     break
         if not signal_type:
@@ -258,6 +265,7 @@ def resolve_requirements_for_archetype(
                     context_datasource_type=target_datasource_type,
                     context_archetype=archetype.id,
                     target_query_language=language,
+                    tenant_id=tenant_id,
                 )
             )
         resolved.sort(key=lambda item: item[1], reverse=True)
@@ -313,6 +321,7 @@ def resolve_requirements_for_archetypes(
     catalog: list[MetricEntry],
     *,
     target_language: str = "promql",
+    tenant_id: str = "default",
 ) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
     """Resolve evidence needs for all selected archetypes."""
     requirements: list[EvidenceRequirement] = []
@@ -323,6 +332,7 @@ def resolve_requirements_for_archetypes(
             intent,
             catalog,
             target_language=target_language,
+            tenant_id=tenant_id,
         )
         requirements.extend(arch_requirements)
         resolutions.extend(arch_resolutions)

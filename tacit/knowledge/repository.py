@@ -703,7 +703,8 @@ class KnowledgeRepository:
                      SELECT 1 FROM proposition_candidates pc
                      JOIN knowledge_candidates c ON c.id=pc.candidate_id AND c.tenant_id=pc.tenant_id
                      WHERE pc.tenant_id=p.tenant_id AND pc.proposition_key=p.proposition_key
-                       AND c.review_state != 'rejected'
+                       AND c.review_state IN ('approved', 'trusted')
+                       AND c.lifecycle_status = 'active'
                    ) ORDER BY p.created_at""",
                 (tenant_id,),
             ).fetchall()

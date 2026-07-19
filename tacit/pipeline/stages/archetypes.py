@@ -38,6 +38,7 @@ def select_archetypes(
     catalog_for_compile: list[MetricEntry],
     target_language: str,
     settings: Settings,
+    tenant_id: str = "default",
 ) -> ArchetypeSelection:
     """Select learned/classifier archetypes and rank them by live coverage."""
     ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
@@ -65,6 +66,7 @@ def select_archetypes(
             services=intent.services,
             max_archetypes=settings.max_blended_archetypes,
             min_secondary_coverage=settings.min_secondary_coverage,
+            tenant_id=tenant_id,
         )
 
     return ArchetypeSelection(
@@ -80,6 +82,7 @@ def compile_selected_archetypes(
     intent: Intent,
     catalog_for_compile: list[MetricEntry],
     timings: dict[str, float],
+    tenant_id: str = "default",
 ) -> ArchetypeCompilation | None:
     """Compile a dashboard from selected archetypes, if any."""
     if not selection.ranked_archetypes:
@@ -93,6 +96,7 @@ def compile_selected_archetypes(
             intent,
             catalog_for_compile,
             target_language=selection.target_language,
+            tenant_id=tenant_id,
         )
     else:
         dashboard_spec = compile_archetype(
@@ -100,6 +104,7 @@ def compile_selected_archetypes(
             intent,
             catalog_for_compile,
             target_language=selection.target_language,
+            tenant_id=tenant_id,
         )
     timings["archetype_compile"] = time.monotonic() - t0
     stage_log(
