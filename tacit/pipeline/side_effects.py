@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Iterable
 
 import structlog
@@ -22,7 +23,16 @@ def safe_finish_timeout_history(
     """Best-effort timeout history persistence."""
     try:
         store = history_store_factory()
-        inv_id = store.start(request.prompt, request.user_id, request.channel_id)
+        start_parameters = inspect.signature(store.start).parameters
+        if "tenant_id" in start_parameters:
+            inv_id = store.start(
+                request.prompt,
+                request.user_id,
+                request.channel_id,
+                tenant_id=request.tenant_id or "default",
+            )
+        else:
+            inv_id = store.start(request.prompt, request.user_id, request.channel_id)
         store.finish(
             inv_id,
             status="timeout",

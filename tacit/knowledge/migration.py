@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from tacit.knowledge.enums import EvidenceRole, KnowledgeKind, LineageKind, Predicate, ReviewState
+from tacit.knowledge.enums import (
+    EvidenceRole,
+    KnowledgeEligibility,
+    KnowledgeKind,
+    LifecycleStatus,
+    LineageKind,
+    Predicate,
+    ReviewState,
+)
 from tacit.knowledge.models import KnowledgeCandidate, KnowledgeEvidenceReference, KnowledgeScope, MigrationProvenance
 from tacit.knowledge.normalization import normalize_service_ref, stable_fingerprint
 from tacit.knowledge.service import KnowledgeService, _source_family
@@ -74,6 +82,7 @@ def migrate_artifact_extractions(
                 tenant_id=tenant_id,
                 candidate_id=candidate_id,
                 migration_provenance=MigrationProvenance(original_record_ref=f"{collection}:{row['id']}"),
+                reactivate_stale=True,
             )
             legacy_review = str(row.get("review_state", ReviewState.CANDIDATE.value))
             if (
@@ -135,6 +144,7 @@ def migrate_signal_mapping(
         tenant_id=tenant_id,
         candidate_id=candidate_id,
         migration_provenance=MigrationProvenance(original_record_ref=f"signal_mapping:{record_ref}"),
+        reactivate_stale=True,
     )
     review = str(row.get("review_state", ReviewState.CANDIDATE.value))
     if existing is None and review in {state.value for state in ReviewState} and review != ReviewState.CANDIDATE.value:
@@ -153,12 +163,15 @@ def _service_ref(value: str) -> str:
 def _evaluate_imported_approval(service: KnowledgeService, candidate: KnowledgeCandidate) -> None:
     if candidate.state.review_state not in {ReviewState.APPROVED, ReviewState.TRUSTED}:
         return
+    item = service.repository.find_knowledge_by_proposition(
+        candidate.tenant_id,
+        candidate.proposition.proposition_key,
+    )
+    current = service.repository.get_revision(item.id, tenant_id=candidate.tenant_id) if item is not None else None
     if (
-        service.repository.find_knowledge_by_proposition(
-            candidate.tenant_id,
-            candidate.proposition.proposition_key,
-        )
-        is None
+        current is None
+        or current.state.lifecycle_status != LifecycleStatus.ACTIVE
+        or current.state.eligibility == KnowledgeEligibility.INELIGIBLE
     ):
         service.evaluate_candidate(candidate.id, tenant_id=candidate.tenant_id)
 

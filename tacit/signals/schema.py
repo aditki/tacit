@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
 -- Inferred candidates that were NOT auto-taught (negative training data).
 CREATE TABLE IF NOT EXISTS rejected_signal_candidates (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
     dashboard_uid       TEXT NOT NULL DEFAULT '',
     backend_name        TEXT NOT NULL DEFAULT '',
     metric              TEXT NOT NULL,
@@ -101,6 +102,8 @@ CREATE TABLE IF NOT EXISTS ingested_dashboards (
     status              TEXT NOT NULL DEFAULT 'pending',
     signals_inferred    TEXT NOT NULL DEFAULT '[]',
     archetype_generated TEXT NOT NULL DEFAULT '',
+    stale               INTEGER NOT NULL DEFAULT 0,
+    missing_since       REAL,
 
     created_at          REAL NOT NULL,
     reviewed_at         REAL,

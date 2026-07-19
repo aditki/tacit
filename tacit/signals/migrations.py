@@ -45,6 +45,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     """Install base schema and run additive migrations."""
     conn.executescript(SCHEMA_SQL)
     ensure_learning_index(conn)
+    ensure_ingested_dashboard_columns(conn)
     ensure_ingested_dashboard_backend_scope(conn)
     ensure_ingested_alert_columns(conn)
     ensure_ingested_alert_tenant_scope(conn)
@@ -52,6 +53,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_artifact_tenant_scope(conn)
     ensure_mapping_columns(conn)
     ensure_mapping_tenant_scope(conn)
+    ensure_rejected_candidate_tenant_scope(conn)
 
 
 def ensure_learning_index(conn: sqlite3.Connection) -> None:
@@ -88,6 +90,17 @@ def ensure_mapping_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN inference_version TEXT NOT NULL DEFAULT ''")
     if "review_state" not in columns:
         conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN review_state TEXT NOT NULL DEFAULT 'trusted'")
+
+
+def ensure_rejected_candidate_tenant_scope(conn: sqlite3.Connection) -> None:
+    """Keep negative signal-training records within their tenant boundary."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(rejected_signal_candidates)").fetchall()}
+    if "tenant_id" not in columns:
+        conn.execute("ALTER TABLE rejected_signal_candidates ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_rejected_signal_tenant_created
+           ON rejected_signal_candidates(tenant_id, created_at)"""
+    )
 
 
 def ensure_mapping_tenant_scope(conn: sqlite3.Connection) -> None:
@@ -154,6 +167,15 @@ def ensure_ingested_dashboard_backend_scope(conn: sqlite3.Connection) -> None:
         if indexed_cols == ["tenant_id", "dashboard_uid", "backend_name"]:
             return
     rebuild_ingested_dashboards_table(conn)
+
+
+def ensure_ingested_dashboard_columns(conn: sqlite3.Connection) -> None:
+    """Add source-lifecycle fields to dashboard records."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(ingested_dashboards)").fetchall()}
+    if "stale" not in columns:
+        conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN stale INTEGER NOT NULL DEFAULT 0")
+    if "missing_since" not in columns:
+        conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN missing_since REAL")
 
 
 def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
@@ -399,6 +421,8 @@ def _rebuild_ingested_dashboards_table(conn: sqlite3.Connection, tenant_select: 
             status              TEXT NOT NULL DEFAULT 'pending',
             signals_inferred    TEXT NOT NULL DEFAULT '[]',
             archetype_generated TEXT NOT NULL DEFAULT '',
+            stale               INTEGER NOT NULL DEFAULT 0,
+            missing_since       REAL,
             created_at          REAL NOT NULL,
             reviewed_at         REAL,
             UNIQUE(tenant_id, dashboard_uid, backend_name)
@@ -410,12 +434,12 @@ def _rebuild_ingested_dashboards_table(conn: sqlite3.Connection, tenant_select: 
             metrics_found, panel_count, row_groups, metric_cooccurrence,
             aggregation_patterns, query_transformations, panel_titles,
             alert_links, drilldown_links, status, signals_inferred,
-            archetype_generated, created_at, reviewed_at)
+            archetype_generated, stale, missing_since, created_at, reviewed_at)
            SELECT id, {tenant_select}, dashboard_uid, COALESCE(backend_name, ''), dashboard_title, dashboard_tags,
                   metrics_found, panel_count, row_groups, metric_cooccurrence,
                   aggregation_patterns, query_transformations, panel_titles,
                   alert_links, drilldown_links, status, signals_inferred,
-                  archetype_generated, created_at, reviewed_at
+                  archetype_generated, stale, missing_since, created_at, reviewed_at
            FROM ingested_dashboards_old""")
     conn.execute("DROP TABLE ingested_dashboards_old")
     conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_tenant_uid_backend

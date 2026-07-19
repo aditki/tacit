@@ -1274,8 +1274,8 @@
 
       try {
         const [listResp, statsResp] = await Promise.all([
-          fetch(`${BASE}/api/v1/signals`),
-          fetch(`${BASE}/api/v1/signals/stats`),
+          fetch(`${BASE}/api/v1/signals`, { headers: knowledgeHeaders() }),
+          fetch(`${BASE}/api/v1/signals/stats`, { headers: knowledgeHeaders() }),
         ]);
         const signals = await listResp.json();
         const stats = await statsResp.json();
@@ -1321,7 +1321,9 @@
       const el = document.getElementById('signals-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const resp = await fetch(`${BASE}/api/v1/signals/${encodeURIComponent(signalType)}`);
+        const resp = await fetch(`${BASE}/api/v1/signals/${encodeURIComponent(signalType)}`, {
+          headers: knowledgeHeaders(),
+        });
         if (!resp.ok) throw new Error('Not found');
         const data = await resp.json();
         const mappings = data.mappings || [];
@@ -1376,7 +1378,7 @@
         if (service) body.services = [service];
         const resp = await fetch(`${BASE}/api/v1/signals/teach`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: knowledgeHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify(body),
         });
         if (!resp.ok) {

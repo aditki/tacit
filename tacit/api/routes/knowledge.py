@@ -7,6 +7,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+import tacit.history as history_mod
 from tacit.api.security import (
     assert_knowledge_permission,
     knowledge_tenant,
@@ -260,6 +261,21 @@ async def create_alias(payload: AliasRequest, request: Request):
 )
 async def create_correction(payload: CorrectionRequest, request: Request):
     tenant_id = _tenant(request)
+    contract = history_mod.get_investigation_store().get_contract(
+        payload.investigation_id,
+        payload.investigation_revision,
+    )
+    if contract is None:
+        raise HTTPException(status_code=404, detail="Investigation revision not found")
+    if str(contract.request.scope.tenant_id or "default") != tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant access denied")
+    if payload.target_ref and payload.target_ref not in {
+        usage.knowledge_ref for usage in contract.knowledge_usage
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Correction target was not considered by the referenced investigation revision",
+        )
     try:
         correction, candidate = get_knowledge_service().create_correction(
             investigation_id=payload.investigation_id,

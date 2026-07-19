@@ -126,6 +126,7 @@ class KnowledgeService:
         tenant_id: str = "default",
         candidate_id: str | None = None,
         migration_provenance: MigrationProvenance | None = None,
+        reactivate_stale: bool = False,
     ) -> KnowledgeCandidate:
         knowledge_kind = KnowledgeKind(kind)
         scope = scope or KnowledgeScope(tenant_id=tenant_id)
@@ -197,9 +198,17 @@ class KnowledgeService:
             proposition_changed = existing.proposition.proposition_key != candidate.proposition.proposition_key
             if proposition_changed and not self._is_entity_resolution_repair(existing, candidate):
                 raise ValueError("candidate identity cannot be reused for a different proposition")
+            existing_state = existing.state
+            if reactivate_stale and existing_state.lifecycle_status == LifecycleStatus.STALE:
+                existing_state = existing_state.model_copy(
+                    update={
+                        "lifecycle_status": LifecycleStatus.ACTIVE,
+                        "eligibility": KnowledgeEligibility.INELIGIBLE,
+                    }
+                )
             candidate = candidate.model_copy(
                 update={
-                    "state": existing.state,
+                    "state": existing_state,
                     "corroboration": existing.corroboration,
                     "policy": existing.policy,
                     "security_flags": sorted(set(existing.security_flags + candidate.security_flags)),
@@ -255,6 +264,12 @@ class KnowledgeService:
             raise PermissionError("knowledge.trust permission is required")
         review_state = ReviewState.TRUSTED if trust else ReviewState.APPROVED if approved else ReviewState.REJECTED
         if candidate.state.review_state == review_state:
+            if review_state == ReviewState.REJECTED:
+                self._reconcile_removed_candidates(
+                    [candidate],
+                    lifecycle_status=LifecycleStatus.WITHDRAWN,
+                    reason="candidate_rejected",
+                )
             return candidate
         state = candidate.state.model_copy(
             update={
@@ -274,6 +289,11 @@ class KnowledgeService:
             decision = self._state_decision(updated, PromotionDecisionType.REJECT, "rejected_by_review")
             self.repository.save_promotion_decision(decision, tenant_id)
             self._resolve_conflicts_for_rejected_proposition(updated, reviewer)
+            self._reconcile_removed_candidates(
+                [updated],
+                lifecycle_status=LifecycleStatus.WITHDRAWN,
+                reason="candidate_rejected",
+            )
         self.repository.append_event(
             "correction_reviewed" if candidate.kind == KnowledgeKind.ARTIFACT_QUALITY else "promotion_evaluated",
             tenant_id=tenant_id,
@@ -382,6 +402,7 @@ class KnowledgeService:
             self.repository.get_revision(existing.id, tenant_id=tenant_id) if existing is not None else None
         )
         if current_revision is not None and current_revision.semantic_fingerprint == semantic:
+            self._sync_signal_mapping_state(current_revision)
             return decision, current_revision
         revision = KnowledgeRevision(
             knowledge_id=knowledge_id,
@@ -402,6 +423,7 @@ class KnowledgeService:
             semantic_fingerprint=semantic,
         )
         self.repository.persist_revision(revision, candidate_id=candidate.id, decision_ref=decision.decision_id)
+        self._sync_signal_mapping_state(revision)
         self.repository.append_event(
             "knowledge_promoted" if revision_number == 1 else "knowledge_revised",
             tenant_id=tenant_id,
@@ -849,6 +871,7 @@ class KnowledgeService:
             }
         )
         self.repository.persist_revision(revision, candidate_id=candidate.id, decision_ref=decision.decision_id)
+        self._sync_signal_mapping_state(revision)
         self.repository.append_event(
             "knowledge_superseded",
             tenant_id=tenant_id,
@@ -890,13 +913,30 @@ class KnowledgeService:
             self.repository.save_candidate(updated)
             retired_candidates.append(updated)
 
-        lifecycle_revisions = []
-        retired_ids = {candidate.id for candidate in retired_candidates}
+        return self._reconcile_removed_candidates(
+            retired_candidates,
+            lifecycle_status=LifecycleStatus.STALE,
+            reason="source_stale" if source_stale else "source_changed",
+        )
+
+    def _reconcile_removed_candidates(
+        self,
+        removed_candidates: list[KnowledgeCandidate],
+        *,
+        lifecycle_status: LifecycleStatus,
+        reason: str,
+    ) -> list[KnowledgeRevision]:
+        """Recompute promoted knowledge after support is removed."""
+        if not removed_candidates:
+            return []
+        tenant_id = removed_candidates[0].tenant_id
+        lifecycle_revisions: list[KnowledgeRevision] = []
+        retired_ids = {candidate.id for candidate in removed_candidates}
         for current in self.repository.list_current_revisions(tenant_id):
             matching_ids = retired_ids.intersection(current.promoted_from_candidate_refs)
             if not matching_ids or current.state.lifecycle_status != LifecycleStatus.ACTIVE:
                 continue
-            candidate = next(candidate for candidate in retired_candidates if candidate.id in matching_ids)
+            candidate = next(candidate for candidate in removed_candidates if candidate.id in matching_ids)
             surviving_candidates = self.corroboration.reviewed_candidates(
                 tenant_id,
                 current.proposition.proposition_key,
@@ -913,8 +953,8 @@ class KnowledgeService:
                 self._retire_knowledge(
                     current,
                     candidate,
-                    lifecycle_status=LifecycleStatus.STALE,
-                    reason="source_stale" if source_stale else "source_changed",
+                    lifecycle_status=lifecycle_status,
+                    reason=reason,
                 )
             )
         return lifecycle_revisions
@@ -955,6 +995,7 @@ class KnowledgeService:
             candidate_id=candidate.id,
             decision_ref=decision.decision_id,
         )
+        self._sync_signal_mapping_state(revision)
         self.repository.append_event(
             "knowledge_retired",
             tenant_id=current.tenant_id,
@@ -967,6 +1008,32 @@ class KnowledgeService:
             payload={"candidate_id": candidate.id, "revision": revision.revision},
         )
         return revision
+
+    def _sync_signal_mapping_state(self, revision: KnowledgeRevision) -> None:
+        """Project governed signal eligibility into the legacy resolver index."""
+        if revision.proposition.kind != KnowledgeKind.SIGNAL_MAPPING:
+            return
+        from tacit.signals.store import SignalStore
+
+        signal_type = revision.proposition.concept_ref.removeprefix("signal:")
+        metric_pattern = revision.proposition.object_ref.removeprefix("concept:")
+        if not signal_type or not metric_pattern:
+            return
+        active = (
+            revision.state.lifecycle_status == LifecycleStatus.ACTIVE
+            and revision.state.eligibility != KnowledgeEligibility.INELIGIBLE
+        )
+        review_state = (
+            revision.state.review_state.value
+            if active and revision.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
+            else ReviewState.CANDIDATE.value
+        )
+        SignalStore(self.repository._db_path).set_mapping_review_state(
+            signal_type,
+            metric_pattern,
+            review_state,
+            tenant_id=revision.tenant_id,
+        )
 
     def impact(self, knowledge_id: str, tenant_id: str = "default") -> KnowledgeImpact:
         usage = self.repository.list_usage(tenant_id=tenant_id, knowledge_id=knowledge_id)
