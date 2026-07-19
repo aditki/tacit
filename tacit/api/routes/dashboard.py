@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from tacit.api.dependencies import get_pipeline_dependencies
-from tacit.api.security import sanitize_prompt, verify_api_key
+from tacit.api.security import resolve_knowledge_tenant, sanitize_prompt, verify_api_key
 from tacit.dependencies import PipelineDependencies
 from tacit.models.schemas import DashRequest, DashResponse
 from tacit.pipeline import run_pipeline
@@ -18,6 +18,14 @@ from tacit.pipeline.progress import reset_progress_callback, set_progress_callba
 
 logger = structlog.get_logger()
 router = APIRouter()
+
+
+def _configured_tenant(request: DashRequest, deps: PipelineDependencies) -> str:
+    return resolve_knowledge_tenant(
+        getattr(deps.settings, "knowledge_tenant_id", "default"),
+        request.tenant_id,
+        reject_pinned_override=False,
+    )
 
 
 @router.post(
@@ -33,7 +41,9 @@ async def create_chart(
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     """Generate a Grafana dashboard from a natural-language prompt."""
-    request = request.model_copy(update={"prompt": sanitize_prompt(request.prompt)})
+    request = request.model_copy(
+        update={"prompt": sanitize_prompt(request.prompt), "tenant_id": _configured_tenant(request, deps)}
+    )
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
     try:
@@ -65,7 +75,9 @@ async def create_chart_stream(
     ranking, publish, ...) as the investigation is built, followed by a final
     `result` event containing the standard DashResponse JSON.
     """
-    request = request.model_copy(update={"prompt": sanitize_prompt(request.prompt)})
+    request = request.model_copy(
+        update={"prompt": sanitize_prompt(request.prompt), "tenant_id": _configured_tenant(request, deps)}
+    )
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 

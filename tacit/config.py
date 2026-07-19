@@ -164,6 +164,11 @@ class Settings(BaseSettings):
     # HTTP API auth
     api_auth_enabled: bool = False  # set True to require API key
     api_auth_key: str = Field(default="", repr=False)
+    knowledge_tenant_id: str = "default"
+    knowledge_permissions: str = (
+        "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.correct,knowledge.export,"
+        "knowledge.override"
+    )
 
     # App
     log_level: str = "INFO"

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -28,6 +30,9 @@ from tacit.pipeline.discovery import (
     discovery_keywords,
     semantic_mapping_diagnostics,
 )
+
+if TYPE_CHECKING:
+    from tacit.knowledge.models import KnowledgeUsage
 from tacit.pipeline.failures import PipelineFailureFactory, handle_empty_catalog
 from tacit.pipeline.recording import (
     PipelineRecorder,
@@ -98,6 +103,11 @@ async def run_pipeline(
     """End-to-end: natural language → Grafana dashboard URL."""
     deps = deps or _default_dependencies()
     runtime_settings = deps.settings
+    configured_tenant = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
+    if configured_tenant == "*" and not request.tenant_id:
+        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
+    tenant_id = request.tenant_id if configured_tenant == "*" else configured_tenant
+    request = request.model_copy(update={"tenant_id": tenant_id})
     bind_request_id()
     sem = _get_semaphore(runtime_settings.pipeline_max_concurrent)
     try:
@@ -169,7 +179,17 @@ async def _run_pipeline_inner(
     t_start = time.monotonic()
     timings: dict[str, float] = {}
     history = deps.history_store_factory()
-    inv_id = investigation_id or history.start(request.prompt, request.user_id or "", request.channel_id or "")
+    if investigation_id:
+        inv_id = investigation_id
+    elif "tenant_id" in inspect.signature(history.start).parameters:
+        inv_id = history.start(
+            request.prompt,
+            request.user_id or "",
+            request.channel_id or "",
+            tenant_id=request.tenant_id or "default",
+        )
+    else:
+        inv_id = history.start(request.prompt, request.user_id or "", request.channel_id or "")
     if base_revision is None and investigation_id and hasattr(history, "get_contract"):
         current_contract = history.get_contract(investigation_id)
         base_revision = current_contract.investigation.revision if current_contract else None
@@ -246,6 +266,7 @@ async def _run_pipeline_inner(
             intent=intent,
             timings=runtime.timings,
             recorder=runtime.recorder,
+            tenant_id=request.tenant_id,
         )
         catalog_discovery = discovery_stage.discovery
         metric_catalog = catalog_discovery.metric_catalog
@@ -273,6 +294,7 @@ async def _run_pipeline_inner(
             catalog_for_compile=catalog_for_compile,
             target_language=target_language,
             settings=runtime.settings,
+            tenant_id=request.tenant_id,
         )
         ranked_archetypes = selection.ranked_archetypes
         learned_archetypes = selection.learned_archetypes
@@ -284,6 +306,7 @@ async def _run_pipeline_inner(
             intent=intent,
             catalog_for_compile=catalog_for_compile,
             timings=runtime.timings,
+            tenant_id=request.tenant_id,
         )
         if compilation is not None:
             dashboard_spec = compilation.dashboard_spec
@@ -309,6 +332,7 @@ async def _run_pipeline_inner(
             intent=intent,
             catalog=catalog_for_compile,
             target_language=target_language,
+            tenant_id=request.tenant_id,
         )
         evidence_requirements = evidence_stage.requirements
         evidence_resolutions = evidence_stage.resolutions
@@ -353,6 +377,7 @@ async def _run_pipeline_inner(
             target_language=target_language,
             ranked_archetypes_present=bool(ranked_archetypes),
             record_stage=record_validation_stage,
+            tenant_id=request.tenant_id,
         )
         dashboard_spec = validation_result.dashboard_spec
         validation_warnings = validation_result.validation_warnings
@@ -365,6 +390,34 @@ async def _run_pipeline_inner(
             evidence_resolutions=evidence_resolutions,
             evidence_observations=validation_result.evidence_observations,
         )
+        baseline_culprit_ranking = culprit_ranking
+        knowledge_snapshot = None
+        knowledge_usage: list[KnowledgeUsage] = []
+        try:
+            from tacit.knowledge.scope import investigation_knowledge_scope
+            from tacit.knowledge.service import get_knowledge_service
+
+            tenant_id = request.tenant_id or getattr(runtime_settings, "knowledge_tenant_id", "default")
+            knowledge_scope = investigation_knowledge_scope(
+                tenant_id=tenant_id,
+                prompt=request.prompt,
+                services=intent.services,
+                archetype_ids={
+                    *[archetype.id for archetype, _ in ranked_archetypes],
+                    *[match.type for match in intent.archetypes],
+                    intent.problem_type,
+                },
+            )
+            knowledge_service = get_knowledge_service()
+            knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(knowledge_scope)
+            knowledge_usage = knowledge_service.reconcile_live_observations(
+                knowledge_usage,
+                validation_result.evidence_observations,
+            )
+            knowledge_snapshot = knowledge_service.snapshot_from_usage(tenant_id, knowledge_usage)
+            culprit_ranking = knowledge_service.apply_to_ranking(culprit_ranking, knowledge_usage)
+        except Exception:
+            logger.warning("operational_knowledge_selection_failed", exc_info=True)
         ranking_status = "passed" if culprit_ranking.candidates else "skipped"
         ranking_reason = (
             culprit_ranking.abstention_reason
@@ -414,7 +467,10 @@ async def _run_pipeline_inner(
             evidence_resolutions=evidence_resolutions,
             evidence_observations=validation_result.evidence_observations,
             culprit_ranking=culprit_ranking,
+            baseline_culprit_ranking=baseline_culprit_ranking,
             context_chunks=context_chunks,
+            knowledge_snapshot=knowledge_snapshot,
+            knowledge_usage=knowledge_usage,
             run_type=run_type,
             revision_reason="refresh" if run_type == InvestigationRunType.REFRESH else "initial",
             base_revision=base_revision,

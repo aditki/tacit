@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import time
 
 import pytest
@@ -100,6 +101,18 @@ def test_runbook_causal_claim_does_not_emit_dependency_hint():
     assert result.dependency_hints == []
     assert result.evidence_requirements == []
     assert result.warnings == ["ignored_causal_claim:Root cause: checkout-api calls redis-cart"]
+
+
+@pytest.mark.parametrize("extractor", [RunbookExtractor(), IncidentExtractor()])
+def test_extractors_scan_full_lines_for_causal_claims_before_excerpt_truncation(extractor):
+    line = "checkout-api depends on redis-cart " + ("context " * 300) + "root cause"
+
+    result = extractor.extract(_artifact(line))
+
+    assert result.dependency_hints == []
+    assert len(result.warnings) == 1
+    assert result.warnings[0].startswith("ignored_causal_claim:checkout-api depends on redis-cart")
+    assert len(result.warnings[0].split(":", 1)[1]) == 2000
 
 
 def test_runbook_causal_claim_suppresses_continuation_dependency_hint():
@@ -311,6 +324,13 @@ def test_incident_ignored_rca_text_is_not_indexed(tmp_path, monkeypatch):
     assert result["warnings"] == ["ignored_causal_claim:Root cause: redis-cart"]
     assert store.search_learning_context("checkout_errors_total")
     assert store.search_learning_context("redis") == []
+
+
+def test_artifact_learning_requires_explicit_tenant_for_wildcard_config(monkeypatch):
+    monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
+
+    with pytest.raises(ValueError, match="tenant_id is required"):
+        learn_artifact(_artifact("## Checks\n- check Redis misses"), RunbookExtractor(), dry_run=True)
 
 
 def test_incident_resolution_section_body_is_not_indexed(tmp_path, monkeypatch):
@@ -753,6 +773,87 @@ def test_list_learned_artifacts_omits_body_text(tmp_path):
     assert "body_text" not in listed[0]
     assert detail is not None
     assert detail["body_text"] == artifact.body_text
+
+
+def test_learned_artifacts_and_extractions_are_tenant_scoped(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    for tenant_id, title in (("tenant-a", "Tenant A"), ("tenant-b", "Tenant B")):
+        store.record_learned_artifact(
+            tenant_id=tenant_id,
+            artifact_id="shared-artifact",
+            artifact_type="runbook",
+            title=title,
+            body_text=f"{title} body",
+            fingerprint=f"fingerprint-{tenant_id}",
+        )
+        store.replace_artifact_extractions(
+            tenant_id=tenant_id,
+            artifact_id="shared-artifact",
+            evidence_requirements=[
+                {
+                    "id": "shared-requirement",
+                    "subject": title,
+                    "evidence_kind": "latency",
+                }
+            ],
+        )
+
+    tenant_a = store.get_learned_artifact("shared-artifact", tenant_id="tenant-a")
+    tenant_b = store.get_learned_artifact("shared-artifact", tenant_id="tenant-b")
+    tenant_a_rows = store.list_artifact_extractions("shared-artifact", tenant_id="tenant-a")
+    tenant_b_rows = store.list_artifact_extractions("shared-artifact", tenant_id="tenant-b")
+
+    assert tenant_a is not None and tenant_a["title"] == "Tenant A"
+    assert tenant_b is not None and tenant_b["title"] == "Tenant B"
+    assert tenant_a_rows["evidence_requirements"][0]["subject"] == "Tenant A"
+    assert tenant_b_rows["evidence_requirements"][0]["subject"] == "Tenant B"
+    assert [row["tenant_id"] for row in store.list_learned_artifacts(tenant_id="tenant-a")] == ["tenant-a"]
+
+
+def test_legacy_artifact_rows_migrate_to_default_tenant(tmp_path):
+    db_path = tmp_path / "legacy-signals.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE learned_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, artifact_id TEXT NOT NULL UNIQUE,
+                artifact_type TEXT NOT NULL, source_vendor TEXT NOT NULL DEFAULT '',
+                source_instance TEXT NOT NULL DEFAULT '', external_id TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '', body_text TEXT NOT NULL DEFAULT '',
+                provenance_url TEXT NOT NULL DEFAULT '', fingerprint TEXT NOT NULL DEFAULT '',
+                stale INTEGER NOT NULL DEFAULT 0, missing_since REAL,
+                first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL,
+                updated_at REAL NOT NULL, created_at REAL NOT NULL
+            );
+            CREATE TABLE evidence_requirements (
+                id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '',
+                evidence_kind TEXT NOT NULL DEFAULT '', target_entity TEXT, signal_hint TEXT,
+                query_hint TEXT, priority INTEGER, source_artifact_id TEXT NOT NULL DEFAULT '',
+                source_excerpt TEXT NOT NULL DEFAULT '', source_type TEXT NOT NULL DEFAULT '',
+                confidence_prior REAL NOT NULL DEFAULT 0.5, review_state TEXT NOT NULL DEFAULT 'candidate',
+                observation_state TEXT NOT NULL DEFAULT 'indeterminate', extraction_hash TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL
+            );
+            INSERT INTO learned_artifacts
+                (artifact_id, artifact_type, title, body_text, first_seen_at, last_seen_at, updated_at, created_at)
+            VALUES ('legacy-artifact', 'runbook', 'Legacy', 'legacy body', 1, 1, 1, 1);
+            INSERT INTO evidence_requirements
+                (id, artifact_id, subject, evidence_kind, created_at)
+            VALUES ('legacy-requirement', 'legacy-artifact', 'checkout', 'latency', 1);
+        """)
+
+    store = SignalStore(db_path=db_path)
+    artifact = store.get_learned_artifact("legacy-artifact")
+    extractions = store.list_artifact_extractions("legacy-artifact")
+
+    assert artifact is not None and artifact["tenant_id"] == "default"
+    assert extractions["evidence_requirements"][0]["tenant_id"] == "default"
+    store.record_learned_artifact(
+        tenant_id="tenant-b",
+        artifact_id="legacy-artifact",
+        artifact_type="runbook",
+        title="Tenant B",
+    )
+    assert store.get_learned_artifact("legacy-artifact", tenant_id="tenant-b") is not None
 
 
 def test_missing_artifact_stale_marking_is_scoped_to_crawled_source(tmp_path):

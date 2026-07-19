@@ -82,6 +82,7 @@ packages = ["tacit"]
 # load the same bootstrap resources without depending on the working directory.
 "tacit/data/archetypes.yaml" = "tacit/data/archetypes.yaml"
 "tacit/data/grounding_benchmark_v1.json" = "tacit/data/grounding_benchmark_v1.json"
+"tacit/data/operational_learning_v1.json" = "tacit/data/operational_learning_v1.json"
 "tacit/data/signals.yaml" = "tacit/data/signals.yaml"
 
 [tool.hatch.build.targets.sdist]

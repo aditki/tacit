@@ -38,6 +38,7 @@ ANONYMOUS_BUNDLE_FILES = (
     "ranking_summary.json",
     "robustness_summary.json",
     "evaluation_summary.json",
+    "learning_evaluation_summary.json",
     "warnings.json",
     "validation_report.json",
 )
@@ -490,8 +491,10 @@ def export_assessment_report(
     if anonymous:
         report = ReportAnonymizer().anonymize_report(report)
         from tacit.evaluation_summary import build_evaluation_summary
+        from tacit.operational_learning_benchmark import run_operational_learning_benchmark
 
         report["evaluation_summary"] = build_evaluation_summary()
+        report["learning_evaluation_summary"] = run_operational_learning_benchmark()
         validation_report = _pending_validation_report()
     else:
         validation_report = _skipped_validation_report()

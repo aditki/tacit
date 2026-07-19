@@ -1,12 +1,100 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
 from tacit.api.app import create_app
+from tacit.api.security import (
+    KnowledgeAction,
+    assert_knowledge_action,
+    assert_tenant_access,
+    resolve_knowledge_tenant,
+)
 from tacit.backends.base import DashboardFeatures
 from tacit.config import Settings
 from tacit.models.schemas import DashRequest, DashResponse
+from tacit.signals import SignalStore
+
+
+def _security_request(runtime_settings: Settings, tenant_id: str | None = None) -> Request:
+    headers = [] if tenant_id is None else [(b"x-tacit-tenant", tenant_id.encode())]
+    return Request(
+        {
+            "type": "http",
+            "app": SimpleNamespace(state=SimpleNamespace(settings=runtime_settings)),
+            "headers": headers,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "required_permissions"),
+    [
+        (KnowledgeAction.READ, ("knowledge.read",)),
+        (KnowledgeAction.APPROVE, ("knowledge.review",)),
+        (KnowledgeAction.TRUST, ("knowledge.review", "knowledge.trust")),
+        (KnowledgeAction.REJECT, ("knowledge.reject",)),
+        (KnowledgeAction.CORRECT, ("knowledge.correct",)),
+        (KnowledgeAction.EXPORT, ("knowledge.export",)),
+        (KnowledgeAction.OVERRIDE, ("knowledge.override",)),
+        (KnowledgeAction.TEACH_SIGNALS, ("knowledge.review", "knowledge.trust")),
+    ],
+)
+def test_knowledge_action_permission_matrix(action, required_permissions):
+    allowed = _security_request(Settings(knowledge_permissions=",".join(required_permissions)))
+    assert_knowledge_action(allowed, action)
+
+    for missing_permission in required_permissions:
+        granted = [permission for permission in required_permissions if permission != missing_permission]
+        denied = _security_request(Settings(knowledge_permissions=",".join(granted)))
+        with pytest.raises(HTTPException) as exc_info:
+            assert_knowledge_action(denied, action)
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.detail == f"Missing permission: {missing_permission}"
+
+
+@pytest.mark.parametrize(
+    ("configured", "requested", "expected", "status_code"),
+    [
+        ("tenant-a", None, "tenant-a", None),
+        ("tenant-a", "tenant-a", "tenant-a", None),
+        ("tenant-a", "tenant-b", None, 403),
+        ("*", "tenant-a", "tenant-a", None),
+        ("*", None, None, 400),
+        ("*", "tenant with spaces", None, 400),
+        ("*", "x" * 129, None, 400),
+    ],
+)
+def test_knowledge_tenant_resolution_matrix(configured, requested, expected, status_code):
+    if status_code is None:
+        assert resolve_knowledge_tenant(configured, requested) == expected
+        return
+    with pytest.raises(HTTPException) as exc_info:
+        resolve_knowledge_tenant(configured, requested)
+    assert exc_info.value.status_code == status_code
+
+
+@pytest.mark.parametrize(
+    ("configured", "selected", "resource_tenant", "status_code"),
+    [
+        ("tenant-a", None, "tenant-a", None),
+        ("*", "tenant-a", "tenant-a", None),
+        ("*", "tenant-a", "tenant-b", 403),
+        ("*", "tenant-a", "", 403),
+    ],
+)
+def test_resource_tenant_access_matrix(configured, selected, resource_tenant, status_code):
+    request = _security_request(Settings(knowledge_tenant_id=configured), selected)
+    if status_code is None:
+        assert assert_tenant_access(request, resource_tenant) == resource_tenant
+        return
+    with pytest.raises(HTTPException) as exc_info:
+        assert_tenant_access(request, resource_tenant)
+    assert exc_info.value.status_code == status_code
 
 
 def test_chart_route_uses_app_scoped_pipeline_settings(monkeypatch):
@@ -104,6 +192,171 @@ def test_learning_dashboard_route_uses_app_scoped_backend_settings(monkeypatch):
     assert response.status_code == 200
     assert response.json()["dashboard_uid"] == "runtime-dash"
     assert seen_settings == [runtime_settings]
+
+
+def test_pending_learning_requires_and_threads_wildcard_tenant(monkeypatch):
+    app = create_app(runtime_settings=Settings(knowledge_tenant_id="*"))
+    seen_tenants: list[str | None] = []
+
+    async def fake_ingest_dashboard(
+        dashboard_uid,
+        backend_name=None,
+        auto_approve=False,
+        runtime_settings=None,
+        tenant_id=None,
+    ):
+        seen_tenants.append(tenant_id)
+        return {"dashboard_uid": dashboard_uid, "status": "pending"}
+
+    monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard", fake_ingest_dashboard)
+    client = TestClient(app)
+
+    missing = client.post(
+        "/api/v1/learn/dashboard",
+        json={"dashboard_uid": "tenant-dash", "auto_approve": False},
+    )
+    accepted = client.post(
+        "/api/v1/learn/dashboard",
+        headers={"X-Tacit-Tenant": "tenant-a"},
+        json={"dashboard_uid": "tenant-dash", "auto_approve": False},
+    )
+
+    assert missing.status_code == 400
+    assert accepted.status_code == 200
+    assert seen_tenants == ["tenant-a"]
+
+
+def test_replay_route_uses_app_scoped_runtime_settings(monkeypatch):
+    runtime_settings = Settings(knowledge_tenant_id="tenant-a")
+    seen_settings: list[Settings] = []
+
+    class FakeContract:
+        class request:
+            class scope:
+                tenant_id = "tenant-a"
+
+        def model_dump(self, **kwargs):
+            return {"investigation": {"id": "inv-app-replay"}}
+
+    class FakeStore:
+        def get_contract(self, investigation_id, revision):
+            return FakeContract()
+
+        def replay_contract(self, investigation_id, revision, *, mode, changes, runtime_settings):
+            seen_settings.append(runtime_settings)
+            return FakeContract()
+
+    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: FakeStore())
+
+    response = TestClient(create_app(runtime_settings=runtime_settings)).post(
+        "/api/v1/investigations/inv-app-replay/replay",
+        json={"mode": "current_engine", "changes": {}},
+    )
+
+    assert response.status_code == 200
+    assert seen_settings == [runtime_settings]
+
+
+@pytest.mark.parametrize(
+    ("permissions", "missing_permission"),
+    [
+        ("knowledge.read", "knowledge.review"),
+        ("knowledge.read,knowledge.review", "knowledge.trust"),
+    ],
+)
+def test_learning_auto_approval_requires_knowledge_permissions(monkeypatch, permissions, missing_permission):
+    app = create_app(runtime_settings=Settings(knowledge_permissions=permissions))
+    called = False
+
+    async def fake_ingest_dashboard(**kwargs):
+        nonlocal called
+        called = True
+        return {"dashboard_uid": kwargs["dashboard_uid"]}
+
+    monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard", fake_ingest_dashboard)
+
+    response = TestClient(app).post(
+        "/api/v1/learn/dashboard",
+        json={"dashboard_uid": "restricted-dash", "auto_approve": True},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == f"Missing permission: {missing_permission}"
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    ("permissions", "missing_permission"),
+    [
+        ("knowledge.read", "knowledge.review"),
+        ("knowledge.read,knowledge.review", "knowledge.trust"),
+    ],
+)
+def test_manual_signal_teaching_requires_review_and_trust_permissions(permissions, missing_permission):
+    client = TestClient(create_app(runtime_settings=Settings(knowledge_permissions=permissions)))
+
+    response = client.post(
+        "/api/v1/signals/teach",
+        json={
+            "signal_type": "restricted_signal",
+            "metric_patterns": [{"pattern": "restricted_metric", "confidence": 0.9}],
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == f"Missing permission: {missing_permission}"
+
+
+def test_dashboard_rejection_requires_knowledge_reject_permission(monkeypatch):
+    called = False
+
+    def fake_reject(**kwargs):
+        nonlocal called
+        called = True
+        return {"status": "rejected"}
+
+    monkeypatch.setattr("tacit.dashboard_ingest.reject_ingested_dashboard_record", fake_reject)
+    client = TestClient(create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read")))
+
+    response = client.post("/api/v1/learn/dashboards/restricted-dash/reject")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.reject"
+    assert called is False
+
+
+def test_dashboard_ignore_requires_knowledge_reject_permission(monkeypatch, tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.record_ingested_dashboard("restricted-dash", status="pending")
+    monkeypatch.setattr("tacit.api.routes.learning.signals_mod.get_signal_store", lambda: store)
+    client = TestClient(create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read")))
+
+    response = client.post("/api/v1/learn/dashboards/restricted-dash/ignore")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.reject"
+    assert store.get_ingested_dashboard("restricted-dash")["status"] == "pending"
+
+
+def test_artifact_lists_use_the_requested_tenant(monkeypatch, tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    for tenant_id in ("tenant-a", "tenant-b"):
+        store.record_learned_artifact(
+            tenant_id=tenant_id,
+            artifact_id="shared-runbook",
+            artifact_type="runbook",
+            title=f"{tenant_id} runbook",
+        )
+    monkeypatch.setattr("tacit.api.routes.learning.signals_mod.get_signal_store", lambda: store)
+    client = TestClient(create_app(runtime_settings=Settings(knowledge_tenant_id="*")))
+
+    missing = client.get("/api/v1/learn/runbooks")
+    tenant_a = client.get("/api/v1/learn/runbooks", headers={"X-Tacit-Tenant": "tenant-a"})
+
+    assert missing.status_code == 400
+    assert tenant_a.status_code == 200
+    assert tenant_a.json()["count"] == 1
+    assert tenant_a.json()["runbooks"][0]["title"] == "tenant-a runbook"
 
 
 def test_learning_backend_route_uses_app_scoped_backend_settings(monkeypatch):

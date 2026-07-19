@@ -361,10 +361,9 @@ async def run_pipeline_validation(
     total = len(cases)
 
     async with httpx.AsyncClient(timeout=180) as client:
-        grafana_headers = {
-            "Authorization": f"Bearer {settings.grafana_api_key}",
-            "X-Grafana-Org-Id": str(settings.grafana_org_id),
-        }
+        grafana_headers = {"X-Grafana-Org-Id": str(settings.grafana_org_id)}
+        if settings.grafana_api_key:
+            grafana_headers["Authorization"] = f"Bearer {settings.grafana_api_key}"
 
         for i, case in enumerate(cases, 1):
             t0 = time.monotonic()

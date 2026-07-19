@@ -1,0 +1,24 @@
+{
+  "benchmark_name": "operational_learning",
+  "benchmark_version": "v1",
+  "cases": [
+    {"id": "entity-exact-id", "family": "entity_binding", "expected": "resolved"},
+    {"id": "entity-exact-alias", "family": "entity_binding", "expected": "resolved"},
+    {"id": "entity-alias-collision", "family": "entity_binding", "expected": "ambiguous"},
+    {"id": "entity-fuzzy", "family": "entity_binding", "expected": "unresolved"},
+    {"id": "entity-unknown", "family": "entity_binding", "expected": "unresolved"},
+    {"id": "proposition-equivalent", "family": "normalization", "expected": "merge"},
+    {"id": "proposition-reversed", "family": "normalization", "expected": "distinct"},
+    {"id": "proposition-scope", "family": "normalization", "expected": "distinct"},
+    {"id": "copied-source", "family": "corroboration", "expected": "uncorroborated"},
+    {"id": "independent-families", "family": "corroboration", "expected": "multi_family"},
+    {"id": "scope-conflict", "family": "conflict", "expected": "resolved_by_scope"},
+    {"id": "rejected-promotion", "family": "promotion", "expected": "blocked"},
+    {"id": "unresolved-promotion", "family": "promotion", "expected": "blocked"},
+    {"id": "ownership-authoritative", "family": "promotion", "expected": "promoted"},
+    {"id": "signal-live-verified", "family": "promotion", "expected": "promoted"},
+    {"id": "investigation-pattern-reviewed", "family": "promotion", "expected": "promoted"},
+    {"id": "historical-causal-claim", "family": "extraction", "expected": "contextual_only"},
+    {"id": "prompt-injection", "family": "security", "expected": "flagged"}
+  ]
+}

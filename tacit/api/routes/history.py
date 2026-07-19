@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 import tacit.history as history_mod
 from tacit.api.dependencies import get_pipeline_dependencies
-from tacit.api.security import verify_api_key
+from tacit.api.security import (
+    KnowledgeAction,
+    assert_knowledge_action,
+    assert_tenant_access,
+    knowledge_tenant,
+    verify_api_key,
+)
+from tacit.config import settings
 from tacit.dependencies import PipelineDependencies
 from tacit.investigation_bundle import build_investigation_bundle
 from tacit.investigation_contract import InvestigationRunType
@@ -35,6 +42,56 @@ class CorrectionReviewRequest(BaseModel):
     reviewed_by: str = Field(min_length=1)
 
 
+def _require_contract_tenant(request: Request, contract, runtime_settings, store=None) -> str:
+    configured = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
+    contract_tenant = str(contract.request.scope.tenant_id or "")
+    contract_investigation = getattr(contract, "investigation", None)
+    investigation_id = str(getattr(contract_investigation, "id", ""))
+    investigation = (
+        store.get(investigation_id) if store is not None and investigation_id and hasattr(store, "get") else None
+    )
+    recorded = str((investigation or {}).get("tenant_id") or contract_tenant)
+    if not recorded and configured != "*":
+        recorded = configured
+    if contract_tenant not in {"", "default", recorded}:
+        raise HTTPException(status_code=403, detail="Tenant access denied")
+    return assert_tenant_access(request, recorded)
+
+
+def _authorized_contract(
+    request: Request,
+    store,
+    investigation_id: str,
+    revision: int | None = None,
+):
+    """Load an immutable contract and enforce its recorded tenant boundary."""
+    contract = store.get_contract(investigation_id, revision)
+    if contract is None:
+        raise HTTPException(status_code=404, detail="Investigation contract not found")
+    runtime_settings = getattr(request.app.state, "settings", settings)
+    _require_contract_tenant(request, contract, runtime_settings, store)
+    return contract
+
+
+def _authorize_investigation(request: Request, store, investigation_id: str):
+    """Authorize legacy rows as well as investigations with contracts."""
+    contract = store.get_contract(investigation_id)
+    if contract is not None:
+        runtime_settings = getattr(request.app.state, "settings", settings)
+        _require_contract_tenant(request, contract, runtime_settings, store)
+        for revision in store.list_revisions(investigation_id):
+            revision_contract = store.get_contract(investigation_id, int(revision["revision"]))
+            if revision_contract is not None:
+                _require_contract_tenant(request, revision_contract, runtime_settings, store)
+        return contract
+    investigation = store.get(investigation_id)
+    if investigation is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    if str(investigation.get("tenant_id") or "default") != knowledge_tenant(request):
+        raise HTTPException(status_code=403, detail="Tenant access denied")
+    return None
+
+
 @router.get(
     "/api/v1/investigations",
     tags=["History"],
@@ -42,6 +99,7 @@ class CorrectionReviewRequest(BaseModel):
     response_description="Investigation history with intent, metrics, queries, timings, and results",
 )
 async def list_investigations(
+    request: Request,
     limit: int = 50,
     offset: int = 0,
     status: str | None = None,
@@ -49,7 +107,13 @@ async def list_investigations(
 ):
     """List recent investigation runs, newest first."""
     store = history_mod.get_investigation_store()
-    investigations = store.list_recent(limit=limit, offset=offset, status=status, user_id=user_id)
+    investigations = store.list_recent(
+        limit=limit,
+        offset=offset,
+        status=status,
+        user_id=user_id,
+        tenant_id=knowledge_tenant(request),
+    )
     return {"count": len(investigations), "investigations": investigations}
 
 
@@ -59,10 +123,10 @@ async def list_investigations(
     summary="Investigation aggregate stats",
     response_description="Aggregate statistics across all investigations",
 )
-async def investigation_stats():
+async def investigation_stats(request: Request):
     """Aggregate stats: success/failure rates, avg timings, path distribution."""
     store = history_mod.get_investigation_store()
-    return store.stats()
+    return store.stats(tenant_id=knowledge_tenant(request))
 
 
 @router.get(
@@ -71,8 +135,9 @@ async def investigation_stats():
     summary="List investigation contract revisions",
     response_description="Immutable investigation contract revision metadata",
 )
-async def list_investigation_revisions(investigation_id: str):
+async def list_investigation_revisions(investigation_id: str, request: Request):
     store = history_mod.get_investigation_store()
+    _authorize_investigation(request, store, investigation_id)
     revisions = store.list_revisions(investigation_id)
     if not revisions and store.get(investigation_id) is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
@@ -84,8 +149,9 @@ async def list_investigation_revisions(investigation_id: str):
     tags=["History"],
     summary="List investigation runs and lifecycle status",
 )
-async def list_investigation_runs(investigation_id: str):
+async def list_investigation_runs(investigation_id: str, request: Request):
     store = history_mod.get_investigation_store()
+    _authorize_investigation(request, store, investigation_id)
     runs = store.list_runs(investigation_id)
     if not runs and store.get(investigation_id) is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
@@ -97,8 +163,9 @@ async def list_investigation_runs(investigation_id: str):
     tags=["History"],
     summary="List append-only investigation lifecycle events",
 )
-async def list_investigation_events(investigation_id: str, run_id: str | None = None):
+async def list_investigation_events(investigation_id: str, request: Request, run_id: str | None = None):
     store = history_mod.get_investigation_store()
+    _authorize_investigation(request, store, investigation_id)
     events = store.list_events(investigation_id, run_id)
     if not events and store.get(investigation_id) is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
@@ -111,11 +178,9 @@ async def list_investigation_events(investigation_id: str, run_id: str | None = 
     summary="Get an investigation contract revision",
     response_description="Canonical Investigation Contract v1 document",
 )
-async def get_investigation_contract(investigation_id: str, revision: int | None = None):
+async def get_investigation_contract(investigation_id: str, request: Request, revision: int | None = None):
     store = history_mod.get_investigation_store()
-    contract = store.get_contract(investigation_id, revision)
-    if contract is None:
-        raise HTTPException(status_code=404, detail="Investigation contract not found")
+    contract = _authorized_contract(request, store, investigation_id, revision)
     return contract.model_dump(mode="json", by_alias=True)
 
 
@@ -125,8 +190,10 @@ async def get_investigation_contract(investigation_id: str, revision: int | None
     summary="Compare two investigation revisions",
     response_description="Fingerprint and top-level section comparison",
 )
-async def compare_investigation_revisions(investigation_id: str, left: int, right: int):
+async def compare_investigation_revisions(investigation_id: str, left: int, right: int, request: Request):
     store = history_mod.get_investigation_store()
+    _authorized_contract(request, store, investigation_id, left)
+    _authorized_contract(request, store, investigation_id, right)
     comparison = store.compare_revisions(investigation_id, left, right)
     if comparison is None:
         raise HTTPException(status_code=404, detail="Investigation revision not found")
@@ -141,17 +208,24 @@ async def compare_investigation_revisions(investigation_id: str, left: int, righ
 )
 async def replay_investigation(
     investigation_id: str,
+    http_request: Request,
     request: ReplayRequest | None = None,
     revision: int | None = None,
+    deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     store = history_mod.get_investigation_store()
     replay_request = request or ReplayRequest()
+    source_contract = store.get_contract(investigation_id, revision)
+    if source_contract is None:
+        raise HTTPException(status_code=404, detail="Investigation contract not found")
+    _require_contract_tenant(http_request, source_contract, deps.settings, store)
     try:
         contract = store.replay_contract(
             investigation_id,
             revision,
             mode=replay_request.mode,
             changes=replay_request.changes,
+            runtime_settings=deps.settings,
         )
     except (history_mod.StaleRevisionError, history_mod.ReplayError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -170,14 +244,20 @@ async def replay_investigation(
     summary="Create a reviewable knowledge candidate from a correction",
     response_description="Correction stored as a scoped, provenance-bearing knowledge candidate",
 )
-async def create_correction_candidate(investigation_id: str, request: CorrectionCandidateRequest):
+async def create_correction_candidate(
+    investigation_id: str,
+    payload: CorrectionCandidateRequest,
+    request: Request,
+):
+    assert_knowledge_action(request, KnowledgeAction.CORRECT)
     store = history_mod.get_investigation_store()
+    _authorized_contract(request, store, investigation_id, payload.revision)
     candidate = store.create_knowledge_candidate(
         investigation_id,
-        revision=request.revision,
-        correction_text=request.correction_text,
-        target_ref=request.target_ref,
-        created_by=request.created_by,
+        revision=payload.revision,
+        correction_text=payload.correction_text,
+        target_ref=payload.target_ref,
+        created_by=payload.created_by,
     )
     if candidate is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
@@ -189,8 +269,9 @@ async def create_correction_candidate(investigation_id: str, request: Correction
     tags=["History"],
     summary="List correction candidates",
 )
-async def list_correction_candidates(investigation_id: str):
+async def list_correction_candidates(investigation_id: str, request: Request):
     store = history_mod.get_investigation_store()
+    _authorize_investigation(request, store, investigation_id)
     candidates = store.list_knowledge_candidates(investigation_id)
     if not candidates and store.get(investigation_id) is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
@@ -205,14 +286,20 @@ async def list_correction_candidates(investigation_id: str):
 async def review_correction_candidate(
     investigation_id: str,
     candidate_id: str,
-    request: CorrectionReviewRequest,
+    payload: CorrectionReviewRequest,
+    request: Request,
 ):
+    assert_knowledge_action(
+        request,
+        KnowledgeAction.APPROVE if payload.approved else KnowledgeAction.REJECT,
+    )
     store = history_mod.get_investigation_store()
+    _authorize_investigation(request, store, investigation_id)
     candidate = store.review_knowledge_candidate(
         investigation_id,
         candidate_id,
-        approved=request.approved,
-        reviewed_by=request.reviewed_by,
+        approved=payload.approved,
+        reviewed_by=payload.reviewed_by,
     )
     if candidate is None:
         raise HTTPException(status_code=404, detail="Correction candidate not found")
@@ -224,8 +311,10 @@ async def review_correction_candidate(
     tags=["History"],
     summary="Apply an approved correction as a new revision",
 )
-async def apply_correction_candidate(investigation_id: str, candidate_id: str):
+async def apply_correction_candidate(investigation_id: str, candidate_id: str, request: Request):
+    assert_knowledge_action(request, KnowledgeAction.CORRECT)
     store = history_mod.get_investigation_store()
+    _authorize_investigation(request, store, investigation_id)
     contract = store.apply_knowledge_candidate(investigation_id, candidate_id)
     if contract is None:
         raise HTTPException(status_code=409, detail="Correction must exist, be approved, and not be expired")
@@ -239,14 +328,20 @@ async def apply_correction_candidate(investigation_id: str, candidate_id: str):
 )
 async def refresh_investigation(
     investigation_id: str,
+    request: Request,
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     store = deps.history_store_factory()
     contract = store.get_contract(investigation_id)
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
+    tenant_id = _require_contract_tenant(request, contract, deps.settings, store)
     response = await run_pipeline(
-        DashRequest(prompt=contract.request.question, user_id=contract.request.requester),
+        DashRequest(
+            prompt=contract.request.question,
+            user_id=contract.request.requester,
+            tenant_id=tenant_id,
+        ),
         deps,
         investigation_id=investigation_id,
         run_type=InvestigationRunType.REFRESH,
@@ -270,8 +365,9 @@ async def refresh_investigation(
     tags=["History"],
     summary="Migrate a legacy history record to Investigation Contract v1",
 )
-async def migrate_investigation(investigation_id: str):
+async def migrate_investigation(investigation_id: str, request: Request):
     store = history_mod.get_investigation_store()
+    _authorize_investigation(request, store, investigation_id)
     contract = store.migrate_legacy_investigation(investigation_id)
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
@@ -283,8 +379,15 @@ async def migrate_investigation(investigation_id: str):
     tags=["History"],
     summary="Export a portable investigation assessment bundle",
 )
-async def export_investigation_assessment_bundle(investigation_id: str, revision: int | None = None):
+async def export_investigation_assessment_bundle(
+    investigation_id: str,
+    request: Request,
+    revision: int | None = None,
+):
+    assert_knowledge_action(request, KnowledgeAction.EXPORT)
     store = history_mod.get_investigation_store()
+    _authorize_investigation(request, store, investigation_id)
+    _authorized_contract(request, store, investigation_id, revision)
     try:
         content = build_investigation_bundle(store, investigation_id, revision=revision)
     except ValueError as exc:
@@ -303,9 +406,10 @@ async def export_investigation_assessment_bundle(investigation_id: str, revision
     summary="Get investigation details",
     response_description="Full investigation record with all pipeline data",
 )
-async def get_investigation(investigation_id: str):
+async def get_investigation(investigation_id: str, request: Request):
     """Get full details of a single investigation by ID."""
     store = history_mod.get_investigation_store()
+    _authorize_investigation(request, store, investigation_id)
     inv = store.get(investigation_id)
     if inv is None:
         raise HTTPException(status_code=404, detail="Investigation not found")

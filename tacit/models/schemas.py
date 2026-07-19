@@ -87,7 +87,11 @@ class LearnRunbookRequest(BaseModel):
     """Request to learn from a runbook body supplied over the API."""
 
     title: str = Field(default="runbook", description="Human-readable runbook title")
-    body_text: str = Field(min_length=1, description="Markdown or plain-text runbook body")
+    body_text: str = Field(
+        min_length=1,
+        max_length=200_000,
+        description="Markdown or plain-text runbook body",
+    )
     external_id: str = Field(
         default="",
         description="Stable source identifier; defaults to provenance/body fingerprint",
@@ -102,7 +106,11 @@ class LearnIncidentRequest(BaseModel):
     """Request to learn from an incident-history body supplied over the API."""
 
     title: str = Field(default="incident", description="Human-readable incident title")
-    body_text: str = Field(min_length=1, description="Markdown or plain-text incident body")
+    body_text: str = Field(
+        min_length=1,
+        max_length=200_000,
+        description="Markdown or plain-text incident body",
+    )
     external_id: str = Field(
         default="",
         description="Stable source identifier; defaults to provenance/body fingerprint",
@@ -209,7 +217,7 @@ class PanelQuery(BaseModel):
     cloudwatch_dimensions: dict[str, str | list[str]] = Field(
         default_factory=dict,
         description=(
-            "CloudWatch dimensions, e.g. {'LoadBalancer': '*'} " "or {'AvailabilityZone': ['us-east-1a', 'us-east-1b']}"
+            "CloudWatch dimensions, e.g. {'LoadBalancer': '*'} or {'AvailabilityZone': ['us-east-1a', 'us-east-1b']}"
         ),
     )
     cloudwatch_region: str = Field(default="", description="AWS region for this CloudWatch query, e.g. 'us-east-1'")
@@ -387,6 +395,7 @@ class DashRequest(BaseModel):
     channel_id: str = Field(default="", description="Slack channel ID (set automatically by Slack integration)")
     user_id: str = Field(default="", description="User identifier for provenance tracking")
     thread_ts: str = Field(default="", description="Slack thread timestamp (set automatically by Slack integration)")
+    tenant_id: str = Field(default="", description="Organization scope for Operational Knowledge isolation")
 
     model_config = {
         "json_schema_extra": {

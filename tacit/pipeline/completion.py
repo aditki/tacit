@@ -11,6 +11,7 @@ from tacit.backends.base import DashboardBackend, PublishResult
 from tacit.dependencies import PipelineDependencies
 from tacit.investigation_contract import InvestigationContractAssembler, InvestigationRunType, RuntimeManifest
 from tacit.investigation_replay import InvestigationReplaySnapshot
+from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
 from tacit.logging import stage_log
 from tacit.models.schemas import (
     ContextChunk,
@@ -52,7 +53,10 @@ async def complete_pipeline(
     evidence_resolutions: list[EvidenceResolution],
     evidence_observations: list[EvidenceObservation],
     culprit_ranking: CulpritRanking,
+    baseline_culprit_ranking: CulpritRanking | None = None,
     context_chunks: list[ContextChunk] | None = None,
+    knowledge_snapshot: KnowledgeSnapshot | None = None,
+    knowledge_usage: list[KnowledgeUsage] | None = None,
     run_type: InvestigationRunType = InvestigationRunType.INITIAL,
     revision_reason: str = "initial",
     base_revision: int | None = None,
@@ -143,6 +147,8 @@ async def complete_pipeline(
                     "prompt_version": "intent-v1",
                 }
             ),
+            knowledge_snapshot_ref=knowledge_snapshot.id if knowledge_snapshot else "",
+            knowledge_usage=knowledge_usage,
         )
         snapshot = InvestigationReplaySnapshot(
             investigation_id=recorder.investigation_id,
@@ -156,6 +162,7 @@ async def complete_pipeline(
             resolution_candidates=[resolution.model_dump(mode="json") for resolution in evidence_resolutions],
             evidence_observations=evidence_observations,
             culprit_ranking=culprit_ranking,
+            baseline_culprit_ranking=baseline_culprit_ranking,
             context_chunks=context_chunks or [],
             renderings=draft_contract.renderings,
             external_errors=[{"type": "validation_warning", "detail": warning} for warning in validation_warnings],
@@ -178,6 +185,8 @@ async def complete_pipeline(
                 for query in panel.queries
             ],
             runtime=draft_contract.runtime,
+            knowledge_snapshot_ref=knowledge_snapshot.id if knowledge_snapshot else "",
+            knowledge_usage=knowledge_usage or [],
         )
         for requirement in draft_contract.evidence_requirements:
             recorder.event("requirement_created", requirement.model_dump(mode="json"))
@@ -190,6 +199,8 @@ async def complete_pipeline(
             recorder.event("observation_created", observation.model_dump(mode="json"))
         for candidate in draft_contract.candidate_rankings:
             recorder.event("candidate_ranked", candidate.model_dump(mode="json"))
+        for usage in draft_contract.knowledge_usage:
+            recorder.event("knowledge_considered", usage.model_dump(mode="json"))
         recorder.event("conclusion_restricted", draft_contract.grounding.model_dump(mode="json"))
         persisted_contract = recorder.history.persist_contract_revision(
             draft_contract,
@@ -206,6 +217,21 @@ async def complete_pipeline(
             dashboard_uid=effective_uid,
             exc_info=True,
         )
+    if persisted_contract and persisted_contract.knowledge_usage:
+        try:
+            from tacit.knowledge.service import get_knowledge_service
+
+            get_knowledge_service().persist_usage(
+                persisted_contract.knowledge_usage,
+                investigation_id=persisted_contract.investigation.id,
+                investigation_revision=persisted_contract.investigation.revision,
+            )
+        except Exception:
+            logger.warning(
+                "knowledge_usage_persist_failed",
+                investigation_id=recorder.investigation_id,
+                exc_info=True,
+            )
 
     refresh_persist_failed = run_type == InvestigationRunType.REFRESH and persisted_contract is None
     recorder.finish(

@@ -16,6 +16,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from tacit import __version__
+from tacit.knowledge.enums import KnowledgeUsageDisposition
+from tacit.knowledge.models import KnowledgeUsage
 from tacit.models.schemas import (
     ContextChunk,
     CulpritRanking,
@@ -106,6 +108,7 @@ class TimeWindow(BaseModel):
 
 
 class InvestigationScope(BaseModel):
+    tenant_id: str = "default"
     services: list[str] = Field(default_factory=list)
     service_ids: list[str] = Field(default_factory=list)
     environments: list[str] = Field(default_factory=list)
@@ -283,6 +286,8 @@ class InvestigationContract(BaseModel):
     decision_log: list[DecisionLogEntry] = Field(default_factory=list)
     provenance: list[ProvenanceRecord] = Field(default_factory=list)
     queries: list[QueryRecord] = Field(default_factory=list)
+    knowledge_snapshot_ref: str = ""
+    knowledge_usage: list[KnowledgeUsage] = Field(default_factory=list)
     corrections: list[CorrectionReference] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     renderings: dict[str, Any] = Field(default_factory=dict)
@@ -317,6 +322,13 @@ class InvestigationContract(BaseModel):
                         raise ValueError(f"observation {observation.id} references unsuccessful query {query_ref}")
         for query in self.queries:
             _require_known_refs(query.provenance_refs, provenance_ids, f"query {query.id}")
+        for usage in self.knowledge_usage:
+            if usage.tenant_id != self.request.scope.tenant_id:
+                raise ValueError("knowledge usage cannot cross investigation tenants")
+            if usage.disposition != KnowledgeUsageDisposition.APPLIED and usage.score_delta != 0:
+                raise ValueError("rejected knowledge cannot contribute a score delta")
+            if usage.disposition == KnowledgeUsageDisposition.APPLIED and usage.knowledge_revision < 1:
+                raise ValueError("applied knowledge must reference an immutable revision")
         _require_known_refs(self.grounding.missing_observation_refs, observation_ids, "grounding")
         _require_known_refs(self.grounding.supported_claims, observation_ids, "grounding supported_claims")
         _require_known_refs(self.grounding.contradicted_claims, observation_ids, "grounding contradicted_claims")
@@ -393,7 +405,11 @@ def fingerprint(value: Any) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def input_fingerprint(contract: InvestigationContract) -> str:
+def input_fingerprint(
+    contract: InvestigationContract,
+    *,
+    include_knowledge_fields: bool = True,
+) -> str:
     data = contract.model_dump(mode="json", by_alias=True)
     captured_provenance = [
         {
@@ -408,28 +424,46 @@ def input_fingerprint(contract: InvestigationContract) -> str:
         for record in data["provenance"]
         if record["source_type"] not in {"request", "runtime"}
     ]
-    return fingerprint(
-        {
-            "request": data["request"],
-            "operational_ir": data["operational_ir"],
-            "evidence_requirements": data["evidence_requirements"],
-            "evidence_resolutions": data["evidence_resolutions"],
-            "queries": data["queries"],
-            "observations": data["observations"],
-            "captured_provenance": captured_provenance,
-            "policy_version": data["runtime"]["policy_version"],
-            "ranking_version": data["runtime"]["ranking_version"],
-            "vocabulary_version": data["runtime"]["vocabulary_version"],
-            "model": data["runtime"]["model"],
-        }
-    )
+    knowledge_usage = data["knowledge_usage"]
+    for usage in knowledge_usage:
+        usage["usage_id"] = ""
+        usage["investigation_id"] = ""
+        usage["investigation_revision"] = 0
+        usage["created_at"] = ""
+    if not include_knowledge_fields:
+        data["request"]["scope"].pop("tenant_id", None)
+    payload = {
+        "request": data["request"],
+        "operational_ir": data["operational_ir"],
+        "evidence_requirements": data["evidence_requirements"],
+        "evidence_resolutions": data["evidence_resolutions"],
+        "queries": data["queries"],
+        "observations": data["observations"],
+        "captured_provenance": captured_provenance,
+        "policy_version": data["runtime"]["policy_version"],
+        "ranking_version": data["runtime"]["ranking_version"],
+        "vocabulary_version": data["runtime"]["vocabulary_version"],
+        "model": data["runtime"]["model"],
+    }
+    if include_knowledge_fields:
+        payload["knowledge_snapshot_ref"] = data["knowledge_snapshot_ref"]
+        payload["knowledge_usage"] = knowledge_usage
+    return fingerprint(payload)
 
 
-def output_fingerprint(contract: InvestigationContract) -> str:
-    return fingerprint(normalized_output_payload(contract))
+def output_fingerprint(
+    contract: InvestigationContract,
+    *,
+    include_knowledge_fields: bool = True,
+) -> str:
+    return fingerprint(normalized_output_payload(contract, include_knowledge_fields=include_knowledge_fields))
 
 
-def normalized_output_payload(contract: InvestigationContract) -> dict[str, Any]:
+def normalized_output_payload(
+    contract: InvestigationContract,
+    *,
+    include_knowledge_fields: bool = True,
+) -> dict[str, Any]:
     """Return contract output with revision-local timestamps removed."""
     data = contract.model_dump(mode="json", by_alias=True)
     data["investigation"]["revision"] = 0
@@ -452,14 +486,41 @@ def normalized_output_payload(contract: InvestigationContract) -> dict[str, Any]
         freshness = provenance.get("freshness")
         if isinstance(freshness, dict) and "last_verified_at" in freshness:
             freshness["last_verified_at"] = ""
+    for usage in data.get("knowledge_usage", []):
+        usage["usage_id"] = ""
+        usage["investigation_id"] = ""
+        usage["created_at"] = ""
+        usage["investigation_revision"] = 0
+    if not include_knowledge_fields:
+        data.pop("knowledge_snapshot_ref", None)
+        data.pop("knowledge_usage", None)
+        data["request"]["scope"].pop("tenant_id", None)
     data["runtime"]["output_fingerprint"] = ""
     return data
 
 
-def stamp_fingerprints(contract: InvestigationContract) -> InvestigationContract:
-    runtime = contract.runtime.model_copy(update={"input_fingerprint": input_fingerprint(contract)})
+def stamp_fingerprints(
+    contract: InvestigationContract,
+    *,
+    include_knowledge_fields: bool = True,
+) -> InvestigationContract:
+    runtime = contract.runtime.model_copy(
+        update={
+            "input_fingerprint": input_fingerprint(
+                contract,
+                include_knowledge_fields=include_knowledge_fields,
+            )
+        }
+    )
     stamped = contract.model_copy(update={"runtime": runtime})
-    runtime = stamped.runtime.model_copy(update={"output_fingerprint": output_fingerprint(stamped)})
+    runtime = stamped.runtime.model_copy(
+        update={
+            "output_fingerprint": output_fingerprint(
+                stamped,
+                include_knowledge_fields=include_knowledge_fields,
+            )
+        }
+    )
     return stamped.model_copy(update={"runtime": runtime})
 
 
@@ -564,11 +625,14 @@ class InvestigationContractAssembler:
         created_at: datetime | None = None,
         completed_at: datetime | None = None,
         runtime_manifest: RuntimeManifest | None = None,
+        knowledge_snapshot_ref: str = "",
+        knowledge_usage: list[KnowledgeUsage] | None = None,
     ) -> InvestigationContract:
         now = utc_now()
         created_at = created_at or now
         completed_at = completed_at or now
         context_chunks = context_chunks or []
+        knowledge_usage = knowledge_usage or []
         provenance = self._provenance(
             requester=request.user_id or request.channel_id or "pipeline",
             observed_at=completed_at,
@@ -586,7 +650,7 @@ class InvestigationContractAssembler:
         )
         rankings = self._rankings(culprit_ranking, observations, requirements)
         grounding = self._grounding(culprit_ranking, observations, requirements, rankings)
-        decision_log = self._decision_log(resolutions, rankings, grounding, dashboard_uid)
+        decision_log = self._decision_log(resolutions, rankings, grounding, dashboard_uid, knowledge_usage)
         context_provenance = provenance[2:]
         contributions = self._artifact_contributions(context_chunks, context_provenance)
 
@@ -605,6 +669,7 @@ class InvestigationContractAssembler:
                 requester=request.user_id or request.channel_id or "",
                 time_window=TimeWindow(label=intent.timerange),
                 scope=InvestigationScope(
+                    tenant_id=request.tenant_id,
                     services=intent.services,
                     service_ids=[f"service:{service}" for service in intent.services],
                 ),
@@ -628,6 +693,8 @@ class InvestigationContractAssembler:
             decision_log=decision_log,
             provenance=provenance,
             queries=queries,
+            knowledge_snapshot_ref=knowledge_snapshot_ref,
+            knowledge_usage=knowledge_usage,
             warnings=warnings or [],
             renderings={
                 "dashboard": {
@@ -1029,6 +1096,7 @@ class InvestigationContractAssembler:
         rankings: list[CandidateRankingContract],
         grounding: GroundingContract,
         dashboard_uid: str,
+        knowledge_usage: list[KnowledgeUsage],
     ) -> list[DecisionLogEntry]:
         decisions: list[DecisionLogEntry] = []
         sequence = 1
@@ -1044,6 +1112,27 @@ class InvestigationContractAssembler:
                     reason="Recorded the evidence binding or explicit gap selected by the resolver.",
                     output_ref=resolution.id,
                     mechanism={"type": "deterministic_rule", "version": "evidence-resolution-v1"},
+                )
+            )
+            sequence += 1
+        for usage in knowledge_usage:
+            decisions.append(
+                DecisionLogEntry(
+                    id=f"decision_{sequence:02d}",
+                    sequence=sequence,
+                    stage="operational_knowledge",
+                    action=(
+                        "applied_knowledge"
+                        if usage.disposition == KnowledgeUsageDisposition.APPLIED
+                        else "rejected_knowledge"
+                    ),
+                    subject_ref=usage.knowledge_ref,
+                    reason_code=usage.disposition.value,
+                    reason="Applied or rejected an exact Operational Knowledge revision under recorded policy.",
+                    inputs=[f"{usage.knowledge_ref}@{usage.knowledge_revision}"],
+                    output_ref=usage.target_ref,
+                    mechanism={"type": "deterministic_policy", "version": "knowledge-selection-v1"},
+                    score_after=usage.score_delta if usage.disposition == KnowledgeUsageDisposition.APPLIED else None,
                 )
             )
             sequence += 1

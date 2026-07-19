@@ -22,7 +22,7 @@ from typing import Any
 
 import structlog
 
-from tacit.config import settings
+from tacit.config import Settings, settings
 from tacit.investigation_contract import (
     CorrectionReference,
     DecisionLogEntry,
@@ -77,6 +77,7 @@ def _db_path() -> Path:
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS investigations (
     id              TEXT PRIMARY KEY,          -- UUID
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
     prompt          TEXT NOT NULL,
     user_id         TEXT NOT NULL DEFAULT '',
     channel_id      TEXT NOT NULL DEFAULT '',
@@ -219,8 +220,9 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_investigation
 class InvestigationStore:
     """SQLite-backed investigation history."""
 
-    def __init__(self, db_path: Path | None = None):
+    def __init__(self, db_path: Path | None = None, *, runtime_settings: Settings | None = None):
         self._db_path = db_path or _db_path()
+        self._settings = runtime_settings or settings
         self._ensure_schema()
 
     @contextmanager
@@ -246,6 +248,26 @@ class InvestigationStore:
                 conn.execute("ALTER TABLE investigations ADD COLUMN stage_outcomes TEXT NOT NULL DEFAULT '{}'")
             if "current_revision" not in columns:
                 conn.execute("ALTER TABLE investigations ADD COLUMN current_revision INTEGER NOT NULL DEFAULT 0")
+            if "tenant_id" not in columns:
+                conn.execute("ALTER TABLE investigations ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
+                configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+                legacy_tenant = configured_tenant if configured_tenant != "*" else "default"
+                rows = conn.execute("""SELECT i.id, r.contract_json
+                       FROM investigations i
+                       LEFT JOIN investigation_revisions r
+                         ON r.investigation_id = i.id AND r.revision = i.current_revision""").fetchall()
+                for row in rows:
+                    tenant_id = legacy_tenant
+                    if row["contract_json"]:
+                        try:
+                            payload = json.loads(row["contract_json"])
+                            scope = payload.get("request", {}).get("scope", {})
+                            if "tenant_id" in scope and scope["tenant_id"]:
+                                tenant_id = str(scope["tenant_id"])
+                        except (TypeError, ValueError):
+                            pass
+                    conn.execute("UPDATE investigations SET tenant_id=? WHERE id=?", (tenant_id, row["id"]))
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_tenant_started ON investigations(tenant_id, started_at)")
             candidate_columns = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_candidates)")}
             if "reviewed_by" not in candidate_columns:
                 conn.execute("ALTER TABLE knowledge_candidates ADD COLUMN reviewed_by TEXT NOT NULL DEFAULT ''")
@@ -257,14 +279,20 @@ class InvestigationStore:
 
     # ── Write operations ──────────────────────────────────────────────────
 
-    def start(self, prompt: str, user_id: str = "", channel_id: str = "") -> str:
+    def start(
+        self,
+        prompt: str,
+        user_id: str = "",
+        channel_id: str = "",
+        tenant_id: str = "default",
+    ) -> str:
         """Record the start of a new investigation. Returns investigation ID."""
         inv_id = uuid.uuid4().hex[:16]
         with self._conn() as conn:
             conn.execute(
-                """INSERT INTO investigations (id, prompt, user_id, channel_id, started_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (inv_id, prompt, user_id, channel_id, time.time()),
+                """INSERT INTO investigations (id, tenant_id, prompt, user_id, channel_id, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (inv_id, tenant_id or "default", prompt, user_id, channel_id, time.time()),
             )
         return inv_id
 
@@ -567,6 +595,17 @@ class InvestigationStore:
                 raise StaleRevisionError(
                     f"expected parent revision {expected_parent_revision}, current revision is {current}"
                 )
+            incoming_tenant = contract.request.scope.tenant_id or "default"
+            investigation_row = conn.execute(
+                "SELECT tenant_id FROM investigations WHERE id=?",
+                (investigation_id,),
+            ).fetchone()
+            if (
+                current > 0
+                and investigation_row is not None
+                and str(investigation_row["tenant_id"] or "default") != incoming_tenant
+            ):
+                raise StaleRevisionError("investigation tenant cannot change across revisions")
             candidate_row = None
             if applied_candidate_id is not None:
                 candidate_row = conn.execute(
@@ -596,6 +635,16 @@ class InvestigationStore:
                 )
                 for correction in contract.corrections
             ]
+            knowledge_usage = [
+                usage.model_copy(
+                    update={
+                        "usage_id": f"usage_{investigation_id}_{revision}_{index:02d}",
+                        "investigation_id": investigation_id,
+                        "investigation_revision": revision,
+                    }
+                )
+                for index, usage in enumerate(contract.knowledge_usage, start=1)
+            ]
             renderings = contract.renderings.copy()
             dashboard_rendering = dict(renderings.get("dashboard", {}))
             references = dict(dashboard_rendering.get("references", {}))
@@ -608,6 +657,7 @@ class InvestigationStore:
                         "investigation": investigation,
                         "renderings": renderings,
                         "corrections": corrections,
+                        "knowledge_usage": knowledge_usage,
                     }
                 )
             )
@@ -655,8 +705,8 @@ class InvestigationStore:
                 ),
             )
             conn.execute(
-                "UPDATE investigations SET current_revision=? WHERE id=?",
-                (revision, investigation_id),
+                "UPDATE investigations SET current_revision=?, tenant_id=? WHERE id=?",
+                (revision, incoming_tenant, investigation_id),
             )
             if candidate_row is not None:
                 candidate_provenance = ProvenanceRecord.model_validate_json(
@@ -685,6 +735,7 @@ class InvestigationStore:
                         "revision": revision,
                         "runtime": stamped.runtime,
                         "corrections": corrections,
+                        "knowledge_usage": knowledge_usage,
                     }
                 )
                 conn.execute(
@@ -833,6 +884,24 @@ class InvestigationStore:
             )
             return None
 
+    def _uses_legacy_v1_fingerprint(self, investigation_id: str, revision: int) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                """SELECT contract_json FROM investigation_revisions
+                   WHERE investigation_id=? AND revision=?""",
+                (investigation_id, revision),
+            ).fetchone()
+        if row is None:
+            return False
+        try:
+            payload = json.loads(row["contract_json"])
+        except (TypeError, json.JSONDecodeError):
+            return False
+        schema = payload.get("schema", {})
+        return schema.get("version") == "1.0" and (
+            "knowledge_snapshot_ref" not in payload or "knowledge_usage" not in payload
+        )
+
     def replay_contract(
         self,
         investigation_id: str,
@@ -840,11 +909,16 @@ class InvestigationStore:
         *,
         mode: ReplayMode = ReplayMode.EXACT,
         changes: CounterfactualChanges | None = None,
+        runtime_settings: Settings | None = None,
     ) -> InvestigationContract | None:
         """Rebuild a contract from captured inputs without external refetch."""
         contract = self.get_contract(investigation_id, revision)
         if contract is None:
             return None
+        legacy_v1_fingerprint = self._uses_legacy_v1_fingerprint(
+            investigation_id,
+            contract.investigation.revision,
+        )
         snapshot = self.get_snapshot(investigation_id, contract.investigation.revision)
         run_id = self.start_run(
             investigation_id,
@@ -887,7 +961,56 @@ class InvestigationStore:
             )
             return contract
         try:
-            rebuilt = rebuild_contract(snapshot, mode=mode, changes=changes)
+            replay_snapshot = snapshot
+            if mode == ReplayMode.CURRENT_ENGINE:
+                from tacit.knowledge.scope import investigation_knowledge_scope
+                from tacit.knowledge.service import get_knowledge_service
+
+                knowledge_service = get_knowledge_service()
+                active_settings = runtime_settings or settings
+                configured_tenant = str(getattr(active_settings, "knowledge_tenant_id", "default") or "default")
+                snapshot_tenant = str(snapshot.request.tenant_id or "")
+                if configured_tenant == "*" and not snapshot_tenant:
+                    raise ReplayError("tenant_id is required for current-engine replay when knowledge_tenant_id is '*'")
+                if configured_tenant != "*" and snapshot_tenant and snapshot_tenant != configured_tenant:
+                    raise ReplayError(
+                        f"investigation tenant {snapshot_tenant!r} does not match configured tenant "
+                        f"{configured_tenant!r}"
+                    )
+                tenant_id = snapshot_tenant or configured_tenant
+                archetype_ids = {
+                    *[match.type for match in snapshot.intent.archetypes],
+                    snapshot.intent.problem_type,
+                    *[panel.source_archetype for panel in snapshot.dashboard_spec.panels if panel.source_archetype],
+                }
+                knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(
+                    investigation_knowledge_scope(
+                        tenant_id=tenant_id,
+                        prompt=snapshot.request.prompt,
+                        services=snapshot.intent.services,
+                        archetype_ids=archetype_ids,
+                    )
+                )
+                knowledge_usage = knowledge_service.reconcile_live_observations(
+                    knowledge_usage,
+                    snapshot.evidence_observations,
+                )
+                knowledge_snapshot = knowledge_service.snapshot_from_usage(tenant_id, knowledge_usage)
+                baseline_ranking = snapshot.baseline_culprit_ranking or snapshot.culprit_ranking
+                replay_snapshot = snapshot.model_copy(
+                    update={
+                        "request": snapshot.request.model_copy(update={"tenant_id": tenant_id}),
+                        "culprit_ranking": knowledge_service.apply_to_ranking(
+                            baseline_ranking,
+                            knowledge_usage,
+                        ),
+                        "knowledge_snapshot_ref": knowledge_snapshot.id,
+                        "knowledge_usage": knowledge_usage,
+                    }
+                )
+            rebuilt = rebuild_contract(replay_snapshot, mode=mode, changes=changes)
+            if mode == ReplayMode.EXACT and legacy_v1_fingerprint:
+                rebuilt = stamp_fingerprints(rebuilt, include_knowledge_fields=False)
             self.append_event(
                 investigation_id,
                 run_id,
@@ -922,7 +1045,7 @@ class InvestigationStore:
             persisted_snapshot = (
                 apply_counterfactual(snapshot, changes or CounterfactualChanges())
                 if mode == ReplayMode.COUNTERFACTUAL
-                else snapshot
+                else replay_snapshot
             )
             persisted = self.persist_contract_revision(
                 rebuilt,
@@ -932,6 +1055,20 @@ class InvestigationStore:
                 run_id=run_id,
                 expected_parent_revision=contract.investigation.revision,
             )
+            if mode == ReplayMode.CURRENT_ENGINE and persisted.knowledge_usage:
+                try:
+                    knowledge_service.persist_usage(
+                        persisted.knowledge_usage,
+                        investigation_id=persisted.investigation.id,
+                        investigation_revision=persisted.investigation.revision,
+                    )
+                except Exception:
+                    logger.warning(
+                        "replay_knowledge_usage_persist_failed",
+                        investigation_id=persisted.investigation.id,
+                        investigation_revision=persisted.investigation.revision,
+                        exc_info=True,
+                    )
             self.complete_run(run_id, status="completed", runtime_manifest=persisted.runtime.model_dump(mode="json"))
             return persisted
         except ExactReplayMismatchError:
@@ -1244,11 +1381,16 @@ class InvestigationStore:
         offset: int = 0,
         status: str | None = None,
         user_id: str | None = None,
+        tenant_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """List recent investigations, newest first."""
         query = "SELECT * FROM investigations"
         params: list[Any] = []
         conditions: list[str] = []
+
+        if tenant_id:
+            conditions.append("tenant_id=?")
+            params.append(tenant_id)
 
         if status:
             conditions.append("status=?")
@@ -1266,10 +1408,10 @@ class InvestigationStore:
             rows = conn.execute(query, params).fetchall()
             return [self._row_to_dict(r) for r in rows]
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self, *, tenant_id: str | None = None) -> dict[str, Any]:
         """Aggregate stats across all investigations."""
         with self._conn() as conn:
-            row = conn.execute("""
+            query = """
                 SELECT
                     COUNT(*) as total,
                     SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as succeeded,
@@ -1282,7 +1424,12 @@ class InvestigationStore:
                     SUM(CASE WHEN path_used='archetype' THEN 1 ELSE 0 END) as archetype_path,
                     SUM(CASE WHEN path_used='freeform' THEN 1 ELSE 0 END) as freeform_path
                 FROM investigations
-            """).fetchone()
+            """
+            params: tuple[Any, ...] = ()
+            if tenant_id:
+                query += " WHERE tenant_id=?"
+                params = (tenant_id,)
+            row = conn.execute(query, params).fetchone()
             return dict(row) if row else {}
 
     @staticmethod

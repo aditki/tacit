@@ -6,6 +6,8 @@ from tacit.alert_ingest import ingest_alert_features
 from tacit.backends.base import AlertFeatures
 from tacit.feedback import FeedbackStore
 from tacit.history import InvestigationStore
+from tacit.knowledge.enums import SourceFamily
+from tacit.knowledge.repository import KnowledgeRepository
 from tacit.signals import SignalStore
 
 
@@ -234,6 +236,10 @@ async def test_unchanged_alert_recrawl_preserves_approved_status(tmp_path, monke
     assert result["status"] == "approved"
     assert row is not None
     assert row["status"] == "approved"
+    governed = KnowledgeRepository(store._db_path).list_candidates("default", kind="signal_mapping")
+    assert len(governed) == 1
+    assert governed[0].payload_ref.startswith("signal_mapping:grafana:alert:checkout-latency")
+    assert governed[0].evidence.items[0].source_family == SourceFamily.ALERT
     if store._learning_index_available():
         rows = store.search_learning_context("checkout latency", service="checkout")
         assert rows
@@ -266,7 +272,58 @@ async def test_unchanged_pending_alert_can_upgrade_to_approved(tmp_path, monkeyp
     if store._learning_index_available():
         rows = store.search_learning_context("checkout latency", service="checkout")
         assert rows
-        assert rows[0]["review_state"] != "candidate"
+        assert rows[0]["review_state"] == "candidate"
+
+
+async def test_alert_refresh_retires_removed_signal_knowledge(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    batches = iter(
+        [
+            [
+                {
+                    "signal_type": "old_alert_signal",
+                    "metric": "old_alert_metric",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+            [
+                {
+                    "signal_type": "new_alert_signal",
+                    "metric": "new_alert_metric",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr("tacit.alert_ingest.infer_signals_from_metrics", lambda *args, **kwargs: next(batches))
+
+    def features(metric: str) -> AlertFeatures:
+        return AlertFeatures(
+            alert_uid="refresh-alert",
+            alert_title="Refresh alert",
+            backend_name="grafana",
+            query_language="promql",
+            condition="A > 1",
+            metrics_found=[metric],
+            query_transformations=[metric],
+        )
+
+    await ingest_alert_features(features("old_alert_metric"), auto_approve=True)
+    await ingest_alert_features(features("new_alert_metric"), auto_approve=True)
+
+    assert store.get_mappings_for_signal("old_alert_signal", include_decayed=True) == []
+    candidates = KnowledgeRepository(store._db_path).list_candidates("default", kind="signal_mapping")
+    old = next(candidate for candidate in candidates if "old_alert_metric" in candidate.payload_ref)
+    new = next(candidate for candidate in candidates if "new_alert_metric" in candidate.payload_ref)
+    assert old.state.lifecycle_status.value == "stale"
+    assert new.state.lifecycle_status.value == "active"
 
 
 def test_missing_alerts_are_marked_stale_not_deleted(tmp_path):

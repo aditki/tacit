@@ -56,6 +56,8 @@ def get_signal_store():
 def infer_signals_from_metrics(
     metrics: list[str],
     panel_data: list[dict[str, Any]] | None = None,
+    *,
+    tenant_id: str = "default",
 ) -> list[dict[str, Any]]:
     """Infer semantic signals from extracted metrics.
 
@@ -71,7 +73,7 @@ def infer_signals_from_metrics(
     signal_family, source ('taxonomy'|'heuristic'), reason, evidence.
     """
     store = get_signal_store()
-    all_signal_types = store.list_signal_types()
+    all_signal_types = store.list_signal_types(tenant_id=tenant_id)
     inferred: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     matched_metrics: set[str] = set()
@@ -80,7 +82,7 @@ def infer_signals_from_metrics(
     for metric in metrics:
         for st in all_signal_types:
             signal_type = st["signal_type"]
-            mappings = store.get_mappings_for_signal(signal_type)
+            mappings = store.get_mappings_for_signal(signal_type, tenant_id=tenant_id)
             for mapping in mappings:
                 from tacit.signals import _metric_matches_pattern
 
@@ -176,12 +178,17 @@ def persist_inferred_signal_review(
     source_ref: str,
     dashboard_uid: str,
     backend_name: str = "",
+    tenant_id: str | None = None,
+    source_type: str = "dashboard_ingest",
+    governed_candidate_ids: set[str] | None = None,
+    governed_pairs: set[tuple[str, str]] | None = None,
 ) -> bool:
     """Persist one inferred signal using the same gate for all approval paths."""
     signal_type = sig["signal_type"]
     metric = sig.get("metric", "")
     confidence = sig.get("confidence", 0.6)
     is_heuristic = sig.get("source") == "heuristic"
+    effective_tenant = resolve_learning_tenant(tenant_id)
 
     if is_heuristic:
         should_teach = bool(metric) and bool(sig.get("auto_teach_eligible"))
@@ -189,19 +196,43 @@ def persist_inferred_signal_review(
         should_teach = bool(metric) and confidence >= 0.5
 
     if should_teach:
+        if governed_pairs is not None:
+            governed_pairs.add((metric, signal_type))
         family = sig.get("signal_family", "")
         if family:
-            store.register_signal_type(signal_type=signal_type, category=family)
+            store.register_signal_type(signal_type=signal_type, category=family, tenant_id=effective_tenant)
         store.add_mapping(
             signal_type=signal_type,
             metric_pattern=metric,
             confidence=confidence,
-            source_type="dashboard_ingest",
+            source_type=source_type,
             source_refs=[source_ref],
             inference_version=sig.get("inference_version", ""),
-            review_state="approved" if is_heuristic else "trusted",
+            review_state="candidate",
+            tenant_id=effective_tenant,
         )
-        return True
+        governed_candidate_id = _govern_signal_mapping(
+            store=store,
+            sig=sig,
+            source_ref=source_ref,
+            source_type=source_type,
+            tenant_id=effective_tenant,
+        )
+        if governed_candidate_ids is not None:
+            governed_candidate_ids.add(governed_candidate_id)
+        if _governed_signal_mapping_is_active(
+            store=store,
+            candidate_id=governed_candidate_id,
+            tenant_id=effective_tenant,
+        ):
+            store.set_mapping_review_state(
+                signal_type,
+                metric,
+                "approved" if is_heuristic else "trusted",
+                tenant_id=effective_tenant,
+            )
+            return True
+        return False
 
     if is_heuristic and metric:
         store.record_rejected_candidate(
@@ -215,8 +246,95 @@ def persist_inferred_signal_review(
             inference_version=sig.get("inference_version", ""),
             dashboard_uid=dashboard_uid,
             backend_name=backend_name,
+            tenant_id=effective_tenant,
         )
     return False
+
+
+def _govern_signal_mapping(
+    *,
+    store: Any,
+    sig: dict[str, Any],
+    source_ref: str,
+    source_type: str,
+    tenant_id: str | None,
+) -> str:
+    effective_tenant = resolve_learning_tenant(tenant_id)
+    from tacit.knowledge.migration import migrate_signal_mapping
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    record_ref = f"{source_ref}:{sig['signal_type']}:{sig.get('metric', '')}"
+    return migrate_signal_mapping(
+        {
+            "id": record_ref,
+            "signal_type": sig["signal_type"],
+            "metric_pattern": sig.get("metric", ""),
+            "context_services": sig.get("services", []),
+            "context_environments": sig.get("environments", []),
+            "context_archetypes": sig.get("archetypes", []),
+            "source_type": source_type,
+            "source_refs": [source_ref],
+            "review_state": "approved" if sig.get("source") == "heuristic" else "trusted",
+        },
+        service=KnowledgeService(KnowledgeRepository(store._db_path)),
+        tenant_id=effective_tenant,
+    )
+
+
+def _governed_signal_mapping_is_active(
+    *,
+    store: Any,
+    candidate_id: str,
+    tenant_id: str,
+) -> bool:
+    from tacit.knowledge.enums import KnowledgeEligibility, LifecycleStatus
+    from tacit.knowledge.repository import KnowledgeRepository
+
+    repository = KnowledgeRepository(store._db_path)
+    candidate = repository.get_candidate(candidate_id, tenant_id)
+    if candidate is None:
+        return False
+    item = repository.find_knowledge_by_proposition(tenant_id, candidate.proposition.proposition_key)
+    revision = repository.get_revision(item.id, tenant_id=tenant_id) if item is not None else None
+    return bool(
+        revision is not None
+        and revision.state.lifecycle_status == LifecycleStatus.ACTIVE
+        and revision.state.eligibility != KnowledgeEligibility.INELIGIBLE
+    )
+
+
+def reconcile_signal_source(
+    *,
+    store: Any,
+    tenant_id: str,
+    source_type: str,
+    source_ref: str,
+    active_pairs: set[tuple[str, str]],
+    active_candidate_ids: set[str],
+) -> None:
+    """Reconcile refreshed legacy mappings and governed knowledge together."""
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    store.reconcile_mapping_source(
+        tenant_id=tenant_id,
+        source_type=source_type,
+        source_ref=source_ref,
+        active_pairs=active_pairs,
+    )
+    KnowledgeService(KnowledgeRepository(store._db_path)).reconcile_source_lifecycle(
+        provenance_ref=source_ref,
+        tenant_id=tenant_id,
+        active_candidate_ids=active_candidate_ids,
+    )
+
+
+def resolve_learning_tenant(tenant_id: str | None) -> str:
+    configured_tenant = str(settings.knowledge_tenant_id or "default")
+    if not tenant_id and configured_tenant == "*":
+        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
+    return tenant_id or configured_tenant
 
 
 def register_generated_archetype_if_enabled(archetype_yaml: str, *, dashboard_uid: str = "") -> bool:
@@ -278,10 +396,16 @@ def approve_ingested_dashboard_record(
     dashboard_uid: str,
     backend_name: str | None = None,
     store: Any | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Approve a pending ingested dashboard and activate learned artifacts."""
     store = store or get_signal_store()
-    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend_name)
+    effective_tenant = resolve_learning_tenant(tenant_id)
+    ingested = store.get_ingested_dashboard(
+        dashboard_uid,
+        backend_name=backend_name,
+        tenant_id=effective_tenant,
+    )
     if ingested is None:
         raise LookupError("Ingested dashboard not found")
 
@@ -297,6 +421,8 @@ def approve_ingested_dashboard_record(
 
     mappings_created = 0
     activated_pairs: set[tuple[str, str]] = set()
+    governed_pairs: set[tuple[str, str]] = set()
+    governed_candidate_ids: set[str] = set()
     source_ref = f"{ingested['backend_name']}:{dashboard_uid}" if ingested.get("backend_name") else dashboard_uid
     for sig in ingested.get("signals_inferred", []):
         if isinstance(sig, dict):
@@ -306,34 +432,55 @@ def approve_ingested_dashboard_record(
                 source_ref=source_ref,
                 dashboard_uid=dashboard_uid,
                 backend_name=ingested.get("backend_name", ""),
+                tenant_id=effective_tenant,
+                governed_candidate_ids=governed_candidate_ids,
+                governed_pairs=governed_pairs,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
         else:
             from tacit.signals import _metric_matches_pattern
 
-            signal_data = store.get_signal_type(sig)
+            signal_data = store.get_signal_type(sig, tenant_id=effective_tenant)
             if not signal_data:
                 continue
             for metric in ingested.get("metrics_found", []):
                 for mapping in signal_data.get("mappings", []):
                     if _metric_matches_pattern(metric, mapping["metric_pattern"]):
-                        store.add_mapping(
-                            signal_type=sig,
-                            metric_pattern=metric,
-                            confidence=mapping.get("confidence", 0.6),
-                            source_type="dashboard_ingest",
-                            source_refs=[source_ref],
-                            review_state="approved",
-                        )
-                        mappings_created += 1
-                        activated_pairs.add((metric, sig))
+                        if persist_inferred_signal_review(
+                            store=store,
+                            sig={
+                                "signal_type": sig,
+                                "metric": metric,
+                                "confidence": mapping.get("confidence", 0.6),
+                                "source": "reviewed_mapping",
+                                "services": [],
+                            },
+                            source_ref=source_ref,
+                            dashboard_uid=dashboard_uid,
+                            backend_name=ingested.get("backend_name", ""),
+                            tenant_id=effective_tenant,
+                            governed_candidate_ids=governed_candidate_ids,
+                            governed_pairs=governed_pairs,
+                        ):
+                            mappings_created += 1
+                            activated_pairs.add((metric, sig))
                         break
+
+    reconcile_signal_source(
+        store=store,
+        tenant_id=effective_tenant,
+        source_type="dashboard_ingest",
+        source_ref=source_ref,
+        active_pairs=governed_pairs,
+        active_candidate_ids=governed_candidate_ids,
+    )
 
     store.approve_ingested_dashboard(
         dashboard_uid,
         backend_name=backend_name,
         activated_pairs=activated_pairs,
+        tenant_id=effective_tenant,
     )
     archetype_registered = register_generated_archetype_if_enabled(
         ingested.get("archetype_generated", ""),
@@ -355,10 +502,16 @@ def reject_ingested_dashboard_record(
     dashboard_uid: str,
     backend_name: str | None = None,
     store: Any | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Reject a pending ingested dashboard and persist heuristic negatives."""
     store = store or get_signal_store()
-    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend_name)
+    effective_tenant = resolve_learning_tenant(tenant_id)
+    ingested = store.get_ingested_dashboard(
+        dashboard_uid,
+        backend_name=backend_name,
+        tenant_id=effective_tenant,
+    )
     if ingested is None:
         raise LookupError("Ingested dashboard not found")
 
@@ -385,10 +538,15 @@ def reject_ingested_dashboard_record(
                 inference_version=sig.get("inference_version", ""),
                 dashboard_uid=dashboard_uid,
                 backend_name=ingested.get("backend_name", ""),
+                tenant_id=effective_tenant,
             )
             rejected_candidates += 1
 
-    if not store.reject_ingested_dashboard(dashboard_uid, backend_name=backend_name):
+    if not store.reject_ingested_dashboard(
+        dashboard_uid,
+        backend_name=backend_name,
+        tenant_id=effective_tenant,
+    ):
         raise RuntimeError("Dashboard is no longer pending")
 
     return {
@@ -405,13 +563,16 @@ async def ingest_dashboard_features(
     *,
     auto_approve: bool = False,
     register_archetype: bool = True,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted dashboard features."""
+    effective_tenant = resolve_learning_tenant(tenant_id)
     extracted = _features_to_dict(features)
 
     signals = infer_signals_from_metrics(
         features.metrics_found,
         features.panels,
+        tenant_id=effective_tenant,
     )
     signal_quality = build_signal_quality_report(metrics=features.metrics_found, signals=signals)
     learning_impact = build_learning_impact_report(
@@ -427,6 +588,7 @@ async def ingest_dashboard_features(
 
     store.record_ingested_dashboard(
         dashboard_uid=features.dashboard_uid,
+        tenant_id=effective_tenant,
         backend_name=features.backend_name,
         dashboard_title=features.dashboard_title,
         dashboard_tags=features.dashboard_tags,
@@ -446,6 +608,8 @@ async def ingest_dashboard_features(
     mappings_created = 0
     archetype_registered = False
     activated_pairs: set[tuple[str, str]] = set()
+    governed_pairs: set[tuple[str, str]] = set()
+    governed_candidate_ids: set[str] = set()
     if auto_approve:
         source_ref = (
             f"{features.backend_name}:{features.dashboard_uid}" if features.backend_name else features.dashboard_uid
@@ -457,9 +621,23 @@ async def ingest_dashboard_features(
                 source_ref=source_ref,
                 dashboard_uid=features.dashboard_uid,
                 backend_name=features.backend_name,
+                tenant_id=effective_tenant,
+                governed_candidate_ids=governed_candidate_ids,
+                governed_pairs=governed_pairs,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
+        reconcile_signal_source(
+            store=store,
+            tenant_id=effective_tenant,
+            source_type="dashboard_ingest",
+            source_ref=source_ref,
+            active_pairs=governed_pairs,
+            active_candidate_ids=governed_candidate_ids,
+        )
+        teachable_count = len(governed_pairs)
+        learning_impact["candidate_mappings_pending_approval"] = max(0, teachable_count - mappings_created)
+        learning_impact["new_active_mappings_after_approval"] = mappings_created
         if register_archetype:
             archetype_registered = register_generated_archetype_if_enabled(
                 archetype_yaml,
@@ -484,6 +662,7 @@ async def ingest_dashboard_features(
         )
 
     indexed_context_rows = store.index_dashboard_context(
+        tenant_id=effective_tenant,
         dashboard_uid=features.dashboard_uid,
         backend_name=features.backend_name,
         dashboard_title=features.dashboard_title,
@@ -528,6 +707,7 @@ async def ingest_dashboard(
     auto_approve: bool = False,
     register_archetype: bool = True,
     runtime_settings: Settings | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Full ingestion pipeline: fetch → extract → infer signals → store.
 
@@ -587,6 +767,7 @@ async def ingest_dashboard(
             features,
             auto_approve=auto_approve,
             register_archetype=register_archetype,
+            tenant_id=tenant_id,
         )
 
     finally:
@@ -601,12 +782,14 @@ async def learn_backend_dashboards(
     auto_approve: bool = False,
     limit: int = 500,
     runtime_settings: Settings | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Crawl a backend and learn from every discoverable dashboard."""
     import asyncio
 
     from tacit.backends import get_active_backends
 
+    effective_tenant = resolve_learning_tenant(tenant_id)
     active_settings = runtime_settings or settings
     all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
     if not all_backends:
@@ -645,6 +828,7 @@ async def learn_backend_dashboards(
                         backend=backend,
                         auto_approve=auto_approve,
                         register_archetype=not auto_approve,
+                        tenant_id=effective_tenant,
                     )
                 return (
                     {
@@ -675,6 +859,39 @@ async def learn_backend_dashboards(
             if failure is not None:
                 failures.append(failure)
                 totals["dashboards_failed"] += 1
+
+        stale_reconciliation_complete = bool(getattr(backend, "last_dashboard_list_complete", False))
+        if stale_reconciliation_complete:
+            store = get_signal_store()
+            seen_dashboard_uids = {str(item.get("uid", "")) for item in dashboards if item.get("uid")}
+            totals["stale_marked"] = store.mark_missing_dashboards_stale(
+                tenant_id=effective_tenant,
+                backend_name=backend_name,
+                seen_dashboard_uids=seen_dashboard_uids,
+            )
+            if totals["stale_marked"]:
+                from tacit.knowledge.repository import KnowledgeRepository
+                from tacit.knowledge.service import KnowledgeService
+
+                knowledge_service = KnowledgeService(KnowledgeRepository(store._db_path))
+                for dashboard in store.list_ingested_dashboards(
+                    status="stale",
+                    limit=10_000,
+                    tenant_id=effective_tenant,
+                ):
+                    if dashboard.get("backend_name") != backend_name:
+                        continue
+                    knowledge_service.reconcile_source_lifecycle(
+                        provenance_ref=(
+                            f"{backend_name}:{dashboard['dashboard_uid']}"
+                            if backend_name
+                            else str(dashboard["dashboard_uid"])
+                        ),
+                        tenant_id=effective_tenant,
+                        source_stale=True,
+                    )
+        else:
+            totals["stale_reconciliation_skipped"] = True
 
         if auto_approve:
             archetype_yamls = [str(item.get("archetype_yaml", "")) for item in learned if item.get("archetype_yaml")]

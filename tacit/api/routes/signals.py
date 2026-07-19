@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 import tacit.signals as signals_mod
-from tacit.api.security import verify_api_key
+from tacit.api.security import KnowledgeAction, assert_knowledge_action, knowledge_tenant, verify_api_key
 from tacit.models.schemas import TeachSignalRequest, TeachSignalResponse
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
@@ -17,10 +17,10 @@ router = APIRouter(dependencies=[Depends(verify_api_key)])
     summary="List all signal types",
     response_description="All registered semantic signal types with categories",
 )
-async def list_signals():
+async def list_signals(request: Request):
     """List all registered semantic signal types."""
     store = signals_mod.get_signal_store()
-    return {"signal_types": store.list_signal_types()}
+    return {"signal_types": store.list_signal_types(tenant_id=knowledge_tenant(request))}
 
 
 @router.get(
@@ -29,10 +29,10 @@ async def list_signals():
     summary="Signal store statistics",
     response_description="Summary stats: signal types, mappings, ingested dashboards",
 )
-async def signal_stats():
+async def signal_stats(request: Request):
     """Summary statistics for the signal mapping store."""
     store = signals_mod.get_signal_store()
-    return store.stats()
+    return store.stats(tenant_id=knowledge_tenant(request))
 
 
 @router.get(
@@ -41,10 +41,10 @@ async def signal_stats():
     summary="Get signal type details",
     response_description="Signal type with all metric mappings, confidence scores, and provenance",
 )
-async def get_signal(signal_type: str):
+async def get_signal(signal_type: str, request: Request):
     """Get a signal type with all its metric mappings."""
     store = signals_mod.get_signal_store()
-    result = store.get_signal_type(signal_type)
+    result = store.get_signal_type(signal_type, tenant_id=knowledge_tenant(request))
     if result is None:
         raise HTTPException(status_code=404, detail=f"Signal type '{signal_type}' not found")
     return result
@@ -57,32 +57,36 @@ async def get_signal(signal_type: str):
     response_model=TeachSignalResponse,
     response_description="Confirmation of the created mapping",
 )
-async def teach_signal(request: TeachSignalRequest) -> TeachSignalResponse:
+async def teach_signal(payload: TeachSignalRequest, request: Request) -> TeachSignalResponse:
     """Teach Tacit an organization-specific signal mapping."""
+    assert_knowledge_action(request, KnowledgeAction.TEACH_SIGNALS)
+    tenant_id = knowledge_tenant(request)
     store = signals_mod.get_signal_store()
     store.register_signal_type(
-        signal_type=request.signal_type,
-        description=request.description,
-        category=request.category,
-        unit=request.unit,
+        signal_type=payload.signal_type,
+        description=payload.description,
+        category=payload.category,
+        unit=payload.unit,
+        tenant_id=tenant_id,
     )
 
     mappings_created = 0
-    for mp in request.metric_patterns:
+    for mp in payload.metric_patterns:
         store.add_mapping(
-            signal_type=request.signal_type,
+            signal_type=payload.signal_type,
             metric_pattern=mp.pattern,
             confidence=mp.confidence,
-            context_services=request.services,
-            context_datasource_types=request.datasource_types,
-            context_environments=request.environments,
+            context_services=payload.services,
+            context_datasource_types=payload.datasource_types,
+            context_environments=payload.environments,
             source_type="teach",
-            source_refs=[f"manual:{request.taught_by}"],
+            source_refs=[f"manual:{payload.taught_by}"],
+            tenant_id=tenant_id,
         )
         mappings_created += 1
 
     return TeachSignalResponse(
-        signal_type=request.signal_type,
+        signal_type=payload.signal_type,
         mappings_created=mappings_created,
-        message=f"Signal '{request.signal_type}' updated with {mappings_created} mapping(s)",
+        message=f"Signal '{payload.signal_type}' updated with {mappings_created} mapping(s)",
     )

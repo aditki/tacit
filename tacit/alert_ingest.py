@@ -20,6 +20,7 @@ from tacit.backends.base import AlertFeatures
 from tacit.config import Settings, settings
 from tacit.dashboard_ingest import infer_signals_from_metrics, persist_inferred_signal_review
 from tacit.dashboard_ingest.reports import build_learning_impact_report, build_signal_quality_report
+from tacit.dashboard_ingest.service import reconcile_signal_source, resolve_learning_tenant
 from tacit.signals import get_signal_store as _default_get_signal_store
 from tacit.signals.learning_index import infer_services_for_learning
 
@@ -149,12 +150,18 @@ async def ingest_alert_features(
     *,
     auto_approve: bool = False,
     dry_run: bool = False,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted alert features."""
+    effective_tenant = tenant_id if dry_run else resolve_learning_tenant(tenant_id)
     store = get_signal_store()
     status = "approved" if auto_approve else "pending"
     panel = alert_to_panel(features)
-    signals = infer_signals_from_metrics(features.metrics_found, [panel])
+    signals = infer_signals_from_metrics(
+        features.metrics_found,
+        [panel],
+        tenant_id=effective_tenant or "default",
+    )
     signal_quality = build_signal_quality_report(metrics=features.metrics_found, signals=signals)
     learning_impact = build_learning_impact_report(
         metrics=features.metrics_found,
@@ -169,6 +176,8 @@ async def ingest_alert_features(
     source_ref = f"{features.backend_name}:alert:{features.alert_uid}" if features.backend_name else features.alert_uid
     mappings_created = 0
     activated_pairs: set[tuple[str, str]] = set()
+    governed_pairs: set[tuple[str, str]] = set()
+    governed_candidate_ids: set[str] = set()
     if auto_approve and not dry_run:
         for sig in signals:
             if persist_inferred_signal_review(
@@ -177,16 +186,21 @@ async def ingest_alert_features(
                 source_ref=source_ref,
                 dashboard_uid=features.alert_uid,
                 backend_name=features.backend_name,
+                tenant_id=effective_tenant,
+                source_type="alert_ingest",
+                governed_candidate_ids=governed_candidate_ids,
+                governed_pairs=governed_pairs,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
-
     change_state = "dry_run"
     indexed_context_rows = 0
     effective_status = status
     if not dry_run:
+        assert effective_tenant is not None
         change_state = store.record_ingested_alert(
             alert_uid=features.alert_uid,
+            tenant_id=effective_tenant,
             backend_name=features.backend_name,
             source_vendor=features.backend_name,
             source_instance=_source_instance(features),
@@ -210,10 +224,15 @@ async def ingest_alert_features(
             signals_inferred=signals,
             status=status,
         )
-        stored_alert = store.get_ingested_alert(features.alert_uid, features.backend_name)
+        stored_alert = store.get_ingested_alert(
+            features.alert_uid,
+            features.backend_name,
+            tenant_id=effective_tenant,
+        )
         if stored_alert is not None:
             effective_status = str(stored_alert.get("status") or status)
         indexed_context_rows = store.index_alert_context(
+            tenant_id=effective_tenant,
             alert_uid=features.alert_uid,
             backend_name=features.backend_name,
             alert_title=features.alert_title,
@@ -226,6 +245,18 @@ async def ingest_alert_features(
             status=effective_status,
             activated_pairs=activated_pairs if auto_approve else None,
         )
+        if auto_approve:
+            reconcile_signal_source(
+                store=store,
+                tenant_id=effective_tenant,
+                source_type="alert_ingest",
+                source_ref=source_ref,
+                active_pairs=governed_pairs,
+                active_candidate_ids=governed_candidate_ids,
+            )
+            teachable_count = len(governed_pairs)
+            learning_impact["candidate_mappings_pending_approval"] = max(0, teachable_count - mappings_created)
+            learning_impact["new_active_mappings_after_approval"] = mappings_created
 
     result = {
         **asdict(features),
@@ -272,6 +303,7 @@ async def ingest_alert(
     auto_approve: bool = False,
     dry_run: bool = False,
     runtime_settings: Settings | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Full alert ingestion pipeline: fetch -> extract -> infer -> persist."""
     from tacit.backends import get_active_backends
@@ -297,7 +329,12 @@ async def ingest_alert(
         if backend is None:
             raise RuntimeError("No backend selected for alert ingestion")
         features = await backend.ingest_alert(alert_uid)
-        return await ingest_alert_features(features, auto_approve=auto_approve, dry_run=dry_run)
+        return await ingest_alert_features(
+            features,
+            auto_approve=auto_approve,
+            dry_run=dry_run,
+            tenant_id=tenant_id,
+        )
     finally:
         if own_backends:
             for item in all_backends:
@@ -311,10 +348,12 @@ async def learn_backend_alerts(
     dry_run: bool = False,
     limit: int = 500,
     runtime_settings: Settings | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Crawl a backend and learn from every discoverable alert rule."""
     from tacit.backends import get_active_backends
 
+    effective_tenant = tenant_id if dry_run else resolve_learning_tenant(tenant_id)
     active_settings = runtime_settings or settings
     all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
     if not all_backends:
@@ -353,6 +392,7 @@ async def learn_backend_alerts(
                         backend=backend,
                         auto_approve=auto_approve,
                         dry_run=dry_run,
+                        tenant_id=effective_tenant,
                     )
                 return (
                     {
@@ -390,12 +430,34 @@ async def learn_backend_alerts(
 
         stale_reconciliation_complete = bool(getattr(backend, "last_alert_list_complete", False))
         if not dry_run and stale_reconciliation_complete:
+            assert effective_tenant is not None
             store = get_signal_store()
             seen_alert_uids = {str(item.get("uid", "")) for item in alerts if item.get("uid")}
             totals["stale_marked"] = store.mark_missing_alerts_stale(
+                tenant_id=effective_tenant,
                 backend_name=backend_name,
                 seen_alert_uids=seen_alert_uids,
             )
+            if totals["stale_marked"]:
+                from tacit.knowledge.repository import KnowledgeRepository
+                from tacit.knowledge.service import KnowledgeService
+
+                knowledge_service = KnowledgeService(KnowledgeRepository(store._db_path))
+                for alert in store.list_ingested_alerts(
+                    status="stale",
+                    limit=10_000,
+                    tenant_id=effective_tenant,
+                ):
+                    if alert.get("backend_name") == backend_name:
+                        knowledge_service.reconcile_source_lifecycle(
+                            provenance_ref=(
+                                f"{backend_name}:alert:{alert['alert_uid']}"
+                                if backend_name
+                                else str(alert["alert_uid"])
+                            ),
+                            tenant_id=effective_tenant,
+                            source_stale=True,
+                        )
         elif not dry_run:
             totals["stale_reconciliation_skipped"] = True
 
