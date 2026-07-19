@@ -383,14 +383,19 @@ async def _run_pipeline_inner(
         knowledge_snapshot = None
         knowledge_usage: list[KnowledgeUsage] = []
         try:
-            from tacit.knowledge.models import KnowledgeScope
-            from tacit.knowledge.normalization import normalize_service_ref
+            from tacit.knowledge.scope import investigation_knowledge_scope
             from tacit.knowledge.service import get_knowledge_service
 
             tenant_id = request.tenant_id or getattr(runtime_settings, "knowledge_tenant_id", "default")
-            knowledge_scope = KnowledgeScope(
+            knowledge_scope = investigation_knowledge_scope(
                 tenant_id=tenant_id,
-                service_refs=[normalize_service_ref(service) for service in intent.services],
+                prompt=request.prompt,
+                services=intent.services,
+                archetype_ids={
+                    *[archetype.id for archetype, _ in ranked_archetypes],
+                    *[match.type for match in intent.archetypes],
+                    intent.problem_type,
+                },
             )
             knowledge_service = get_knowledge_service()
             knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(knowledge_scope)

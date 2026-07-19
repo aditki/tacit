@@ -2217,7 +2217,7 @@ def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch
         pass
 
     deps = PipelineDependencies(
-        settings=object(),
+        settings=Settings(knowledge_tenant_id="tenant-a"),
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
         feedback_store_factory=FeedbackStore,
@@ -2251,6 +2251,40 @@ def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch
     assert received["investigation_id"] == investigation_id
     assert received["run_type"] == InvestigationRunType.REFRESH
     assert received["base_revision"] == 1
+
+
+def test_refresh_rejects_investigation_outside_configured_tenant(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    draft = _draft_contract(investigation_id)
+    tenant_request = draft.request.model_copy(
+        update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}
+    )
+    store.persist_contract_revision(draft.model_copy(update={"request": tenant_request}))
+    deps = PipelineDependencies(
+        settings=Settings(knowledge_tenant_id="tenant-b"),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+    called = False
+
+    async def fake_run_pipeline(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("pipeline must not run across the tenant boundary")
+
+    monkeypatch.setattr("tacit.api.routes.history.run_pipeline", fake_run_pipeline)
+    app = create_app(runtime_settings=deps.settings)
+    app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
+
+    response = TestClient(app).post(f"/api/v1/investigations/{investigation_id}/refresh")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Tenant access denied"
+    assert called is False
 
 
 def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp_path, monkeypatch):

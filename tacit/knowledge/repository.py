@@ -705,6 +705,7 @@ class KnowledgeRepository:
                      WHERE pc.tenant_id=p.tenant_id AND pc.proposition_key=p.proposition_key
                        AND c.review_state IN ('approved', 'trusted')
                        AND c.lifecycle_status = 'active'
+                       AND c.entity_resolution_status = 'resolved'
                    ) ORDER BY p.created_at""",
                 (tenant_id,),
             ).fetchall()

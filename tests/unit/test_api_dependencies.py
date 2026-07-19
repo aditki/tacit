@@ -192,6 +192,28 @@ def test_learning_auto_approval_requires_knowledge_permissions(monkeypatch, perm
     assert called is False
 
 
+@pytest.mark.parametrize(
+    ("permissions", "missing_permission"),
+    [
+        ("knowledge.read", "knowledge.review"),
+        ("knowledge.read,knowledge.review", "knowledge.trust"),
+    ],
+)
+def test_manual_signal_teaching_requires_review_and_trust_permissions(permissions, missing_permission):
+    client = TestClient(create_app(runtime_settings=Settings(knowledge_permissions=permissions)))
+
+    response = client.post(
+        "/api/v1/signals/teach",
+        json={
+            "signal_type": "restricted_signal",
+            "metric_patterns": [{"pattern": "restricted_metric", "confidence": 0.9}],
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == f"Missing permission: {missing_permission}"
+
+
 def test_dashboard_rejection_requires_knowledge_reject_permission(monkeypatch):
     called = False
 

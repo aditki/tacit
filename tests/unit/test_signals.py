@@ -37,6 +37,7 @@ from tacit.signals import (
     _effective_confidence,
     _metric_matches_pattern,
 )
+from tacit.signals.migrations import ensure_mapping_tenant_scope
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -125,6 +126,109 @@ def test_bootstrap_signal_mappings_are_available_to_every_tenant(signal_store):
 
     assert signal_store.resolve_signal("request_latency", catalog, tenant_id="tenant-a")
     assert signal_store.resolve_signal("request_latency", catalog, tenant_id="tenant-b")
+
+
+def test_context_rejected_tenant_override_does_not_hide_bootstrap_mapping(signal_store):
+    signal_store.add_mapping(
+        "request_latency",
+        "http_request_duration_seconds",
+        confidence=0.9,
+        source_type="bootstrap",
+    )
+    signal_store.add_mapping(
+        "request_latency",
+        "http_request_duration_seconds",
+        confidence=0.95,
+        source_type="teach",
+        context_services=["checkout"],
+        tenant_id="tenant-a",
+    )
+
+    mappings = signal_store.get_mappings_for_signal(
+        "request_latency",
+        context_service="payments",
+        tenant_id="tenant-a",
+    )
+
+    assert len(mappings) == 1
+    assert mappings[0]["source_type"] == "bootstrap"
+
+
+def test_stale_alert_removes_only_its_signal_mapping_provenance(signal_store):
+    for alert_uid in ("checkout-latency", "payments-latency"):
+        signal_store.record_ingested_alert(
+            alert_uid,
+            tenant_id="tenant-a",
+            backend_name="grafana",
+            status="approved",
+        )
+    signal_store.add_mapping(
+        "request_latency",
+        "service_latency_seconds",
+        confidence=0.9,
+        source_type="alert_ingest",
+        source_refs=["grafana:alert:checkout-latency", "grafana:alert:payments-latency"],
+        tenant_id="tenant-a",
+    )
+    signal_store.add_mapping(
+        "checkout_latency",
+        "checkout_latency_seconds",
+        confidence=0.9,
+        source_type="alert_ingest",
+        source_refs=["grafana:alert:checkout-latency"],
+        tenant_id="tenant-a",
+    )
+
+    signal_store.mark_missing_alerts_stale(
+        tenant_id="tenant-a",
+        backend_name="grafana",
+        seen_alert_uids={"payments-latency"},
+    )
+
+    mappings = signal_store.get_mappings_for_signal(
+        "request_latency",
+        include_decayed=True,
+        tenant_id="tenant-a",
+    )
+    assert mappings[0]["source_refs"] == ["grafana:alert:payments-latency"]
+    assert (
+        signal_store.get_mappings_for_signal(
+            "checkout_latency",
+            include_decayed=True,
+            tenant_id="tenant-a",
+        )
+        == []
+    )
+
+
+def test_mapping_tenant_rebuild_rolls_back_on_copy_failure(tmp_path):
+    db_path = tmp_path / "failed-mapping-migration.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE TABLE signal_metric_mappings (
+                id INTEGER PRIMARY KEY, signal_type TEXT, metric_pattern TEXT,
+                confidence REAL, context_services TEXT, context_datasource_types TEXT,
+                context_environments TEXT, context_archetypes TEXT, source_type TEXT,
+                source_refs TEXT, inference_version TEXT, review_state TEXT, use_count INTEGER,
+                positive_feedback INTEGER, negative_feedback INTEGER, created_at REAL, last_seen REAL,
+                UNIQUE(signal_type, metric_pattern)
+            );
+            INSERT INTO signal_metric_mappings VALUES
+                (1, 'latency', 'broken_metric', NULL, '[]', '[]', '[]', '[]',
+                 'teach', '[]', '', 'trusted', 0, 0, 0, 1, 1);
+        """)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            ensure_mapping_tenant_scope(conn)
+
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)")}
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        row = conn.execute("SELECT confidence FROM signal_metric_mappings WHERE id=1").fetchone()
+
+    assert "tenant_id" not in columns
+    assert "signal_metric_mappings_old" not in tables
+    assert row["confidence"] is None
 
 
 def test_approved_signal_mapping_is_written_to_the_governed_tenant(signal_store):

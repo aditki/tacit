@@ -467,9 +467,6 @@ class SignalStore:
         seen_patterns: set[str] = set()
         for row in rows:
             m = _deserialize_mapping(row)
-            if m["metric_pattern"] in seen_patterns:
-                continue
-            seen_patterns.add(m["metric_pattern"])
 
             # Context filtering
             if not _context_matches(
@@ -497,6 +494,9 @@ class SignalStore:
             )
             if not include_decayed and trust_effective < TRUST_THRESHOLD:
                 continue
+            if m["metric_pattern"] in seen_patterns:
+                continue
+            seen_patterns.add(m["metric_pattern"])
 
             m["effective_confidence"] = round(effective, 4)
             results.append(m)
@@ -1353,24 +1353,12 @@ class SignalStore:
                     )
                 except sqlite3.OperationalError as exc:
                     logger.warning("stale_artifact_context_update_failed", error=str(exc))
-            mapping_rows = conn.execute(
-                """SELECT id, source_refs FROM signal_metric_mappings
-                   WHERE tenant_id = ? AND source_type = ?""",
-                (tenant_id, artifact_type),
-            ).fetchall()
-            missing_set = set(missing)
-            for mapping in mapping_rows:
-                refs = json.loads(mapping["source_refs"] or "[]")
-                if not any(ref in missing_set for ref in refs):
-                    continue
-                remaining_refs = [ref for ref in refs if ref not in missing_set]
-                if remaining_refs:
-                    conn.execute(
-                        "UPDATE signal_metric_mappings SET source_refs = ? WHERE id = ?",
-                        (json.dumps(remaining_refs), mapping["id"]),
-                    )
-                else:
-                    conn.execute("DELETE FROM signal_metric_mappings WHERE id = ?", (mapping["id"],))
+            self._remove_mapping_source_refs(
+                conn,
+                tenant_id=tenant_id,
+                source_type=artifact_type,
+                stale_refs=set(missing),
+            )
             return cursor.rowcount
 
     def list_learned_artifacts(
@@ -1539,7 +1527,43 @@ class SignalStore:
                     )
                 except sqlite3.OperationalError as exc:
                     logger.warning("stale_alert_context_update_failed", error=str(exc))
+            stale_source_refs = {
+                f"{backend_name}:alert:{alert_uid}" if backend_name else alert_uid for alert_uid in missing
+            }
+            self._remove_mapping_source_refs(
+                conn,
+                tenant_id=tenant_id,
+                source_type="alert_ingest",
+                stale_refs=stale_source_refs,
+            )
             return cursor.rowcount
+
+    @staticmethod
+    def _remove_mapping_source_refs(
+        conn: sqlite3.Connection,
+        *,
+        tenant_id: str,
+        source_type: str,
+        stale_refs: set[str],
+    ) -> None:
+        """Remove stale provenance from active mappings, deleting unsupported rows."""
+        mappings = conn.execute(
+            """SELECT id, source_refs FROM signal_metric_mappings
+               WHERE tenant_id = ? AND source_type = ?""",
+            (tenant_id, source_type),
+        ).fetchall()
+        for mapping in mappings:
+            refs = json.loads(mapping["source_refs"] or "[]")
+            if stale_refs.isdisjoint(refs):
+                continue
+            remaining_refs = [ref for ref in refs if ref not in stale_refs]
+            if remaining_refs:
+                conn.execute(
+                    "UPDATE signal_metric_mappings SET source_refs = ? WHERE id = ?",
+                    (json.dumps(remaining_refs), mapping["id"]),
+                )
+            else:
+                conn.execute("DELETE FROM signal_metric_mappings WHERE id = ?", (mapping["id"],))
 
     def index_alert_context(
         self,

@@ -378,6 +378,11 @@ class KnowledgeService:
                 "provenance": provenance_refs,
             }
         )
+        current_revision = (
+            self.repository.get_revision(existing.id, tenant_id=tenant_id) if existing is not None else None
+        )
+        if current_revision is not None and current_revision.semantic_fingerprint == semantic:
+            return decision, current_revision
         revision = KnowledgeRevision(
             knowledge_id=knowledge_id,
             tenant_id=tenant_id,
@@ -880,14 +885,26 @@ class KnowledgeService:
             self.repository.save_candidate(updated)
             retired_candidates.append(updated)
 
-        retired_revisions = []
+        lifecycle_revisions = []
         retired_ids = {candidate.id for candidate in retired_candidates}
         for current in self.repository.list_current_revisions(tenant_id):
             matching_ids = retired_ids.intersection(current.promoted_from_candidate_refs)
             if not matching_ids or current.state.lifecycle_status != LifecycleStatus.ACTIVE:
                 continue
             candidate = next(candidate for candidate in retired_candidates if candidate.id in matching_ids)
-            retired_revisions.append(
+            surviving_candidates = self.corroboration.reviewed_candidates(
+                tenant_id,
+                current.proposition.proposition_key,
+            )
+            if surviving_candidates:
+                _, supported_revision = self.evaluate_candidate(
+                    surviving_candidates[0].id,
+                    tenant_id=tenant_id,
+                )
+                if supported_revision is not None:
+                    lifecycle_revisions.append(supported_revision)
+                    continue
+            lifecycle_revisions.append(
                 self._retire_knowledge(
                     current,
                     candidate,
@@ -895,7 +912,7 @@ class KnowledgeService:
                     reason="source_stale" if source_stale else "source_changed",
                 )
             )
-        return retired_revisions
+        return lifecycle_revisions
 
     def _retire_knowledge(
         self,

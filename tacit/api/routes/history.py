@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 import tacit.history as history_mod
 from tacit.api.dependencies import get_pipeline_dependencies
-from tacit.api.security import verify_api_key
+from tacit.api.security import resolve_knowledge_tenant, verify_api_key
 from tacit.dependencies import PipelineDependencies
 from tacit.investigation_bundle import build_investigation_bundle
 from tacit.investigation_contract import InvestigationRunType
@@ -247,11 +247,15 @@ async def refresh_investigation(
     contract = store.get_contract(investigation_id)
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
+    tenant_id = resolve_knowledge_tenant(
+        str(getattr(deps.settings, "knowledge_tenant_id", "default") or "default"),
+        contract.request.scope.tenant_id,
+    )
     response = await run_pipeline(
         DashRequest(
             prompt=contract.request.question,
             user_id=contract.request.requester,
-            tenant_id=contract.request.scope.tenant_id,
+            tenant_id=tenant_id,
         ),
         deps,
         investigation_id=investigation_id,

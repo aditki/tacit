@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 import tacit.signals as signals_mod
-from tacit.api.security import knowledge_tenant, verify_api_key
+from tacit.api.security import assert_knowledge_permission, knowledge_tenant, verify_api_key
 from tacit.models.schemas import TeachSignalRequest, TeachSignalResponse
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
@@ -59,6 +59,9 @@ async def get_signal(signal_type: str, request: Request):
 )
 async def teach_signal(payload: TeachSignalRequest, request: Request) -> TeachSignalResponse:
     """Teach Tacit an organization-specific signal mapping."""
+    assert_knowledge_permission(request, "knowledge.review")
+    assert_knowledge_permission(request, "knowledge.trust")
+    tenant_id = knowledge_tenant(request)
     store = signals_mod.get_signal_store()
     store.register_signal_type(
         signal_type=payload.signal_type,
@@ -68,7 +71,6 @@ async def teach_signal(payload: TeachSignalRequest, request: Request) -> TeachSi
     )
 
     mappings_created = 0
-    tenant_id = knowledge_tenant(request)
     for mp in payload.metric_patterns:
         store.add_mapping(
             signal_type=payload.signal_type,
