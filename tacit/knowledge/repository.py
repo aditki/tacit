@@ -33,6 +33,14 @@ from tacit.signals.schema import SQLITE_BUSY_TIMEOUT_MS
 logger = structlog.get_logger()
 
 
+class CandidateReviewConflictError(ValueError):
+    """Raised when a reviewer acts on a candidate state that has already changed."""
+
+
+class KnowledgeRevisionConflictError(ValueError):
+    """Raised when another writer advances an immutable knowledge item first."""
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS knowledge_candidates (
     id TEXT PRIMARY KEY,
@@ -474,7 +482,7 @@ class KnowledgeRepository:
                 params,
             )
             if cursor.rowcount != 1:
-                raise ValueError("candidate review state changed; reload before reviewing")
+                raise CandidateReviewConflictError("candidate review state changed; reload before reviewing")
         return candidate
 
     def list_candidates(
@@ -830,7 +838,9 @@ class KnowledgeRepository:
             ).fetchone()
             current = int(row["current_revision"]) if row else 0
             if revision.revision != current + 1:
-                raise ValueError(f"expected knowledge revision {current + 1}, got {revision.revision}")
+                raise KnowledgeRevisionConflictError(
+                    f"expected knowledge revision {current + 1}, got {revision.revision}"
+                )
             if row is None:
                 conn.execute(
                     """INSERT INTO operational_knowledge (

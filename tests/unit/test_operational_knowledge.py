@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -25,16 +27,24 @@ from tacit.knowledge.enums import (
     ReviewState,
     SourceFamily,
 )
+from tacit.knowledge.lifecycle import (
+    LIFECYCLE_TRANSITIONS,
+    REVIEW_TRANSITIONS,
+    transition_lifecycle_state,
+    transition_review_state,
+)
 from tacit.knowledge.migration import migrate_artifact_extractions, migrate_signal_mapping
 from tacit.knowledge.models import (
     Entity,
     EntityAlias,
+    KnowledgeCandidate,
     KnowledgeEvidenceReference,
+    KnowledgeRevision,
     KnowledgeScope,
     KnowledgeState,
 )
 from tacit.knowledge.normalization import normalize_service_ref
-from tacit.knowledge.repository import KnowledgeRepository
+from tacit.knowledge.repository import CandidateReviewConflictError, KnowledgeRepository
 from tacit.knowledge.scope import investigation_knowledge_scope
 from tacit.knowledge.service import KnowledgeService
 from tacit.models.schemas import CulpritCandidate, CulpritRanking, EvidenceObservation, EvidenceObservationOutcome
@@ -143,6 +153,46 @@ def _promoted_dependency(
     return first, revision
 
 
+def _assert_repository_invariants(repository: KnowledgeRepository, tenant_id: str = "default") -> None:
+    with repository._conn() as conn:
+        candidate_rows = conn.execute(
+            """SELECT tenant_id, review_state, lifecycle_status, eligibility, candidate_json
+               FROM knowledge_candidates WHERE tenant_id=?""",
+            (tenant_id,),
+        ).fetchall()
+        current_rows = conn.execute(
+            """SELECT item.tenant_id, item.current_revision, item.status, revision.content_json
+               FROM operational_knowledge AS item
+               JOIN operational_knowledge_revisions AS revision
+                 ON revision.tenant_id=item.tenant_id
+                AND revision.knowledge_id=item.knowledge_id
+                AND revision.revision=item.current_revision
+               WHERE item.tenant_id=?""",
+            (tenant_id,),
+        ).fetchall()
+        item_count = conn.execute(
+            "SELECT COUNT(*) FROM operational_knowledge WHERE tenant_id=?",
+            (tenant_id,),
+        ).fetchone()[0]
+
+    assert len(current_rows) == item_count
+
+    for row in candidate_rows:
+        candidate = KnowledgeCandidate.model_validate_json(row["candidate_json"])
+        assert candidate.tenant_id == row["tenant_id"]
+        assert candidate.scope.tenant_id == row["tenant_id"]
+        assert candidate.state.review_state.value == row["review_state"]
+        assert candidate.state.lifecycle_status.value == row["lifecycle_status"]
+        assert candidate.state.eligibility.value == row["eligibility"]
+
+    for row in current_rows:
+        revision = KnowledgeRevision.model_validate_json(row["content_json"])
+        assert revision.tenant_id == row["tenant_id"]
+        assert revision.scope.tenant_id == row["tenant_id"]
+        assert revision.revision == row["current_revision"]
+        assert revision.state.lifecycle_status.value == row["status"]
+
+
 def test_state_invariants_reject_unsafe_combinations():
     with pytest.raises(ValidationError, match="rejected knowledge must be ineligible"):
         KnowledgeState(
@@ -154,6 +204,66 @@ def test_state_invariants_reject_unsafe_combinations():
             lifecycle_status=LifecycleStatus.SUPERSEDED,
             eligibility=KnowledgeEligibility.CONTEXTUAL_ONLY,
         )
+    with pytest.raises(ValidationError, match="stale knowledge must be ineligible"):
+        KnowledgeState(
+            review_state=ReviewState.APPROVED,
+            lifecycle_status=LifecycleStatus.STALE,
+            eligibility=KnowledgeEligibility.CONTEXTUAL_ONLY,
+        )
+    with pytest.raises(ValidationError, match="unreviewed knowledge must be ineligible"):
+        KnowledgeState(eligibility=KnowledgeEligibility.CONTEXTUAL_ONLY)
+
+
+def test_scope_invariants_reject_reversed_validity_windows():
+    start = datetime.now(UTC)
+    with pytest.raises(ValidationError, match="valid_until must be after valid_from"):
+        KnowledgeScope(valid_from=start, valid_until=start - timedelta(seconds=1))
+
+
+@pytest.mark.parametrize("source", list(ReviewState))
+@pytest.mark.parametrize("target", list(ReviewState))
+def test_review_lifecycle_transition_matrix(source, target):
+    eligibility = (
+        KnowledgeEligibility.CONTEXTUAL_ONLY
+        if source in {ReviewState.APPROVED, ReviewState.TRUSTED}
+        else KnowledgeEligibility.INELIGIBLE
+    )
+    state = KnowledgeState(review_state=source, eligibility=eligibility)
+    allowed = source == target or target in REVIEW_TRANSITIONS[source]
+
+    if not allowed:
+        with pytest.raises(ValueError, match="cannot transition review state"):
+            transition_review_state(state, target)
+        return
+
+    transitioned = transition_review_state(state, target)
+    assert transitioned.review_state == target
+    if source != target:
+        assert transitioned.eligibility == KnowledgeEligibility.INELIGIBLE
+
+
+@pytest.mark.parametrize("source", list(LifecycleStatus))
+@pytest.mark.parametrize("target", list(LifecycleStatus))
+def test_source_lifecycle_transition_matrix(source, target):
+    eligibility = (
+        KnowledgeEligibility.CONTEXTUAL_ONLY if source == LifecycleStatus.ACTIVE else KnowledgeEligibility.INELIGIBLE
+    )
+    state = KnowledgeState(
+        review_state=ReviewState.APPROVED,
+        lifecycle_status=source,
+        eligibility=eligibility,
+    )
+    allowed = source == target or target in LIFECYCLE_TRANSITIONS[source]
+
+    if not allowed:
+        with pytest.raises(ValueError, match="cannot transition lifecycle"):
+            transition_lifecycle_state(state, target)
+        return
+
+    transitioned = transition_lifecycle_state(state, target)
+    assert transitioned.lifecycle_status == target
+    if source != target:
+        assert transitioned.eligibility == KnowledgeEligibility.INELIGIBLE
 
 
 def test_resolution_normalization_corroboration_and_promotion(tmp_path: Path):
@@ -203,6 +313,38 @@ def test_resolution_normalization_corroboration_and_promotion(tmp_path: Path):
     reconciled_snapshot = service.snapshot_from_usage("default", contradicted)
     assert reconciled_snapshot.items == []
     assert reconciled_snapshot.id != snapshot_a.id
+
+
+def test_revision_invariants_reject_cross_tenant_and_broken_parentage(tmp_path: Path):
+    service = _service(tmp_path)
+    _, revision = _promoted_dependency(service)
+    payload = revision.model_dump(mode="python")
+
+    with pytest.raises(ValidationError, match="tenant and scope tenant must match"):
+        KnowledgeRevision.model_validate({**payload, "tenant_id": "tenant-b"})
+    with pytest.raises(ValidationError, match="parent must be the preceding revision"):
+        KnowledgeRevision.model_validate({**payload, "revision": 2, "parent_revision": None})
+
+
+def test_repository_invariants_hold_after_source_retirement(tmp_path: Path):
+    service = _service(tmp_path)
+    first, active = _promoted_dependency(service)
+    _assert_repository_invariants(service.repository)
+
+    service.reconcile_source_lifecycle(
+        provenance_ref="provenance:runbook",
+        active_candidate_ids=set(),
+    )
+
+    _assert_repository_invariants(service.repository)
+    stale_candidate = service.repository.get_candidate(first.id)
+    current = service.repository.get_revision(active.knowledge_id)
+    assert stale_candidate is not None
+    assert stale_candidate.state.lifecycle_status == LifecycleStatus.STALE
+    assert stale_candidate.state.eligibility == KnowledgeEligibility.INELIGIBLE
+    assert current is not None
+    assert current.state.lifecycle_status == LifecycleStatus.STALE
+    assert current.state.eligibility == KnowledgeEligibility.INELIGIBLE
 
 
 def test_knowledge_candidate_clears_empty_ranking_abstention(tmp_path: Path):
@@ -912,6 +1054,44 @@ def test_signal_mapping_usage_does_not_claim_unapplied_score_delta(tmp_path: Pat
     assert usage[0].score_delta == 0
 
 
+@pytest.mark.parametrize(
+    ("proposition", "reason"),
+    [
+        (
+            {
+                "subject_ref": "concept:latency",
+                "predicate": "represented_by",
+                "concept_ref": "signal:latency",
+            },
+            "signal_metric_unresolved",
+        ),
+        (
+            {
+                "subject_ref": "concept:latency",
+                "predicate": "represented_by",
+                "object_ref": "concept:http_request_duration_seconds",
+            },
+            "signal_concept_unresolved",
+        ),
+    ],
+)
+def test_signal_mapping_requires_signal_and_metric(tmp_path: Path, proposition, reason):
+    service = _service(tmp_path)
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref=f"incomplete:{reason}",
+        typed_payload={},
+        proposition=proposition,
+        provenance_refs=["human:review"],
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+
+    decision, revision = service.evaluate_candidate(candidate.id, authoritative_source=True)
+
+    assert revision is None
+    assert reason in decision.reason_codes
+
+
 def test_negative_dependency_excludes_matching_ranked_candidate(tmp_path: Path):
     service = _service(tmp_path)
     candidate = _dependency(
@@ -1372,6 +1552,123 @@ def test_repeated_candidate_evaluation_reuses_unchanged_revision(tmp_path: Path)
     assert decision.decision.value == "promote"
     assert repeated == original
     assert len(service.repository.list_revisions(original.knowledge_id)) == 1
+
+
+def test_concurrent_candidate_evaluation_reuses_the_committed_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    first = _dependency(
+        service,
+        payload_ref="concurrent-runbook",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="concurrent-runbook",
+    )
+    second = _dependency(
+        service,
+        payload_ref="concurrent-dashboard",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="concurrent-dashboard",
+    )
+    service.review_candidate(first.id, approved=True, reviewer="reviewer")
+    service.review_candidate(second.id, approved=True, reviewer="reviewer")
+    barrier = threading.Barrier(2)
+    persist_revision = service.repository.persist_revision
+
+    def synchronized_persist(revision, **kwargs):
+        barrier.wait(timeout=5)
+        return persist_revision(revision, **kwargs)
+
+    monkeypatch.setattr(service.repository, "persist_revision", synchronized_persist)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: service.evaluate_candidate(first.id), range(2)))
+
+    revisions = [revision for _, revision in results]
+    assert all(revision is not None for revision in revisions)
+    assert len({(revision.knowledge_id, revision.revision) for revision in revisions if revision}) == 1
+    assert len(service.repository.list_revisions(revisions[0].knowledge_id)) == 1
+
+
+def test_overlapping_candidate_reviews_compare_against_the_loaded_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref="concurrent-review",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="concurrent-review",
+    )
+    barrier = threading.Barrier(2)
+    require_candidate = service._require_candidate
+
+    def synchronized_load(candidate_id, tenant_id):
+        loaded = require_candidate(candidate_id, tenant_id)
+        barrier.wait(timeout=5)
+        return loaded
+
+    monkeypatch.setattr(service, "_require_candidate", synchronized_load)
+
+    def review(approved: bool):
+        try:
+            updated = service.review_candidate(
+                candidate.id,
+                approved=approved,
+                reviewer=f"reviewer-{approved}",
+            )
+        except CandidateReviewConflictError:
+            return "conflict"
+        return updated.state.review_state.value
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(review, [True, False]))
+
+    assert results.count("conflict") == 1
+    stored = service.repository.get_candidate(candidate.id)
+    assert stored is not None
+    assert stored.state.review_state.value in set(results)
+
+
+def test_duplicate_overlapping_reviews_are_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref="duplicate-review",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="duplicate-review",
+    )
+    barrier = threading.Barrier(2)
+    require_candidate = service._require_candidate
+
+    def synchronized_load(candidate_id, tenant_id):
+        loaded = require_candidate(candidate_id, tenant_id)
+        barrier.wait(timeout=5)
+        return loaded
+
+    monkeypatch.setattr(service, "_require_candidate", synchronized_load)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda reviewer: service.review_candidate(
+                    candidate.id,
+                    approved=True,
+                    reviewer=reviewer,
+                ),
+                ["reviewer-a", "reviewer-b"],
+            )
+        )
+
+    assert {result.state.review_state for result in results} == {ReviewState.APPROVED}
+    stored = service.repository.get_candidate(candidate.id)
+    assert stored is not None
+    assert stored.state.review_state == ReviewState.APPROVED
 
 
 def test_unresolved_approved_candidate_does_not_create_conflict(tmp_path: Path):
@@ -1889,6 +2186,77 @@ def test_api_trusted_alias_requires_trust_permission(tmp_path: Path, monkeypatch
     assert service.repository.find_aliases("tenant-a", "trusted-checkout") == []
 
 
+@pytest.mark.parametrize(
+    ("permissions", "missing_permission"),
+    [
+        ("knowledge.read,knowledge.trust", "knowledge.review"),
+        ("knowledge.read,knowledge.review", "knowledge.trust"),
+    ],
+)
+def test_api_candidate_trust_requires_review_and_trust_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    permissions: str,
+    missing_permission: str,
+):
+    service = _service(tmp_path, "tenant-a")
+    candidate = _dependency(
+        service,
+        payload_ref=f"trust-matrix:{missing_permission}",
+        family=SourceFamily.RUNBOOK,
+        lineage_group=f"trust-matrix:{missing_permission}",
+        tenant_id="tenant-a",
+    )
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    client = TestClient(
+        create_app(
+            runtime_settings=Settings(
+                knowledge_tenant_id="tenant-a",
+                knowledge_permissions=permissions,
+            )
+        )
+    )
+
+    response = client.post(
+        f"/api/v1/knowledge/candidates/{candidate.id}/review",
+        json={"decision": "trust", "reviewer": "operator", "evaluate": False},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == f"Missing permission: {missing_permission}"
+    stored = service.repository.get_candidate(candidate.id, "tenant-a")
+    assert stored is not None
+    assert stored.state.review_state == ReviewState.CANDIDATE
+
+
+def test_api_reports_concurrent_candidate_review_as_conflict(monkeypatch: pytest.MonkeyPatch):
+    import tacit.api.routes.knowledge as routes
+
+    class ConflictingService:
+        def review_candidate(self, *args, **kwargs):
+            raise CandidateReviewConflictError("candidate review state changed; reload before reviewing")
+
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda: ConflictingService())
+    client = TestClient(
+        create_app(
+            runtime_settings=Settings(
+                knowledge_permissions="knowledge.read,knowledge.review",
+            )
+        )
+    )
+
+    response = client.post(
+        "/api/v1/knowledge/candidates/kc-concurrent/review",
+        json={"decision": "approve", "reviewer": "operator"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "candidate review state changed; reload before reviewing"
+
+
 def test_alias_upsert_updates_lookup_columns(tmp_path: Path):
     service = _service(tmp_path)
     first = EntityAlias(
@@ -2176,6 +2544,9 @@ def test_knowledge_ui_sends_selected_tenant_header():
     assert "knowledgeHeaders({ 'Content-Type': 'application/json' })" in html
     assert "if (tenant) payload.tenant_id = tenant" in html
     assert "headers: knowledgeHeaders()," in html
+    assert "fetch(`${BASE}/api/v1/investigations${qs}`, { headers: knowledgeHeaders() })" in html
+    assert "fetch(`${BASE}/api/v1/investigations/${id}`, { headers: knowledgeHeaders() })" in html
+    assert "fetch(`${BASE}/api/v1/investigations/stats`, { headers: knowledgeHeaders() })" in html
 
 
 def test_wildcard_cli_pipeline_commands_require_tenant(monkeypatch: pytest.MonkeyPatch):

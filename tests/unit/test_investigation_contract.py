@@ -2201,6 +2201,81 @@ def test_contract_api_routes_expose_revision_replay_and_correction_candidate(tmp
     assert bundle_response.headers["content-type"] == "application/gzip"
 
 
+def test_legacy_correction_mutations_require_action_permissions(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    persisted = store.persist_contract_revision(_draft_contract(investigation_id))
+    candidate = store.create_knowledge_candidate(
+        investigation_id,
+        revision=persisted.investigation.revision,
+        correction_text="The cache was saturated.",
+        created_by="reviewer",
+    )
+    assert candidate is not None
+    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
+
+    read_only = TestClient(create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read")))
+    create_response = read_only.post(
+        f"/api/v1/investigations/{investigation_id}/corrections",
+        json={"correction_text": "Unauthorized correction", "created_by": "reviewer"},
+    )
+    approve_response = read_only.post(
+        f"/api/v1/investigations/{investigation_id}/corrections/{candidate.id}/review",
+        json={"approved": True, "reviewed_by": "reviewer"},
+    )
+    reject_response = read_only.post(
+        f"/api/v1/investigations/{investigation_id}/corrections/{candidate.id}/review",
+        json={"approved": False, "reviewed_by": "reviewer"},
+    )
+
+    assert create_response.status_code == 403
+    assert create_response.json()["detail"] == "Missing permission: knowledge.correct"
+    assert approve_response.status_code == 403
+    assert approve_response.json()["detail"] == "Missing permission: knowledge.review"
+    assert reject_response.status_code == 403
+    assert reject_response.json()["detail"] == "Missing permission: knowledge.reject"
+
+    store.review_knowledge_candidate(
+        investigation_id,
+        candidate.id,
+        approved=True,
+        reviewed_by="authorized-reviewer",
+    )
+    no_correction_permission = TestClient(
+        create_app(
+            runtime_settings=Settings(
+                knowledge_permissions="knowledge.read,knowledge.review,knowledge.reject",
+            )
+        )
+    )
+    apply_response = no_correction_permission.post(
+        f"/api/v1/investigations/{investigation_id}/corrections/{candidate.id}/apply"
+    )
+
+    assert apply_response.status_code == 403
+    assert apply_response.json()["detail"] == "Missing permission: knowledge.correct"
+    assert len(store.list_revisions(investigation_id)) == 1
+
+
+def test_assessment_bundle_export_requires_export_permission(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
+
+    denied = TestClient(create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read"))).get(
+        f"/api/v1/investigations/{investigation_id}/assessment-bundle"
+    )
+    allowed = TestClient(create_app(runtime_settings=Settings(knowledge_permissions="knowledge.export"))).get(
+        f"/api/v1/investigations/{investigation_id}/assessment-bundle"
+    )
+
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "Missing permission: knowledge.export"
+    assert allowed.status_code == 200
+    assert allowed.headers["content-type"] == "application/gzip"
+
+
 def test_contract_api_rejects_unsupported_schema_in_history(tmp_path, monkeypatch):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="api")
@@ -2453,6 +2528,63 @@ def test_investigation_tenant_is_immutable_across_revisions(tmp_path):
 
     with pytest.raises(StaleRevisionError, match="tenant cannot change"):
         store.persist_contract_revision(draft.model_copy(update={"request": tenant_b_request}))
+
+
+def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy-history.db"
+    store = InvestigationStore(db_path=db_path)
+    investigation_id = store.start("Legacy investigation", user_id="legacy")
+    persisted = store.persist_contract_revision(_draft_contract(investigation_id))
+    payload = persisted.model_dump(mode="json", by_alias=True)
+    payload["request"]["scope"].pop("tenant_id", None)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """UPDATE investigation_revisions SET contract_json=?
+               WHERE investigation_id=? AND revision=?""",
+            (json.dumps(payload), investigation_id, persisted.investigation.revision),
+        )
+        conn.execute("DROP INDEX IF EXISTS idx_inv_tenant_started")
+        conn.execute("ALTER TABLE investigations DROP COLUMN tenant_id")
+
+    migrated = InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+    )
+    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: migrated)
+    runtime_settings = Settings(knowledge_tenant_id="tenant-a")
+    deps = PipelineDependencies(
+        settings=runtime_settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: migrated,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+    seen_tenants = []
+
+    async def fake_refresh(request, supplied_deps=None, **kwargs):
+        seen_tenants.append(request.tenant_id)
+        return DashResponse(
+            dashboard_url="http://grafana/legacy-refresh",
+            dashboard_uid="legacy-refresh",
+            panel_count=1,
+            summary="Legacy refresh",
+            investigation_id=investigation_id,
+            investigation_revision=2,
+        )
+
+    monkeypatch.setattr("tacit.api.routes.history.run_pipeline", fake_refresh)
+    app = create_app(runtime_settings=runtime_settings)
+    app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
+    client = TestClient(app)
+
+    assert migrated.get(investigation_id)["tenant_id"] == "tenant-a"
+    assert [item["id"] for item in migrated.list_recent(tenant_id="tenant-a")] == [investigation_id]
+    response = client.get(f"/api/v1/investigations/{investigation_id}/contract")
+    assert response.status_code == 200
+    refresh = client.post(f"/api/v1/investigations/{investigation_id}/refresh")
+    assert refresh.status_code == 200
+    assert seen_tenants == ["tenant-a"]
 
 
 def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp_path, monkeypatch):

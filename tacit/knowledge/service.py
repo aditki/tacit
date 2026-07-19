@@ -24,6 +24,10 @@ from tacit.knowledge.enums import (
     ReviewState,
     SourceFamily,
 )
+from tacit.knowledge.lifecycle import (
+    transition_lifecycle_state,
+    transition_review_state,
+)
 from tacit.knowledge.models import (
     CandidatePolicyState,
     Entity,
@@ -52,7 +56,12 @@ from tacit.knowledge.normalization import (
     stable_fingerprint,
 )
 from tacit.knowledge.policies import default_policies
-from tacit.knowledge.repository import KnowledgeRepository, get_knowledge_repository
+from tacit.knowledge.repository import (
+    CandidateReviewConflictError,
+    KnowledgeRepository,
+    KnowledgeRevisionConflictError,
+    get_knowledge_repository,
+)
 
 PROMPT_INJECTION_RE = re.compile(
     r"\b(ignore (?:all |the )?(?:previous|system) instructions|system prompt|developer message|"
@@ -200,12 +209,7 @@ class KnowledgeService:
                 raise ValueError("candidate identity cannot be reused for a different proposition")
             existing_state = existing.state
             if reactivate_stale and existing_state.lifecycle_status == LifecycleStatus.STALE:
-                existing_state = existing_state.model_copy(
-                    update={
-                        "lifecycle_status": LifecycleStatus.ACTIVE,
-                        "eligibility": KnowledgeEligibility.INELIGIBLE,
-                    }
-                )
+                existing_state = transition_lifecycle_state(existing_state, LifecycleStatus.ACTIVE)
             candidate = candidate.model_copy(
                 update={
                     "state": existing_state,
@@ -271,20 +275,18 @@ class KnowledgeService:
                     reason="candidate_rejected",
                 )
             return candidate
-        state = candidate.state.model_copy(
-            update={
-                "review_state": review_state,
-                "eligibility": KnowledgeEligibility.INELIGIBLE,
-            }
-        )
+        state = transition_review_state(candidate.state, review_state)
         updated = candidate.model_copy(update={"state": state, "updated_at": utc_now()})
-        if review_state == ReviewState.TRUSTED:
-            expected_states = {ReviewState.CANDIDATE.value, ReviewState.APPROVED.value}
-        elif review_state == ReviewState.REJECTED:
-            expected_states = {ReviewState.CANDIDATE.value, ReviewState.APPROVED.value}
-        else:
-            expected_states = {ReviewState.CANDIDATE.value}
-        self.repository.transition_candidate_review(updated, expected_states=expected_states)
+        try:
+            self.repository.transition_candidate_review(
+                updated,
+                expected_states={candidate.state.review_state.value},
+            )
+        except CandidateReviewConflictError:
+            concurrent = self.repository.get_candidate(candidate.id, tenant_id)
+            if concurrent is not None and concurrent.state.review_state == review_state:
+                return concurrent
+            raise
         if review_state == ReviewState.REJECTED:
             decision = self._state_decision(updated, PromotionDecisionType.REJECT, "rejected_by_review")
             self.repository.save_promotion_decision(decision, tenant_id)
@@ -422,7 +424,18 @@ class KnowledgeService:
             revision_reason="promoted" if revision_number == 1 else "corroborated",
             semantic_fingerprint=semantic,
         )
-        self.repository.persist_revision(revision, candidate_id=candidate.id, decision_ref=decision.decision_id)
+        try:
+            self.repository.persist_revision(
+                revision,
+                candidate_id=candidate.id,
+                decision_ref=decision.decision_id,
+            )
+        except KnowledgeRevisionConflictError:
+            concurrent = self.repository.get_revision(knowledge_id, tenant_id=tenant_id)
+            if concurrent is None or concurrent.semantic_fingerprint != revision.semantic_fingerprint:
+                raise
+            self._sync_signal_mapping_state(concurrent)
+            return decision, concurrent
         self._sync_signal_mapping_state(revision)
         self.repository.append_event(
             "knowledge_promoted" if revision_number == 1 else "knowledge_revised",
@@ -851,9 +864,7 @@ class KnowledgeService:
             raise ValueError("knowledge item not found")
         decision = self._state_decision(candidate, PromotionDecisionType.SUPERSEDE, "superseded_by_correction")
         self.repository.save_promotion_decision(decision, tenant_id)
-        state = current.state.model_copy(
-            update={"lifecycle_status": LifecycleStatus.SUPERSEDED, "eligibility": KnowledgeEligibility.INELIGIBLE}
-        )
+        state = transition_lifecycle_state(current.state, LifecycleStatus.SUPERSEDED)
         revision = current.model_copy(
             update={
                 "revision": current.revision + 1,
@@ -903,12 +914,7 @@ class KnowledgeService:
                 continue
             if candidate.state.lifecycle_status != LifecycleStatus.ACTIVE:
                 continue
-            state = candidate.state.model_copy(
-                update={
-                    "lifecycle_status": LifecycleStatus.STALE,
-                    "eligibility": KnowledgeEligibility.INELIGIBLE,
-                }
-            )
+            state = transition_lifecycle_state(candidate.state, LifecycleStatus.STALE)
             updated = candidate.model_copy(update={"state": state, "updated_at": utc_now()})
             self.repository.save_candidate(updated)
             retired_candidates.append(updated)
@@ -969,12 +975,7 @@ class KnowledgeService:
     ) -> KnowledgeRevision:
         decision = self._state_decision(candidate, PromotionDecisionType.EXPIRE, reason)
         self.repository.save_promotion_decision(decision, current.tenant_id)
-        state = current.state.model_copy(
-            update={
-                "lifecycle_status": lifecycle_status,
-                "eligibility": KnowledgeEligibility.INELIGIBLE,
-            }
-        )
+        state = transition_lifecycle_state(current.state, lifecycle_status)
         revision = current.model_copy(
             update={
                 "revision": current.revision + 1,
