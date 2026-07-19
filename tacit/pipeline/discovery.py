@@ -136,6 +136,7 @@ def confirm_colloquial_keywords(
     metric_catalog: list[MetricEntry],
     target_query_language: str,
     signal_store: Any | None = None,
+    tenant_id: str = "default",
 ) -> list[str]:
     """Promote low-confidence colloquial evidence only after live signal coverage.
 
@@ -165,6 +166,7 @@ def confirm_colloquial_keywords(
                         confirmation_catalog,
                         context_service=context_service,
                         target_query_language=target_query_language,
+                        tenant_id=tenant_id,
                     )
                     resolve_cache[sig] = bool(hits)
                 except Exception:

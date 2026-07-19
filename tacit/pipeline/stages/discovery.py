@@ -32,6 +32,7 @@ async def run_discovery_stage(
     timings: dict[str, float],
     recorder: PipelineRecorder,
     signal_store: Any | None = None,
+    tenant_id: str = "default",
 ) -> DiscoveryStageResult:
     """Discover catalogs and record discovery diagnostics."""
     from tacit.pipeline.discovery import confirm_colloquial_keywords
@@ -60,5 +61,6 @@ async def run_discovery_stage(
         discovery.metric_catalog,
         primary.query_language,
         signal_store,
+        tenant_id,
     )
     return DiscoveryStageResult(discovery=discovery, confirmed_keywords=confirmed_keywords)

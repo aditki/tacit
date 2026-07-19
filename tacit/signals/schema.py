@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS signal_types (
 
 CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
     signal_type         TEXT NOT NULL,
     metric_pattern      TEXT NOT NULL,
     confidence          REAL NOT NULL DEFAULT 0.5,
@@ -47,7 +48,7 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     created_at          REAL NOT NULL,
     last_seen           REAL NOT NULL,
 
-    UNIQUE(signal_type, metric_pattern),
+    UNIQUE(tenant_id, signal_type, metric_pattern),
     FOREIGN KEY (signal_type) REFERENCES signal_types(signal_type)
 );
 
@@ -238,6 +239,7 @@ CREATE INDEX IF NOT EXISTS idx_ingested_alert_uid_backend ON ingested_alerts(ale
 
 FTS_SCHEMA_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS learning_context_fts USING fts5(
+    tenant_id UNINDEXED,
     source_kind,
     source_id UNINDEXED,
     backend_name UNINDEXED,

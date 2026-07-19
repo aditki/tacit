@@ -8,6 +8,7 @@ from typing import Any
 from tacit.knowledge.corroboration import ConflictDetectionService, CorroborationService
 from tacit.knowledge.entities import EntityResolutionService
 from tacit.knowledge.enums import (
+    ConflictKind,
     ConflictResolutionStatus,
     CorrectionType,
     EntityKind,
@@ -253,6 +254,8 @@ class KnowledgeService:
         if trust and not can_trust:
             raise PermissionError("knowledge.trust permission is required")
         review_state = ReviewState.TRUSTED if trust else ReviewState.APPROVED if approved else ReviewState.REJECTED
+        if candidate.state.review_state == review_state:
+            return candidate
         state = candidate.state.model_copy(
             update={
                 "review_state": review_state,
@@ -260,11 +263,12 @@ class KnowledgeService:
             }
         )
         updated = candidate.model_copy(update={"state": state, "updated_at": utc_now()})
-        expected_states = (
-            {ReviewState.CANDIDATE.value, ReviewState.APPROVED.value}
-            if review_state == ReviewState.TRUSTED
-            else {ReviewState.CANDIDATE.value}
-        )
+        if review_state == ReviewState.TRUSTED:
+            expected_states = {ReviewState.CANDIDATE.value, ReviewState.APPROVED.value}
+        elif review_state == ReviewState.REJECTED:
+            expected_states = {ReviewState.CANDIDATE.value, ReviewState.APPROVED.value}
+        else:
+            expected_states = {ReviewState.CANDIDATE.value}
         self.repository.transition_candidate_review(updated, expected_states=expected_states)
         if review_state == ReviewState.REJECTED:
             decision = self._state_decision(updated, PromotionDecisionType.REJECT, "rejected_by_review")
@@ -739,6 +743,24 @@ class KnowledgeService:
         self.repository.save_correction(correction)
         if not approved:
             return correction, None
+        if correction.correction_type in {
+            CorrectionType.KNOWLEDGE_STALE,
+            CorrectionType.KNOWLEDGE_INCORRECT,
+        }:
+            if target is None:
+                raise ValueError(f"{correction.correction_type.value} correction requires target_ref")
+            lifecycle_status = (
+                LifecycleStatus.STALE
+                if correction.correction_type == CorrectionType.KNOWLEDGE_STALE
+                else LifecycleStatus.WITHDRAWN
+            )
+            retired_revision = self._retire_knowledge(
+                target,
+                candidate,
+                lifecycle_status=lifecycle_status,
+                reason=correction.correction_type.value,
+            )
+            return correction, retired_revision
         conflicts = self.conflicts.analyze(
             tenant_id,
             candidate.proposition.proposition_key,
@@ -830,6 +852,100 @@ class KnowledgeService:
         )
         return revision
 
+    def reconcile_source_lifecycle(
+        self,
+        *,
+        provenance_ref: str,
+        tenant_id: str = "default",
+        active_candidate_ids: set[str] | None = None,
+        source_stale: bool = False,
+    ) -> list[KnowledgeRevision]:
+        """Retire candidates and promoted knowledge no longer backed by a live source."""
+        retired_candidates: list[KnowledgeCandidate] = []
+        for candidate in self.repository.list_candidates(tenant_id, limit=None):
+            evidence_refs = {ref for evidence in candidate.evidence.items for ref in evidence.provenance_refs}
+            if provenance_ref not in set(candidate.provenance_refs).union(evidence_refs):
+                continue
+            if not source_stale and active_candidate_ids is not None and candidate.id in active_candidate_ids:
+                continue
+            if candidate.state.lifecycle_status != LifecycleStatus.ACTIVE:
+                continue
+            state = candidate.state.model_copy(
+                update={
+                    "lifecycle_status": LifecycleStatus.STALE,
+                    "eligibility": KnowledgeEligibility.INELIGIBLE,
+                }
+            )
+            updated = candidate.model_copy(update={"state": state, "updated_at": utc_now()})
+            self.repository.save_candidate(updated)
+            retired_candidates.append(updated)
+
+        retired_revisions = []
+        retired_ids = {candidate.id for candidate in retired_candidates}
+        for current in self.repository.list_current_revisions(tenant_id):
+            matching_ids = retired_ids.intersection(current.promoted_from_candidate_refs)
+            if not matching_ids or current.state.lifecycle_status != LifecycleStatus.ACTIVE:
+                continue
+            candidate = next(candidate for candidate in retired_candidates if candidate.id in matching_ids)
+            retired_revisions.append(
+                self._retire_knowledge(
+                    current,
+                    candidate,
+                    lifecycle_status=LifecycleStatus.STALE,
+                    reason="source_stale" if source_stale else "source_changed",
+                )
+            )
+        return retired_revisions
+
+    def _retire_knowledge(
+        self,
+        current: KnowledgeRevision,
+        candidate: KnowledgeCandidate,
+        *,
+        lifecycle_status: LifecycleStatus,
+        reason: str,
+    ) -> KnowledgeRevision:
+        decision = self._state_decision(candidate, PromotionDecisionType.EXPIRE, reason)
+        self.repository.save_promotion_decision(decision, current.tenant_id)
+        state = current.state.model_copy(
+            update={
+                "lifecycle_status": lifecycle_status,
+                "eligibility": KnowledgeEligibility.INELIGIBLE,
+            }
+        )
+        revision = current.model_copy(
+            update={
+                "revision": current.revision + 1,
+                "parent_revision": current.revision,
+                "state": state,
+                "policy_id": decision.policy_id,
+                "policy_version": decision.policy_version,
+                "decision_ref": decision.decision_id,
+                "revision_reason": reason,
+                "semantic_fingerprint": stable_fingerprint(
+                    [current.semantic_fingerprint, lifecycle_status.value, reason]
+                ),
+                "created_at": utc_now(),
+            }
+        )
+        self.repository.persist_revision(
+            revision,
+            candidate_id=candidate.id,
+            decision_ref=decision.decision_id,
+        )
+        self.repository.append_event(
+            "knowledge_retired",
+            tenant_id=current.tenant_id,
+            subject_ref=current.knowledge_id,
+            dimensions={
+                "knowledge_kind": current.proposition.kind.value,
+                "lifecycle_status": lifecycle_status.value,
+                "reason_code": reason,
+            },
+            payload={"candidate_id": candidate.id, "revision": revision.revision},
+        )
+        return revision
+
     def impact(self, knowledge_id: str, tenant_id: str = "default") -> KnowledgeImpact:
         usage = self.repository.list_usage(tenant_id=tenant_id, knowledge_id=knowledge_id)
         seen = set()
@@ -909,7 +1025,7 @@ class KnowledgeService:
         viable_candidates = [
             item
             for item in self.repository.candidates_for_proposition(candidate.tenant_id, proposition_key)
-            if item.state.review_state != ReviewState.REJECTED
+            if item.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
         ]
         if viable_candidates:
             return
@@ -1046,6 +1162,24 @@ class KnowledgeService:
             proposition_key=revision.proposition.proposition_key,
             unresolved_only=True,
         )
+        active_propositions = {row["proposition_key"] for row in self.repository.list_propositions(revision.tenant_id)}
+        conflicts = [
+            conflict
+            for conflict in conflicts
+            if conflict.left_proposition_ref in active_propositions
+            and conflict.right_proposition_ref in active_propositions
+            and (
+                conflict.conflict_kind == ConflictKind.DIRECT_NEGATION
+                or (
+                    revision.proposition.kind == KnowledgeKind.OWNERSHIP
+                    and conflict.conflict_kind == ConflictKind.COMPETING_OWNER
+                )
+                or (
+                    revision.proposition.kind == KnowledgeKind.SIGNAL_MAPPING
+                    and conflict.conflict_kind == ConflictKind.COMPETING_SIGNAL_MAPPING
+                )
+            )
+        ]
         if conflicts:
             return KnowledgeUsageDisposition.REJECTED_BY_CONFLICT, ["unresolved_conflict"]
         return KnowledgeUsageDisposition.APPLIED, ["eligible_under_recorded_policy"]

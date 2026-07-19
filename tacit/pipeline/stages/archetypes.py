@@ -123,6 +123,7 @@ def select_archetypes(
             max_archetypes=settings.max_blended_archetypes,
             min_secondary_coverage=settings.min_secondary_coverage,
             signal_store=signal_store,
+            tenant_id=tenant_id or "default",
         )
 
     return ArchetypeSelection(
@@ -149,6 +150,7 @@ def compile_selected_archetypes(
     catalog_for_compile: list[MetricEntry],
     timings: dict[str, float],
     signal_store: Any | None = None,
+    tenant_id: str = "default",
 ) -> ArchetypeCompilation | None:
     """Compile a dashboard from selected archetypes, if any."""
     if not selection.ranked_archetypes:
@@ -163,6 +165,7 @@ def compile_selected_archetypes(
             catalog_for_compile,
             target_language=selection.target_language,
             signal_store=signal_store,
+            tenant_id=tenant_id,
         )
     else:
         dashboard_spec = compile_archetype(
@@ -171,6 +174,7 @@ def compile_selected_archetypes(
             catalog_for_compile,
             target_language=selection.target_language,
             signal_store=signal_store,
+            tenant_id=tenant_id,
         )
     timings["archetype_compile"] = time.monotonic() - t0
     stage_log(

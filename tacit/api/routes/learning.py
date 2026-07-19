@@ -482,6 +482,7 @@ async def list_learned_incidents(
     response_description="FTS-ranked learned context rows",
 )
 async def search_learning_context(
+    request: Request,
     q: str = Query(..., min_length=1),
     service: str = "",
     include_candidates: bool = True,
@@ -495,6 +496,7 @@ async def search_learning_context(
             service=service,
             include_candidates=include_candidates,
             limit=limit,
+            tenant_id=knowledge_tenant(request),
         )
     except signals_mod.LearningIndexUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -508,6 +510,7 @@ async def search_learning_context(
     response_description="Service-level learned dashboards, metrics, panels, and signals",
 )
 async def describe_service(
+    request: Request,
     service_name: str = PathParam(description="Service/component name to describe"),
     include_candidates: bool = True,
     limit: int = Query(50, ge=1, le=200),
@@ -519,6 +522,7 @@ async def describe_service(
             service_name,
             include_candidates=include_candidates,
             limit=limit,
+            tenant_id=knowledge_tenant(request),
         )
     except signals_mod.LearningIndexUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))

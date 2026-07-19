@@ -61,6 +61,7 @@ def infer_signals_from_metrics(
     panel_data: list[dict[str, Any]] | None = None,
     *,
     store: Any | None = None,
+    tenant_id: str = "default",
 ) -> list[dict[str, Any]]:
     """Infer semantic signals from extracted metrics.
 
@@ -76,7 +77,7 @@ def infer_signals_from_metrics(
     signal_family, source ('taxonomy'|'heuristic'), reason, evidence.
     """
     store = store or get_signal_store()
-    all_signal_types = store.list_signal_types()
+    all_signal_types = store.list_signal_types(tenant_id=tenant_id)
     inferred: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     matched_metrics: set[str] = set()
@@ -85,7 +86,7 @@ def infer_signals_from_metrics(
     for metric in metrics:
         for st in all_signal_types:
             signal_type = st["signal_type"]
-            mappings = store.get_mappings_for_signal(signal_type)
+            mappings = store.get_mappings_for_signal(signal_type, tenant_id=tenant_id)
             for mapping in mappings:
                 from tacit.signals import _metric_matches_pattern
 
@@ -213,6 +214,7 @@ def persist_inferred_signal_review(
             source_refs=[source_ref],
             inference_version=sig.get("inference_version", ""),
             review_state="approved" if is_heuristic else "trusted",
+            tenant_id=effective_tenant,
         )
         _govern_signal_mapping(
             store=store,
@@ -393,7 +395,7 @@ def approve_ingested_dashboard_record(
         else:
             from tacit.signals import _metric_matches_pattern
 
-            signal_data = store.get_signal_type(sig)
+            signal_data = store.get_signal_type(sig, tenant_id=effective_tenant)
             if not signal_data:
                 continue
             for metric in ingested.get("metrics_found", []):
@@ -406,6 +408,7 @@ def approve_ingested_dashboard_record(
                             source_type="dashboard_ingest",
                             source_refs=[source_ref],
                             review_state="approved",
+                            tenant_id=effective_tenant,
                         )
                         _govern_signal_mapping(
                             store=store,
@@ -525,6 +528,7 @@ async def ingest_dashboard_features(
         features.metrics_found,
         features.panels,
         store=store,
+        tenant_id=effective_tenant,
     )
     signal_quality = build_signal_quality_report(metrics=features.metrics_found, signals=signals)
     learning_impact = build_learning_impact_report(
@@ -617,6 +621,7 @@ async def ingest_dashboard_features(
         )
 
     indexed_context_rows = store.index_dashboard_context(
+        tenant_id=effective_tenant,
         dashboard_uid=features.dashboard_uid,
         backend_name=features.backend_name,
         dashboard_title=features.dashboard_title,

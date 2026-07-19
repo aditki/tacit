@@ -92,6 +92,7 @@ async def _preserve_symptom_evidence(
     evidence_resolutions: list[EvidenceResolution],
     record_stage: Callable[..., None],
     signal_store: Any | None,
+    tenant_id: str = "default",
 ) -> tuple[DashboardSpec, DashboardSpec, int]:
     initial_observations = observe_evidence(
         evidence_requirements,
@@ -118,6 +119,7 @@ async def _preserve_symptom_evidence(
         target_language=target_language,
         timerange=pre_validation_spec.timerange,
         signal_store=signal_store,
+        tenant_id=tenant_id,
     )
     if not symptom_pre_validation_spec.panels:
         record_stage(
@@ -174,6 +176,7 @@ async def _preserve_gap_evidence(
     evidence_resolutions: list[EvidenceResolution],
     record_stage: Callable[..., None],
     signal_store: Any | None,
+    tenant_id: str = "default",
 ) -> tuple[DashboardSpec, DashboardSpec, int]:
     gap_observations = observe_evidence(
         evidence_requirements,
@@ -202,6 +205,7 @@ async def _preserve_gap_evidence(
         target_language=target_language,
         timerange=pre_validation_spec.timerange,
         signal_store=signal_store,
+        tenant_id=tenant_id,
     )
     if not gap_pre_validation_spec.panels:
         record_stage(
@@ -299,6 +303,7 @@ async def validate_dashboard_and_evidence(
     ranked_archetypes_present: bool,
     record_stage: Callable[..., None],
     signal_store: Any | None = None,
+    tenant_id: str = "default",
 ) -> ValidationEvidenceResult:
     """Validate dashboard queries and preserve critical evidence when possible."""
     panels_before = len(dashboard_spec.panels)
@@ -319,6 +324,7 @@ async def validate_dashboard_and_evidence(
             evidence_resolutions=evidence_resolutions,
             record_stage=record_stage,
             signal_store=signal_store,
+            tenant_id=tenant_id,
         )
         pre_validation_spec, dashboard_spec, panels_before = await _preserve_gap_evidence(
             primary=primary,
@@ -333,6 +339,7 @@ async def validate_dashboard_and_evidence(
             evidence_resolutions=evidence_resolutions,
             record_stage=record_stage,
             signal_store=signal_store,
+            tenant_id=tenant_id,
         )
 
     validation_status, validation_reason = _validation_status(panels_before, len(dashboard_spec.panels))

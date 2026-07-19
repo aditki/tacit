@@ -13,6 +13,7 @@ from tacit.cli import cli
 from tacit.config import Settings
 from tacit.knowledge.enums import (
     ConflictResolutionStatus,
+    CorrectionType,
     EntityBindingMethod,
     EntityKind,
     EntityStatus,
@@ -455,6 +456,8 @@ def test_rejecting_last_candidate_resolves_existing_conflicts(tmp_path: Path):
         lineage_group="negative",
         predicate="does_not_depend_on",
     )
+    service.review_candidate(positive.id, approved=True, reviewer="operator")
+    service.review_candidate(rejected.id, approved=True, reviewer="operator")
     conflicts = service.conflicts.analyze("default", positive.proposition.proposition_key)
     assert len(conflicts) == 1
     assert conflicts[0].resolution_status == ConflictResolutionStatus.UNRESOLVED
@@ -482,6 +485,8 @@ def test_new_candidate_reopens_conflict_resolved_by_rejection(tmp_path: Path):
         lineage_group="negative",
         predicate="does_not_depend_on",
     )
+    service.review_candidate(positive.id, approved=True, reviewer="operator")
+    service.review_candidate(rejected.id, approved=True, reviewer="operator")
     service.conflicts.analyze("default", positive.proposition.proposition_key)
     service.review_candidate(rejected.id, approved=False, reviewer="operator")
     assert service.repository.list_conflicts("default", unresolved_only=True) == []
@@ -492,6 +497,7 @@ def test_new_candidate_reopens_conflict_resolved_by_rejection(tmp_path: Path):
         lineage_group="replacement-negative",
         predicate="does_not_depend_on",
     )
+    service.review_candidate(replacement.id, approved=True, reviewer="operator")
 
     conflicts = service.conflicts.analyze("default", replacement.proposition.proposition_key)
 
@@ -571,7 +577,7 @@ def test_conflict_scope_analysis_includes_services(tmp_path: Path):
         scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
         provenance_refs=["catalog:checkout"],
     )
-    service.create_candidate(
+    second = service.create_candidate(
         kind=KnowledgeKind.SIGNAL_MAPPING,
         payload_ref="payment-signal",
         typed_payload={},
@@ -583,6 +589,8 @@ def test_conflict_scope_analysis_includes_services(tmp_path: Path):
         scope=KnowledgeScope(service_refs=["entity:service:payment"]),
         provenance_refs=["catalog:payment"],
     )
+    service.review_candidate(first.id, approved=True, reviewer="operator")
+    service.review_candidate(second.id, approved=True, reviewer="operator")
 
     conflicts = service.conflicts.analyze("default", first.proposition.proposition_key)
 
@@ -608,7 +616,7 @@ def test_conflict_scope_analysis_includes_archetypes(tmp_path: Path):
         ),
         provenance_refs=["catalog:http"],
     )
-    service.create_candidate(
+    second = service.create_candidate(
         kind=KnowledgeKind.SIGNAL_MAPPING,
         payload_ref="queue-signal",
         typed_payload={},
@@ -623,6 +631,8 @@ def test_conflict_scope_analysis_includes_archetypes(tmp_path: Path):
         ),
         provenance_refs=["catalog:queue"],
     )
+    service.review_candidate(first.id, approved=True, reviewer="operator")
+    service.review_candidate(second.id, approved=True, reviewer="operator")
 
     conflicts = service.conflicts.analyze("default", first.proposition.proposition_key)
 
@@ -802,6 +812,43 @@ def test_migrated_dependency_scope_uses_source_service(tmp_path: Path):
 
     assert candidate is not None
     assert candidate.scope.service_refs == ["entity:service:checkout"]
+
+
+def test_copied_artifacts_share_one_independence_group(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate_ids = []
+    for artifact_id, artifact_type, row_id in (
+        ("runbook-copy", "runbook", "dep-copy-a"),
+        ("incident-copy", "incident", "dep-copy-b"),
+    ):
+        candidate_ids.extend(
+            migrate_artifact_extractions(
+                artifact_id=artifact_id,
+                artifact_type=artifact_type,
+                artifact_fingerprint="same-content-fingerprint",
+                rows={
+                    "dependency_hints": [
+                        {
+                            "id": row_id,
+                            "source_entity": "checkout",
+                            "target_entity": "redis-session",
+                            "direction": "depends_on",
+                        }
+                    ]
+                },
+                service=service,
+            )
+        )
+    for candidate_id in candidate_ids:
+        service.review_candidate(candidate_id, approved=True, reviewer="operator")
+    candidate = service.repository.get_candidate(candidate_ids[0])
+    assert candidate is not None
+
+    summary, _ = service.corroboration.analyze("default", candidate.proposition.proposition_key)
+
+    assert summary.raw_source_count == 2
+    assert summary.independent_source_count == 1
+    assert summary.independent_source_family_count == 1
 
 
 def test_service_scope_normalization_matches_governed_knowledge(tmp_path: Path):
@@ -1090,6 +1137,109 @@ def test_authoritative_signal_correction_promotes(tmp_path: Path):
     assert reviewed.review_state == ReviewState.APPROVED
     assert revision is not None
     assert revision.proposition.kind == KnowledgeKind.SIGNAL_MAPPING
+
+
+@pytest.mark.parametrize(
+    ("correction_type", "expected_status"),
+    [
+        (CorrectionType.KNOWLEDGE_STALE, LifecycleStatus.STALE),
+        (CorrectionType.KNOWLEDGE_INCORRECT, LifecycleStatus.WITHDRAWN),
+    ],
+)
+def test_stale_and_incorrect_corrections_retire_their_target(
+    tmp_path: Path,
+    correction_type: CorrectionType,
+    expected_status: LifecycleStatus,
+):
+    service = _service(tmp_path)
+    _, target = _promoted_dependency(service)
+    correction, _ = service.create_correction(
+        investigation_id="inv-retire-target",
+        investigation_revision=1,
+        correction_type=correction_type,
+        target_ref=target.knowledge_id,
+        proposed={
+            "subject_ref": "concept:artifact-quality",
+            "predicate": "useful_for_investigation",
+            "concept_ref": "concept:retirement-review",
+        },
+        scope=KnowledgeScope(),
+        explanation="The governed source is no longer valid.",
+        created_by="operator",
+    )
+
+    _, retired = service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="operator",
+        authoritative=True,
+    )
+
+    assert retired is not None
+    assert retired.knowledge_id == target.knowledge_id
+    assert retired.state.lifecycle_status == expected_status
+    assert retired.state.eligibility == KnowledgeEligibility.INELIGIBLE
+
+
+def test_pending_counter_proposition_does_not_disable_active_knowledge(tmp_path: Path):
+    service = _service(tmp_path)
+    _, active = _promoted_dependency(service)
+    pending = _dependency(
+        service,
+        payload_ref="pending-negative",
+        family=SourceFamily.INCIDENT,
+        lineage_group="pending-negative",
+        predicate="does_not_depend_on",
+    )
+
+    conflicts = service.conflicts.analyze("default", pending.proposition.proposition_key)
+    _, usage = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        )
+    )
+
+    assert conflicts == []
+    active_usage = next(item for item in usage if item.knowledge_ref == active.knowledge_id)
+    assert active_usage.disposition.value == "applied"
+
+
+def test_complementary_evidence_requirements_do_not_conflict(tmp_path: Path):
+    service = _service(tmp_path)
+    candidates = []
+    for signal in ("latency", "error-rate"):
+        candidate = service.create_candidate(
+            kind=KnowledgeKind.EVIDENCE_REQUIREMENT,
+            payload_ref=f"require-{signal}",
+            typed_payload={},
+            proposition={
+                "subject_ref": "entity:service:checkout",
+                "predicate": "requires_observation",
+                "concept_ref": f"signal:{signal}",
+            },
+            scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+            provenance_refs=[f"runbook:{signal}"],
+        )
+        service.review_candidate(candidate.id, approved=True, reviewer="operator")
+        candidates.append(candidate)
+
+    assert service.conflicts.analyze("default", candidates[0].proposition.proposition_key) == []
+
+
+def test_removed_source_retires_promoted_knowledge(tmp_path: Path):
+    service = _service(tmp_path)
+    _, active = _promoted_dependency(service)
+
+    retired = service.reconcile_source_lifecycle(
+        provenance_ref="provenance:runbook",
+        active_candidate_ids=set(),
+    )
+
+    assert len(retired) == 1
+    assert retired[0].knowledge_id == active.knowledge_id
+    assert retired[0].state.lifecycle_status == LifecycleStatus.STALE
+    assert service.repository.get_revision(active.knowledge_id).state.eligibility == KnowledgeEligibility.INELIGIBLE
 
 
 def test_correction_without_target_keeps_conflict_unresolved(tmp_path: Path):
@@ -1648,6 +1798,49 @@ def test_api_review_returns_post_evaluation_candidate_state(tmp_path: Path, monk
     assert body["knowledge_revision"] is not None
     assert body["candidate"]["state"]["eligibility"] == "contextual_only"
     assert body["candidate"]["policy"]["promotion_policy_ref"] == "dependency-promotion-v1"
+
+
+def test_approved_candidate_can_be_evaluated_on_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path, "tenant-a")
+    candidate = _dependency(
+        service,
+        payload_ref="deferred-evaluation",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="deferred-evaluation",
+        tenant_id="tenant-a",
+    )
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    app = create_app(
+        runtime_settings=Settings(
+            api_auth_enabled=False,
+            knowledge_tenant_id="tenant-a",
+            knowledge_permissions="knowledge.read,knowledge.review,knowledge.override",
+        )
+    )
+    client = TestClient(app)
+
+    reviewed = client.post(
+        f"/api/v1/knowledge/{candidate.id}/review",
+        json={"decision": "approve", "reviewer": "operator", "evaluate": False},
+    )
+    evaluated = client.post(
+        f"/api/v1/knowledge/{candidate.id}/review",
+        json={
+            "decision": "approve",
+            "reviewer": "operator",
+            "evaluate": True,
+            "authoritative_source": True,
+        },
+    )
+
+    assert reviewed.status_code == 200
+    assert reviewed.json()["promotion_decision"] is None
+    assert evaluated.status_code == 200
+    assert evaluated.json()["promotion_decision"]["decision"] == "promote"
+    assert evaluated.json()["knowledge_revision"] is not None
 
 
 def test_api_correction_authority_requires_override_permission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

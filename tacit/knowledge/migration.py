@@ -14,6 +14,7 @@ def migrate_artifact_extractions(
     *,
     artifact_id: str,
     artifact_type: str,
+    artifact_fingerprint: str = "",
     rows: dict[str, list[dict[str, Any]]],
     service: KnowledgeService,
     tenant_id: str = "default",
@@ -33,7 +34,9 @@ def migrate_artifact_extractions(
                 evidence_ref=f"artifact:{artifact_id}:{row['id']}",
                 evidence_role=EvidenceRole.SUPPORTING,
                 source_family=_source_family(artifact_type),
-                lineage_group=f"artifact:{artifact_id}",
+                lineage_group=(
+                    f"artifact_content:{artifact_fingerprint}" if artifact_fingerprint else f"artifact:{artifact_id}"
+                ),
                 lineage_kind=LineageKind.INDEPENDENT,
                 provenance_refs=[f"prov_artifact:{artifact_id}"],
             )

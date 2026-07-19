@@ -294,6 +294,7 @@ def build_symptom_evidence_dashboard(
     target_language: str,
     timerange: str,
     signal_store: Any | None = None,
+    tenant_id: str = "default",
 ) -> tuple[DashboardSpec, list[EvidenceResolution]]:
     """Build direct, validation-gated panels for observed application symptoms."""
     resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
@@ -310,6 +311,7 @@ def build_symptom_evidence_dashboard(
                 catalog,
                 target_language=target_language,
                 signal_store=signal_store,
+                tenant_id=tenant_id,
             )
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             continue
@@ -377,6 +379,7 @@ def build_evidence_gap_dashboard(
     target_language: str,
     timerange: str,
     signal_store: Any | None = None,
+    tenant_id: str = "default",
 ) -> tuple[DashboardSpec, list[EvidenceResolution]]:
     """Build validation-gated panels for supported observations found while closing evidence gaps."""
     resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
@@ -401,6 +404,7 @@ def build_evidence_gap_dashboard(
                 catalog,
                 target_language=target_language,
                 signal_store=signal_store,
+                tenant_id=tenant_id,
             )
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             continue
@@ -531,6 +535,7 @@ def _resolve_direct_symptom_evidence(
     *,
     target_language: str,
     signal_store: Any | None = None,
+    tenant_id: str = "default",
 ) -> EvidenceResolution | None:
     """Resolve symptom evidence for direct observation panels."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal
@@ -549,6 +554,7 @@ def _resolve_direct_symptom_evidence(
         requirement.default_metric,
         scoped_catalog,
         target_language,
+        tenant_id,
     )
     if signal_type not in _SYMPTOM_SIGNAL_PANELS:
         return None
@@ -559,6 +565,7 @@ def _resolve_direct_symptom_evidence(
         context_datasource_type=_datasource_type_for_language(target_language),
         context_archetype=requirement.source,
         target_query_language=target_language,
+        tenant_id=tenant_id,
     )
     if not resolved:
         return None
@@ -588,6 +595,7 @@ def _resolve_evidence_gap_observation(
     *,
     target_language: str,
     signal_store: Any | None = None,
+    tenant_id: str = "default",
 ) -> EvidenceResolution | None:
     """Resolve an evidence gap only when ownership is specific enough to observe safely."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal
@@ -606,6 +614,7 @@ def _resolve_evidence_gap_observation(
         requirement.default_metric,
         scoped_catalog,
         target_language,
+        tenant_id,
     )
     if signal_type not in _EVIDENCE_GAP_SIGNAL_PANELS:
         return None
@@ -616,6 +625,7 @@ def _resolve_evidence_gap_observation(
         context_datasource_type=_datasource_type_for_language(target_language),
         context_archetype=requirement.source,
         target_query_language=target_language,
+        tenant_id=tenant_id,
     )
     if not resolved:
         return None

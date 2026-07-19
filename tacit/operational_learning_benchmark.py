@@ -265,6 +265,7 @@ def _run_case(service: KnowledgeService, case: dict[str, Any]) -> tuple[bool, st
                 provenance_refs=[f"catalog:{environment}"],
             )
             propositions.append(candidate.proposition.proposition_key)
+            service.review_candidate(candidate.id, approved=True, reviewer="benchmark")
         conflicts = service.conflicts.analyze("default", propositions[0])
         return any(conflict.resolution_status.value == case["expected"] for conflict in conflicts), "scope_analyzed"
     if case_id in {"rejected-promotion", "unresolved-promotion"}:

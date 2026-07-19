@@ -329,6 +329,7 @@ async def _run_pipeline_inner(
             timings=runtime.timings,
             recorder=runtime.recorder,
             signal_store=signal_store,
+            tenant_id=request.tenant_id,
         )
         catalog_discovery = discovery_stage.discovery
         metric_catalog = catalog_discovery.metric_catalog
@@ -359,6 +360,7 @@ async def _run_pipeline_inner(
             settings=runtime.settings,
             environment_refs=intent.environments,
             signal_store=signal_store,
+            tenant_id=request.tenant_id,
         )
         ranked_archetypes = selection.ranked_archetypes
         learned_archetypes = selection.learned_archetypes
@@ -403,6 +405,7 @@ async def _run_pipeline_inner(
             catalog_for_compile=catalog_for_compile,
             timings=runtime.timings,
             signal_store=signal_store,
+            tenant_id=request.tenant_id,
         )
         if compilation is not None:
             dashboard_spec = compilation.dashboard_spec
@@ -429,6 +432,7 @@ async def _run_pipeline_inner(
             catalog=catalog_for_compile,
             target_language=target_language,
             signal_store=signal_store,
+            tenant_id=request.tenant_id,
         )
         evidence_requirements = evidence_stage.requirements
         evidence_resolutions = evidence_stage.resolutions
@@ -474,6 +478,7 @@ async def _run_pipeline_inner(
             ranked_archetypes_present=bool(ranked_archetypes),
             record_stage=record_validation_stage,
             signal_store=signal_store,
+            tenant_id=request.tenant_id,
         )
         dashboard_spec = validation_result.dashboard_spec
         validation_warnings = validation_result.validation_warnings

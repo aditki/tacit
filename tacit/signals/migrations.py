@@ -21,14 +21,33 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_artifact_learning_columns(conn)
     ensure_artifact_tenant_scope(conn)
     ensure_mapping_columns(conn)
+    ensure_mapping_tenant_scope(conn)
 
 
 def ensure_learning_index(conn: sqlite3.Connection) -> None:
     """Create the FTS5 operational knowledge index when available."""
     try:
         conn.executescript(FTS_SCHEMA_SQL)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(learning_context_fts)").fetchall()}
+        if columns and "tenant_id" not in columns:
+            rebuild_learning_index(conn)
     except sqlite3.OperationalError as exc:
         logger.warning("learning_context_fts_unavailable", error=str(exc))
+
+
+def rebuild_learning_index(conn: sqlite3.Connection) -> None:
+    """Migrate legacy learning-index rows into the default tenant."""
+    conn.execute("ALTER TABLE learning_context_fts RENAME TO learning_context_fts_old")
+    conn.executescript(FTS_SCHEMA_SQL)
+    conn.execute("""INSERT INTO learning_context_fts
+        (tenant_id, source_kind, source_id, backend_name, dashboard_uid,
+         dashboard_title, dashboard_tags, panel_title, metric_name, query_text,
+         service, signal_type, review_state, reason, provenance, indexed_at)
+        SELECT 'default', source_kind, source_id, backend_name, dashboard_uid,
+               dashboard_title, dashboard_tags, panel_title, metric_name, query_text,
+               service, signal_type, review_state, reason, provenance, indexed_at
+        FROM learning_context_fts_old""")
+    conn.execute("DROP TABLE learning_context_fts_old")
 
 
 def ensure_mapping_columns(conn: sqlite3.Connection) -> None:
@@ -38,6 +57,58 @@ def ensure_mapping_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN inference_version TEXT NOT NULL DEFAULT ''")
     if "review_state" not in columns:
         conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN review_state TEXT NOT NULL DEFAULT 'trusted'")
+
+
+def ensure_mapping_tenant_scope(conn: sqlite3.Connection) -> None:
+    """Ensure learned signal mappings are isolated by tenant."""
+    unique_indexes = [
+        [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
+        for index in conn.execute("PRAGMA index_list(signal_metric_mappings)").fetchall()
+        if index["unique"]
+    ]
+    if ["tenant_id", "signal_type", "metric_pattern"] in unique_indexes and [
+        "signal_type",
+        "metric_pattern",
+    ] not in unique_indexes:
+        return
+    old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
+    tenant_select = "COALESCE(tenant_id, 'default')" if "tenant_id" in old_columns else "'default'"
+    conn.execute("ALTER TABLE signal_metric_mappings RENAME TO signal_metric_mappings_old")
+    conn.executescript("""
+        CREATE TABLE signal_metric_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL DEFAULT 'default',
+            signal_type TEXT NOT NULL, metric_pattern TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0.5,
+            context_services TEXT NOT NULL DEFAULT '[]',
+            context_datasource_types TEXT NOT NULL DEFAULT '[]',
+            context_environments TEXT NOT NULL DEFAULT '[]',
+            context_archetypes TEXT NOT NULL DEFAULT '[]',
+            source_type TEXT NOT NULL DEFAULT 'bootstrap', source_refs TEXT NOT NULL DEFAULT '[]',
+            inference_version TEXT NOT NULL DEFAULT '', review_state TEXT NOT NULL DEFAULT 'trusted',
+            use_count INTEGER NOT NULL DEFAULT 0, positive_feedback INTEGER NOT NULL DEFAULT 0,
+            negative_feedback INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, last_seen REAL NOT NULL,
+            UNIQUE(tenant_id, signal_type, metric_pattern),
+            FOREIGN KEY (signal_type) REFERENCES signal_types(signal_type)
+        );
+    """)
+    conn.execute(f"""INSERT INTO signal_metric_mappings
+        (id, tenant_id, signal_type, metric_pattern, confidence, context_services,
+         context_datasource_types, context_environments, context_archetypes,
+         source_type, source_refs, inference_version, review_state, use_count,
+         positive_feedback, negative_feedback, created_at, last_seen)
+        SELECT id, {tenant_select}, signal_type, metric_pattern, confidence, context_services,
+               context_datasource_types, context_environments, context_archetypes,
+               source_type, source_refs, inference_version, review_state, use_count,
+               positive_feedback, negative_feedback, created_at, last_seen
+        FROM signal_metric_mappings_old""")
+    conn.execute("DROP TABLE signal_metric_mappings_old")
+    conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_smm_signal ON signal_metric_mappings(signal_type);
+        CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern);
+        CREATE INDEX IF NOT EXISTS idx_smm_tenant_signal
+            ON signal_metric_mappings(tenant_id, signal_type);
+    """)
 
 
 def ensure_ingested_dashboard_backend_scope(conn: sqlite3.Connection) -> None:

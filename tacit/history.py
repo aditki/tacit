@@ -931,9 +931,15 @@ class InvestigationStore:
                 knowledge_service = get_knowledge_service()
                 active_settings = runtime_settings or settings
                 configured_tenant = str(getattr(active_settings, "knowledge_tenant_id", "default") or "default")
-                if configured_tenant == "*" and not snapshot.request.tenant_id:
+                snapshot_tenant = str(snapshot.request.tenant_id or "")
+                if configured_tenant == "*" and not snapshot_tenant:
                     raise ReplayError("tenant_id is required for current-engine replay when knowledge_tenant_id is '*'")
-                tenant_id = snapshot.request.tenant_id if configured_tenant == "*" else configured_tenant
+                if configured_tenant != "*" and snapshot_tenant and snapshot_tenant != configured_tenant:
+                    raise ReplayError(
+                        f"investigation tenant {snapshot_tenant!r} does not match configured tenant "
+                        f"{configured_tenant!r}"
+                    )
+                tenant_id = snapshot_tenant or configured_tenant
                 knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(
                     KnowledgeScope(
                         tenant_id=tenant_id,
