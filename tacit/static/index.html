@@ -601,7 +601,9 @@
         let contract = null;
         if (data.investigation_id) {
           const revisionQuery = data.investigation_revision == null ? '' : `?revision=${data.investigation_revision}`;
-          const contractResp = await fetch(`${BASE}/api/v1/investigations/${encodeURIComponent(data.investigation_id)}/contract${revisionQuery}`);
+          const contractResp = await fetch(`${BASE}/api/v1/investigations/${encodeURIComponent(data.investigation_id)}/contract${revisionQuery}`, {
+            headers: knowledgeHeaders(),
+          });
           if (contractResp.ok) contract = await contractResp.json();
         }
         const dashUrl = data.dashboard_url ? data.dashboard_url.replace('http://localhost:3000', 'http://' + window.location.hostname + ':3000') : '';
@@ -802,7 +804,7 @@
       const status = document.getElementById('hist-status').value;
       const qs = status ? `?status=${status}&limit=50` : '?limit=50';
       try {
-        const resp = await fetch(`${BASE}/api/v1/investigations${qs}`);
+        const resp = await fetch(`${BASE}/api/v1/investigations${qs}`, { headers: knowledgeHeaders() });
         const data = await resp.json();
         if (!data.investigations || data.investigations.length === 0) {
           el.innerHTML = '<div class="status">No investigations yet. Generate a dashboard to see history.</div>';
@@ -839,7 +841,7 @@
       const el = document.getElementById('history-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const resp = await fetch(`${BASE}/api/v1/investigations/${id}`);
+        const resp = await fetch(`${BASE}/api/v1/investigations/${id}`, { headers: knowledgeHeaders() });
         if (!resp.ok) throw new Error('Not found');
         const inv = await resp.json();
         const badge = statusBadge(inv.status);
@@ -919,7 +921,7 @@
       const el = document.getElementById('history-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const resp = await fetch(`${BASE}/api/v1/investigations/stats`);
+        const resp = await fetch(`${BASE}/api/v1/investigations/stats`, { headers: knowledgeHeaders() });
         const s = await resp.json();
         if (!s.total) {
           el.innerHTML = '<div class="status">No investigations recorded yet.</div>';

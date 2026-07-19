@@ -54,6 +54,12 @@ class KnowledgeScope(BaseModel):
             return value.replace(tzinfo=UTC)
         return value.astimezone(UTC)
 
+    @model_validator(mode="after")
+    def validate_validity_window(self) -> KnowledgeScope:
+        if self.valid_from and self.valid_until and self.valid_until <= self.valid_from:
+            raise ValueError("knowledge scope valid_until must be after valid_from")
+        return self
+
     def applies_to(self, other: KnowledgeScope) -> bool:
         if self.tenant_id != other.tenant_id:
             return False
@@ -98,6 +104,7 @@ class KnowledgeState(BaseModel):
         if (
             self.lifecycle_status
             in {
+                LifecycleStatus.STALE,
                 LifecycleStatus.EXPIRED,
                 LifecycleStatus.SUPERSEDED,
                 LifecycleStatus.WITHDRAWN,
@@ -105,6 +112,8 @@ class KnowledgeState(BaseModel):
             and self.eligibility != KnowledgeEligibility.INELIGIBLE
         ):
             raise ValueError(f"{self.lifecycle_status.value} knowledge must be ineligible")
+        if self.review_state == ReviewState.CANDIDATE and self.eligibility != KnowledgeEligibility.INELIGIBLE:
+            raise ValueError("unreviewed knowledge must be ineligible")
         return self
 
 
@@ -270,6 +279,19 @@ class KnowledgeRevision(BaseModel):
     semantic_fingerprint: str
     created_at: datetime = Field(default_factory=utc_now)
 
+    @model_validator(mode="after")
+    def validate_revision_invariants(self) -> KnowledgeRevision:
+        if self.scope.tenant_id != self.tenant_id:
+            raise ValueError("knowledge revision tenant and scope tenant must match")
+        expected_parent = self.revision - 1 or None
+        if self.parent_revision != expected_parent:
+            raise ValueError("knowledge revision parent must be the preceding revision")
+        if self.proposition.kind == KnowledgeKind.SIGNAL_MAPPING and (
+            not self.proposition.concept_ref or not self.proposition.object_ref
+        ):
+            raise ValueError("promoted signal mappings require both signal and metric references")
+        return self
+
 
 class KnowledgeSnapshotItem(BaseModel):
     knowledge_ref: str
@@ -322,6 +344,12 @@ class KnowledgeCorrection(BaseModel):
     created_by: str
     created_at: datetime = Field(default_factory=utc_now)
     knowledge_candidate_ref: str = ""
+
+    @model_validator(mode="after")
+    def validate_correction_tenant(self) -> KnowledgeCorrection:
+        if self.scope.tenant_id != self.tenant_id:
+            raise ValueError("knowledge correction tenant and scope tenant must match")
+        return self
 
 
 class KnowledgeImpact(BaseModel):

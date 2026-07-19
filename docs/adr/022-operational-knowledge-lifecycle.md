@@ -1,4 +1,4 @@
-# ADR-019: Operational Knowledge is governed, scoped, and revisioned
+# ADR-022: Operational Knowledge is governed, scoped, and revisioned
 
 ## Status
 

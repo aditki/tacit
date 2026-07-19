@@ -76,8 +76,10 @@ class ConservativePromotionPolicy:
             if not context.authoritative_source and SourceFamily.HUMAN_CORRECTION not in corroboration.source_families:
                 return ["authoritative_source_or_human_review_required"]
         elif self.knowledge_kind == KnowledgeKind.SIGNAL_MAPPING:
-            if not candidate.proposition.concept_ref and not candidate.proposition.object_ref:
-                return ["signal_unresolved"]
+            if not candidate.proposition.concept_ref:
+                return ["signal_concept_unresolved"]
+            if not candidate.proposition.object_ref:
+                return ["signal_metric_unresolved"]
             if (
                 not context.authoritative_source
                 and not context.live_verified

@@ -220,8 +220,9 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_investigation
 class InvestigationStore:
     """SQLite-backed investigation history."""
 
-    def __init__(self, db_path: Path | None = None):
+    def __init__(self, db_path: Path | None = None, *, runtime_settings: Settings | None = None):
         self._db_path = db_path or _db_path()
+        self._settings = runtime_settings or settings
         self._ensure_schema()
 
     @contextmanager
@@ -249,24 +250,24 @@ class InvestigationStore:
                 conn.execute("ALTER TABLE investigations ADD COLUMN current_revision INTEGER NOT NULL DEFAULT 0")
             if "tenant_id" not in columns:
                 conn.execute("ALTER TABLE investigations ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
-                rows = conn.execute(
-                    """SELECT i.id, r.contract_json
+                configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+                legacy_tenant = configured_tenant if configured_tenant != "*" else "default"
+                rows = conn.execute("""SELECT i.id, r.contract_json
                        FROM investigations i
                        LEFT JOIN investigation_revisions r
-                         ON r.investigation_id = i.id AND r.revision = i.current_revision"""
-                ).fetchall()
+                         ON r.investigation_id = i.id AND r.revision = i.current_revision""").fetchall()
                 for row in rows:
-                    tenant_id = "default"
+                    tenant_id = legacy_tenant
                     if row["contract_json"]:
                         try:
                             payload = json.loads(row["contract_json"])
-                            tenant_id = str(payload.get("request", {}).get("scope", {}).get("tenant_id") or "default")
+                            scope = payload.get("request", {}).get("scope", {})
+                            if "tenant_id" in scope and scope["tenant_id"]:
+                                tenant_id = str(scope["tenant_id"])
                         except (TypeError, ValueError):
                             pass
                     conn.execute("UPDATE investigations SET tenant_id=? WHERE id=?", (tenant_id, row["id"]))
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_inv_tenant_started ON investigations(tenant_id, started_at)"
-            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_tenant_started ON investigations(tenant_id, started_at)")
             candidate_columns = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_candidates)")}
             if "reviewed_by" not in candidate_columns:
                 conn.execute("ALTER TABLE knowledge_candidates ADD COLUMN reviewed_by TEXT NOT NULL DEFAULT ''")

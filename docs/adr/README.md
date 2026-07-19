@@ -29,4 +29,4 @@ production-readiness claims.
 | [ADR-019](019-governed-knowledge-authority.md) | Operational Knowledge is the authority for learned organizational behavior | Accepted, amended by ADR-020/021 | Containment implemented; consolidation in progress |
 | [ADR-020](020-generated-archetypes-shadow-before-lifecycle.md) | Generated archetypes must prove value in shadow mode before lifecycle investment | Accepted | Containment implemented; shadow evaluation pending |
 | [ADR-021](021-generated-archetype-scope-context.md) | Generated-archetype evaluation uses explicit request scope and fails closed | Accepted | Not implemented |
-| [ADR-022](019-operational-knowledge-lifecycle.md) | Operational Knowledge is governed, scoped, and revisioned | Accepted | Implemented through product milestone |
+| [ADR-022](022-operational-knowledge-lifecycle.md) | Operational Knowledge is governed, scoped, and revisioned | Accepted | Implemented through product milestone |

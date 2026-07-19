@@ -9,7 +9,13 @@ from pydantic import BaseModel, Field
 
 import tacit.history as history_mod
 from tacit.api.dependencies import get_history_store, get_pipeline_dependencies
-from tacit.api.security import knowledge_tenant, resolve_knowledge_tenant, verify_api_key
+from tacit.api.security import (
+    KnowledgeAction,
+    assert_knowledge_action,
+    assert_tenant_access,
+    knowledge_tenant,
+    verify_api_key,
+)
 from tacit.config import settings
 from tacit.dependencies import PipelineDependencies
 from tacit.investigation_bundle import build_investigation_bundle
@@ -38,14 +44,20 @@ class CorrectionReviewRequest(BaseModel):
     reviewed_by: str = Field(min_length=1)
 
 
-def _require_contract_tenant(request: Request, contract, runtime_settings) -> str:
+def _require_contract_tenant(request: Request, contract, runtime_settings, store=None) -> str:
     configured = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
-    recorded = str(contract.request.scope.tenant_id or "")
+    contract_tenant = str(contract.request.scope.tenant_id or "")
+    contract_investigation = getattr(contract, "investigation", None)
+    investigation_id = str(getattr(contract_investigation, "id", ""))
+    investigation = (
+        store.get(investigation_id) if store is not None and investigation_id and hasattr(store, "get") else None
+    )
+    recorded = str((investigation or {}).get("tenant_id") or contract_tenant)
     if not recorded and configured != "*":
         recorded = configured
-    if not recorded or knowledge_tenant(request) != recorded:
+    if contract_tenant not in {"", "default", recorded}:
         raise HTTPException(status_code=403, detail="Tenant access denied")
-    return recorded
+    return assert_tenant_access(request, recorded)
 
 
 def _authorized_contract(
@@ -59,7 +71,7 @@ def _authorized_contract(
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
     runtime_settings = getattr(request.app.state, "settings", settings)
-    _require_contract_tenant(request, contract, runtime_settings)
+    _require_contract_tenant(request, contract, runtime_settings, store)
     return contract
 
 
@@ -68,11 +80,11 @@ def _authorize_investigation(request: Request, store, investigation_id: str):
     contract = store.get_contract(investigation_id)
     if contract is not None:
         runtime_settings = getattr(request.app.state, "settings", settings)
-        _require_contract_tenant(request, contract, runtime_settings)
+        _require_contract_tenant(request, contract, runtime_settings, store)
         for revision in store.list_revisions(investigation_id):
             revision_contract = store.get_contract(investigation_id, int(revision["revision"]))
             if revision_contract is not None:
-                _require_contract_tenant(request, revision_contract, runtime_settings)
+                _require_contract_tenant(request, revision_contract, runtime_settings, store)
         return contract
     investigation = store.get(investigation_id)
     if investigation is None:
@@ -222,7 +234,7 @@ async def replay_investigation(
     source_contract = store.get_contract(investigation_id, revision)
     if source_contract is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
-    _require_contract_tenant(http_request, source_contract, deps.settings)
+    _require_contract_tenant(http_request, source_contract, deps.settings, store)
     try:
         contract = store.replay_contract(
             investigation_id,
@@ -254,6 +266,7 @@ async def create_correction_candidate(
     request: Request,
     store: Any = Depends(get_history_store),
 ):
+    assert_knowledge_action(request, KnowledgeAction.CORRECT)
     _authorized_contract(request, store, investigation_id, payload.revision)
     candidate = store.create_knowledge_candidate(
         investigation_id,
@@ -294,6 +307,10 @@ async def review_correction_candidate(
     request: Request,
     store: Any = Depends(get_history_store),
 ):
+    assert_knowledge_action(
+        request,
+        KnowledgeAction.APPROVE if payload.approved else KnowledgeAction.REJECT,
+    )
     _authorize_investigation(request, store, investigation_id)
     candidate = store.review_knowledge_candidate(
         investigation_id,
@@ -317,6 +334,7 @@ async def apply_correction_candidate(
     request: Request,
     store: Any = Depends(get_history_store),
 ):
+    assert_knowledge_action(request, KnowledgeAction.CORRECT)
     _authorize_investigation(request, store, investigation_id)
     contract = store.apply_knowledge_candidate(investigation_id, candidate_id)
     if contract is None:
@@ -338,11 +356,7 @@ async def refresh_investigation(
     contract = store.get_contract(investigation_id)
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
-    _require_contract_tenant(request, contract, deps.settings)
-    tenant_id = resolve_knowledge_tenant(
-        str(getattr(deps.settings, "knowledge_tenant_id", "default") or "default"),
-        contract.request.scope.tenant_id,
-    )
+    tenant_id = _require_contract_tenant(request, contract, deps.settings, store)
     response = await run_pipeline(
         DashRequest(
             prompt=contract.request.question,
@@ -393,6 +407,7 @@ async def export_investigation_assessment_bundle(
     revision: int | None = None,
     store: Any = Depends(get_history_store),
 ):
+    assert_knowledge_action(request, KnowledgeAction.EXPORT)
     _authorize_investigation(request, store, investigation_id)
     _authorized_contract(request, store, investigation_id, revision)
     try:

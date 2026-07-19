@@ -12,7 +12,7 @@ from fastapi import Path as PathParam
 
 import tacit.signals as signals_mod
 from tacit.api.dependencies import get_runtime_stores, get_signal_store
-from tacit.api.security import assert_knowledge_permission, knowledge_tenant, verify_api_key
+from tacit.api.security import KnowledgeAction, assert_knowledge_action, knowledge_tenant, verify_api_key
 from tacit.models.schemas import (
     LearnAlertRequest,
     LearnDashboardRequest,
@@ -38,8 +38,7 @@ class _ArtifactPayload(Protocol):
 def _authorize_signal_approval(request: Request, enabled: bool) -> None:
     if not enabled:
         return
-    assert_knowledge_permission(request, "knowledge.review")
-    assert_knowledge_permission(request, "knowledge.trust")
+    assert_knowledge_action(request, KnowledgeAction.TEACH_SIGNALS)
 
 
 def _artifact_external_id(payload: _ArtifactPayload, artifact_type: str) -> str:
@@ -572,7 +571,7 @@ async def reject_ingested_dashboard(
     """Reject a pending ingested dashboard."""
     from tacit.dashboard_ingest import reject_ingested_dashboard_record
 
-    assert_knowledge_permission(request, "knowledge.reject")
+    assert_knowledge_action(request, KnowledgeAction.REJECT)
     try:
         return reject_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
@@ -599,6 +598,7 @@ async def ignore_ingested_dashboard(
     store: Any = Depends(get_signal_store),
 ):
     """Ignore a pending ingested dashboard without creating mappings or negative examples."""
+    assert_knowledge_action(request, KnowledgeAction.REJECT)
     tenant_id = knowledge_tenant(request)
     ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend, tenant_id=tenant_id)
     if ingested is None:

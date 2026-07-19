@@ -28,6 +28,7 @@ from tacit.dashboard_ingest import (
 )
 from tacit.dashboard_ingest.service import persist_inferred_signal_review
 from tacit.dashboard_uploads import parse_uploaded_dashboard
+from tacit.knowledge.repository import KnowledgeRepository
 from tacit.models.schemas import MetricEntry
 from tacit.signals import (
     SignalStore,

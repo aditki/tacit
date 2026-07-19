@@ -9,18 +9,24 @@ from pydantic import BaseModel, Field
 
 import tacit.history as history_mod
 from tacit.api.security import (
-    assert_knowledge_permission,
+    KnowledgeAction,
+    assert_knowledge_action,
+    assert_tenant_access,
     knowledge_tenant,
-    require_knowledge_permission,
+    require_knowledge_action,
     verify_api_key,
 )
 from tacit.knowledge.entities import normalize_entity
 from tacit.knowledge.enums import CorrectionType, EntityBindingMethod, EntityKind, ReviewState
 from tacit.knowledge.models import Entity, EntityAlias, KnowledgeScope
-from tacit.knowledge.repository import get_knowledge_repository
+from tacit.knowledge.repository import (
+    CandidateReviewConflictError,
+    KnowledgeRevisionConflictError,
+    get_knowledge_repository,
+)
 from tacit.knowledge.service import get_knowledge_service
 
-router = APIRouter(dependencies=[Depends(verify_api_key), Depends(require_knowledge_permission("knowledge.read"))])
+router = APIRouter(dependencies=[Depends(verify_api_key), Depends(require_knowledge_action(KnowledgeAction.READ))])
 
 
 class CandidateReviewRequest(BaseModel):
@@ -161,14 +167,14 @@ async def list_candidates(
 
 @router.post("/api/v1/knowledge/candidates/{candidate_id}/review", tags=["Operational Knowledge"])
 async def review_candidate(candidate_id: str, payload: CandidateReviewRequest, request: Request):
-    permission = {
-        "approve": "knowledge.review",
-        "reject": "knowledge.reject",
-        "trust": "knowledge.trust",
+    action = {
+        "approve": KnowledgeAction.APPROVE,
+        "reject": KnowledgeAction.REJECT,
+        "trust": KnowledgeAction.TRUST,
     }[payload.decision]
-    assert_knowledge_permission(request, permission)
+    assert_knowledge_action(request, action)
     if payload.authoritative_source or payload.live_verified:
-        assert_knowledge_permission(request, "knowledge.override")
+        assert_knowledge_action(request, KnowledgeAction.OVERRIDE)
     tenant_id = _tenant(request)
     service = get_knowledge_service()
     try:
@@ -198,6 +204,8 @@ async def review_candidate(candidate_id: str, payload: CandidateReviewRequest, r
         }
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (CandidateReviewConflictError, KnowledgeRevisionConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -211,7 +219,7 @@ async def review_knowledge(knowledge_id: str, payload: CandidateReviewRequest, r
 @router.post(
     "/api/v1/knowledge/entities",
     tags=["Operational Knowledge"],
-    dependencies=[Depends(require_knowledge_permission("knowledge.review"))],
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.APPROVE))],
 )
 async def create_entity(payload: EntityRequest, request: Request):
     tenant_id = _tenant(request)
@@ -231,11 +239,11 @@ async def create_entity(payload: EntityRequest, request: Request):
 @router.post(
     "/api/v1/knowledge/aliases",
     tags=["Operational Knowledge"],
-    dependencies=[Depends(require_knowledge_permission("knowledge.review"))],
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.APPROVE))],
 )
 async def create_alias(payload: AliasRequest, request: Request):
     if payload.review_state == ReviewState.TRUSTED:
-        assert_knowledge_permission(request, "knowledge.trust")
+        assert_knowledge_action(request, KnowledgeAction.TRUST)
     tenant_id = _tenant(request)
     alias = EntityAlias(
         id=payload.id,
@@ -257,7 +265,7 @@ async def create_alias(payload: AliasRequest, request: Request):
 @router.post(
     "/api/v1/knowledge/corrections",
     tags=["Operational Knowledge"],
-    dependencies=[Depends(require_knowledge_permission("knowledge.correct"))],
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.CORRECT))],
 )
 async def create_correction(payload: CorrectionRequest, request: Request):
     tenant_id = _tenant(request)
@@ -267,11 +275,8 @@ async def create_correction(payload: CorrectionRequest, request: Request):
     )
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation revision not found")
-    if str(contract.request.scope.tenant_id or "default") != tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant access denied")
-    if payload.target_ref and payload.target_ref not in {
-        usage.knowledge_ref for usage in contract.knowledge_usage
-    }:
+    assert_tenant_access(request, str(contract.request.scope.tenant_id or "default"))
+    if payload.target_ref and payload.target_ref not in {usage.knowledge_ref for usage in contract.knowledge_usage}:
         raise HTTPException(
             status_code=400,
             detail="Correction target was not considered by the referenced investigation revision",
@@ -301,9 +306,12 @@ async def create_correction(payload: CorrectionRequest, request: Request):
     tags=["Operational Knowledge"],
 )
 async def review_correction(correction_id: str, payload: CorrectionReviewRequest, request: Request):
-    assert_knowledge_permission(request, "knowledge.review" if payload.decision == "approve" else "knowledge.reject")
+    assert_knowledge_action(
+        request,
+        KnowledgeAction.APPROVE if payload.decision == "approve" else KnowledgeAction.REJECT,
+    )
     if payload.authoritative:
-        assert_knowledge_permission(request, "knowledge.override")
+        assert_knowledge_action(request, KnowledgeAction.OVERRIDE)
     try:
         correction, revision = get_knowledge_service().review_correction(
             correction_id,

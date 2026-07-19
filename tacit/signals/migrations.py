@@ -97,10 +97,8 @@ def ensure_rejected_candidate_tenant_scope(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(rejected_signal_candidates)").fetchall()}
     if "tenant_id" not in columns:
         conn.execute("ALTER TABLE rejected_signal_candidates ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
-    conn.execute(
-        """CREATE INDEX IF NOT EXISTS idx_rejected_signal_tenant_created
-           ON rejected_signal_candidates(tenant_id, created_at)"""
-    )
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_rejected_signal_tenant_created
+           ON rejected_signal_candidates(tenant_id, created_at)""")
 
 
 def ensure_mapping_tenant_scope(conn: sqlite3.Connection) -> None:
