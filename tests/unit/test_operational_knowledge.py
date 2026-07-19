@@ -35,6 +35,7 @@ from tacit.knowledge.models import (
 )
 from tacit.knowledge.normalization import normalize_service_ref
 from tacit.knowledge.repository import KnowledgeRepository
+from tacit.knowledge.scope import investigation_knowledge_scope
 from tacit.knowledge.service import KnowledgeService
 from tacit.models.schemas import CulpritCandidate, CulpritRanking, EvidenceObservation, EvidenceObservationOutcome
 from tacit.operational_learning_benchmark import (
@@ -1242,6 +1243,105 @@ def test_removed_source_retires_promoted_knowledge(tmp_path: Path):
     assert service.repository.get_revision(active.knowledge_id).state.eligibility == KnowledgeEligibility.INELIGIBLE
 
 
+def test_removed_source_keeps_knowledge_active_when_independent_support_remains(tmp_path: Path):
+    service = _service(tmp_path)
+    removed, active = _promoted_dependency(service)
+    survivor = _dependency(
+        service,
+        payload_ref="incident",
+        family=SourceFamily.INCIDENT,
+        lineage_group="incident:1",
+    )
+    service.review_candidate(survivor.id, approved=True, reviewer="reviewer")
+
+    reconciled = service.reconcile_source_lifecycle(
+        provenance_ref="provenance:runbook",
+        active_candidate_ids=set(),
+    )
+
+    assert len(reconciled) == 1
+    current = service.repository.get_revision(active.knowledge_id)
+    assert current is not None
+    assert current.state.lifecycle_status == LifecycleStatus.ACTIVE
+    assert current.state.eligibility == KnowledgeEligibility.CONTEXTUAL_ONLY
+    assert removed.id not in current.promoted_from_candidate_refs
+    assert set(current.promoted_from_candidate_refs) == (set(active.promoted_from_candidate_refs) - {removed.id}) | {
+        survivor.id
+    }
+
+
+def test_repeated_candidate_evaluation_reuses_unchanged_revision(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate, original = _promoted_dependency(service)
+
+    decision, repeated = service.evaluate_candidate(candidate.id)
+
+    assert decision.decision.value == "promote"
+    assert repeated == original
+    assert len(service.repository.list_revisions(original.knowledge_id)) == 1
+
+
+def test_unresolved_approved_candidate_does_not_create_conflict(tmp_path: Path):
+    service = _service(tmp_path)
+    service.register_entity(
+        Entity(
+            id="entity:team:payments",
+            kind=EntityKind.TEAM,
+            canonical_name="payments",
+            scope=KnowledgeScope(),
+            provenance_refs=["catalog:team"],
+        )
+    )
+    resolved = service.create_candidate(
+        kind=KnowledgeKind.OWNERSHIP,
+        payload_ref="resolved-owner",
+        typed_payload={},
+        proposition={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "owned_by",
+            "object_ref": "entity:team:payments",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["catalog:ownership"],
+    )
+    unresolved = service.create_candidate(
+        kind=KnowledgeKind.OWNERSHIP,
+        payload_ref="unresolved-owner",
+        typed_payload={},
+        proposition={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "owned_by",
+            "object_ref": "unknown-team",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["artifact:ownership"],
+    )
+    service.review_candidate(resolved.id, approved=True, reviewer="operator")
+    service.review_candidate(unresolved.id, approved=True, reviewer="operator")
+
+    assert unresolved.entity_resolution.status.value == "unresolved"
+    assert service.conflicts.analyze("default", resolved.proposition.proposition_key) == []
+
+
+def test_investigation_scope_extracts_supported_prompt_dimensions():
+    scope = investigation_knowledge_scope(
+        tenant_id="tenant-a",
+        prompt=(
+            "Investigate checkout in production us-east-1, cluster: prod-east, " "namespace payments on release v2.4.1"
+        ),
+        services=["Checkout API"],
+        archetype_ids=["latency_investigation"],
+    )
+
+    assert "environment:production" in scope.environment_refs
+    assert "region:us-east-1" in scope.region_refs
+    assert "cluster:prod-east" in scope.cluster_refs
+    assert "namespace:payments" in scope.namespace_refs
+    assert "entity:service:checkout-api" in scope.service_refs
+    assert "archetype:latency_investigation" in scope.archetype_refs
+    assert "version:v2.4.1" in scope.version_constraints
+
+
 def test_correction_without_target_keeps_conflict_unresolved(tmp_path: Path):
     service = _service(tmp_path)
     _, original = _promoted_dependency(service)
@@ -1942,6 +2042,37 @@ def test_artifact_learning_cli_missing_tenant_exits_nonzero(tmp_path: Path, monk
     assert incident_result.exit_code != 0
     assert "--tenant is required" in runbook_result.output
     assert "--tenant is required" in incident_result.output
+
+
+def test_pending_cli_learning_preserves_wildcard_tenant(monkeypatch: pytest.MonkeyPatch):
+    seen: list[tuple[str, str | None]] = []
+
+    async def ingest_dashboard(**kwargs):
+        seen.append(("dashboard", kwargs["tenant_id"]))
+        return {"dashboard_uid": kwargs["dashboard_uid"], "status": "pending"}
+
+    async def learn_dashboards(*args, **kwargs):
+        seen.append(("bulk-dashboard", kwargs["tenant_id"]))
+        return {"dashboards_learned": 0, "signals_inferred": 0, "mappings_created": 0, "warnings": []}
+
+    async def learn_alerts(*args, **kwargs):
+        seen.append(("alerts", kwargs["tenant_id"]))
+        return {"alerts_learned": 0, "signals_inferred": 0, "mappings_created": 0, "warnings": []}
+
+    monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
+    monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard", ingest_dashboard)
+    monkeypatch.setattr("tacit.dashboard_ingest.learn_backend_dashboards", learn_dashboards)
+    monkeypatch.setattr("tacit.alert_ingest.learn_backend_alerts", learn_alerts)
+    runner = CliRunner()
+
+    results = [
+        runner.invoke(cli, ["learn", "dashboard", "dash-1", "--pending", "--tenant", "acme"]),
+        runner.invoke(cli, ["learn", "grafana", "--pending", "--tenant", "acme"]),
+        runner.invoke(cli, ["learn", "alerts", "--pending", "--tenant", "acme"]),
+    ]
+
+    assert all(result.exit_code == 0 for result in results)
+    assert seen == [("dashboard", "acme"), ("bulk-dashboard", "acme"), ("alerts", "acme")]
 
 
 def test_knowledge_ui_sends_selected_tenant_header():

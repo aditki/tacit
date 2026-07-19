@@ -3,12 +3,42 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import structlog
 
 from tacit.signals.schema import FTS_SCHEMA_SQL, SCHEMA_SQL
 
 logger = structlog.get_logger()
+
+
+@contextmanager
+def atomic_rebuild(conn: sqlite3.Connection, name: str) -> Iterator[None]:
+    """Keep a table rename/copy/drop migration within one rollback boundary."""
+    conn.execute(f"SAVEPOINT {name}")
+    try:
+        yield
+    except Exception:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+        conn.execute(f"RELEASE SAVEPOINT {name}")
+        raise
+    else:
+        conn.execute(f"RELEASE SAVEPOINT {name}")
+
+
+def execute_script_statements(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a SQL script statement-by-statement without implicit commits."""
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if not sqlite3.complete_statement(statement):
+            continue
+        if statement.strip():
+            conn.execute(statement)
+        statement = ""
+    if statement.strip():
+        raise ValueError("incomplete SQL migration statement")
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -27,7 +57,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 def ensure_learning_index(conn: sqlite3.Connection) -> None:
     """Create the FTS5 operational knowledge index when available."""
     try:
-        conn.executescript(FTS_SCHEMA_SQL)
+        conn.execute(FTS_SCHEMA_SQL)
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(learning_context_fts)").fetchall()}
         if columns and "tenant_id" not in columns:
             rebuild_learning_index(conn)
@@ -37,17 +67,18 @@ def ensure_learning_index(conn: sqlite3.Connection) -> None:
 
 def rebuild_learning_index(conn: sqlite3.Connection) -> None:
     """Migrate legacy learning-index rows into the default tenant."""
-    conn.execute("ALTER TABLE learning_context_fts RENAME TO learning_context_fts_old")
-    conn.executescript(FTS_SCHEMA_SQL)
-    conn.execute("""INSERT INTO learning_context_fts
-        (tenant_id, source_kind, source_id, backend_name, dashboard_uid,
-         dashboard_title, dashboard_tags, panel_title, metric_name, query_text,
-         service, signal_type, review_state, reason, provenance, indexed_at)
-        SELECT 'default', source_kind, source_id, backend_name, dashboard_uid,
-               dashboard_title, dashboard_tags, panel_title, metric_name, query_text,
-               service, signal_type, review_state, reason, provenance, indexed_at
-        FROM learning_context_fts_old""")
-    conn.execute("DROP TABLE learning_context_fts_old")
+    with atomic_rebuild(conn, "rebuild_learning_context_fts"):
+        conn.execute("ALTER TABLE learning_context_fts RENAME TO learning_context_fts_old")
+        conn.execute(FTS_SCHEMA_SQL)
+        conn.execute("""INSERT INTO learning_context_fts
+            (tenant_id, source_kind, source_id, backend_name, dashboard_uid,
+             dashboard_title, dashboard_tags, panel_title, metric_name, query_text,
+             service, signal_type, review_state, reason, provenance, indexed_at)
+            SELECT 'default', source_kind, source_id, backend_name, dashboard_uid,
+                   dashboard_title, dashboard_tags, panel_title, metric_name, query_text,
+                   service, signal_type, review_state, reason, provenance, indexed_at
+            FROM learning_context_fts_old""")
+        conn.execute("DROP TABLE learning_context_fts_old")
 
 
 def ensure_mapping_columns(conn: sqlite3.Connection) -> None:
@@ -73,9 +104,9 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection) -> None:
         return
     old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
     tenant_select = "COALESCE(tenant_id, 'default')" if "tenant_id" in old_columns else "'default'"
-    conn.execute("ALTER TABLE signal_metric_mappings RENAME TO signal_metric_mappings_old")
-    conn.executescript("""
-        CREATE TABLE signal_metric_mappings (
+    with atomic_rebuild(conn, "rebuild_signal_metric_mappings"):
+        conn.execute("ALTER TABLE signal_metric_mappings RENAME TO signal_metric_mappings_old")
+        conn.execute("""CREATE TABLE signal_metric_mappings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tenant_id TEXT NOT NULL DEFAULT 'default',
             signal_type TEXT NOT NULL, metric_pattern TEXT NOT NULL,
@@ -90,25 +121,22 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection) -> None:
             negative_feedback INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, last_seen REAL NOT NULL,
             UNIQUE(tenant_id, signal_type, metric_pattern),
             FOREIGN KEY (signal_type) REFERENCES signal_types(signal_type)
-        );
-    """)
-    conn.execute(f"""INSERT INTO signal_metric_mappings
-        (id, tenant_id, signal_type, metric_pattern, confidence, context_services,
-         context_datasource_types, context_environments, context_archetypes,
-         source_type, source_refs, inference_version, review_state, use_count,
-         positive_feedback, negative_feedback, created_at, last_seen)
-        SELECT id, {tenant_select}, signal_type, metric_pattern, confidence, context_services,
-               context_datasource_types, context_environments, context_archetypes,
-               source_type, source_refs, inference_version, review_state, use_count,
-               positive_feedback, negative_feedback, created_at, last_seen
-        FROM signal_metric_mappings_old""")
-    conn.execute("DROP TABLE signal_metric_mappings_old")
-    conn.executescript("""
-        CREATE INDEX IF NOT EXISTS idx_smm_signal ON signal_metric_mappings(signal_type);
-        CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern);
-        CREATE INDEX IF NOT EXISTS idx_smm_tenant_signal
-            ON signal_metric_mappings(tenant_id, signal_type);
-    """)
+        )""")
+        conn.execute(f"""INSERT INTO signal_metric_mappings
+            (id, tenant_id, signal_type, metric_pattern, confidence, context_services,
+             context_datasource_types, context_environments, context_archetypes,
+             source_type, source_refs, inference_version, review_state, use_count,
+             positive_feedback, negative_feedback, created_at, last_seen)
+            SELECT id, {tenant_select}, signal_type, metric_pattern, confidence, context_services,
+                   context_datasource_types, context_environments, context_archetypes,
+                   source_type, source_refs, inference_version, review_state, use_count,
+                   positive_feedback, negative_feedback, created_at, last_seen
+            FROM signal_metric_mappings_old""")
+        conn.execute("DROP TABLE signal_metric_mappings_old")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_smm_signal ON signal_metric_mappings(signal_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern)")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_tenant_signal
+               ON signal_metric_mappings(tenant_id, signal_type)""")
 
 
 def ensure_ingested_dashboard_backend_scope(conn: sqlite3.Connection) -> None:
@@ -214,7 +242,9 @@ def ensure_artifact_tenant_scope(conn: sqlite3.Connection) -> None:
 
 def ensure_artifact_tenant_indexes(conn: sqlite3.Connection) -> None:
     """Create tenant-leading lookup indexes after tenant columns are available."""
-    conn.executescript("""
+    execute_script_statements(
+        conn,
+        """
         CREATE INDEX IF NOT EXISTS idx_learned_artifacts_type
             ON learned_artifacts(tenant_id, artifact_type);
         CREATE INDEX IF NOT EXISTS idx_evidence_requirements_artifact
@@ -225,7 +255,8 @@ def ensure_artifact_tenant_indexes(conn: sqlite3.Connection) -> None:
             ON dependency_hints(tenant_id, artifact_id);
         CREATE INDEX IF NOT EXISTS idx_signal_mapping_candidates_artifact
             ON signal_mapping_candidates(tenant_id, artifact_id);
-    """)
+    """,
+    )
 
 
 def rebuild_artifact_learning_tables(conn: sqlite3.Connection) -> None:
@@ -245,9 +276,20 @@ def rebuild_artifact_learning_tables(conn: sqlite3.Connection) -> None:
         )
         for table in tables
     }
+    with atomic_rebuild(conn, "rebuild_artifact_learning"):
+        _rebuild_artifact_learning_tables(conn, tables, tenant_select)
+
+
+def _rebuild_artifact_learning_tables(
+    conn: sqlite3.Connection,
+    tables: tuple[str, ...],
+    tenant_select: dict[str, str],
+) -> None:
     for table in tables:
         conn.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
-    conn.executescript("""
+    execute_script_statements(
+        conn,
+        """
         CREATE TABLE learned_artifacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tenant_id TEXT NOT NULL DEFAULT 'default', artifact_id TEXT NOT NULL,
@@ -295,7 +337,8 @@ def rebuild_artifact_learning_tables(conn: sqlite3.Connection) -> None:
             extraction_hash TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
             PRIMARY KEY (tenant_id, id)
         );
-    """)
+    """,
+    )
     conn.execute(f"""INSERT INTO learned_artifacts
         SELECT id, {tenant_select['learned_artifacts']}, artifact_id, artifact_type, source_vendor,
                source_instance, external_id, title, body_text, provenance_url, fingerprint, stale,
@@ -327,8 +370,15 @@ def rebuild_ingested_dashboards_table(conn: sqlite3.Connection) -> None:
     """Rebuild legacy ingested dashboards with tenant/backend-scoped uniqueness."""
     old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ingested_dashboards)").fetchall()}
     tenant_select = "COALESCE(tenant_id, 'default')" if "tenant_id" in old_columns else "'default'"
+    with atomic_rebuild(conn, "rebuild_ingested_dashboards"):
+        _rebuild_ingested_dashboards_table(conn, tenant_select)
+
+
+def _rebuild_ingested_dashboards_table(conn: sqlite3.Connection, tenant_select: str) -> None:
     conn.execute("ALTER TABLE ingested_dashboards RENAME TO ingested_dashboards_old")
-    conn.executescript("""
+    execute_script_statements(
+        conn,
+        """
         CREATE TABLE ingested_dashboards (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
             tenant_id           TEXT NOT NULL DEFAULT 'default',
@@ -352,7 +402,8 @@ def rebuild_ingested_dashboards_table(conn: sqlite3.Connection) -> None:
             reviewed_at         REAL,
             UNIQUE(tenant_id, dashboard_uid, backend_name)
         );
-    """)
+    """,
+    )
     conn.execute(f"""INSERT INTO ingested_dashboards
            (id, tenant_id, dashboard_uid, backend_name, dashboard_title, dashboard_tags,
             metrics_found, panel_count, row_groups, metric_cooccurrence,
@@ -376,8 +427,15 @@ def rebuild_ingested_alerts_table(conn: sqlite3.Connection) -> None:
     """Rebuild legacy ingested alerts with tenant/backend-scoped uniqueness."""
     old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ingested_alerts)").fetchall()}
     tenant_select = "COALESCE(tenant_id, 'default')" if "tenant_id" in old_columns else "'default'"
+    with atomic_rebuild(conn, "rebuild_ingested_alerts"):
+        _rebuild_ingested_alerts_table(conn, tenant_select)
+
+
+def _rebuild_ingested_alerts_table(conn: sqlite3.Connection, tenant_select: str) -> None:
     conn.execute("ALTER TABLE ingested_alerts RENAME TO ingested_alerts_old")
-    conn.executescript("""
+    execute_script_statements(
+        conn,
+        """
         CREATE TABLE ingested_alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tenant_id TEXT NOT NULL DEFAULT 'default', alert_uid TEXT NOT NULL,
@@ -397,7 +455,8 @@ def rebuild_ingested_alerts_table(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL, created_at REAL NOT NULL, reviewed_at REAL,
             UNIQUE(tenant_id, alert_uid, backend_name)
         );
-    """)
+    """,
+    )
     conn.execute(f"""INSERT INTO ingested_alerts
            (id, tenant_id, alert_uid, backend_name, source_vendor, source_instance, external_id,
             fingerprint, alert_title, alert_tags, condition, severity, enabled, labels, annotations,

@@ -6,6 +6,7 @@ from tacit.knowledge.enums import (
     ConflictKind,
     ConflictResolutionStatus,
     CorroborationStatus,
+    EntityResolutionStatus,
     EvidenceRole,
     KnowledgeKind,
     LifecycleStatus,
@@ -75,6 +76,8 @@ class CorroborationService:
             candidate
             for candidate in self.repository.candidates_for_proposition(tenant_id, proposition_key)
             if candidate.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
+            and candidate.state.lifecycle_status == LifecycleStatus.ACTIVE
+            and candidate.entity_resolution.status == EntityResolutionStatus.RESOLVED
         ]
 
     def contributing_candidates(self, tenant_id: str, proposition_key: str) -> list[KnowledgeCandidate]:
