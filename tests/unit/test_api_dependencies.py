@@ -145,10 +145,17 @@ def test_replay_route_uses_app_scoped_runtime_settings(monkeypatch):
     seen_settings: list[Settings] = []
 
     class FakeContract:
+        class request:
+            class scope:
+                tenant_id = "tenant-a"
+
         def model_dump(self, **kwargs):
             return {"investigation": {"id": "inv-app-replay"}}
 
     class FakeStore:
+        def get_contract(self, investigation_id, revision):
+            return FakeContract()
+
         def replay_contract(self, investigation_id, revision, *, mode, changes, runtime_settings):
             seen_settings.append(runtime_settings)
             return FakeContract()

@@ -708,15 +708,28 @@ def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, m
         }
     )
     snapshot = _snapshot_for(draft).model_copy(
-        update={"baseline_culprit_ranking": baseline, "culprit_ranking": historical}
+        update={
+            "request": _snapshot_for(draft).request.model_copy(
+                update={
+                    "prompt": (
+                        "Why is checkout slow in production us-east-1, cluster: prod-east, "
+                        "namespace payments on release v2.4.1?"
+                    )
+                }
+            ),
+            "baseline_culprit_ranking": baseline,
+            "culprit_ranking": historical,
+        }
     )
     store.persist_contract_revision(draft, snapshot=snapshot)
 
     class FakeKnowledgeService:
         seen_score: float | None = None
         persisted_usage: tuple[str, int, list[KnowledgeUsage]] | None = None
+        scope = None
 
         def create_snapshot(self, scope):
+            self.scope = scope
             return KnowledgeSnapshot(
                 id="knowledge_snapshot_current",
                 tenant_id=scope.tenant_id,
@@ -782,6 +795,11 @@ def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, m
     assert fake.persisted_usage[0] == investigation_id
     assert fake.persisted_usage[1] == replayed.investigation.revision
     assert fake.persisted_usage[2][0].knowledge_ref == "knowledge_current"
+    assert "environment:production" in fake.scope.environment_refs
+    assert "region:us-east-1" in fake.scope.region_refs
+    assert "cluster:prod-east" in fake.scope.cluster_refs
+    assert "namespace:payments" in fake.scope.namespace_refs
+    assert "version:v2.4.1" in fake.scope.version_constraints
 
 
 def test_current_engine_replay_snapshots_reconciled_knowledge_usage(tmp_path, monkeypatch):
@@ -2240,7 +2258,7 @@ def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch
         )
 
     monkeypatch.setattr("tacit.api.routes.history.run_pipeline", fake_run_pipeline)
-    app = create_app()
+    app = create_app(runtime_settings=deps.settings)
     app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
 
     response = TestClient(app).post(f"/api/v1/investigations/{investigation_id}/refresh")
@@ -2285,6 +2303,48 @@ def test_refresh_rejects_investigation_outside_configured_tenant(tmp_path, monke
     assert response.status_code == 403
     assert response.json()["detail"] == "Tenant access denied"
     assert called is False
+
+
+def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    draft = _draft_contract(investigation_id)
+    tenant_request = draft.request.model_copy(
+        update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}
+    )
+    store.persist_contract_revision(
+        draft.model_copy(update={"request": tenant_request}),
+        snapshot=_snapshot_for(draft).model_copy(
+            update={"request": _snapshot_for(draft).request.model_copy(update={"tenant_id": "tenant-a"})}
+        ),
+    )
+    settings = Settings(knowledge_tenant_id="*")
+    deps = PipelineDependencies(
+        settings=settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
+    app = create_app(runtime_settings=settings)
+    app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
+    client = TestClient(app)
+    run_count = len(store.list_runs(investigation_id))
+
+    replay = client.post(
+        f"/api/v1/investigations/{investigation_id}/replay",
+        headers={"X-Tacit-Tenant": "tenant-b"},
+    )
+    refresh = client.post(
+        f"/api/v1/investigations/{investigation_id}/refresh",
+        headers={"X-Tacit-Tenant": "tenant-b"},
+    )
+
+    assert replay.status_code == 403
+    assert refresh.status_code == 403
+    assert len(store.list_runs(investigation_id)) == run_count
 
 
 def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp_path, monkeypatch):

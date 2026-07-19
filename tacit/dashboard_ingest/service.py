@@ -180,6 +180,7 @@ def persist_inferred_signal_review(
     backend_name: str = "",
     tenant_id: str | None = None,
     source_type: str = "dashboard_ingest",
+    governed_candidate_ids: set[str] | None = None,
 ) -> bool:
     """Persist one inferred signal using the same gate for all approval paths."""
     signal_type = sig["signal_type"]
@@ -196,7 +197,7 @@ def persist_inferred_signal_review(
         effective_tenant = resolve_learning_tenant(tenant_id)
         family = sig.get("signal_family", "")
         if family:
-            store.register_signal_type(signal_type=signal_type, category=family)
+            store.register_signal_type(signal_type=signal_type, category=family, tenant_id=effective_tenant)
         store.add_mapping(
             signal_type=signal_type,
             metric_pattern=metric,
@@ -207,13 +208,15 @@ def persist_inferred_signal_review(
             review_state="approved" if is_heuristic else "trusted",
             tenant_id=effective_tenant,
         )
-        _govern_signal_mapping(
+        governed_candidate_id = _govern_signal_mapping(
             store=store,
             sig=sig,
             source_ref=source_ref,
             source_type=source_type,
             tenant_id=effective_tenant,
         )
+        if governed_candidate_ids is not None:
+            governed_candidate_ids.add(governed_candidate_id)
         return True
 
     if is_heuristic and metric:
@@ -260,6 +263,32 @@ def _govern_signal_mapping(
         },
         service=KnowledgeService(KnowledgeRepository(store._db_path)),
         tenant_id=effective_tenant,
+    )
+
+
+def reconcile_signal_source(
+    *,
+    store: Any,
+    tenant_id: str,
+    source_type: str,
+    source_ref: str,
+    active_pairs: set[tuple[str, str]],
+    active_candidate_ids: set[str],
+) -> None:
+    """Reconcile refreshed legacy mappings and governed knowledge together."""
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    store.reconcile_mapping_source(
+        tenant_id=tenant_id,
+        source_type=source_type,
+        source_ref=source_ref,
+        active_pairs=active_pairs,
+    )
+    KnowledgeService(KnowledgeRepository(store._db_path)).reconcile_source_lifecycle(
+        provenance_ref=source_ref,
+        tenant_id=tenant_id,
+        active_candidate_ids=active_candidate_ids,
     )
 
 
@@ -354,6 +383,7 @@ def approve_ingested_dashboard_record(
 
     mappings_created = 0
     activated_pairs: set[tuple[str, str]] = set()
+    governed_candidate_ids: set[str] = set()
     source_ref = f"{ingested['backend_name']}:{dashboard_uid}" if ingested.get("backend_name") else dashboard_uid
     for sig in ingested.get("signals_inferred", []):
         if isinstance(sig, dict):
@@ -364,6 +394,7 @@ def approve_ingested_dashboard_record(
                 dashboard_uid=dashboard_uid,
                 backend_name=ingested.get("backend_name", ""),
                 tenant_id=effective_tenant,
+                governed_candidate_ids=governed_candidate_ids,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
@@ -385,21 +416,32 @@ def approve_ingested_dashboard_record(
                             review_state="approved",
                             tenant_id=effective_tenant,
                         )
-                        _govern_signal_mapping(
-                            store=store,
-                            sig={
-                                "signal_type": sig,
-                                "metric": metric,
-                                "source": "heuristic",
-                                "services": [],
-                            },
-                            source_ref=source_ref,
-                            source_type="dashboard_ingest",
-                            tenant_id=effective_tenant,
+                        governed_candidate_ids.add(
+                            _govern_signal_mapping(
+                                store=store,
+                                sig={
+                                    "signal_type": sig,
+                                    "metric": metric,
+                                    "source": "heuristic",
+                                    "services": [],
+                                },
+                                source_ref=source_ref,
+                                source_type="dashboard_ingest",
+                                tenant_id=effective_tenant,
+                            )
                         )
                         mappings_created += 1
                         activated_pairs.add((metric, sig))
                         break
+
+    reconcile_signal_source(
+        store=store,
+        tenant_id=effective_tenant,
+        source_type="dashboard_ingest",
+        source_ref=source_ref,
+        active_pairs=activated_pairs,
+        active_candidate_ids=governed_candidate_ids,
+    )
 
     store.approve_ingested_dashboard(
         dashboard_uid,
@@ -532,6 +574,7 @@ async def ingest_dashboard_features(
     mappings_created = 0
     archetype_registered = False
     activated_pairs: set[tuple[str, str]] = set()
+    governed_candidate_ids: set[str] = set()
     if auto_approve:
         source_ref = (
             f"{features.backend_name}:{features.dashboard_uid}" if features.backend_name else features.dashboard_uid
@@ -544,9 +587,18 @@ async def ingest_dashboard_features(
                 dashboard_uid=features.dashboard_uid,
                 backend_name=features.backend_name,
                 tenant_id=effective_tenant,
+                governed_candidate_ids=governed_candidate_ids,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
+        reconcile_signal_source(
+            store=store,
+            tenant_id=effective_tenant,
+            source_type="dashboard_ingest",
+            source_ref=source_ref,
+            active_pairs=activated_pairs,
+            active_candidate_ids=governed_candidate_ids,
+        )
         if register_archetype:
             archetype_registered = register_generated_archetype_if_enabled(
                 archetype_yaml,

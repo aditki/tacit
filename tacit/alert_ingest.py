@@ -20,7 +20,7 @@ from tacit.backends.base import AlertFeatures
 from tacit.config import Settings, settings
 from tacit.dashboard_ingest import infer_signals_from_metrics, persist_inferred_signal_review
 from tacit.dashboard_ingest.reports import build_learning_impact_report, build_signal_quality_report
-from tacit.dashboard_ingest.service import resolve_learning_tenant
+from tacit.dashboard_ingest.service import reconcile_signal_source, resolve_learning_tenant
 from tacit.signals import get_signal_store as _default_get_signal_store
 from tacit.signals.learning_index import infer_services_for_learning
 
@@ -176,6 +176,7 @@ async def ingest_alert_features(
     source_ref = f"{features.backend_name}:alert:{features.alert_uid}" if features.backend_name else features.alert_uid
     mappings_created = 0
     activated_pairs: set[tuple[str, str]] = set()
+    governed_candidate_ids: set[str] = set()
     if auto_approve and not dry_run:
         for sig in signals:
             if persist_inferred_signal_review(
@@ -186,14 +187,15 @@ async def ingest_alert_features(
                 backend_name=features.backend_name,
                 tenant_id=effective_tenant,
                 source_type="alert_ingest",
+                governed_candidate_ids=governed_candidate_ids,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
-
     change_state = "dry_run"
     indexed_context_rows = 0
     effective_status = status
     if not dry_run:
+        assert effective_tenant is not None
         change_state = store.record_ingested_alert(
             alert_uid=features.alert_uid,
             tenant_id=effective_tenant,
@@ -241,6 +243,15 @@ async def ingest_alert_features(
             status=effective_status,
             activated_pairs=activated_pairs if auto_approve else None,
         )
+        if auto_approve:
+            reconcile_signal_source(
+                store=store,
+                tenant_id=effective_tenant,
+                source_type="alert_ingest",
+                source_ref=source_ref,
+                active_pairs=activated_pairs,
+                active_candidate_ids=governed_candidate_ids,
+            )
 
     result = {
         **asdict(features),

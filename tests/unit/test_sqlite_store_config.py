@@ -275,6 +275,57 @@ async def test_unchanged_pending_alert_can_upgrade_to_approved(tmp_path, monkeyp
         assert rows[0]["review_state"] != "candidate"
 
 
+async def test_alert_refresh_retires_removed_signal_knowledge(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    batches = iter(
+        [
+            [
+                {
+                    "signal_type": "old_alert_signal",
+                    "metric": "old_alert_metric",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+            [
+                {
+                    "signal_type": "new_alert_signal",
+                    "metric": "new_alert_metric",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr("tacit.alert_ingest.infer_signals_from_metrics", lambda *args, **kwargs: next(batches))
+
+    def features(metric: str) -> AlertFeatures:
+        return AlertFeatures(
+            alert_uid="refresh-alert",
+            alert_title="Refresh alert",
+            backend_name="grafana",
+            query_language="promql",
+            condition="A > 1",
+            metrics_found=[metric],
+            query_transformations=[metric],
+        )
+
+    await ingest_alert_features(features("old_alert_metric"), auto_approve=True)
+    await ingest_alert_features(features("new_alert_metric"), auto_approve=True)
+
+    assert store.get_mappings_for_signal("old_alert_signal", include_decayed=True) == []
+    candidates = KnowledgeRepository(store._db_path).list_candidates("default", kind="signal_mapping")
+    old = next(candidate for candidate in candidates if "old_alert_metric" in candidate.payload_ref)
+    new = next(candidate for candidate in candidates if "new_alert_metric" in candidate.payload_ref)
+    assert old.state.lifecycle_status.value == "stale"
+    assert new.state.lifecycle_status.value == "active"
+
+
 def test_missing_alerts_are_marked_stale_not_deleted(tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.record_ingested_alert(

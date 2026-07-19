@@ -273,6 +273,35 @@ def test_learning_context_index_is_tenant_scoped(signal_store):
     assert {row["dashboard_title"] for row in tenant_b} == {"Tenant B Checkout"}
 
 
+def test_taught_signal_definitions_are_tenant_scoped(signal_store):
+    signal_store.register_signal_type(
+        "request_latency",
+        description="Built-in latency",
+        category="latency",
+    )
+    signal_store.register_signal_type(
+        "request_latency",
+        description="Acme latency semantics",
+        tenant_id="tenant-a",
+    )
+    signal_store.register_signal_type(
+        "acme_queue_pressure",
+        description="Acme custom queue signal",
+        category="saturation",
+        tenant_id="tenant-a",
+    )
+
+    tenant_a = {row["signal_type"]: row for row in signal_store.list_signal_types(tenant_id="tenant-a")}
+    tenant_b = {row["signal_type"]: row for row in signal_store.list_signal_types(tenant_id="tenant-b")}
+
+    assert tenant_a["request_latency"]["description"] == "Acme latency semantics"
+    assert tenant_a["request_latency"]["category"] == "latency"
+    assert tenant_b["request_latency"]["description"] == "Built-in latency"
+    assert "acme_queue_pressure" in tenant_a
+    assert "acme_queue_pressure" not in tenant_b
+    assert signal_store.get_signal_type("acme_queue_pressure", tenant_id="tenant-b") is None
+
+
 def test_legacy_mappings_and_learning_index_migrate_to_default_tenant(tmp_path):
     db_path = tmp_path / "legacy-tenantless-signals.db"
     with sqlite3.connect(db_path) as conn:
@@ -3196,6 +3225,61 @@ class TestSignalFlowArchetypeGeneration:
         # Expression must be preserved as-is (no brace escaping
         # that would break SignalFlow syntax)
         assert "data('cpu.utilization').publish()" in query["expr"]
+
+
+async def test_dashboard_refresh_retires_removed_signal_knowledge(signal_store, monkeypatch):
+    from tacit import dashboard_ingest as di
+
+    batches = iter(
+        [
+            [
+                {
+                    "signal_type": "old_latency",
+                    "metric": "old_latency_seconds",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+            [
+                {
+                    "signal_type": "new_latency",
+                    "metric": "new_latency_seconds",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
+    monkeypatch.setattr(
+        "tacit.dashboard_ingest.service.infer_signals_from_metrics",
+        lambda *args, **kwargs: next(batches),
+    )
+
+    def features(metric: str) -> DashboardFeatures:
+        return DashboardFeatures(
+            dashboard_uid="refresh-dashboard",
+            dashboard_title="Refresh dashboard",
+            backend_name="grafana",
+            query_language="promql",
+            metrics_found=[metric],
+            panel_count=1,
+            panels=[{"title": "Latency", "metrics": [metric], "queries": [metric]}],
+        )
+
+    await di.ingest_dashboard_features(features("old_latency_seconds"), auto_approve=True)
+    await di.ingest_dashboard_features(features("new_latency_seconds"), auto_approve=True)
+
+    assert signal_store.get_mappings_for_signal("old_latency", include_decayed=True) == []
+    candidates = KnowledgeRepository(signal_store._db_path).list_candidates("default", kind="signal_mapping")
+    old = next(candidate for candidate in candidates if "old_latency_seconds" in candidate.payload_ref)
+    new = next(candidate for candidate in candidates if "new_latency_seconds" in candidate.payload_ref)
+    assert old.state.lifecycle_status.value == "stale"
+    assert new.state.lifecycle_status.value == "active"
 
 
 class TestLearningTabRendering:

@@ -1182,6 +1182,54 @@ def test_stale_and_incorrect_corrections_retire_their_target(
     assert retired.state.eligibility == KnowledgeEligibility.INELIGIBLE
 
 
+@pytest.mark.parametrize(
+    "correction_type",
+    [CorrectionType.KNOWLEDGE_STALE, CorrectionType.KNOWLEDGE_INCORRECT],
+)
+def test_target_required_corrections_remain_pending_when_target_is_missing(
+    tmp_path: Path,
+    correction_type: CorrectionType,
+):
+    service = _service(tmp_path)
+    correction, candidate = service.create_correction(
+        investigation_id="inv-missing-target",
+        investigation_revision=1,
+        correction_type=correction_type,
+        proposed={
+            "subject_ref": "concept:artifact-quality",
+            "predicate": "useful_for_investigation",
+            "concept_ref": "concept:retirement-review",
+        },
+        scope=KnowledgeScope(),
+        explanation="This correction should have selected a target.",
+        created_by="operator",
+    )
+
+    with pytest.raises(ValueError, match="requires target_ref"):
+        service.review_correction(
+            correction.id,
+            approved=True,
+            reviewer="operator",
+            authoritative=True,
+        )
+
+    assert service.repository.get_correction(correction.id).review_state == ReviewState.CANDIDATE
+    assert service.repository.get_candidate(candidate.id).state.review_state == ReviewState.CANDIDATE
+
+
+def test_entity_kind_is_immutable_for_registered_identity(tmp_path: Path):
+    service = _service(tmp_path)
+    checkout = service.repository.get_entity("entity:service:checkout")
+    assert checkout is not None
+
+    with pytest.raises(ValueError, match="entity kind cannot change"):
+        service.register_entity(checkout.model_copy(update={"kind": EntityKind.TEAM}))
+
+    stored = service.repository.get_entity(checkout.id)
+    assert stored is not None
+    assert stored.kind == EntityKind.SERVICE
+
+
 def test_pending_counter_proposition_does_not_disable_active_knowledge(tmp_path: Path):
     service = _service(tmp_path)
     _, active = _promoted_dependency(service)

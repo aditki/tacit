@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 import tacit.history as history_mod
 from tacit.api.dependencies import get_pipeline_dependencies
-from tacit.api.security import resolve_knowledge_tenant, verify_api_key
+from tacit.api.security import knowledge_tenant, resolve_knowledge_tenant, verify_api_key
 from tacit.dependencies import PipelineDependencies
 from tacit.investigation_bundle import build_investigation_bundle
 from tacit.investigation_contract import InvestigationRunType
@@ -33,6 +33,16 @@ class ReplayRequest(BaseModel):
 class CorrectionReviewRequest(BaseModel):
     approved: bool
     reviewed_by: str = Field(min_length=1)
+
+
+def _require_contract_tenant(request: Request, contract, runtime_settings) -> str:
+    configured = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
+    recorded = str(contract.request.scope.tenant_id or "")
+    if not recorded and configured != "*":
+        recorded = configured
+    if not recorded or knowledge_tenant(request) != recorded:
+        raise HTTPException(status_code=403, detail="Tenant access denied")
+    return recorded
 
 
 @router.get(
@@ -141,12 +151,17 @@ async def compare_investigation_revisions(investigation_id: str, left: int, righ
 )
 async def replay_investigation(
     investigation_id: str,
+    http_request: Request,
     request: ReplayRequest | None = None,
     revision: int | None = None,
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     store = history_mod.get_investigation_store()
     replay_request = request or ReplayRequest()
+    source_contract = store.get_contract(investigation_id, revision)
+    if source_contract is None:
+        raise HTTPException(status_code=404, detail="Investigation contract not found")
+    _require_contract_tenant(http_request, source_contract, deps.settings)
     try:
         contract = store.replay_contract(
             investigation_id,
@@ -241,12 +256,14 @@ async def apply_correction_candidate(investigation_id: str, candidate_id: str):
 )
 async def refresh_investigation(
     investigation_id: str,
+    request: Request,
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     store = deps.history_store_factory()
     contract = store.get_contract(investigation_id)
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation contract not found")
+    _require_contract_tenant(request, contract, deps.settings)
     tenant_id = resolve_knowledge_tenant(
         str(getattr(deps.settings, "knowledge_tenant_id", "default") or "default"),
         contract.request.scope.tenant_id,

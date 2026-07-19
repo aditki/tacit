@@ -97,10 +97,12 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection) -> None:
         for index in conn.execute("PRAGMA index_list(signal_metric_mappings)").fetchall()
         if index["unique"]
     ]
-    if ["tenant_id", "signal_type", "metric_pattern"] in unique_indexes and [
-        "signal_type",
-        "metric_pattern",
-    ] not in unique_indexes:
+    has_legacy_foreign_key = bool(conn.execute("PRAGMA foreign_key_list(signal_metric_mappings)").fetchall())
+    if (
+        ["tenant_id", "signal_type", "metric_pattern"] in unique_indexes
+        and ["signal_type", "metric_pattern"] not in unique_indexes
+        and not has_legacy_foreign_key
+    ):
         return
     old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
     tenant_select = "COALESCE(tenant_id, 'default')" if "tenant_id" in old_columns else "'default'"
@@ -119,8 +121,7 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection) -> None:
             inference_version TEXT NOT NULL DEFAULT '', review_state TEXT NOT NULL DEFAULT 'trusted',
             use_count INTEGER NOT NULL DEFAULT 0, positive_feedback INTEGER NOT NULL DEFAULT 0,
             negative_feedback INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, last_seen REAL NOT NULL,
-            UNIQUE(tenant_id, signal_type, metric_pattern),
-            FOREIGN KEY (signal_type) REFERENCES signal_types(signal_type)
+            UNIQUE(tenant_id, signal_type, metric_pattern)
         )""")
         conn.execute(f"""INSERT INTO signal_metric_mappings
             (id, tenant_id, signal_type, metric_pattern, confidence, context_services,
