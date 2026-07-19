@@ -924,8 +924,7 @@ class InvestigationStore:
         try:
             replay_snapshot = snapshot
             if mode == ReplayMode.CURRENT_ENGINE:
-                from tacit.knowledge.models import KnowledgeScope
-                from tacit.knowledge.normalization import normalize_service_ref
+                from tacit.knowledge.scope import investigation_knowledge_scope
                 from tacit.knowledge.service import get_knowledge_service
 
                 knowledge_service = get_knowledge_service()
@@ -940,10 +939,17 @@ class InvestigationStore:
                         f"{configured_tenant!r}"
                     )
                 tenant_id = snapshot_tenant or configured_tenant
+                archetype_ids = {
+                    *[match.type for match in snapshot.intent.archetypes],
+                    snapshot.intent.problem_type,
+                    *[panel.source_archetype for panel in snapshot.dashboard_spec.panels if panel.source_archetype],
+                }
                 knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(
-                    KnowledgeScope(
+                    investigation_knowledge_scope(
                         tenant_id=tenant_id,
-                        service_refs=[normalize_service_ref(service) for service in snapshot.intent.services],
+                        prompt=snapshot.request.prompt,
+                        services=snapshot.intent.services,
+                        archetype_ids=archetype_ids,
                     )
                 )
                 knowledge_usage = knowledge_service.reconcile_live_observations(

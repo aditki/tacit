@@ -168,49 +168,84 @@ class SignalStore:
         description: str = "",
         category: str = "",
         unit: str = "",
+        *,
+        tenant_id: str | None = None,
     ) -> None:
-        """Register or update a canonical signal type."""
+        """Register a global taxonomy definition or a tenant-specific override."""
         now = time.time()
         with self._conn() as conn:
-            conn.execute(
-                """INSERT INTO signal_types (signal_type, description, category, unit, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(signal_type) DO UPDATE SET
-                       -- Only overwrite metadata when a non-empty value is
-                       -- supplied, so a teach call with blank fields doesn't
-                       -- wipe bootstrap taxonomy (description/category/unit).
-                       description = CASE WHEN excluded.description != '' THEN excluded.description
-                                         ELSE signal_types.description END,
-                       category = CASE WHEN excluded.category != '' THEN excluded.category
-                                       ELSE signal_types.category END,
-                       unit = CASE WHEN excluded.unit != '' THEN excluded.unit
-                                   ELSE signal_types.unit END,
-                       updated_at = excluded.updated_at""",
-                (signal_type, description, category, unit, now, now),
-            )
+            if tenant_id is None:
+                conn.execute(
+                    """INSERT INTO signal_types (signal_type, description, category, unit, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(signal_type) DO UPDATE SET
+                           description = CASE WHEN excluded.description != '' THEN excluded.description
+                                             ELSE signal_types.description END,
+                           category = CASE WHEN excluded.category != '' THEN excluded.category
+                                           ELSE signal_types.category END,
+                           unit = CASE WHEN excluded.unit != '' THEN excluded.unit ELSE signal_types.unit END,
+                           updated_at = excluded.updated_at""",
+                    (signal_type, description, category, unit, now, now),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO tenant_signal_types
+                       (tenant_id, signal_type, description, category, unit, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(tenant_id, signal_type) DO UPDATE SET
+                           description = CASE WHEN excluded.description != '' THEN excluded.description
+                                             ELSE tenant_signal_types.description END,
+                           category = CASE WHEN excluded.category != '' THEN excluded.category
+                                           ELSE tenant_signal_types.category END,
+                           unit = CASE WHEN excluded.unit != '' THEN excluded.unit ELSE tenant_signal_types.unit END,
+                           updated_at = excluded.updated_at""",
+                    (tenant_id, signal_type, description, category, unit, now, now),
+                )
 
     def list_signal_types(self, *, tenant_id: str = "default") -> list[dict[str, Any]]:
         """List all registered signal types with mapping counts."""
         with self._conn() as conn:
-            rows = conn.execute(
-                """SELECT st.*, COUNT(m.id) AS mapping_count
-                   FROM signal_types st
-                   LEFT JOIN signal_metric_mappings m
-                     ON st.signal_type = m.signal_type
-                    AND (m.tenant_id = ? OR (m.tenant_id = 'default' AND m.source_type = 'bootstrap'))
-                   GROUP BY st.signal_type
-                   ORDER BY st.category, st.signal_type""",
+            global_rows = conn.execute("SELECT * FROM signal_types").fetchall()
+            tenant_rows = conn.execute(
+                "SELECT * FROM tenant_signal_types WHERE tenant_id = ?",
                 (tenant_id,),
             ).fetchall()
-        return [dict(r) for r in rows]
+            mapping_rows = conn.execute(
+                """SELECT signal_type, COUNT(*) AS mapping_count
+                   FROM signal_metric_mappings
+                   WHERE tenant_id = ? OR (tenant_id = 'default' AND source_type = 'bootstrap')
+                   GROUP BY signal_type""",
+                (tenant_id,),
+            ).fetchall()
+        definitions = {row["signal_type"]: dict(row) for row in global_rows}
+        for row in tenant_rows:
+            signal_type = row["signal_type"]
+            merged = _merge_signal_definition(definitions.get(signal_type), dict(row))
+            assert merged is not None
+            definitions[signal_type] = merged
+        counts = {row["signal_type"]: row["mapping_count"] for row in mapping_rows}
+        result = []
+        for signal_type, definition in definitions.items():
+            definition.pop("tenant_id", None)
+            definition["mapping_count"] = counts.get(signal_type, 0)
+            result.append(definition)
+        return sorted(result, key=lambda row: (row["category"], row["signal_type"]))
 
     def get_signal_type(self, signal_type: str, *, tenant_id: str = "default") -> dict[str, Any] | None:
         """Get a signal type with all its metric mappings."""
         with self._conn() as conn:
-            st = conn.execute(
+            tenant_definition = conn.execute(
+                "SELECT * FROM tenant_signal_types WHERE tenant_id = ? AND signal_type = ?",
+                (tenant_id, signal_type),
+            ).fetchone()
+            global_definition = conn.execute(
                 "SELECT * FROM signal_types WHERE signal_type = ?",
                 (signal_type,),
             ).fetchone()
+            st = _merge_signal_definition(
+                dict(global_definition) if global_definition is not None else None,
+                dict(tenant_definition) if tenant_definition is not None else None,
+            )
             if st is None:
                 return None
 
@@ -223,6 +258,7 @@ class SignalStore:
             ).fetchall()
 
         result = dict(st)
+        result.pop("tenant_id", None)
         result["mappings"] = [_deserialize_mapping(r) for r in mappings]
         return result
 
@@ -261,15 +297,27 @@ class SignalStore:
         with self._conn() as conn:
             # Ensure signal type exists
             existing = conn.execute(
-                "SELECT 1 FROM signal_types WHERE signal_type = ?",
-                (signal_type,),
+                """SELECT 1 FROM signal_types WHERE signal_type = ?
+                   UNION ALL
+                   SELECT 1 FROM tenant_signal_types WHERE tenant_id = ? AND signal_type = ?
+                   LIMIT 1""",
+                (signal_type, tenant_id, signal_type),
             ).fetchone()
             if existing is None:
-                conn.execute(
-                    """INSERT INTO signal_types (signal_type, description, category, unit, created_at, updated_at)
-                       VALUES (?, '', '', '', ?, ?)""",
-                    (signal_type, now, now),
-                )
+                if source_type == "bootstrap":
+                    conn.execute(
+                        """INSERT INTO signal_types
+                           (signal_type, description, category, unit, created_at, updated_at)
+                           VALUES (?, '', '', '', ?, ?)""",
+                        (signal_type, now, now),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO tenant_signal_types
+                           (tenant_id, signal_type, description, category, unit, created_at, updated_at)
+                           VALUES (?, ?, '', '', '', ?, ?)""",
+                        (tenant_id, signal_type, now, now),
+                    )
 
             # Merge context scopes with any existing mapping so re-teaching the
             # same signal/metric for a second service unions rather than
@@ -1565,6 +1613,36 @@ class SignalStore:
             else:
                 conn.execute("DELETE FROM signal_metric_mappings WHERE id = ?", (mapping["id"],))
 
+    def reconcile_mapping_source(
+        self,
+        *,
+        tenant_id: str,
+        source_type: str,
+        source_ref: str,
+        active_pairs: set[tuple[str, str]],
+    ) -> None:
+        """Remove one refreshed source from mappings it no longer supports."""
+        with self._conn() as conn:
+            mappings = conn.execute(
+                """SELECT id, signal_type, metric_pattern, source_refs
+                   FROM signal_metric_mappings
+                   WHERE tenant_id = ? AND source_type = ?""",
+                (tenant_id, source_type),
+            ).fetchall()
+            for mapping in mappings:
+                refs = json.loads(mapping["source_refs"] or "[]")
+                pair = (mapping["metric_pattern"], mapping["signal_type"])
+                if source_ref not in refs or pair in active_pairs:
+                    continue
+                remaining_refs = [ref for ref in refs if ref != source_ref]
+                if remaining_refs:
+                    conn.execute(
+                        "UPDATE signal_metric_mappings SET source_refs = ? WHERE id = ?",
+                        (json.dumps(remaining_refs), mapping["id"]),
+                    )
+                else:
+                    conn.execute("DELETE FROM signal_metric_mappings WHERE id = ?", (mapping["id"],))
+
     def index_alert_context(
         self,
         *,
@@ -1989,7 +2067,6 @@ class SignalStore:
     def stats(self, *, tenant_id: str = "default") -> dict[str, Any]:
         """Summary statistics for the signal store."""
         with self._conn() as conn:
-            signal_count = conn.execute("SELECT COUNT(*) FROM signal_types").fetchone()[0]
             mapping_count = conn.execute(
                 "SELECT COUNT(*) FROM signal_metric_mappings WHERE tenant_id = ?", (tenant_id,)
             ).fetchone()[0]
@@ -2009,18 +2086,38 @@ class SignalStore:
                 (tenant_id,),
             ).fetchall()
 
-            by_category = conn.execute("""SELECT category, COUNT(*) as n
-                   FROM signal_types GROUP BY category""").fetchall()
+        visible_definitions = self.list_signal_types(tenant_id=tenant_id)
+        by_category: dict[str, int] = {}
+        for definition in visible_definitions:
+            category = str(definition.get("category", ""))
+            by_category[category] = by_category.get(category, 0) + 1
 
         return {
-            "signal_types": signal_count,
+            "signal_types": len(visible_definitions),
             "metric_mappings": mapping_count,
             "ingested_dashboards": ingested_count,
             "ingested_alerts": ingested_alert_count,
             "learned_artifacts": learned_artifact_count,
             "mappings_by_source": {r["source_type"]: r["n"] for r in by_source},
-            "signals_by_category": {r["category"]: r["n"] for r in by_category},
+            "signals_by_category": by_category,
         }
+
+
+def _merge_signal_definition(
+    global_definition: dict[str, Any] | None,
+    tenant_definition: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if tenant_definition is None:
+        return global_definition
+    if global_definition is None:
+        return tenant_definition
+    merged = dict(global_definition)
+    for field in ("description", "category", "unit"):
+        if tenant_definition.get(field):
+            merged[field] = tenant_definition[field]
+    merged["updated_at"] = tenant_definition["updated_at"]
+    merged["tenant_id"] = tenant_definition["tenant_id"]
+    return merged
 
 
 def _deserialize_mapping(row: sqlite3.Row) -> dict[str, Any]:

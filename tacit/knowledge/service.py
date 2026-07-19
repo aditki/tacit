@@ -733,6 +733,12 @@ class KnowledgeService:
         correction = self.repository.get_correction(correction_id, tenant_id)
         if correction is None:
             raise ValueError("knowledge correction not found")
+        if (
+            approved
+            and correction.correction_type in {CorrectionType.KNOWLEDGE_STALE, CorrectionType.KNOWLEDGE_INCORRECT}
+            and not correction.target_ref
+        ):
+            raise ValueError(f"{correction.correction_type.value} correction requires target_ref")
         target = None
         if correction.target_ref:
             target = self.repository.get_revision(correction.target_ref, tenant_id=tenant_id)
@@ -752,8 +758,7 @@ class KnowledgeService:
             CorrectionType.KNOWLEDGE_STALE,
             CorrectionType.KNOWLEDGE_INCORRECT,
         }:
-            if target is None:
-                raise ValueError(f"{correction.correction_type.value} correction requires target_ref")
+            assert target is not None
             lifecycle_status = (
                 LifecycleStatus.STALE
                 if correction.correction_type == CorrectionType.KNOWLEDGE_STALE

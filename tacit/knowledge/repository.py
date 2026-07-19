@@ -507,6 +507,12 @@ class KnowledgeRepository:
 
     def save_entity(self, entity: Entity) -> Entity:
         with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT kind FROM entities WHERE id=? AND tenant_id=?",
+                (entity.id, entity.tenant_id),
+            ).fetchone()
+            if existing is not None and existing["kind"] != entity.kind.value:
+                raise ValueError("entity kind cannot change for an existing entity id")
             conn.execute(
                 """INSERT INTO entities (
                    id, tenant_id, kind, canonical_name, normalized_name, display_name, status,

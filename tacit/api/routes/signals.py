@@ -70,6 +70,7 @@ async def teach_signal(
         description=payload.description,
         category=payload.category,
         unit=payload.unit,
+        tenant_id=tenant_id,
     )
 
     mappings_created = 0

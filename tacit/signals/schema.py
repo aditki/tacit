@@ -17,6 +17,17 @@ CREATE TABLE IF NOT EXISTS signal_types (
     updated_at      REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tenant_signal_types (
+    tenant_id      TEXT NOT NULL,
+    signal_type    TEXT NOT NULL,
+    description    TEXT NOT NULL DEFAULT '',
+    category       TEXT NOT NULL DEFAULT '',
+    unit           TEXT NOT NULL DEFAULT '',
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL,
+    PRIMARY KEY (tenant_id, signal_type)
+);
+
 CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     tenant_id           TEXT NOT NULL DEFAULT 'default',
@@ -48,8 +59,7 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     created_at          REAL NOT NULL,
     last_seen           REAL NOT NULL,
 
-    UNIQUE(tenant_id, signal_type, metric_pattern),
-    FOREIGN KEY (signal_type) REFERENCES signal_types(signal_type)
+    UNIQUE(tenant_id, signal_type, metric_pattern)
 );
 
 -- Inferred candidates that were NOT auto-taught (negative training data).
