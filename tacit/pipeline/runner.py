@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -178,7 +179,17 @@ async def _run_pipeline_inner(
     t_start = time.monotonic()
     timings: dict[str, float] = {}
     history = deps.history_store_factory()
-    inv_id = investigation_id or history.start(request.prompt, request.user_id or "", request.channel_id or "")
+    if investigation_id:
+        inv_id = investigation_id
+    elif "tenant_id" in inspect.signature(history.start).parameters:
+        inv_id = history.start(
+            request.prompt,
+            request.user_id or "",
+            request.channel_id or "",
+            tenant_id=request.tenant_id or "default",
+        )
+    else:
+        inv_id = history.start(request.prompt, request.user_id or "", request.channel_id or "")
     if base_revision is None and investigation_id and hasattr(history, "get_contract"):
         current_contract = history.get_contract(investigation_id)
         base_revision = current_contract.investigation.revision if current_contract else None

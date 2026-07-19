@@ -176,6 +176,7 @@ async def ingest_alert_features(
     source_ref = f"{features.backend_name}:alert:{features.alert_uid}" if features.backend_name else features.alert_uid
     mappings_created = 0
     activated_pairs: set[tuple[str, str]] = set()
+    governed_pairs: set[tuple[str, str]] = set()
     governed_candidate_ids: set[str] = set()
     if auto_approve and not dry_run:
         for sig in signals:
@@ -188,6 +189,7 @@ async def ingest_alert_features(
                 tenant_id=effective_tenant,
                 source_type="alert_ingest",
                 governed_candidate_ids=governed_candidate_ids,
+                governed_pairs=governed_pairs,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
@@ -249,9 +251,12 @@ async def ingest_alert_features(
                 tenant_id=effective_tenant,
                 source_type="alert_ingest",
                 source_ref=source_ref,
-                active_pairs=activated_pairs,
+                active_pairs=governed_pairs,
                 active_candidate_ids=governed_candidate_ids,
             )
+            teachable_count = len(governed_pairs)
+            learning_impact["candidate_mappings_pending_approval"] = max(0, teachable_count - mappings_created)
+            learning_impact["new_active_mappings_after_approval"] = mappings_created
 
     result = {
         **asdict(features),

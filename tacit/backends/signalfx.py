@@ -27,6 +27,7 @@ class SignalFxBackend:
         self._client = client or SignalFxClient(runtime_settings=runtime_settings)
         self.last_discovery_status = DiscoveryStatus()
         self.last_alert_list_complete = False
+        self.last_dashboard_list_complete = False
 
     # ── Protocol properties ───────────────────────────────────────────
 
@@ -100,6 +101,7 @@ class SignalFxBackend:
 
     async def list_dashboards(self, limit: int = 500) -> list[dict]:
         """List SignalFx dashboards from dashboard groups when available."""
+        self.last_dashboard_list_complete = False
         out: list[dict] = []
         seen: set[str] = set()
         offset = 0
@@ -149,6 +151,7 @@ class SignalFxBackend:
                 total_seen=offset + len(group_items),
             )
             if page_complete or not group_items:
+                self.last_dashboard_list_complete = True
                 break
             offset += len(group_items)
         return out

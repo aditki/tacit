@@ -272,7 +272,7 @@ async def test_unchanged_pending_alert_can_upgrade_to_approved(tmp_path, monkeyp
     if store._learning_index_available():
         rows = store.search_learning_context("checkout latency", service="checkout")
         assert rows
-        assert rows[0]["review_state"] != "candidate"
+        assert rows[0]["review_state"] == "candidate"
 
 
 async def test_alert_refresh_retires_removed_signal_knowledge(tmp_path, monkeypatch):

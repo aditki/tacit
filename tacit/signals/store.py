@@ -423,6 +423,7 @@ class SignalStore:
         inference_version: str = "",
         dashboard_uid: str = "",
         backend_name: str = "",
+        tenant_id: str = "default",
     ) -> int:
         """Persist an inferred candidate that was NOT auto-taught.
 
@@ -433,10 +434,11 @@ class SignalStore:
         with self._conn() as conn:
             cursor = conn.execute(
                 """INSERT INTO rejected_signal_candidates
-                   (dashboard_uid, backend_name, metric, signal_family, signal_name,
+                   (tenant_id, dashboard_uid, backend_name, metric, signal_family, signal_name,
                     score, margin, why_not, evidence, inference_version, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
+                    tenant_id,
                     dashboard_uid,
                     backend_name,
                     metric,
@@ -452,12 +454,18 @@ class SignalStore:
             )
             return cursor.lastrowid or 0
 
-    def list_rejected_candidates(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_rejected_candidates(
+        self,
+        limit: int = 100,
+        *,
+        tenant_id: str = "default",
+    ) -> list[dict[str, Any]]:
         """Return recorded rejected candidates (newest first)."""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM rejected_signal_candidates ORDER BY created_at DESC LIMIT ?",
-                (limit,),
+                """SELECT * FROM rejected_signal_candidates
+                   WHERE tenant_id=? ORDER BY created_at DESC LIMIT ?""",
+                (tenant_id, limit),
             ).fetchall()
         out = []
         for r in rows:
@@ -485,6 +493,23 @@ class SignalStore:
                 (time.time(), tenant_id, signal_type, metric_pattern),
             )
 
+    def set_mapping_review_state(
+        self,
+        signal_type: str,
+        metric_pattern: str,
+        review_state: str,
+        *,
+        tenant_id: str = "default",
+    ) -> bool:
+        """Activate or deactivate a tenant mapping after governance evaluation."""
+        with self._conn() as conn:
+            updated = conn.execute(
+                """UPDATE signal_metric_mappings SET review_state=?, last_seen=?
+                   WHERE tenant_id=? AND signal_type=? AND metric_pattern=?""",
+                (review_state, time.time(), tenant_id, signal_type, metric_pattern),
+            )
+            return updated.rowcount == 1
+
     def get_mappings_for_signal(
         self,
         signal_type: str,
@@ -506,6 +531,7 @@ class SignalStore:
                 """SELECT * FROM signal_metric_mappings
                    WHERE signal_type = ?
                      AND (tenant_id = ? OR (tenant_id = 'default' AND source_type = 'bootstrap'))
+                     AND review_state IN ('approved', 'trusted')
                    ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END, confidence DESC""",
                 (signal_type, tenant_id, tenant_id),
             ).fetchall()
@@ -793,8 +819,8 @@ class SignalStore:
                     metric_cooccurrence, aggregation_patterns,
                     query_transformations, panel_titles,
                     alert_links, drilldown_links,
-                    status, signals_inferred, archetype_generated, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status, signals_inferred, archetype_generated, stale, missing_since, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)""",
                 (
                     tenant_id,
                     dashboard_uid,
@@ -1586,6 +1612,50 @@ class SignalStore:
             )
             return cursor.rowcount
 
+    def mark_missing_dashboards_stale(
+        self,
+        *,
+        tenant_id: str = "default",
+        backend_name: str,
+        seen_dashboard_uids: set[str],
+    ) -> int:
+        """Mark dashboards absent from a complete backend crawl as stale."""
+        now = time.time()
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT dashboard_uid FROM ingested_dashboards
+                   WHERE tenant_id=? AND backend_name=? AND stale=0""",
+                (tenant_id, backend_name),
+            ).fetchall()
+            missing = [row["dashboard_uid"] for row in rows if row["dashboard_uid"] not in seen_dashboard_uids]
+            if not missing:
+                return 0
+            placeholders = ", ".join("?" for _ in missing)
+            cursor = conn.execute(
+                f"""UPDATE ingested_dashboards
+                    SET stale=1, missing_since=COALESCE(missing_since, ?), status='stale'
+                    WHERE tenant_id=? AND backend_name=? AND dashboard_uid IN ({placeholders})""",
+                (now, tenant_id, backend_name, *missing),
+            )
+            if self._learning_index_available():
+                try:
+                    conn.execute(
+                        f"""UPDATE learning_context_fts SET review_state='stale'
+                            WHERE tenant_id=? AND source_kind='dashboard_panel' AND backend_name=?
+                              AND dashboard_uid IN ({placeholders})""",
+                        (tenant_id, backend_name, *missing),
+                    )
+                except sqlite3.OperationalError as exc:
+                    logger.warning("stale_dashboard_context_update_failed", error=str(exc))
+            stale_refs = {f"{backend_name}:{uid}" if backend_name else uid for uid in missing}
+            self._remove_mapping_source_refs(
+                conn,
+                tenant_id=tenant_id,
+                source_type="dashboard_ingest",
+                stale_refs=stale_refs,
+            )
+            return cursor.rowcount
+
     @staticmethod
     def _remove_mapping_source_refs(
         conn: sqlite3.Connection,
@@ -1597,8 +1667,8 @@ class SignalStore:
         """Remove stale provenance from active mappings, deleting unsupported rows."""
         mappings = conn.execute(
             """SELECT id, source_refs FROM signal_metric_mappings
-               WHERE tenant_id = ? AND source_type = ?""",
-            (tenant_id, source_type),
+               WHERE tenant_id = ?""",
+            (tenant_id,),
         ).fetchall()
         for mapping in mappings:
             refs = json.loads(mapping["source_refs"] or "[]")
@@ -1626,8 +1696,8 @@ class SignalStore:
             mappings = conn.execute(
                 """SELECT id, signal_type, metric_pattern, source_refs
                    FROM signal_metric_mappings
-                   WHERE tenant_id = ? AND source_type = ?""",
-                (tenant_id, source_type),
+                   WHERE tenant_id = ?""",
+                (tenant_id,),
             ).fetchall()
             for mapping in mappings:
                 refs = json.loads(mapping["source_refs"] or "[]")
@@ -2152,6 +2222,8 @@ def _deserialize_ingested(row: sqlite3.Row) -> dict[str, Any]:
     ):
         if field in d and isinstance(d[field], str):
             d[field] = json.loads(d[field])
+    if "stale" in d:
+        d["stale"] = bool(d["stale"])
     return d
 
 

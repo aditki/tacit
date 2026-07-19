@@ -1318,6 +1318,51 @@ def test_removed_source_keeps_knowledge_active_when_independent_support_remains(
     }
 
 
+def test_rejecting_promoted_contributor_recomputes_current_knowledge(tmp_path: Path):
+    service = _service(tmp_path)
+    rejected, active = _promoted_dependency(service)
+
+    service.review_candidate(rejected.id, approved=False, reviewer="operator")
+
+    current = service.repository.get_revision(active.knowledge_id)
+    assert current is not None
+    assert current.revision == active.revision + 1
+    assert current.state.lifecycle_status == LifecycleStatus.WITHDRAWN
+    assert current.state.eligibility == KnowledgeEligibility.INELIGIBLE
+
+
+def test_reingested_stale_candidate_reactivates_and_is_reevaluated(tmp_path: Path):
+    service = _service(tmp_path)
+    first, active = _promoted_dependency(service)
+    service.reconcile_source_lifecycle(
+        provenance_ref="provenance:runbook",
+        active_candidate_ids=set(),
+    )
+    stale = service.repository.get_candidate(first.id)
+    assert stale is not None
+    assert stale.state.lifecycle_status == LifecycleStatus.STALE
+
+    restored = service.create_candidate(
+        kind=first.kind,
+        payload_ref=first.payload_ref,
+        typed_payload=first.typed_payload,
+        proposition=first.proposition,
+        scope=first.scope,
+        evidence=first.evidence.items,
+        provenance_refs=first.provenance_refs,
+        candidate_id=first.id,
+        reactivate_stale=True,
+    )
+    service.evaluate_candidate(restored.id)
+
+    current = service.repository.get_revision(active.knowledge_id)
+    assert restored.state.review_state == ReviewState.APPROVED
+    assert restored.state.lifecycle_status == LifecycleStatus.ACTIVE
+    assert current is not None
+    assert current.state.lifecycle_status == LifecycleStatus.ACTIVE
+    assert current.state.eligibility == KnowledgeEligibility.CONTEXTUAL_ONLY
+
+
 def test_repeated_candidate_evaluation_reuses_unchanged_revision(tmp_path: Path):
     service = _service(tmp_path)
     candidate, original = _promoted_dependency(service)

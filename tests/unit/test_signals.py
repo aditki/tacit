@@ -201,6 +201,51 @@ def test_stale_alert_removes_only_its_signal_mapping_provenance(signal_store):
     )
 
 
+def test_mapping_reconciliation_checks_all_provenance_refs(signal_store):
+    signal_store.add_mapping(
+        "request_latency",
+        "service_latency_seconds",
+        confidence=0.9,
+        source_type="dashboard_ingest",
+        source_refs=["grafana:dashboard:checkout"],
+        tenant_id="tenant-a",
+    )
+    signal_store.add_mapping(
+        "request_latency",
+        "service_latency_seconds",
+        confidence=0.9,
+        source_type="alert_ingest",
+        source_refs=["grafana:alert:checkout"],
+        tenant_id="tenant-a",
+    )
+
+    signal_store.reconcile_mapping_source(
+        tenant_id="tenant-a",
+        source_type="dashboard_ingest",
+        source_ref="grafana:dashboard:checkout",
+        active_pairs=set(),
+    )
+
+    mappings = signal_store.get_mappings_for_signal(
+        "request_latency",
+        include_decayed=True,
+        tenant_id="tenant-a",
+    )
+    assert mappings[0]["source_refs"] == ["grafana:alert:checkout"]
+
+
+def test_rejected_signal_candidates_are_tenant_scoped(signal_store):
+    signal_store.record_rejected_candidate("tenant_a_metric", tenant_id="tenant-a")
+    signal_store.record_rejected_candidate("tenant_b_metric", tenant_id="tenant-b")
+
+    assert [item["metric"] for item in signal_store.list_rejected_candidates(tenant_id="tenant-a")] == [
+        "tenant_a_metric"
+    ]
+    assert [item["metric"] for item in signal_store.list_rejected_candidates(tenant_id="tenant-b")] == [
+        "tenant_b_metric"
+    ]
+
+
 def test_mapping_tenant_rebuild_rolls_back_on_copy_failure(tmp_path):
     db_path = tmp_path / "failed-mapping-migration.db"
     with sqlite3.connect(db_path) as conn:
@@ -231,8 +276,8 @@ def test_mapping_tenant_rebuild_rolls_back_on_copy_failure(tmp_path):
     assert row["confidence"] is None
 
 
-def test_approved_signal_mapping_is_written_to_the_governed_tenant(signal_store):
-    persisted = persist_inferred_signal_review(
+def test_signal_mapping_activates_after_governed_corroboration(signal_store):
+    first_persisted = persist_inferred_signal_review(
         store=signal_store,
         sig={
             "signal_type": "checkout_latency",
@@ -247,7 +292,25 @@ def test_approved_signal_mapping_is_written_to_the_governed_tenant(signal_store)
     )
     catalog = [_metric_entry("checkout_latency_seconds")]
 
-    assert persisted is True
+    assert first_persisted is False
+    assert signal_store.resolve_signal("checkout_latency", catalog, tenant_id="tenant-a") == []
+
+    second_persisted = persist_inferred_signal_review(
+        store=signal_store,
+        sig={
+            "signal_type": "checkout_latency",
+            "metric": "checkout_latency_seconds",
+            "source": "heuristic",
+            "auto_teach_eligible": True,
+            "confidence": 0.9,
+        },
+        source_ref="grafana:alert:checkout",
+        source_type="alert_ingest",
+        dashboard_uid="checkout-alert",
+        tenant_id="tenant-a",
+    )
+
+    assert second_persisted is True
     assert signal_store.resolve_signal("checkout_latency", catalog, tenant_id="tenant-a")
     assert signal_store.resolve_signal("checkout_latency", catalog, tenant_id="tenant-b") == []
 
@@ -1357,7 +1420,7 @@ class TestIngestedDashboards:
             service="checkout",
             include_candidates=False,
         )
-        assert approved[0]["review_state"] == "approved"
+        assert approved == []
 
     def test_describe_service_summarizes_learned_context(self, signal_store):
         if not signal_store._learning_index_available():
@@ -1683,13 +1746,13 @@ archetypes:
             store=signal_store,
         )
 
-        assert result["mappings_created"] == 1
+        assert result["mappings_created"] == 0
         approved = signal_store.search_learning_context(
             "checkout latency",
             service="checkout",
             include_candidates=False,
         )
-        assert approved[0]["metric_name"] == "checkout_custom_latency_ms"
+        assert approved == []
         assert signal_store.search_learning_context("opaque", service="checkout", include_candidates=False) == []
         candidate = signal_store.search_learning_context("opaque", service="checkout")
         assert candidate[0]["review_state"] == "candidate"
@@ -2031,18 +2094,15 @@ archetypes:
 
         approved = await di.ingest_dashboard_features(features, auto_approve=True)
 
-        assert approved["learning_impact"]["candidate_mappings_pending_approval"] == 0
-        assert approved["learning_impact"]["new_active_mappings_after_approval"] == 2
+        assert approved["learning_impact"]["candidate_mappings_pending_approval"] == 2
+        assert approved["learning_impact"]["new_active_mappings_after_approval"] == 0
         after = signal_store.resolve_signals_for_archetype(
             signal_bindings=signal_bindings,
             catalog=catalog,
             context_datasource_type="prometheus",
             target_query_language="promql",
         )
-        assert after == {
-            "http_request_duration_seconds": "checkout_custom_latency_ms",
-            "http_requests_total": "checkout_5xx_count",
-        }
+        assert after == {}
 
     @pytest.mark.asyncio
     async def test_bulk_auto_approve_registers_archetypes_once(self, signal_store, monkeypatch):
@@ -2099,6 +2159,45 @@ archetypes:
         assert "checkout_a" in calls[0][1]
         assert "checkout_b" in calls[0][1]
         assert all(item["archetype_registered"] for item in result["learned"])
+
+    @pytest.mark.asyncio
+    async def test_complete_dashboard_crawl_retires_missing_sources(self, signal_store, monkeypatch):
+        import tacit.backends as backends_mod
+        from tacit import dashboard_ingest as di
+
+        signal_store.record_ingested_dashboard(
+            "removed-dashboard",
+            backend_name="grafana",
+            dashboard_title="Removed dashboard",
+            status="approved",
+        )
+        signal_store.add_mapping(
+            "request_latency",
+            "removed_latency_seconds",
+            source_type="dashboard_ingest",
+            source_refs=["grafana:removed-dashboard"],
+        )
+
+        class CompleteBackend:
+            name = "grafana"
+            last_dashboard_list_complete = True
+
+            async def list_dashboards(self, limit=500):
+                return []
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
+        monkeypatch.setattr(backends_mod, "get_active_backends", lambda: [CompleteBackend()])
+
+        result = await di.learn_backend_dashboards("grafana")
+
+        dashboard = signal_store.get_ingested_dashboard("removed-dashboard", backend_name="grafana")
+        assert result["stale_marked"] == 1
+        assert dashboard is not None and dashboard["stale"] is True
+        assert dashboard["status"] == "stale"
+        assert signal_store.get_mappings_for_signal("request_latency", include_decayed=True) == []
 
     def test_dashboard_uid_is_scoped_by_backend(self, signal_store):
         signal_store.record_ingested_dashboard(

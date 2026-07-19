@@ -2347,6 +2347,114 @@ def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, mo
     assert len(store.list_runs(investigation_id)) == run_count
 
 
+def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_ids = {}
+    for tenant_id in ("tenant-a", "tenant-b"):
+        investigation_id = store.start(
+            f"Why is {tenant_id} checkout slow?",
+            user_id="api",
+            tenant_id=tenant_id,
+        )
+        draft = _draft_contract(investigation_id)
+        tenant_request = draft.request.model_copy(
+            update={"scope": draft.request.scope.model_copy(update={"tenant_id": tenant_id})}
+        )
+        store.persist_contract_revision(draft.model_copy(update={"request": tenant_request}))
+        investigation_ids[tenant_id] = investigation_id
+
+    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
+    runtime_settings = Settings(knowledge_tenant_id="*")
+    client = TestClient(create_app(runtime_settings=runtime_settings))
+    headers = {"X-Tacit-Tenant": "tenant-a"}
+    own_id = investigation_ids["tenant-a"]
+    other_id = investigation_ids["tenant-b"]
+
+    listing = client.get("/api/v1/investigations", headers=headers)
+    stats = client.get("/api/v1/investigations/stats", headers=headers)
+    assert [item["id"] for item in listing.json()["investigations"]] == [own_id]
+    assert stats.json()["total"] == 1
+
+    blocked_requests = (
+        ("get", f"/api/v1/investigations/{other_id}"),
+        ("get", f"/api/v1/investigations/{other_id}/contract"),
+        ("get", f"/api/v1/investigations/{other_id}/revisions"),
+        ("get", f"/api/v1/investigations/{other_id}/runs"),
+        ("get", f"/api/v1/investigations/{other_id}/events"),
+        ("get", f"/api/v1/investigations/{other_id}/compare?left=1&right=1"),
+        ("get", f"/api/v1/investigations/{other_id}/corrections"),
+        ("get", f"/api/v1/investigations/{other_id}/assessment-bundle"),
+        ("post", f"/api/v1/investigations/{other_id}/migrate"),
+    )
+    for method, path in blocked_requests:
+        response = client.request(method, path, headers=headers)
+        assert response.status_code == 403, path
+
+    correction = client.post(
+        f"/api/v1/investigations/{other_id}/corrections",
+        headers=headers,
+        json={"correction_text": "Cross-tenant correction", "created_by": "reviewer"},
+    )
+    assert correction.status_code == 403
+    correction_review = client.post(
+        f"/api/v1/investigations/{other_id}/corrections/missing/review",
+        headers=headers,
+        json={"approved": True, "reviewed_by": "reviewer"},
+    )
+    correction_apply = client.post(
+        f"/api/v1/investigations/{other_id}/corrections/missing/apply",
+        headers=headers,
+    )
+    assert correction_review.status_code == 403
+    assert correction_apply.status_code == 403
+
+    knowledge_correction_payload = {
+        "investigation_id": other_id,
+        "investigation_revision": 1,
+        "correction_type": "dependency",
+        "proposed": {
+            "subject_ref": "entity:service:checkout",
+            "predicate": "depends_on",
+            "object_ref": "entity:service:redis",
+        },
+        "explanation": "Cross-tenant provenance must be rejected.",
+        "created_by": "reviewer",
+    }
+    knowledge_correction = client.post(
+        "/api/v1/knowledge/corrections",
+        headers=headers,
+        json=knowledge_correction_payload,
+    )
+    assert knowledge_correction.status_code == 403
+
+    unrelated_target = client.post(
+        "/api/v1/knowledge/corrections",
+        headers=headers,
+        json={
+            **knowledge_correction_payload,
+            "investigation_id": own_id,
+            "target_ref": "knowledge_not_used_by_contract",
+        },
+    )
+    assert unrelated_target.status_code == 400
+
+
+def test_investigation_tenant_is_immutable_across_revisions(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Tenant-bound investigation", tenant_id="tenant-a")
+    draft = _draft_contract(investigation_id)
+    tenant_a_request = draft.request.model_copy(
+        update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}
+    )
+    store.persist_contract_revision(draft.model_copy(update={"request": tenant_a_request}))
+    tenant_b_request = draft.request.model_copy(
+        update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-b"})}
+    )
+
+    with pytest.raises(StaleRevisionError, match="tenant cannot change"):
+        store.persist_contract_revision(draft.model_copy(update={"request": tenant_b_request}))
+
+
 def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp_path, monkeypatch):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="api")

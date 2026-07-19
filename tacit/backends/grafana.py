@@ -33,6 +33,7 @@ class GrafanaBackend:
         self._client = client or GrafanaClient(runtime_settings=runtime_settings)
         self.last_discovery_status = DiscoveryStatus()
         self.last_alert_list_complete = False
+        self.last_dashboard_list_complete = False
 
     # ── Protocol properties ───────────────────────────────────────────
 
@@ -170,6 +171,7 @@ class GrafanaBackend:
 
     async def list_dashboards(self, limit: int = 500) -> list[dict]:
         """List Grafana dashboards discoverable by the configured token."""
+        self.last_dashboard_list_complete = False
         out: list[dict] = []
         seen: set[str] = set()
         page = 1
@@ -185,6 +187,7 @@ class GrafanaBackend:
             )
             dashboards = raw if isinstance(raw, list) else []
             if not dashboards:
+                self.last_dashboard_list_complete = True
                 break
 
             previous_count = len(out)
@@ -206,6 +209,7 @@ class GrafanaBackend:
                     break
 
             if len(dashboards) < page_limit:
+                self.last_dashboard_list_complete = True
                 break
             if len(out) == previous_count:
                 logger.warning("grafana_dashboard_search_no_new_results", page=page, page_limit=page_limit)

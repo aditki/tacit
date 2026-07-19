@@ -77,6 +77,7 @@ def _db_path() -> Path:
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS investigations (
     id              TEXT PRIMARY KEY,          -- UUID
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
     prompt          TEXT NOT NULL,
     user_id         TEXT NOT NULL DEFAULT '',
     channel_id      TEXT NOT NULL DEFAULT '',
@@ -246,6 +247,26 @@ class InvestigationStore:
                 conn.execute("ALTER TABLE investigations ADD COLUMN stage_outcomes TEXT NOT NULL DEFAULT '{}'")
             if "current_revision" not in columns:
                 conn.execute("ALTER TABLE investigations ADD COLUMN current_revision INTEGER NOT NULL DEFAULT 0")
+            if "tenant_id" not in columns:
+                conn.execute("ALTER TABLE investigations ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
+                rows = conn.execute(
+                    """SELECT i.id, r.contract_json
+                       FROM investigations i
+                       LEFT JOIN investigation_revisions r
+                         ON r.investigation_id = i.id AND r.revision = i.current_revision"""
+                ).fetchall()
+                for row in rows:
+                    tenant_id = "default"
+                    if row["contract_json"]:
+                        try:
+                            payload = json.loads(row["contract_json"])
+                            tenant_id = str(payload.get("request", {}).get("scope", {}).get("tenant_id") or "default")
+                        except (TypeError, ValueError):
+                            pass
+                    conn.execute("UPDATE investigations SET tenant_id=? WHERE id=?", (tenant_id, row["id"]))
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_inv_tenant_started ON investigations(tenant_id, started_at)"
+            )
             candidate_columns = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_candidates)")}
             if "reviewed_by" not in candidate_columns:
                 conn.execute("ALTER TABLE knowledge_candidates ADD COLUMN reviewed_by TEXT NOT NULL DEFAULT ''")
@@ -257,14 +278,20 @@ class InvestigationStore:
 
     # ── Write operations ──────────────────────────────────────────────────
 
-    def start(self, prompt: str, user_id: str = "", channel_id: str = "") -> str:
+    def start(
+        self,
+        prompt: str,
+        user_id: str = "",
+        channel_id: str = "",
+        tenant_id: str = "default",
+    ) -> str:
         """Record the start of a new investigation. Returns investigation ID."""
         inv_id = uuid.uuid4().hex[:16]
         with self._conn() as conn:
             conn.execute(
-                """INSERT INTO investigations (id, prompt, user_id, channel_id, started_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (inv_id, prompt, user_id, channel_id, time.time()),
+                """INSERT INTO investigations (id, tenant_id, prompt, user_id, channel_id, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (inv_id, tenant_id or "default", prompt, user_id, channel_id, time.time()),
             )
         return inv_id
 
@@ -567,6 +594,17 @@ class InvestigationStore:
                 raise StaleRevisionError(
                     f"expected parent revision {expected_parent_revision}, current revision is {current}"
                 )
+            incoming_tenant = contract.request.scope.tenant_id or "default"
+            investigation_row = conn.execute(
+                "SELECT tenant_id FROM investigations WHERE id=?",
+                (investigation_id,),
+            ).fetchone()
+            if (
+                current > 0
+                and investigation_row is not None
+                and str(investigation_row["tenant_id"] or "default") != incoming_tenant
+            ):
+                raise StaleRevisionError("investigation tenant cannot change across revisions")
             candidate_row = None
             if applied_candidate_id is not None:
                 candidate_row = conn.execute(
@@ -666,8 +704,8 @@ class InvestigationStore:
                 ),
             )
             conn.execute(
-                "UPDATE investigations SET current_revision=? WHERE id=?",
-                (revision, investigation_id),
+                "UPDATE investigations SET current_revision=?, tenant_id=? WHERE id=?",
+                (revision, incoming_tenant, investigation_id),
             )
             if candidate_row is not None:
                 candidate_provenance = ProvenanceRecord.model_validate_json(
@@ -1342,11 +1380,16 @@ class InvestigationStore:
         offset: int = 0,
         status: str | None = None,
         user_id: str | None = None,
+        tenant_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """List recent investigations, newest first."""
         query = "SELECT * FROM investigations"
         params: list[Any] = []
         conditions: list[str] = []
+
+        if tenant_id:
+            conditions.append("tenant_id=?")
+            params.append(tenant_id)
 
         if status:
             conditions.append("status=?")
@@ -1364,10 +1407,10 @@ class InvestigationStore:
             rows = conn.execute(query, params).fetchall()
             return [self._row_to_dict(r) for r in rows]
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self, *, tenant_id: str | None = None) -> dict[str, Any]:
         """Aggregate stats across all investigations."""
         with self._conn() as conn:
-            row = conn.execute("""
+            query = """
                 SELECT
                     COUNT(*) as total,
                     SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as succeeded,
@@ -1380,7 +1423,12 @@ class InvestigationStore:
                     SUM(CASE WHEN path_used='archetype' THEN 1 ELSE 0 END) as archetype_path,
                     SUM(CASE WHEN path_used='freeform' THEN 1 ELSE 0 END) as freeform_path
                 FROM investigations
-            """).fetchone()
+            """
+            params: tuple[Any, ...] = ()
+            if tenant_id:
+                query += " WHERE tenant_id=?"
+                params = (tenant_id,)
+            row = conn.execute(query, params).fetchone()
             return dict(row) if row else {}
 
     @staticmethod
