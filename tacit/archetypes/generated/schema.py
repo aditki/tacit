@@ -82,6 +82,8 @@ class GeneratedArchetype(InvestigationArchetype):
 
     def registration_errors(self) -> list[str]:
         errors: list[str] = []
+        if not self.id.strip():
+            errors.append("id is required")
         if not self.tenant_id:
             errors.append("tenant_id is required")
         if not self.service_refs:

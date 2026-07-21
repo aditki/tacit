@@ -120,7 +120,10 @@ def select_archetypes(
         )
 
     experimental_ids = {archetype.id for archetype, _ in experimental_archetypes}
-    selected_experimental = sum(archetype.id in experimental_ids for archetype, _ in ranked_archetypes)
+    experimental_archetypes = [
+        (archetype, confidence) for archetype, confidence in ranked_archetypes if archetype.id in experimental_ids
+    ]
+    selected_experimental = len(experimental_archetypes)
 
     return ArchetypeSelection(
         ranked_archetypes=ranked_archetypes,

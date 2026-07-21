@@ -165,6 +165,14 @@ def test_quarantine_rejects_generated_artifact_without_tenant_scope(tmp_path):
         quarantine_generated_archetype_yaml(generated_yaml, tmp_path)
 
 
+def test_quarantine_rejects_generated_artifact_without_id(tmp_path):
+    artifact = _generated(status=GeneratedArchetypeStatus.QUARANTINED).model_copy(update={"id": ""})
+    generated_yaml = yaml.safe_dump({"generated_archetypes": [artifact.model_dump(mode="json")]}, sort_keys=False)
+
+    with pytest.raises(ValueError, match="id is required"):
+        quarantine_generated_archetype_yaml(generated_yaml, tmp_path)
+
+
 @pytest.mark.parametrize(
     ("field", "message"),
     [("archetype_kind", "archetype_kind"), ("generation_version", "generation_version")],
@@ -198,6 +206,25 @@ def test_generation_captures_only_explicit_query_service_scope():
 
     generated = yaml.safe_load(generated_yaml)["archetypes"][0]
 
+    assert generated["service_refs"] == ["entity:service:checkout"]
+
+
+@pytest.mark.parametrize("variable", ["$service", "${service}", "[[service]]"])
+def test_generation_excludes_unresolved_grafana_service_variables(variable):
+    generated_yaml = generate_archetype_yaml(
+        {
+            "dashboard_title": "Checkout Dashboard",
+            "dashboard_tags": ["service:checkout"],
+            "metrics_found": ["shared_cpu_metric"],
+            "panels": [{"title": "CPU", "queries": [f'shared_cpu_metric{{service="{variable}"}}']}],
+        },
+        [],
+        tenant_id="tenant-a",
+        generation_run_id="run-123",
+        source_refs=["dashboard:checkout"],
+    )
+
+    generated = yaml.safe_load(generated_yaml)["archetypes"][0]
     assert generated["service_refs"] == ["entity:service:checkout"]
 
 
@@ -300,3 +327,24 @@ def test_exact_scope_experimental_mode_can_select_generated_archetype(tmp_path):
     assert selection.context_sources["generated_archetypes"] == 1
     assert selection.experimental_retrieval.files_scanned == 1
     assert selection.unexpected_cross_service_matches == 0
+
+
+def test_generated_candidate_removed_by_ranking_is_not_reported(tmp_path, monkeypatch):
+    write_generated_archetype(_generated(), tmp_path)
+    settings = _settings(tmp_path, mode=ArchetypeRetrievalMode.CURATED_WITH_EXPERIMENTAL_EXACT_SCOPE)
+
+    monkeypatch.setattr(
+        "tacit.pipeline.stages.archetypes.rank_archetypes_by_coverage",
+        lambda candidates, *_args, **_kwargs: [item for item in candidates if item[0].id != "checkout_generated"],
+    )
+    selection = select_archetypes(
+        intent=_intent("checkout"),
+        metric_catalog=_catalog(),
+        catalog_for_compile=_catalog(),
+        target_language="promql",
+        settings=settings,
+    )
+
+    assert selection.experimental_retrieval.archetypes
+    assert selection.experimental_archetypes == []
+    assert selection.context_sources["generated_archetypes"] == 0

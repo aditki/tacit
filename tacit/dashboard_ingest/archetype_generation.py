@@ -26,6 +26,12 @@ _SIGNALFLOW_SERVICE_PATTERN = re.compile(
     r"\bfilter\(\s*['\"](?:service|service_name|app|application|component)['\"]\s*,\s*['\"]([^'\"]+)['\"]",
     re.I,
 )
+_GRAFANA_VARIABLE_PATTERN = re.compile(r"(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\[\[[^\]]+\]\])")
+
+
+def _is_resolved_scope_value(value: object) -> bool:
+    """Return false for Grafana template variables that have no concrete scope."""
+    return bool(value) and not _GRAFANA_VARIABLE_PATTERN.search(str(value))
 
 
 def escape_literal_braces(expr: str) -> str:
@@ -173,7 +179,13 @@ def generate_archetype_yaml(
         "origin": GeneratedArchetypeOrigin.GENERATED_EXPERIMENTAL.value,
         "retrieval_status": GeneratedArchetypeStatus.QUARANTINED.value,
         "tenant_id": normalize_tenant_id(tenant_id),
-        "service_refs": sorted({ref for value in explicit_services if (ref := normalize_service_ref(value))}),
+        "service_refs": sorted(
+            {
+                ref
+                for value in explicit_services
+                if _is_resolved_scope_value(value) and (ref := normalize_service_ref(value))
+            }
+        ),
         "environment_refs": sorted(
             {ref for value in explicit_environments if (ref := normalize_environment_ref(value))}
         ),

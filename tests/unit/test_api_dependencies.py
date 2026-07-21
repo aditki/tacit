@@ -131,3 +131,44 @@ def test_learning_backend_route_uses_app_scoped_backend_settings(monkeypatch):
     assert response.status_code == 200
     assert response.json()["backend"] == "grafana"
     assert seen_settings == [runtime_settings]
+
+
+def test_uploaded_dashboard_route_uses_app_scoped_settings(monkeypatch):
+    runtime_settings = Settings(learned_archetypes_generation_enabled=True, learned_archetypes_tenant_id="runtime")
+    app = create_app(runtime_settings=runtime_settings)
+    seen_settings: list[Settings] = []
+
+    monkeypatch.setattr("tacit.dashboard_uploads.parse_uploaded_dashboard", lambda *_args, **_kwargs: object())
+
+    async def fake_ingest_features(_features, **kwargs):
+        seen_settings.append(kwargs["runtime_settings"])
+        return {"dashboard_uid": "uploaded"}
+
+    monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard_features", fake_ingest_features)
+    response = TestClient(app).post(
+        "/api/v1/learn/dashboard/json",
+        json={"vendor": "grafana", "source_name": "upload.json", "dashboard": {}, "auto_approve": False},
+    )
+
+    assert response.status_code == 200
+    assert seen_settings == [runtime_settings]
+
+
+def test_dashboard_approval_route_uses_app_scoped_settings(monkeypatch):
+    runtime_settings = Settings(
+        learned_archetypes_automatic_registration_enabled=True,
+        learned_archetypes_quarantine_path="runtime-quarantine",
+    )
+    app = create_app(runtime_settings=runtime_settings)
+    seen_settings: list[Settings] = []
+
+    def fake_approve(**kwargs):
+        seen_settings.append(kwargs["runtime_settings"])
+        return {"dashboard_uid": kwargs["dashboard_uid"], "status": "approved"}
+
+    monkeypatch.setattr("tacit.dashboard_ingest.approve_ingested_dashboard_record", fake_approve)
+    monkeypatch.setattr("tacit.api.routes.learning.signals_mod.get_signal_store", lambda: object())
+    response = TestClient(app).post("/api/v1/learn/dashboards/uploaded/approve?backend=grafana_json")
+
+    assert response.status_code == 200
+    assert seen_settings == [runtime_settings]

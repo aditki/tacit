@@ -295,6 +295,7 @@ def approve_ingested_dashboard_record(
     dashboard_uid: str,
     backend_name: str | None = None,
     store: Any | None = None,
+    runtime_settings: Settings | None = None,
 ) -> dict[str, Any]:
     """Approve a pending ingested dashboard and activate learned artifacts."""
     store = store or get_signal_store()
@@ -356,6 +357,7 @@ def approve_ingested_dashboard_record(
     quarantine_paths = quarantine_generated_archetype_if_enabled(
         ingested.get("archetype_generated", ""),
         dashboard_uid=dashboard_uid,
+        runtime_settings=runtime_settings,
     )
 
     return {

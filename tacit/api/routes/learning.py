@@ -191,22 +191,28 @@ async def learn_from_incident(payload: LearnIncidentRequest):
     summary="Learn from uploaded dashboard JSON",
     response_description="Extracted features, inferred signals, and optional quarantined archetype YAML",
 )
-async def learn_from_dashboard_json(request: LearnDashboardUploadRequest):
+async def learn_from_dashboard_json(request: Request, payload: LearnDashboardUploadRequest):
     """Ingest an uploaded dashboard JSON export without contacting the vendor."""
     from tacit.dashboard_ingest import ingest_dashboard_features
     from tacit.dashboard_uploads import parse_uploaded_dashboard
 
     try:
         features = parse_uploaded_dashboard(
-            request.dashboard,
-            vendor=request.vendor,
-            source_name=request.source_name,
+            payload.dashboard,
+            vendor=payload.vendor,
+            source_name=payload.source_name,
         )
-        return await ingest_dashboard_features(features, auto_approve=request.auto_approve)
+        from tacit.config import settings
+
+        return await ingest_dashboard_features(
+            features,
+            auto_approve=payload.auto_approve,
+            runtime_settings=getattr(request.app.state, "settings", settings),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
-        logger.exception("dashboard_json_ingest_failed", vendor=request.vendor, source_name=request.source_name)
+        logger.exception("dashboard_json_ingest_failed", vendor=payload.vendor, source_name=payload.source_name)
         raise HTTPException(
             status_code=500,
             detail="Failed to ingest uploaded dashboard JSON. Check that the file is a supported dashboard export.",
@@ -436,8 +442,9 @@ async def describe_service(
     summary="Approve an ingested dashboard",
     response_description="Approval status and signal mappings created",
 )
-async def approve_ingested_dashboard(dashboard_uid: str, backend: str | None = None):
+async def approve_ingested_dashboard(request: Request, dashboard_uid: str, backend: str | None = None):
     """Approve a pending ingested dashboard, activating its signal mappings."""
+    from tacit.config import settings
     from tacit.dashboard_ingest import approve_ingested_dashboard_record
 
     try:
@@ -445,6 +452,7 @@ async def approve_ingested_dashboard(dashboard_uid: str, backend: str | None = N
             dashboard_uid=dashboard_uid,
             backend_name=backend,
             store=signals_mod.get_signal_store(),
+            runtime_settings=getattr(request.app.state, "settings", settings),
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")

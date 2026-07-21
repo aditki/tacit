@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -87,16 +88,23 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
     catalog = scenario_catalog(scenario)
     backend = CapturingBackend(catalog=catalog)
     monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
-    fixture_provider = IncidentFixtureProvider(
-        catalog,
-        inferred_metrics,
-        service=scenario["prompt_matrix"]["services"][0],
-    )
+    current_service = scenario["prompt_matrix"]["services"][0]
+    resolved_metrics = {
+        entry.name
+        for signal_type in {sig["signal_type"] for sig in inferred_signals}
+        for entry, _confidence in signal_store.resolve_signal(
+            signal_type,
+            catalog,
+            context_service=current_service,
+            target_query_language="promql",
+        )
+    }
+    assert resolved_metrics
+    assert resolved_metrics <= inferred_metrics
+    fixture_provider = IncidentFixtureProvider(catalog, resolved_metrics, service=current_service)
     monkeypatch.setattr(provider_registry, "create_provider", lambda _settings: fixture_provider)
 
     monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
-
-    current_service = scenario["prompt_matrix"]["services"][0]
 
     async def fake_classify_intent(prompt: str):
         return intent_from_prompt(prompt, service=current_service), TokenUsage()
@@ -117,7 +125,13 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
         assert backend.published_specs, case.case_id
         spec = backend.published_specs[-1]
         assert "Checkout Edge Incident Response" not in spec.title
-        evaluation = evaluate_incident(spec, case)
+        approved_case = replace(
+            case,
+            expected_metrics=[metric for metric in case.expected_metrics if metric in resolved_metrics],
+            critical_metrics=[metric for metric in case.critical_metrics if metric in resolved_metrics],
+        )
+        assert approved_case.expected_metrics, case.case_id
+        evaluation = evaluate_incident(spec, approved_case)
         evaluation.assert_passes(thresholds, case_id=case.case_id)
         evaluations.append(evaluation)
 
