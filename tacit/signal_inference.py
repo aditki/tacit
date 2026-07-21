@@ -37,7 +37,7 @@ SIGNAL_FAMILIES = (
 )
 
 # Bump when rules change so learned mappings can be invalidated/replayed.
-INFERENCE_VERSION = "1.1"
+INFERENCE_VERSION = "1.2"
 
 MIN_SCORE = 0.25  # below this we emit nothing rather than guess
 
@@ -82,7 +82,7 @@ _NAME_RULES: list[tuple[re.Pattern[str], str, float, str]] = [
     (re.compile(r"(_timeouts?)"), "errors", 0.7, "name indicates timeouts"),
     (re.compile(r"(latency|duration|response_time|_rtt)"), "latency", 1.0, "name indicates latency/duration"),
     (
-        re.compile(r"((db|database|sql|connection|pool).*wait|wait.*(db|database|sql|connection|pool))"),
+        re.compile(r"((db|database|sql|connection).*wait|wait.*(db|database|sql|connection))"),
         "latency",
         0.95,
         "name indicates database or connection-pool wait time",

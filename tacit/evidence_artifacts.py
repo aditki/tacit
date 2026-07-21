@@ -533,6 +533,7 @@ def _resolve_direct_symptom_evidence(
 ) -> EvidenceResolution | None:
     """Resolve symptom evidence for direct observation panels."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal
+
     store = signal_store
     if store is None:
         from tacit.signals import get_signal_store
@@ -593,6 +594,7 @@ def _resolve_evidence_gap_observation(
 ) -> EvidenceResolution | None:
     """Resolve an evidence gap only when ownership is specific enough to observe safely."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal
+
     store = signal_store
     if store is None:
         from tacit.signals import get_signal_store

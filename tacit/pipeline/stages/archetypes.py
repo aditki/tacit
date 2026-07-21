@@ -86,7 +86,7 @@ def select_archetypes(
         exact_query = GeneratedArchetypeQuery.exact(
             tenant_id=str(tenant_id or getattr(settings, "learned_archetypes_tenant_id", "default") or "default"),
             service_refs=intent.services,
-            environment_refs=environment_refs or [],
+            environment_refs=intent.environments if environment_refs is None else environment_refs,
             archetype_kind=archetype_kind,
             generation_version=getattr(
                 settings,

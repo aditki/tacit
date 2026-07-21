@@ -57,11 +57,12 @@ def _generated(
     )
 
 
-def _intent(service: str) -> Intent:
+def _intent(service: str, *, environments: list[str] | None = None) -> Intent:
     return Intent(
         summary=f"high CPU on {service}",
         domain="application",
         services=[service],
+        environments=environments or [],
         signals=[SignalType.METRICS],
         keywords=["high", "cpu"],
         timerange="30m",
@@ -356,6 +357,27 @@ def test_exact_scope_experimental_mode_keeps_generated_archetype_shadow_only(tmp
     assert selection.context_sources["shadow_generated_archetypes"] == 1
     assert selection.experimental_retrieval.files_scanned == 1
     assert selection.unexpected_cross_service_matches == 0
+
+
+def test_environment_scoped_artifact_uses_the_frozen_intent_scope(tmp_path):
+    write_generated_archetype(
+        _generated(environment_refs=frozenset({"production"})),
+        tmp_path,
+    )
+
+    selection = select_archetypes(
+        intent=_intent("checkout", environments=["production"]),
+        metric_catalog=_catalog(),
+        catalog_for_compile=_catalog(),
+        target_language="promql",
+        settings=_settings(
+            tmp_path,
+            mode=ArchetypeRetrievalMode.CURATED_WITH_EXPERIMENTAL_EXACT_SCOPE,
+        ),
+    )
+
+    assert [archetype.id for archetype, _ in selection.shadow_archetypes] == ["checkout_generated"]
+    assert selection.experimental_retrieval.rejected_by_scope == 0
 
 
 def test_same_id_generated_archetype_remains_in_shadow_evaluation(tmp_path):

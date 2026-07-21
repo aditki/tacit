@@ -90,6 +90,13 @@ class TestHeuristicIntent:
     def test_timerange_default(self):
         assert heuristic_intent("something is wrong").timerange == "1h"
 
+    def test_explicit_environment_is_captured_without_defaulting(self):
+        production = heuristic_intent("checkout latency on checkout in production")
+        assert production.environments == ["production"]
+        assert production.services == ["checkout"]
+        assert heuristic_intent("checkout latency on checkout env:us-east-prod").environments == ["us-east-prod"]
+        assert heuristic_intent("checkout latency").environments == []
+
     def test_unmatched_prompt_falls_back_to_golden_signals(self):
         intent = heuristic_intent("something feels off with the flux capacitor")
         assert intent.archetypes[0].type == "golden_signals"

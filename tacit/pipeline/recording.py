@@ -62,6 +62,7 @@ class PipelineRecorder:
             summary=intent.summary,
             domain=intent.domain,
             services=intent.services,
+            environments=intent.environments,
             archetypes=[{"type": a.type, "confidence": a.confidence} for a in intent.archetypes],
             timerange=intent.timerange,
         )

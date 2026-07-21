@@ -16,7 +16,7 @@ from tacit.models.schemas import (
     SignalType,
 )
 from tacit.pipeline.failures import PipelineFailureFactory
-from tacit.pipeline.runner import _get_semaphore
+from tacit.pipeline.runner import _get_semaphore, _initialize_signal_store
 from tacit.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history, safe_record_provenance
 from tacit.pipeline.stages.freeform import build_freeform_dashboard
 from tacit.pipeline.stages.intent import run_intent_stage
@@ -25,9 +25,13 @@ from tacit.pipeline.stages.intent import run_intent_stage
 class FakeRecorder:
     def __init__(self):
         self.finished: list[dict] = []
+        self.stages: list[tuple[str, str, str, dict]] = []
 
     def finish(self, **kwargs):
         self.finished.append(kwargs)
+
+    def stage(self, stage, status, reason_code, **details):
+        self.stages.append((stage, status, reason_code, details))
 
 
 class FakeHistoryStore:
@@ -153,6 +157,33 @@ def test_pipeline_failure_factory_records_finish():
     assert response.summary == "No data"
     assert recorder.finished[0]["status"] == "failed"
     assert recorder.finished[0]["error"] == "no data"
+
+
+def test_signal_store_initialization_failure_is_recorded_and_nonfatal():
+    recorder = FakeRecorder()
+    timings: dict[str, float] = {}
+    deps = PipelineDependencies(
+        settings=Settings(),
+        backend_factory=lambda: [],
+        history_store_factory=FakeHistoryStore,
+        feedback_store_factory=FakeFeedbackStore,
+        signal_store_factory=lambda: (_ for _ in ()).throw(OSError("signals database unavailable")),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    store = _initialize_signal_store(deps, recorder, timings)
+
+    assert store is None
+    assert timings["signal_store_init"] >= 0
+    assert recorder.stages == [
+        (
+            "signal_store",
+            "skipped",
+            "signal_store_unavailable",
+            {"error_type": "OSError"},
+        )
+    ]
 
 
 async def test_build_freeform_dashboard_no_metrics_returns_failure():

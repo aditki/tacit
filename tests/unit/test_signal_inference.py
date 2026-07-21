@@ -175,6 +175,34 @@ class TestInferenceHardening:
         assert signal is not None
         assert signal.auto_teach_eligible is True
 
+    def test_pool_wait_metrics_do_not_teach_frontend_request_latency(self, signal_store):
+        metrics = ["connection_pool_wait_seconds", "worker_pool_wait_seconds"]
+        panels = [
+            {
+                "title": "Connection pool wait",
+                "unit": "s",
+                "metrics": ["connection_pool_wait_seconds"],
+                "queries": ["connection_pool_wait_seconds"],
+            },
+            {
+                "title": "Worker pool",
+                "unit": "s",
+                "metrics": ["worker_pool_wait_seconds"],
+                "queries": ["worker_pool_wait_seconds"],
+            },
+        ]
+
+        inferred = {
+            signal["metric"]: signal for signal in infer_signals_from_metrics(metrics, panels, store=signal_store)
+        }
+
+        assert inferred["connection_pool_wait_seconds"]["signal_type"] == "db_connection_pool"
+        assert inferred["connection_pool_wait_seconds"]["signal_family"] == "saturation"
+        assert inferred["connection_pool_wait_seconds"]["auto_teach_eligible"] is True
+        assert inferred["worker_pool_wait_seconds"]["signal_type"] == "worker_pool_wait"
+        assert inferred["worker_pool_wait_seconds"]["auto_teach_eligible"] is False
+        assert all(signal["signal_type"] != "request_latency" for signal in inferred.values())
+
     def test_weak_single_source_not_auto_teachable(self):
         bare = infer_signal("felix_iptables_save_errors")  # name only, score 0.40
         assert bare.signal_family == "errors"

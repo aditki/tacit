@@ -27,12 +27,7 @@ class _MetricQualityStore:
 
     def analyze(self):
         self.analyze_calls += 1
-        return {
-            "metric_quality": [
-                {"metric": metric, "quality_score": score}
-                for metric, score in self.scores.items()
-            ]
-        }
+        return {"metric_quality": [{"metric": metric, "quality_score": score} for metric, score in self.scores.items()]}
 
 
 def _metric(name: str) -> MetricEntry:
@@ -75,3 +70,37 @@ def test_preranking_uses_feedback_and_cache_from_the_supplied_store(tmp_path, mo
     assert [metric.name for metric in cached_first] == ["alpha_latency"]
     assert first_store.analyze_calls == 1
     assert second_store.analyze_calls == 1
+
+
+def test_preranking_does_not_open_feedback_store_for_small_catalogs():
+    def unavailable_store():
+        raise AssertionError("feedback store should not be initialized")
+
+    catalog = [_metric("alpha_latency"), _metric("beta_latency")]
+    ranked = prerank_metrics(
+        Intent(summary="latency", domain="application", keywords=["latency"]),
+        catalog,
+        max_candidates=2,
+        feedback_store_factory=unavailable_store,
+    )
+
+    assert ranked == catalog
+
+
+def test_preranking_tolerates_feedback_store_initialization_failure():
+    calls = 0
+
+    def unavailable_store():
+        nonlocal calls
+        calls += 1
+        raise OSError("feedback database unavailable")
+
+    ranked = prerank_metrics(
+        Intent(summary="latency", domain="application", keywords=["latency"]),
+        [_metric("alpha_latency"), _metric("beta_latency")],
+        max_candidates=1,
+        feedback_store_factory=unavailable_store,
+    )
+
+    assert len(ranked) == 1
+    assert calls == 1

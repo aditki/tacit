@@ -57,7 +57,7 @@ async def build_freeform_dashboard(
     ranked_catalog = prerank_metrics(
         intent,
         metric_catalog,
-        feedback_store=deps.feedback_store_factory(),
+        feedback_store_factory=deps.feedback_store_factory,
     )
     stage_log(
         "metric_ranking",

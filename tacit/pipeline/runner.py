@@ -89,6 +89,57 @@ def _get_semaphore(max_concurrent: int) -> asyncio.Semaphore:
     return _pipeline_semaphore
 
 
+def _initialize_signal_store(
+    deps: PipelineDependencies,
+    recorder: PipelineRecorder,
+    timings: dict[str, float],
+) -> Any | None:
+    """Initialize optional semantic storage without failing core generation."""
+    started_at = time.monotonic()
+    if deps.signal_store_factory is None:
+        timings["signal_store_init"] = time.monotonic() - started_at
+        stage_log(
+            "signal_store_init",
+            timings["signal_store_init"] * 1000,
+            configured=False,
+            available=False,
+        )
+        return None
+
+    try:
+        store = deps.signal_store_factory()
+    except Exception as exc:
+        timings["signal_store_init"] = time.monotonic() - started_at
+        logger.warning(
+            "signal_store_initialization_failed",
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        stage_log(
+            "signal_store_init",
+            timings["signal_store_init"] * 1000,
+            configured=True,
+            available=False,
+            error_type=type(exc).__name__,
+        )
+        recorder.stage(
+            "signal_store",
+            "skipped",
+            "signal_store_unavailable",
+            error_type=type(exc).__name__,
+        )
+        return None
+
+    timings["signal_store_init"] = time.monotonic() - started_at
+    stage_log(
+        "signal_store_init",
+        timings["signal_store_init"] * 1000,
+        configured=True,
+        available=True,
+    )
+    return store
+
+
 async def run_pipeline(
     request: DashRequest,
     deps: PipelineDependencies | None = None,
@@ -223,7 +274,7 @@ async def _run_pipeline_inner(
     )
 
     try:
-        signal_store = deps.signal_store_factory() if deps.signal_store_factory is not None else None
+        signal_store = _initialize_signal_store(deps, runtime.recorder, runtime.timings)
 
         # ── 1. Intent Agent ──────────────────────────────────────────
         llm_provider_factory = runtime.deps.llm_provider_factory
@@ -279,6 +330,7 @@ async def _run_pipeline_inner(
             catalog_for_compile=catalog_for_compile,
             target_language=target_language,
             settings=runtime.settings,
+            environment_refs=intent.environments,
             signal_store=signal_store,
         )
         ranked_archetypes = selection.ranked_archetypes

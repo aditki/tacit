@@ -35,6 +35,10 @@ class Intent(BaseModel):
     summary: str = Field(description="One-line restatement of the user problem")
     domain: str = Field(description="Observability domain, e.g. 'infrastructure', 'application', 'network'")
     services: list[str] = Field(default_factory=list, description="Mentioned service/component names")
+    environments: list[str] = Field(
+        default_factory=list,
+        description="Explicitly mentioned deployment environments, e.g. 'production' or 'staging'",
+    )
     signals: list[SignalType] = Field(
         default_factory=lambda: [SignalType.METRICS],
         description="Signal types to explore",

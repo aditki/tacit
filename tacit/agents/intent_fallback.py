@@ -201,6 +201,14 @@ _TIMERANGE = re.compile(
     r"(?:last|past)\s+(\d+)\s*(m(?:in(?:ute)?s?)?|h(?:(?:ou)?rs?)?|d(?:ays?)?)\b",
     re.IGNORECASE,
 )
+_ENVIRONMENT = re.compile(
+    r"\b(production|prod|staging|stage|development|dev|qa|test|sandbox)\b",
+    re.IGNORECASE,
+)
+_QUALIFIED_ENVIRONMENT = re.compile(
+    r"\b(?:environment|env)\s*[:=]\s*([a-z0-9][a-z0-9_.:-]*)",
+    re.IGNORECASE,
+)
 
 
 def zero_key_mode(settings: Settings) -> bool:
@@ -229,13 +237,14 @@ def _match_archetypes(text: str) -> list[ArchetypeMatch]:
 
 def _extract_services(text: str) -> list[str]:
     services: list[str] = []
+    environments = set(_extract_environments(text))
     candidates = [
         *[match.lower() for match in _SERVICE_PHRASE.findall(text)],
         *[match.lower() for match in _SERVICE_PREPOSITION.findall(text)],
         *_SERVICE_TOKEN.findall(text.lower()),
     ]
     for token in candidates:
-        if token in _SERVICE_STOPLIST or token in services:
+        if token in _SERVICE_STOPLIST or token in environments or _ENVIRONMENT.fullmatch(token) or token in services:
             continue
         services.append(token)
     return services[:5]
@@ -247,6 +256,13 @@ def _extract_timerange(text: str) -> str:
         return "1h"
     value, unit = match.group(1), match.group(2).lower()
     return f"{value}{unit[0]}"
+
+
+def _extract_environments(text: str) -> list[str]:
+    """Capture only environment names explicitly present in the prompt."""
+    qualified = _QUALIFIED_ENVIRONMENT.findall(text)
+    candidates = [*qualified, *_ENVIRONMENT.findall(_QUALIFIED_ENVIRONMENT.sub("", text))]
+    return list(dict.fromkeys(match.casefold() for match in candidates))
 
 
 def _extract_signals(text: str) -> list[SignalType]:
@@ -274,6 +290,7 @@ def heuristic_intent(prompt: str) -> Intent:
         summary=prompt.strip()[:200],
         domain=_DOMAIN_BY_ARCHETYPE.get(top, "general"),
         services=_extract_services(prompt),
+        environments=_extract_environments(prompt),
         signals=_extract_signals(prompt),
         keywords=expand_operational_terms(prompt, []),
         timerange=_extract_timerange(prompt),
@@ -286,6 +303,7 @@ def heuristic_intent(prompt: str) -> Intent:
         reason="no_llm_api_key",
         archetypes=[(a.type, a.confidence) for a in intent.archetypes],
         services=intent.services,
+        environments=intent.environments,
         timerange=intent.timerange,
     )
     return intent

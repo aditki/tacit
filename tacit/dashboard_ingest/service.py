@@ -113,6 +113,7 @@ def infer_signals_from_metrics(
     unmatched = [m for m in dict.fromkeys(metrics) if m not in matched_metrics]
     for sig in _infer_heuristic(unmatched, panel_data or []):
         signal_type = _canonical_signal_type_for_heuristic(sig)
+        signal_family = "saturation" if signal_type == "db_connection_pool" else sig.signal_family
         inferred.append(
             {
                 "signal_type": signal_type,
@@ -122,7 +123,7 @@ def infer_signals_from_metrics(
                 "score": sig.score,
                 "margin": sig.margin,
                 "confidence_label": sig.confidence_label,
-                "signal_family": sig.signal_family,
+                "signal_family": signal_family,
                 "source": "heuristic",
                 "reason": "; ".join(sig.evidence),
                 "evidence": sig.evidence,
@@ -142,6 +143,10 @@ def _canonical_signal_type_for_heuristic(sig: Any) -> str:
     metric = sig.metric.lower()
     family = sig.signal_family
     if family == "latency":
+        if "pool" in metric and "wait" in metric:
+            if any(token in metric for token in ("db", "database", "sql", "query", "connection")):
+                return "db_connection_pool"
+            return sig.signal_name
         if any(token in metric for token in ("db", "sql", "query")):
             return "db_query_latency"
         if "dns" in metric:

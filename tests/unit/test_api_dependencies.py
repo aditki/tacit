@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
@@ -242,3 +243,44 @@ def test_app_scoped_database_paths_drive_pipeline_and_api_stores(tmp_path, monke
     assert seen_stores["feedback"]._db_path == tmp_path / "app" / "feedback.db"
     assert seen_stores["signals"]._db_path == tmp_path / "app" / "signals.db"
     assert seen_stores["signals"].list_learned_artifacts(artifact_type="runbook")
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload"),
+    [
+        (
+            "/api/v1/learn/runbooks",
+            {
+                "title": "Checkout recovery",
+                "body_text": "Check checkout_latency_seconds.",
+                "external_id": "runbook:dry-run",
+                "dry_run": True,
+            },
+        ),
+        (
+            "/api/v1/learn/incidents",
+            {
+                "title": "Checkout incident",
+                "body_text": "Observed checkout_latency_seconds.",
+                "external_id": "incident:dry-run",
+                "dry_run": True,
+            },
+        ),
+    ],
+)
+def test_artifact_dry_runs_do_not_initialize_signal_storage(endpoint, payload):
+    app = create_app(runtime_settings=Settings(_env_file=None))
+    store_calls = 0
+
+    def unavailable_store():
+        nonlocal store_calls
+        store_calls += 1
+        raise AssertionError("dry-run initialized persistent signal storage")
+
+    app.state.runtime_stores.signals = unavailable_store
+
+    response = TestClient(app).post(endpoint, json=payload)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["dry_run"] is True
+    assert store_calls == 0

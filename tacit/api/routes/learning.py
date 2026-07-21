@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi import Path as PathParam
 
 import tacit.signals as signals_mod
-from tacit.api.dependencies import get_signal_store
+from tacit.api.dependencies import get_runtime_stores, get_signal_store
 from tacit.api.security import verify_api_key
 from tacit.models.schemas import (
     LearnAlertRequest,
@@ -20,6 +20,7 @@ from tacit.models.schemas import (
     LearnIncidentRequest,
     LearnRunbookRequest,
 )
+from tacit.runtime_stores import RuntimeStores
 
 logger = structlog.get_logger()
 router = APIRouter(dependencies=[Depends(verify_api_key)])
@@ -151,12 +152,13 @@ async def learn_from_alert(
 )
 async def learn_from_runbook(
     payload: LearnRunbookRequest,
-    store: Any = Depends(get_signal_store),
+    stores: RuntimeStores = Depends(get_runtime_stores),
 ):
     """Learn operational candidates from a markdown/plain-text runbook."""
     from tacit.artifact_learning import RunbookExtractor, artifact_from_text, learn_artifact
 
     try:
+        store = None if payload.dry_run else stores.signals()
         artifact = artifact_from_text(
             artifact_type="runbook",
             title=payload.title,
@@ -182,12 +184,13 @@ async def learn_from_runbook(
 )
 async def learn_from_incident(
     payload: LearnIncidentRequest,
-    store: Any = Depends(get_signal_store),
+    stores: RuntimeStores = Depends(get_runtime_stores),
 ):
     """Learn operational candidates from an incident-history record."""
     from tacit.artifact_learning import IncidentExtractor, artifact_from_text, learn_artifact
 
     try:
+        store = None if payload.dry_run else stores.signals()
         artifact = artifact_from_text(
             artifact_type="incident",
             title=payload.title,
