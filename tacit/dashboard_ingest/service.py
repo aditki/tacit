@@ -494,7 +494,15 @@ async def ingest_dashboard_features(
         status=status,
     )
     mappings_created = 0
-    quarantine_paths: list[str] = []
+    quarantine_paths = (
+        quarantine_generated_archetype_if_enabled(
+            archetype_yaml,
+            dashboard_uid=features.dashboard_uid,
+            runtime_settings=active_settings,
+        )
+        if register_archetype
+        else []
+    )
     activated_pairs: set[tuple[str, str]] = set()
     if auto_approve:
         for sig in signals:
@@ -507,12 +515,6 @@ async def ingest_dashboard_features(
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
-        if register_archetype:
-            quarantine_paths = quarantine_generated_archetype_if_enabled(
-                archetype_yaml,
-                dashboard_uid=features.dashboard_uid,
-                runtime_settings=active_settings,
-            )
         logger.info(
             "dashboard_ingested_auto_approved",
             uid=features.dashboard_uid,

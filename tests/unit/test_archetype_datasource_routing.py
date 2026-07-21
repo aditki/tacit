@@ -2,6 +2,51 @@ from tacit.archetypes.engine import compile_archetype
 from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from tacit.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
 from tacit.signals import SignalStore
+from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE
+
+
+def test_unavailable_injected_store_does_not_use_global_signal_mappings(monkeypatch):
+    monkeypatch.setattr(
+        "tacit.signals.get_signal_store",
+        lambda: (_ for _ in ()).throw(AssertionError("global signal store was consulted")),
+    )
+    archetype = InvestigationArchetype(
+        id="resource-saturation",
+        name="Resource saturation",
+        problem_types=["resource_saturation"],
+        required_signals=["cpu_usage"],
+        signal_bindings={"cpu_usage": "container_cpu_usage_seconds_total"},
+        panels=[
+            PanelTemplate(
+                title="CPU",
+                queries=[QueryTemplate(expr="rate(container_cpu_usage_seconds_total[5m])")],
+            )
+        ],
+    )
+    intent = Intent(
+        summary="resource pressure",
+        domain="infrastructure",
+        services=["checkout"],
+        problem_type="resource_saturation",
+    )
+    catalog = [
+        MetricEntry(
+            name="gamma_container_cpu_usage_seconds_total",
+            datasource_uid="gamma",
+            datasource_name="GAMMA",
+            datasource_type="prometheus",
+            query_language="promql",
+        )
+    ]
+
+    dashboard = compile_archetype(
+        archetype,
+        intent,
+        catalog,
+        signal_store=SIGNAL_STORE_UNAVAILABLE,
+    )
+
+    assert dashboard.panels[0].queries[0].expr == "rate(container_cpu_usage_seconds_total[5m])"
 
 
 def test_promql_query_routes_to_datasource_that_owns_metric():

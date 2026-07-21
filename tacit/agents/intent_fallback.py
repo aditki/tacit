@@ -261,7 +261,14 @@ def _extract_timerange(text: str) -> str:
 def _extract_environments(text: str) -> list[str]:
     """Capture only environment names explicitly present in the prompt."""
     qualified = _QUALIFIED_ENVIRONMENT.findall(text)
-    candidates = [*qualified, *_ENVIRONMENT.findall(_QUALIFIED_ENVIRONMENT.sub("", text))]
+    unqualified_text = _QUALIFIED_ENVIRONMENT.sub("", text)
+    standalone = [
+        match.group(1)
+        for match in _ENVIRONMENT.finditer(unqualified_text)
+        if (match.start() == 0 or unqualified_text[match.start() - 1] not in "-_.")
+        and (match.end() == len(unqualified_text) or unqualified_text[match.end()] not in "-_.")
+    ]
+    candidates = [*qualified, *standalone]
     return list(dict.fromkeys(match.casefold() for match in candidates))
 
 

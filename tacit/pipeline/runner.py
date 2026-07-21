@@ -44,6 +44,7 @@ from tacit.pipeline.stages.freeform import build_freeform_dashboard
 from tacit.pipeline.stages.intent import run_intent_stage
 from tacit.pipeline.validation import validate_dashboard_and_evidence
 from tacit.runtime_stores import RuntimeStores
+from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE
 
 logger = structlog.get_logger()
 
@@ -104,7 +105,7 @@ def _initialize_signal_store(
             configured=False,
             available=False,
         )
-        return None
+        return SIGNAL_STORE_UNAVAILABLE
 
     try:
         store = deps.signal_store_factory()
@@ -128,7 +129,25 @@ def _initialize_signal_store(
             "signal_store_unavailable",
             error_type=type(exc).__name__,
         )
-        return None
+        return SIGNAL_STORE_UNAVAILABLE
+
+    if store is None:
+        timings["signal_store_init"] = time.monotonic() - started_at
+        logger.warning("signal_store_initialization_returned_none")
+        stage_log(
+            "signal_store_init",
+            timings["signal_store_init"] * 1000,
+            configured=True,
+            available=False,
+            error_type="NoneReturned",
+        )
+        recorder.stage(
+            "signal_store",
+            "skipped",
+            "signal_store_unavailable",
+            error_type="NoneReturned",
+        )
+        return SIGNAL_STORE_UNAVAILABLE
 
     timings["signal_store_init"] = time.monotonic() - started_at
     stage_log(

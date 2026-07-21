@@ -1237,6 +1237,42 @@ class TestIngestedDashboards:
         assert "checkout_autoreg" in quarantine_files[0].read_text()
 
     @pytest.mark.asyncio
+    async def test_pending_ingest_quarantines_without_activating_mappings(self, signal_store, monkeypatch, tmp_path):
+        from tacit import dashboard_ingest as di
+
+        monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
+        monkeypatch.setattr(di.settings, "learned_archetypes_generation_enabled", True)
+        monkeypatch.setattr(di.settings, "learned_archetypes_automatic_registration_enabled", True)
+        monkeypatch.setattr(di.settings, "learned_archetypes_quarantine_path", str(tmp_path / "quarantine"))
+        features = DashboardFeatures(
+            dashboard_uid="checkout-pending",
+            dashboard_title="Checkout Pending",
+            dashboard_tags=["service:checkout"],
+            backend_name="grafana_json",
+            query_language="promql",
+            metrics_found=["checkout_custom_latency_ms"],
+            panel_count=1,
+            panel_titles=["Checkout Latency"],
+            panels=[
+                {
+                    "title": "Checkout Latency",
+                    "queries": ["checkout_custom_latency_ms"],
+                    "metrics": ["checkout_custom_latency_ms"],
+                }
+            ],
+        )
+
+        result = await di.ingest_dashboard_features(features, auto_approve=False)
+
+        assert result["status"] == "pending"
+        assert result["archetype_quarantined"] is True
+        assert len(list((tmp_path / "quarantine").rglob("*.yaml"))) == 1
+        active_metrics = {
+            mapping["metric_pattern"] for mapping in signal_store.get_mappings_for_signal("request_latency")
+        }
+        assert "checkout_custom_latency_ms" not in active_metrics
+
+    @pytest.mark.asyncio
     async def test_auto_approve_keeps_held_candidates_out_of_approved_context(self, signal_store, monkeypatch):
         from tacit import dashboard_ingest as di
 

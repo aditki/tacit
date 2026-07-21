@@ -23,6 +23,7 @@ from tacit.models.schemas import (
     PanelSpec,
     QueryTarget,
 )
+from tacit.signals.availability import resolve_signal_store
 
 logger = structlog.get_logger()
 
@@ -772,7 +773,9 @@ def _resolve_archetype_signals(
     try:
         from tacit.signals import get_signal_store
 
-        store = signal_store or get_signal_store()
+        store = resolve_signal_store(signal_store, get_signal_store)
+        if store is None:
+            return archetype
         substitutions = store.resolve_signals_for_archetype(
             signal_bindings=archetype.signal_bindings,
             catalog=catalog,
@@ -1011,14 +1014,9 @@ def _archetype_live_coverage(
     if not catalog_names:
         return 0.0
 
-    store = signal_store
-    if store is None:
-        try:
-            from tacit.signals import get_signal_store
+    from tacit.signals import get_signal_store
 
-            store = get_signal_store()
-        except Exception:
-            store = None
+    store = resolve_signal_store(signal_store, get_signal_store)
 
     resolved = 0
     for sig in signals:

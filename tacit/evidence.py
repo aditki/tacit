@@ -29,6 +29,7 @@ from tacit.models.schemas import (
     Intent,
     MetricEntry,
 )
+from tacit.signals.availability import resolve_signal_store
 
 _METRIC_TOKEN_CHARS = r"A-Za-z0-9_:."
 _PROMETHEUS_HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
@@ -171,10 +172,7 @@ def resolve_requirements_for_archetype(
         if entry.name:
             catalog_by_name[entry.name].append(entry)
 
-    try:
-        store = signal_store or get_signal_store()
-    except Exception:
-        store = None
+    store = resolve_signal_store(signal_store, get_signal_store)
 
     resolutions: list[EvidenceResolution] = []
 

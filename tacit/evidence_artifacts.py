@@ -18,6 +18,7 @@ from tacit.models.schemas import (
     PanelQuery,
     PanelSpec,
 )
+from tacit.signals.availability import resolve_signal_store
 
 _SYMPTOM_SIGNAL_PANELS = {
     "request_latency": ("Observed Request Latency", "Application request timing evidence", "s"),
@@ -533,15 +534,11 @@ def _resolve_direct_symptom_evidence(
 ) -> EvidenceResolution | None:
     """Resolve symptom evidence for direct observation panels."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal
+    from tacit.signals import get_signal_store
 
-    store = signal_store
+    store = resolve_signal_store(signal_store, get_signal_store)
     if store is None:
-        from tacit.signals import get_signal_store
-
-        try:
-            store = get_signal_store()
-        except Exception:
-            return None
+        return None
 
     target_catalog = [
         entry for entry in catalog if (entry.query_language or "").lower() in {"", target_language.lower()}
@@ -594,15 +591,11 @@ def _resolve_evidence_gap_observation(
 ) -> EvidenceResolution | None:
     """Resolve an evidence gap only when ownership is specific enough to observe safely."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal
+    from tacit.signals import get_signal_store
 
-    store = signal_store
+    store = resolve_signal_store(signal_store, get_signal_store)
     if store is None:
-        from tacit.signals import get_signal_store
-
-        try:
-            store = get_signal_store()
-        except Exception:
-            return None
+        return None
 
     target_catalog = [
         entry for entry in catalog if (entry.query_language or "").lower() in {"", target_language.lower()}

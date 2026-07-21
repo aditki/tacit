@@ -24,6 +24,7 @@ from tacit.models.schemas import (
     SignalType,
 )
 from tacit.signals import SignalStore
+from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE
 
 
 def _intent() -> Intent:
@@ -72,6 +73,25 @@ def _resource_archetype() -> InvestigationArchetype:
             ),
         ],
     )
+
+
+def test_unavailable_injected_store_marks_semantic_evidence_unknown(monkeypatch):
+    monkeypatch.setattr(
+        "tacit.signals.get_signal_store",
+        lambda: (_ for _ in ()).throw(AssertionError("global signal store was consulted")),
+    )
+    archetype = _resource_archetype()
+
+    requirements, resolutions = resolve_requirements_for_archetype(
+        archetype,
+        _intent(),
+        [_metric("gamma_container_cpu_usage_seconds_total")],
+        signal_store=SIGNAL_STORE_UNAVAILABLE,
+    )
+
+    assert requirements
+    assert all(resolution.status == EvidenceResolutionStatus.UNKNOWN for resolution in resolutions)
+    assert {resolution.reason_code for resolution in resolutions} == {"signal_store_unavailable"}
 
 
 def test_evidence_requirements_are_declared_once_per_archetype_signal():

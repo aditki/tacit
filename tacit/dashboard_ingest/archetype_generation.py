@@ -19,9 +19,10 @@ from tacit.query_parsing.languages import datasource_type_to_language, language_
 
 _TEMPLATE_PLACEHOLDER_NAMES = ("service_filter", "container_filter", "rate_interval")
 _SERVICE_LABEL_PATTERN = re.compile(
-    r'\b(?:service|service_name|app|application|component)\s*=\s*["\']([^"\']+)["\']',
+    r'\b(?:service|service_name|app|application|component)\s*(=~|=)\s*["\']([^"\']+)["\']',
     re.I,
 )
+_REGEX_META_PATTERN = re.compile(r"[.*+?()\[\]{}|^$\\]")
 _SIGNALFLOW_SERVICE_PATTERN = re.compile(
     r"\bfilter\(\s*['\"](?:service|service_name|app|application|component)['\"]\s*,\s*['\"]([^'\"]+)['\"]",
     re.I,
@@ -146,7 +147,10 @@ def generate_archetype_yaml(
         for query in panel.get("queries", []) or []:
             if not isinstance(query, str):
                 continue
-            explicit_services.extend(_SERVICE_LABEL_PATTERN.findall(query))
+            for operator, value in _SERVICE_LABEL_PATTERN.findall(query):
+                if operator == "=~" and _REGEX_META_PATTERN.search(value):
+                    continue
+                explicit_services.append(value)
             explicit_services.extend(_SIGNALFLOW_SERVICE_PATTERN.findall(query))
         for target in panel.get("cloudwatch_targets", []) or []:
             for name, value in (target.get("dimensions", {}) or {}).items():

@@ -237,14 +237,63 @@ def test_generation_captures_only_explicit_query_service_scope():
     assert generated["service_refs"] == ["entity:service:checkout"]
 
 
+def test_generation_captures_positive_regex_query_service_scope():
+    generated_yaml = generate_archetype_yaml(
+        {
+            "dashboard_title": "Checkout Dashboard",
+            "dashboard_tags": [],
+            "metrics_found": ["shared_cpu_metric"],
+            "panels": [
+                {
+                    "title": "CPU",
+                    "queries": ['shared_cpu_metric{service=~"checkout"}'],
+                }
+            ],
+        },
+        [],
+        tenant_id="tenant-a",
+        generation_run_id="run-123",
+        source_refs=["dashboard:checkout"],
+    )
+
+    generated = yaml.safe_load(generated_yaml)["archetypes"][0]
+
+    assert generated["service_refs"] == ["entity:service:checkout"]
+
+
+def test_generation_does_not_treat_multi_service_regex_as_exact_scope():
+    generated_yaml = generate_archetype_yaml(
+        {
+            "dashboard_title": "Shared Dashboard",
+            "dashboard_tags": [],
+            "metrics_found": ["shared_cpu_metric"],
+            "panels": [
+                {
+                    "title": "CPU",
+                    "queries": ['shared_cpu_metric{service=~"checkout|payments"}'],
+                }
+            ],
+        },
+        [],
+        tenant_id="tenant-a",
+        generation_run_id="run-123",
+        source_refs=["dashboard:shared"],
+    )
+
+    generated = yaml.safe_load(generated_yaml)["archetypes"][0]
+
+    assert generated["service_refs"] == []
+
+
+@pytest.mark.parametrize("operator", ["=", "=~"])
 @pytest.mark.parametrize("variable", ["$service", "${service}", "[[service]]"])
-def test_generation_excludes_unresolved_grafana_service_variables(variable):
+def test_generation_excludes_unresolved_grafana_service_variables(variable, operator):
     generated_yaml = generate_archetype_yaml(
         {
             "dashboard_title": "Checkout Dashboard",
             "dashboard_tags": ["service:checkout"],
             "metrics_found": ["shared_cpu_metric"],
-            "panels": [{"title": "CPU", "queries": [f'shared_cpu_metric{{service="{variable}"}}']}],
+            "panels": [{"title": "CPU", "queries": [f'shared_cpu_metric{{service{operator}"{variable}"}}']}],
         },
         [],
         tenant_id="tenant-a",
