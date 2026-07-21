@@ -119,6 +119,14 @@ def normalize_archetype(problem_type: str) -> str:
     return ARCHETYPE_ALIASES.get(problem_type, "general")
 
 
+def grafana_request_headers(api_key: str, org_id: int) -> dict[str, str]:
+    """Build valid Grafana headers for anonymous and authenticated benchmarks."""
+    headers = {"X-Grafana-Org-Id": str(org_id)}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 # ── CSV loader ──────────────────────────────────────────────────────────────
 
 
@@ -361,10 +369,7 @@ async def run_pipeline_validation(
     total = len(cases)
 
     async with httpx.AsyncClient(timeout=180) as client:
-        grafana_headers = {
-            "Authorization": f"Bearer {settings.grafana_api_key}",
-            "X-Grafana-Org-Id": str(settings.grafana_org_id),
-        }
+        grafana_headers = grafana_request_headers(settings.grafana_api_key, settings.grafana_org_id)
 
         for i, case in enumerate(cases, 1):
             t0 = time.monotonic()
@@ -421,6 +426,7 @@ async def run_pipeline_validation(
 
                 # Fetch dashboard JSON from Grafana to inspect panel queries
                 found_metrics: set[str] = set()
+                dashboard_fetch_error = ""
                 try:
                     dash_resp = await client.get(
                         f"{grafana_url}/api/dashboards/uid/{dashboard_uid}",
@@ -436,8 +442,32 @@ async def run_pipeline_validation(
                             for nested in panel.get("panels", []):
                                 for target in nested.get("targets", []):
                                     found_metrics.update(extract_metrics_from_expr(target.get("expr", "")))
-                except Exception:
-                    pass  # grafana fetch failure — metrics stay empty
+                    else:
+                        dashboard_fetch_error = (
+                            f"Grafana dashboard fetch HTTP {dash_resp.status_code}: {dash_resp.text[:200]}"
+                        )
+                except Exception as exc:
+                    dashboard_fetch_error = f"Grafana dashboard fetch failed: {exc}"
+
+                if dashboard_fetch_error:
+                    results.append(
+                        PipelineResult(
+                            prompt_id=case.prompt_id,
+                            expected_metrics=case.expected_metrics,
+                            found_metrics=[],
+                            missing_metrics=case.expected_metrics,
+                            extra_metrics=[],
+                            metric_recall=0.0,
+                            dashboard_url=dashboard_url,
+                            panel_count=panel_count,
+                            latency_ms=elapsed,
+                            error=dashboard_fetch_error,
+                            critical_metrics_expected=case.critical_metrics,
+                            critical_metrics_missing=case.critical_metrics,
+                        )
+                    )
+                    print(f"  [{i:3d}/{total}] ✗ {case.prompt_id}: {dashboard_fetch_error} ({elapsed:.0f}ms)")
+                    continue
 
                 expected_set = set(case.expected_metrics)
                 matched = fuzzy_metric_match(expected_set, found_metrics)
