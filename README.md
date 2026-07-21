@@ -185,16 +185,27 @@ tacit learn signalfx
 ```
 
 Bulk learning paginates backend dashboard listings and ingests dashboards with
-bounded concurrency. Inferred mappings start as reviewable candidates unless you
-choose to auto-approve them.
+bounded concurrency. Inferred mappings start as reviewable candidates. Controlled
+flows can request automated approval for eligible **signal mappings only**; this
+does not approve, register, or retrieve a generated archetype.
 
 The learning loop is intentionally conservative:
 
-- trusted dashboards teach Tacit the local telemetry vocabulary
+- trusted dashboards propose Tacit's local telemetry vocabulary
 - candidate mappings remain visible for review
-- approved mappings improve future metric selection
+- governed, eligible mappings improve future metric selection
 - rejected dashboards preserve negative examples
 - ignored dashboards do not create mappings
+
+Generated archetypes are not part of this normal learning loop. Generation is
+disabled by default. When explicitly enabled, output remains a quarantined
+experimental artifact and cannot modify the curated archetype registry or normal
+investigation retrieval. There is no auto-approval path for generated archetypes.
+The governing authority and containment boundary are recorded in
+[ADR-019](docs/adr/019-governed-knowledge-authority.md). Generated archetypes must
+prove unique value through side-effect-free shadow evaluation before Tacit builds
+any promotion lifecycle; see [ADR-020](docs/adr/020-generated-archetypes-shadow-before-lifecycle.md)
+and the [evaluation roadmap](docs/generated-archetype-evaluation-roadmap.md).
 
 ### Learn PagerDuty Incident History
 

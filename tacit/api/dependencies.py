@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import inspect
+import threading
 from collections.abc import Callable
-from dataclasses import replace
 from typing import Any
 
 from fastapi import Request
@@ -12,12 +12,39 @@ from fastapi import Request
 import tacit.pipeline as pipeline_mod
 from tacit.config import Settings, settings
 from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies
+from tacit.runtime_stores import RuntimeStores
+
+_APP_STORE_LOCK = threading.Lock()
 
 
-def _get_feedback_store():
-    from tacit import feedback
+def get_runtime_stores(request: Request) -> RuntimeStores:
+    """Return the persistence owner bound to this FastAPI application."""
+    state = request.app.state
+    existing = getattr(state, "runtime_stores", None)
+    if existing is not None:
+        return existing
+    with _APP_STORE_LOCK:
+        existing = getattr(state, "runtime_stores", None)
+        if existing is None:
+            runtime_settings = getattr(state, "settings", settings)
+            existing = RuntimeStores(runtime_settings)
+            state.runtime_stores = existing
+    return existing
 
-    return feedback.get_feedback_store()
+
+def get_history_store(request: Request) -> Any:
+    """Return one history store bound to this app's runtime settings."""
+    return get_runtime_stores(request).history()
+
+
+def get_feedback_store(request: Request) -> Any:
+    """Return one feedback store bound to this app's runtime settings."""
+    return get_runtime_stores(request).feedback()
+
+
+def get_signal_store(request: Request) -> Any:
+    """Return one bootstrapped signal store bound to this app's runtime settings."""
+    return get_runtime_stores(request).signals()
 
 
 def _backend_factory_for(runtime_settings: Settings) -> Callable[[], Any]:
@@ -47,9 +74,9 @@ def get_pipeline_dependencies(request: Request) -> PipelineDependencies:
     if sync is not None:
         sync()
     runtime_settings = getattr(request.app.state, "settings", settings)
-    return replace(
-        build_pipeline_dependencies(runtime_settings),
+    stores = get_runtime_stores(request)
+    return build_pipeline_dependencies(
+        runtime_settings,
+        stores=stores,
         backend_factory=_backend_factory_for(runtime_settings),
-        history_store_factory=pipeline_mod.get_investigation_store,
-        feedback_store_factory=_get_feedback_store,
     )

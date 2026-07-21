@@ -16,18 +16,23 @@ from tacit.models.schemas import (
     SignalType,
 )
 from tacit.pipeline.failures import PipelineFailureFactory
-from tacit.pipeline.runner import _get_semaphore
+from tacit.pipeline.runner import _get_semaphore, _initialize_signal_store
 from tacit.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history, safe_record_provenance
 from tacit.pipeline.stages.freeform import build_freeform_dashboard
 from tacit.pipeline.stages.intent import run_intent_stage
+from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE, resolve_signal_store
 
 
 class FakeRecorder:
     def __init__(self):
         self.finished: list[dict] = []
+        self.stages: list[tuple[str, str, str, dict]] = []
 
     def finish(self, **kwargs):
         self.finished.append(kwargs)
+
+    def stage(self, stage, status, reason_code, **details):
+        self.stages.append((stage, status, reason_code, details))
 
 
 class FakeHistoryStore:
@@ -153,6 +158,69 @@ def test_pipeline_failure_factory_records_finish():
     assert response.summary == "No data"
     assert recorder.finished[0]["status"] == "failed"
     assert recorder.finished[0]["error"] == "no data"
+
+
+def test_signal_store_initialization_failure_is_recorded_and_nonfatal():
+    recorder = FakeRecorder()
+    timings: dict[str, float] = {}
+    deps = PipelineDependencies(
+        settings=Settings(),
+        backend_factory=lambda: [],
+        history_store_factory=FakeHistoryStore,
+        feedback_store_factory=FakeFeedbackStore,
+        signal_store_factory=lambda: (_ for _ in ()).throw(OSError("signals database unavailable")),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    store = _initialize_signal_store(deps, recorder, timings)
+
+    assert store is SIGNAL_STORE_UNAVAILABLE
+    assert timings["signal_store_init"] >= 0
+    assert recorder.stages == [
+        (
+            "signal_store",
+            "skipped",
+            "signal_store_unavailable",
+            {"error_type": "OSError"},
+        )
+    ]
+
+
+def test_unavailable_signal_store_forbids_global_fallback():
+    fallback_calls = 0
+
+    def global_store():
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return object()
+
+    assert resolve_signal_store(SIGNAL_STORE_UNAVAILABLE, global_store) is None
+    assert fallback_calls == 0
+
+
+def test_none_returned_by_signal_store_factory_becomes_explicitly_unavailable():
+    recorder = FakeRecorder()
+    deps = PipelineDependencies(
+        settings=Settings(),
+        backend_factory=lambda: [],
+        history_store_factory=FakeHistoryStore,
+        feedback_store_factory=FakeFeedbackStore,
+        signal_store_factory=lambda: None,
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    store = _initialize_signal_store(deps, recorder, {})
+
+    assert store is SIGNAL_STORE_UNAVAILABLE
+    assert recorder.stages[0][2:] == ("signal_store_unavailable", {"error_type": "NoneReturned"})
+
+
+def test_omitted_signal_store_preserves_legacy_global_fallback():
+    fallback_store = object()
+
+    assert resolve_signal_store(None, lambda: fallback_store) is fallback_store
 
 
 async def test_build_freeform_dashboard_no_metrics_returns_failure():

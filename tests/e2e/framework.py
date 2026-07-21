@@ -9,6 +9,7 @@ means "did Tacit preserve the incident investigation path?" rather than
 from __future__ import annotations
 
 import itertools
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any
 
 import yaml
 
+from tacit.agents.providers.base import LLMProvider, LLMResult
 from tacit.backends.base import DashboardFeatures, DiscoveryStatus, PublishResult
 from tacit.dashboard_ingest import extract_metrics_from_promql
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
@@ -105,6 +107,91 @@ class CapturingBackend:
 
     async def close(self) -> None:
         return None
+
+
+class IncidentFixtureProvider(LLMProvider):
+    """Deterministic LLM substitute bounded to approved fixture metrics."""
+
+    def __init__(self, catalog: list[MetricEntry], approved_metrics: set[str], service: str):
+        self._catalog = [entry for entry in catalog if entry.name in approved_metrics]
+        self._service = service
+
+    async def chat_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.2,
+    ) -> LLMResult:
+        del user_prompt, temperature
+        if "Metrics Discovery Agent" in system_prompt:
+            return LLMResult(
+                json.dumps(
+                    {
+                        "metrics": [
+                            {
+                                "metric_name": entry.name,
+                                "datasource_uid": entry.datasource_uid,
+                                "datasource_name": entry.datasource_name,
+                                "datasource_type": entry.datasource_type,
+                                "query_language": entry.query_language,
+                                "namespace": entry.namespace,
+                                "relevance_reason": "Approved dashboard signal",
+                            }
+                            for entry in self._catalog
+                        ]
+                    }
+                )
+            )
+        if "Query Builder Agent" in system_prompt:
+            return LLMResult(
+                json.dumps(
+                    {
+                        "title": f"{self._service} incident investigation",
+                        "tags": ["incident", "approved-signals"],
+                        "timerange": "1h",
+                        "panels": [self._panel(entry) for entry in self._catalog],
+                    }
+                )
+            )
+        raise AssertionError("Unexpected agent prompt in incident fixture provider")
+
+    async def chat_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.3,
+    ) -> LLMResult:
+        del system_prompt, user_prompt, temperature
+        return LLMResult("")
+
+    def _panel(self, entry: MetricEntry) -> dict[str, Any]:
+        metric = entry.name
+        if metric.endswith("_bucket"):
+            expr = f'histogram_quantile(0.95, sum(rate({metric}{{service="{self._service}"}}[5m])) by (le))'
+            unit = "s"
+        elif metric.endswith("_total"):
+            expr = f'sum(rate({metric}{{service="{self._service}"}}[5m]))'
+            unit = "reqps"
+        else:
+            expr = f'{metric}{{service="{self._service}"}}'
+            unit = "bytes" if "memory" in metric else "short"
+        return {
+            "title": metric.replace("_", " ").title(),
+            "description": "Approved dashboard signal",
+            "panel_type": "timeseries",
+            "row": "Investigation",
+            "queries": [
+                {
+                    "expr": expr,
+                    "legend_format": self._service,
+                    "datasource_uid": entry.datasource_uid,
+                    "datasource_type": entry.datasource_type,
+                    "query_language": entry.query_language,
+                }
+            ],
+            "unit": unit,
+            "thresholds": [],
+        }
 
 
 def load_scenario(path: Path) -> dict[str, Any]:

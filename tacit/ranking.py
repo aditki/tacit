@@ -12,6 +12,9 @@ metrics that correlate with poorly-rated dashboards get demoted.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -26,12 +29,29 @@ MAX_LLM_CANDIDATES = 60
 # Cached metric quality scores from the feedback store.
 # Refreshed at most every 10 minutes to avoid hitting SQLite on every request.
 
-_metric_quality_cache: dict[str, float] = {}
-_metric_quality_expires: float = 0.0
+_metric_quality_caches: dict[tuple[str, str], tuple[float, dict[str, float]]] = {}
 _QUALITY_CACHE_TTL = 600  # seconds
 
 
-def _load_metric_quality() -> dict[str, float]:
+def _feedback_store_cache_key(store: Any) -> tuple[str, str]:
+    db_path = getattr(store, "_db_path", None)
+    if db_path is not None:
+        return "db_path", str(Path(db_path).expanduser().resolve())
+    return "instance", str(id(store))
+
+
+def invalidate_metric_quality_cache(store: Any | None = None) -> None:
+    """Invalidate feedback-derived ranking scores globally or for one store."""
+    if store is None:
+        _metric_quality_caches.clear()
+        return
+    _metric_quality_caches.pop(_feedback_store_cache_key(store), None)
+
+
+def _load_metric_quality(
+    feedback_store: Any | None = None,
+    feedback_store_factory: Callable[[], Any] | None = None,
+) -> dict[str, float]:
     """Load metric quality scores from feedback analysis.
 
     Returns a dict of {metric_name: quality_score} where:
@@ -39,27 +59,44 @@ def _load_metric_quality() -> dict[str, float]:
     - quality_score < 0.5 → metric appears more in poor dashboards (penalize)
     - quality_score = 0.5 → neutral (no data or balanced)
     """
-    global _metric_quality_cache, _metric_quality_expires
+    started_at = time.monotonic()
+    try:
+        if feedback_store is None:
+            if feedback_store_factory is not None:
+                feedback_store = feedback_store_factory()
+            else:
+                from tacit.feedback import get_feedback_store
 
+                feedback_store = get_feedback_store()
+    except Exception as exc:
+        logger.warning(
+            "metric_quality_store_unavailable",
+            error_type=type(exc).__name__,
+            latency_ms=round((time.monotonic() - started_at) * 1000, 1),
+            exc_info=True,
+        )
+        return {}
+
+    cache_key = _feedback_store_cache_key(feedback_store)
     now = time.monotonic()
-    if now < _metric_quality_expires and _metric_quality_cache:
-        return _metric_quality_cache
+    cached = _metric_quality_caches.get(cache_key)
+    if cached is not None and now < cached[0]:
+        logger.debug("metric_quality_cache_hit", count=len(cached[1]), store_scope=cache_key[0])
+        return cached[1]
 
     try:
-        from tacit.feedback import get_feedback_store
-
-        store = get_feedback_store()
-        report = store.analyze()
+        report = feedback_store.analyze()
         quality_list = report.get("metric_quality", [])
-        _metric_quality_cache = {m["metric"]: m["quality_score"] for m in quality_list}
-        _metric_quality_expires = now + _QUALITY_CACHE_TTL
-        if _metric_quality_cache:
-            logger.debug("metric_quality_loaded", count=len(_metric_quality_cache))
+        scores = {m["metric"]: m["quality_score"] for m in quality_list}
+        _metric_quality_caches[cache_key] = (now + _QUALITY_CACHE_TTL, scores)
+        if scores:
+            logger.debug("metric_quality_loaded", count=len(scores), store_scope=cache_key[0])
     except Exception:
-        _metric_quality_cache = {}
-        _metric_quality_expires = now + 60  # retry sooner on failure
+        scores = {}
+        _metric_quality_caches[cache_key] = (now + 60, scores)  # retry sooner on failure
+        logger.warning("metric_quality_load_failed", store_scope=cache_key[0], exc_info=True)
 
-    return _metric_quality_cache
+    return scores
 
 
 def _score_metric(
@@ -136,6 +173,9 @@ def prerank_metrics(
     intent: Intent,
     catalog: list[MetricEntry],
     max_candidates: int = MAX_LLM_CANDIDATES,
+    *,
+    feedback_store: Any | None = None,
+    feedback_store_factory: Callable[[], Any] | None = None,
 ) -> list[MetricEntry]:
     """Rank and truncate the metric catalog before sending to the LLM.
 
@@ -146,7 +186,7 @@ def prerank_metrics(
         return catalog
 
     # Load feedback quality scores (cached, lightweight)
-    feedback_scores = _load_metric_quality()
+    feedback_scores = _load_metric_quality(feedback_store, feedback_store_factory)
 
     scored = [
         (entry, _score_metric(entry.name, intent.keywords, intent.services, feedback_scores)) for entry in catalog

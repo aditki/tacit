@@ -269,6 +269,30 @@ def _snapshot_for(contract: InvestigationContract) -> InvestigationReplaySnapsho
     )
 
 
+def test_contract_preserves_the_frozen_environment_scope():
+    contract = InvestigationContractAssembler().from_pipeline(
+        investigation_id="inv_environment_scope",
+        revision=0,
+        parent_revision=None,
+        request=DashRequest(prompt="Investigate checkout in production", user_id="sdet"),
+        intent=Intent(
+            summary="Investigate checkout in production",
+            domain="application",
+            services=["checkout"],
+            environments=["production"],
+        ),
+        dashboard_spec=DashboardSpec(title="Checkout", panels=[]),
+        evidence_requirements=[],
+        evidence_resolutions=[],
+        evidence_observations=[],
+        culprit_ranking=CulpritRanking(),
+        dashboard_url="",
+        dashboard_uid="",
+    )
+
+    assert contract.request.scope.environments == ["production"]
+
+
 def test_contract_revision_survives_persist_load_serialize_deserialize_compare(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")

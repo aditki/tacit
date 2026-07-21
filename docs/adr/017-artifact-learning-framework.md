@@ -4,6 +4,9 @@
 
 Proposed
 
+ADR-019 constrains this decision: Operational IR outputs are candidate inputs. They may affect a normal investigation
+only through an eligible Operational Knowledge revision selected into the investigation's knowledge snapshot.
+
 ## Context
 
 Tacit learns from operational artifacts such as dashboards, alerts, runbooks, incidents, documentation, deployments,

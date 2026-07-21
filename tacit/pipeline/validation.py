@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import structlog
 
@@ -91,6 +91,7 @@ async def _preserve_symptom_evidence(
     evidence_requirements: list[EvidenceRequirement],
     evidence_resolutions: list[EvidenceResolution],
     record_stage: Callable[..., None],
+    signal_store: Any | None,
 ) -> tuple[DashboardSpec, DashboardSpec, int]:
     initial_observations = observe_evidence(
         evidence_requirements,
@@ -116,6 +117,7 @@ async def _preserve_symptom_evidence(
         catalog=catalog,
         target_language=target_language,
         timerange=pre_validation_spec.timerange,
+        signal_store=signal_store,
     )
     if not symptom_pre_validation_spec.panels:
         record_stage(
@@ -171,6 +173,7 @@ async def _preserve_gap_evidence(
     evidence_requirements: list[EvidenceRequirement],
     evidence_resolutions: list[EvidenceResolution],
     record_stage: Callable[..., None],
+    signal_store: Any | None,
 ) -> tuple[DashboardSpec, DashboardSpec, int]:
     gap_observations = observe_evidence(
         evidence_requirements,
@@ -198,6 +201,7 @@ async def _preserve_gap_evidence(
         catalog=catalog,
         target_language=target_language,
         timerange=pre_validation_spec.timerange,
+        signal_store=signal_store,
     )
     if not gap_pre_validation_spec.panels:
         record_stage(
@@ -294,6 +298,7 @@ async def validate_dashboard_and_evidence(
     target_language: str,
     ranked_archetypes_present: bool,
     record_stage: Callable[..., None],
+    signal_store: Any | None = None,
 ) -> ValidationEvidenceResult:
     """Validate dashboard queries and preserve critical evidence when possible."""
     panels_before = len(dashboard_spec.panels)
@@ -313,6 +318,7 @@ async def validate_dashboard_and_evidence(
             evidence_requirements=evidence_requirements,
             evidence_resolutions=evidence_resolutions,
             record_stage=record_stage,
+            signal_store=signal_store,
         )
         pre_validation_spec, dashboard_spec, panels_before = await _preserve_gap_evidence(
             primary=primary,
@@ -326,6 +332,7 @@ async def validate_dashboard_and_evidence(
             evidence_requirements=evidence_requirements,
             evidence_resolutions=evidence_resolutions,
             record_stage=record_stage,
+            signal_store=signal_store,
         )
 
     validation_status, validation_reason = _validation_status(panels_before, len(dashboard_spec.panels))

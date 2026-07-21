@@ -94,8 +94,11 @@ services:
       GRAFANA_URL: http://gamma-grafana:3000
       GRAFANA_PUBLIC_URL: http://localhost:3001
       SSL_CERT_FILE: ""
-      LEARNING_AUTO_REGISTER_ARCHETYPE: "true"
-      TACIT_ARCHETYPES_PATH: /app/data/gamma-archetypes.yaml
+      LEARNED_ARCHETYPES_GENERATION_ENABLED: "false"
+      LEARNED_ARCHETYPES_AUTOMATIC_REGISTRATION_ENABLED: "false"
+      LEARNED_ARCHETYPES_NORMAL_RETRIEVAL_ENABLED: "false"
+      LEARNED_ARCHETYPES_RETRIEVAL_MODE: curated_only
+      LEARNED_ARCHETYPES_QUARANTINE_PATH: /app/data/generated_archetypes/quarantine
     volumes:
       - gamma_tacit_data:/app/data
     depends_on:
@@ -116,9 +119,11 @@ services:
       # the Docker-network hostname above.
       GRAFANA_PUBLIC_URL: http://localhost:3000
       SSL_CERT_FILE: ""
-      # The demo intentionally proves the review -> reuse loop in one session.
-      LEARNING_AUTO_REGISTER_ARCHETYPE: "true"
-      TACIT_ARCHETYPES_PATH: /app/data/demo-archetypes.yaml
+      LEARNED_ARCHETYPES_GENERATION_ENABLED: "false"
+      LEARNED_ARCHETYPES_AUTOMATIC_REGISTRATION_ENABLED: "false"
+      LEARNED_ARCHETYPES_NORMAL_RETRIEVAL_ENABLED: "false"
+      LEARNED_ARCHETYPES_RETRIEVAL_MODE: curated_only
+      LEARNED_ARCHETYPES_QUARANTINE_PATH: /app/data/generated_archetypes/quarantine
     volumes:
       - tacit_data:/app/data
     depends_on:

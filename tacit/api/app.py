@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from tacit import __version__
 from tacit.config import Settings
 from tacit.config import settings as default_settings
+from tacit.runtime_stores import RuntimeStores
 
 LifespanFactory = Any
 
@@ -32,7 +33,7 @@ OPENAPI_TAGS = [
     {
         "name": "Archetypes",
         "description": "View and manage investigation archetype templates. "
-        "Archetypes are loaded from packaged data or `TACIT_ARCHETYPES_PATH` "
+        "Curated archetypes are loaded from packaged data or `TACIT_ARCHETYPES_PATH` "
         "and can be hot-reloaded without restart.",
     },
     {
@@ -45,7 +46,8 @@ OPENAPI_TAGS = [
         "name": "Learning",
         "description": "Learn operational patterns from trusted dashboards and alerts. "
         "Ingests dashboards, extracts metric co-occurrence, panel groupings, "
-        "and aggregation patterns, then infers signal mappings.",
+        "and aggregation patterns, then proposes governed signal mappings. "
+        "Generated archetype output is quarantined and disabled by default.",
     },
     {
         "name": "System",
@@ -64,7 +66,8 @@ DESCRIPTION = (
     "### Key capabilities\n"
     "- **Investigation generation** — describe the incident, get validated evidence artifacts\n"
     "- **Feedback loop** — rate dashboards, and the system automatically improves metric selection\n"
-    "- **Archetype management** — edit investigation templates via YAML, hot-reload without restart\n\n"
+    "- **Curated archetype management** — edit operator-authored templates via YAML and hot-reload without restart; "
+    "generated output remains quarantined\n\n"
     "### Authentication\n"
     "When `API_AUTH_ENABLED=true`, pass your key via the `X-API-Key` header. "
     "When disabled (default for development), all endpoints are open.\n\n"
@@ -95,6 +98,7 @@ def create_app(
         openapi_tags=OPENAPI_TAGS,
     )
     app.state.settings = runtime_settings
+    app.state.runtime_stores = RuntimeStores(runtime_settings)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

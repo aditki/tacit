@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from typing import Any
 
 from tacit.archetypes.schema import InvestigationArchetype
 from tacit.catalog import catalog_for_services
@@ -28,6 +29,7 @@ from tacit.models.schemas import (
     Intent,
     MetricEntry,
 )
+from tacit.signals.availability import resolve_signal_store
 
 _METRIC_TOKEN_CHARS = r"A-Za-z0-9_:."
 _PROMETHEUS_HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
@@ -145,6 +147,7 @@ def resolve_requirements_for_archetype(
     catalog: list[MetricEntry],
     *,
     target_language: str = "promql",
+    signal_store: Any | None = None,
 ) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
     """Resolve one archetype's evidence needs against the live catalog."""
     from tacit.archetypes.engine import (
@@ -169,10 +172,7 @@ def resolve_requirements_for_archetype(
         if entry.name:
             catalog_by_name[entry.name].append(entry)
 
-    try:
-        store = get_signal_store()
-    except Exception:
-        store = None
+    store = resolve_signal_store(signal_store, get_signal_store)
 
     resolutions: list[EvidenceResolution] = []
 
@@ -313,6 +313,7 @@ def resolve_requirements_for_archetypes(
     catalog: list[MetricEntry],
     *,
     target_language: str = "promql",
+    signal_store: Any | None = None,
 ) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
     """Resolve evidence needs for all selected archetypes."""
     requirements: list[EvidenceRequirement] = []
@@ -323,6 +324,7 @@ def resolve_requirements_for_archetypes(
             intent,
             catalog,
             target_language=target_language,
+            signal_store=signal_store,
         )
         requirements.extend(arch_requirements)
         resolutions.extend(arch_resolutions)

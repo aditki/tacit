@@ -15,6 +15,8 @@ import yaml
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from tacit.archetypes.generated.schema import ArchetypeRetrievalMode
+
 # ── Config file discovery ──────────────────────────────────────────────────
 # Priority: TACIT_CONFIG env var → ./tacit.yaml → ./tacit.yml → None
 
@@ -151,9 +153,27 @@ class Settings(BaseSettings):
     learned_archetype_min_coverage: float = 0.75
     learned_archetype_boost: float = 0.15
 
-    # Dashboard ingestion / learning
-    # When True, approving an ingested dashboard also writes its generated
-    # archetype into TACIT_ARCHETYPES_PATH and hot-reloads (compounding).
+    # SQLite storage. Empty values preserve the built-in data/*.db defaults;
+    # configured paths may be relative to the process working directory or absolute.
+    history_db_path: str = ""
+    feedback_db_path: str = ""
+    signals_db_path: str = ""
+
+    # Generated archetypes are experimental artifacts, never curated registry
+    # entries. Generation, quarantine persistence, and explicit experimental
+    # retrieval are separate controls and are all disabled by default.
+    learned_archetypes_generation_enabled: bool = False
+    # Legacy compatibility name. This can permit quarantine writes only; direct
+    # registration into the curated registry has been removed.
+    learned_archetypes_automatic_registration_enabled: bool = False
+    learned_archetypes_normal_retrieval_enabled: bool = False
+    learned_archetypes_retrieval_mode: ArchetypeRetrievalMode = ArchetypeRetrievalMode.CURATED_ONLY
+    learned_archetypes_quarantine_path: str = "data/generated_archetypes/quarantine"
+    learned_archetypes_generation_version: str = "generated-archetype-v1"
+    learned_archetypes_tenant_id: str = "default"
+
+    # Deprecated compatibility input. It is intentionally ignored so an old
+    # deployment cannot restore direct writes into TACIT_ARCHETYPES_PATH.
     learning_auto_register_archetype: bool = False
 
     # Local benchmark result storage. Raw result files may contain fixture

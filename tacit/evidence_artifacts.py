@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from tacit.catalog import catalog_for_services
 from tacit.evidence import SUPPORTED_OBSERVATION
@@ -17,6 +18,7 @@ from tacit.models.schemas import (
     PanelQuery,
     PanelSpec,
 )
+from tacit.signals.availability import resolve_signal_store
 
 _SYMPTOM_SIGNAL_PANELS = {
     "request_latency": ("Observed Request Latency", "Application request timing evidence", "s"),
@@ -291,6 +293,7 @@ def build_symptom_evidence_dashboard(
     catalog: list[MetricEntry],
     target_language: str,
     timerange: str,
+    signal_store: Any | None = None,
 ) -> tuple[DashboardSpec, list[EvidenceResolution]]:
     """Build direct, validation-gated panels for observed application symptoms."""
     resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
@@ -306,6 +309,7 @@ def build_symptom_evidence_dashboard(
                 intent,
                 catalog,
                 target_language=target_language,
+                signal_store=signal_store,
             )
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             continue
@@ -372,6 +376,7 @@ def build_evidence_gap_dashboard(
     catalog: list[MetricEntry],
     target_language: str,
     timerange: str,
+    signal_store: Any | None = None,
 ) -> tuple[DashboardSpec, list[EvidenceResolution]]:
     """Build validation-gated panels for supported observations found while closing evidence gaps."""
     resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
@@ -395,6 +400,7 @@ def build_evidence_gap_dashboard(
                 intent,
                 catalog,
                 target_language=target_language,
+                signal_store=signal_store,
             )
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             continue
@@ -524,14 +530,14 @@ def _resolve_direct_symptom_evidence(
     catalog: list[MetricEntry],
     *,
     target_language: str,
+    signal_store: Any | None = None,
 ) -> EvidenceResolution | None:
     """Resolve symptom evidence for direct observation panels."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal
     from tacit.signals import get_signal_store
 
-    try:
-        store = get_signal_store()
-    except Exception:
+    store = resolve_signal_store(signal_store, get_signal_store)
+    if store is None:
         return None
 
     target_catalog = [
@@ -581,14 +587,14 @@ def _resolve_evidence_gap_observation(
     catalog: list[MetricEntry],
     *,
     target_language: str,
+    signal_store: Any | None = None,
 ) -> EvidenceResolution | None:
     """Resolve an evidence gap only when ownership is specific enough to observe safely."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal
     from tacit.signals import get_signal_store
 
-    try:
-        store = get_signal_store()
-    except Exception:
+    store = resolve_signal_store(signal_store, get_signal_store)
+    if store is None:
         return None
 
     target_catalog = [

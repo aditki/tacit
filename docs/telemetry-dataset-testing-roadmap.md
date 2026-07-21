@@ -159,7 +159,9 @@ The synthetic benchmark's 90% top-1 archetype accuracy is credible for classific
 - Use metric metadata, units, labels, and OTel scope to improve semantic inference.
 - Add explicit cache signals: size, hit ratio, misses, evictions, memory pressure, client pressure.
 - Rank archetypes by live metric coverage before blending them.
-- Prefer a strongly matching learned archetype over numerous generic templates.
+- Keep generated archetypes out of normal retrieval. Evaluate exact-scope candidates
+  only through the side-effect-free shadow path defined by
+  [ADR-020](adr/020-generated-archetypes-shadow-before-lifecycle.md).
 - Cap irrelevant archetype blending and panel count.
 - Ensure summaries describe only surviving panels and datasources.
 - Validate each query independently, not merely whether one query in a panel returns data.

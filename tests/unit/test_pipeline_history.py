@@ -25,6 +25,7 @@ from tacit.pipeline import (
     _history_signals,
     _semantic_mapping_diagnostics,
 )
+from tacit.pipeline.validation import validate_dashboard_and_evidence
 from tacit.signals import SignalStore
 
 
@@ -86,9 +87,29 @@ def test_history_archetypes_include_selected_learned_matches():
 
     assert records[0]["type"] == "learned_falco_memory"
     assert records[0]["source"] == "learned"
+    assert records[0]["retrieval_source"] == "curated_context"
+    assert records[0]["template_origin"] == "curated"
     assert records[0]["selected"] is True
     assert records[0]["signals"] == ["container_memory_usage", "pod_memory_pressure"]
     assert records[1]["type"] == "resource_saturation"
+
+
+def test_history_archetypes_record_exact_scope_generated_matches_as_shadow_only():
+    generated = _arch("checkout_generated")
+
+    records = _history_archetypes(
+        [],
+        selected_archetypes=[],
+        learned_archetypes=[],
+        shadow_archetypes=[(generated, 1.0)],
+    )
+
+    assert records[0]["source"] == "generated"
+    assert records[0]["retrieval_source"] == "experimental_exact_scope_shadow"
+    assert records[0]["template_origin"] == "generated"
+    assert records[0]["selected"] is False
+    assert records[0]["shadow_only"] is True
+    assert records[0]["output_applied"] is False
 
 
 def test_history_signals_include_semantic_archetype_signals():
@@ -258,7 +279,10 @@ def test_symptom_evidence_dashboard_does_not_promote_resource_evidence():
 def test_symptom_evidence_dashboard_resolves_direct_latency_when_template_shape_fails(monkeypatch, tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr(
+        "tacit.signals.get_signal_store",
+        lambda: (_ for _ in ()).throw(AssertionError("global signal store was consulted")),
+    )
     archetype = InvestigationArchetype(
         id="latency_investigation",
         name="Latency Investigation",
@@ -298,6 +322,7 @@ def test_symptom_evidence_dashboard_resolves_direct_latency_when_template_shape_
         catalog=[_metric("gamma_request_latency_seconds")],
         target_language="promql",
         timerange="15m",
+        signal_store=store,
     )
 
     assert [panel.title for panel in dashboard.panels] == ["Observed Request Latency"]
@@ -1074,7 +1099,10 @@ def testmissing_critical_symptom_requirements_treats_signalfx_exists_as_surfaced
 def test_evidence_gap_dashboard_resolves_supported_resource_observation(monkeypatch, tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
-    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    monkeypatch.setattr(
+        "tacit.signals.get_signal_store",
+        lambda: (_ for _ in ()).throw(AssertionError("global signal store was consulted")),
+    )
     archetype = _arch(
         "resource_saturation",
         required_signals=["cpu_usage"],
@@ -1111,6 +1139,7 @@ def test_evidence_gap_dashboard_resolves_supported_resource_observation(monkeypa
         ],
         target_language="promql",
         timerange="15m",
+        signal_store=store,
     )
 
     assert dashboard.tags == ["tacit", "evidence", "gap-observation"]
@@ -1131,6 +1160,70 @@ def test_evidence_gap_dashboard_resolves_supported_resource_observation(monkeypa
     assert "culprit" not in panel_text
     assert "root cause" not in panel_text
     assert "caused by" not in panel_text
+
+
+async def test_validation_rescue_uses_the_scoped_signal_store(monkeypatch, tmp_path):
+    store = SignalStore(db_path=tmp_path / "scoped-signals.db")
+    store.load_from_yaml()
+    monkeypatch.setattr(
+        "tacit.signals.get_signal_store",
+        lambda: (_ for _ in ()).throw(AssertionError("global signal store was consulted")),
+    )
+    archetype = _arch(
+        "latency_and_cpu",
+        required_signals=["request_latency", "cpu_usage"],
+        signal_bindings={
+            "request_latency": "http_request_duration_seconds",
+            "cpu_usage": "container_cpu_usage_seconds_total",
+        },
+    )
+    intent = Intent(
+        summary="checkout latency and resource pressure",
+        domain="application",
+        services=["checkout"],
+        signals=[SignalType.METRICS],
+        keywords=["latency", "cpu"],
+        problem_type="latency_and_cpu",
+    )
+    requirements = requirements_for_archetype(archetype, intent)
+    resolutions = [
+        EvidenceResolution(
+            requirement_id=requirement.id,
+            status="unresolved",
+            reason_code="no_compatible_live_signal",
+        )
+        for requirement in requirements
+    ]
+    catalog = [
+        _metric("gamma_request_latency_seconds", dimensions=["service={checkout}"]),
+        _metric(
+            "gamma_container_cpu_usage_seconds_total",
+            dimensions=["service={checkout}"],
+            metric_type="counter",
+        ),
+    ]
+
+    class _PassThroughBackend:
+        async def validate_queries(self, dashboard, _catalog):
+            return dashboard, []
+
+    result = await validate_dashboard_and_evidence(
+        primary=_PassThroughBackend(),
+        dashboard_spec=DashboardSpec(title="Initial", panels=[]),
+        catalog=catalog,
+        evidence_requirements=requirements,
+        evidence_resolutions=resolutions,
+        intent=intent,
+        target_language="promql",
+        ranked_archetypes_present=True,
+        record_stage=lambda *_args, **_kwargs: None,
+        signal_store=store,
+    )
+
+    assert {panel.title for panel in result.dashboard_spec.panels} == {
+        "Observed Request Latency",
+        "Supported CPU Observation",
+    }
 
 
 def test_evidence_gap_dashboard_marks_reused_primary_resolution_as_gap():

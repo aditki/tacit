@@ -23,6 +23,8 @@ Return a JSON object with these fields:
 - "summary": one-line restatement of the problem
 - "domain": one of "infrastructure", "application", "network", "database", "messaging", "general"
 - "services": list of service or component names mentioned (empty list if none)
+- "environments": list of deployment environments explicitly mentioned, preserving the user's names
+  (e.g. ["production", "us-east-prod"]); do not infer one when none is stated
 - "signals": list of signal types to explore; choose from ["metrics", "logs", "traces"]
 - "keywords": list of observability keywords to use for metric search
   (e.g. "latency", "error_rate", "cpu", "memory", "disk", "requests", "5xx",
@@ -152,7 +154,7 @@ async def classify_intent(
     #    keywords (high precision, dataset-independent).
     #  - COLLOQUIAL metaphors are kept only as scored evidence with provenance;
     #    they are advisory and must be confirmed downstream against live metric
-    #    coverage or a learned archetype, never trusted on their own.
+    #    coverage or governed Operational Knowledge, never trusted on their own.
     intent.keywords = expand_operational_terms(prompt, intent.keywords)
     intent.keyword_evidence = [e.as_dict() for e in operational_evidence(prompt)]
 
@@ -170,6 +172,7 @@ async def classify_intent(
         domain=intent.domain,
         keywords=intent.keywords,
         services=intent.services,
+        environments=intent.environments,
         archetypes=[(a.type, a.confidence) for a in intent.archetypes],
     )
     return intent, usage

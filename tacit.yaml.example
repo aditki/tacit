@@ -65,6 +65,26 @@ adapter:
 # ── Metrics ──────────────────────────────────────────────────────────────────
 max_metric_catalog_size: 300   # total metrics across all datasources sent to LLM
 
+# ── SQLite Storage ───────────────────────────────────────────────────────────
+history:
+  db_path: data/tacit_history.db
+feedback:
+  db_path: data/tacit_feedback.db
+signals:
+  db_path: data/tacit_signals.db
+
+# ── Generated Archetypes (experimental) ─────────────────────────────────────
+# These controls are intentionally independent. Generated output is quarantined
+# and is never written into the curated system archetype registry.
+learned_archetypes:
+  generation_enabled: false
+  automatic_registration_enabled: false  # legacy name; permits quarantine persistence only
+  normal_retrieval_enabled: false
+  retrieval_mode: curated_only
+  quarantine_path: data/generated_archetypes/quarantine
+  generation_version: generated-archetype-v1
+  tenant_id: default
+
 # ── HTTP API Auth ────────────────────────────────────────────────────────────
 api:
   auth_enabled: false          # set true to require X-API-Key header

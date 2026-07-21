@@ -39,7 +39,7 @@ _SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 def _db_path() -> Path:
     """Resolve DB path from settings or default."""
-    custom = getattr(settings, "feedback_db_path", None)
+    custom = settings.feedback_db_path
     path = Path(custom) if custom else _DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     return path

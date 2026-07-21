@@ -69,11 +69,16 @@ A critical signal counts as "resolved" only if it passes all three validation ch
 Cold and learned recall are different experiments and must not share state. Before every **cold** run the harness must reset, to a known baseline:
 
 - the signal mapping store (`signals.py` SQLite) back to the packaged `signals.yaml` only — no learned mappings;
-- runtime/learned archetypes (`archetypes/templates.py` registered-from-ingest entries) back to the packaged set;
+- the curated archetype registry back to the packaged set;
+- the generated-archetype quarantine to an empty test directory, with generation and experimental retrieval disabled;
 - the LLM/discovery cache (`cache.py`) and metric catalog cache;
 - the investigation history and feedback/provenance stores (`history.py`, `feedback.py`), since ranking reads metric quality from feedback.
 
 During ClickStack testing, repeated runs contaminated the baseline precisely because these stores accumulate across runs. Learned runs then start from a defined teaching step (a specified set of approved dashboards) so the learned baseline is reproducible rather than path-dependent.
+Generated archetypes are not a learned-run input. They may be evaluated only as a
+side-effect-free shadow comparison and cannot contribute to the normal cold or
+learned release gates. See [ADR-020](adr/020-generated-archetypes-shadow-before-lifecycle.md)
+and the [Generated Archetype Evaluation Roadmap](generated-archetype-evaluation-roadmap.md).
 
 ### Repeated trials and variance
 
@@ -108,7 +113,7 @@ evaluation must introduce new incident-level holdouts before changes are made.
 | Cache size, eviction, memory, and client pressure were unmapped | Explicit semantic signals and mappings exist in both packaged and repository `signals.yaml` |
 | Resolution used metric names only | `MetricEntry` carries unit/type/namespace/dimensions; `resolve_signal` applies metadata compatibility |
 | Archetype blending produced 20+ panels | Live-coverage ranking, secondary coverage threshold, archetype cap, panel cap, and query-signature dedup are enforced |
-| Generic templates outranked a strong learned match | Strongly covered learned archetypes receive a bounded preference after live-coverage scoring |
+| Generic templates outranked a generated learned match | Historical pre-containment fix; generated archetypes are now excluded from normal retrieval by ADR-019 |
 | One valid query kept fabricated siblings | Validation now evaluates and drops each query independently |
 | Datasource summaries described discarded candidates | Summary datasource names are derived only from surviving panel queries |
 
@@ -135,12 +140,13 @@ remain unlabeled and unmeasured.
 ### Critical-signal recall — cold ≥75%, learned ≥90%
 
 **Offline resolvability proxy passing; end-to-end gate pending.** Cold and separately
-taught runtimes map all fixture critical signals (ClickStack 7/7, LO2 5/5, GAMMA 4/4), and
-strongly covered learned archetypes win the selection check. The remaining code
-risk is exact-default short-circuiting: a catalog metric can exist but return no
-data while a better semantic alias is never attempted. Because the offline harness
-does not prove expected-UID routing or data in-window, it does not by itself satisfy
-the formal critical-signal recall gate.
+taught runtimes map all fixture critical signals (ClickStack 7/7, LO2 5/5, GAMMA
+4/4). Learned-mode evaluation now measures governed signal mappings while holding
+the curated archetype registry constant. Generated archetypes are excluded from
+this gate. The remaining code risk is exact-default short-circuiting: a catalog
+metric can exist but return no data while a better semantic alias is never
+attempted. Because the offline harness does not prove expected-UID routing or data
+in-window, it does not by itself satisfy the formal critical-signal recall gate.
 
 ### Correct datasource routing 100%
 
@@ -366,9 +372,11 @@ result, not evidence that the complete source datasets are perfectly classified.
 | GAMMA | holdout | 4/4 | 1.00 | cold ≥75% |
 
 The same critical signals are also 7/7, 5/5, and 4/4 in separately created taught
-runtimes. The learned-selection check prefers a strongly covered learned archetype
-over a higher raw-confidence generic template for all three slices, while weakly
-covered learned templates receive no preference.
+runtimes. A legacy pre-containment selection check also preferred a strongly
+covered generated archetype over a higher raw-confidence generic template for all
+three slices. That result is retained as historical evidence only: ADR-019 removed
+generated archetypes from normal retrieval, so it no longer contributes to the
+learned release gate.
 
 **What this run caught (the overfitting guard working).** The first run scored
 ClickStack offline critical-signal resolvability at **3/7** while both synthetic holdouts passed —

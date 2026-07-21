@@ -1,15 +1,38 @@
-"""Generate learned archetypes from parsed dashboard features."""
+"""Generate quarantined experimental archetype candidates from dashboard features."""
 
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 import yaml
 
+from tacit.archetypes.generated.schema import (
+    GeneratedArchetypeOrigin,
+    GeneratedArchetypeStatus,
+    normalize_environment_ref,
+    normalize_service_ref,
+    normalize_tenant_id,
+)
 from tacit.query_parsing.languages import datasource_type_to_language, language_to_datasource_type
 
 _TEMPLATE_PLACEHOLDER_NAMES = ("service_filter", "container_filter", "rate_interval")
+_SERVICE_LABEL_PATTERN = re.compile(
+    r'\b(?:service|service_name|app|application|component)\s*(=~|=)\s*["\']([^"\']+)["\']',
+    re.I,
+)
+_REGEX_META_PATTERN = re.compile(r"[.*+?()\[\]{}|^$\\]")
+_SIGNALFLOW_SERVICE_PATTERN = re.compile(
+    r"\bfilter\(\s*['\"](?:service|service_name|app|application|component)['\"]\s*,\s*['\"]([^'\"]+)['\"]",
+    re.I,
+)
+_GRAFANA_VARIABLE_PATTERN = re.compile(r"(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\[\[[^\]]+\]\])")
+
+
+def _is_resolved_scope_value(value: object) -> bool:
+    """Return false for Grafana template variables that have no concrete scope."""
+    return bool(value) and not _GRAFANA_VARIABLE_PATTERN.search(str(value))
 
 
 def escape_literal_braces(expr: str) -> str:
@@ -37,8 +60,17 @@ def generate_archetype_yaml(
     extracted: dict[str, Any],
     signals: list[dict[str, Any]],
     archetype_id: str = "",
+    *,
+    tenant_id: str = "",
+    service_refs: list[str] | None = None,
+    environment_refs: list[str] | None = None,
+    archetype_kind: str = "investigation_dashboard",
+    generation_version: str = "generated-archetype-v1",
+    generation_run_id: str = "",
+    source_refs: list[str] | None = None,
+    created_at: datetime | None = None,
 ) -> str:
-    """Generate an archetype YAML snippet from extracted dashboard features."""
+    """Generate a quarantined artifact candidate, never a curated template."""
     title = extracted["dashboard_title"]
     if not archetype_id:
         archetype_id = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
@@ -106,6 +138,37 @@ def generate_archetype_yaml(
                 panel_def["description"] = panel["description"]
             panels.append(panel_def)
 
+    explicit_services = list(service_refs or [])
+    if not explicit_services:
+        explicit_services = [
+            str(service) for signal in signals for service in (signal.get("services", []) or []) if service
+        ]
+    for panel in extracted.get("panels", []):
+        for query in panel.get("queries", []) or []:
+            if not isinstance(query, str):
+                continue
+            for operator, value in _SERVICE_LABEL_PATTERN.findall(query):
+                if operator == "=~" and _REGEX_META_PATTERN.search(value):
+                    continue
+                explicit_services.append(value)
+            explicit_services.extend(_SIGNALFLOW_SERVICE_PATTERN.findall(query))
+        for target in panel.get("cloudwatch_targets", []) or []:
+            for name, value in (target.get("dimensions", {}) or {}).items():
+                if name.casefold() not in {"service", "service_name", "app", "application", "component"}:
+                    continue
+                if isinstance(value, list):
+                    explicit_services.extend(str(item) for item in value)
+                elif value:
+                    explicit_services.append(str(value))
+    explicit_environments = list(environment_refs or [])
+    for tag in extracted.get("dashboard_tags", []):
+        match = re.match(r"^(?:service|service_name|app|application|component)\s*[:=]\s*(.+)$", tag, re.I)
+        if match:
+            explicit_services.append(match.group(1))
+        environment_match = re.match(r"^(?:environment|env)\s*[:=]\s*(.+)$", tag, re.I)
+        if environment_match:
+            explicit_environments.append(environment_match.group(1))
+
     archetype = {
         "id": archetype_id,
         "name": title,
@@ -117,6 +180,24 @@ def generate_archetype_yaml(
         "tags": list(dict.fromkeys(extracted.get("dashboard_tags", []) + ["auto-generated", "learned"])),
         "default_timerange": "1h",
         "panels": panels,
+        "origin": GeneratedArchetypeOrigin.GENERATED_EXPERIMENTAL.value,
+        "retrieval_status": GeneratedArchetypeStatus.QUARANTINED.value,
+        "tenant_id": normalize_tenant_id(tenant_id),
+        "service_refs": sorted(
+            {
+                ref
+                for value in explicit_services
+                if _is_resolved_scope_value(value) and (ref := normalize_service_ref(value))
+            }
+        ),
+        "environment_refs": sorted(
+            {ref for value in explicit_environments if (ref := normalize_environment_ref(value))}
+        ),
+        "archetype_kind": archetype_kind,
+        "generation_version": generation_version,
+        "generation_run_id": generation_run_id,
+        "source_refs": list(dict.fromkeys(source_refs or [])),
+        "created_at": (created_at or datetime.now(UTC)).isoformat(),
     }
 
     return yaml.dump(

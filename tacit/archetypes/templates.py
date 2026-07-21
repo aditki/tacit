@@ -418,6 +418,20 @@ _DEFAULT_YAML_PATHS = [
     Path("archetypes.yaml"),  # cwd
 ]
 
+_GENERATED_TAGS = {"learned", "auto-generated"}
+
+
+def _is_generated_entry(entry: object) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    origin = str(entry.get("origin", ""))
+    tags = {str(tag) for tag in entry.get("tags", []) or []}
+    return origin == "generated_experimental" or _GENERATED_TAGS <= tags
+
+
+def _is_generated_archetype(archetype: InvestigationArchetype) -> bool:
+    return _GENERATED_TAGS <= set(archetype.tags)
+
 
 def _load_archetypes_from_yaml(path: Path) -> list[InvestigationArchetype]:
     """Parse archetypes.yaml into InvestigationArchetype objects."""
@@ -438,7 +452,11 @@ def _load_archetypes_from_data(data: object) -> list[InvestigationArchetype]:
         raise ValueError("archetype YAML must define at least one archetype")
 
     archetypes = []
+    generated_ids: list[str] = []
     for entry in raw_archetypes:
+        if _is_generated_entry(entry):
+            generated_ids.append(str(entry.get("id", "unknown")))
+            continue
         panels = []
         for p in entry.get("panels", []):
             queries = [
@@ -477,6 +495,12 @@ def _load_archetypes_from_data(data: object) -> list[InvestigationArchetype]:
                 tags=entry.get("tags", []),
                 default_timerange=entry.get("default_timerange", "1h"),
             )
+        )
+    if generated_ids:
+        logger.warning(
+            "generated_archetypes_excluded_from_curated_registry",
+            count=len(generated_ids),
+            archetype_ids=sorted(generated_ids),
         )
     if not archetypes:
         raise ValueError("archetype YAML did not load any archetypes")
@@ -557,19 +581,19 @@ ALL_ARCHETYPES, _ARCHETYPE_BY_PROBLEM = _build_registry()
 
 
 def reload_archetypes() -> None:
-    """Hot-reload archetypes from YAML. Call after editing the configured override."""
+    """Hot-reload curated archetypes after editing the configured YAML override."""
     global ALL_ARCHETYPES, _ARCHETYPE_BY_PROBLEM
     ALL_ARCHETYPES, _ARCHETYPE_BY_PROBLEM = _build_registry()
     logger.info("archetypes_reloaded", count=len(ALL_ARCHETYPES))
 
 
 def append_archetype_to_yaml(archetype_yaml: str, path: Path | None = None) -> Path | None:
-    """Merge a generated archetype into the active override file, then reload.
+    """Merge curated operator-authored archetypes into an override, then reload.
 
     De-dupes by archetype ``id`` (an existing id is overwritten). Returns the
     path written, or ``None`` if no writable override is configured — we never
-    write into the packaged read-only archetypes, so this needs
-    ``TACIT_ARCHETYPES_PATH`` (or an explicit ``path``).
+    write into packaged read-only archetypes. Generated artifacts are rejected;
+    they belong in the separate quarantine store.
     """
     import yaml
 
@@ -582,6 +606,9 @@ def append_archetype_to_yaml(archetype_yaml: str, path: Path | None = None) -> P
     new_items = new_doc.get("archetypes", []) or []
     if not new_items:
         return None
+    generated_ids = [str(item.get("id", "unknown")) for item in new_items if _is_generated_entry(item)]
+    if generated_ids:
+        raise ValueError("Generated archetypes cannot enter the curated registry: " + ", ".join(sorted(generated_ids)))
 
     def _seed_archetypes() -> list[dict]:
         return [arch.model_dump(mode="python") for arch in ALL_ARCHETYPES]
@@ -600,6 +627,7 @@ def append_archetype_to_yaml(archetype_yaml: str, path: Path | None = None) -> P
         if aid in by_id:
             items[by_id[aid]] = arch  # overwrite same id
         else:
+            by_id[aid] = len(items)
             items.append(arch)
     existing["archetypes"] = items
 
@@ -657,18 +685,18 @@ def get_archetypes_by_learning_context(
     min_confidence: float = 0.35,
     exclude_ids: set[str] | None = None,
 ) -> list[tuple[InvestigationArchetype, float]]:
-    """Retrieve archetypes by learned signal/metric overlap.
+    """Retrieve curated archetypes by deterministic signal/metric overlap.
 
     The intent classifier only knows labels it was trained/prompted to emit.
-    Generated archetypes from dashboard ingestion may have environment-specific
-    problem types, so we add a deterministic retrieval pass based on:
+    This supplements classifier labels with a deterministic retrieval pass based
+    on:
 
     - prompt/intent text overlap with archetype ids, tags, problem types, and
       required signals
     - live catalog metric overlap with required_metrics and signal_bindings
 
-    This lets approved dashboard learning become routable without retraining the
-    classifier for every newly learned dashboard family.
+    Generated artifacts are excluded defensively even if a legacy override file
+    still contains them.
     """
     exclude_ids = exclude_ids or set()
     catalog_names = {getattr(entry, "name", "") for entry in catalog if getattr(entry, "name", "")}
@@ -679,7 +707,7 @@ def get_archetypes_by_learning_context(
     results: list[tuple[InvestigationArchetype, float]] = []
 
     for arch in ALL_ARCHETYPES:
-        if arch.id in exclude_ids:
+        if arch.id in exclude_ids or _is_generated_archetype(arch):
             continue
 
         arch_tokens = _archetype_tokens(arch)

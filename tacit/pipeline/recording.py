@@ -62,6 +62,7 @@ class PipelineRecorder:
             summary=intent.summary,
             domain=intent.domain,
             services=intent.services,
+            environments=intent.environments,
             archetypes=[{"type": a.type, "confidence": a.confidence} for a in intent.archetypes],
             timerange=intent.timerange,
         )
@@ -91,10 +92,18 @@ class PipelineRecorder:
         intent: Intent,
         ranked_archetypes: list[tuple[Any, float]],
         learned_archetypes: list[tuple[Any, float]],
+        shadow_archetypes: list[tuple[Any, float]] | None = None,
     ) -> None:
         if not self.record_investigation_updates:
             return
-        record_selected_intent(self.history, self.investigation_id, intent, ranked_archetypes, learned_archetypes)
+        record_selected_intent(
+            self.history,
+            self.investigation_id,
+            intent,
+            ranked_archetypes,
+            learned_archetypes,
+            shadow_archetypes,
+        )
 
     def discovery(self, catalog_discovery: Any) -> None:
         emit_progress(
@@ -240,24 +249,70 @@ def history_archetypes(
     classifier_archetypes: list,
     selected_archetypes: list[tuple[Any, float]],
     learned_archetypes: list[tuple[Any, float]],
+    shadow_archetypes: list[tuple[Any, float]] | None = None,
 ) -> list[dict[str, object]]:
-    """Return history archetype records with selected learned matches included."""
+    """Return authoritative selections plus non-applied shadow candidates."""
     learned_ids = {arch.id for arch, _ in learned_archetypes}
     selected_ids = {arch.id for arch, _ in selected_archetypes}
     records: list[dict[str, object]] = []
     seen: set[str] = set()
+    seen_shadow_refs: set[tuple[str, str, str, str]] = set()
 
     for arch, confidence in selected_archetypes:
         if arch.id in seen:
             continue
         seen.add(arch.id)
+        if arch.id in learned_ids:
+            source = "learned"
+            retrieval_source = "curated_context"
+            template_origin = "curated"
+        else:
+            source = "classifier"
+            retrieval_source = "classifier"
+            template_origin = "curated"
         records.append(
             {
                 "type": arch.id,
                 "name": arch.name,
                 "confidence": confidence,
-                "source": "learned" if arch.id in learned_ids else "classifier",
+                "source": source,
+                "retrieval_source": retrieval_source,
+                "template_origin": template_origin,
                 "selected": True,
+                "signals": sorted(set(arch.required_signals) | set(arch.signal_bindings.keys())),
+            }
+        )
+
+    for arch, confidence in shadow_archetypes or []:
+        created_at = getattr(arch, "created_at", None)
+        created_at_ref = str(created_at or "")
+        isoformat = getattr(created_at, "isoformat", None)
+        if callable(isoformat):
+            created_at_ref = str(isoformat())
+        shadow_ref = (
+            arch.id,
+            str(getattr(arch, "generation_version", "")),
+            str(getattr(arch, "generation_run_id", "")),
+            created_at_ref,
+        )
+        if shadow_ref in seen_shadow_refs:
+            continue
+        seen_shadow_refs.add(shadow_ref)
+        records.append(
+            {
+                "type": arch.id,
+                "name": arch.name,
+                "confidence": confidence,
+                "source": "generated",
+                "retrieval_source": "experimental_exact_scope_shadow",
+                "template_origin": "generated",
+                "selected": False,
+                "shadow_only": True,
+                "output_applied": False,
+                "generation_version": shadow_ref[1],
+                "generation_run_id": shadow_ref[2],
+                "generated_at": shadow_ref[3],
+                "artifact_ref": ":".join(("generated", *shadow_ref)),
                 "signals": sorted(set(arch.required_signals) | set(arch.signal_bindings.keys())),
             }
         )
@@ -388,6 +443,7 @@ def record_selected_intent(
     intent: Intent,
     ranked_archetypes: list[tuple[Any, float]],
     learned_archetypes: list[tuple[Any, float]],
+    shadow_archetypes: list[tuple[Any, float]] | None = None,
 ) -> None:
     """Persist selected archetype context without leaking persistence policy into the runner."""
     try:
@@ -399,7 +455,12 @@ def record_selected_intent(
             keywords=intent.keywords,
             signals=history_signals(intent.signals, ranked_archetypes),
             problem_type=intent.problem_type,
-            archetypes=history_archetypes(intent.archetypes, ranked_archetypes, learned_archetypes),
+            archetypes=history_archetypes(
+                intent.archetypes,
+                ranked_archetypes,
+                learned_archetypes,
+                shadow_archetypes,
+            ),
             timerange=intent.timerange,
         )
     except Exception:

@@ -68,7 +68,7 @@ class ExactReplayMismatchError(ReplayError):
 
 
 def _db_path() -> Path:
-    custom = getattr(settings, "history_db_path", None)
+    custom = settings.history_db_path
     path = Path(custom) if custom else _DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     return path

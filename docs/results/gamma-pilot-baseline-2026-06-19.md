@@ -1,5 +1,12 @@
 # GAMMA Pilot Baseline — 2026-06-19
 
+> **Historical architecture note:** This baseline records the pre-containment behavior
+> that auto-registered generated archetypes for replay. ADR-019 retired that runtime
+> path. Generated archetype creation is now disabled by default; explicitly generated
+> output is quarantined and cannot enter normal investigation retrieval. The result
+> below remains useful evidence about metric binding, not a description of current
+> learning behavior.
+
 ## Scope
 
 - Source: Kaggle GAMMA archive, 9.4 GB compressed and 129,510 entries.
@@ -38,7 +45,7 @@ An additional infrastructure wording probe used “social-network services.” Q
 
 1. **Application metrics tested the engine more sharply than the synthetic benchmark.** Tacit discovered `gamma_request_latency_seconds` and `gamma_request_rate`, but the selected latency archetype compiled `http_request_duration_seconds_bucket` and `http_requests_total`. Per-query validation correctly rejected every empty panel.
 2. **The cold-start gap is compilation, not catalog discovery.** Infrastructure and combined catalogs were visible, but packaged archetypes emitted canonical hard-coded metric names instead of resolving the live signal mappings or falling back to freeform generation.
-3. **Same-vocabulary template replay works.** Uploading one representative five-panel dashboard produced an auto-generated learned archetype with the six real GAMMA metrics. One independent Qwen generation produced all five valid panels, and two cached replays reproduced it. This does not establish learned generalization.
+3. **The retired same-vocabulary template replay worked in this historical run.** Uploading one representative five-panel dashboard produced an automatically generated archetype with the six real GAMMA metrics under the pre-containment architecture. One independent Qwen generation produced all five valid panels, and two cached replays reproduced it. Current Tacit does not auto-register or normally retrieve that output, and this result does not establish learned generalization.
 4. **Sampling-aware query windows matter.** A 1-minute `rate()` window was too narrow for irregular source samples and dropped CPU/network panels. Five minutes returned data consistently.
 5. **Root-cause ranking is not yet measured.** The learned dashboard presents latency and resources by service, but the current artifact does not rank culprit services or state a root cause. Dashboard success must not be reported as culprit-service accuracy.
 

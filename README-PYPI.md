@@ -30,7 +30,7 @@ tacit --help
 Configure Tacit:
 
 ```bash
-tacit setup
+tacit init
 ```
 
 Check your local environment:
@@ -56,7 +56,7 @@ Then open `http://127.0.0.1:8000`.
 ## Common Commands
 
 ```bash
-tacit setup
+tacit init
 tacit doctor
 tacit test --prompt "5xx errors on checkout-service"
 tacit serve --no-slack
@@ -80,6 +80,9 @@ Useful settings include:
 - `LLM_MODEL`
 - `LLM_API_KEY`
 - `SIGNALFX_API_TOKEN`
+- `HISTORY_DB_PATH`
+- `FEEDBACK_DB_PATH`
+- `SIGNALS_DB_PATH`
 - `API_AUTH_ENABLED`
 - `API_AUTH_KEY`
 

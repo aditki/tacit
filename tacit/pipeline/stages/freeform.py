@@ -54,7 +54,11 @@ async def build_freeform_dashboard(
         return FreeformBuildResult(dashboard_spec=None, token_usage=TokenUsage(), failure=failure)
 
     t_prerank = time.monotonic()
-    ranked_catalog = prerank_metrics(intent, metric_catalog)
+    ranked_catalog = prerank_metrics(
+        intent,
+        metric_catalog,
+        feedback_store_factory=deps.feedback_store_factory,
+    )
     stage_log(
         "metric_ranking",
         (time.monotonic() - t_prerank) * 1000,

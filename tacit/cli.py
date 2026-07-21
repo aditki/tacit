@@ -322,6 +322,7 @@ def doctor():
     """Validate Grafana, datasources, LLM connectivity, and cache state."""
     _header("Tacit Doctor")
     _load_env()
+    stores = _cli_runtime_stores()
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -416,7 +417,7 @@ def doctor():
     try:
         from tacit.assess import build_assessment
 
-        _report = build_assessment()
+        _report = build_assessment(stores=stores)
         _inv = _report["inventory"]
         knowledge = {
             "dashboards": _inv["dashboards_ingested"],
@@ -506,6 +507,14 @@ def _load_env():
         os.environ["TACIT_CONFIG"] = str(CONFIG_FILE)
 
 
+def _cli_runtime_stores():
+    """Build one settings-backed store owner for the active CLI command."""
+    from tacit.config import create_settings
+    from tacit.runtime_stores import RuntimeStores
+
+    return RuntimeStores(create_settings())
+
+
 def _llm_zero_key_mode() -> bool:
     """True only when deterministic fallback applies to a key-based provider."""
     try:
@@ -534,7 +543,7 @@ def _check_grafana() -> bool:
         resp = httpx.get(f"{url}/api/org", headers=headers, timeout=10)
         if resp.status_code == 200:
             org = resp.json()
-            _success(f"Grafana: connected to \"{org.get('name', 'unknown')}\" at {url}")
+            _success(f'Grafana: connected to "{org.get("name", "unknown")}" at {url}')
             return True
         else:
             _fail(f"Grafana: HTTP {resp.status_code} from {url}/api/org")
@@ -737,7 +746,7 @@ def connect_grafana(url: str | None, api_key: str | None):
             _fail(f"Connection failed: HTTP {resp.status_code}")
             return
         org = resp.json()
-        _success(f"Connected to \"{org.get('name', 'unknown')}\" at {url}")
+        _success(f'Connected to "{org.get("name", "unknown")}" at {url}')
     except Exception as e:
         _fail(f"Connection failed: {e}")
         return
@@ -870,15 +879,19 @@ def investigate(prompt: str | None, json_output: bool, open_browser: bool):
 
     import asyncio
 
+    from tacit.dependencies import build_pipeline_dependencies
+
+    stores = _cli_runtime_stores()
+    deps = build_pipeline_dependencies(stores.settings, stores=stores)
+
     async def _run():
-        from tacit.history import get_investigation_store
         from tacit.models.schemas import DashRequest
         from tacit.pipeline import run_pipeline
 
-        result = await run_pipeline(DashRequest(prompt=prompt, user_id="cli"))
+        result = await run_pipeline(DashRequest(prompt=prompt, user_id="cli"), deps)
         contract = None
         if result.investigation_id:
-            contract = get_investigation_store().get_contract(result.investigation_id, result.investigation_revision)
+            contract = stores.history().get_contract(result.investigation_id, result.investigation_revision)
         return result, contract
 
     try:
@@ -925,13 +938,18 @@ def test_run(prompt: str | None, open_browser: bool):
 
     import asyncio
 
+    from tacit.dependencies import build_pipeline_dependencies
+
+    stores = _cli_runtime_stores()
+    deps = build_pipeline_dependencies(stores.settings, stores=stores)
+
     async def _run():
         from tacit.models.schemas import DashRequest
         from tacit.pipeline import run_pipeline
 
         req = DashRequest(prompt=prompt)
         _info("Running pipeline...")
-        result = await run_pipeline(req)
+        result = await run_pipeline(req, deps)
         return result
 
     try:
@@ -1075,7 +1093,8 @@ def assess(as_json: bool, with_llm: bool):
     _load_env()
     from tacit.assess import build_assessment
 
-    report = build_assessment()
+    stores = _cli_runtime_stores()
+    report = build_assessment(stores=stores)
 
     if as_json:
         import json as json_module
@@ -1171,13 +1190,19 @@ def learn():
 @learn.command("dashboard")
 @click.argument("dashboard_uid")
 @click.option("--backend", default="", help="Backend name, e.g. grafana or signalfx")
-@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+@click.option(
+    "--auto-approve/--pending",
+    default=False,
+    help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
+)
 def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool):
     """Ingest a dashboard and show what Tacit learned."""
     _header("Learn Dashboard")
     _load_env()
 
     import asyncio
+
+    stores = _cli_runtime_stores()
 
     async def _run():
         from tacit.dashboard_ingest import ingest_dashboard
@@ -1186,6 +1211,8 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool):
             dashboard_uid=dashboard_uid,
             backend_name=backend,
             auto_approve=auto_approve,
+            runtime_settings=stores.settings,
+            store=stores.signals(),
         )
 
     try:
@@ -1240,7 +1267,7 @@ def _print_bulk_learning_summary(result: dict):
     _info(f"Indexed context rows: {result.get('indexed_context_rows', 0)}")
     if result.get("auto_approve"):
         _info(f"Mappings created: {result.get('mappings_created', 0)}")
-        _info(f"Archetypes registered: {result.get('archetypes_registered', 0)}")
+        _info(f"Generated archetypes quarantined: {result.get('archetypes_quarantined', 0)}")
 
     learned = result.get("learned", [])
     if learned:
@@ -1341,15 +1368,17 @@ def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool)
     if bool(file_path) == bool(dir_path):
         _fail("Pass exactly one of --file or --dir.")
         return
+    stores = _cli_runtime_stores()
+    signal_store = None if dry_run else stores.signals()
     try:
         if file_path:
             from tacit.artifact_learning import learn_runbook_file
 
-            result = learn_runbook_file(file_path, dry_run=dry_run)
+            result = learn_runbook_file(file_path, dry_run=dry_run, store=signal_store)
         else:
             from tacit.artifact_learning import learn_runbook_dir
 
-            result = learn_runbook_dir(dir_path, dry_run=dry_run)  # type: ignore[arg-type]
+            result = learn_runbook_dir(dir_path, dry_run=dry_run, store=signal_store)  # type: ignore[arg-type]
     except Exception as e:
         _fail(f"Runbook learning failed: {e}")
         return
@@ -1369,15 +1398,17 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
     if bool(file_path) == bool(dir_path):
         _fail("Pass exactly one of --file or --dir.")
         return
+    stores = _cli_runtime_stores()
+    signal_store = None if dry_run else stores.signals()
     try:
         if file_path:
             from tacit.artifact_learning import learn_incident_file
 
-            result = learn_incident_file(file_path, dry_run=dry_run)
+            result = learn_incident_file(file_path, dry_run=dry_run, store=signal_store)
         else:
             from tacit.artifact_learning import learn_incident_dir
 
-            result = learn_incident_dir(dir_path, dry_run=dry_run)  # type: ignore[arg-type]
+            result = learn_incident_dir(dir_path, dry_run=dry_run, store=signal_store)  # type: ignore[arg-type]
     except Exception as e:
         _fail(f"Incident learning failed: {e}")
         return
@@ -1409,10 +1440,13 @@ def learn_pagerduty(since: str, until: str | None, statuses: tuple[str, ...], li
 
     import asyncio
 
+    stores = _cli_runtime_stores()
+
     async def _run():
         from tacit.integrations.pagerduty import PagerDutyClient, learn_pagerduty_incidents
 
         async with PagerDutyClient() as client:
+            signal_store = None if dry_run else stores.signals()
             return await learn_pagerduty_incidents(
                 client,
                 statuses=list(statuses),
@@ -1420,6 +1454,7 @@ def learn_pagerduty(since: str, until: str | None, statuses: tuple[str, ...], li
                 until=until,
                 max_items=limit,
                 dry_run=dry_run,
+                store=signal_store,
             )
 
     try:
@@ -1433,7 +1468,11 @@ def learn_pagerduty(since: str, until: str | None, statuses: tuple[str, ...], li
 @learn.command("alerts")
 @click.option("--from", "source", default="grafana", show_default=True, help="Backend source: grafana or signalfx")
 @click.option("--uid", "alert_uid", default="", help="Ingest one alert UID instead of crawling all alerts")
-@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+@click.option(
+    "--auto-approve/--pending",
+    default=False,
+    help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
+)
 @click.option("--dry-run", is_flag=True, help="Preview alert ingestion without persisting learned context")
 @click.option("--limit", default=500, show_default=True, help="Maximum alerts to crawl")
 def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool, limit: int):
@@ -1442,6 +1481,8 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
     _load_env()
 
     import asyncio
+
+    stores = _cli_runtime_stores()
 
     async def _run():
         if alert_uid:
@@ -1452,6 +1493,8 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
                 backend_name=source,
                 auto_approve=auto_approve,
                 dry_run=dry_run,
+                runtime_settings=stores.settings,
+                store=stores.signals(),
             )
         from tacit.alert_ingest import learn_backend_alerts
 
@@ -1460,6 +1503,8 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
             auto_approve=auto_approve,
             dry_run=dry_run,
             limit=limit,
+            runtime_settings=stores.settings,
+            store=stores.signals(),
         )
 
     try:
@@ -1505,6 +1550,8 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
 
     import asyncio
 
+    stores = _cli_runtime_stores()
+
     async def _run():
         from tacit.dashboard_ingest import learn_backend_dashboards
 
@@ -1512,6 +1559,8 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
             backend_name,
             auto_approve=auto_approve,
             limit=limit,
+            runtime_settings=stores.settings,
+            store=stores.signals(),
         )
 
     try:
@@ -1525,7 +1574,11 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
 
 
 @learn.command("grafana")
-@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+@click.option(
+    "--auto-approve/--pending",
+    default=False,
+    help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
+)
 @click.option("--limit", default=500, show_default=True, help="Maximum dashboards to crawl")
 def learn_grafana(auto_approve: bool, limit: int):
     """Crawl Grafana dashboards and persist learned operational context."""
@@ -1533,7 +1586,11 @@ def learn_grafana(auto_approve: bool, limit: int):
 
 
 @learn.command("signalfx")
-@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+@click.option(
+    "--auto-approve/--pending",
+    default=False,
+    help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
+)
 @click.option("--limit", default=500, show_default=True, help="Maximum dashboards to crawl")
 def learn_signalfx(auto_approve: bool, limit: int):
     """Crawl SignalFx dashboards and persist learned operational context."""
@@ -1544,16 +1601,19 @@ def learn_signalfx(auto_approve: bool, limit: int):
 @click.argument("dashboard_uid")
 @click.option("--backend", default="", help="Backend name, e.g. grafana_json or signalfx")
 def learn_approve(dashboard_uid: str, backend: str):
-    """Approve a pending learned dashboard and activate mappings."""
+    """Approve a pending dashboard and evaluate eligible signal mappings."""
     _header("Approve Learned Dashboard")
     _load_env()
 
     from tacit.dashboard_ingest import approve_ingested_dashboard_record
 
+    stores = _cli_runtime_stores()
     try:
         result = approve_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend or None,
+            store=stores.signals(),
+            runtime_settings=stores.settings,
         )
     except LookupError:
         _fail("Ingested dashboard not found")
@@ -1562,7 +1622,7 @@ def learn_approve(dashboard_uid: str, backend: str):
     if result.get("status") == "approved":
         _success(result.get("message", "Dashboard approved"))
         _info(f"Mappings created: {result.get('mappings_created', 0)}")
-        _info(f"Archetype registered: {result.get('archetype_registered', False)}")
+        _info(f"Generated archetype quarantined: {result.get('archetype_quarantined', False)}")
     else:
         _info(result.get("message", f"Dashboard already {result.get('status')}"))
 
@@ -1577,10 +1637,12 @@ def learn_reject(dashboard_uid: str, backend: str):
 
     from tacit.dashboard_ingest import reject_ingested_dashboard_record
 
+    stores = _cli_runtime_stores()
     try:
         result = reject_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend or None,
+            store=stores.signals(),
         )
     except LookupError:
         _fail("Ingested dashboard not found or not pending")
@@ -1604,9 +1666,7 @@ def learn_ignore(dashboard_uid: str, backend: str):
     _header("Ignore Learned Dashboard")
     _load_env()
 
-    from tacit.signals import get_signal_store
-
-    store = get_signal_store()
+    store = _cli_runtime_stores().signals()
     if store.ignore_ingested_dashboard(dashboard_uid, backend_name=backend or None):
         _success("Dashboard ignored")
     else:
@@ -1623,9 +1683,9 @@ def learn_search(query: str, service: str, approved_only: bool, limit: int):
     _header("Search Learned Context")
     _load_env()
 
-    from tacit.signals import LearningIndexUnavailable, get_signal_store
+    from tacit.signals import LearningIndexUnavailable
 
-    store = get_signal_store()
+    store = _cli_runtime_stores().signals()
     try:
         rows = store.search_learning_context(
             query,
@@ -1659,13 +1719,17 @@ def learn_service(service: str, approved_only: bool, limit: int):
     _header(f"Service Context: {service}")
     _load_env()
 
-    from tacit.signals import LearningIndexUnavailable, get_signal_store
+    from tacit.signals import LearningIndexUnavailable
 
     try:
-        summary = get_signal_store().describe_service(
-            service,
-            include_candidates=not approved_only,
-            limit=limit,
+        summary = (
+            _cli_runtime_stores()
+            .signals()
+            .describe_service(
+                service,
+                include_candidates=not approved_only,
+                limit=limit,
+            )
         )
     except LearningIndexUnavailable as e:
         _fail(str(e))
@@ -1754,8 +1818,14 @@ def export_report(anonymous: bool, output: Path | None, validate_bundle: bool):
 
     from tacit.export_report import export_assessment_report
 
+    stores = _cli_runtime_stores()
     try:
-        result = export_assessment_report(output=output, anonymous=anonymous, validate=validate_bundle)
+        result = export_assessment_report(
+            output=output,
+            anonymous=anonymous,
+            validate=validate_bundle,
+            stores=stores,
+        )
     except ValueError as exc:
         _fail(str(exc))
         raise click.ClickException(str(exc)) from exc
@@ -1787,9 +1857,8 @@ def history():
 def history_list(limit: int, status: str | None, user: str | None):
     """List recent investigations."""
     _load_env()
-    from tacit.history import get_investigation_store
 
-    store = get_investigation_store()
+    store = _cli_runtime_stores().history()
     investigations = store.list_recent(limit=limit, status=status, user_id=user)
 
     if not investigations:
@@ -1836,9 +1905,8 @@ def history_list(limit: int, status: str | None, user: str | None):
 def history_show(investigation_id: str):
     """Show full details of a single investigation."""
     _load_env()
-    from tacit.history import get_investigation_store
 
-    store = get_investigation_store()
+    store = _cli_runtime_stores().history()
     inv = store.get(investigation_id)
 
     if inv is None:
@@ -1922,9 +1990,8 @@ def history_show(investigation_id: str):
 def history_contract(investigation_id: str, revision: int | None):
     """Print the canonical contract for an investigation."""
     _load_env()
-    from tacit.history import get_investigation_store
 
-    contract = get_investigation_store().get_contract(investigation_id, revision)
+    contract = _cli_runtime_stores().history().get_contract(investigation_id, revision)
     if contract is None:
         raise click.ClickException("Investigation contract not found")
     click.echo(json.dumps(contract.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True))
@@ -1937,14 +2004,18 @@ def history_contract(investigation_id: str, revision: int | None):
 def history_replay(investigation_id: str, revision: int | None, mode: str):
     """Replay an investigation from captured inputs without external refetch."""
     _load_env()
-    from tacit.history import ReplayError, StaleRevisionError, get_investigation_store
+    from tacit.history import ReplayError, StaleRevisionError
     from tacit.investigation_replay import ReplayMode
 
     try:
-        contract = get_investigation_store().replay_contract(
-            investigation_id,
-            revision,
-            mode=ReplayMode(mode),
+        contract = (
+            _cli_runtime_stores()
+            .history()
+            .replay_contract(
+                investigation_id,
+                revision,
+                mode=ReplayMode(mode),
+            )
         )
     except (StaleRevisionError, ReplayError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -1960,9 +2031,8 @@ def history_replay(investigation_id: str, revision: int | None, mode: str):
 def history_compare(investigation_id: str, left: int, right: int):
     """Compare two immutable investigation revisions."""
     _load_env()
-    from tacit.history import get_investigation_store
 
-    comparison = get_investigation_store().compare_revisions(investigation_id, left, right)
+    comparison = _cli_runtime_stores().history().compare_revisions(investigation_id, left, right)
     if comparison is None:
         raise click.ClickException("Investigation revision not found")
     click.echo(json.dumps(comparison, indent=2, sort_keys=True))
@@ -1975,13 +2045,12 @@ def history_compare(investigation_id: str, left: int, right: int):
 def history_export(investigation_id: str, revision: int | None, output: Path | None):
     """Export one investigation as a portable Assessment Bundle."""
     _load_env()
-    from tacit.history import get_investigation_store
     from tacit.investigation_bundle import export_investigation_bundle
 
     target = output or Path(f"tacit-investigation-{investigation_id}.tar.gz")
     try:
         export_investigation_bundle(
-            get_investigation_store(),
+            _cli_runtime_stores().history(),
             investigation_id,
             target,
             revision=revision,
@@ -1995,9 +2064,8 @@ def history_export(investigation_id: str, revision: int | None, output: Path | N
 def history_stats():
     """Show aggregate investigation statistics."""
     _load_env()
-    from tacit.history import get_investigation_store
 
-    store = get_investigation_store()
+    store = _cli_runtime_stores().history()
     s = store.stats()
 
     _header("Investigation Stats")

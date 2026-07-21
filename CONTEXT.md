@@ -46,7 +46,13 @@ decomposition pattern.
 | `SLACK_APP_TOKEN` | Slack app-level token (`xapp-...`) |
 | `API_AUTH_ENABLED` | Enable API key auth (`true`/`false`) |
 | `API_AUTH_KEY` | API key for `X-API-Key` header |
-| `TACIT_ARCHETYPES_PATH` | Custom path to `archetypes.yaml` |
+| `HISTORY_DB_PATH` | Investigation history SQLite path |
+| `FEEDBACK_DB_PATH` | Feedback SQLite path |
+| `SIGNALS_DB_PATH` | Signal and learning SQLite path |
+| `TACIT_ARCHETYPES_PATH` | Curated archetype override; generated entries are rejected |
+| `LEARNED_ARCHETYPES_GENERATION_ENABLED` | Generate quarantined experimental archetype output (default `false`) |
+| `LEARNED_ARCHETYPES_AUTOMATIC_REGISTRATION_ENABLED` | Legacy name: permit quarantine persistence only; curated registration is impossible (default `false`) |
+| `LEARNED_ARCHETYPES_RETRIEVAL_MODE` | Archetype retrieval policy (default `curated_only`) |
 | `TACIT_CONFIG` | Custom path to `tacit.yaml` |
 
 ---
@@ -128,15 +134,21 @@ signal quality over taxonomy purity.
 **Problem**: Editing investigation templates required Python code changes — high friction
 for SRE teams.
 
-**Solution**: `archetypes.yaml` with hot-reload API endpoint (`POST /api/v1/archetypes/reload`).
+**Solution**: Curated, operator-authored `archetypes.yaml` with a hot-reload API endpoint
+(`POST /api/v1/archetypes/reload`).
 
 **Implementation**:
-- `archetypes.yaml` at project root (or `TACIT_ARCHETYPES_PATH` env var)
+- Curated `archetypes.yaml` at project root (or curated `TACIT_ARCHETYPES_PATH` override)
+- Generated archetype creation is disabled by default; explicitly generated output uses a separate quarantine store
+- Generated archetypes cannot be auto-approved, hot-reloaded, or included in normal retrieval
+- Generated archetypes must prove unique value in shadow evaluation before any promotion lifecycle is designed
+- [ADR-020](docs/adr/020-generated-archetypes-shadow-before-lifecycle.md) and the
+  [evaluation roadmap](docs/generated-archetype-evaluation-roadmap.md) define the shadow-only decision gate
 - `templates.py` loads YAML first, falls back to hardcoded Python definitions
 - Uses `yaml.safe_load` (security: no arbitrary code execution)
 - Template placeholders: `{service_filter}`, `{container_filter}`, `{rate_interval}`
 - Panel types: timeseries, stat, gauge, table, logs
-- Hot reload: `reload_archetypes()` function, exposed via API
+- Curated-only hot reload: `reload_archetypes()` function, exposed via API
 - **Current count**: 41 archetypes, 176 panels, 153 problem_types
 
 **Tradeoff**: YAML is less expressive than Python for complex query logic — but
@@ -238,7 +250,7 @@ dashboard_uid values.
 | `GET` | `/api/v1/feedback/stats` | Insights | Aggregate feedback statistics |
 | `GET` | `/api/v1/feedback/analysis` | Insights | Analysis & recommendations |
 | `GET` | `/api/v1/feedback/{dashboard_uid}` | Feedback | Provenance + feedback for a dashboard |
-| `POST` | `/api/v1/archetypes/reload` | Archetypes | Hot-reload from YAML |
+| `POST` | `/api/v1/archetypes/reload` | Archetypes | Hot-reload curated, operator-authored YAML |
 | `GET` | `/api/v1/archetypes` | Archetypes | List loaded archetypes |
 | `GET` | `/api/v1/investigations` | History | List recent investigations (filter by status, user) |
 | `GET` | `/api/v1/investigations/stats` | History | Aggregate investigation stats |
@@ -601,7 +613,7 @@ python tests/validate.py --mode pipeline --api-url http://localhost:8000 --revie
   signal mappings. Human approval workflow for anti-drift protection.
 - Pre-ranking with feedback-driven quality scoring
 - Feedback collection, analysis, and recommendations
-- YAML archetype templates with hot-reload
+- Curated YAML archetype templates with operator-triggered hot reload
 - Web UI with feedback forms and archetype info
 - Swagger/ReDoc API documentation
 - Query validation (drops panels with no data)

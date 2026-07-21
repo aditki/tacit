@@ -149,12 +149,13 @@ async def ingest_alert_features(
     *,
     auto_approve: bool = False,
     dry_run: bool = False,
+    store: Any | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted alert features."""
-    store = get_signal_store()
+    store = store or get_signal_store()
     status = "approved" if auto_approve else "pending"
     panel = alert_to_panel(features)
-    signals = infer_signals_from_metrics(features.metrics_found, [panel])
+    signals = infer_signals_from_metrics(features.metrics_found, [panel], store=store)
     signal_quality = build_signal_quality_report(metrics=features.metrics_found, signals=signals)
     learning_impact = build_learning_impact_report(
         metrics=features.metrics_found,
@@ -272,6 +273,7 @@ async def ingest_alert(
     auto_approve: bool = False,
     dry_run: bool = False,
     runtime_settings: Settings | None = None,
+    store: Any | None = None,
 ) -> dict[str, Any]:
     """Full alert ingestion pipeline: fetch -> extract -> infer -> persist."""
     from tacit.backends import get_active_backends
@@ -297,7 +299,7 @@ async def ingest_alert(
         if backend is None:
             raise RuntimeError("No backend selected for alert ingestion")
         features = await backend.ingest_alert(alert_uid)
-        return await ingest_alert_features(features, auto_approve=auto_approve, dry_run=dry_run)
+        return await ingest_alert_features(features, auto_approve=auto_approve, dry_run=dry_run, store=store)
     finally:
         if own_backends:
             for item in all_backends:
@@ -311,6 +313,7 @@ async def learn_backend_alerts(
     dry_run: bool = False,
     limit: int = 500,
     runtime_settings: Settings | None = None,
+    store: Any | None = None,
 ) -> dict[str, Any]:
     """Crawl a backend and learn from every discoverable alert rule."""
     from tacit.backends import get_active_backends
@@ -353,6 +356,7 @@ async def learn_backend_alerts(
                         backend=backend,
                         auto_approve=auto_approve,
                         dry_run=dry_run,
+                        store=store,
                     )
                 return (
                     {
@@ -390,7 +394,7 @@ async def learn_backend_alerts(
 
         stale_reconciliation_complete = bool(getattr(backend, "last_alert_list_complete", False))
         if not dry_run and stale_reconciliation_complete:
-            store = get_signal_store()
+            store = store or get_signal_store()
             seen_alert_uids = {str(item.get("uid", "")) for item in alerts if item.get("uid")}
             totals["stale_marked"] = store.mark_missing_alerts_stale(
                 backend_name=backend_name,

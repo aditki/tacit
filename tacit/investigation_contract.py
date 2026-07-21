@@ -607,6 +607,7 @@ class InvestigationContractAssembler:
                 scope=InvestigationScope(
                     services=intent.services,
                     service_ids=[f"service:{service}" for service in intent.services],
+                    environments=intent.environments,
                 ),
             ),
             operational_ir=OperationalIR(

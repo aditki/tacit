@@ -13,7 +13,7 @@ layer cannot quietly memorize an evaluation corpus:
   "key churn", "reuse efficiency", "ran out of headroom"). These are emitted as
   *scored evidence with provenance*, NOT injected as ground-truth keywords. They
   carry low confidence and a source phrase so a downstream consumer can decide
-  whether live metric coverage or a learned archetype actually backs them. This
+  whether live metric coverage or governed Operational Knowledge actually backs them. This
   keeps a single metaphor from confidently steering an investigation, and keeps
   the deterministic floor honest (metaphors do not auto-satisfy a scorer).
 
@@ -135,7 +135,7 @@ _CONVENTIONAL: list[tuple[str, frozenset[str]]] = [
 
 # ── Colloquial: metaphor / ambiguous — EVIDENCE ONLY, never auto-injected ─────
 # Low precision. Emitted with provenance so downstream can confirm against live
-# metric coverage or a learned archetype before trusting it.
+# metric coverage or governed Operational Knowledge before trusting it.
 _COLLOQUIAL: list[tuple[str, frozenset[str]]] = [
     ("fast-data layer", frozenset({"cache"})),
     ("fast data layer", frozenset({"cache"})),

@@ -4,11 +4,17 @@
 
 Accepted
 
+Amended by [ADR-019](019-governed-knowledge-authority.md). The legacy
+`auto_teach_eligible` field describes inference strength only. It does not grant
+runtime authority, activate a signal mapping, or approve/register a generated
+archetype.
+
 ## Context
 
 Signal inference affects trust. If Tacit silently learns bad mappings, future dashboards become worse. The current
 repo uses deterministic inference over metric names, panel titles, units, query shape, dashboard grouping, and bootstrap
-patterns. The inference code records evidence, score, confidence, margin, and auto-teach eligibility.
+patterns. The inference code records evidence, score, confidence, margin, and
+legacy auto-teach eligibility as candidate-quality evidence for governance.
 
 ## Decision
 
@@ -19,6 +25,8 @@ be useful later, but should be opt-in due to cost, non-determinism, and trust ri
 
 - Candidate inference should expose why a mapping was suggested.
 - Review output should include enough evidence for humans to approve or reject.
+- Candidate eligibility must remain separate from governed promotion and runtime projection.
+- Generated archetypes are never approved through signal-inference eligibility.
 - LLMs can help summarize or cluster later, but deterministic gates should remain the default learning path.
 
 ## Implementation Notes
@@ -36,4 +44,3 @@ Validated against:
 TODO:
 
 - If LLM-assisted signal inference is added, require an explicit config flag and record the model/source in provenance.
-

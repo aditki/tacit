@@ -307,7 +307,7 @@
       </div>
       <div class="toggle-row">
         <div class="toggle" id="auto-approve-toggle" onclick="toggleAutoApprove()"></div>
-        <span class="toggle-label">Auto-approve signal mappings</span>
+        <span class="toggle-label">Auto-review eligible signal mappings</span>
       </div>
       <div class="actions">
         <button class="btn-primary" id="ingest-btn" onclick="ingestDashboard()">Ingest Dashboard</button>
@@ -1017,7 +1017,7 @@
           <div class="ingest-metrics"><strong>Metrics:</strong> ${(data.metrics_found || []).map(m => `<code>${esc(m)}</code>`).join(', ')}</div>
           ${quality}
           ${signalChips ? `<div class="ingest-signals">${signalChips}</div>` : ''}
-          ${data.archetype_yaml ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Generated archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(data.archetype_yaml)}</pre></details>` : ''}
+          ${data.archetype_yaml ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Quarantined experimental archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(data.archetype_yaml)}</pre></details>` : ''}
         </div>`;
     }
 
@@ -1120,7 +1120,7 @@
             return `<span class="signal-chip">${signalType}${metric}${confidence}</span>`;
           }).join('');
           const archetypeYaml = d.archetype_generated
-            ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Generated archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(d.archetype_generated)}</pre></details>`
+            ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Quarantined experimental archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(d.archetype_generated)}</pre></details>`
             : '';
           const quality = renderSignalQuality(d.signal_quality, d.learning_impact);
           const reviewBtns = d.status === 'pending'

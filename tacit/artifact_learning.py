@@ -717,6 +717,7 @@ def learn_artifact(
     extractor: ArtifactExtractor,
     *,
     dry_run: bool = False,
+    store: Any | None = None,
 ) -> dict[str, object]:
     result = extractor.extract(artifact)
     evidence_rows = _as_store_rows(result.evidence_requirements)
@@ -727,7 +728,7 @@ def learn_artifact(
     indexed_context_rows = 0
     mappings_created = 0
     if not dry_run:
-        store = get_signal_store()
+        store = store or get_signal_store()
         change_state = store.record_learned_artifact(
             artifact_id=artifact.id,
             artifact_type=artifact.artifact_type,
@@ -840,8 +841,8 @@ def learn_artifact(
     }
 
 
-def learn_runbook_file(path: Path, *, dry_run: bool = False) -> dict[str, object]:
-    return learn_artifact(runbook_from_file(path), RunbookExtractor(), dry_run=dry_run)
+def learn_runbook_file(path: Path, *, dry_run: bool = False, store: Any | None = None) -> dict[str, object]:
+    return learn_artifact(runbook_from_file(path), RunbookExtractor(), dry_run=dry_run, store=store)
 
 
 def incident_from_file(path: Path) -> LearnedArtifact:
@@ -858,13 +859,13 @@ def incident_from_file(path: Path) -> LearnedArtifact:
     )
 
 
-def learn_incident_file(path: Path, *, dry_run: bool = False) -> dict[str, object]:
-    return learn_artifact(incident_from_file(path), IncidentExtractor(), dry_run=dry_run)
+def learn_incident_file(path: Path, *, dry_run: bool = False, store: Any | None = None) -> dict[str, object]:
+    return learn_artifact(incident_from_file(path), IncidentExtractor(), dry_run=dry_run, store=store)
 
 
-def learn_incident_dir(path: Path, *, dry_run: bool = False) -> dict[str, object]:
+def learn_incident_dir(path: Path, *, dry_run: bool = False, store: Any | None = None) -> dict[str, object]:
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
-    learned = [learn_incident_file(file, dry_run=dry_run) for file in files]
+    learned = [learn_incident_file(file, dry_run=dry_run, store=store) for file in files]
 
     def _count(key: str) -> int:
         total = 0
@@ -876,7 +877,7 @@ def learn_incident_dir(path: Path, *, dry_run: bool = False) -> dict[str, object
 
     stale_marked = 0
     if not dry_run:
-        store = get_signal_store()
+        store = store or get_signal_store()
         seen = {str(item["artifact_id"]) for item in learned}
         stale_marked = store.mark_missing_artifacts_stale(
             artifact_type="incident",
@@ -903,9 +904,9 @@ def learn_incident_dir(path: Path, *, dry_run: bool = False) -> dict[str, object
     }
 
 
-def learn_runbook_dir(path: Path, *, dry_run: bool = False) -> dict[str, object]:
+def learn_runbook_dir(path: Path, *, dry_run: bool = False, store: Any | None = None) -> dict[str, object]:
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
-    learned = [learn_runbook_file(file, dry_run=dry_run) for file in files]
+    learned = [learn_runbook_file(file, dry_run=dry_run, store=store) for file in files]
 
     def _count(key: str) -> int:
         total = 0
@@ -917,7 +918,7 @@ def learn_runbook_dir(path: Path, *, dry_run: bool = False) -> dict[str, object]
 
     stale_marked = 0
     if not dry_run:
-        store = get_signal_store()
+        store = store or get_signal_store()
         seen = {str(item["artifact_id"]) for item in learned}
         stale_marked = store.mark_missing_artifacts_stale(
             artifact_type="runbook",

@@ -144,6 +144,65 @@ class TestInferenceHardening:
         assert rich.auto_teach_eligible is True
         assert set(rich.evidence_sources) >= {"name", "title"}
 
+    @pytest.mark.parametrize(
+        ("metric", "panel"),
+        [
+            (
+                "checkout_edge_inflight_requests",
+                {
+                    "title": "In-flight requests",
+                    "row": "Saturation",
+                    "unit": "short",
+                    "metrics": ["checkout_edge_inflight_requests"],
+                    "queries": ["checkout_edge_inflight_requests"],
+                },
+            ),
+            (
+                "checkout_edge_db_pool_wait_seconds_bucket",
+                {
+                    "title": "DB pool wait time",
+                    "row": "Downstream",
+                    "unit": "s",
+                    "metrics": ["checkout_edge_db_pool_wait_seconds_bucket"],
+                    "queries": ["histogram_quantile(0.95, checkout_edge_db_pool_wait_seconds_bucket)"],
+                },
+            ),
+        ],
+    )
+    def test_explicit_incident_signals_are_auto_teachable(self, metric, panel):
+        signal = infer_signal(metric, [panel])
+
+        assert signal is not None
+        assert signal.auto_teach_eligible is True
+
+    def test_pool_wait_metrics_do_not_teach_frontend_request_latency(self, signal_store):
+        metrics = ["connection_pool_wait_seconds", "worker_pool_wait_seconds"]
+        panels = [
+            {
+                "title": "Connection pool wait",
+                "unit": "s",
+                "metrics": ["connection_pool_wait_seconds"],
+                "queries": ["connection_pool_wait_seconds"],
+            },
+            {
+                "title": "Worker pool",
+                "unit": "s",
+                "metrics": ["worker_pool_wait_seconds"],
+                "queries": ["worker_pool_wait_seconds"],
+            },
+        ]
+
+        inferred = {
+            signal["metric"]: signal for signal in infer_signals_from_metrics(metrics, panels, store=signal_store)
+        }
+
+        assert inferred["connection_pool_wait_seconds"]["signal_type"] == "db_connection_pool"
+        assert inferred["connection_pool_wait_seconds"]["signal_family"] == "saturation"
+        assert inferred["connection_pool_wait_seconds"]["auto_teach_eligible"] is True
+        assert inferred["worker_pool_wait_seconds"]["signal_type"] == "worker_pool_wait"
+        assert inferred["worker_pool_wait_seconds"]["auto_teach_eligible"] is False
+        assert all(signal["signal_type"] != "request_latency" for signal in inferred.values())
+
     def test_weak_single_source_not_auto_teachable(self):
         bare = infer_signal("felix_iptables_save_errors")  # name only, score 0.40
         assert bare.signal_family == "errors"
@@ -200,16 +259,16 @@ class TestIngestionInference:
             panels,
         )
 
-    def test_custom_metrics_inferred_via_heuristic(self):
+    def test_custom_metrics_inferred_via_heuristic(self, signal_store):
         _, metrics, panels = self._felix_extracted()
-        signals = infer_signals_from_metrics(metrics, panels)
+        signals = infer_signals_from_metrics(metrics, panels, store=signal_store)
         assert signals, "felix metrics should infer signals without teaching"
         assert all(s.get("signal_family") for s in signals)
         assert any(s["source"] == "heuristic" for s in signals)
 
-    def test_generated_archetype_has_signal_bindings(self):
+    def test_generated_archetype_has_signal_bindings(self, signal_store):
         extracted, metrics, panels = self._felix_extracted()
-        signals = infer_signals_from_metrics(metrics, panels)
+        signals = infer_signals_from_metrics(metrics, panels, store=signal_store)
         arch = _yaml.safe_load(generate_archetype_yaml(extracted, signals, archetype_id="felix"))["archetypes"][0]
         assert arch["signal_bindings"], "felix archetype must now carry signal bindings"
         assert arch["required_signals"]

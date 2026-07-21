@@ -6,6 +6,7 @@ import asyncio
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 
@@ -14,7 +15,7 @@ from tacit.backends import get_active_backends
 from tacit.config import settings
 from tacit.context.enrichment import enrich_context
 from tacit.culprit_ranking import rank_culprits
-from tacit.dependencies import PipelineDependencies, _get_feedback_store, build_pipeline_dependencies
+from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies
 from tacit.history import get_investigation_store
 from tacit.investigation_contract import InvestigationRunType
 from tacit.logging import bind_request_id, stage_log, unbind_request_id
@@ -42,6 +43,8 @@ from tacit.pipeline.stages.evidence import run_evidence_stage
 from tacit.pipeline.stages.freeform import build_freeform_dashboard
 from tacit.pipeline.stages.intent import run_intent_stage
 from tacit.pipeline.validation import validate_dashboard_and_evidence
+from tacit.runtime_stores import RuntimeStores
+from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE
 
 logger = structlog.get_logger()
 
@@ -71,11 +74,11 @@ def _default_dependencies() -> PipelineDependencies:
     cold isolated runtime. Keeping the default lookup here preserves that
     behavior while the core runner still accepts explicit dependencies.
     """
+    stores = RuntimeStores(settings, history_fallback=get_investigation_store)
     return build_pipeline_dependencies(
         settings,
+        stores=stores,
         backend_factory=get_active_backends,
-        history_store_factory=get_investigation_store,
-        feedback_store_factory=_get_feedback_store,
     )
 
 
@@ -85,6 +88,75 @@ def _get_semaphore(max_concurrent: int) -> asyncio.Semaphore:
         _pipeline_semaphore = asyncio.Semaphore(max_concurrent)
         _pipeline_semaphore_limit = max_concurrent
     return _pipeline_semaphore
+
+
+def _initialize_signal_store(
+    deps: PipelineDependencies,
+    recorder: PipelineRecorder,
+    timings: dict[str, float],
+) -> Any | None:
+    """Initialize optional semantic storage without failing core generation."""
+    started_at = time.monotonic()
+    if deps.signal_store_factory is None:
+        timings["signal_store_init"] = time.monotonic() - started_at
+        stage_log(
+            "signal_store_init",
+            timings["signal_store_init"] * 1000,
+            configured=False,
+            available=False,
+        )
+        return SIGNAL_STORE_UNAVAILABLE
+
+    try:
+        store = deps.signal_store_factory()
+    except Exception as exc:
+        timings["signal_store_init"] = time.monotonic() - started_at
+        logger.warning(
+            "signal_store_initialization_failed",
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
+        stage_log(
+            "signal_store_init",
+            timings["signal_store_init"] * 1000,
+            configured=True,
+            available=False,
+            error_type=type(exc).__name__,
+        )
+        recorder.stage(
+            "signal_store",
+            "skipped",
+            "signal_store_unavailable",
+            error_type=type(exc).__name__,
+        )
+        return SIGNAL_STORE_UNAVAILABLE
+
+    if store is None:
+        timings["signal_store_init"] = time.monotonic() - started_at
+        logger.warning("signal_store_initialization_returned_none")
+        stage_log(
+            "signal_store_init",
+            timings["signal_store_init"] * 1000,
+            configured=True,
+            available=False,
+            error_type="NoneReturned",
+        )
+        recorder.stage(
+            "signal_store",
+            "skipped",
+            "signal_store_unavailable",
+            error_type="NoneReturned",
+        )
+        return SIGNAL_STORE_UNAVAILABLE
+
+    timings["signal_store_init"] = time.monotonic() - started_at
+    stage_log(
+        "signal_store_init",
+        timings["signal_store_init"] * 1000,
+        configured=True,
+        available=True,
+    )
+    return store
 
 
 async def run_pipeline(
@@ -221,6 +293,8 @@ async def _run_pipeline_inner(
     )
 
     try:
+        signal_store = _initialize_signal_store(deps, runtime.recorder, runtime.timings)
+
         # ── 1. Intent Agent ──────────────────────────────────────────
         llm_provider_factory = runtime.deps.llm_provider_factory
         context_provider_factory = runtime.deps.context_provider_factory
@@ -246,6 +320,7 @@ async def _run_pipeline_inner(
             intent=intent,
             timings=runtime.timings,
             recorder=runtime.recorder,
+            signal_store=signal_store,
         )
         catalog_discovery = discovery_stage.discovery
         metric_catalog = catalog_discovery.metric_catalog
@@ -267,23 +342,59 @@ async def _run_pipeline_inner(
 
         # ── 4. Multi-label archetype matching ────────────────────
         target_language = primary.query_language
+        t0 = time.monotonic()
         selection = select_archetypes(
             intent=intent,
             metric_catalog=metric_catalog,
             catalog_for_compile=catalog_for_compile,
             target_language=target_language,
             settings=runtime.settings,
+            environment_refs=intent.environments,
+            signal_store=signal_store,
         )
         ranked_archetypes = selection.ranked_archetypes
         learned_archetypes = selection.learned_archetypes
+        runtime.timings["archetype_select"] = time.monotonic() - t0
 
-        runtime.recorder.selected_intent(intent, ranked_archetypes, learned_archetypes)
+        retrieval_details: dict[str, Any] = {
+            "retrieval_mode": selection.retrieval_mode.value,
+            "investigation_context_sources": selection.context_sources,
+            "generated_candidates": len(selection.shadow_archetypes),
+            "generated_files_scanned": selection.experimental_retrieval.files_scanned,
+            "generated_quarantined": selection.experimental_retrieval.quarantined,
+            "generated_rejected_by_scope": selection.experimental_retrieval.rejected_by_scope,
+            "generated_invalid": selection.experimental_retrieval.invalid,
+            "unexpected_cross_service_matches": selection.unexpected_cross_service_matches,
+            "normal_generated_retrieval_requested_but_blocked": (
+                bool(getattr(runtime.settings, "learned_archetypes_normal_retrieval_enabled", False))
+            ),
+            "output_applied": False,
+        }
+        stage_log(
+            "archetype_retrieval",
+            runtime.timings["archetype_select"] * 1000,
+            **retrieval_details,
+        )
+        runtime.recorder.stage(
+            "archetype_retrieval",
+            "passed",
+            selection.retrieval_reason_code,
+            **retrieval_details,
+        )
+
+        runtime.recorder.selected_intent(
+            intent,
+            ranked_archetypes,
+            learned_archetypes,
+            selection.shadow_archetypes,
+        )
 
         compilation = compile_selected_archetypes(
             selection=selection,
             intent=intent,
             catalog_for_compile=catalog_for_compile,
             timings=runtime.timings,
+            signal_store=signal_store,
         )
         if compilation is not None:
             dashboard_spec = compilation.dashboard_spec
@@ -309,6 +420,7 @@ async def _run_pipeline_inner(
             intent=intent,
             catalog=catalog_for_compile,
             target_language=target_language,
+            signal_store=signal_store,
         )
         evidence_requirements = evidence_stage.requirements
         evidence_resolutions = evidence_stage.resolutions
@@ -353,6 +465,7 @@ async def _run_pipeline_inner(
             target_language=target_language,
             ranked_archetypes_present=bool(ranked_archetypes),
             record_stage=record_validation_stage,
+            signal_store=signal_store,
         )
         dashboard_spec = validation_result.dashboard_spec
         validation_warnings = validation_result.validation_warnings

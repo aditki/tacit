@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException
 
-import tacit.signals as signals_mod
+from tacit.api.dependencies import get_signal_store
 from tacit.api.security import verify_api_key
 from tacit.models.schemas import TeachSignalRequest, TeachSignalResponse
 
@@ -17,9 +19,8 @@ router = APIRouter(dependencies=[Depends(verify_api_key)])
     summary="List all signal types",
     response_description="All registered semantic signal types with categories",
 )
-async def list_signals():
+async def list_signals(store: Any = Depends(get_signal_store)):
     """List all registered semantic signal types."""
-    store = signals_mod.get_signal_store()
     return {"signal_types": store.list_signal_types()}
 
 
@@ -29,9 +30,8 @@ async def list_signals():
     summary="Signal store statistics",
     response_description="Summary stats: signal types, mappings, ingested dashboards",
 )
-async def signal_stats():
+async def signal_stats(store: Any = Depends(get_signal_store)):
     """Summary statistics for the signal mapping store."""
-    store = signals_mod.get_signal_store()
     return store.stats()
 
 
@@ -41,9 +41,8 @@ async def signal_stats():
     summary="Get signal type details",
     response_description="Signal type with all metric mappings, confidence scores, and provenance",
 )
-async def get_signal(signal_type: str):
+async def get_signal(signal_type: str, store: Any = Depends(get_signal_store)):
     """Get a signal type with all its metric mappings."""
-    store = signals_mod.get_signal_store()
     result = store.get_signal_type(signal_type)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Signal type '{signal_type}' not found")
@@ -57,9 +56,11 @@ async def get_signal(signal_type: str):
     response_model=TeachSignalResponse,
     response_description="Confirmation of the created mapping",
 )
-async def teach_signal(request: TeachSignalRequest) -> TeachSignalResponse:
+async def teach_signal(
+    request: TeachSignalRequest,
+    store: Any = Depends(get_signal_store),
+) -> TeachSignalResponse:
     """Teach Tacit an organization-specific signal mapping."""
-    store = signals_mod.get_signal_store()
     store.register_signal_type(
         signal_type=request.signal_type,
         description=request.description,

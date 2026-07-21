@@ -298,16 +298,29 @@ def _readiness(report: dict[str, Any]) -> dict[str, Any]:
     return {"score": score, "max_score": 100, "level": level, "reasons": reasons}
 
 
-def build_assessment(signal_store: Any | None = None, history_store: Any | None = None) -> dict[str, Any]:
+def build_assessment(
+    signal_store: Any | None = None,
+    history_store: Any | None = None,
+    *,
+    stores: Any | None = None,
+) -> dict[str, Any]:
     """Compute the deterministic operational-knowledge assessment."""
+    if stores is not None:
+        signal_store = signal_store or stores.signals()
+        history_store = history_store or stores.history()
     if signal_store is None:
-        from tacit.signals.store import get_signal_store
+        from tacit.config import settings
+        from tacit.runtime_stores import RuntimeStores
 
-        signal_store = get_signal_store()
+        stores = RuntimeStores(settings)
+        signal_store = stores.signals()
     if history_store is None:
-        from tacit.history import get_investigation_store
+        if stores is None:
+            from tacit.config import settings
+            from tacit.runtime_stores import RuntimeStores
 
-        history_store = get_investigation_store()
+            stores = RuntimeStores(settings)
+        history_store = stores.history()
 
     now = time.time()
     with signal_store._conn() as conn:  # noqa: SLF001 — read-only sibling-module access
