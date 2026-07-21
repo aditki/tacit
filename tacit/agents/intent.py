@@ -152,7 +152,7 @@ async def classify_intent(
     #    keywords (high precision, dataset-independent).
     #  - COLLOQUIAL metaphors are kept only as scored evidence with provenance;
     #    they are advisory and must be confirmed downstream against live metric
-    #    coverage or a learned archetype, never trusted on their own.
+    #    coverage or governed Operational Knowledge, never trusted on their own.
     intent.keywords = expand_operational_terms(prompt, intent.keywords)
     intent.keyword_evidence = [e.as_dict() for e in operational_evidence(prompt)]
 

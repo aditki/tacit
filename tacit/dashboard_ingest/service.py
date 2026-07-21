@@ -2,8 +2,8 @@
 
 Vendor-agnostic: each DashboardBackend implements ``ingest_dashboard()``
 which returns a common ``DashboardFeatures`` dataclass.  This module handles
-the vendor-independent parts: signal inference, archetype generation, and
-signal store persistence.
+the vendor-independent parts: signal inference, optional quarantined
+archetype-candidate generation, and signal store persistence.
 
 Per-backend parsers extract:
 - Metric names from queries (PromQL, SignalFlow, LogQL, CloudWatch, etc.)
@@ -17,17 +17,20 @@ Per-backend parsers extract:
 - Drilldown links to other dashboards
 
 Then infers signal types by matching extracted metrics against the signal
-store's taxonomy, and optionally auto-generates an archetype YAML snippet.
+store's taxonomy. Experimental archetype generation is disabled by default;
+when explicitly enabled, its YAML output is quarantined and cannot enter the
+curated registry or normal retrieval.
 """
 
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import Any
 
 import structlog
-import yaml
 
+from tacit.archetypes.generated.store import quarantine_generated_archetype_yaml
 from tacit.config import Settings, settings
 from tacit.dashboard_ingest.archetype_generation import generate_archetype_yaml
 from tacit.dashboard_ingest.features import (
@@ -37,7 +40,7 @@ from tacit.dashboard_ingest.reports import build_learning_impact_report, build_s
 from tacit.signals import get_signal_store as _default_get_signal_store
 
 logger = structlog.get_logger()
-_ARCHETYPE_REGISTRATION_LOCK = threading.Lock()
+_ARCHETYPE_QUARANTINE_LOCK = threading.Lock()
 
 
 def get_signal_store():
@@ -220,35 +223,10 @@ def persist_inferred_signal_review(
 
 
 def register_generated_archetype_if_enabled(archetype_yaml: str, *, dashboard_uid: str = "") -> bool:
-    """Auto-register a generated archetype when learning compounding is enabled."""
-    import tacit.dashboard_ingest as dashboard_ingest_pkg
-
-    package_register = getattr(
-        dashboard_ingest_pkg,
-        "register_generated_archetype_if_enabled",
-        register_generated_archetype_if_enabled,
-    )
-    if package_register is not register_generated_archetype_if_enabled:
-        return package_register(archetype_yaml, dashboard_uid=dashboard_uid)
-
-    if not settings.learning_auto_register_archetype or not archetype_yaml:
-        return False
-    from tacit.archetypes.templates import append_archetype_to_yaml
-
-    try:
-        with _ARCHETYPE_REGISTRATION_LOCK:
-            written = append_archetype_to_yaml(archetype_yaml)
-        registered = written is not None
-        if not registered:
-            logger.warning(
-                "archetype_autoregister_skipped",
-                uid=dashboard_uid,
-                reason="no TACIT_ARCHETYPES_PATH set",
-            )
-        return registered
-    except Exception:
-        logger.exception("archetype_autoregister_failed", uid=dashboard_uid)
-        return False
+    """Compatibility guard: generated artifacts can never enter curated YAML."""
+    if archetype_yaml:
+        logger.warning("generated_archetype_curated_registration_blocked", uid=dashboard_uid)
+    return False
 
 
 def register_generated_archetypes_if_enabled(
@@ -256,21 +234,60 @@ def register_generated_archetypes_if_enabled(
     *,
     dashboard_uid: str = "bulk",
 ) -> bool:
-    """Auto-register multiple generated archetypes with one YAML write/reload."""
-    if not settings.learning_auto_register_archetype:
-        return False
-    items: list[dict[str, Any]] = []
+    """Compatibility guard for the retired bulk curated-registration path."""
+    if any(archetype_yamls):
+        logger.warning("generated_archetype_bulk_curated_registration_blocked", uid=dashboard_uid)
+    return False
+
+
+def quarantine_generated_archetype_if_enabled(
+    archetype_yaml: str,
+    *,
+    dashboard_uid: str = "",
+    runtime_settings: Settings | None = None,
+) -> list[str]:
+    """Persist generated output only in the experimental quarantine namespace."""
+    active_settings = runtime_settings or settings
+    if (
+        not bool(getattr(active_settings, "learned_archetypes_automatic_registration_enabled", False))
+        or not archetype_yaml
+    ):
+        return []
+    try:
+        with _ARCHETYPE_QUARANTINE_LOCK:
+            paths = quarantine_generated_archetype_yaml(
+                archetype_yaml,
+                Path(
+                    getattr(
+                        active_settings,
+                        "learned_archetypes_quarantine_path",
+                        "data/generated_archetypes/quarantine",
+                    )
+                ),
+            )
+        return [str(path) for path in paths]
+    except Exception:
+        logger.exception("generated_archetype_quarantine_failed", uid=dashboard_uid)
+        return []
+
+
+def quarantine_generated_archetypes_if_enabled(
+    archetype_yamls: list[str],
+    *,
+    dashboard_uid: str = "bulk",
+    runtime_settings: Settings | None = None,
+) -> list[str]:
+    """Quarantine a batch without combining it into a global registry document."""
+    paths: list[str] = []
     for archetype_yaml in archetype_yamls:
-        doc = yaml.safe_load(archetype_yaml) or {}
-        for item in doc.get("archetypes", []) or []:
-            if isinstance(item, dict):
-                items.append(item)
-    if not items:
-        return False
-    return register_generated_archetype_if_enabled(
-        yaml.safe_dump({"archetypes": items}, sort_keys=False, width=120),
-        dashboard_uid=dashboard_uid,
-    )
+        paths.extend(
+            quarantine_generated_archetype_if_enabled(
+                archetype_yaml,
+                dashboard_uid=dashboard_uid,
+                runtime_settings=runtime_settings,
+            )
+        )
+    return paths
 
 
 def approve_ingested_dashboard_record(
@@ -292,6 +309,7 @@ def approve_ingested_dashboard_record(
             "status": ingested["status"],
             "mappings_created": 0,
             "archetype_registered": False,
+            "archetype_quarantined": False,
             "message": f"Dashboard already {ingested['status']}",
         }
 
@@ -335,7 +353,7 @@ def approve_ingested_dashboard_record(
         backend_name=backend_name,
         activated_pairs=activated_pairs,
     )
-    archetype_registered = register_generated_archetype_if_enabled(
+    quarantine_paths = quarantine_generated_archetype_if_enabled(
         ingested.get("archetype_generated", ""),
         dashboard_uid=dashboard_uid,
     )
@@ -345,7 +363,9 @@ def approve_ingested_dashboard_record(
         "backend_name": ingested.get("backend_name", ""),
         "status": "approved",
         "mappings_created": mappings_created,
-        "archetype_registered": archetype_registered,
+        "archetype_registered": False,
+        "archetype_quarantined": bool(quarantine_paths),
+        "archetype_quarantine_paths": quarantine_paths,
         "message": f"Dashboard approved, {mappings_created} signal mapping(s) created",
     }
 
@@ -405,8 +425,10 @@ async def ingest_dashboard_features(
     *,
     auto_approve: bool = False,
     register_archetype: bool = True,
+    runtime_settings: Settings | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted dashboard features."""
+    active_settings = runtime_settings or settings
     extracted = _features_to_dict(features)
 
     signals = infer_signals_from_metrics(
@@ -420,7 +442,24 @@ async def ingest_dashboard_features(
         approved=auto_approve,
     )
 
-    archetype_yaml = generate_archetype_yaml(extracted, signals)
+    source_ref = (
+        f"{features.backend_name}:{features.dashboard_uid}" if features.backend_name else features.dashboard_uid
+    )
+    archetype_yaml = ""
+    generation_enabled = bool(getattr(active_settings, "learned_archetypes_generation_enabled", False))
+    if generation_enabled:
+        archetype_yaml = generate_archetype_yaml(
+            extracted,
+            signals,
+            tenant_id=getattr(active_settings, "learned_archetypes_tenant_id", "default"),
+            generation_version=getattr(
+                active_settings,
+                "learned_archetypes_generation_version",
+                "generated-archetype-v1",
+            ),
+            generation_run_id=f"dashboard_ingest:{source_ref}",
+            source_refs=[source_ref],
+        )
 
     store = get_signal_store()
     status = "approved" if auto_approve else "pending"
@@ -444,12 +483,9 @@ async def ingest_dashboard_features(
         status=status,
     )
     mappings_created = 0
-    archetype_registered = False
+    quarantine_paths: list[str] = []
     activated_pairs: set[tuple[str, str]] = set()
     if auto_approve:
-        source_ref = (
-            f"{features.backend_name}:{features.dashboard_uid}" if features.backend_name else features.dashboard_uid
-        )
         for sig in signals:
             if persist_inferred_signal_review(
                 store=store,
@@ -461,9 +497,10 @@ async def ingest_dashboard_features(
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
         if register_archetype:
-            archetype_registered = register_generated_archetype_if_enabled(
+            quarantine_paths = quarantine_generated_archetype_if_enabled(
                 archetype_yaml,
                 dashboard_uid=features.dashboard_uid,
+                runtime_settings=active_settings,
             )
         logger.info(
             "dashboard_ingested_auto_approved",
@@ -472,7 +509,8 @@ async def ingest_dashboard_features(
             metrics=len(features.metrics_found),
             signals=len(signals),
             mappings_created=mappings_created,
-            archetype_registered=archetype_registered,
+            archetype_registered=False,
+            archetype_quarantined=bool(quarantine_paths),
         )
     else:
         logger.info(
@@ -514,10 +552,13 @@ async def ingest_dashboard_features(
         "learning_impact": learning_impact,
         "indexed_context_rows": indexed_context_rows,
         "archetype_yaml": archetype_yaml,
+        "archetype_generation_enabled": generation_enabled,
+        "archetype_registered": False,
+        "archetype_quarantined": bool(quarantine_paths),
+        "archetype_quarantine_paths": quarantine_paths,
     }
     if auto_approve:
         result["mappings_created"] = mappings_created
-        result["archetype_registered"] = archetype_registered
     return result
 
 
@@ -548,13 +589,14 @@ async def ingest_dashboard(
         If provided without an explicit ``backend``, selects the backend by
         name (e.g. 'grafana', 'signalfx').
     auto_approve : bool
-        If True, automatically approve and create signal mappings.
-        If False (default), stores as 'pending' for human review.
+        If True, request automated review for eligible signal mappings only.
+        Governance determines activation, and generated archetypes remain
+        quarantined. If False (default), stores as 'pending' for human review.
 
     Returns
     -------
-    dict with: extracted features, inferred signals, generated archetype YAML,
-    and status.
+    dict with extracted features, inferred signals, optional quarantined
+    archetype-candidate YAML, and status.
     """
     from tacit.backends import get_active_backends
     from tacit.backends.base import DashboardFeatures
@@ -587,6 +629,7 @@ async def ingest_dashboard(
             features,
             auto_approve=auto_approve,
             register_archetype=register_archetype,
+            runtime_settings=runtime_settings,
         )
 
     finally:
@@ -644,7 +687,8 @@ async def learn_backend_dashboards(
                         uid,
                         backend=backend,
                         auto_approve=auto_approve,
-                        register_archetype=not auto_approve,
+                        register_archetype=True,
+                        runtime_settings=active_settings,
                     )
                 return (
                     {
@@ -655,7 +699,9 @@ async def learn_backend_dashboards(
                         "signals_inferred": len(result.get("signals_inferred", [])),
                         "indexed_context_rows": result.get("indexed_context_rows", 0),
                         "mappings_created": result.get("mappings_created", 0),
-                        "archetype_registered": result.get("archetype_registered", False),
+                        "archetype_registered": False,
+                        "archetype_quarantined": result.get("archetype_quarantined", False),
+                        "archetype_quarantine_paths": result.get("archetype_quarantine_paths", []),
                         "archetype_yaml": result.get("archetype_yaml", ""),
                     },
                     None,
@@ -676,19 +722,8 @@ async def learn_backend_dashboards(
                 failures.append(failure)
                 totals["dashboards_failed"] += 1
 
-        if auto_approve:
-            archetype_yamls = [str(item.get("archetype_yaml", "")) for item in learned if item.get("archetype_yaml")]
-            archetype_registered = register_generated_archetypes_if_enabled(
-                archetype_yamls,
-                dashboard_uid=f"{backend_name}:bulk",
-            )
-            if archetype_registered:
-                for item in learned:
-                    if item.get("archetype_yaml"):
-                        item["archetype_registered"] = True
-            totals["archetypes_registered"] = len(archetype_yamls) if archetype_registered else 0
-        else:
-            totals["archetypes_registered"] = 0
+        totals["archetypes_registered"] = 0
+        totals["archetypes_quarantined"] = sum(bool(item.get("archetype_quarantined")) for item in learned)
 
         return {
             "backend": backend_name,

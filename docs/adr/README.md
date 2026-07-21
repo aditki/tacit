@@ -13,7 +13,7 @@ production-readiness claims.
 | [ADR-003](003-emergent-signals-over-fixed-taxonomy.md) | Signals should emerge from observed usage, not a fixed vendor taxonomy | Accepted | Partially implemented |
 | [ADR-004](004-dashboard-ingestion-onboarding.md) | Dashboard ingestion is the primary onboarding path for custom telemetry | Accepted | Partially implemented |
 | [ADR-005](005-deterministic-candidate-signal-inference.md) | Deterministic candidate signal inference is the default | Accepted | Implemented |
-| [ADR-006](006-conservative-auto-teach.md) | Conservative auto-teach prevents learned mapping poisoning | Accepted | Implemented |
+| [ADR-006](006-conservative-auto-teach.md) | Conservative auto-teach prevents learned mapping poisoning | Accepted, amended by ADR-019 | Inference gate implemented; governance consolidation in progress |
 | [ADR-007](007-lightweight-investigation-plans.md) | Investigation plans are useful, but should remain lightweight for now | Accepted | Partially implemented |
 | [ADR-008](008-dashboards-as-evidence-artifacts.md) | Dashboards are evidence artifacts, not the sole product | Accepted | Partially implemented |
 | [ADR-009](009-operational-usefulness-evaluation.md) | Evaluation should prioritize operational usefulness over label purity | Accepted | Partially implemented |
@@ -26,3 +26,6 @@ production-readiness claims.
 | [ADR-016](016-contextual-vs-telemetry-evidenced-ranking.md) | Culprit ranking has contextual and telemetry-evidenced tiers | Accepted | Partially implemented |
 | [ADR-017](017-artifact-learning-framework.md) | Artifact learning compiles operational artifacts into Operational IR | Proposed | Partially implemented |
 | [ADR-018](018-investigation-contract.md) | Investigation is the primary product, exposed as a versioned contract | Proposed | Not implemented |
+| [ADR-019](019-governed-knowledge-authority.md) | Operational Knowledge is the authority for learned organizational behavior | Accepted, amended by ADR-020/021 | Containment implemented; consolidation in progress |
+| [ADR-020](020-generated-archetypes-shadow-before-lifecycle.md) | Generated archetypes must prove value in shadow mode before lifecycle investment | Accepted | Containment implemented; shadow evaluation pending |
+| [ADR-021](021-generated-archetype-scope-context.md) | Generated-archetype evaluation uses explicit request scope and fails closed | Accepted | Not implemented |

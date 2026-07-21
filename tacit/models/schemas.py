@@ -64,7 +64,7 @@ class Intent(BaseModel):
         description="Scored operational-synonym evidence with provenance: "
         "[{keyword, score, tier, source}]. Conventional terms are also folded "
         "into 'keywords'; colloquial (low-score) terms are advisory only and "
-        "must be confirmed against live coverage / learned archetypes before use.",
+        "must be confirmed against live coverage or governed Operational Knowledge before use.",
     )
 
 
@@ -209,7 +209,7 @@ class PanelQuery(BaseModel):
     cloudwatch_dimensions: dict[str, str | list[str]] = Field(
         default_factory=dict,
         description=(
-            "CloudWatch dimensions, e.g. {'LoadBalancer': '*'} " "or {'AvailabilityZone': ['us-east-1a', 'us-east-1b']}"
+            "CloudWatch dimensions, e.g. {'LoadBalancer': '*'} or {'AvailabilityZone': ['us-east-1a', 'us-east-1b']}"
         ),
     )
     cloudwatch_region: str = Field(default="", description="AWS region for this CloudWatch query, e.g. 'us-east-1'")
@@ -505,7 +505,7 @@ class ArchetypeListResponse(BaseModel):
 
 
 class ArchetypeReloadResponse(BaseModel):
-    """Result of an archetype hot-reload operation."""
+    """Result of a curated-archetype hot-reload operation."""
 
     message: str = Field(description="Status message")
     count: int = Field(description="Number of archetypes loaded")
@@ -610,7 +610,8 @@ class LearnDashboardRequest(BaseModel):
     )
     auto_approve: bool = Field(
         default=False,
-        description="If true, approve and create signal mappings immediately; otherwise store as 'pending'.",
+        description="Request automated review for eligible signal mappings only; generated archetypes remain "
+        "quarantined. Otherwise store the dashboard as 'pending'.",
     )
 
     @field_validator("dashboard_uid")
@@ -649,7 +650,8 @@ class LearnAlertRequest(BaseModel):
     )
     auto_approve: bool = Field(
         default=False,
-        description="If true, approve and create signal mappings immediately; otherwise store as 'pending'.",
+        description="Request automated review for eligible signal mappings only; generated archetypes remain "
+        "quarantined. Otherwise store the alert as 'pending'.",
     )
     dry_run: bool = Field(
         default=False,
@@ -697,7 +699,8 @@ class LearnDashboardUploadRequest(BaseModel):
     dashboard: dict[str, Any] = Field(description="Exported dashboard JSON document.")
     auto_approve: bool = Field(
         default=False,
-        description="If true, approve and create signal mappings immediately; otherwise store as 'pending'.",
+        description="Request automated review for eligible signal mappings only; generated archetypes remain "
+        "quarantined. Otherwise store the upload as 'pending'.",
     )
 
     @field_validator("vendor")

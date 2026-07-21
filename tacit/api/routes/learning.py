@@ -72,7 +72,7 @@ async def _call_learn_backend_alerts(learn_backend_alerts, **kwargs):
     "/api/v1/learn/dashboard",
     tags=["Learning"],
     summary="Learn from an existing Grafana dashboard",
-    response_description="Extracted features, inferred signals, and generated archetype YAML",
+    response_description="Extracted features, inferred signals, and optional quarantined archetype YAML",
 )
 async def learn_from_dashboard(request: Request, payload: LearnDashboardRequest):
     """Ingest an existing dashboard to learn operational patterns."""
@@ -189,7 +189,7 @@ async def learn_from_incident(payload: LearnIncidentRequest):
     "/api/v1/learn/dashboard/json",
     tags=["Learning"],
     summary="Learn from uploaded dashboard JSON",
-    response_description="Extracted features, inferred signals, and generated archetype YAML",
+    response_description="Extracted features, inferred signals, and optional quarantined archetype YAML",
 )
 async def learn_from_dashboard_json(request: LearnDashboardUploadRequest):
     """Ingest an uploaded dashboard JSON export without contacting the vendor."""
@@ -222,7 +222,11 @@ async def learn_from_dashboard_json(request: LearnDashboardUploadRequest):
 async def learn_backend(
     request: Request,
     backend_name: str = PathParam(description="Backend name: grafana or signalfx"),
-    auto_approve: bool = Query(False, description="Immediately approve eligible inferred mappings"),
+    auto_approve: bool = Query(
+        False,
+        description="Request automated review for eligible signal mappings only; "
+        "generated archetypes remain quarantined",
+    ),
     limit: int = Query(500, ge=1, le=5000, description="Maximum dashboards to crawl"),
 ):
     """Crawl a connected backend and persist learned dashboard context."""
@@ -256,7 +260,11 @@ async def learn_backend(
 async def learn_backend_alert_rules(
     request: Request,
     backend_name: str = PathParam(description="Backend name: grafana or signalfx"),
-    auto_approve: bool = Query(False, description="Immediately approve eligible inferred mappings"),
+    auto_approve: bool = Query(
+        False,
+        description="Request automated review for eligible signal mappings only; "
+        "generated archetypes remain quarantined",
+    ),
     dry_run: bool = Query(False, description="Preview alert ingestion without persisting learned context"),
     limit: int = Query(500, ge=1, le=5000, description="Maximum alerts to crawl"),
 ):

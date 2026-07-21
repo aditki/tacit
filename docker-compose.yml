@@ -14,6 +14,12 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      LEARNED_ARCHETYPES_GENERATION_ENABLED: "false"
+      LEARNED_ARCHETYPES_AUTOMATIC_REGISTRATION_ENABLED: "false"
+      LEARNED_ARCHETYPES_NORMAL_RETRIEVAL_ENABLED: "false"
+      LEARNED_ARCHETYPES_RETRIEVAL_MODE: curated_only
+      LEARNED_ARCHETYPES_QUARANTINE_PATH: /app/data/generated_archetypes/quarantine
     volumes:
       - tacit_data:/app/data
     read_only: true

@@ -534,7 +534,7 @@ def _check_grafana() -> bool:
         resp = httpx.get(f"{url}/api/org", headers=headers, timeout=10)
         if resp.status_code == 200:
             org = resp.json()
-            _success(f"Grafana: connected to \"{org.get('name', 'unknown')}\" at {url}")
+            _success(f'Grafana: connected to "{org.get("name", "unknown")}" at {url}')
             return True
         else:
             _fail(f"Grafana: HTTP {resp.status_code} from {url}/api/org")
@@ -737,7 +737,7 @@ def connect_grafana(url: str | None, api_key: str | None):
             _fail(f"Connection failed: HTTP {resp.status_code}")
             return
         org = resp.json()
-        _success(f"Connected to \"{org.get('name', 'unknown')}\" at {url}")
+        _success(f'Connected to "{org.get("name", "unknown")}" at {url}')
     except Exception as e:
         _fail(f"Connection failed: {e}")
         return
@@ -1171,7 +1171,11 @@ def learn():
 @learn.command("dashboard")
 @click.argument("dashboard_uid")
 @click.option("--backend", default="", help="Backend name, e.g. grafana or signalfx")
-@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+@click.option(
+    "--auto-approve/--pending",
+    default=False,
+    help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
+)
 def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool):
     """Ingest a dashboard and show what Tacit learned."""
     _header("Learn Dashboard")
@@ -1240,7 +1244,7 @@ def _print_bulk_learning_summary(result: dict):
     _info(f"Indexed context rows: {result.get('indexed_context_rows', 0)}")
     if result.get("auto_approve"):
         _info(f"Mappings created: {result.get('mappings_created', 0)}")
-        _info(f"Archetypes registered: {result.get('archetypes_registered', 0)}")
+        _info(f"Generated archetypes quarantined: {result.get('archetypes_quarantined', 0)}")
 
     learned = result.get("learned", [])
     if learned:
@@ -1433,7 +1437,11 @@ def learn_pagerduty(since: str, until: str | None, statuses: tuple[str, ...], li
 @learn.command("alerts")
 @click.option("--from", "source", default="grafana", show_default=True, help="Backend source: grafana or signalfx")
 @click.option("--uid", "alert_uid", default="", help="Ingest one alert UID instead of crawling all alerts")
-@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+@click.option(
+    "--auto-approve/--pending",
+    default=False,
+    help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
+)
 @click.option("--dry-run", is_flag=True, help="Preview alert ingestion without persisting learned context")
 @click.option("--limit", default=500, show_default=True, help="Maximum alerts to crawl")
 def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool, limit: int):
@@ -1525,7 +1533,11 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
 
 
 @learn.command("grafana")
-@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+@click.option(
+    "--auto-approve/--pending",
+    default=False,
+    help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
+)
 @click.option("--limit", default=500, show_default=True, help="Maximum dashboards to crawl")
 def learn_grafana(auto_approve: bool, limit: int):
     """Crawl Grafana dashboards and persist learned operational context."""
@@ -1533,7 +1545,11 @@ def learn_grafana(auto_approve: bool, limit: int):
 
 
 @learn.command("signalfx")
-@click.option("--auto-approve/--pending", default=False, help="Immediately activate eligible mappings")
+@click.option(
+    "--auto-approve/--pending",
+    default=False,
+    help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
+)
 @click.option("--limit", default=500, show_default=True, help="Maximum dashboards to crawl")
 def learn_signalfx(auto_approve: bool, limit: int):
     """Crawl SignalFx dashboards and persist learned operational context."""
@@ -1544,7 +1560,7 @@ def learn_signalfx(auto_approve: bool, limit: int):
 @click.argument("dashboard_uid")
 @click.option("--backend", default="", help="Backend name, e.g. grafana_json or signalfx")
 def learn_approve(dashboard_uid: str, backend: str):
-    """Approve a pending learned dashboard and activate mappings."""
+    """Approve a pending dashboard and evaluate eligible signal mappings."""
     _header("Approve Learned Dashboard")
     _load_env()
 
@@ -1562,7 +1578,7 @@ def learn_approve(dashboard_uid: str, backend: str):
     if result.get("status") == "approved":
         _success(result.get("message", "Dashboard approved"))
         _info(f"Mappings created: {result.get('mappings_created', 0)}")
-        _info(f"Archetype registered: {result.get('archetype_registered', False)}")
+        _info(f"Generated archetype quarantined: {result.get('archetype_quarantined', False)}")
     else:
         _info(result.get("message", f"Dashboard already {result.get('status')}"))
 

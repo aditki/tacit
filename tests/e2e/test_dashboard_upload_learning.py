@@ -7,11 +7,13 @@ from fastapi.testclient import TestClient
 
 import tacit.archetypes.templates as templates
 import tacit.pipeline as pipeline_mod
+from tacit.agents.providers import registry as provider_registry
 from tacit.agents.providers.base import TokenUsage
 from tacit.main import app
 from tacit.models.schemas import ArchetypeMatch, DashRequest, Intent, MetricEntry, SignalType
 from tests.e2e.framework import (
     CapturingBackend,
+    IncidentFixtureProvider,
     build_grafana_dashboard,
     evaluate_incident,
     incident_cases,
@@ -32,7 +34,7 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
     isolated_learning_runtime,
     monkeypatch,
 ):
-    signal_store, _history_store, _feedback_store, archetypes_path = isolated_learning_runtime
+    signal_store, history_store, _feedback_store, _archetypes_path, quarantine_path = isolated_learning_runtime
     scenario = load_scenario(SCENARIO_PATH)
     dashboard_json = build_grafana_dashboard(scenario)
     client = TestClient(app)
@@ -75,14 +77,22 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
     approved = approve.json()
     assert approved["status"] == "approved"
     assert approved["mappings_created"] >= 5
-    assert approved["archetype_registered"] is True
-    assert archetypes_path.is_file()
+    assert approved["archetype_registered"] is False
+    assert approved["archetype_quarantined"] is True
+    assert len(list(quarantine_path.rglob("*.yaml"))) == 1
 
     learned_sources = signal_store.stats()["mappings_by_source"]
     assert learned_sources.get("dashboard_ingest", 0) >= 5
 
-    backend = CapturingBackend(catalog=scenario_catalog(scenario))
+    catalog = scenario_catalog(scenario)
+    backend = CapturingBackend(catalog=catalog)
     monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
+    fixture_provider = IncidentFixtureProvider(
+        catalog,
+        inferred_metrics,
+        service=scenario["prompt_matrix"]["services"][0],
+    )
+    monkeypatch.setattr(provider_registry, "create_provider", lambda _settings: fixture_provider)
 
     monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
 
@@ -101,9 +111,12 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
             DashRequest(prompt=case.prompt, user_id="e2e", channel_id="dashboard-upload-learning")
         )
         assert response.dashboard_uid, case.case_id
+        contract = history_store.get_contract(response.investigation_id)
+        assert contract is not None, case.case_id
+        assert "checkout_edge_incident_response" not in contract.model_dump_json(), case.case_id
         assert backend.published_specs, case.case_id
         spec = backend.published_specs[-1]
-        assert "Checkout Edge Incident Response" in spec.title
+        assert "Checkout Edge Incident Response" not in spec.title
         evaluation = evaluate_incident(spec, case)
         evaluation.assert_passes(thresholds, case_id=case.case_id)
         evaluations.append(evaluation)
@@ -117,7 +130,7 @@ async def test_manual_teach_signal_mapping_is_used_before_dashboard_creation(
     isolated_learning_runtime,
     monkeypatch,
 ):
-    _signal_store, _history_store, _feedback_store, archetypes_path = isolated_learning_runtime
+    _signal_store, _history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
     archetypes_path.write_text(
         """
 archetypes:
@@ -210,7 +223,7 @@ archetypes:
 def test_reject_uploaded_dashboard_records_negative_candidates_without_teaching(
     isolated_learning_runtime,
 ):
-    signal_store, _history_store, _feedback_store, _archetypes_path = isolated_learning_runtime
+    signal_store, _history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
     scenario = load_scenario(SCENARIO_PATH)
     client = TestClient(app)
 
@@ -246,7 +259,7 @@ async def test_pipeline_returns_helpful_no_metrics_response_without_publishing(
     isolated_learning_runtime,
     monkeypatch,
 ):
-    _signal_store, _history_store, _feedback_store, _archetypes_path = isolated_learning_runtime
+    _signal_store, _history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
     backend = CapturingBackend(catalog=[])
     monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
     monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)

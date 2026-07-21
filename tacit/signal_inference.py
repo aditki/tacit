@@ -41,7 +41,8 @@ INFERENCE_VERSION = "1.1"
 
 MIN_SCORE = 0.25  # below this we emit nothing rather than guess
 
-# Auto-teach (L3) thresholds — deliberately conservative.
+# Legacy auto-teach eligibility thresholds. This is candidate-quality evidence;
+# governed promotion remains the authority for runtime activation.
 _AUTOTEACH_SCORE = 0.70
 _AUTOTEACH_MARGIN = 0.25
 _EXPLICIT_SCORE = 0.45  # explicit names may teach with a single source
@@ -71,7 +72,7 @@ _OVERRIDE_RULES: list[tuple[str, re.Pattern[str], str]] = [
     ),
 ]
 
-# Explicit, high-strength name rules (>=0.9) may auto-teach with a single source.
+# Explicit, high-strength name rules (>=0.9) may qualify with a single source.
 # (regex, family, strength, evidence)
 _NAME_RULES: list[tuple[re.Pattern[str], str, float, str]] = [
     (re.compile(r"([45]xx|http_?5\d\d|status_?5\d\d)"), "errors", 1.0, "name indicates HTTP errors"),
@@ -220,7 +221,7 @@ class InferredSignal:
 
     @property
     def auto_teach_eligible(self) -> bool:
-        """Conservative gate for L3 auto-teach — avoids poisoning the store."""
+        """Conservative candidate-quality gate; this does not grant runtime authority."""
         if self.explicit_name and self.score >= _EXPLICIT_SCORE:
             return True
         return self.score >= _AUTOTEACH_SCORE and self.margin >= _AUTOTEACH_MARGIN and len(self.evidence_sources) >= 2

@@ -110,7 +110,7 @@ def _stronger_review_state(existing: str, incoming: str) -> str:
 
 
 def _db_path() -> Path:
-    custom = getattr(settings, "signals_db_path", None)
+    custom = settings.signals_db_path
     path = Path(custom) if custom else _DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     return path

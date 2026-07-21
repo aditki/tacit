@@ -1,12 +1,91 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
+import tacit.feedback as feedback_mod
+import tacit.history as history_mod
+import tacit.signals.store as signals_store_mod
 from tacit.alert_ingest import ingest_alert_features
 from tacit.backends.base import AlertFeatures
+from tacit.config import create_settings
 from tacit.feedback import FeedbackStore
 from tacit.history import InvestigationStore
 from tacit.signals import SignalStore
+
+
+def _clear_store_path_environment(monkeypatch) -> None:
+    for name in ("HISTORY_DB_PATH", "FEEDBACK_DB_PATH", "SIGNALS_DB_PATH"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_sqlite_store_paths_load_from_environment_and_drive_stores(tmp_path, monkeypatch):
+    paths = {
+        "HISTORY_DB_PATH": tmp_path / "state" / "history.db",
+        "FEEDBACK_DB_PATH": tmp_path / "state" / "feedback.db",
+        "SIGNALS_DB_PATH": tmp_path / "state" / "signals.db",
+    }
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TACIT_CONFIG", raising=False)
+    for name, path in paths.items():
+        monkeypatch.setenv(name, str(path))
+
+    runtime_settings = create_settings()
+
+    assert runtime_settings.history_db_path == str(paths["HISTORY_DB_PATH"])
+    assert runtime_settings.feedback_db_path == str(paths["FEEDBACK_DB_PATH"])
+    assert runtime_settings.signals_db_path == str(paths["SIGNALS_DB_PATH"])
+
+    monkeypatch.setattr(history_mod, "settings", runtime_settings)
+    monkeypatch.setattr(feedback_mod, "settings", runtime_settings)
+    monkeypatch.setattr(signals_store_mod, "settings", runtime_settings)
+
+    assert InvestigationStore()._db_path == paths["HISTORY_DB_PATH"]
+    assert FeedbackStore()._db_path == paths["FEEDBACK_DB_PATH"]
+    assert SignalStore()._db_path == paths["SIGNALS_DB_PATH"]
+
+
+def test_sqlite_store_paths_load_from_dotenv(tmp_path, monkeypatch):
+    expected = {
+        "history_db_path": tmp_path / "dotenv-history.db",
+        "feedback_db_path": tmp_path / "dotenv-feedback.db",
+        "signals_db_path": tmp_path / "dotenv-signals.db",
+    }
+    (tmp_path / ".env").write_text(
+        "\n".join(f"{name.upper()}={path}" for name, path in expected.items()),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TACIT_CONFIG", raising=False)
+    _clear_store_path_environment(monkeypatch)
+
+    runtime_settings = create_settings()
+
+    for field, path in expected.items():
+        assert Path(getattr(runtime_settings, field)) == path
+
+
+def test_sqlite_store_paths_load_from_yaml(tmp_path, monkeypatch):
+    config_path = tmp_path / "tacit.yaml"
+    config_path.write_text(
+        """
+history:
+  db_path: state/yaml-history.db
+feedback:
+  db_path: state/yaml-feedback.db
+signals:
+  db_path: state/yaml-signals.db
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TACIT_CONFIG", str(config_path))
+    _clear_store_path_environment(monkeypatch)
+
+    runtime_settings = create_settings()
+
+    assert runtime_settings.history_db_path == "state/yaml-history.db"
+    assert runtime_settings.feedback_db_path == "state/yaml-feedback.db"
+    assert runtime_settings.signals_db_path == "state/yaml-signals.db"
 
 
 def test_signal_store_sets_busy_timeout(tmp_path):

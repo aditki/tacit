@@ -34,7 +34,7 @@ def _http_catalog() -> list[MetricEntry]:
 
 @pytest.mark.e2e
 def test_system_archetype_signal_and_auth_endpoints(isolated_learning_runtime, monkeypatch):
-    signal_store, _history_store, _feedback_store, _archetypes_path = isolated_learning_runtime
+    signal_store, _history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
     client = TestClient(app)
 
     assert client.get("/healthz").json() == {"status": "ok"}
@@ -84,7 +84,7 @@ def test_system_archetype_signal_and_auth_endpoints(isolated_learning_runtime, m
 
 @pytest.mark.e2e
 def test_chart_history_feedback_and_insights_endpoints(isolated_learning_runtime, monkeypatch):
-    _signal_store, history_store, _feedback_store, _archetypes_path = isolated_learning_runtime
+    _signal_store, history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
     client = TestClient(app)
     backend = CapturingBackend(catalog=_http_catalog())
     monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
@@ -173,7 +173,7 @@ def test_chart_history_feedback_and_insights_endpoints(isolated_learning_runtime
 
 @pytest.mark.e2e
 def test_learning_list_ignore_and_upload_validation_endpoints(isolated_learning_runtime):
-    signal_store, _history_store, _feedback_store, _archetypes_path = isolated_learning_runtime
+    signal_store, _history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
     scenario = load_scenario(SCENARIO_PATH)
     client = TestClient(app)
 

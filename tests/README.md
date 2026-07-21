@@ -39,9 +39,10 @@ The validation suite uses a **tiered evaluation framework**:
 
 1. Upload a representative dashboard JSON.
 2. Infer semantic signals and keep the dashboard pending.
-3. Approve it, which creates signal mappings and registers the generated learned archetype.
-4. Run a combinatorial prompt matrix against the learned telemetry language.
-5. Score the generated dashboard spec for metric recall, critical evidence, signal-to-noise, and an incident usefulness score.
+3. Approve it, which evaluates eligible signal mappings through the governed learning path.
+4. Verify that generated archetype output remains quarantined and absent from normal retrieval.
+5. Run a combinatorial prompt matrix against the learned telemetry language.
+6. Score the generated dashboard spec for metric recall, critical evidence, signal-to-noise, and an incident usefulness score.
 
 It also covers manual signal teaching, rejecting uploaded dashboards without activating mappings, and the no-metrics failure path.
 The API-surface E2E tests additionally cover health, auth, archetype reload/listing, signal detail/stats, chart generation, investigation history, feedback, feedback insights, learning lists, ignore flows, and upload validation failures.

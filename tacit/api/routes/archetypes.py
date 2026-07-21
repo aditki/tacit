@@ -13,19 +13,19 @@ router = APIRouter(dependencies=[Depends(verify_api_key)])
 @router.post(
     "/api/v1/archetypes/reload",
     tags=["Archetypes"],
-    summary="Reload archetypes from YAML",
+    summary="Reload curated archetypes from YAML",
     response_model=ArchetypeReloadResponse,
-    response_description="Confirmation with count and summary of loaded archetypes",
+    response_description="Confirmation with count and summary of loaded curated archetypes",
 )
 async def reload_archetypes_endpoint():
-    """Hot-reload archetype templates without server restart."""
+    """Hot-reload curated, operator-authored templates without server restart."""
     from tacit.archetypes.templates import reload_archetypes
 
     reload_archetypes()
     from tacit.archetypes.templates import ALL_ARCHETYPES as reloaded
 
     return {
-        "message": "Archetypes reloaded",
+        "message": "Curated archetypes reloaded",
         "count": len(reloaded),
         "archetypes": [{"id": a.id, "name": a.name, "panels": len(a.panels)} for a in reloaded],
     }

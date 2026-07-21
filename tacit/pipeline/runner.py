@@ -6,6 +6,7 @@ import asyncio
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 
@@ -267,6 +268,7 @@ async def _run_pipeline_inner(
 
         # ── 4. Multi-label archetype matching ────────────────────
         target_language = primary.query_language
+        t0 = time.monotonic()
         selection = select_archetypes(
             intent=intent,
             metric_catalog=metric_catalog,
@@ -276,8 +278,39 @@ async def _run_pipeline_inner(
         )
         ranked_archetypes = selection.ranked_archetypes
         learned_archetypes = selection.learned_archetypes
+        runtime.timings["archetype_select"] = time.monotonic() - t0
 
-        runtime.recorder.selected_intent(intent, ranked_archetypes, learned_archetypes)
+        retrieval_details: dict[str, Any] = {
+            "retrieval_mode": selection.retrieval_mode.value,
+            "investigation_context_sources": selection.context_sources,
+            "generated_candidates": len(selection.experimental_archetypes),
+            "generated_files_scanned": selection.experimental_retrieval.files_scanned,
+            "generated_quarantined": selection.experimental_retrieval.quarantined,
+            "generated_rejected_by_scope": selection.experimental_retrieval.rejected_by_scope,
+            "generated_invalid": selection.experimental_retrieval.invalid,
+            "unexpected_cross_service_matches": selection.unexpected_cross_service_matches,
+            "normal_generated_retrieval_requested_but_blocked": (
+                bool(getattr(runtime.settings, "learned_archetypes_normal_retrieval_enabled", False))
+            ),
+        }
+        stage_log(
+            "archetype_retrieval",
+            runtime.timings["archetype_select"] * 1000,
+            **retrieval_details,
+        )
+        runtime.recorder.stage(
+            "archetype_retrieval",
+            "passed",
+            "curated_only" if not selection.experimental_archetypes else "experimental_exact_scope_selected",
+            **retrieval_details,
+        )
+
+        runtime.recorder.selected_intent(
+            intent,
+            ranked_archetypes,
+            learned_archetypes,
+            selection.experimental_archetypes,
+        )
 
         compilation = compile_selected_archetypes(
             selection=selection,

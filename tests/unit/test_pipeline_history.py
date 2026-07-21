@@ -86,9 +86,26 @@ def test_history_archetypes_include_selected_learned_matches():
 
     assert records[0]["type"] == "learned_falco_memory"
     assert records[0]["source"] == "learned"
+    assert records[0]["retrieval_source"] == "curated_context"
+    assert records[0]["template_origin"] == "curated"
     assert records[0]["selected"] is True
     assert records[0]["signals"] == ["container_memory_usage", "pod_memory_pressure"]
     assert records[1]["type"] == "resource_saturation"
+
+
+def test_history_archetypes_attribute_exact_scope_experimental_matches():
+    generated = _arch("checkout_generated")
+
+    records = _history_archetypes(
+        [],
+        selected_archetypes=[(generated, 1.0)],
+        learned_archetypes=[],
+        experimental_archetypes=[(generated, 1.0)],
+    )
+
+    assert records[0]["source"] == "learned"
+    assert records[0]["retrieval_source"] == "experimental_exact_scope"
+    assert records[0]["template_origin"] == "generated"
 
 
 def test_history_signals_include_semantic_archetype_signals():

@@ -1162,7 +1162,7 @@ class TestIngestedDashboards:
         assert summary["top_metrics"] == []
 
     @pytest.mark.asyncio
-    async def test_ingest_dashboard_persists_generated_archetype(self, signal_store, monkeypatch):
+    async def test_ingest_dashboard_does_not_generate_archetype_by_default(self, signal_store, monkeypatch):
         from tacit import dashboard_ingest as di
 
         class FakeBackend:
@@ -1198,20 +1198,22 @@ class TestIngestedDashboards:
         assert stored is not None
         assert stored["backend_name"] == "signalfx"
         assert stored["archetype_generated"] == result["archetype_yaml"]
-        assert "archetypes:" in stored["archetype_generated"]
+        assert stored["archetype_generated"] == ""
+        assert result["archetype_generation_enabled"] is False
 
     @pytest.mark.asyncio
-    async def test_auto_approve_registers_generated_archetype(self, signal_store, monkeypatch, tmp_path):
+    async def test_auto_approve_quarantines_generated_archetype(self, signal_store, monkeypatch, tmp_path):
         from tacit import dashboard_ingest as di
 
         monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
-        monkeypatch.setattr(di.settings, "learning_auto_register_archetype", True)
-        archetype_path = tmp_path / "learned_archetypes.yaml"
-        monkeypatch.setenv("TACIT_ARCHETYPES_PATH", str(archetype_path))
+        monkeypatch.setattr(di.settings, "learned_archetypes_generation_enabled", True)
+        monkeypatch.setattr(di.settings, "learned_archetypes_automatic_registration_enabled", True)
+        monkeypatch.setattr(di.settings, "learned_archetypes_quarantine_path", str(tmp_path / "quarantine"))
 
         features = DashboardFeatures(
             dashboard_uid="checkout-autoreg",
             dashboard_title="Checkout Autoreg",
+            dashboard_tags=["service:checkout"],
             backend_name="grafana_json",
             query_language="promql",
             metrics_found=["checkout_custom_latency_ms"],
@@ -1228,9 +1230,11 @@ class TestIngestedDashboards:
 
         result = await di.ingest_dashboard_features(features, auto_approve=True)
 
-        assert result["archetype_registered"] is True
-        assert archetype_path.exists()
-        assert "checkout_autoreg" in archetype_path.read_text()
+        assert result["archetype_registered"] is False
+        assert result["archetype_quarantined"] is True
+        quarantine_files = list((tmp_path / "quarantine").rglob("*.yaml"))
+        assert len(quarantine_files) == 1
+        assert "checkout_autoreg" in quarantine_files[0].read_text()
 
     @pytest.mark.asyncio
     async def test_auto_approve_keeps_held_candidates_out_of_approved_context(self, signal_store, monkeypatch):
@@ -1277,12 +1281,24 @@ class TestIngestedDashboards:
         candidate = signal_store.search_learning_context("opaque", service="checkout")
         assert candidate[0]["review_state"] == "candidate"
 
-    def test_manual_approval_registers_generated_archetype(self, signal_store, monkeypatch, tmp_path):
+    def test_manual_approval_quarantines_generated_archetype(self, signal_store, monkeypatch, tmp_path):
         from tacit import dashboard_ingest as di
 
-        monkeypatch.setattr(di.settings, "learning_auto_register_archetype", True)
-        archetype_path = tmp_path / "learned_archetypes.yaml"
-        monkeypatch.setenv("TACIT_ARCHETYPES_PATH", str(archetype_path))
+        monkeypatch.setattr(di.settings, "learned_archetypes_automatic_registration_enabled", True)
+        monkeypatch.setattr(di.settings, "learned_archetypes_quarantine_path", str(tmp_path / "quarantine"))
+
+        archetype_yaml = generate_archetype_yaml(
+            {
+                "dashboard_title": "Checkout Manual",
+                "dashboard_tags": ["service:checkout"],
+                "metrics_found": ["checkout_5xx_count"],
+                "panels": [],
+            },
+            [],
+            tenant_id="default",
+            generation_run_id="dashboard_ingest:grafana_json:checkout-manual",
+            source_refs=["grafana_json:checkout-manual"],
+        )
 
         signal_store.record_ingested_dashboard(
             "checkout-manual",
@@ -1297,15 +1313,7 @@ class TestIngestedDashboards:
                     "auto_teach_eligible": True,
                 }
             ],
-            archetype_generated="""
-archetypes:
-  - id: checkout_manual
-    name: Checkout Manual
-    problem_types: [checkout_manual]
-    signals: [metrics]
-    default_timerange: 1h
-    panels: []
-""",
+            archetype_generated=archetype_yaml,
             status="pending",
         )
 
@@ -1316,8 +1324,11 @@ archetypes:
         )
 
         assert result["status"] == "approved"
-        assert result["archetype_registered"] is True
-        assert "checkout_manual" in archetype_path.read_text()
+        assert result["archetype_registered"] is False
+        assert result["archetype_quarantined"] is True
+        quarantine_files = list((tmp_path / "quarantine").rglob("*.yaml"))
+        assert len(quarantine_files) == 1
+        assert "checkout_manual" in quarantine_files[0].read_text()
 
     def test_manual_approval_keeps_held_candidates_out_of_approved_context(self, signal_store):
         if not signal_store._learning_index_available():
@@ -1739,7 +1750,7 @@ archetypes:
         }
 
     @pytest.mark.asyncio
-    async def test_bulk_auto_approve_registers_archetypes_once(self, signal_store, monkeypatch):
+    async def test_bulk_auto_approve_quarantines_archetypes(self, signal_store, monkeypatch, tmp_path):
         import tacit.backends as backends_mod
         from tacit import dashboard_ingest as di
 
@@ -1756,6 +1767,7 @@ archetypes:
                 return DashboardFeatures(
                     dashboard_uid=uid,
                     dashboard_title=uid.replace("-", " ").title(),
+                    dashboard_tags=[f"service:{uid}"],
                     backend_name="grafana",
                     query_language="promql",
                     metrics_found=[f"{uid.replace('-', '_')}_latency_ms"],
@@ -1773,26 +1785,20 @@ archetypes:
             async def close(self):
                 return None
 
-        calls = []
-
-        def fake_register(archetype_yaml, *, dashboard_uid=""):
-            calls.append((dashboard_uid, archetype_yaml))
-            return True
-
         monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
-        monkeypatch.setattr(di.settings, "learning_auto_register_archetype", True)
+        monkeypatch.setattr(di.settings, "learned_archetypes_generation_enabled", True)
+        monkeypatch.setattr(di.settings, "learned_archetypes_automatic_registration_enabled", True)
+        monkeypatch.setattr(di.settings, "learned_archetypes_quarantine_path", str(tmp_path / "quarantine"))
         monkeypatch.setattr(backends_mod, "get_active_backends", lambda: [FakeBackend()])
-        monkeypatch.setattr(di, "register_generated_archetype_if_enabled", fake_register)
 
         result = await di.learn_backend_dashboards("grafana", auto_approve=True)
 
         assert result["dashboards_learned"] == 2
-        assert result["archetypes_registered"] == 2
-        assert len(calls) == 1
-        assert calls[0][0] == "grafana:bulk"
-        assert "checkout_a" in calls[0][1]
-        assert "checkout_b" in calls[0][1]
-        assert all(item["archetype_registered"] for item in result["learned"])
+        assert result["archetypes_registered"] == 0
+        assert result["archetypes_quarantined"] == 2
+        assert len(list((tmp_path / "quarantine").rglob("*.yaml"))) == 2
+        assert all(item["archetype_registered"] is False for item in result["learned"])
+        assert all(item["archetype_quarantined"] is True for item in result["learned"])
 
     def test_dashboard_uid_is_scoped_by_backend(self, signal_store):
         signal_store.record_ingested_dashboard(
@@ -2911,7 +2917,7 @@ class TestLearningTabRendering:
     def test_ingested_dashboard_list_renders_persisted_archetype_yaml(self):
         load_section = self._learning_load_section()
         assert "d.archetype_generated" in load_section
-        assert "Generated archetype YAML" in load_section
+        assert "Quarantined experimental archetype YAML" in load_section
 
     def test_ingested_dashboard_approval_uses_data_attributes_not_inline_js(self):
         html = (Path(__file__).parent.parent.parent / "tacit" / "static" / "index.html").read_text()
