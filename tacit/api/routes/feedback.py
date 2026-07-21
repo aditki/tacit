@@ -33,6 +33,9 @@ async def submit_feedback(req: FeedbackRequest, store: Any = Depends(get_feedbac
         comment=req.comment,
         reviewer=req.reviewer,
     )
+    from tacit.ranking import invalidate_metric_quality_cache
+
+    invalidate_metric_quality_cache(store)
     return FeedbackResponse(feedback_id=feedback_id, dashboard_uid=req.dashboard_uid)
 
 

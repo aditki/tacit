@@ -23,11 +23,13 @@ from tacit.archetypes.templates import (
 from tacit.config import Settings
 from tacit.dashboard_ingest import generate_archetype_yaml, register_generated_archetype_if_enabled
 from tacit.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
+from tacit.pipeline import _history_archetypes
 from tacit.pipeline.stages.archetypes import select_archetypes
 
 
 def _generated(
     *,
+    archetype_id: str = "checkout_generated",
     tenant_id: str = "tenant-a",
     service: str = "checkout",
     status: GeneratedArchetypeStatus = GeneratedArchetypeStatus.EXPERIMENTAL,
@@ -36,7 +38,7 @@ def _generated(
     generation_version: str = "generated-archetype-v1",
 ) -> GeneratedArchetype:
     return GeneratedArchetype(
-        id="checkout_generated",
+        id=archetype_id,
         name="Checkout Generated",
         description="Experimental checkout dashboard",
         problem_types=["resource_saturation"],
@@ -354,6 +356,54 @@ def test_exact_scope_experimental_mode_keeps_generated_archetype_shadow_only(tmp
     assert selection.context_sources["shadow_generated_archetypes"] == 1
     assert selection.experimental_retrieval.files_scanned == 1
     assert selection.unexpected_cross_service_matches == 0
+
+
+def test_same_id_generated_archetype_remains_in_shadow_evaluation(tmp_path):
+    generated = _generated(archetype_id="resource_saturation")
+    write_generated_archetype(generated, tmp_path)
+    settings = _settings(tmp_path, mode=ArchetypeRetrievalMode.CURATED_WITH_EXPERIMENTAL_EXACT_SCOPE)
+
+    selection = select_archetypes(
+        intent=_intent("checkout"),
+        metric_catalog=_catalog(),
+        catalog_for_compile=_catalog(),
+        target_language="promql",
+        settings=settings,
+    )
+
+    assert "resource_saturation" in {archetype.id for archetype, _ in selection.ranked_archetypes}
+    assert [archetype for archetype, _ in selection.shadow_archetypes] == [generated]
+
+    records = _history_archetypes(
+        [],
+        selection.ranked_archetypes,
+        selection.learned_archetypes,
+        selection.shadow_archetypes,
+    )
+    same_id_records = [record for record in records if record["type"] == "resource_saturation"]
+    assert len(same_id_records) == 2
+    assert {record["template_origin"] for record in same_id_records} == {"curated", "generated"}
+    generated_record = next(record for record in same_id_records if record["template_origin"] == "generated")
+    assert generated_record["generation_version"] == generated.generation_version
+    assert generated_record["generation_run_id"] == generated.generation_run_id
+    assert str(generated_record["artifact_ref"]).startswith("generated:resource_saturation:")
+
+
+def test_experimental_mode_records_no_match_separately_from_curated_control(tmp_path):
+    selection = select_archetypes(
+        intent=_intent("checkout"),
+        metric_catalog=_catalog(),
+        catalog_for_compile=_catalog(),
+        target_language="promql",
+        settings=_settings(
+            tmp_path,
+            mode=ArchetypeRetrievalMode.CURATED_WITH_EXPERIMENTAL_EXACT_SCOPE,
+        ),
+    )
+
+    assert selection.shadow_archetypes == []
+    assert selection.retrieval_mode == ArchetypeRetrievalMode.CURATED_WITH_EXPERIMENTAL_EXACT_SCOPE
+    assert selection.retrieval_reason_code == "experimental_exact_scope_no_match"
 
 
 def test_shadow_candidate_never_enters_authoritative_coverage_ranking(tmp_path, monkeypatch):

@@ -255,6 +255,7 @@ def history_archetypes(
     selected_ids = {arch.id for arch, _ in selected_archetypes}
     records: list[dict[str, object]] = []
     seen: set[str] = set()
+    seen_shadow_refs: set[tuple[str, str, str, str]] = set()
 
     for arch, confidence in selected_archetypes:
         if arch.id in seen:
@@ -282,9 +283,20 @@ def history_archetypes(
         )
 
     for arch, confidence in shadow_archetypes or []:
-        if arch.id in seen or arch.id in selected_ids:
+        created_at = getattr(arch, "created_at", None)
+        created_at_ref = str(created_at or "")
+        isoformat = getattr(created_at, "isoformat", None)
+        if callable(isoformat):
+            created_at_ref = str(isoformat())
+        shadow_ref = (
+            arch.id,
+            str(getattr(arch, "generation_version", "")),
+            str(getattr(arch, "generation_run_id", "")),
+            created_at_ref,
+        )
+        if shadow_ref in seen_shadow_refs:
             continue
-        seen.add(arch.id)
+        seen_shadow_refs.add(shadow_ref)
         records.append(
             {
                 "type": arch.id,
@@ -296,6 +308,10 @@ def history_archetypes(
                 "selected": False,
                 "shadow_only": True,
                 "output_applied": False,
+                "generation_version": shadow_ref[1],
+                "generation_run_id": shadow_ref[2],
+                "generated_at": shadow_ref[3],
+                "artifact_ref": ":".join(("generated", *shadow_ref)),
                 "signals": sorted(set(arch.required_signals) | set(arch.signal_bindings.keys())),
             }
         )

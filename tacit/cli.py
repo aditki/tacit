@@ -1722,10 +1722,14 @@ def learn_service(service: str, approved_only: bool, limit: int):
     from tacit.signals import LearningIndexUnavailable
 
     try:
-        summary = _cli_runtime_stores().signals().describe_service(
-            service,
-            include_candidates=not approved_only,
-            limit=limit,
+        summary = (
+            _cli_runtime_stores()
+            .signals()
+            .describe_service(
+                service,
+                include_candidates=not approved_only,
+                limit=limit,
+            )
         )
     except LearningIndexUnavailable as e:
         _fail(str(e))
@@ -2004,10 +2008,14 @@ def history_replay(investigation_id: str, revision: int | None, mode: str):
     from tacit.investigation_replay import ReplayMode
 
     try:
-        contract = _cli_runtime_stores().history().replay_contract(
-            investigation_id,
-            revision,
-            mode=ReplayMode(mode),
+        contract = (
+            _cli_runtime_stores()
+            .history()
+            .replay_contract(
+                investigation_id,
+                revision,
+                mode=ReplayMode(mode),
+            )
         )
     except (StaleRevisionError, ReplayError) as exc:
         raise click.ClickException(str(exc)) from exc

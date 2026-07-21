@@ -35,6 +35,14 @@ class ArchetypeSelection:
     retrieval_mode: ArchetypeRetrievalMode
     target_language: str
 
+    @property
+    def retrieval_reason_code(self) -> str:
+        if self.retrieval_mode == ArchetypeRetrievalMode.CURATED_ONLY:
+            return "curated_only"
+        if self.shadow_archetypes:
+            return "experimental_exact_scope_shadow_only"
+        return "experimental_exact_scope_no_match"
+
 
 @dataclass(frozen=True)
 class ArchetypeCompilation:
@@ -96,10 +104,7 @@ def select_archetypes(
             ),
             exact_query,
         )
-        existing_ids = {archetype.id for archetype, _ in ranked_archetypes}
-        shadow_archetypes = [
-            (archetype, 1.0) for archetype in experimental_retrieval.archetypes if archetype.id not in existing_ids
-        ]
+        shadow_archetypes = [(archetype, 1.0) for archetype in experimental_retrieval.archetypes]
         unexpected_cross_service_matches = sum(
             archetype.service_refs != exact_query.service_refs for archetype, _ in shadow_archetypes
         )

@@ -70,9 +70,7 @@ class RuntimeStores:
                 if self._history_store is None:
                     from tacit.history import InvestigationStore
 
-                    self._history_store = InvestigationStore(
-                        self._configured_path(self.settings.history_db_path)
-                    )
+                    self._history_store = InvestigationStore(self._configured_path(self.settings.history_db_path))
         return self._history_store
 
     def feedback(self) -> Any:
@@ -84,9 +82,7 @@ class RuntimeStores:
                 if self._feedback_store is None:
                     from tacit.feedback import FeedbackStore
 
-                    self._feedback_store = FeedbackStore(
-                        self._configured_path(self.settings.feedback_db_path)
-                    )
+                    self._feedback_store = FeedbackStore(self._configured_path(self.settings.feedback_db_path))
         return self._feedback_store
 
     def signals(self) -> Any:

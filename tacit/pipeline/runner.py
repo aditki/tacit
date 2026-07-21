@@ -307,7 +307,7 @@ async def _run_pipeline_inner(
         runtime.recorder.stage(
             "archetype_retrieval",
             "passed",
-            "curated_only" if not selection.shadow_archetypes else "experimental_exact_scope_shadow_only",
+            selection.retrieval_reason_code,
             **retrieval_details,
         )
 
@@ -394,6 +394,7 @@ async def _run_pipeline_inner(
             target_language=target_language,
             ranked_archetypes_present=bool(ranked_archetypes),
             record_stage=record_validation_stage,
+            signal_store=signal_store,
         )
         dashboard_spec = validation_result.dashboard_spec
         validation_warnings = validation_result.validation_warnings
