@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-from typing import Protocol
+from typing import Any, Protocol
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi import Path as PathParam
 
 import tacit.signals as signals_mod
+from tacit.api.dependencies import get_signal_store
 from tacit.api.security import verify_api_key
 from tacit.models.schemas import (
     LearnAlertRequest,
@@ -44,28 +45,31 @@ def _artifact_external_id(payload: _ArtifactPayload, artifact_type: str) -> str:
     return f"{artifact_type}:{source_vendor}:{source_instance}:{payload.title}:{body_hash}"
 
 
-async def _call_ingest_dashboard(ingest_dashboard, **kwargs):
-    if "runtime_settings" not in inspect.signature(ingest_dashboard).parameters:
-        kwargs.pop("runtime_settings", None)
-    return await ingest_dashboard(**kwargs)
+def _supported_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Keep route adapters compatible with older integrations and test doubles."""
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in parameters}
 
 
-async def _call_learn_backend_dashboards(learn_backend_dashboards, **kwargs):
-    if "runtime_settings" not in inspect.signature(learn_backend_dashboards).parameters:
-        kwargs.pop("runtime_settings", None)
-    return await learn_backend_dashboards(**kwargs)
+async def _call_ingest_dashboard(ingest_dashboard: Any, **kwargs: Any) -> Any:
+    return await ingest_dashboard(**_supported_kwargs(ingest_dashboard, kwargs))
 
 
-async def _call_ingest_alert(ingest_alert, **kwargs):
-    if "runtime_settings" not in inspect.signature(ingest_alert).parameters:
-        kwargs.pop("runtime_settings", None)
-    return await ingest_alert(**kwargs)
+async def _call_learn_backend_dashboards(learn_backend_dashboards: Any, **kwargs: Any) -> Any:
+    return await learn_backend_dashboards(**_supported_kwargs(learn_backend_dashboards, kwargs))
 
 
-async def _call_learn_backend_alerts(learn_backend_alerts, **kwargs):
-    if "runtime_settings" not in inspect.signature(learn_backend_alerts).parameters:
-        kwargs.pop("runtime_settings", None)
-    return await learn_backend_alerts(**kwargs)
+async def _call_ingest_alert(ingest_alert: Any, **kwargs: Any) -> Any:
+    return await ingest_alert(**_supported_kwargs(ingest_alert, kwargs))
+
+
+async def _call_learn_backend_alerts(learn_backend_alerts: Any, **kwargs: Any) -> Any:
+    return await learn_backend_alerts(**_supported_kwargs(learn_backend_alerts, kwargs))
 
 
 @router.post(
@@ -74,7 +78,11 @@ async def _call_learn_backend_alerts(learn_backend_alerts, **kwargs):
     summary="Learn from an existing Grafana dashboard",
     response_description="Extracted features, inferred signals, and optional quarantined archetype YAML",
 )
-async def learn_from_dashboard(request: Request, payload: LearnDashboardRequest):
+async def learn_from_dashboard(
+    request: Request,
+    payload: LearnDashboardRequest,
+    store: Any = Depends(get_signal_store),
+):
     """Ingest an existing dashboard to learn operational patterns."""
     from tacit.config import settings
     from tacit.dashboard_ingest import ingest_dashboard
@@ -86,6 +94,7 @@ async def learn_from_dashboard(request: Request, payload: LearnDashboardRequest)
             backend_name=payload.backend,
             auto_approve=payload.auto_approve,
             runtime_settings=getattr(request.app.state, "settings", settings),
+            store=store,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -104,7 +113,11 @@ async def learn_from_dashboard(request: Request, payload: LearnDashboardRequest)
     summary="Learn from an existing alert rule",
     response_description="Extracted alert features and inferred signals",
 )
-async def learn_from_alert(request: Request, payload: LearnAlertRequest):
+async def learn_from_alert(
+    request: Request,
+    payload: LearnAlertRequest,
+    store: Any = Depends(get_signal_store),
+):
     """Ingest an existing alert rule/detector to learn operational patterns."""
     from tacit.alert_ingest import ingest_alert
     from tacit.config import settings
@@ -117,6 +130,7 @@ async def learn_from_alert(request: Request, payload: LearnAlertRequest):
             auto_approve=payload.auto_approve,
             dry_run=payload.dry_run,
             runtime_settings=getattr(request.app.state, "settings", settings),
+            store=store,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -135,7 +149,10 @@ async def learn_from_alert(request: Request, payload: LearnAlertRequest):
     summary="Learn from a runbook artifact",
     response_description="Extracted operational IR candidates with provenance",
 )
-async def learn_from_runbook(payload: LearnRunbookRequest):
+async def learn_from_runbook(
+    payload: LearnRunbookRequest,
+    store: Any = Depends(get_signal_store),
+):
     """Learn operational candidates from a markdown/plain-text runbook."""
     from tacit.artifact_learning import RunbookExtractor, artifact_from_text, learn_artifact
 
@@ -149,7 +166,7 @@ async def learn_from_runbook(payload: LearnRunbookRequest):
             source_instance=payload.source_instance,
             provenance_url=payload.provenance_url,
         )
-        return learn_artifact(artifact, RunbookExtractor(), dry_run=payload.dry_run)
+        return learn_artifact(artifact, RunbookExtractor(), dry_run=payload.dry_run, store=store)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
@@ -163,7 +180,10 @@ async def learn_from_runbook(payload: LearnRunbookRequest):
     summary="Learn from an incident-history artifact",
     response_description="Extracted operational IR candidates with provenance",
 )
-async def learn_from_incident(payload: LearnIncidentRequest):
+async def learn_from_incident(
+    payload: LearnIncidentRequest,
+    store: Any = Depends(get_signal_store),
+):
     """Learn operational candidates from an incident-history record."""
     from tacit.artifact_learning import IncidentExtractor, artifact_from_text, learn_artifact
 
@@ -177,7 +197,7 @@ async def learn_from_incident(payload: LearnIncidentRequest):
             source_instance=payload.source_instance,
             provenance_url=payload.provenance_url,
         )
-        return learn_artifact(artifact, IncidentExtractor(), dry_run=payload.dry_run)
+        return learn_artifact(artifact, IncidentExtractor(), dry_run=payload.dry_run, store=store)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
@@ -191,7 +211,11 @@ async def learn_from_incident(payload: LearnIncidentRequest):
     summary="Learn from uploaded dashboard JSON",
     response_description="Extracted features, inferred signals, and optional quarantined archetype YAML",
 )
-async def learn_from_dashboard_json(request: Request, payload: LearnDashboardUploadRequest):
+async def learn_from_dashboard_json(
+    request: Request,
+    payload: LearnDashboardUploadRequest,
+    store: Any = Depends(get_signal_store),
+):
     """Ingest an uploaded dashboard JSON export without contacting the vendor."""
     from tacit.dashboard_ingest import ingest_dashboard_features
     from tacit.dashboard_uploads import parse_uploaded_dashboard
@@ -208,6 +232,7 @@ async def learn_from_dashboard_json(request: Request, payload: LearnDashboardUpl
             features,
             auto_approve=payload.auto_approve,
             runtime_settings=getattr(request.app.state, "settings", settings),
+            store=store,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -234,6 +259,7 @@ async def learn_backend(
         "generated archetypes remain quarantined",
     ),
     limit: int = Query(500, ge=1, le=5000, description="Maximum dashboards to crawl"),
+    store: Any = Depends(get_signal_store),
 ):
     """Crawl a connected backend and persist learned dashboard context."""
     from tacit.config import settings
@@ -246,6 +272,7 @@ async def learn_backend(
             auto_approve=auto_approve,
             limit=limit,
             runtime_settings=getattr(request.app.state, "settings", settings),
+            store=store,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -273,6 +300,7 @@ async def learn_backend_alert_rules(
     ),
     dry_run: bool = Query(False, description="Preview alert ingestion without persisting learned context"),
     limit: int = Query(500, ge=1, le=5000, description="Maximum alerts to crawl"),
+    store: Any = Depends(get_signal_store),
 ):
     """Crawl a connected backend and persist learned alert context."""
     from tacit.alert_ingest import learn_backend_alerts
@@ -286,6 +314,7 @@ async def learn_backend_alert_rules(
             dry_run=dry_run,
             limit=limit,
             runtime_settings=getattr(request.app.state, "settings", settings),
+            store=store,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -306,11 +335,11 @@ async def learn_backend_alert_rules(
 async def list_ingested_dashboards(
     status: str | None = None,
     limit: int = 50,
+    store: Any = Depends(get_signal_store),
 ):
     """List dashboards that have been ingested for learning."""
     from tacit.dashboard_ingest import build_learning_impact_report, build_signal_quality_report
 
-    store = signals_mod.get_signal_store()
     dashboards = store.list_ingested_dashboards(status=status, limit=limit)
     for dashboard in dashboards:
         metrics = dashboard.get("metrics_found", [])
@@ -334,11 +363,11 @@ async def list_ingested_dashboards(
 async def list_ingested_alerts(
     status: str | None = None,
     limit: int = 50,
+    store: Any = Depends(get_signal_store),
 ):
     """List alerts that have been ingested for learning."""
     from tacit.dashboard_ingest import build_learning_impact_report, build_signal_quality_report
 
-    store = signals_mod.get_signal_store()
     alerts = store.list_ingested_alerts(status=status, limit=limit)
     for alert in alerts:
         metrics = alert.get("metrics_found", [])
@@ -361,9 +390,9 @@ async def list_ingested_alerts(
 )
 async def list_learned_runbooks(
     limit: int = Query(50, ge=1, le=500),
+    store: Any = Depends(get_signal_store),
 ):
     """List runbooks learned by Tacit Artifact Learning v1."""
-    store = signals_mod.get_signal_store()
     runbooks = store.list_learned_artifacts(artifact_type="runbook", limit=limit)
     for runbook in runbooks:
         runbook["extractions"] = store.list_artifact_extractions(runbook["artifact_id"])
@@ -378,9 +407,9 @@ async def list_learned_runbooks(
 )
 async def list_learned_incidents(
     limit: int = Query(50, ge=1, le=500),
+    store: Any = Depends(get_signal_store),
 ):
     """List incident history learned by Tacit Artifact Learning v1."""
-    store = signals_mod.get_signal_store()
     incidents = store.list_learned_artifacts(artifact_type="incident", limit=limit)
     for incident in incidents:
         incident["extractions"] = store.list_artifact_extractions(incident["artifact_id"])
@@ -398,9 +427,9 @@ async def search_learning_context(
     service: str = "",
     include_candidates: bool = True,
     limit: int = Query(20, ge=1, le=100),
+    store: Any = Depends(get_signal_store),
 ):
     """Search learned dashboard/panel/metric context."""
-    store = signals_mod.get_signal_store()
     try:
         rows = store.search_learning_context(
             q,
@@ -423,9 +452,9 @@ async def describe_service(
     service_name: str = PathParam(description="Service/component name to describe"),
     include_candidates: bool = True,
     limit: int = Query(50, ge=1, le=200),
+    store: Any = Depends(get_signal_store),
 ):
     """Answer what is known about this service from learned context."""
-    store = signals_mod.get_signal_store()
     try:
         return store.describe_service(
             service_name,
@@ -442,7 +471,12 @@ async def describe_service(
     summary="Approve an ingested dashboard",
     response_description="Approval status and signal mappings created",
 )
-async def approve_ingested_dashboard(request: Request, dashboard_uid: str, backend: str | None = None):
+async def approve_ingested_dashboard(
+    request: Request,
+    dashboard_uid: str,
+    backend: str | None = None,
+    store: Any = Depends(get_signal_store),
+):
     """Approve a pending ingested dashboard, activating its signal mappings."""
     from tacit.config import settings
     from tacit.dashboard_ingest import approve_ingested_dashboard_record
@@ -451,7 +485,7 @@ async def approve_ingested_dashboard(request: Request, dashboard_uid: str, backe
         return approve_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend,
-            store=signals_mod.get_signal_store(),
+            store=store,
             runtime_settings=getattr(request.app.state, "settings", settings),
         )
     except LookupError:
@@ -464,7 +498,11 @@ async def approve_ingested_dashboard(request: Request, dashboard_uid: str, backe
     summary="Reject an ingested dashboard",
     response_description="Rejection status; no signal mappings are created",
 )
-async def reject_ingested_dashboard(dashboard_uid: str, backend: str | None = None):
+async def reject_ingested_dashboard(
+    dashboard_uid: str,
+    backend: str | None = None,
+    store: Any = Depends(get_signal_store),
+):
     """Reject a pending ingested dashboard."""
     from tacit.dashboard_ingest import reject_ingested_dashboard_record
 
@@ -472,7 +510,7 @@ async def reject_ingested_dashboard(dashboard_uid: str, backend: str | None = No
         return reject_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend,
-            store=signals_mod.get_signal_store(),
+            store=store,
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")
@@ -486,9 +524,12 @@ async def reject_ingested_dashboard(dashboard_uid: str, backend: str | None = No
     summary="Ignore an ingested dashboard",
     response_description="Ignored status; no signal mappings or negative examples are created",
 )
-async def ignore_ingested_dashboard(dashboard_uid: str, backend: str | None = None):
+async def ignore_ingested_dashboard(
+    dashboard_uid: str,
+    backend: str | None = None,
+    store: Any = Depends(get_signal_store),
+):
     """Ignore a pending ingested dashboard without creating mappings or negative examples."""
-    store = signals_mod.get_signal_store()
     ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend)
     if ingested is None:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")

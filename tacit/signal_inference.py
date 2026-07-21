@@ -81,12 +81,18 @@ _NAME_RULES: list[tuple[re.Pattern[str], str, float, str]] = [
     (re.compile(r"(_dropped|_drops?|_discard|_rejected)"), "errors", 0.9, "name indicates drops/rejects"),
     (re.compile(r"(_timeouts?)"), "errors", 0.7, "name indicates timeouts"),
     (re.compile(r"(latency|duration|response_time|_rtt)"), "latency", 1.0, "name indicates latency/duration"),
+    (
+        re.compile(r"((db|database|sql|connection|pool).*wait|wait.*(db|database|sql|connection|pool))"),
+        "latency",
+        0.95,
+        "name indicates database or connection-pool wait time",
+    ),
     # Bare time unit → latency, but NOT counters of seconds (e.g.
     # process_cpu_seconds_total is CPU time, a resource — handled by the
     # resource rule). True latency counters carry duration/latency keywords.
     (re.compile(r"(_seconds|_time)(_sum|_count)?$"), "latency", 0.8, "name ends with a time unit"),
     (re.compile(r"(_depth|_backlog|_pending|_lag|queue)"), "backlog", 0.9, "name indicates a queue/backlog"),
-    (re.compile(r"(inflight|in_flight|concurrent)"), "saturation", 0.85, "name indicates concurrency"),
+    (re.compile(r"(inflight|in_flight|concurrent)"), "saturation", 0.95, "name indicates concurrency"),
     (
         # Match both Redis-INFO order (connected_clients) and OTLP semconv
         # order (clients_connected); same for blocked/rejected.

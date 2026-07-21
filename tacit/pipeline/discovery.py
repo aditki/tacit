@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 
@@ -133,6 +134,7 @@ def confirm_colloquial_keywords(
     intent: Intent,
     metric_catalog: list[MetricEntry],
     target_query_language: str,
+    signal_store: Any | None = None,
 ) -> list[str]:
     """Promote low-confidence colloquial evidence only after live signal coverage.
 
@@ -147,7 +149,7 @@ def confirm_colloquial_keywords(
         from tacit.agents.synonyms import SynonymEvidence, confirm_colloquial
         from tacit.signals import get_signal_store
 
-        signal_store = get_signal_store()
+        signal_store = signal_store or get_signal_store()
         resolve_cache: dict[str, bool] = {}
         confirmation_catalog = catalog_for_services(metric_catalog, intent.services)
         context_service = intent.services[0] if intent.services else ""

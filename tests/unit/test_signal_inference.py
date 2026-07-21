@@ -144,6 +144,37 @@ class TestInferenceHardening:
         assert rich.auto_teach_eligible is True
         assert set(rich.evidence_sources) >= {"name", "title"}
 
+    @pytest.mark.parametrize(
+        ("metric", "panel"),
+        [
+            (
+                "checkout_edge_inflight_requests",
+                {
+                    "title": "In-flight requests",
+                    "row": "Saturation",
+                    "unit": "short",
+                    "metrics": ["checkout_edge_inflight_requests"],
+                    "queries": ["checkout_edge_inflight_requests"],
+                },
+            ),
+            (
+                "checkout_edge_db_pool_wait_seconds_bucket",
+                {
+                    "title": "DB pool wait time",
+                    "row": "Downstream",
+                    "unit": "s",
+                    "metrics": ["checkout_edge_db_pool_wait_seconds_bucket"],
+                    "queries": ["histogram_quantile(0.95, checkout_edge_db_pool_wait_seconds_bucket)"],
+                },
+            ),
+        ],
+    )
+    def test_explicit_incident_signals_are_auto_teachable(self, metric, panel):
+        signal = infer_signal(metric, [panel])
+
+        assert signal is not None
+        assert signal.auto_teach_eligible is True
+
     def test_weak_single_source_not_auto_teachable(self):
         bare = infer_signal("felix_iptables_save_errors")  # name only, score 0.40
         assert bare.signal_family == "errors"
@@ -200,16 +231,16 @@ class TestIngestionInference:
             panels,
         )
 
-    def test_custom_metrics_inferred_via_heuristic(self):
+    def test_custom_metrics_inferred_via_heuristic(self, signal_store):
         _, metrics, panels = self._felix_extracted()
-        signals = infer_signals_from_metrics(metrics, panels)
+        signals = infer_signals_from_metrics(metrics, panels, store=signal_store)
         assert signals, "felix metrics should infer signals without teaching"
         assert all(s.get("signal_family") for s in signals)
         assert any(s["source"] == "heuristic" for s in signals)
 
-    def test_generated_archetype_has_signal_bindings(self):
+    def test_generated_archetype_has_signal_bindings(self, signal_store):
         extracted, metrics, panels = self._felix_extracted()
-        signals = infer_signals_from_metrics(metrics, panels)
+        signals = infer_signals_from_metrics(metrics, panels, store=signal_store)
         arch = _yaml.safe_load(generate_archetype_yaml(extracted, signals, archetype_id="felix"))["archetypes"][0]
         assert arch["signal_bindings"], "felix archetype must now carry signal bindings"
         assert arch["required_signals"]

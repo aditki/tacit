@@ -8,6 +8,7 @@ target backend. No LLM needed for query generation.
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import structlog
 
@@ -755,6 +756,7 @@ def _resolve_archetype_signals(
     catalog: list[MetricEntry],
     intent: Intent,
     target_language: str = "promql",
+    signal_store: Any | None = None,
 ) -> InvestigationArchetype:
     """Resolve signal bindings and substitute metrics if needed.
 
@@ -770,7 +772,7 @@ def _resolve_archetype_signals(
     try:
         from tacit.signals import get_signal_store
 
-        store = get_signal_store()
+        store = signal_store or get_signal_store()
         substitutions = store.resolve_signals_for_archetype(
             signal_bindings=archetype.signal_bindings,
             catalog=catalog,
@@ -806,6 +808,7 @@ def compile_archetype(
     intent: Intent,
     catalog: list[MetricEntry],
     target_language: str = "promql",
+    signal_store: Any | None = None,
 ) -> DashboardSpec:
     """Compile an archetype template into a concrete DashboardSpec.
 
@@ -819,7 +822,13 @@ def compile_archetype(
     target_language: 'promql' (default) or 'signalflow'
     """
     # Resolve signals → actual metrics before compiling templates
-    archetype = _resolve_archetype_signals(archetype, catalog, intent, target_language)
+    archetype = _resolve_archetype_signals(
+        archetype,
+        catalog,
+        intent,
+        target_language,
+        signal_store,
+    )
 
     rate_interval = _resolve_rate_interval(intent)
 
@@ -979,6 +988,7 @@ def _archetype_live_coverage(
     catalog: list[MetricEntry],
     target_language: str = "promql",
     services: list[str] | None = None,
+    signal_store: Any | None = None,
 ) -> float | None:
     """Fraction of an archetype's declared evidence covered by the live catalog.
 
@@ -1001,13 +1011,14 @@ def _archetype_live_coverage(
     if not catalog_names:
         return 0.0
 
-    store = None
-    try:
-        from tacit.signals import get_signal_store
+    store = signal_store
+    if store is None:
+        try:
+            from tacit.signals import get_signal_store
 
-        store = get_signal_store()
-    except Exception:
-        store = None
+            store = get_signal_store()
+        except Exception:
+            store = None
 
     resolved = 0
     for sig in signals:
@@ -1047,6 +1058,7 @@ def rank_archetypes_by_coverage(
     services: list[str] | None = None,
     max_archetypes: int | None = None,
     min_secondary_coverage: float = 0.0,
+    signal_store: Any | None = None,
 ) -> list[tuple[InvestigationArchetype, float]]:
     """Re-rank archetypes by classifier_confidence × live signal coverage.
 
@@ -1061,7 +1073,13 @@ def rank_archetypes_by_coverage(
 
     scored: list[tuple[InvestigationArchetype, float, float, float]] = []
     for arch, confidence in ranked_archetypes:
-        coverage = _archetype_live_coverage(arch, catalog, target_language, services)
+        coverage = _archetype_live_coverage(
+            arch,
+            catalog,
+            target_language,
+            services,
+            signal_store,
+        )
         # Unknown coverage (no declared signals) keeps the classifier confidence.
         effective = confidence if coverage is None else confidence * coverage
         is_learned = bool({"learned", "auto-generated"} & set(arch.tags))
@@ -1112,6 +1130,7 @@ def blend_archetypes(
     catalog: list[MetricEntry],
     secondary_min_confidence: float = 0.4,
     target_language: str = "promql",
+    signal_store: Any | None = None,
 ) -> DashboardSpec:
     """Blend panels from multiple archetypes into a single dashboard.
 
@@ -1144,11 +1163,18 @@ def blend_archetypes(
         services=intent.services,
         max_archetypes=settings.max_blended_archetypes,
         min_secondary_coverage=settings.min_secondary_coverage,
+        signal_store=signal_store,
     )
     max_panels = settings.max_dashboard_panels
 
     primary_arch, primary_conf = ranked_archetypes[0]
-    primary_spec = compile_archetype(primary_arch, intent, catalog, target_language=target_language)
+    primary_spec = compile_archetype(
+        primary_arch,
+        intent,
+        catalog,
+        target_language=target_language,
+        signal_store=signal_store,
+    )
 
     # De-dup on the panel's *query signature* (the set of normalized query
     # expressions), not just its title — so the same panel arriving from two
@@ -1166,7 +1192,13 @@ def blend_archetypes(
         if len(blended_panels) >= max_panels:
             break
 
-        secondary_spec = compile_archetype(arch, intent, catalog, target_language=target_language)
+        secondary_spec = compile_archetype(
+            arch,
+            intent,
+            catalog,
+            target_language=target_language,
+            signal_store=signal_store,
+        )
         added = 0
         for panel in secondary_spec.panels:
             if len(blended_panels) >= max_panels:

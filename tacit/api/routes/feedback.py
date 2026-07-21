@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi import Path as PathParam
 
-import tacit.feedback as feedback_mod
+from tacit.api.dependencies import get_feedback_store
 from tacit.api.security import verify_api_key
 from tacit.models.schemas import FeedbackRequest, FeedbackResponse, FeedbackStatsResponse
 
@@ -19,9 +21,8 @@ router = APIRouter(dependencies=[Depends(verify_api_key)])
     summary="Submit dashboard feedback",
     response_description="Confirmation with feedback ID",
 )
-async def submit_feedback(req: FeedbackRequest):
+async def submit_feedback(req: FeedbackRequest, store: Any = Depends(get_feedback_store)):
     """Submit human evaluation feedback for a generated dashboard."""
-    store = feedback_mod.get_feedback_store()
     feedback_id = store.submit_feedback(
         dashboard_uid=req.dashboard_uid,
         symptom_visibility=req.symptom_visibility,
@@ -44,9 +45,8 @@ async def submit_feedback(req: FeedbackRequest):
         "Aggregate stats: total feedback, dashboards reviewed, useful rate, average dimensional scores"
     ),
 )
-async def get_feedback_stats():
+async def get_feedback_stats(store: Any = Depends(get_feedback_store)):
     """Aggregate feedback statistics across all reviewed dashboards."""
-    store = feedback_mod.get_feedback_store()
     return store.get_aggregate_stats()
 
 
@@ -56,9 +56,8 @@ async def get_feedback_stats():
     summary="Feedback analysis & recommendations",
     response_description="Actionable improvement signals with prioritized recommendations",
 )
-async def get_feedback_analysis():
+async def get_feedback_analysis(store: Any = Depends(get_feedback_store)):
     """Analyze collected feedback to produce actionable improvement signals."""
-    store = feedback_mod.get_feedback_store()
     return store.analyze()
 
 
@@ -70,9 +69,9 @@ async def get_feedback_analysis():
 )
 async def get_feedback(
     dashboard_uid: str = PathParam(..., pattern=r"^[a-zA-Z0-9_\-]{1,128}$", description="Dashboard UID"),
+    store: Any = Depends(get_feedback_store),
 ):
     """Retrieve provenance and feedback for a dashboard UID."""
-    store = feedback_mod.get_feedback_store()
     provenance = store.get_provenance(dashboard_uid)
     feedback = store.get_feedback(dashboard_uid)
     if not provenance and not feedback:

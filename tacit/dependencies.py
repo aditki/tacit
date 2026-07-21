@@ -1,10 +1,4 @@
-"""Application dependency container.
-
-The default app still uses the existing singleton factories, but core flows can
-now receive an explicit dependency bundle in tests, CLIs, or future app
-factories. This starts moving orchestration code away from hidden global lookups
-without forcing a broad rewrite of every store/backend today.
-"""
+"""Application dependency containers."""
 
 from __future__ import annotations
 
@@ -15,12 +9,11 @@ from typing import Any
 import structlog
 
 from tacit.agents.providers.base import LLMProvider
-from tacit.backends import get_active_backends
 from tacit.backends.base import DashboardBackend
 from tacit.cache import llm_cache, make_cache_key
 from tacit.config import Settings, settings
 from tacit.context.base import ContextProvider
-from tacit.history import get_investigation_store
+from tacit.runtime_stores import RuntimeStores
 
 logger = structlog.get_logger()
 
@@ -33,6 +26,7 @@ class PipelineDependencies:
     feedback_store_factory: Callable[[], Any]
     llm_cache: Any
     cache_key_factory: Callable[..., str]
+    signal_store_factory: Callable[[], Any] | None = None
     llm_provider_factory: Callable[[], LLMProvider] | None = None
     context_provider_factory: Callable[[], ContextProvider | None] | None = None
     resource_cleanup: Callable[[], Awaitable[None]] | None = None
@@ -50,14 +44,20 @@ class PipelineDependencies:
 def build_pipeline_dependencies(
     runtime_settings: Settings,
     *,
+    stores: RuntimeStores | None = None,
     backend_factory: Callable[[], list[DashboardBackend]] | None = None,
-    history_store_factory: Callable[[], Any] = get_investigation_store,
+    history_store_factory: Callable[[], Any] | None = None,
     feedback_store_factory: Callable[[], Any] | None = None,
+    signal_store_factory: Callable[[], Any] | None = None,
 ) -> PipelineDependencies:
     """Build a dependency bundle scoped to one runtime settings object."""
 
+    runtime_stores = stores or RuntimeStores(runtime_settings)
+
     def runtime_backends() -> list[DashboardBackend]:
-        return get_active_backends(runtime_settings)
+        from tacit import backends
+
+        return backends.get_active_backends(runtime_settings)
 
     llm_provider: LLMProvider | None = None
     context_provider: ContextProvider | None = None
@@ -100,21 +100,15 @@ def build_pipeline_dependencies(
     return PipelineDependencies(
         settings=runtime_settings,
         backend_factory=backend_factory or runtime_backends,
-        history_store_factory=history_store_factory,
-        feedback_store_factory=feedback_store_factory or _get_feedback_store,
+        history_store_factory=history_store_factory or runtime_stores.history,
+        feedback_store_factory=feedback_store_factory or runtime_stores.feedback,
         llm_cache=llm_cache,
         cache_key_factory=make_cache_key,
+        signal_store_factory=signal_store_factory or runtime_stores.signals,
         llm_provider_factory=runtime_llm_provider,
         context_provider_factory=runtime_context_provider,
         resource_cleanup=close_runtime_resources,
     )
-
-
-def _get_feedback_store() -> Any:
-    """Resolve the feedback store lazily so monkeypatched runtimes are honored."""
-    from tacit import feedback
-
-    return feedback.get_feedback_store()
 
 
 def get_default_dependencies() -> PipelineDependencies:

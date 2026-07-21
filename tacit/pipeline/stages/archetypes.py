@@ -28,7 +28,7 @@ from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
 class ArchetypeSelection:
     ranked_archetypes: list[tuple[Any, float]]
     learned_archetypes: list[tuple[Any, float]]
-    experimental_archetypes: list[tuple[Any, float]]
+    shadow_archetypes: list[tuple[Any, float]]
     experimental_retrieval: GeneratedArchetypeRetrieval
     context_sources: dict[str, int]
     unexpected_cross_service_matches: int
@@ -53,8 +53,9 @@ def select_archetypes(
     tenant_id: str | None = None,
     environment_refs: list[str] | None = None,
     archetype_kind: str = "investigation_dashboard",
+    signal_store: Any | None = None,
 ) -> ArchetypeSelection:
-    """Select curated archetypes plus explicitly enabled exact-scope experiments."""
+    """Select authoritative curated archetypes and discover shadow-only generated candidates."""
     ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
     ranked_ids = {arch.id for arch, _ in ranked_archetypes}
     learned_archetypes = get_archetypes_by_learning_context(
@@ -70,7 +71,7 @@ def select_archetypes(
     retrieval_mode = ArchetypeRetrievalMode(
         getattr(settings, "learned_archetypes_retrieval_mode", ArchetypeRetrievalMode.CURATED_ONLY)
     )
-    experimental_archetypes: list[tuple[Any, float]] = []
+    shadow_archetypes: list[tuple[Any, float]] = []
     experimental_retrieval = GeneratedArchetypeRetrieval()
     unexpected_cross_service_matches = 0
     if retrieval_mode == ArchetypeRetrievalMode.CURATED_WITH_EXPERIMENTAL_EXACT_SCOPE:
@@ -96,13 +97,12 @@ def select_archetypes(
             exact_query,
         )
         existing_ids = {archetype.id for archetype, _ in ranked_archetypes}
-        experimental_archetypes = [
+        shadow_archetypes = [
             (archetype, 1.0) for archetype in experimental_retrieval.archetypes if archetype.id not in existing_ids
         ]
         unexpected_cross_service_matches = sum(
-            archetype.service_refs != exact_query.service_refs for archetype, _ in experimental_archetypes
+            archetype.service_refs != exact_query.service_refs for archetype, _ in shadow_archetypes
         )
-        ranked_archetypes.extend(experimental_archetypes)
 
     if not ranked_archetypes:
         legacy = get_archetype(intent.problem_type)
@@ -117,23 +117,19 @@ def select_archetypes(
             services=intent.services,
             max_archetypes=settings.max_blended_archetypes,
             min_secondary_coverage=settings.min_secondary_coverage,
+            signal_store=signal_store,
         )
-
-    experimental_ids = {archetype.id for archetype, _ in experimental_archetypes}
-    experimental_archetypes = [
-        (archetype, confidence) for archetype, confidence in ranked_archetypes if archetype.id in experimental_ids
-    ]
-    selected_experimental = len(experimental_archetypes)
 
     return ArchetypeSelection(
         ranked_archetypes=ranked_archetypes,
         learned_archetypes=learned_archetypes,
-        experimental_archetypes=experimental_archetypes,
+        shadow_archetypes=shadow_archetypes,
         experimental_retrieval=experimental_retrieval,
         context_sources={
-            "curated_archetypes": len(ranked_archetypes) - selected_experimental,
+            "curated_archetypes": len(ranked_archetypes),
             "operational_knowledge_items": 0,
-            "generated_archetypes": selected_experimental,
+            "generated_archetypes": 0,
+            "shadow_generated_archetypes": len(shadow_archetypes),
         },
         unexpected_cross_service_matches=unexpected_cross_service_matches,
         retrieval_mode=retrieval_mode,
@@ -147,6 +143,7 @@ def compile_selected_archetypes(
     intent: Intent,
     catalog_for_compile: list[MetricEntry],
     timings: dict[str, float],
+    signal_store: Any | None = None,
 ) -> ArchetypeCompilation | None:
     """Compile a dashboard from selected archetypes, if any."""
     if not selection.ranked_archetypes:
@@ -160,6 +157,7 @@ def compile_selected_archetypes(
             intent,
             catalog_for_compile,
             target_language=selection.target_language,
+            signal_store=signal_store,
         )
     else:
         dashboard_spec = compile_archetype(
@@ -167,6 +165,7 @@ def compile_selected_archetypes(
             intent,
             catalog_for_compile,
             target_language=selection.target_language,
+            signal_store=signal_store,
         )
     timings["archetype_compile"] = time.monotonic() - t0
     stage_log(
@@ -176,7 +175,8 @@ def compile_selected_archetypes(
         primary_confidence=primary_conf,
         archetypes_matched=len(selection.ranked_archetypes),
         learned_archetypes_matched=len(selection.learned_archetypes),
-        generated_archetypes_matched=len(selection.experimental_archetypes),
+        generated_archetypes_matched=0,
+        generated_shadow_candidates=len(selection.shadow_archetypes),
         investigation_context_sources=selection.context_sources,
         generated_rejected_by_scope=selection.experimental_retrieval.rejected_by_scope,
         generated_quarantined=selection.experimental_retrieval.quarantined,

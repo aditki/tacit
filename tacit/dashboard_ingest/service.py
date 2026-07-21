@@ -59,6 +59,8 @@ def get_signal_store():
 def infer_signals_from_metrics(
     metrics: list[str],
     panel_data: list[dict[str, Any]] | None = None,
+    *,
+    store: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Infer semantic signals from extracted metrics.
 
@@ -73,7 +75,7 @@ def infer_signals_from_metrics(
     Returns a list of dicts with: signal_type (name), metric, confidence,
     signal_family, source ('taxonomy'|'heuristic'), reason, evidence.
     """
-    store = get_signal_store()
+    store = store or get_signal_store()
     all_signal_types = store.list_signal_types()
     inferred: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -428,6 +430,7 @@ async def ingest_dashboard_features(
     auto_approve: bool = False,
     register_archetype: bool = True,
     runtime_settings: Settings | None = None,
+    store: Any | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted dashboard features."""
     active_settings = runtime_settings or settings
@@ -436,6 +439,7 @@ async def ingest_dashboard_features(
     signals = infer_signals_from_metrics(
         features.metrics_found,
         features.panels,
+        store=store,
     )
     signal_quality = build_signal_quality_report(metrics=features.metrics_found, signals=signals)
     learning_impact = build_learning_impact_report(
@@ -463,7 +467,7 @@ async def ingest_dashboard_features(
             source_refs=[source_ref],
         )
 
-    store = get_signal_store()
+    store = store or get_signal_store()
     status = "approved" if auto_approve else "pending"
 
     store.record_ingested_dashboard(
@@ -571,6 +575,7 @@ async def ingest_dashboard(
     auto_approve: bool = False,
     register_archetype: bool = True,
     runtime_settings: Settings | None = None,
+    store: Any | None = None,
 ) -> dict[str, Any]:
     """Full ingestion pipeline: fetch → extract → infer signals → store.
 
@@ -632,6 +637,7 @@ async def ingest_dashboard(
             auto_approve=auto_approve,
             register_archetype=register_archetype,
             runtime_settings=runtime_settings,
+            store=store,
         )
 
     finally:
@@ -646,6 +652,7 @@ async def learn_backend_dashboards(
     auto_approve: bool = False,
     limit: int = 500,
     runtime_settings: Settings | None = None,
+    store: Any | None = None,
 ) -> dict[str, Any]:
     """Crawl a backend and learn from every discoverable dashboard."""
     import asyncio
@@ -691,6 +698,7 @@ async def learn_backend_dashboards(
                         auto_approve=auto_approve,
                         register_archetype=True,
                         runtime_settings=active_settings,
+                        store=store,
                     )
                 return (
                     {

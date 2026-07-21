@@ -15,7 +15,7 @@ from tacit.backends import get_active_backends
 from tacit.config import settings
 from tacit.context.enrichment import enrich_context
 from tacit.culprit_ranking import rank_culprits
-from tacit.dependencies import PipelineDependencies, _get_feedback_store, build_pipeline_dependencies
+from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies
 from tacit.history import get_investigation_store
 from tacit.investigation_contract import InvestigationRunType
 from tacit.logging import bind_request_id, stage_log, unbind_request_id
@@ -43,6 +43,7 @@ from tacit.pipeline.stages.evidence import run_evidence_stage
 from tacit.pipeline.stages.freeform import build_freeform_dashboard
 from tacit.pipeline.stages.intent import run_intent_stage
 from tacit.pipeline.validation import validate_dashboard_and_evidence
+from tacit.runtime_stores import RuntimeStores
 
 logger = structlog.get_logger()
 
@@ -72,11 +73,11 @@ def _default_dependencies() -> PipelineDependencies:
     cold isolated runtime. Keeping the default lookup here preserves that
     behavior while the core runner still accepts explicit dependencies.
     """
+    stores = RuntimeStores(settings, history_fallback=get_investigation_store)
     return build_pipeline_dependencies(
         settings,
+        stores=stores,
         backend_factory=get_active_backends,
-        history_store_factory=get_investigation_store,
-        feedback_store_factory=_get_feedback_store,
     )
 
 
@@ -222,6 +223,8 @@ async def _run_pipeline_inner(
     )
 
     try:
+        signal_store = deps.signal_store_factory() if deps.signal_store_factory is not None else None
+
         # ── 1. Intent Agent ──────────────────────────────────────────
         llm_provider_factory = runtime.deps.llm_provider_factory
         context_provider_factory = runtime.deps.context_provider_factory
@@ -247,6 +250,7 @@ async def _run_pipeline_inner(
             intent=intent,
             timings=runtime.timings,
             recorder=runtime.recorder,
+            signal_store=signal_store,
         )
         catalog_discovery = discovery_stage.discovery
         metric_catalog = catalog_discovery.metric_catalog
@@ -275,6 +279,7 @@ async def _run_pipeline_inner(
             catalog_for_compile=catalog_for_compile,
             target_language=target_language,
             settings=runtime.settings,
+            signal_store=signal_store,
         )
         ranked_archetypes = selection.ranked_archetypes
         learned_archetypes = selection.learned_archetypes
@@ -283,7 +288,7 @@ async def _run_pipeline_inner(
         retrieval_details: dict[str, Any] = {
             "retrieval_mode": selection.retrieval_mode.value,
             "investigation_context_sources": selection.context_sources,
-            "generated_candidates": len(selection.experimental_archetypes),
+            "generated_candidates": len(selection.shadow_archetypes),
             "generated_files_scanned": selection.experimental_retrieval.files_scanned,
             "generated_quarantined": selection.experimental_retrieval.quarantined,
             "generated_rejected_by_scope": selection.experimental_retrieval.rejected_by_scope,
@@ -292,6 +297,7 @@ async def _run_pipeline_inner(
             "normal_generated_retrieval_requested_but_blocked": (
                 bool(getattr(runtime.settings, "learned_archetypes_normal_retrieval_enabled", False))
             ),
+            "output_applied": False,
         }
         stage_log(
             "archetype_retrieval",
@@ -301,7 +307,7 @@ async def _run_pipeline_inner(
         runtime.recorder.stage(
             "archetype_retrieval",
             "passed",
-            "curated_only" if not selection.experimental_archetypes else "experimental_exact_scope_selected",
+            "curated_only" if not selection.shadow_archetypes else "experimental_exact_scope_shadow_only",
             **retrieval_details,
         )
 
@@ -309,7 +315,7 @@ async def _run_pipeline_inner(
             intent,
             ranked_archetypes,
             learned_archetypes,
-            selection.experimental_archetypes,
+            selection.shadow_archetypes,
         )
 
         compilation = compile_selected_archetypes(
@@ -317,6 +323,7 @@ async def _run_pipeline_inner(
             intent=intent,
             catalog_for_compile=catalog_for_compile,
             timings=runtime.timings,
+            signal_store=signal_store,
         )
         if compilation is not None:
             dashboard_spec = compilation.dashboard_spec
@@ -342,6 +349,7 @@ async def _run_pipeline_inner(
             intent=intent,
             catalog=catalog_for_compile,
             target_language=target_language,
+            signal_store=signal_store,
         )
         evidence_requirements = evidence_stage.requirements
         evidence_resolutions = evidence_stage.resolutions

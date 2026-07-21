@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -125,13 +124,7 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
         assert backend.published_specs, case.case_id
         spec = backend.published_specs[-1]
         assert "Checkout Edge Incident Response" not in spec.title
-        approved_case = replace(
-            case,
-            expected_metrics=[metric for metric in case.expected_metrics if metric in resolved_metrics],
-            critical_metrics=[metric for metric in case.critical_metrics if metric in resolved_metrics],
-        )
-        assert approved_case.expected_metrics, case.case_id
-        evaluation = evaluate_incident(spec, approved_case)
+        evaluation = evaluate_incident(spec, case)
         evaluation.assert_passes(thresholds, case_id=case.case_id)
         evaluations.append(evaluation)
 

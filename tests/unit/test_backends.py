@@ -697,11 +697,14 @@ def test_signalfx_backend_discover_error():
 # ── Bug 8: ingest_dashboard must close all backends ────────────────────
 
 
-def test_ingest_dashboard_closes_all_backends():
+def test_ingest_dashboard_closes_all_backends(tmp_path):
     """When get_active_backends() returns multiple backends and one is
     selected by name, ALL backends must be closed — not just the selected
     one.  Otherwise, unused HTTP clients leak."""
     from tacit.backends.base import DashboardFeatures
+    from tacit.signals import SignalStore
+
+    signal_store = SignalStore(db_path=tmp_path / "signals.db")
 
     grafana_backend = AsyncMock()
     grafana_backend.name = "grafana"
@@ -731,6 +734,7 @@ def test_ingest_dashboard_closes_all_backends():
                 dashboard_uid="test-uid",
                 backend_name="grafana",
                 auto_approve=False,
+                store=signal_store,
             )
         )
 

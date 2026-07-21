@@ -93,19 +93,22 @@ def test_history_archetypes_include_selected_learned_matches():
     assert records[1]["type"] == "resource_saturation"
 
 
-def test_history_archetypes_attribute_exact_scope_experimental_matches():
+def test_history_archetypes_record_exact_scope_generated_matches_as_shadow_only():
     generated = _arch("checkout_generated")
 
     records = _history_archetypes(
         [],
-        selected_archetypes=[(generated, 1.0)],
+        selected_archetypes=[],
         learned_archetypes=[],
-        experimental_archetypes=[(generated, 1.0)],
+        shadow_archetypes=[(generated, 1.0)],
     )
 
-    assert records[0]["source"] == "learned"
-    assert records[0]["retrieval_source"] == "experimental_exact_scope"
+    assert records[0]["source"] == "generated"
+    assert records[0]["retrieval_source"] == "experimental_exact_scope_shadow"
     assert records[0]["template_origin"] == "generated"
+    assert records[0]["selected"] is False
+    assert records[0]["shadow_only"] is True
+    assert records[0]["output_applied"] is False
 
 
 def test_history_signals_include_semantic_archetype_signals():

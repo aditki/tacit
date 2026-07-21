@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from tacit import __version__
 from tacit.config import Settings
 from tacit.config import settings as default_settings
+from tacit.runtime_stores import RuntimeStores
 
 LifespanFactory = Any
 
@@ -97,6 +98,7 @@ def create_app(
         openapi_tags=OPENAPI_TAGS,
     )
     app.state.settings = runtime_settings
+    app.state.runtime_stores = RuntimeStores(runtime_settings)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

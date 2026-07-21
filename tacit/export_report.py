@@ -422,16 +422,18 @@ def redact_text(value: str) -> str:
     return value
 
 
-def build_assessment_report(*, anonymous: bool) -> AssessmentReport:
+def build_assessment_report(*, anonymous: bool, stores: Any | None = None) -> AssessmentReport:
     """Build the report sections from local Tacit stores."""
-    from tacit.feedback import get_feedback_store
-    from tacit.history import get_investigation_store
-    from tacit.signals import get_signal_store
+    if stores is None:
+        from tacit.config import settings
+        from tacit.runtime_stores import RuntimeStores
+
+        stores = RuntimeStores(settings)
 
     generated_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    history_store = get_investigation_store()
-    feedback_store = get_feedback_store()
-    signal_store = get_signal_store()
+    history_store = stores.history()
+    feedback_store = stores.feedback()
+    signal_store = stores.signals()
 
     investigations = _collect_recent_investigations(history_store)
     history_stats = history_store.stats()
@@ -484,9 +486,10 @@ def export_assessment_report(
     output: Path | None = None,
     anonymous: bool = False,
     validate: bool = False,
+    stores: Any | None = None,
 ) -> ExportResult:
     """Write a tar.gz assessment bundle and return export metadata."""
-    report = build_assessment_report(anonymous=anonymous)
+    report = build_assessment_report(anonymous=anonymous, stores=stores)
     if anonymous:
         report = ReportAnonymizer().anonymize_report(report)
         from tacit.evaluation_summary import build_evaluation_summary

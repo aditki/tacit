@@ -27,6 +27,7 @@ def run_evidence_stage(
     intent: Intent,
     catalog: list[MetricEntry],
     target_language: str,
+    signal_store: Any | None = None,
 ) -> EvidenceStageResult:
     """Resolve evidence requirements for the archetypes that contributed panels."""
     if not ranked_archetypes:
@@ -38,6 +39,7 @@ def run_evidence_stage(
             intent,
             catalog,
             target_language=target_language,
+            signal_store=signal_store,
         )
         return EvidenceStageResult(requirements=requirements, resolutions=resolutions)
     except Exception:

@@ -426,11 +426,11 @@ def _is_generated_entry(entry: object) -> bool:
         return False
     origin = str(entry.get("origin", ""))
     tags = {str(tag) for tag in entry.get("tags", []) or []}
-    return origin == "generated_experimental" or bool(_GENERATED_TAGS & tags)
+    return origin == "generated_experimental" or _GENERATED_TAGS <= tags
 
 
 def _is_generated_archetype(archetype: InvestigationArchetype) -> bool:
-    return bool(_GENERATED_TAGS & set(archetype.tags))
+    return _GENERATED_TAGS <= set(archetype.tags)
 
 
 def _load_archetypes_from_yaml(path: Path) -> list[InvestigationArchetype]:

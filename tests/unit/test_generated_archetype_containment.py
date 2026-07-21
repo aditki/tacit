@@ -15,7 +15,11 @@ from tacit.archetypes.generated import (
     write_generated_archetype,
 )
 from tacit.archetypes.schema import InvestigationArchetype
-from tacit.archetypes.templates import _load_archetypes_from_yaml, append_archetype_to_yaml
+from tacit.archetypes.templates import (
+    _is_generated_archetype,
+    _load_archetypes_from_yaml,
+    append_archetype_to_yaml,
+)
 from tacit.config import Settings
 from tacit.dashboard_ingest import generate_archetype_yaml, register_generated_archetype_if_enabled
 from tacit.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
@@ -133,6 +137,27 @@ def test_legacy_generated_entries_are_filtered_when_curated_yaml_loads(tmp_path)
     loaded = _load_archetypes_from_yaml(path)
 
     assert [item.id for item in loaded] == ["curated"]
+
+
+@pytest.mark.parametrize("tag", ["learned", "auto-generated"])
+def test_curated_archetype_with_an_ordinary_learning_tag_is_preserved(tmp_path, tag):
+    curated = InvestigationArchetype(
+        id=f"curated_{tag}",
+        name="Operator Curated",
+        problem_types=["resource_saturation"],
+        panels=[],
+        tags=[tag, "operator-authored"],
+    )
+    path = tmp_path / "archetypes.yaml"
+    path.write_text(
+        yaml.safe_dump({"archetypes": [curated.model_dump(mode="json")]}, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    loaded = _load_archetypes_from_yaml(path)
+
+    assert [item.id for item in loaded] == [curated.id]
+    assert _is_generated_archetype(loaded[0]) is False
 
 
 def test_quarantine_rejects_generated_artifact_without_service_scope(tmp_path):
@@ -308,7 +333,7 @@ def test_checkout_generated_archetype_is_absent_from_normal_payment_selection(tm
     assert selection.unexpected_cross_service_matches == 0
 
 
-def test_exact_scope_experimental_mode_can_select_generated_archetype(tmp_path):
+def test_exact_scope_experimental_mode_keeps_generated_archetype_shadow_only(tmp_path):
     write_generated_archetype(_generated(), tmp_path)
     settings = _settings(
         tmp_path,
@@ -323,19 +348,26 @@ def test_exact_scope_experimental_mode_can_select_generated_archetype(tmp_path):
         settings=settings,
     )
 
-    assert "checkout_generated" in {archetype.id for archetype, _ in selection.ranked_archetypes}
-    assert selection.context_sources["generated_archetypes"] == 1
+    assert "checkout_generated" not in {archetype.id for archetype, _ in selection.ranked_archetypes}
+    assert [archetype.id for archetype, _ in selection.shadow_archetypes] == ["checkout_generated"]
+    assert selection.context_sources["generated_archetypes"] == 0
+    assert selection.context_sources["shadow_generated_archetypes"] == 1
     assert selection.experimental_retrieval.files_scanned == 1
     assert selection.unexpected_cross_service_matches == 0
 
 
-def test_generated_candidate_removed_by_ranking_is_not_reported(tmp_path, monkeypatch):
+def test_shadow_candidate_never_enters_authoritative_coverage_ranking(tmp_path, monkeypatch):
     write_generated_archetype(_generated(), tmp_path)
     settings = _settings(tmp_path, mode=ArchetypeRetrievalMode.CURATED_WITH_EXPERIMENTAL_EXACT_SCOPE)
+    ranked_candidate_ids: list[list[str]] = []
+
+    def capture_authoritative_candidates(candidates, *_args, **_kwargs):
+        ranked_candidate_ids.append([item[0].id for item in candidates])
+        return candidates
 
     monkeypatch.setattr(
         "tacit.pipeline.stages.archetypes.rank_archetypes_by_coverage",
-        lambda candidates, *_args, **_kwargs: [item for item in candidates if item[0].id != "checkout_generated"],
+        capture_authoritative_candidates,
     )
     selection = select_archetypes(
         intent=_intent("checkout"),
@@ -346,5 +378,6 @@ def test_generated_candidate_removed_by_ranking_is_not_reported(tmp_path, monkey
     )
 
     assert selection.experimental_retrieval.archetypes
-    assert selection.experimental_archetypes == []
+    assert [archetype.id for archetype, _ in selection.shadow_archetypes] == ["checkout_generated"]
+    assert all("checkout_generated" not in candidate_ids for candidate_ids in ranked_candidate_ids)
     assert selection.context_sources["generated_archetypes"] == 0
