@@ -6,6 +6,10 @@ They are intentionally lightweight and validated against the current repository 
 Tacit is an experimental, public-beta infrastructure project. These records should not be read as
 production-readiness claims.
 
+Recurring implementation invariants and refactor signals that have not become
+architecture decisions are maintained in the
+[engineering design notes](../engineering-design-notes.md).
+
 | ADR | Title | Status | Implementation Status |
 |---|---|---|---|
 | [ADR-001](001-investigation-first.md) | Tacit is investigation-first, not dashboard-only | Accepted | Partially implemented |

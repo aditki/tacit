@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 
-from tacit.knowledge.enums import KnowledgeKind, Predicate
+from tacit.knowledge.enums import EntityKind, KnowledgeKind, Predicate
 from tacit.knowledge.models import KnowledgeProposition, KnowledgeScope
 
 PREDICATE_ALIASES = {
@@ -49,6 +49,29 @@ def normalize_entity(value: str) -> str:
     return re.sub(r"[^a-z0-9_.:-]+", "-", value.strip().casefold()).strip("-")
 
 
+def normalize_entity_id(value: str, kind: EntityKind) -> str:
+    """Build a canonical, kind-safe entity identifier from operator input."""
+    normalized = normalize_entity(value)
+    if not normalized:
+        raise ValueError("entity id must contain canonical identifier characters")
+    known_kinds = {item.value for item in EntityKind}
+    parts = normalized.split(":")
+    if parts[0] == "entity":
+        if len(parts) < 3 or not parts[2]:
+            raise ValueError("entity id must use entity:<kind>:<name>")
+        declared_kind = parts[1]
+        canonical = normalized
+    elif len(parts) >= 2 and parts[0] in known_kinds:
+        declared_kind = parts[0]
+        canonical = f"entity:{normalized}"
+    else:
+        declared_kind = kind.value
+        canonical = f"entity:{kind.value}:{normalized}"
+    if declared_kind != kind.value:
+        raise ValueError(f"entity id kind {declared_kind!r} does not match declared kind {kind.value!r}")
+    return canonical
+
+
 def normalize_service_ref(value: str) -> str:
     """Canonicalize service mentions to the scope reference format."""
     normalized = normalize_entity(value)
@@ -57,6 +80,16 @@ def normalize_service_ref(value: str) -> str:
     if normalized.startswith("service:"):
         return f"entity:{normalized}"
     return f"entity:service:{normalized}"
+
+
+def candidate_ref_from_entity_ref(entity_ref: str) -> str:
+    """Convert a governed entity reference into the ranking candidate form."""
+    parts = entity_ref.split(":")
+    if len(parts) >= 3 and parts[0] == "entity":
+        return f"{parts[1]}:{':'.join(parts[2:])}"
+    if len(parts) >= 2:
+        return entity_ref
+    return f"service:{entity_ref}"
 
 
 SCOPE_LIST_FIELDS = (

@@ -156,7 +156,7 @@ async def test_manual_teach_signal_mapping_is_used_before_dashboard_creation(
     isolated_learning_runtime,
     monkeypatch,
 ):
-    _signal_store, _history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
+    _signal_store, history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
     archetypes_path.write_text(
         """
 archetypes:
@@ -243,6 +243,15 @@ archetypes:
     found = {query.expr for panel in backend.published_specs[-1].panels for query in panel.queries}
     assert any("acme_checkout_latency_seconds_bucket" in expr for expr in found)
     assert all("http_request_duration_seconds" not in expr for expr in found)
+    contract = history_store.get_contract(response.investigation_id)
+    assert contract is not None
+    compilation_usage = [
+        usage
+        for usage in contract.knowledge_usage
+        if usage.disposition == "applied" and "query_compilation" in usage.used_for
+    ]
+    assert len(compilation_usage) == 1
+    assert compilation_usage[0].score_delta == 0
 
 
 @pytest.mark.e2e

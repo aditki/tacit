@@ -36,6 +36,17 @@ docker build -t tacit:local .
 Live vendor scripts under `tests/live/` are not part of the hermetic test suite.
 Run them only against accounts and dashboards you are allowed to mutate.
 
+## Design Guidance
+
+Before cross-cutting work, read the relevant records in `docs/adr/` and the
+[living engineering design notes](docs/engineering-design-notes.md). The ADRs
+capture accepted decisions; the living notes capture recurring invariants,
+refactor triggers, observability expectations, and validation matrices found
+during implementation.
+
+When a change exposes reusable design pressure, update the living notes. When it
+selects a durable product or architecture direction, create or amend an ADR.
+
 ## Security
 
 - Do not commit API keys, tokens, `.env` files, or generated credentials.

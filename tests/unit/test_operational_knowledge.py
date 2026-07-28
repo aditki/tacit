@@ -23,6 +23,7 @@ from tacit.knowledge.enums import (
     EvidenceRole,
     KnowledgeEligibility,
     KnowledgeKind,
+    KnowledgeUsageDisposition,
     LifecycleStatus,
     LineageKind,
     ReviewState,
@@ -43,6 +44,7 @@ from tacit.knowledge.models import (
     KnowledgeRevision,
     KnowledgeScope,
     KnowledgeState,
+    KnowledgeUsage,
 )
 from tacit.knowledge.normalization import normalize_service_ref
 from tacit.knowledge.repository import (
@@ -937,6 +939,32 @@ def test_canonical_entity_names_use_resolver_normalization(tmp_path: Path):
     assert candidate.proposition.subject_ref == "entity:service:payment-api"
 
 
+def test_entity_registration_normalizes_ids_before_exact_resolution(tmp_path: Path):
+    db_path = tmp_path / "entity-normalization.db"
+    app = create_app(runtime_settings=Settings(signals_db_path=str(db_path)))
+    response = TestClient(app).post(
+        "/api/v1/knowledge/entities",
+        json={
+            "id": "Service:Payment API",
+            "kind": "service",
+            "canonical_name": "Payment API",
+            "provenance_refs": ["operator:entity"],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["id"] == "entity:service:payment-api"
+    service = app.state.runtime_stores.knowledge()
+    resolution = service.entity_resolution.resolve(
+        "entity:service:payment-api",
+        EntityKind.SERVICE,
+        KnowledgeScope(),
+        ["operator:entity"],
+    )
+    assert resolution.status.value == "resolved"
+    assert resolution.selected_entity_ref == "entity:service:payment-api"
+
+
 @pytest.mark.parametrize(
     ("subject_ref", "object_ref"),
     [
@@ -1491,6 +1519,30 @@ def test_correction_creates_candidate_revision_and_impact(tmp_path: Path):
     assert service.impact(original.knowledge_id).recommended_action == "replay_current"
 
 
+def test_impact_includes_only_investigations_where_knowledge_was_applied(tmp_path: Path):
+    service = _service(tmp_path)
+    _, revision = _promoted_dependency(service)
+    for investigation_id, disposition in (
+        ("inv-applied", KnowledgeUsageDisposition.APPLIED),
+        ("inv-considered", KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED),
+        ("inv-rejected", KnowledgeUsageDisposition.REJECTED_BY_SCOPE),
+    ):
+        service.repository.save_usage(
+            KnowledgeUsage(
+                investigation_id=investigation_id,
+                investigation_revision=1,
+                knowledge_ref=revision.knowledge_id,
+                knowledge_revision=revision.revision,
+                disposition=disposition,
+                used_for=["ranking"] if disposition == KnowledgeUsageDisposition.APPLIED else [],
+            )
+        )
+
+    impact = service.impact(revision.knowledge_id)
+
+    assert impact.affected_investigations == [{"investigation_id": "inv-applied", "revision": 1}]
+
+
 def test_correction_rejects_target_that_advanced_after_creation(tmp_path: Path):
     service = _service(tmp_path)
     _, original = _promoted_dependency(service)
@@ -1709,6 +1761,13 @@ def test_governed_signal_projection_preserves_each_revision_scope(tmp_path: Path
     assert {row["governance_ref"] for row in rows} == {checkout.knowledge_id, payments.knowledge_id}
     assert {row["context_services"] for row in rows} == {'["checkout"]', '["payments"]'}
 
+    _, usage = service.create_snapshot(checkout.scope)
+    compilation_usage = service.apply_compilation_usage(usage, {checkout.knowledge_id})
+    checkout_usage = next(item for item in compilation_usage if item.knowledge_ref == checkout.knowledge_id)
+    assert checkout_usage.disposition == KnowledgeUsageDisposition.APPLIED
+    assert checkout_usage.used_for == ["query_compilation"]
+    assert checkout_usage.score_delta == 0
+
     stale, _ = service.create_correction(
         investigation_id="inv-checkout-stale",
         investigation_revision=2,
@@ -1857,6 +1916,50 @@ def test_manual_signal_teaching_creates_governed_revision_before_activation(tmp_
     assert len(taught) == 1
     assert taught[0]["source_type"] == "operational_knowledge"
     assert taught[0]["confidence"] == 0.95
+
+
+def test_manual_signal_reteach_uses_scope_in_candidate_identity(tmp_path: Path):
+    db_path = tmp_path / "scoped-signals.db"
+    app = create_app(
+        runtime_settings=Settings(
+            signals_db_path=str(db_path),
+            knowledge_tenant_id="tenant-a",
+        )
+    )
+    client = TestClient(app)
+    base_payload = {
+        "signal_type": "request_latency",
+        "metric_patterns": [{"pattern": "shared_latency_seconds", "confidence": 0.9}],
+        "category": "latency",
+        "taught_by": "operator",
+    }
+    scopes = (
+        {
+            "services": ["checkout"],
+            "environments": ["environment:production"],
+            "datasource_types": ["prometheus"],
+        },
+        {
+            "services": ["payments"],
+            "environments": ["environment:staging"],
+            "datasource_types": ["prometheus"],
+        },
+        {
+            "services": ["payments"],
+            "environments": ["environment:staging"],
+            "datasource_types": ["cloudwatch"],
+        },
+    )
+
+    responses = [client.post("/api/v1/signals/teach", json={**base_payload, **scope}) for scope in scopes]
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    candidates = app.state.runtime_stores.knowledge_repository().list_candidates(
+        "tenant-a",
+        kind=KnowledgeKind.SIGNAL_MAPPING.value,
+    )
+    assert len(candidates) == 3
+    assert len({candidate.id for candidate in candidates}) == 3
 
 
 @pytest.mark.parametrize(
@@ -2150,6 +2253,7 @@ def test_rejecting_promoted_contributor_recomputes_current_knowledge(tmp_path: P
     assert current.revision == active.revision + 1
     assert current.state.lifecycle_status == LifecycleStatus.WITHDRAWN
     assert current.state.eligibility == KnowledgeEligibility.INELIGIBLE
+    assert service.repository.stats()["lifecycle"]["withdrawn"] == 1
 
 
 def test_reingested_stale_candidate_reactivates_and_is_reevaluated(tmp_path: Path):

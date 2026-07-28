@@ -24,6 +24,7 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,7 @@ logger = structlog.get_logger()
 
 __all__ = [
     "LearningIndexUnavailable",
+    "ResolvedSignal",
     "SignalStore",
     "_effective_confidence",
     "_metric_matches_pattern",
@@ -99,6 +101,13 @@ _DEFAULT_DB_PATH = DEFAULT_DB_PATH
 
 class LearningIndexUnavailable(RuntimeError):
     """Raised when SQLite FTS5-backed learning retrieval is unavailable."""
+
+
+@dataclass(frozen=True)
+class ResolvedSignal:
+    entry: MetricEntry
+    confidence: float
+    governance_ref: str = ""
 
 
 def _escape_like_prefix(value: str) -> str:
@@ -623,6 +632,33 @@ class SignalStore:
         target_query_language: str = "",
         tenant_id: str = "default",
     ) -> list[tuple[MetricEntry, float]]:
+        """Resolve a semantic signal while preserving the established public result shape."""
+        return [
+            (match.entry, match.confidence)
+            for match in self.resolve_signal_details(
+                signal_type,
+                catalog,
+                context_service=context_service,
+                context_datasource_type=context_datasource_type,
+                context_archetype=context_archetype,
+                context_environment=context_environment,
+                target_query_language=target_query_language,
+                tenant_id=tenant_id,
+            )
+        ]
+
+    def resolve_signal_details(
+        self,
+        signal_type: str,
+        catalog: list[MetricEntry],
+        *,
+        context_service: str = "",
+        context_datasource_type: str = "",
+        context_archetype: str = "",
+        context_environment: str = "",
+        target_query_language: str = "",
+        tenant_id: str = "default",
+    ) -> list[ResolvedSignal]:
         """Resolve a semantic signal to actual metrics from the live catalog.
 
         Returns a list of (MetricEntry, effective_confidence) sorted by
@@ -652,7 +688,7 @@ class SignalStore:
 
         target_lang = target_query_language.lower()
         target_ds = context_datasource_type.lower()
-        matched: list[tuple[MetricEntry, float]] = []
+        matched: list[ResolvedSignal] = []
         seen_metrics: set[tuple[str, str]] = set()
 
         sig_type = self.get_signal_type(signal_type, tenant_id=tenant_id)
@@ -673,10 +709,16 @@ class SignalStore:
                     continue
                 if _metric_matches_pattern(entry.name, pattern):
                     adjusted = eff_conf * _metric_metadata_compatibility(signal_type, sig_type or {}, entry)
-                    matched.append((entry, round(adjusted, 4)))
+                    matched.append(
+                        ResolvedSignal(
+                            entry=entry,
+                            confidence=round(adjusted, 4),
+                            governance_ref=str(mapping.get("governance_ref") or ""),
+                        )
+                    )
                     seen_metrics.add(metric_key)
 
-        matched.sort(key=lambda x: x[1], reverse=True)
+        matched.sort(key=lambda item: item.confidence, reverse=True)
         return matched
 
     def resolve_signals_for_archetype(
@@ -687,8 +729,10 @@ class SignalStore:
         context_service: str = "",
         context_datasource_type: str = "",
         context_archetype: str = "",
+        context_environment: str = "",
         target_query_language: str = "",
         tenant_id: str = "default",
+        applied_governance_refs: set[str] | None = None,
     ) -> dict[str, str]:
         """Resolve signal bindings to metric substitutions for archetype compile.
 
@@ -726,25 +770,30 @@ class SignalStore:
                 continue
 
             # Try signal-based resolution
-            resolved = self.resolve_signal(
+            resolved = self.resolve_signal_details(
                 signal_type,
                 catalog,
                 context_service=context_service,
                 context_datasource_type=context_datasource_type,
                 context_archetype=context_archetype,
+                context_environment=context_environment,
                 target_query_language=target_query_language,
                 tenant_id=tenant_id,
             )
 
             if resolved:
-                best_entry, confidence = resolved[0]
+                best = resolved[0]
+                best_entry = best.entry
                 substitutions[default_metric] = best_entry.name
+                if applied_governance_refs is not None and best.governance_ref:
+                    applied_governance_refs.add(best.governance_ref)
                 logger.info(
                     "signal_resolved",
                     signal=signal_type,
                     default_metric=default_metric,
                     resolved_to=best_entry.name,
-                    confidence=confidence,
+                    confidence=best.confidence,
+                    governance_ref=best.governance_ref,
                 )
 
         return substitutions

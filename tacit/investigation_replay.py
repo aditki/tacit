@@ -16,7 +16,9 @@ from tacit.investigation_contract import (
     stamp_fingerprints,
     utc_now,
 )
+from tacit.knowledge.enums import KnowledgeUsageDisposition
 from tacit.knowledge.models import KnowledgeUsage
+from tacit.knowledge.normalization import candidate_ref_from_entity_ref
 from tacit.models.schemas import (
     ContextChunk,
     CulpritRanking,
@@ -215,6 +217,26 @@ def apply_counterfactual(
             ),
         }
     )
+    removed_candidate_refs = set(changes.remove_candidate_refs)
+    knowledge_usage = []
+    for usage in snapshot.knowledge_usage:
+        if (
+            usage.disposition == KnowledgeUsageDisposition.APPLIED
+            and usage.target_ref
+            and candidate_ref_from_entity_ref(usage.target_ref) in removed_candidate_refs
+        ):
+            reason_codes = list(usage.reason_codes)
+            if "counterfactual_candidate_removed" not in reason_codes:
+                reason_codes.append("counterfactual_candidate_removed")
+            usage = usage.model_copy(
+                update={
+                    "disposition": KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+                    "used_for": [],
+                    "score_delta": 0.0,
+                    "reason_codes": reason_codes,
+                }
+            )
+        knowledge_usage.append(usage)
     removed_context_refs = set(changes.remove_context_refs)
     stale_context_refs = set(changes.stale_context_refs)
     context_chunks = []
@@ -242,5 +264,6 @@ def apply_counterfactual(
             "evidence_observations": observations,
             "culprit_ranking": culprit_ranking,
             "context_chunks": context_chunks,
+            "knowledge_usage": knowledge_usage,
         }
     )

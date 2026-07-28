@@ -405,6 +405,17 @@ def test_governed_mapping_scopes_and_lifecycles_are_independent(signal_store):
         ("knowledge-payments", '["payments"]'),
     ]
 
+    applied_refs: set[str] = set()
+    substitutions = signal_store.resolve_signals_for_archetype(
+        {"request_latency": "default_latency_seconds"},
+        [_metric_entry("shared_latency_seconds")],
+        context_service="checkout",
+        tenant_id="tenant-a",
+        applied_governance_refs=applied_refs,
+    )
+    assert substitutions == {"default_latency_seconds": "shared_latency_seconds"}
+    assert applied_refs == {"knowledge-checkout"}
+
     assert signal_store.set_mapping_review_state(
         "request_latency",
         "shared_latency_seconds",

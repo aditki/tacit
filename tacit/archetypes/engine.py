@@ -618,16 +618,16 @@ def _apply_metric_substitutions(
     )
 
 
-def _legacy_metric_signal(
+def _legacy_metric_signal_details(
     store,
     default_metric: str,
     catalog: list[MetricEntry],
     target_language: str,
     tenant_id: str = "default",
-) -> str:
+) -> tuple[str, str]:
     """Infer the taxonomy signal represented by a legacy required metric."""
     if not catalog:
-        return ""
+        return "", ""
     exemplar = catalog[0]
     pseudo = MetricEntry(
         name=default_metric,
@@ -636,21 +636,39 @@ def _legacy_metric_signal(
         datasource_type=exemplar.datasource_type,
         query_language=target_language or exemplar.query_language,
     )
-    candidates: list[tuple[str, float]] = []
+    candidates: list[tuple[str, float, str]] = []
     for signal in store.list_signal_types(tenant_id=tenant_id):
         signal_type = str(signal.get("signal_type", ""))
         if not signal_type:
             continue
-        matches = store.resolve_signal(
+        matches = store.resolve_signal_details(
             signal_type,
             [pseudo],
             target_query_language=target_language,
             tenant_id=tenant_id,
         )
         if matches:
-            candidates.append((signal_type, matches[0][1]))
+            candidates.append((signal_type, matches[0].confidence, matches[0].governance_ref))
     candidates.sort(key=lambda item: item[1], reverse=True)
-    return candidates[0][0] if candidates else ""
+    return (candidates[0][0], candidates[0][2]) if candidates else ("", "")
+
+
+def _legacy_metric_signal(
+    store,
+    default_metric: str,
+    catalog: list[MetricEntry],
+    target_language: str,
+    tenant_id: str = "default",
+) -> str:
+    """Infer the taxonomy signal represented by a legacy required metric."""
+    signal_type, _ = _legacy_metric_signal_details(
+        store,
+        default_metric,
+        catalog,
+        target_language,
+        tenant_id,
+    )
+    return signal_type
 
 
 def _substitution_shape_compatible(
@@ -705,6 +723,7 @@ def _resolve_legacy_required_metrics(
     intent: Intent,
     target_language: str,
     tenant_id: str = "default",
+    applied_knowledge_refs: set[str] | None = None,
 ) -> dict[str, str]:
     """Resolve legacy required_metrics through the semantic taxonomy."""
     target_datasource_type = _datasource_type_for_language(target_language)
@@ -720,18 +739,26 @@ def _resolve_legacy_required_metrics(
     for default_metric in archetype.required_metrics:
         if default_metric in catalog_names:
             continue
-        signal_type = _legacy_metric_signal(store, default_metric, target_catalog, target_language, tenant_id)
+        signal_type, inferred_by = _legacy_metric_signal_details(
+            store,
+            default_metric,
+            target_catalog,
+            target_language,
+            tenant_id,
+        )
         if not signal_type:
             continue
-        resolved = store.resolve_signal(
+        resolved_details = store.resolve_signal_details(
             signal_type,
             resolution_catalog,
             context_service=intent.services[0] if intent.services else "",
             context_datasource_type=target_datasource_type,
             context_archetype=archetype.id,
+            context_environment=intent.environments[0] if intent.environments else "",
             target_query_language=target_language,
             tenant_id=tenant_id,
         )
+        resolved = [(match.entry, match.confidence) for match in resolved_details]
         selected = _unambiguous_legacy_candidate(resolved, archetype, default_metric)
         if selected is None:
             if resolved:
@@ -745,6 +772,15 @@ def _resolve_legacy_required_metrics(
             continue
         candidate, confidence = selected
         substitutions[default_metric] = candidate.name
+        if applied_knowledge_refs is not None:
+            if inferred_by:
+                applied_knowledge_refs.add(inferred_by)
+            selected_match = next(
+                (match for match in resolved_details if match.entry == candidate and match.confidence == confidence),
+                None,
+            )
+            if selected_match is not None and selected_match.governance_ref:
+                applied_knowledge_refs.add(selected_match.governance_ref)
         logger.info(
             "legacy_metric_signal_resolved",
             archetype=archetype.id,
@@ -763,6 +799,7 @@ def _resolve_archetype_signals(
     target_language: str = "promql",
     signal_store: Any | None = None,
     tenant_id: str = "default",
+    applied_knowledge_refs: set[str] | None = None,
 ) -> InvestigationArchetype:
     """Resolve signal bindings and substitute metrics if needed.
 
@@ -781,14 +818,17 @@ def _resolve_archetype_signals(
         store = resolve_signal_store(signal_store, get_signal_store)
         if store is None:
             return archetype
+        resolved_refs: set[str] = set()
         substitutions = store.resolve_signals_for_archetype(
             signal_bindings=archetype.signal_bindings,
             catalog=catalog,
             context_service=intent.services[0] if intent.services else "",
             context_datasource_type=_datasource_type_for_language(target_language),
             context_archetype=archetype.id,
+            context_environment=intent.environments[0] if intent.environments else "",
             target_query_language=target_language,
             tenant_id=tenant_id,
+            applied_governance_refs=resolved_refs,
         )
         legacy_substitutions = _resolve_legacy_required_metrics(
             archetype,
@@ -797,6 +837,7 @@ def _resolve_archetype_signals(
             intent,
             target_language,
             tenant_id,
+            resolved_refs,
         )
         for default_metric, resolved_metric in legacy_substitutions.items():
             substitutions.setdefault(default_metric, resolved_metric)
@@ -806,7 +847,10 @@ def _resolve_archetype_signals(
                 archetype=archetype.id,
                 substitutions=substitutions,
             )
-            return _apply_metric_substitutions(archetype, substitutions)
+            resolved_archetype = _apply_metric_substitutions(archetype, substitutions)
+            if applied_knowledge_refs is not None:
+                applied_knowledge_refs.update(resolved_refs)
+            return resolved_archetype
     except Exception:
         logger.warning("signal_resolution_failed", archetype=archetype.id, exc_info=True)
 
@@ -820,6 +864,7 @@ def compile_archetype(
     target_language: str = "promql",
     signal_store: Any | None = None,
     tenant_id: str = "default",
+    applied_knowledge_refs: set[str] | None = None,
 ) -> DashboardSpec:
     """Compile an archetype template into a concrete DashboardSpec.
 
@@ -840,6 +885,7 @@ def compile_archetype(
         target_language,
         signal_store,
         tenant_id,
+        applied_knowledge_refs,
     )
 
     rate_interval = _resolve_rate_interval(intent)
@@ -1143,6 +1189,7 @@ def blend_archetypes(
     target_language: str = "promql",
     signal_store: Any | None = None,
     tenant_id: str = "default",
+    applied_knowledge_refs: set[str] | None = None,
 ) -> DashboardSpec:
     """Blend panels from multiple archetypes into a single dashboard.
 
@@ -1181,6 +1228,7 @@ def blend_archetypes(
     max_panels = settings.max_dashboard_panels
 
     primary_arch, primary_conf = ranked_archetypes[0]
+    primary_refs: set[str] = set()
     primary_spec = compile_archetype(
         primary_arch,
         intent,
@@ -1188,7 +1236,10 @@ def blend_archetypes(
         target_language=target_language,
         signal_store=signal_store,
         tenant_id=tenant_id,
+        applied_knowledge_refs=primary_refs,
     )
+    if applied_knowledge_refs is not None:
+        applied_knowledge_refs.update(primary_refs)
 
     # De-dup on the panel's *query signature* (the set of normalized query
     # expressions), not just its title — so the same panel arriving from two
@@ -1206,6 +1257,7 @@ def blend_archetypes(
         if len(blended_panels) >= max_panels:
             break
 
+        secondary_refs: set[str] = set()
         secondary_spec = compile_archetype(
             arch,
             intent,
@@ -1213,6 +1265,7 @@ def blend_archetypes(
             target_language=target_language,
             signal_store=signal_store,
             tenant_id=tenant_id,
+            applied_knowledge_refs=secondary_refs,
         )
         added = 0
         for panel in secondary_spec.panels:
@@ -1227,6 +1280,8 @@ def blend_archetypes(
                 added += 1
 
         if added > 0:
+            if applied_knowledge_refs is not None:
+                applied_knowledge_refs.update(secondary_refs)
             blended_tags.extend(arch.tags)
             logger.info(
                 "archetype_blended",

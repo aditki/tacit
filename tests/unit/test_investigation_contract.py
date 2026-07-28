@@ -571,6 +571,39 @@ def test_counterfactual_replay_resorts_candidates_after_score_changes(tmp_path):
     assert replayed.grounding.maximum_trustworthy_conclusion["text"].startswith("cache:shared-cache")
 
 
+def test_counterfactual_candidate_removal_downgrades_matching_knowledge_usage(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    usage = KnowledgeUsage(
+        tenant_id="",
+        knowledge_ref="knowledge_checkout_dependency",
+        knowledge_revision=1,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        used_for=["candidate_generation", "ranking"],
+        target_ref="entity:service:checkout",
+        score_delta=0.08,
+        reason_codes=["ranking_changed"],
+    )
+    draft = _draft_contract(investigation_id).model_copy(update={"knowledge_usage": [usage]})
+    snapshot = _snapshot_for(draft).model_copy(update={"knowledge_usage": [usage]})
+    store.persist_contract_revision(draft, snapshot=snapshot)
+
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.COUNTERFACTUAL,
+        changes=CounterfactualChanges(remove_candidate_refs=["service:checkout"]),
+    )
+
+    assert replayed is not None
+    assert replayed.candidate_rankings == []
+    assert len(replayed.knowledge_usage) == 1
+    usage = replayed.knowledge_usage[0]
+    assert usage.disposition == KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED
+    assert usage.used_for == []
+    assert usage.score_delta == 0
+    assert "counterfactual_candidate_removed" in usage.reason_codes
+
+
 def test_counterfactual_observation_removal_records_an_explicit_gap(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")

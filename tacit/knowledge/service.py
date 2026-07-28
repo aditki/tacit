@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import structlog
+
 from tacit.knowledge.corroboration import ConflictDetectionService, CorroborationService
 from tacit.knowledge.entities import EntityResolutionService
 from tacit.knowledge.enums import (
@@ -53,8 +55,10 @@ from tacit.knowledge.models import (
 )
 from tacit.knowledge.normalization import (
     PropositionNormalizer,
+    candidate_ref_from_entity_ref,
     canonical_scope_payload,
     normalize_entity,
+    normalize_entity_id,
     normalize_service_ref,
     stable_fingerprint,
 )
@@ -72,6 +76,7 @@ PROMPT_INJECTION_RE = re.compile(
     r"mark (?:this|me) trusted|promote (?:this|me)|override (?:policy|ranking)|reveal secrets?)\b",
     re.I,
 )
+logger = structlog.get_logger()
 
 
 def _id(prefix: str, value: Any) -> str:
@@ -104,6 +109,12 @@ class KnowledgeService:
         self.policies = default_policies()
 
     def register_entity(self, entity: Entity) -> Entity:
+        existing = self.repository.get_entity(normalize_entity(entity.id), entity.tenant_id)
+        if existing is not None and existing.kind != entity.kind:
+            raise ValueError("entity kind cannot change for an existing entity id")
+        canonical_id = normalize_entity_id(entity.id, entity.kind)
+        if canonical_id != entity.id:
+            entity = entity.model_copy(update={"id": canonical_id})
         if entity.scope.tenant_id != entity.tenant_id:
             entity = entity.model_copy(
                 update={"scope": entity.scope.model_copy(update={"tenant_id": entity.tenant_id})}
@@ -525,6 +536,47 @@ class KnowledgeService:
             }
         ]
         return self._save_snapshot(tenant_id, selected)
+
+    def apply_compilation_usage(
+        self,
+        usage: list[KnowledgeUsage],
+        applied_knowledge_refs: set[str] | frozenset[str],
+    ) -> list[KnowledgeUsage]:
+        """Mark governed signal mappings whose resolver rows changed compilation."""
+        if not applied_knowledge_refs:
+            return usage
+        reconciled = list(usage)
+        for index, item in enumerate(usage):
+            if item.knowledge_ref not in applied_knowledge_refs:
+                continue
+            if item.disposition != KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED:
+                logger.warning(
+                    "signal_mapping_usage_disposition_mismatch",
+                    tenant_id=item.tenant_id,
+                    knowledge_id=item.knowledge_ref,
+                    knowledge_revision=item.knowledge_revision,
+                    disposition=item.disposition.value,
+                )
+                continue
+            revision = self.repository.get_revision(
+                item.knowledge_ref,
+                item.knowledge_revision,
+                tenant_id=item.tenant_id,
+            )
+            if revision is None or revision.proposition.kind != KnowledgeKind.SIGNAL_MAPPING:
+                continue
+            reason_codes = list(item.reason_codes)
+            if "signal_mapping_selected_for_compilation" not in reason_codes:
+                reason_codes.append("signal_mapping_selected_for_compilation")
+            reconciled[index] = item.model_copy(
+                update={
+                    "disposition": KnowledgeUsageDisposition.APPLIED,
+                    "used_for": ["query_compilation"],
+                    "score_delta": 0.0,
+                    "reason_codes": reason_codes,
+                }
+            )
+        return reconciled
 
     def _save_snapshot(
         self,
@@ -1317,6 +1369,8 @@ class KnowledgeService:
         seen = set()
         affected = []
         for item in usage:
+            if item.disposition != KnowledgeUsageDisposition.APPLIED:
+                continue
             key = (item.investigation_id, item.investigation_revision)
             if key in seen:
                 continue
@@ -1495,12 +1549,7 @@ class KnowledgeService:
 
     @staticmethod
     def _candidate_ref(entity_ref: str) -> str:
-        parts = entity_ref.split(":")
-        if len(parts) >= 3 and parts[0] == "entity":
-            return f"{parts[1]}:{':'.join(parts[2:])}"
-        if len(parts) >= 2:
-            return entity_ref
-        return f"service:{entity_ref}"
+        return candidate_ref_from_entity_ref(entity_ref)
 
     def _disposition(self, revision: KnowledgeRevision, scope: KnowledgeScope):
         state = revision.state

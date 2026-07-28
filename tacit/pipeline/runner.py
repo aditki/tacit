@@ -525,6 +525,10 @@ async def _run_pipeline_inner(
             )
             knowledge_service = resolve_knowledge_service(deps, signal_store=signal_store)
             knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(knowledge_scope)
+            knowledge_usage = knowledge_service.apply_compilation_usage(
+                knowledge_usage,
+                compilation.applied_knowledge_refs if compilation is not None else frozenset(),
+            )
             knowledge_usage = knowledge_service.reconcile_live_observations(
                 knowledge_usage,
                 validation_result.evidence_observations,

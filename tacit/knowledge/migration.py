@@ -14,7 +14,7 @@ from tacit.knowledge.enums import (
     ReviewState,
 )
 from tacit.knowledge.models import KnowledgeCandidate, KnowledgeEvidenceReference, KnowledgeScope, MigrationProvenance
-from tacit.knowledge.normalization import normalize_service_ref, stable_fingerprint
+from tacit.knowledge.normalization import canonical_scope_payload, normalize_service_ref, stable_fingerprint
 from tacit.knowledge.service import KnowledgeService, _source_family
 
 
@@ -161,7 +161,20 @@ def migrate_signal_mapping(
         )
         for index, source_ref in enumerate(source_refs, 1)
     ]
-    candidate_digest = stable_fingerprint({"tenant_id": tenant_id, "record_ref": record_ref}).split(":", 1)[1][:20]
+    scope = KnowledgeScope(
+        tenant_id=tenant_id,
+        service_refs=[normalize_service_ref(str(value)) for value in (row.get("context_services") or [])],
+        environment_refs=[str(value) for value in (row.get("context_environments") or [])],
+        archetype_refs=[str(value) for value in (row.get("context_archetypes") or [])],
+    )
+    candidate_digest = stable_fingerprint(
+        {
+            "tenant_id": tenant_id,
+            "record_ref": record_ref,
+            "scope": canonical_scope_payload(scope),
+            "context_datasource_types": sorted({str(value) for value in (row.get("context_datasource_types") or [])}),
+        }
+    ).split(":", 1)[1][:20]
     candidate_id = f"kc_signal_{candidate_digest}"
     existing = service.repository.get_candidate(candidate_id, tenant_id)
     candidate = service.create_candidate(
@@ -174,12 +187,7 @@ def migrate_signal_mapping(
             "concept_ref": f"signal:{signal}",
             "object_ref": f"concept:{metric}",
         },
-        scope=KnowledgeScope(
-            tenant_id=tenant_id,
-            service_refs=[normalize_service_ref(str(value)) for value in (row.get("context_services") or [])],
-            environment_refs=[str(value) for value in (row.get("context_environments") or [])],
-            archetype_refs=[str(value) for value in (row.get("context_archetypes") or [])],
-        ),
+        scope=scope,
         evidence=evidence,
         provenance_refs=source_refs,
         tenant_id=tenant_id,

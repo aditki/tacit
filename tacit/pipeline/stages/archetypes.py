@@ -49,6 +49,7 @@ class ArchetypeCompilation:
     dashboard_spec: DashboardSpec
     primary_archetype: Any
     primary_confidence: float
+    applied_knowledge_refs: frozenset[str]
 
 
 def select_archetypes(
@@ -158,6 +159,7 @@ def compile_selected_archetypes(
 
     t0 = time.monotonic()
     primary_arch, primary_conf = selection.ranked_archetypes[0]
+    applied_knowledge_refs: set[str] = set()
     if len(selection.ranked_archetypes) > 1:
         dashboard_spec = blend_archetypes(
             selection.ranked_archetypes,
@@ -166,6 +168,7 @@ def compile_selected_archetypes(
             target_language=selection.target_language,
             signal_store=signal_store,
             tenant_id=tenant_id,
+            applied_knowledge_refs=applied_knowledge_refs,
         )
     else:
         dashboard_spec = compile_archetype(
@@ -175,6 +178,7 @@ def compile_selected_archetypes(
             target_language=selection.target_language,
             signal_store=signal_store,
             tenant_id=tenant_id,
+            applied_knowledge_refs=applied_knowledge_refs,
         )
     timings["archetype_compile"] = time.monotonic() - t0
     stage_log(
@@ -197,4 +201,5 @@ def compile_selected_archetypes(
         dashboard_spec=dashboard_spec,
         primary_archetype=primary_arch,
         primary_confidence=primary_conf,
+        applied_knowledge_refs=frozenset(applied_knowledge_refs),
     )

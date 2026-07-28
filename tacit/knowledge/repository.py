@@ -1238,7 +1238,7 @@ class KnowledgeRepository:
             },
             "lifecycle": {
                 state: count(knowledge_rows, "status", state) + count(candidate_rows, "lifecycle_status", state)
-                for state in ("active", "stale", "superseded", "expired")
+                for state in ("active", "stale", "superseded", "expired", "withdrawn")
             },
             "quality": {
                 "corroborated": sum(
