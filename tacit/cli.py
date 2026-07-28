@@ -1409,9 +1409,8 @@ def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool,
         else:
             from tacit.artifact_learning import learn_runbook_dir
 
-            result = learn_runbook_dir(  # type: ignore[arg-type]
-                dir_path, dry_run=dry_run, store=signal_store, tenant_id=tenant_id
-            )
+            assert dir_path is not None
+            result = learn_runbook_dir(dir_path, dry_run=dry_run, store=signal_store, tenant_id=tenant_id)
     except Exception as e:
         _fail(f"Runbook learning failed: {e}")
         return
@@ -1443,9 +1442,8 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
         else:
             from tacit.artifact_learning import learn_incident_dir
 
-            result = learn_incident_dir(  # type: ignore[arg-type]
-                dir_path, dry_run=dry_run, store=signal_store, tenant_id=tenant_id
-            )
+            assert dir_path is not None
+            result = learn_incident_dir(dir_path, dry_run=dry_run, store=signal_store, tenant_id=tenant_id)
     except Exception as e:
         _fail(f"Incident learning failed: {e}")
         return
