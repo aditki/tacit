@@ -70,6 +70,5 @@ def _dimension_refs(prefix: str, values: Iterable[str]) -> list[str]:
         normalized = normalize_entity(value)
         if not normalized:
             continue
-        refs.add(normalized)
         refs.add(normalized if normalized.startswith(f"{prefix}:") else f"{prefix}:{normalized}")
     return sorted(refs)

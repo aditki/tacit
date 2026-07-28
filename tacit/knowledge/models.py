@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from tacit.knowledge.enums import (
     ConflictKind,
@@ -33,6 +34,37 @@ def utc_now() -> datetime:
     return datetime.now(UTC).replace(microsecond=0)
 
 
+SCOPE_REFERENCE_PREFIXES = {
+    "environment_refs": "environment",
+    "region_refs": "region",
+    "cluster_refs": "cluster",
+    "namespace_refs": "namespace",
+    "service_refs": "entity:service",
+    "archetype_refs": "archetype",
+    "version_constraints": "version",
+}
+
+
+def canonical_scope_reference(field_name: str, value: str) -> str:
+    """Normalize one scope dimension to its typed reference form."""
+    normalized = re.sub(r"[^a-z0-9_.:+<>=~-]+", "-", value.strip().casefold()).strip("-")
+    if not normalized:
+        return ""
+    prefix = SCOPE_REFERENCE_PREFIXES[field_name]
+    if field_name == "service_refs":
+        if normalized.startswith("entity:service:"):
+            return normalized
+        if normalized.startswith("service:"):
+            return f"entity:{normalized}"
+    elif normalized.startswith(f"{prefix}:"):
+        return normalized
+    return f"{prefix}:{normalized}"
+
+
+def canonical_scope_references(field_name: str, values: list[str]) -> list[str]:
+    return sorted({ref for value in values if (ref := canonical_scope_reference(field_name, str(value)))})
+
+
 class KnowledgeScope(BaseModel):
     tenant_id: str = "default"
     environment_refs: list[str] = Field(default_factory=list)
@@ -44,6 +76,17 @@ class KnowledgeScope(BaseModel):
     version_constraints: list[str] = Field(default_factory=list)
     valid_from: datetime | None = None
     valid_until: datetime | None = None
+
+    @field_validator(*SCOPE_REFERENCE_PREFIXES, mode="before")
+    @classmethod
+    def normalize_scope_references(cls, value: Any, info: ValidationInfo) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            raise ValueError(f"{info.field_name} must be a list of scope references")
+        if info.field_name is None:
+            raise ValueError("scope reference validator requires a field name")
+        return canonical_scope_references(info.field_name, list(value))
 
     @field_validator("valid_from", "valid_until")
     @classmethod

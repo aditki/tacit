@@ -454,12 +454,20 @@ async def learn_backend_alerts(
                 from tacit.knowledge.service import KnowledgeService
 
                 knowledge_service = KnowledgeService(KnowledgeRepository(store._db_path))
-                for alert in store.list_ingested_alerts(
-                    status="stale",
-                    limit=10_000,
-                    tenant_id=effective_tenant,
-                ):
-                    if alert.get("backend_name") == backend_name:
+                offset = 0
+                page_size = 500
+                reconciled_count = 0
+                page_count = 0
+                while True:
+                    stale_alerts = store.list_ingested_alerts(
+                        status="stale",
+                        limit=page_size,
+                        tenant_id=effective_tenant,
+                        backend_name=backend_name,
+                        offset=offset,
+                    )
+                    page_count += 1
+                    for alert in stale_alerts:
                         knowledge_service.reconcile_source_lifecycle(
                             provenance_ref=(
                                 f"{backend_name}:alert:{alert['alert_uid']}"
@@ -469,6 +477,18 @@ async def learn_backend_alerts(
                             tenant_id=effective_tenant,
                             source_stale=True,
                         )
+                        reconciled_count += 1
+                    if len(stale_alerts) < page_size:
+                        break
+                    offset += len(stale_alerts)
+                logger.info(
+                    "stale_alert_knowledge_reconciled",
+                    tenant_id=effective_tenant,
+                    backend_name=backend_name,
+                    stale_marked=totals["stale_marked"],
+                    records_reconciled=reconciled_count,
+                    pages_scanned=page_count,
+                )
         elif not dry_run:
             totals["stale_reconciliation_skipped"] = True
 

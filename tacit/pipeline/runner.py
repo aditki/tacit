@@ -17,6 +17,7 @@ from tacit.config import settings
 from tacit.context.enrichment import enrich_context
 from tacit.culprit_ranking import rank_culprits
 from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies, resolve_knowledge_service
+from tacit.errors import FatalPipelineError
 from tacit.history import get_investigation_store
 from tacit.investigation_contract import InvestigationRunType
 from tacit.logging import bind_request_id, stage_log, unbind_request_id
@@ -525,10 +526,22 @@ async def _run_pipeline_inner(
             )
             knowledge_service = resolve_knowledge_service(deps, signal_store=signal_store)
             knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(knowledge_scope)
+            surviving_compilation_refs = (
+                compilation.surviving_knowledge_refs(dashboard_spec) if compilation is not None else frozenset()
+            )
             knowledge_usage = knowledge_service.apply_compilation_usage(
                 knowledge_usage,
-                compilation.applied_knowledge_refs if compilation is not None else frozenset(),
+                surviving_compilation_refs,
             )
+            if compilation is not None and compilation.applied_knowledge_refs:
+                logger.info(
+                    "governed_compilation_usage_reconciled",
+                    selected_knowledge_refs=sorted(compilation.applied_knowledge_refs),
+                    surviving_knowledge_refs=sorted(surviving_compilation_refs),
+                    dropped_knowledge_refs=sorted(
+                        compilation.applied_knowledge_refs.difference(surviving_compilation_refs)
+                    ),
+                )
             knowledge_usage = knowledge_service.reconcile_live_observations(
                 knowledge_usage,
                 validation_result.evidence_observations,
@@ -538,8 +551,19 @@ async def _run_pipeline_inner(
                 knowledge_usage,
             )
             knowledge_snapshot = knowledge_service.snapshot_from_usage(tenant_id, knowledge_usage)
-        except Exception:
+        except Exception as exc:
             logger.warning("operational_knowledge_selection_failed", exc_info=True)
+            if compilation is not None and compilation.applied_knowledge_refs:
+                runtime.recorder.stage(
+                    "knowledge_audit",
+                    "failed",
+                    "governed_compilation_audit_failed",
+                    knowledge_refs=sorted(compilation.applied_knowledge_refs),
+                    error_type=type(exc).__name__,
+                )
+                raise FatalPipelineError(
+                    "Governed mappings changed compilation but their usage audit could not be persisted"
+                ) from exc
         ranking_status = "passed" if culprit_ranking.candidates else "skipped"
         ranking_reason = (
             culprit_ranking.abstention_reason

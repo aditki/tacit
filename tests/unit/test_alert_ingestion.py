@@ -336,6 +336,62 @@ async def test_limited_alert_crawl_does_not_mark_unseen_alerts_stale(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_complete_alert_crawl_paginates_all_stale_sources_for_its_backend(tmp_path, monkeypatch):
+    from tacit.signals import SignalStore
+
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.record_ingested_alert(
+        "removed-alert",
+        backend_name="grafana",
+        alert_title="Removed alert",
+        fingerprint="abc",
+        metrics_found=["checkout_request_duration_seconds"],
+    )
+    offsets: list[int] = []
+    reconciled: list[str] = []
+
+    def list_stale_alerts(*, status, limit, tenant_id, backend_name, offset):
+        assert status == "stale"
+        assert limit == 500
+        assert tenant_id == "default"
+        assert backend_name == "grafana"
+        offsets.append(offset)
+        if offset == 0:
+            return [{"alert_uid": f"stale-{index}"} for index in range(500)]
+        if offset == 500:
+            return [{"alert_uid": "stale-final"}]
+        return []
+
+    def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale):
+        assert tenant_id == "default"
+        assert source_stale is True
+        reconciled.append(provenance_ref)
+
+    monkeypatch.setattr(store, "list_ingested_alerts", list_stale_alerts)
+    monkeypatch.setattr("tacit.knowledge.service.KnowledgeService.reconcile_source_lifecycle", reconcile_source)
+
+    class CompleteBackend:
+        name = "grafana"
+        last_alert_list_complete = True
+
+        async def list_alerts(self, limit=500):
+            return []
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("tacit.backends.get_active_backends", lambda *_args, **_kwargs: [CompleteBackend()])
+
+    result = await learn_backend_alerts("grafana", store=store)
+
+    assert result["stale_marked"] == 1
+    assert offsets == [0, 500]
+    assert len(reconciled) == 501
+    assert reconciled[0] == "grafana:alert:stale-0"
+    assert reconciled[-1] == "grafana:alert:stale-final"
+
+
+@pytest.mark.asyncio
 async def test_signalfx_detector_crawl_marks_short_page_complete():
     class FakeSignalFxClient:
         realm = "us1"

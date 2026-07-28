@@ -42,3 +42,26 @@ def test_generated_archetype_shadow_decisions_are_linked():
     assert "Option 2: Compile Discoveries Into Operational Knowledge" in roadmap
     assert "Option 3: Retire The Runtime Abstraction" in roadmap
     assert "no runtime promotion code is merged before that decision" in roadmap
+
+
+def test_documented_operational_learning_benchmark_command_and_alias(monkeypatch):
+    calls = 0
+
+    def fake_benchmark():
+        nonlocal calls
+        calls += 1
+        return {"passed": True, "case_count": 1}
+
+    monkeypatch.setattr(
+        "tacit.operational_learning_benchmark.run_operational_learning_benchmark",
+        fake_benchmark,
+    )
+    runner = CliRunner()
+
+    documented = runner.invoke(cli, ["operational-learning-benchmark"])
+    alias = runner.invoke(cli, ["benchmark-learning"])
+
+    assert documented.exit_code == 0, documented.output
+    assert alias.exit_code == 0, alias.output
+    assert '"passed": true' in documented.output
+    assert calls == 2

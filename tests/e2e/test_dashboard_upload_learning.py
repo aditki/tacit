@@ -9,6 +9,7 @@ import tacit.archetypes.templates as templates
 import tacit.pipeline as pipeline_mod
 from tacit.agents.providers import registry as provider_registry
 from tacit.agents.providers.base import TokenUsage
+from tacit.errors import FatalPipelineError
 from tacit.main import app
 from tacit.models.schemas import ArchetypeMatch, DashRequest, Intent, MetricEntry, SignalType
 from tests.e2e.framework import (
@@ -23,10 +24,91 @@ from tests.e2e.framework import (
 )
 
 SCENARIO_PATH = Path(__file__).parent / "scenarios" / "checkout_upload_incident.yaml"
+TAUGHT_LATENCY_ARCHETYPE = """
+archetypes:
+  - id: taught_latency
+    name: Taught Latency
+    description: Uses manually taught latency mappings
+    problem_types: [latency_investigation]
+    required_metrics:
+      - http_request_duration_seconds
+    required_signals:
+      - request_latency
+    signal_bindings:
+      request_latency: http_request_duration_seconds
+    tags: [manual-teach, latency]
+    default_timerange: 1h
+    panels:
+      - title: Taught p95 latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: >
+              histogram_quantile(
+                0.95,
+                sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le)
+              )
+            legend_format: p95
+"""
 
 
 async def _no_context(_intent):
     return []
+
+
+def _install_taught_latency_archetype(archetypes_path: Path) -> None:
+    archetypes_path.write_text(TAUGHT_LATENCY_ARCHETYPE, encoding="utf-8")
+    templates.reload_archetypes()
+
+
+def _teach_taught_latency_mapping() -> None:
+    teach = TestClient(app).post(
+        "/api/v1/signals/teach",
+        json={
+            "signal_type": "request_latency",
+            "metric_patterns": [{"pattern": "acme_checkout_latency_seconds", "confidence": 0.94}],
+            "category": "latency",
+            "datasource_types": ["prometheus"],
+            "taught_by": "e2e",
+        },
+    )
+    assert teach.status_code == 200, teach.text
+    assert teach.json()["mappings_created"] == 1
+
+
+def _configure_taught_latency_pipeline(monkeypatch) -> CapturingBackend:
+    backend = CapturingBackend(
+        catalog=[
+            MetricEntry(
+                name="acme_checkout_latency_seconds_bucket",
+                datasource_uid="prom-e2e",
+                datasource_name="Prometheus E2E",
+                datasource_type="prometheus",
+                query_language="promql",
+                dimensions=['service="checkout-api"', "le={0.1,0.5,1,5}"],
+            )
+        ]
+    )
+    monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
+    monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
+
+    async def fake_classify_intent(prompt: str):
+        return (
+            Intent(
+                summary=prompt,
+                domain="application",
+                services=["checkout-api"],
+                signals=[SignalType.METRICS],
+                keywords=["checkout", "latency", "p95"],
+                timerange="1h",
+                problem_type="latency_investigation",
+                archetypes=[ArchetypeMatch(type="latency_investigation", confidence=0.97)],
+            ),
+            TokenUsage(),
+        )
+
+    monkeypatch.setattr(pipeline_mod, "classify_intent", fake_classify_intent)
+    return backend
 
 
 @pytest.mark.e2e
@@ -157,82 +239,9 @@ async def test_manual_teach_signal_mapping_is_used_before_dashboard_creation(
     monkeypatch,
 ):
     _signal_store, history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
-    archetypes_path.write_text(
-        """
-archetypes:
-  - id: taught_latency
-    name: Taught Latency
-    description: Uses manually taught latency mappings
-    problem_types: [latency_investigation]
-    required_metrics:
-      - http_request_duration_seconds
-    required_signals:
-      - request_latency
-    signal_bindings:
-      request_latency: http_request_duration_seconds
-    tags: [manual-teach, latency]
-    default_timerange: 1h
-    panels:
-      - title: Taught p95 latency
-        row: Latency
-        unit: s
-        queries:
-          - expr: >
-              histogram_quantile(
-                0.95,
-                sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le)
-              )
-            legend_format: p95
-""",
-        encoding="utf-8",
-    )
-    templates.reload_archetypes()
-
-    client = TestClient(app)
-    teach = client.post(
-        "/api/v1/signals/teach",
-        json={
-            "signal_type": "request_latency",
-            "metric_patterns": [{"pattern": "acme_checkout_latency_seconds", "confidence": 0.94}],
-            "category": "latency",
-            "datasource_types": ["prometheus"],
-            "taught_by": "e2e",
-        },
-    )
-    assert teach.status_code == 200, teach.text
-    assert teach.json()["mappings_created"] == 1
-
-    backend = CapturingBackend(
-        catalog=[
-            MetricEntry(
-                name="acme_checkout_latency_seconds_bucket",
-                datasource_uid="prom-e2e",
-                datasource_name="Prometheus E2E",
-                datasource_type="prometheus",
-                query_language="promql",
-                dimensions=['service="checkout-api"', "le={0.1,0.5,1,5}"],
-            )
-        ]
-    )
-    monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
-    monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
-
-    async def fake_classify_intent(prompt: str):
-        return (
-            Intent(
-                summary=prompt,
-                domain="application",
-                services=["checkout-api"],
-                signals=[SignalType.METRICS],
-                keywords=["checkout", "latency", "p95"],
-                timerange="1h",
-                problem_type="latency_investigation",
-                archetypes=[ArchetypeMatch(type="latency_investigation", confidence=0.97)],
-            ),
-            TokenUsage(),
-        )
-
-    monkeypatch.setattr(pipeline_mod, "classify_intent", fake_classify_intent)
+    _install_taught_latency_archetype(archetypes_path)
+    _teach_taught_latency_mapping()
+    backend = _configure_taught_latency_pipeline(monkeypatch)
 
     response = await pipeline_mod.run_pipeline(
         DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="manual-teach")
@@ -252,6 +261,32 @@ archetypes:
     ]
     assert len(compilation_usage) == 1
     assert compilation_usage[0].score_delta == 0
+
+
+@pytest.mark.e2e
+async def test_governed_compilation_fails_closed_when_usage_audit_is_unavailable(
+    isolated_learning_runtime,
+    monkeypatch,
+):
+    _signal_store, history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
+    _install_taught_latency_archetype(archetypes_path)
+    _teach_taught_latency_mapping()
+    backend = _configure_taught_latency_pipeline(monkeypatch)
+
+    def fail_snapshot(_self, _scope):
+        raise OSError("knowledge audit database unavailable")
+
+    monkeypatch.setattr("tacit.knowledge.service.KnowledgeService.create_snapshot", fail_snapshot)
+
+    with pytest.raises(FatalPipelineError, match="Governed mappings changed compilation"):
+        await pipeline_mod.run_pipeline(
+            DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="audit-failure")
+        )
+
+    assert backend.published_specs == []
+    investigation = history_store.list_recent(limit=1)[0]
+    assert investigation["status"] == "failed"
+    assert "Governed mappings changed compilation" in investigation["error"]
 
 
 @pytest.mark.e2e

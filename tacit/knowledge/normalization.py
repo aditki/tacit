@@ -7,7 +7,12 @@ import json
 import re
 
 from tacit.knowledge.enums import EntityKind, KnowledgeKind, Predicate
-from tacit.knowledge.models import KnowledgeProposition, KnowledgeScope
+from tacit.knowledge.models import (
+    SCOPE_REFERENCE_PREFIXES,
+    KnowledgeProposition,
+    KnowledgeScope,
+    canonical_scope_references,
+)
 
 PREDICATE_ALIASES = {
     "depends on": Predicate.DEPENDS_ON,
@@ -92,21 +97,13 @@ def candidate_ref_from_entity_ref(entity_ref: str) -> str:
     return f"service:{entity_ref}"
 
 
-SCOPE_LIST_FIELDS = (
-    "environment_refs",
-    "region_refs",
-    "cluster_refs",
-    "namespace_refs",
-    "service_refs",
-    "archetype_refs",
-    "version_constraints",
-)
+SCOPE_LIST_FIELDS = tuple(SCOPE_REFERENCE_PREFIXES)
 
 
 def canonical_scope_payload(scope: KnowledgeScope) -> dict:
     payload = scope.model_dump(mode="json", exclude={"valid_from", "valid_until"})
     for field_name in SCOPE_LIST_FIELDS:
-        payload[field_name] = sorted(set(payload.get(field_name) or []))
+        payload[field_name] = canonical_scope_references(field_name, payload.get(field_name) or [])
     return payload
 
 

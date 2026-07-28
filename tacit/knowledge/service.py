@@ -167,7 +167,7 @@ class KnowledgeService:
         reactivate_stale: bool = False,
     ) -> KnowledgeCandidate:
         knowledge_kind = KnowledgeKind(kind)
-        scope = scope or KnowledgeScope(tenant_id=tenant_id)
+        scope = KnowledgeScope.model_validate((scope or KnowledgeScope(tenant_id=tenant_id)).model_dump(mode="python"))
         if scope.tenant_id != tenant_id:
             raise ValueError("candidate scope cannot cross tenants")
         raw = proposition if isinstance(proposition, dict) else proposition.model_dump(mode="python")
@@ -449,6 +449,7 @@ class KnowledgeService:
             self.repository.get_revision(existing.id, tenant_id=tenant_id) if existing is not None else None
         )
         if current_revision is not None and current_revision.semantic_fingerprint == semantic:
+            self._sync_signal_mapping_state(current_revision)
             return decision, current_revision
         revision = KnowledgeRevision(
             knowledge_id=knowledge_id,
@@ -576,6 +577,21 @@ class KnowledgeService:
                     "reason_codes": reason_codes,
                 }
             )
+        audited_refs = {
+            item.knowledge_ref
+            for item in reconciled
+            if item.disposition == KnowledgeUsageDisposition.APPLIED and "query_compilation" in item.used_for
+        }
+        missing_refs = set(applied_knowledge_refs).difference(audited_refs)
+        if missing_refs:
+            logger.error(
+                "governed_compilation_usage_missing",
+                knowledge_refs=sorted(missing_refs),
+            )
+            raise RuntimeError(
+                "Governed compilation references were not present in the selected knowledge snapshot: "
+                + ", ".join(sorted(missing_refs))
+            )
         return reconciled
 
     def _save_snapshot(
@@ -599,7 +615,6 @@ class KnowledgeService:
 
         candidates = list(ranking.candidates)
         original_candidate_count = len(candidates)
-        added_ranked_candidate = False
         updated_usage = list(usage)
         applicable: list[tuple[int, KnowledgeUsage, KnowledgeRevision]] = []
         selectable = {
@@ -697,7 +712,6 @@ class KnowledgeService:
                 )
                 candidates.append(added)
                 by_ref[candidate_ref] = added
-                added_ranked_candidate = True
                 used_for = ["candidate_generation", "ranking"]
                 applied_delta = requested_delta
             reason_codes = list(item.reason_codes)
@@ -714,9 +728,7 @@ class KnowledgeService:
         candidates.sort(key=lambda candidate: (-candidate.score, candidate.suspect_type, candidate.suspect))
         candidates = [candidate.model_copy(update={"rank": index}) for index, candidate in enumerate(candidates, 1)]
         update: dict[str, Any] = {"candidates": candidates}
-        if added_ranked_candidate and candidates and ranking.abstained:
-            update.update({"abstained": False, "abstention_reason": ""})
-        elif excluded_ranked_candidate and not candidates and not ranking.abstained:
+        if excluded_ranked_candidate and not candidates and not ranking.abstained:
             update.update(
                 {
                     "abstained": True,

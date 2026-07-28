@@ -443,7 +443,8 @@ def test_chart_route_uses_configured_tenant_when_request_omits_it(monkeypatch):
         "/api/v1/chart",
         json={"prompt": "Investigate checkout latency", "tenant_id": "tenant-b"},
     )
-    assert override_response.status_code == 200
+    assert override_response.status_code == 403
+    assert override_response.json()["detail"] == "Tenant access denied"
     assert captured["request"].tenant_id == "tenant-a"
 
 

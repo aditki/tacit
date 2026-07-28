@@ -308,6 +308,34 @@ def test_rejected_signal_candidates_are_tenant_scoped(signal_store):
     ]
 
 
+def test_ingested_source_lists_filter_by_backend_before_pagination(signal_store):
+    for uid, backend in (
+        ("grafana-old", "grafana"),
+        ("signalfx-new", "signalfx"),
+        ("grafana-new", "grafana"),
+    ):
+        signal_store.record_ingested_dashboard(uid, backend_name=backend, status="stale")
+        signal_store.record_ingested_alert(uid, backend_name=backend, status="stale")
+
+    dashboard_page = signal_store.list_ingested_dashboards(
+        status="stale",
+        limit=1,
+        tenant_id="default",
+        backend_name="grafana",
+        offset=1,
+    )
+    alert_page = signal_store.list_ingested_alerts(
+        status="stale",
+        limit=1,
+        tenant_id="default",
+        backend_name="grafana",
+        offset=1,
+    )
+
+    assert [row["dashboard_uid"] for row in dashboard_page] == ["grafana-old"]
+    assert [row["alert_uid"] for row in alert_page] == ["grafana-old"]
+
+
 def test_mapping_tenant_rebuild_rolls_back_on_copy_failure(tmp_path):
     db_path = tmp_path / "failed-mapping-migration.db"
     with sqlite3.connect(db_path) as conn:
@@ -378,6 +406,18 @@ def test_signal_mapping_activates_after_governed_corroboration(signal_store):
     assert second_persisted is True
     assert signal_store.resolve_signal("checkout_latency", catalog, tenant_id="tenant-a")
     assert signal_store.resolve_signal("checkout_latency", catalog, tenant_id="tenant-b") == []
+    with signal_store._conn() as conn:
+        rows = conn.execute(
+            """SELECT governance_ref, review_state
+                 FROM signal_metric_mappings
+                WHERE tenant_id = ? AND signal_type = ? AND metric_pattern = ?
+                ORDER BY governance_ref""",
+            ("tenant-a", "checkout_latency", "checkout_latency_seconds"),
+        ).fetchall()
+    ungoverned = next(row for row in rows if not row["governance_ref"])
+    governed = next(row for row in rows if row["governance_ref"])
+    assert ungoverned["review_state"] == "candidate"
+    assert governed["review_state"] == "approved"
 
 
 def test_governed_mapping_scopes_and_lifecycles_are_independent(signal_store):
@@ -2485,6 +2525,67 @@ class TestIngestedDashboards:
         assert dashboard is not None and dashboard["stale"] is True
         assert dashboard["status"] == "stale"
         assert signal_store.get_mappings_for_signal("request_latency", include_decayed=True) == []
+
+    @pytest.mark.asyncio
+    async def test_complete_dashboard_crawl_paginates_all_stale_sources_for_its_backend(
+        self,
+        signal_store,
+        monkeypatch,
+    ):
+        import tacit.backends as backends_mod
+        from tacit import dashboard_ingest as di
+
+        signal_store.record_ingested_dashboard(
+            "removed-dashboard",
+            backend_name="grafana",
+            dashboard_title="Removed dashboard",
+            status="approved",
+        )
+        offsets: list[int] = []
+        reconciled: list[str] = []
+
+        def list_stale_dashboards(*, status, limit, tenant_id, backend_name, offset):
+            assert status == "stale"
+            assert limit == 500
+            assert tenant_id == "default"
+            assert backend_name == "grafana"
+            offsets.append(offset)
+            if offset == 0:
+                return [{"dashboard_uid": f"stale-{index}"} for index in range(500)]
+            if offset == 500:
+                return [{"dashboard_uid": "stale-final"}]
+            return []
+
+        def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale):
+            assert tenant_id == "default"
+            assert source_stale is True
+            reconciled.append(provenance_ref)
+
+        monkeypatch.setattr(signal_store, "list_ingested_dashboards", list_stale_dashboards)
+        monkeypatch.setattr(
+            "tacit.knowledge.service.KnowledgeService.reconcile_source_lifecycle",
+            reconcile_source,
+        )
+
+        class CompleteBackend:
+            name = "grafana"
+            last_dashboard_list_complete = True
+
+            async def list_dashboards(self, limit=500):
+                return []
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr(backends_mod, "get_active_backends", lambda: [CompleteBackend()])
+
+        result = await di.learn_backend_dashboards("grafana", store=signal_store)
+
+        assert result["stale_marked"] == 1
+        assert offsets == [0, 500]
+        assert len(reconciled) == 501
+        assert reconciled[0] == "grafana:stale-0"
+        assert reconciled[-1] == "grafana:stale-final"
 
     def test_dashboard_uid_is_scoped_by_backend(self, signal_store):
         signal_store.record_ingested_dashboard(

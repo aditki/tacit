@@ -231,16 +231,18 @@ def persist_inferred_signal_review(
         )
         if governed_candidate_ids is not None:
             governed_candidate_ids.add(governed_candidate_id)
-        if _governed_signal_mapping_is_active(
+        governed_knowledge_ref = _active_governed_signal_mapping_ref(
             store=store,
             candidate_id=governed_candidate_id,
             tenant_id=effective_tenant,
-        ):
+        )
+        if governed_knowledge_ref:
             store.set_mapping_review_state(
                 signal_type,
                 metric,
                 "approved" if is_heuristic else "trusted",
                 tenant_id=effective_tenant,
+                governance_ref=governed_knowledge_ref,
             )
             return True
         return False
@@ -294,26 +296,28 @@ def _govern_signal_mapping(
     )
 
 
-def _governed_signal_mapping_is_active(
+def _active_governed_signal_mapping_ref(
     *,
     store: Any,
     candidate_id: str,
     tenant_id: str,
-) -> bool:
+) -> str:
     from tacit.knowledge.enums import KnowledgeEligibility, LifecycleStatus
     from tacit.knowledge.repository import KnowledgeRepository
 
     repository = KnowledgeRepository(store._db_path)
     candidate = repository.get_candidate(candidate_id, tenant_id)
     if candidate is None:
-        return False
+        return ""
     item = repository.find_knowledge_by_proposition(tenant_id, candidate.proposition.proposition_key)
     revision = repository.get_revision(item.id, tenant_id=tenant_id) if item is not None else None
-    return bool(
+    if (
         revision is not None
         and revision.state.lifecycle_status == LifecycleStatus.ACTIVE
         and revision.state.eligibility != KnowledgeEligibility.INELIGIBLE
-    )
+    ):
+        return revision.knowledge_id
+    return ""
 
 
 def reconcile_signal_source(
@@ -957,22 +961,41 @@ async def learn_backend_dashboards(
                 from tacit.knowledge.service import KnowledgeService
 
                 knowledge_service = KnowledgeService(KnowledgeRepository(store._db_path))
-                for dashboard in store.list_ingested_dashboards(
-                    status="stale",
-                    limit=10_000,
-                    tenant_id=effective_tenant,
-                ):
-                    if dashboard.get("backend_name") != backend_name:
-                        continue
-                    knowledge_service.reconcile_source_lifecycle(
-                        provenance_ref=(
-                            f"{backend_name}:{dashboard['dashboard_uid']}"
-                            if backend_name
-                            else str(dashboard["dashboard_uid"])
-                        ),
+                offset = 0
+                page_size = 500
+                reconciled_count = 0
+                page_count = 0
+                while True:
+                    stale_dashboards = store.list_ingested_dashboards(
+                        status="stale",
+                        limit=page_size,
                         tenant_id=effective_tenant,
-                        source_stale=True,
+                        backend_name=backend_name,
+                        offset=offset,
                     )
+                    page_count += 1
+                    for dashboard in stale_dashboards:
+                        knowledge_service.reconcile_source_lifecycle(
+                            provenance_ref=(
+                                f"{backend_name}:{dashboard['dashboard_uid']}"
+                                if backend_name
+                                else str(dashboard["dashboard_uid"])
+                            ),
+                            tenant_id=effective_tenant,
+                            source_stale=True,
+                        )
+                        reconciled_count += 1
+                    if len(stale_dashboards) < page_size:
+                        break
+                    offset += len(stale_dashboards)
+                logger.info(
+                    "stale_dashboard_knowledge_reconciled",
+                    tenant_id=effective_tenant,
+                    backend_name=backend_name,
+                    stale_marked=totals["stale_marked"],
+                    records_reconciled=reconciled_count,
+                    pages_scanned=page_count,
+                )
         else:
             totals["stale_reconciliation_skipped"] = True
 

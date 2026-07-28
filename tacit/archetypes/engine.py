@@ -8,6 +8,7 @@ target backend. No LLM needed for query generation.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -32,6 +33,68 @@ _PROMETHEUS_HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
 # Characters that are special in RE2 (used by PromQL) and need escaping.
 # Note: dash `-` is NOT special in RE2 outside character classes.
 _RE2_SPECIAL = frozenset(r"\.+*?()[]{}|^$")
+
+
+@dataclass(frozen=True)
+class KnowledgeQueryUse:
+    """One governed mapping's contribution to a compiled query."""
+
+    knowledge_ref: str
+    source_archetype: str
+    panel_title: str
+    query_expr: str
+    datasource_uid: str
+    datasource_type: str
+    query_language: str
+
+    @classmethod
+    def from_query(cls, knowledge_ref: str, panel: PanelSpec, query: PanelQuery) -> KnowledgeQueryUse:
+        return cls(
+            knowledge_ref=knowledge_ref,
+            source_archetype=panel.source_archetype,
+            panel_title=panel.title,
+            query_expr=query.expr,
+            datasource_uid=query.datasource_uid,
+            datasource_type=query.datasource_type,
+            query_language=query.query_language,
+        )
+
+    def query_identity(self) -> tuple[str, str, str, str, str, str]:
+        return (
+            self.source_archetype,
+            self.panel_title,
+            self.query_expr,
+            self.datasource_uid,
+            self.datasource_type,
+            self.query_language,
+        )
+
+
+def dashboard_query_identities(dashboard_spec: DashboardSpec) -> set[tuple[str, str, str, str, str, str]]:
+    return {
+        (
+            panel.source_archetype,
+            panel.title,
+            query.expr,
+            query.datasource_uid,
+            query.datasource_type,
+            query.query_language,
+        )
+        for panel in dashboard_spec.panels
+        for query in panel.queries
+    }
+
+
+def _query_references_metric(query_expr: str, metric: str) -> bool:
+    """Match one exact metric token across supported query syntaxes."""
+    token_character = r"a-zA-Z0-9_:./-"
+    return (
+        re.search(
+            rf"(?<![{token_character}]){re.escape(metric)}(?![{token_character}])",
+            query_expr,
+        )
+        is not None
+    )
 
 
 def _re2_escape(s: str) -> str:
@@ -723,7 +786,7 @@ def _resolve_legacy_required_metrics(
     intent: Intent,
     target_language: str,
     tenant_id: str = "default",
-    applied_knowledge_refs: set[str] | None = None,
+    governance_refs_by_default_metric: dict[str, set[str]] | None = None,
 ) -> dict[str, str]:
     """Resolve legacy required_metrics through the semantic taxonomy."""
     target_datasource_type = _datasource_type_for_language(target_language)
@@ -772,15 +835,16 @@ def _resolve_legacy_required_metrics(
             continue
         candidate, confidence = selected
         substitutions[default_metric] = candidate.name
-        if applied_knowledge_refs is not None:
+        if governance_refs_by_default_metric is not None:
+            refs = governance_refs_by_default_metric.setdefault(default_metric, set())
             if inferred_by:
-                applied_knowledge_refs.add(inferred_by)
+                refs.add(inferred_by)
             selected_match = next(
                 (match for match in resolved_details if match.entry == candidate and match.confidence == confidence),
                 None,
             )
             if selected_match is not None and selected_match.governance_ref:
-                applied_knowledge_refs.add(selected_match.governance_ref)
+                refs.add(selected_match.governance_ref)
         logger.info(
             "legacy_metric_signal_resolved",
             archetype=archetype.id,
@@ -799,7 +863,7 @@ def _resolve_archetype_signals(
     target_language: str = "promql",
     signal_store: Any | None = None,
     tenant_id: str = "default",
-    applied_knowledge_refs: set[str] | None = None,
+    governance_refs_by_resolved_metric: dict[str, set[str]] | None = None,
 ) -> InvestigationArchetype:
     """Resolve signal bindings and substitute metrics if needed.
 
@@ -818,7 +882,7 @@ def _resolve_archetype_signals(
         store = resolve_signal_store(signal_store, get_signal_store)
         if store is None:
             return archetype
-        resolved_refs: set[str] = set()
+        refs_by_default_metric: dict[str, set[str]] = {}
         substitutions = store.resolve_signals_for_archetype(
             signal_bindings=archetype.signal_bindings,
             catalog=catalog,
@@ -828,7 +892,7 @@ def _resolve_archetype_signals(
             context_environment=intent.environments[0] if intent.environments else "",
             target_query_language=target_language,
             tenant_id=tenant_id,
-            applied_governance_refs=resolved_refs,
+            governance_refs_by_default_metric=refs_by_default_metric,
         )
         legacy_substitutions = _resolve_legacy_required_metrics(
             archetype,
@@ -837,7 +901,7 @@ def _resolve_archetype_signals(
             intent,
             target_language,
             tenant_id,
-            resolved_refs,
+            refs_by_default_metric,
         )
         for default_metric, resolved_metric in legacy_substitutions.items():
             substitutions.setdefault(default_metric, resolved_metric)
@@ -848,8 +912,11 @@ def _resolve_archetype_signals(
                 substitutions=substitutions,
             )
             resolved_archetype = _apply_metric_substitutions(archetype, substitutions)
-            if applied_knowledge_refs is not None:
-                applied_knowledge_refs.update(resolved_refs)
+            if governance_refs_by_resolved_metric is not None:
+                for default_metric, resolved_metric in substitutions.items():
+                    refs = refs_by_default_metric.get(default_metric, set())
+                    if refs:
+                        governance_refs_by_resolved_metric.setdefault(resolved_metric, set()).update(refs)
             return resolved_archetype
     except Exception:
         logger.warning("signal_resolution_failed", archetype=archetype.id, exc_info=True)
@@ -864,7 +931,7 @@ def compile_archetype(
     target_language: str = "promql",
     signal_store: Any | None = None,
     tenant_id: str = "default",
-    applied_knowledge_refs: set[str] | None = None,
+    knowledge_query_uses: list[KnowledgeQueryUse] | None = None,
 ) -> DashboardSpec:
     """Compile an archetype template into a concrete DashboardSpec.
 
@@ -878,6 +945,7 @@ def compile_archetype(
     target_language: 'promql' (default) or 'signalflow'
     """
     # Resolve signals → actual metrics before compiling templates
+    governance_refs_by_resolved_metric: dict[str, set[str]] = {}
     archetype = _resolve_archetype_signals(
         archetype,
         catalog,
@@ -885,7 +953,7 @@ def compile_archetype(
         target_language,
         signal_store,
         tenant_id,
-        applied_knowledge_refs,
+        governance_refs_by_resolved_metric,
     )
 
     rate_interval = _resolve_rate_interval(intent)
@@ -996,6 +1064,18 @@ def compile_archetype(
         timerange=intent.timerange or archetype.default_timerange,
         panels=panels,
     )
+    if knowledge_query_uses is not None:
+        for panel in spec.panels:
+            for query in panel.queries:
+                refs = {
+                    knowledge_ref
+                    for metric, metric_refs in governance_refs_by_resolved_metric.items()
+                    if metric and _query_references_metric(query.expr, metric)
+                    for knowledge_ref in metric_refs
+                }
+                knowledge_query_uses.extend(
+                    KnowledgeQueryUse.from_query(knowledge_ref, panel, query) for knowledge_ref in sorted(refs)
+                )
 
     logger.info(
         "archetype_compiled",
@@ -1189,7 +1269,7 @@ def blend_archetypes(
     target_language: str = "promql",
     signal_store: Any | None = None,
     tenant_id: str = "default",
-    applied_knowledge_refs: set[str] | None = None,
+    knowledge_query_uses: list[KnowledgeQueryUse] | None = None,
 ) -> DashboardSpec:
     """Blend panels from multiple archetypes into a single dashboard.
 
@@ -1228,7 +1308,7 @@ def blend_archetypes(
     max_panels = settings.max_dashboard_panels
 
     primary_arch, primary_conf = ranked_archetypes[0]
-    primary_refs: set[str] = set()
+    compiled_query_uses: list[KnowledgeQueryUse] = []
     primary_spec = compile_archetype(
         primary_arch,
         intent,
@@ -1236,10 +1316,8 @@ def blend_archetypes(
         target_language=target_language,
         signal_store=signal_store,
         tenant_id=tenant_id,
-        applied_knowledge_refs=primary_refs,
+        knowledge_query_uses=compiled_query_uses,
     )
-    if applied_knowledge_refs is not None:
-        applied_knowledge_refs.update(primary_refs)
 
     # De-dup on the panel's *query signature* (the set of normalized query
     # expressions), not just its title — so the same panel arriving from two
@@ -1257,7 +1335,6 @@ def blend_archetypes(
         if len(blended_panels) >= max_panels:
             break
 
-        secondary_refs: set[str] = set()
         secondary_spec = compile_archetype(
             arch,
             intent,
@@ -1265,7 +1342,7 @@ def blend_archetypes(
             target_language=target_language,
             signal_store=signal_store,
             tenant_id=tenant_id,
-            applied_knowledge_refs=secondary_refs,
+            knowledge_query_uses=compiled_query_uses,
         )
         added = 0
         for panel in secondary_spec.panels:
@@ -1280,8 +1357,6 @@ def blend_archetypes(
                 added += 1
 
         if added > 0:
-            if applied_knowledge_refs is not None:
-                applied_knowledge_refs.update(secondary_refs)
             blended_tags.extend(arch.tags)
             logger.info(
                 "archetype_blended",
@@ -1301,6 +1376,9 @@ def blend_archetypes(
         timerange=intent.timerange or primary_arch.default_timerange,
         panels=blended_panels[:max_panels],
     )
+    if knowledge_query_uses is not None:
+        surviving_query_ids = dashboard_query_identities(spec)
+        knowledge_query_uses.extend(use for use in compiled_query_uses if use.query_identity() in surviving_query_ids)
 
     logger.info(
         "archetype_blend_complete",

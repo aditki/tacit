@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from click.testing import CliRunner
 
 from tacit.cli import cli
@@ -88,3 +90,54 @@ def test_injected_signal_store_also_scopes_operational_knowledge(tmp_path):
 
     assert service.repository._db_path == injected._db_path
     assert dependencies.knowledge_service_factory() is service
+
+
+def test_cli_history_replay_requires_and_authorizes_wildcard_tenant(monkeypatch):
+    class FakeContract:
+        request = SimpleNamespace(scope=SimpleNamespace(tenant_id="tenant-a"))
+
+        def model_dump(self, **_kwargs):
+            return {"investigation": {"id": "inv-a"}}
+
+    class FakeHistory:
+        replay_calls = 0
+
+        def get_contract(self, investigation_id, revision=None):
+            assert investigation_id == "inv-a"
+            return FakeContract()
+
+        def get(self, investigation_id):
+            assert investigation_id == "inv-a"
+            return {"tenant_id": "tenant-a"}
+
+        def replay_contract(self, investigation_id, revision=None, **_kwargs):
+            assert investigation_id == "inv-a"
+            self.replay_calls += 1
+            return FakeContract()
+
+    class FakeStores:
+        settings = Settings(_env_file=None, knowledge_tenant_id="*")
+
+        def __init__(self):
+            self.history_store = FakeHistory()
+
+        def history(self):
+            return self.history_store
+
+        def knowledge(self):
+            raise AssertionError("exact replay should not resolve current knowledge")
+
+    stores = FakeStores()
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: stores)
+    runner = CliRunner()
+
+    missing = runner.invoke(cli, ["history", "replay", "inv-a"])
+    denied = runner.invoke(cli, ["history", "replay", "inv-a", "--tenant", "tenant-b"])
+    allowed = runner.invoke(cli, ["history", "replay", "inv-a", "--tenant", "tenant-a"])
+
+    assert missing.exit_code != 0
+    assert "--tenant is required" in missing.output
+    assert denied.exit_code != 0
+    assert "Tenant access denied" in denied.output
+    assert allowed.exit_code == 0, allowed.output
+    assert stores.history_store.replay_calls == 1

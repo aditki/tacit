@@ -1002,15 +1002,25 @@ def benchmark_grounding():
         raise SystemExit(1)
 
 
-@cli.command("benchmark-learning")
-def benchmark_learning():
-    """Run the deterministic Operational Learning v1 quality gate."""
+def _run_operational_learning_benchmark() -> None:
     from tacit.operational_learning_benchmark import run_operational_learning_benchmark
 
     result = run_operational_learning_benchmark()
     click.echo(json.dumps(result, indent=2, sort_keys=True))
     if not result["passed"]:
         raise SystemExit(1)
+
+
+@cli.command("operational-learning-benchmark")
+def operational_learning_benchmark():
+    """Run the deterministic Operational Learning v1 quality gate."""
+    _run_operational_learning_benchmark()
+
+
+@cli.command("benchmark-learning")
+def benchmark_learning():
+    """Alias for the Operational Learning v1 quality gate."""
+    _run_operational_learning_benchmark()
 
 
 # ── tacit demo ───────────────────────────────────────────────────────────
@@ -2320,15 +2330,25 @@ def history_contract(investigation_id: str, revision: int | None):
 @click.argument("investigation_id")
 @click.option("--revision", type=int, default=None)
 @click.option("--mode", type=click.Choice(["exact", "current_engine", "counterfactual"]), default="exact")
-def history_replay(investigation_id: str, revision: int | None, mode: str):
+@click.option("--tenant", default=None, help="Knowledge tenant that owns the investigation.")
+def history_replay(investigation_id: str, revision: int | None, mode: str, tenant: str | None):
     """Replay an investigation from captured inputs without external refetch."""
     _load_env()
     from tacit.history import ReplayError, StaleRevisionError
     from tacit.investigation_replay import ReplayMode
 
     stores = _cli_runtime_stores()
+    selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    history_store = stores.history()
+    existing_contract = history_store.get_contract(investigation_id, revision)
+    investigation = history_store.get(investigation_id)
+    if existing_contract is None or investigation is None:
+        raise click.ClickException("Investigation or captured inputs not found")
+    recorded_tenant = str(investigation.get("tenant_id") or existing_contract.request.scope.tenant_id or "default")
+    if recorded_tenant != selected_tenant:
+        raise click.ClickException("Tenant access denied")
     try:
-        contract = stores.history().replay_contract(
+        contract = history_store.replay_contract(
             investigation_id,
             revision,
             mode=ReplayMode(mode),

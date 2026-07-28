@@ -733,6 +733,7 @@ class SignalStore:
         target_query_language: str = "",
         tenant_id: str = "default",
         applied_governance_refs: set[str] | None = None,
+        governance_refs_by_default_metric: dict[str, set[str]] | None = None,
     ) -> dict[str, str]:
         """Resolve signal bindings to metric substitutions for archetype compile.
 
@@ -787,6 +788,8 @@ class SignalStore:
                 substitutions[default_metric] = best_entry.name
                 if applied_governance_refs is not None and best.governance_ref:
                     applied_governance_refs.add(best.governance_ref)
+                if governance_refs_by_default_metric is not None and best.governance_ref:
+                    governance_refs_by_default_metric.setdefault(default_metric, set()).add(best.governance_ref)
                 logger.info(
                     "signal_resolved",
                     signal=signal_type,
@@ -2081,21 +2084,26 @@ class SignalStore:
         limit: int = 50,
         *,
         tenant_id: str = "default",
+        backend_name: str | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """List ingested dashboards, optionally filtered by status."""
+        conditions = ["tenant_id = ?"]
+        params: list[Any] = [tenant_id]
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if backend_name is not None:
+            conditions.append("backend_name = ?")
+            params.append(backend_name)
+        params.extend([limit, offset])
         with self._conn() as conn:
-            if status:
-                rows = conn.execute(
-                    """SELECT * FROM ingested_dashboards
-                       WHERE tenant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?""",
-                    (tenant_id, status, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """SELECT * FROM ingested_dashboards
-                       WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?""",
-                    (tenant_id, limit),
-                ).fetchall()
+            rows = conn.execute(
+                f"""SELECT * FROM ingested_dashboards
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
+                params,
+            ).fetchall()
         return [_deserialize_ingested(r) for r in rows]
 
     def list_ingested_alerts(
@@ -2104,21 +2112,26 @@ class SignalStore:
         limit: int = 50,
         *,
         tenant_id: str = "default",
+        backend_name: str | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """List ingested alerts, optionally filtered by status."""
+        conditions = ["tenant_id = ?"]
+        params: list[Any] = [tenant_id]
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if backend_name is not None:
+            conditions.append("backend_name = ?")
+            params.append(backend_name)
+        params.extend([limit, offset])
         with self._conn() as conn:
-            if status:
-                rows = conn.execute(
-                    """SELECT * FROM ingested_alerts
-                       WHERE tenant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?""",
-                    (tenant_id, status, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """SELECT * FROM ingested_alerts
-                       WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?""",
-                    (tenant_id, limit),
-                ).fetchall()
+            rows = conn.execute(
+                f"""SELECT * FROM ingested_alerts
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
+                params,
+            ).fetchall()
         return [_deserialize_ingested_alert(r) for r in rows]
 
     def get_ingested_alert(

@@ -24,7 +24,6 @@ def _configured_tenant(request: DashRequest, deps: PipelineDependencies) -> str:
     return resolve_knowledge_tenant(
         getattr(deps.settings, "knowledge_tenant_id", "default"),
         request.tenant_id,
-        reject_pinned_override=False,
     )
 
 

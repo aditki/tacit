@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from tacit.archetypes.engine import blend_archetypes, compile_archetype, rank_archetypes_by_coverage
+from tacit.archetypes.engine import (
+    KnowledgeQueryUse,
+    blend_archetypes,
+    compile_archetype,
+    dashboard_query_identities,
+    rank_archetypes_by_coverage,
+)
 from tacit.archetypes.generated import (
     ArchetypeRetrievalMode,
     GeneratedArchetypeQuery,
@@ -49,7 +55,17 @@ class ArchetypeCompilation:
     dashboard_spec: DashboardSpec
     primary_archetype: Any
     primary_confidence: float
-    applied_knowledge_refs: frozenset[str]
+    knowledge_query_uses: tuple[KnowledgeQueryUse, ...]
+
+    @property
+    def applied_knowledge_refs(self) -> frozenset[str]:
+        return frozenset(use.knowledge_ref for use in self.knowledge_query_uses)
+
+    def surviving_knowledge_refs(self, dashboard_spec: DashboardSpec) -> frozenset[str]:
+        surviving_query_ids = dashboard_query_identities(dashboard_spec)
+        return frozenset(
+            use.knowledge_ref for use in self.knowledge_query_uses if use.query_identity() in surviving_query_ids
+        )
 
 
 def select_archetypes(
@@ -159,7 +175,7 @@ def compile_selected_archetypes(
 
     t0 = time.monotonic()
     primary_arch, primary_conf = selection.ranked_archetypes[0]
-    applied_knowledge_refs: set[str] = set()
+    knowledge_query_uses: list[KnowledgeQueryUse] = []
     if len(selection.ranked_archetypes) > 1:
         dashboard_spec = blend_archetypes(
             selection.ranked_archetypes,
@@ -168,7 +184,7 @@ def compile_selected_archetypes(
             target_language=selection.target_language,
             signal_store=signal_store,
             tenant_id=tenant_id,
-            applied_knowledge_refs=applied_knowledge_refs,
+            knowledge_query_uses=knowledge_query_uses,
         )
     else:
         dashboard_spec = compile_archetype(
@@ -178,7 +194,7 @@ def compile_selected_archetypes(
             target_language=selection.target_language,
             signal_store=signal_store,
             tenant_id=tenant_id,
-            applied_knowledge_refs=applied_knowledge_refs,
+            knowledge_query_uses=knowledge_query_uses,
         )
     timings["archetype_compile"] = time.monotonic() - t0
     stage_log(
@@ -201,5 +217,5 @@ def compile_selected_archetypes(
         dashboard_spec=dashboard_spec,
         primary_archetype=primary_arch,
         primary_confidence=primary_conf,
-        applied_knowledge_refs=frozenset(applied_knowledge_refs),
+        knowledge_query_uses=tuple(knowledge_query_uses),
     )

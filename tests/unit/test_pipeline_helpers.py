@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tacit.agents.providers.base import LLMProvider, LLMResult, TokenUsage
+from tacit.archetypes.engine import KnowledgeQueryUse, _query_references_metric
 from tacit.config import Settings
 from tacit.context.base import ContextProvider
 from tacit.context.enrichment import enrich_context
@@ -18,6 +19,7 @@ from tacit.models.schemas import (
 from tacit.pipeline.failures import PipelineFailureFactory
 from tacit.pipeline.runner import _get_semaphore, _initialize_signal_store
 from tacit.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history, safe_record_provenance
+from tacit.pipeline.stages.archetypes import ArchetypeCompilation
 from tacit.pipeline.stages.freeform import build_freeform_dashboard
 from tacit.pipeline.stages.intent import run_intent_stage
 from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE, resolve_signal_store
@@ -140,6 +142,57 @@ def _dashboard() -> DashboardSpec:
                 queries=[PanelQuery(expr="up", datasource_uid="prom")],
             )
         ],
+    )
+
+
+def test_compilation_usage_keeps_only_governed_queries_that_survive_validation():
+    kept_query = PanelQuery(
+        expr="kept_metric",
+        datasource_uid="prom",
+        datasource_type="prometheus",
+        query_language="promql",
+    )
+    dropped_query = PanelQuery(
+        expr="dropped_metric",
+        datasource_uid="prom",
+        datasource_type="prometheus",
+        query_language="promql",
+    )
+    selected = DashboardSpec(
+        title="Selected",
+        panels=[
+            PanelSpec(
+                title="Kept",
+                source_archetype="latency",
+                queries=[kept_query],
+            ),
+            PanelSpec(
+                title="Dropped",
+                source_archetype="errors",
+                queries=[dropped_query],
+            ),
+        ],
+    )
+    compilation = ArchetypeCompilation(
+        dashboard_spec=selected,
+        primary_archetype=object(),
+        primary_confidence=0.9,
+        knowledge_query_uses=(
+            KnowledgeQueryUse.from_query("knowledge-kept", selected.panels[0], kept_query),
+            KnowledgeQueryUse.from_query("knowledge-dropped", selected.panels[1], dropped_query),
+        ),
+    )
+    validated = selected.model_copy(update={"panels": [selected.panels[0]]})
+
+    assert compilation.applied_knowledge_refs == frozenset({"knowledge-kept", "knowledge-dropped"})
+    assert compilation.surviving_knowledge_refs(validated) == frozenset({"knowledge-kept"})
+
+
+def test_compilation_provenance_matches_complete_metric_tokens():
+    assert _query_references_metric("sum(rate(checkout_latency_seconds[5m]))", "checkout_latency_seconds")
+    assert not _query_references_metric(
+        "sum(rate(checkout_latency_seconds_total[5m]))",
+        "checkout_latency_seconds",
     )
 
 

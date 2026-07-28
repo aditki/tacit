@@ -46,7 +46,7 @@ from tacit.knowledge.models import (
     KnowledgeState,
     KnowledgeUsage,
 )
-from tacit.knowledge.normalization import normalize_service_ref
+from tacit.knowledge.normalization import canonical_scope_payload, normalize_service_ref
 from tacit.knowledge.repository import (
     CandidateEvaluationConflictError,
     CandidateReviewConflictError,
@@ -355,7 +355,7 @@ def test_repository_invariants_hold_after_source_retirement(tmp_path: Path):
     assert current.state.eligibility == KnowledgeEligibility.INELIGIBLE
 
 
-def test_knowledge_candidate_clears_empty_ranking_abstention(tmp_path: Path):
+def test_knowledge_candidate_preserves_evidence_abstention(tmp_path: Path):
     service = _service(tmp_path)
     _promoted_dependency(service)
     _, usage = service.create_snapshot(
@@ -366,13 +366,13 @@ def test_knowledge_candidate_clears_empty_ranking_abstention(tmp_path: Path):
     )
 
     ranking, applied_usage = service.apply_to_ranking(
-        CulpritRanking(abstained=True, abstention_reason="no_rankable_candidates"),
+        CulpritRanking(abstained=True, abstention_reason="no_supported_runtime_evidence"),
         usage,
     )
 
     assert len(ranking.candidates) == 1
-    assert ranking.abstained is False
-    assert ranking.abstention_reason == ""
+    assert ranking.abstained is True
+    assert ranking.abstention_reason == "no_supported_runtime_evidence"
     assert applied_usage[0].disposition.value == "applied"
     assert applied_usage[0].used_for == ["candidate_generation", "ranking"]
 
@@ -406,6 +406,59 @@ def test_knowledge_preserves_abstention_when_it_only_boosts_an_existing_candidat
     assert ranking.abstention_reason == "runtime_evidence_unavailable"
     assert applied_usage[0].disposition.value == "applied"
     assert applied_usage[0].used_for == ["ranking"]
+
+
+def test_scope_references_are_canonical_before_proposition_hashing(tmp_path: Path):
+    service = _service(tmp_path)
+    raw_scope = KnowledgeScope(
+        environment_refs=["Production"],
+        region_refs=["US East 1"],
+        cluster_refs=["Checkout Primary"],
+        namespace_refs=["Checkout Apps"],
+        service_refs=["Checkout"],
+        archetype_refs=["HTTP Service"],
+        version_constraints=[">=1.2"],
+    )
+    canonical_scope = KnowledgeScope(
+        environment_refs=["environment:production"],
+        region_refs=["region:us-east-1"],
+        cluster_refs=["cluster:checkout-primary"],
+        namespace_refs=["namespace:checkout-apps"],
+        service_refs=["entity:service:checkout"],
+        archetype_refs=["archetype:http-service"],
+        version_constraints=["version:>=1.2"],
+    )
+
+    first = service.create_candidate(
+        kind=KnowledgeKind.DEPENDENCY,
+        payload_ref="raw-scope",
+        typed_payload={},
+        proposition={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "depends_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=raw_scope,
+        provenance_refs=["catalog:raw"],
+    )
+    second = service.create_candidate(
+        kind=KnowledgeKind.DEPENDENCY,
+        payload_ref="canonical-scope",
+        typed_payload={},
+        proposition={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "depends_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=canonical_scope,
+        provenance_refs=["catalog:canonical"],
+    )
+
+    assert canonical_scope_payload(first.scope) == canonical_scope_payload(second.scope)
+    assert first.proposition.proposition_key == second.proposition.proposition_key
+    assert first.scope.service_refs == ["entity:service:checkout"]
+    assert first.scope.environment_refs == ["environment:production"]
+    assert first.scope.version_constraints == ["version:>=1.2"]
 
 
 def test_duplicate_lineage_does_not_inflate_corroboration(tmp_path: Path):
@@ -1248,6 +1301,81 @@ def test_signal_mapping_usage_remains_considered_until_a_stage_consumes_it(tmp_p
     assert usage[0].disposition.value == "considered_not_applied"
     assert usage[0].used_for == []
     assert usage[0].score_delta == 0
+
+
+def test_compilation_usage_fails_when_a_governed_reference_is_missing_from_the_snapshot(tmp_path: Path):
+    service = _service(tmp_path)
+
+    with pytest.raises(RuntimeError, match="not present in the selected knowledge snapshot"):
+        service.apply_compilation_usage([], {"knowledge-missing"})
+
+
+def test_idempotent_promotion_repairs_a_missing_signal_projection(tmp_path: Path, monkeypatch):
+    from tacit.signals.store import SignalStore
+
+    service = _service(tmp_path)
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="signal:custom-latency",
+        typed_payload={
+            "metric_pattern": "custom_checkout_latency_seconds",
+            "confidence": 0.94,
+            "context_datasource_types": ["prometheus"],
+        },
+        proposition={
+            "subject_ref": "concept:request_latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:custom_checkout_latency_seconds",
+            "concept_ref": "signal:request_latency",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["operator:signal-correction"],
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    original_sync = service._sync_signal_mapping_state
+    sync_attempts = 0
+
+    def flaky_sync(revision):
+        nonlocal sync_attempts
+        sync_attempts += 1
+        if sync_attempts == 1:
+            raise OSError("resolver projection unavailable")
+        original_sync(revision)
+
+    monkeypatch.setattr(service, "_sync_signal_mapping_state", flaky_sync)
+
+    with pytest.raises(OSError, match="resolver projection unavailable"):
+        service.evaluate_candidate(candidate.id, live_verified=True)
+
+    knowledge = service.repository.find_knowledge_by_proposition(
+        "default",
+        candidate.proposition.proposition_key,
+    )
+    assert knowledge is not None
+    persisted = service.repository.get_revision(knowledge.id)
+    assert persisted is not None
+    signal_store = SignalStore(service.repository._db_path)
+    assert not any(
+        row["metric_pattern"] == "custom_checkout_latency_seconds"
+        for row in signal_store.get_mappings_for_signal(
+            "request_latency",
+            tenant_id="default",
+            include_decayed=True,
+        )
+    )
+
+    _, repaired = service.evaluate_candidate(candidate.id, live_verified=True)
+
+    assert repaired is not None
+    assert repaired.revision == persisted.revision
+    mappings = signal_store.get_mappings_for_signal(
+        "request_latency",
+        tenant_id="default",
+        include_decayed=True,
+    )
+    projection = next(row for row in mappings if row["metric_pattern"] == "custom_checkout_latency_seconds")
+    assert projection["governance_ref"] == repaired.knowledge_id
+    assert sync_attempts == 2
 
 
 @pytest.mark.parametrize(
