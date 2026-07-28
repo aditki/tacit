@@ -47,6 +47,16 @@ def get_signal_store(request: Request) -> Any:
     return get_runtime_stores(request).signals()
 
 
+def get_knowledge_repository(request: Request) -> Any:
+    """Return Operational Knowledge persistence bound to this application."""
+    return get_runtime_stores(request).knowledge_repository()
+
+
+def get_knowledge_service(request: Request) -> Any:
+    """Return Operational Knowledge orchestration bound to this application."""
+    return get_runtime_stores(request).knowledge()
+
+
 def _backend_factory_for(runtime_settings: Settings) -> Callable[[], Any]:
     """Build backends from app-scoped settings while honoring test monkeypatches."""
 

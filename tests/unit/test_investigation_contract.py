@@ -2581,7 +2581,7 @@ def test_knowledge_correction_uses_target_revision_from_contract_usage(tmp_path,
 
     monkeypatch.setattr(
         "tacit.api.routes.knowledge.get_knowledge_service",
-        lambda: CapturingKnowledgeService(),
+        lambda request: CapturingKnowledgeService(),
     )
     app = create_app(runtime_settings=Settings(knowledge_tenant_id="default"))
     app.dependency_overrides[get_history_store] = lambda: store
@@ -2655,7 +2655,7 @@ def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeyp
     knowledge_service = KnowledgeService(KnowledgeRepository(tmp_path / "knowledge.db"))
     monkeypatch.setattr(
         "tacit.api.routes.knowledge.get_knowledge_service",
-        lambda: knowledge_service,
+        lambda request: knowledge_service,
     )
     app = create_app(runtime_settings=runtime_settings)
     app.dependency_overrides[get_pipeline_dependencies] = lambda: deps

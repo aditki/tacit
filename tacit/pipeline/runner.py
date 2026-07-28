@@ -16,7 +16,7 @@ from tacit.backends import get_active_backends
 from tacit.config import settings
 from tacit.context.enrichment import enrich_context
 from tacit.culprit_ranking import rank_culprits
-from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies
+from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies, resolve_knowledge_service
 from tacit.history import get_investigation_store
 from tacit.investigation_contract import InvestigationRunType
 from tacit.logging import bind_request_id, stage_log, unbind_request_id
@@ -507,7 +507,9 @@ async def _run_pipeline_inner(
         knowledge_usage: list[KnowledgeUsage] = []
         try:
             from tacit.knowledge.scope import investigation_knowledge_scope
-            from tacit.knowledge.service import get_knowledge_service
+
+            if signal_store is SIGNAL_STORE_UNAVAILABLE:
+                raise RuntimeError("Operational Knowledge store is unavailable")
 
             tenant_id = request.tenant_id or getattr(runtime_settings, "knowledge_tenant_id", "default")
             knowledge_scope = investigation_knowledge_scope(
@@ -520,7 +522,7 @@ async def _run_pipeline_inner(
                     intent.problem_type,
                 },
             )
-            knowledge_service = get_knowledge_service()
+            knowledge_service = resolve_knowledge_service(deps, signal_store=signal_store)
             knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(knowledge_scope)
             knowledge_usage = knowledge_service.reconcile_live_observations(
                 knowledge_usage,

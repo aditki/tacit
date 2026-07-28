@@ -8,7 +8,7 @@ import structlog
 
 from tacit.agents.providers.base import TokenUsage
 from tacit.backends.base import DashboardBackend, PublishResult
-from tacit.dependencies import PipelineDependencies
+from tacit.dependencies import PipelineDependencies, resolve_knowledge_service
 from tacit.investigation_contract import InvestigationContractAssembler, InvestigationRunType, RuntimeManifest
 from tacit.investigation_replay import InvestigationReplaySnapshot
 from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
@@ -219,9 +219,7 @@ async def complete_pipeline(
         )
     if persisted_contract and persisted_contract.knowledge_usage:
         try:
-            from tacit.knowledge.service import get_knowledge_service
-
-            get_knowledge_service().persist_usage(
+            resolve_knowledge_service(deps).persist_usage(
                 persisted_contract.knowledge_usage,
                 investigation_id=persisted_contract.investigation.id,
                 investigation_revision=persisted_contract.investigation.revision,

@@ -44,7 +44,11 @@ from tacit.knowledge.models import (
     KnowledgeState,
 )
 from tacit.knowledge.normalization import normalize_service_ref
-from tacit.knowledge.repository import CandidateReviewConflictError, KnowledgeRepository
+from tacit.knowledge.repository import (
+    CandidateEvaluationConflictError,
+    CandidateReviewConflictError,
+    KnowledgeRepository,
+)
 from tacit.knowledge.scope import investigation_knowledge_scope
 from tacit.knowledge.service import KnowledgeService
 from tacit.models.schemas import CulpritCandidate, CulpritRanking, EvidenceObservation, EvidenceObservationOutcome
@@ -367,6 +371,37 @@ def test_knowledge_candidate_clears_empty_ranking_abstention(tmp_path: Path):
     assert ranking.abstention_reason == ""
     assert applied_usage[0].disposition.value == "applied"
     assert applied_usage[0].used_for == ["candidate_generation", "ranking"]
+
+
+def test_knowledge_preserves_abstention_when_it_only_boosts_an_existing_candidate(tmp_path: Path):
+    service = _service(tmp_path)
+    _promoted_dependency(service)
+    _, usage = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        )
+    )
+    baseline = CulpritRanking(
+        abstained=True,
+        abstention_reason="runtime_evidence_unavailable",
+        candidates=[
+            CulpritCandidate(
+                rank=1,
+                suspect="redis-session",
+                suspect_type="datastore",
+                score=0.25,
+            )
+        ],
+    )
+
+    ranking, applied_usage = service.apply_to_ranking(baseline, usage)
+
+    assert ranking.candidates[0].score > baseline.candidates[0].score
+    assert ranking.abstained is True
+    assert ranking.abstention_reason == "runtime_evidence_unavailable"
+    assert applied_usage[0].disposition.value == "applied"
+    assert applied_usage[0].used_for == ["ranking"]
 
 
 def test_duplicate_lineage_does_not_inflate_corroboration(tmp_path: Path):
@@ -1427,6 +1462,13 @@ def test_authoritative_signal_correction_promotes(tmp_path: Path):
     assert reviewed.review_state == ReviewState.APPROVED
     assert revision is not None
     assert revision.proposition.kind == KnowledgeKind.SIGNAL_MAPPING
+    from tacit.signals.store import SignalStore
+
+    mappings = SignalStore(service.repository._db_path).get_mappings_for_signal(
+        "latency",
+        context_service="checkout",
+    )
+    assert [mapping["metric_pattern"] for mapping in mappings] == ["http_request_duration_seconds"]
 
 
 @pytest.mark.parametrize(
@@ -1800,6 +1842,64 @@ def test_concurrent_candidate_evaluation_reuses_the_committed_revision(
     assert all(revision is not None for revision in revisions)
     assert len({(revision.knowledge_id, revision.revision) for revision in revisions if revision}) == 1
     assert len(service.repository.list_revisions(revisions[0].knowledge_id)) == 1
+
+
+@pytest.mark.parametrize(
+    ("concurrent_transition", "expected_review", "expected_lifecycle"),
+    [
+        ("reject", ReviewState.REJECTED, LifecycleStatus.ACTIVE),
+        ("stale", ReviewState.APPROVED, LifecycleStatus.STALE),
+    ],
+)
+def test_candidate_evaluation_cannot_overwrite_concurrent_terminal_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    concurrent_transition: str,
+    expected_review: ReviewState,
+    expected_lifecycle: LifecycleStatus,
+):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref=f"evaluation-race-{concurrent_transition}",
+        family=SourceFamily.HUMAN_CORRECTION,
+        lineage_group=f"evaluation-race-{concurrent_transition}",
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="reviewer")
+    evaluation_reached_save = threading.Event()
+    allow_evaluation_save = threading.Event()
+    save_evaluation = service.repository.save_candidate_evaluation
+
+    def delayed_save(evaluated, *, expected):
+        evaluation_reached_save.set()
+        assert allow_evaluation_save.wait(timeout=5)
+        return save_evaluation(evaluated, expected=expected)
+
+    monkeypatch.setattr(service.repository, "save_candidate_evaluation", delayed_save)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            service.evaluate_candidate,
+            candidate.id,
+            authoritative_source=True,
+        )
+        assert evaluation_reached_save.wait(timeout=5)
+        if concurrent_transition == "reject":
+            service.review_candidate(candidate.id, approved=False, reviewer="rejector")
+        else:
+            service.reconcile_source_lifecycle(
+                provenance_ref=candidate.provenance_refs[0],
+                active_candidate_ids=set(),
+            )
+        allow_evaluation_save.set()
+        with pytest.raises(CandidateEvaluationConflictError):
+            future.result(timeout=5)
+
+    persisted = service.repository.get_candidate(candidate.id)
+    assert persisted is not None
+    assert persisted.state.review_state == expected_review
+    assert persisted.state.lifecycle_status == expected_lifecycle
+    assert service.repository.list_current_revisions() == []
 
 
 def test_overlapping_candidate_reviews_compare_against_the_loaded_state(
@@ -2200,8 +2300,8 @@ def test_signal_mapping_candidate_ids_are_url_safe_and_reviewable(tmp_path: Path
 
     import tacit.api.routes.knowledge as routes
 
-    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
-    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
     app = create_app(
         runtime_settings=Settings(
             knowledge_permissions="knowledge.read,knowledge.review",
@@ -2277,8 +2377,8 @@ def test_api_queue_tenant_and_permissions(tmp_path: Path, monkeypatch: pytest.Mo
     )
     import tacit.api.routes.knowledge as routes
 
-    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
-    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
     app = create_app(
         runtime_settings=Settings(
             api_auth_enabled=False,
@@ -2322,8 +2422,8 @@ def test_review_queue_prioritizes_before_applying_limit(tmp_path: Path, monkeypa
 
     import tacit.api.routes.knowledge as routes
 
-    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
-    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
     app = create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read"))
 
     response = TestClient(app).get("/api/v1/knowledge/review-queue?limit=1")
@@ -2340,8 +2440,8 @@ def test_api_aliases_use_resolver_normalization(tmp_path: Path, monkeypatch: pyt
     service = _service(tmp_path, "tenant-a")
     import tacit.api.routes.knowledge as routes
 
-    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
-    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
     app = create_app(
         runtime_settings=Settings(
             api_auth_enabled=False,
@@ -2371,8 +2471,8 @@ def test_api_trusted_alias_requires_trust_permission(tmp_path: Path, monkeypatch
     service = _service(tmp_path, "tenant-a")
     import tacit.api.routes.knowledge as routes
 
-    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
-    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
     app = create_app(
         runtime_settings=Settings(
             api_auth_enabled=False,
@@ -2420,8 +2520,8 @@ def test_api_candidate_trust_requires_review_and_trust_permissions(
     )
     import tacit.api.routes.knowledge as routes
 
-    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
-    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
     client = TestClient(
         create_app(
             runtime_settings=Settings(
@@ -2450,7 +2550,7 @@ def test_api_reports_concurrent_candidate_review_as_conflict(monkeypatch: pytest
         def review_candidate(self, *args, **kwargs):
             raise CandidateReviewConflictError("candidate review state changed; reload before reviewing")
 
-    monkeypatch.setattr(routes, "get_knowledge_service", lambda: ConflictingService())
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: ConflictingService())
     client = TestClient(
         create_app(
             runtime_settings=Settings(
@@ -2509,8 +2609,8 @@ def test_api_policy_overrides_require_privileged_permission(tmp_path: Path, monk
     )
     import tacit.api.routes.knowledge as routes
 
-    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
-    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
     app = create_app(
         runtime_settings=Settings(
             api_auth_enabled=False,
@@ -2545,8 +2645,8 @@ def test_api_review_returns_post_evaluation_candidate_state(tmp_path: Path, monk
     )
     import tacit.api.routes.knowledge as routes
 
-    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
-    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
     app = create_app(
         runtime_settings=Settings(
             api_auth_enabled=False,
@@ -2583,8 +2683,8 @@ def test_approved_candidate_can_be_evaluated_on_retry(tmp_path: Path, monkeypatc
     )
     import tacit.api.routes.knowledge as routes
 
-    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
-    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
     app = create_app(
         runtime_settings=Settings(
             api_auth_enabled=False,
@@ -2633,8 +2733,8 @@ def test_api_correction_authority_requires_override_permission(tmp_path: Path, m
     )
     import tacit.api.routes.knowledge as routes
 
-    monkeypatch.setattr(routes, "get_knowledge_repository", lambda: service.repository)
-    monkeypatch.setattr(routes, "get_knowledge_service", lambda: service)
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
     app = create_app(
         runtime_settings=Settings(
             api_auth_enabled=False,
@@ -2680,6 +2780,30 @@ def test_cli_policy_overrides_require_privileged_permission(tmp_path: Path, monk
     assert result.exit_code != 0
     assert "missing permission: knowledge.override" in result.output
     assert service.repository.get_candidate(candidate.id).state.review_state == ReviewState.CANDIDATE
+
+
+def test_cli_trust_requires_review_and_trust_permissions(monkeypatch: pytest.MonkeyPatch):
+    class UnexpectedService:
+        def review_candidate(self, *args, **kwargs):
+            raise AssertionError("unauthorized trust reached the knowledge service")
+
+    monkeypatch.setattr("tacit.cli._cli_knowledge_service", lambda: UnexpectedService())
+    monkeypatch.setattr("tacit.config.settings.knowledge_permissions", "knowledge.trust")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "knowledge",
+            "review",
+            "candidate",
+            "--trust",
+            "--reviewer",
+            "operator",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "missing permission: knowledge.review" in result.output
 
 
 def test_cli_exposes_phase_three_commands():
@@ -2745,6 +2869,38 @@ def test_pending_cli_learning_preserves_wildcard_tenant(monkeypatch: pytest.Monk
 
     assert all(result.exit_code == 0 for result in results)
     assert seen == [("dashboard", "acme"), ("bulk-dashboard", "acme"), ("alerts", "acme")]
+
+
+def test_cli_reject_and_ignore_thread_wildcard_tenant(monkeypatch: pytest.MonkeyPatch):
+    seen: list[tuple[str, str]] = []
+
+    class FakeSignalStore:
+        def ignore_ingested_dashboard(self, dashboard_uid, *, backend_name, tenant_id):
+            seen.append(("ignore", tenant_id))
+            return True
+
+    class FakeStores:
+        def signals(self):
+            return FakeSignalStore()
+
+    def reject_dashboard_record(**kwargs):
+        seen.append(("reject", kwargs["tenant_id"]))
+        return {"status": "rejected", "rejected_candidates": 0}
+
+    monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: FakeStores())
+    monkeypatch.setattr(
+        "tacit.dashboard_ingest.reject_ingested_dashboard_record",
+        reject_dashboard_record,
+    )
+    runner = CliRunner()
+
+    rejected = runner.invoke(cli, ["learn", "reject", "dash-1", "--tenant", "acme"])
+    ignored = runner.invoke(cli, ["learn", "ignore", "dash-2", "--tenant", "acme"])
+
+    assert rejected.exit_code == 0, rejected.output
+    assert ignored.exit_code == 0, ignored.output
+    assert seen == [("reject", "acme"), ("ignore", "acme")]
 
 
 def test_knowledge_ui_sends_selected_tenant_header():

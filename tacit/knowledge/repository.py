@@ -37,6 +37,10 @@ class CandidateReviewConflictError(ValueError):
     """Raised when a reviewer acts on a candidate state that has already changed."""
 
 
+class CandidateEvaluationConflictError(ValueError):
+    """Raised when a candidate changes while its promotion policy is evaluated."""
+
+
 class KnowledgeRevisionConflictError(ValueError):
     """Raised when another writer advances an immutable knowledge item first."""
 
@@ -456,6 +460,50 @@ class KnowledgeRepository:
             ).fetchone()
         return KnowledgeCandidate.model_validate_json(row["candidate_json"]) if row else None
 
+    def save_candidate_evaluation(
+        self,
+        candidate: KnowledgeCandidate,
+        *,
+        expected: KnowledgeCandidate,
+    ) -> KnowledgeCandidate:
+        """Persist policy output only if no reviewer or lifecycle writer won first."""
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """UPDATE knowledge_candidates SET
+                       review_state=?, lifecycle_status=?, eligibility=?,
+                       promotion_policy_id=?, promotion_policy_version=?,
+                       candidate_json=?, updated_at=?
+                   WHERE id=? AND tenant_id=? AND candidate_json=?""",
+                (
+                    candidate.state.review_state.value,
+                    candidate.state.lifecycle_status.value,
+                    candidate.state.eligibility.value,
+                    candidate.policy.promotion_policy_ref,
+                    (
+                        candidate.policy.promotion_policy_ref.rsplit("-", 1)[-1]
+                        if candidate.policy.promotion_policy_ref
+                        else ""
+                    ),
+                    candidate.model_dump_json(),
+                    _ts(candidate.updated_at),
+                    candidate.id,
+                    candidate.tenant_id,
+                    expected.model_dump_json(),
+                ),
+            )
+            if cursor.rowcount != 1:
+                logger.info(
+                    "knowledge_candidate_evaluation_conflict",
+                    tenant_id=candidate.tenant_id,
+                    candidate_id=candidate.id,
+                    phase="policy_state_persist",
+                )
+                raise CandidateEvaluationConflictError(
+                    "candidate changed during policy evaluation; reload before evaluating"
+                )
+        return candidate
+
     def transition_candidate_review(
         self,
         candidate: KnowledgeCandidate,
@@ -823,15 +871,26 @@ class KnowledgeRepository:
         *,
         candidate_id: str,
         decision_ref: str,
+        expected_candidate: KnowledgeCandidate | None = None,
     ) -> KnowledgeRevision:
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             candidate = conn.execute(
-                "SELECT tenant_id FROM knowledge_candidates WHERE id=? AND tenant_id=?",
+                "SELECT tenant_id, candidate_json FROM knowledge_candidates WHERE id=? AND tenant_id=?",
                 (candidate_id, revision.tenant_id),
             ).fetchone()
             if candidate is None:
                 raise ValueError("promotion candidate does not belong to the knowledge tenant")
+            if expected_candidate is not None and candidate["candidate_json"] != expected_candidate.model_dump_json():
+                logger.info(
+                    "knowledge_candidate_evaluation_conflict",
+                    tenant_id=revision.tenant_id,
+                    candidate_id=candidate_id,
+                    phase="revision_persist",
+                )
+                raise CandidateEvaluationConflictError(
+                    "candidate changed before promotion persistence; reload before evaluating"
+                )
             row = conn.execute(
                 "SELECT current_revision, created_at FROM operational_knowledge WHERE tenant_id=? AND knowledge_id=?",
                 (revision.tenant_id, revision.knowledge_id),

@@ -57,6 +57,7 @@ from tacit.knowledge.normalization import (
 )
 from tacit.knowledge.policies import default_policies
 from tacit.knowledge.repository import (
+    CandidateEvaluationConflictError,
     CandidateReviewConflictError,
     KnowledgeRepository,
     KnowledgeRevisionConflictError,
@@ -320,6 +321,7 @@ class KnowledgeService:
         ignored_conflict_ids: set[str] | None = None,
     ) -> tuple[PromotionDecision, KnowledgeRevision | None]:
         candidate = self._require_candidate(candidate_id, tenant_id)
+        evaluated_candidate = candidate
         summary, corroboration_ref = self.corroboration.analyze(tenant_id, candidate.proposition.proposition_key)
         conflicts = self.conflicts.analyze(
             tenant_id,
@@ -354,7 +356,16 @@ class KnowledgeService:
         candidate = candidate.model_copy(
             update={"corroboration": summary, "policy": policy_state, "state": state, "updated_at": utc_now()}
         )
-        self.repository.save_candidate(candidate)
+        try:
+            self.repository.save_candidate_evaluation(candidate, expected=evaluated_candidate)
+        except CandidateEvaluationConflictError:
+            concurrent_candidate = self.repository.get_candidate(candidate.id, tenant_id)
+            if (
+                concurrent_candidate is None
+                or concurrent_candidate.model_copy(update={"updated_at": candidate.updated_at}) != candidate
+            ):
+                raise
+            candidate = concurrent_candidate
         self.repository.append_event(
             "promotion_evaluated",
             tenant_id=tenant_id,
@@ -410,7 +421,6 @@ class KnowledgeService:
             self.repository.get_revision(existing.id, tenant_id=tenant_id) if existing is not None else None
         )
         if current_revision is not None and current_revision.semantic_fingerprint == semantic:
-            self._sync_signal_mapping_state(current_revision)
             return decision, current_revision
         revision = KnowledgeRevision(
             knowledge_id=knowledge_id,
@@ -435,13 +445,14 @@ class KnowledgeService:
                 revision,
                 candidate_id=candidate.id,
                 decision_ref=decision.decision_id,
+                expected_candidate=candidate,
             )
         except KnowledgeRevisionConflictError:
-            concurrent = self.repository.get_revision(knowledge_id, tenant_id=tenant_id)
-            if concurrent is None or concurrent.semantic_fingerprint != revision.semantic_fingerprint:
+            concurrent_revision = self.repository.get_revision(knowledge_id, tenant_id=tenant_id)
+            if concurrent_revision is None or concurrent_revision.semantic_fingerprint != revision.semantic_fingerprint:
                 raise
-            self._sync_signal_mapping_state(concurrent)
-            return decision, concurrent
+            self._sync_signal_mapping_state(concurrent_revision)
+            return decision, concurrent_revision
         self._sync_signal_mapping_state(revision)
         self.repository.append_event(
             "knowledge_promoted" if revision_number == 1 else "knowledge_revised",
@@ -519,6 +530,7 @@ class KnowledgeService:
 
         candidates = list(ranking.candidates)
         original_candidate_count = len(candidates)
+        added_ranked_candidate = False
         updated_usage = list(usage)
         applicable: list[tuple[int, KnowledgeUsage, KnowledgeRevision]] = []
         selectable = {
@@ -616,6 +628,7 @@ class KnowledgeService:
                 )
                 candidates.append(added)
                 by_ref[candidate_ref] = added
+                added_ranked_candidate = True
                 used_for = ["candidate_generation", "ranking"]
                 applied_delta = requested_delta
             reason_codes = list(item.reason_codes)
@@ -632,7 +645,7 @@ class KnowledgeService:
         candidates.sort(key=lambda candidate: (-candidate.score, candidate.suspect_type, candidate.suspect))
         candidates = [candidate.model_copy(update={"rank": index}) for index, candidate in enumerate(candidates, 1)]
         update: dict[str, Any] = {"candidates": candidates}
-        if candidates and ranking.abstained:
+        if added_ranked_candidate and candidates and ranking.abstained:
             update.update({"abstained": False, "abstention_reason": ""})
         elif excluded_ranked_candidate and not candidates and not ranking.abstained:
             update.update(
@@ -1133,12 +1146,46 @@ class KnowledgeService:
             if active and revision.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
             else ReviewState.CANDIDATE.value
         )
-        SignalStore(self.repository._db_path).set_mapping_review_state(
+        store = SignalStore(self.repository._db_path)
+        updated = store.set_mapping_review_state(
             signal_type,
             metric_pattern,
             review_state,
             tenant_id=revision.tenant_id,
         )
+        if active and not updated:
+            store.add_mapping(
+                signal_type,
+                metric_pattern,
+                confidence=0.5,
+                context_services=self._resolver_scope_values(
+                    revision.scope.service_refs,
+                    "entity:service:",
+                ),
+                context_environments=self._resolver_scope_values(
+                    revision.scope.environment_refs,
+                    "environment:",
+                ),
+                context_archetypes=self._resolver_scope_values(
+                    revision.scope.archetype_refs,
+                    "archetype:",
+                ),
+                source_type="operational_knowledge",
+                source_refs=[
+                    f"{revision.knowledge_id}@{revision.revision}",
+                    *revision.provenance_refs,
+                ],
+                inference_version=f"{revision.policy_id}:{revision.policy_version}",
+                review_state=review_state,
+                tenant_id=revision.tenant_id,
+            )
+
+    @staticmethod
+    def _resolver_scope_values(refs: list[str], prefix: str) -> list[str]:
+        values = {
+            value.removeprefix(prefix) for value in refs if value and (value.startswith(prefix) or ":" not in value)
+        }
+        return sorted(values)
 
     def impact(self, knowledge_id: str, tenant_id: str = "default") -> KnowledgeImpact:
         usage = self.repository.list_usage(tenant_id=tenant_id, knowledge_id=knowledge_id)

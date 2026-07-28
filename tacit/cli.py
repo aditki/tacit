@@ -515,6 +515,16 @@ def _cli_runtime_stores():
     return RuntimeStores(create_settings())
 
 
+def _cli_knowledge_repository():
+    """Resolve Operational Knowledge from the CLI runtime's signal database."""
+    return _cli_runtime_stores().knowledge_repository()
+
+
+def _cli_knowledge_service():
+    """Resolve Operational Knowledge orchestration for the active CLI command."""
+    return _cli_runtime_stores().knowledge()
+
+
 def _llm_zero_key_mode() -> bool:
     """True only when deterministic fallback applies to a key-based provider."""
     try:
@@ -1281,10 +1291,9 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool, tenant
 def learn_status(tenant: str | None):
     """Show governed learning inventory and review status."""
     _load_env()
-    from tacit.knowledge.repository import get_knowledge_repository
 
     tenant_id = _knowledge_tenant(tenant)
-    click.echo(json.dumps(get_knowledge_repository().stats(tenant_id), indent=2, sort_keys=True))
+    click.echo(json.dumps(_cli_knowledge_repository().stats(tenant_id), indent=2, sort_keys=True))
 
 
 def _print_bulk_learning_summary(result: dict):
@@ -1686,7 +1695,8 @@ def learn_approve(dashboard_uid: str, backend: str, tenant: str | None):
 @learn.command("reject")
 @click.argument("dashboard_uid")
 @click.option("--backend", default="", help="Backend name, e.g. grafana_json or signalfx")
-def learn_reject(dashboard_uid: str, backend: str):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_reject(dashboard_uid: str, backend: str, tenant: str | None):
     """Reject a pending learned dashboard and remove it from default retrieval."""
     _header("Reject Learned Dashboard")
     _load_env()
@@ -1694,11 +1704,13 @@ def learn_reject(dashboard_uid: str, backend: str):
     from tacit.dashboard_ingest import reject_ingested_dashboard_record
 
     stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant)
     try:
         result = reject_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend or None,
             store=stores.signals(),
+            tenant_id=tenant_id,
         )
     except LookupError:
         _fail("Ingested dashboard not found or not pending")
@@ -1717,13 +1729,19 @@ def learn_reject(dashboard_uid: str, backend: str):
 @learn.command("ignore")
 @click.argument("dashboard_uid")
 @click.option("--backend", default="", help="Backend name, e.g. grafana_json or signalfx")
-def learn_ignore(dashboard_uid: str, backend: str):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_ignore(dashboard_uid: str, backend: str, tenant: str | None):
     """Ignore a pending learned dashboard without negative training data."""
     _header("Ignore Learned Dashboard")
     _load_env()
 
     store = _cli_runtime_stores().signals()
-    if store.ignore_ingested_dashboard(dashboard_uid, backend_name=backend or None):
+    tenant_id = _knowledge_tenant(tenant)
+    if store.ignore_ingested_dashboard(
+        dashboard_uid,
+        backend_name=backend or None,
+        tenant_id=tenant_id,
+    ):
         _success("Dashboard ignored")
     else:
         _fail("Ingested dashboard not found or not pending")
@@ -1935,9 +1953,8 @@ def _knowledge_json(value: Any) -> None:
 def knowledge_status(tenant: str | None):
     """Show lifecycle counts and pending work."""
     _load_env()
-    from tacit.knowledge.repository import get_knowledge_repository
 
-    _knowledge_json(get_knowledge_repository().stats(_knowledge_tenant(tenant)))
+    _knowledge_json(_cli_knowledge_repository().stats(_knowledge_tenant(tenant)))
 
 
 @knowledge.command("list")
@@ -1947,9 +1964,8 @@ def knowledge_status(tenant: str | None):
 def knowledge_list(tenant: str | None, kind: str | None, status: str | None):
     """List current knowledge revisions."""
     _load_env()
-    from tacit.knowledge.repository import get_knowledge_repository
 
-    values = get_knowledge_repository().list_current_revisions(_knowledge_tenant(tenant))
+    values = _cli_knowledge_repository().list_current_revisions(_knowledge_tenant(tenant))
     if kind:
         values = [item for item in values if item.proposition.kind.value == kind]
     if status:
@@ -1965,10 +1981,9 @@ def knowledge_list(tenant: str | None, kind: str | None, status: str | None):
 def knowledge_candidates(tenant: str | None, kind: str | None, review_state: str | None, limit: int):
     """List extracted candidates awaiting governance."""
     _load_env()
-    from tacit.knowledge.repository import get_knowledge_repository
 
     _knowledge_json(
-        get_knowledge_repository().list_candidates(
+        _cli_knowledge_repository().list_candidates(
             _knowledge_tenant(tenant), kind=kind, review_state=review_state, limit=limit
         )
     )
@@ -1981,9 +1996,8 @@ def knowledge_candidates(tenant: str | None, kind: str | None, review_state: str
 def knowledge_show(knowledge_id: str, revision: int | None, tenant: str | None):
     """Show one immutable knowledge revision."""
     _load_env()
-    from tacit.knowledge.repository import get_knowledge_repository
 
-    value = get_knowledge_repository().get_revision(
+    value = _cli_knowledge_repository().get_revision(
         knowledge_id, revision=revision, tenant_id=_knowledge_tenant(tenant)
     )
     if value is None:
@@ -1997,10 +2011,9 @@ def knowledge_show(knowledge_id: str, revision: int | None, tenant: str | None):
 def knowledge_explain(knowledge_id: str, tenant: str | None):
     """Explain provenance, policy, conflicts, and investigation use."""
     _load_env()
-    from tacit.knowledge.service import get_knowledge_service
 
     try:
-        _knowledge_json(get_knowledge_service().explain(knowledge_id, _knowledge_tenant(tenant)))
+        _knowledge_json(_cli_knowledge_service().explain(knowledge_id, _knowledge_tenant(tenant)))
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -2011,10 +2024,12 @@ def knowledge_explain(knowledge_id: str, tenant: str | None):
 def knowledge_conflicts(tenant: str | None, unresolved_only: bool):
     """List proposition conflicts."""
     _load_env()
-    from tacit.knowledge.repository import get_knowledge_repository
 
     _knowledge_json(
-        get_knowledge_repository().list_conflicts(_knowledge_tenant(tenant), unresolved_only=unresolved_only)
+        _cli_knowledge_repository().list_conflicts(
+            _knowledge_tenant(tenant),
+            unresolved_only=unresolved_only,
+        )
     )
 
 
@@ -2041,25 +2056,26 @@ def knowledge_review(
 ):
     """Review a candidate and evaluate it for promotion."""
     _load_env()
+    from tacit.api.security import KNOWLEDGE_ACTION_PERMISSIONS, KnowledgeAction
     from tacit.config import settings
-    from tacit.knowledge.service import get_knowledge_service
 
     tenant_id = _knowledge_tenant(tenant)
-    service = get_knowledge_service()
+    service = _cli_knowledge_service()
     selected = [value for value, enabled in (("approve", approve), ("reject", reject), ("trust", trust)) if enabled]
     if decision:
         selected.append(decision)
     if len(set(selected)) != 1:
         raise click.ClickException("choose exactly one of --approve, --reject, --trust, or --decision")
     decision = selected[0]
-    permission = {
-        "approve": "knowledge.review",
-        "reject": "knowledge.reject",
-        "trust": "knowledge.trust",
+    action = {
+        "approve": KnowledgeAction.APPROVE,
+        "reject": KnowledgeAction.REJECT,
+        "trust": KnowledgeAction.TRUST,
     }[decision]
     permissions = {value.strip() for value in settings.knowledge_permissions.split(",") if value.strip()}
-    if permission not in permissions:
-        raise click.ClickException(f"missing permission: {permission}")
+    for permission in KNOWLEDGE_ACTION_PERMISSIONS[action]:
+        if permission not in permissions:
+            raise click.ClickException(f"missing permission: {permission}")
     if (authoritative_source or live_verified) and "knowledge.override" not in permissions:
         raise click.ClickException("missing permission: knowledge.override")
     try:
@@ -2096,9 +2112,8 @@ def knowledge_review(
 def knowledge_history(knowledge_id: str, tenant: str | None):
     """List immutable revisions for one knowledge item."""
     _load_env()
-    from tacit.knowledge.repository import get_knowledge_repository
 
-    _knowledge_json(get_knowledge_repository().list_revisions(knowledge_id, _knowledge_tenant(tenant)))
+    _knowledge_json(_cli_knowledge_repository().list_revisions(knowledge_id, _knowledge_tenant(tenant)))
 
 
 @knowledge.command("usage")
@@ -2107,10 +2122,12 @@ def knowledge_history(knowledge_id: str, tenant: str | None):
 def knowledge_usage(knowledge_id: str, tenant: str | None):
     """List investigations that considered a knowledge item."""
     _load_env()
-    from tacit.knowledge.repository import get_knowledge_repository
 
     _knowledge_json(
-        get_knowledge_repository().list_usage(tenant_id=_knowledge_tenant(tenant), knowledge_id=knowledge_id)
+        _cli_knowledge_repository().list_usage(
+            tenant_id=_knowledge_tenant(tenant),
+            knowledge_id=knowledge_id,
+        )
     )
 
 
@@ -2278,15 +2295,14 @@ def history_replay(investigation_id: str, revision: int | None, mode: str):
     from tacit.history import ReplayError, StaleRevisionError
     from tacit.investigation_replay import ReplayMode
 
+    stores = _cli_runtime_stores()
     try:
-        contract = (
-            _cli_runtime_stores()
-            .history()
-            .replay_contract(
-                investigation_id,
-                revision,
-                mode=ReplayMode(mode),
-            )
+        contract = stores.history().replay_contract(
+            investigation_id,
+            revision,
+            mode=ReplayMode(mode),
+            runtime_settings=stores.settings,
+            knowledge_service_factory=stores.knowledge,
         )
     except (StaleRevisionError, ReplayError) as exc:
         raise click.ClickException(str(exc)) from exc

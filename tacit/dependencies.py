@@ -27,6 +27,7 @@ class PipelineDependencies:
     llm_cache: Any
     cache_key_factory: Callable[..., str]
     signal_store_factory: Callable[[], Any] | None = None
+    knowledge_service_factory: Callable[[], Any] | None = None
     llm_provider_factory: Callable[[], LLMProvider] | None = None
     context_provider_factory: Callable[[], ContextProvider | None] | None = None
     resource_cleanup: Callable[[], Awaitable[None]] | None = None
@@ -49,10 +50,32 @@ def build_pipeline_dependencies(
     history_store_factory: Callable[[], Any] | None = None,
     feedback_store_factory: Callable[[], Any] | None = None,
     signal_store_factory: Callable[[], Any] | None = None,
+    knowledge_service_factory: Callable[[], Any] | None = None,
 ) -> PipelineDependencies:
     """Build a dependency bundle scoped to one runtime settings object."""
 
     runtime_stores = stores or RuntimeStores(runtime_settings)
+    resolved_signal_store_factory = signal_store_factory or runtime_stores.signals
+    scoped_knowledge_service: Any | None = None
+    scoped_knowledge_path: Any | None = None
+
+    def runtime_knowledge_service() -> Any:
+        nonlocal scoped_knowledge_path, scoped_knowledge_service
+        if knowledge_service_factory is not None:
+            return knowledge_service_factory()
+        if signal_store_factory is None:
+            return runtime_stores.knowledge()
+        signal_store = resolved_signal_store_factory()
+        db_path = getattr(signal_store, "_db_path", None)
+        if db_path is None:
+            raise RuntimeError("the injected signal store does not expose its database path")
+        if scoped_knowledge_service is None or scoped_knowledge_path != db_path:
+            from tacit.knowledge.repository import KnowledgeRepository
+            from tacit.knowledge.service import KnowledgeService
+
+            scoped_knowledge_service = KnowledgeService(KnowledgeRepository(db_path))
+            scoped_knowledge_path = db_path
+        return scoped_knowledge_service
 
     def runtime_backends() -> list[DashboardBackend]:
         from tacit import backends
@@ -104,7 +127,8 @@ def build_pipeline_dependencies(
         feedback_store_factory=feedback_store_factory or runtime_stores.feedback,
         llm_cache=llm_cache,
         cache_key_factory=make_cache_key,
-        signal_store_factory=signal_store_factory or runtime_stores.signals,
+        signal_store_factory=resolved_signal_store_factory,
+        knowledge_service_factory=runtime_knowledge_service,
         llm_provider_factory=runtime_llm_provider,
         context_provider_factory=runtime_context_provider,
         resource_cleanup=close_runtime_resources,
@@ -114,3 +138,25 @@ def build_pipeline_dependencies(
 def get_default_dependencies() -> PipelineDependencies:
     """Return the production dependency bundle."""
     return PipelineDependencies.defaults()
+
+
+def resolve_knowledge_service(
+    deps: PipelineDependencies,
+    *,
+    signal_store: Any | None = None,
+) -> Any:
+    """Resolve Operational Knowledge from the active runtime's signal database."""
+    if deps.knowledge_service_factory is not None:
+        return deps.knowledge_service_factory()
+    active_signal_store = signal_store
+    if active_signal_store is None and deps.signal_store_factory is not None:
+        active_signal_store = deps.signal_store_factory()
+    db_path = getattr(active_signal_store, "_db_path", None)
+    if db_path is not None:
+        from tacit.knowledge.repository import KnowledgeRepository
+        from tacit.knowledge.service import KnowledgeService
+
+        return KnowledgeService(KnowledgeRepository(db_path))
+    from tacit.knowledge.service import get_knowledge_service
+
+    return get_knowledge_service()

@@ -2225,10 +2225,13 @@ class TestIngestedDashboards:
             async def close(self):
                 return None
 
-        monkeypatch.setattr(di, "get_signal_store", lambda: signal_store)
+        def unexpected_global_store():
+            raise AssertionError("injected dashboard crawl consulted the process-global signal store")
+
+        monkeypatch.setattr("tacit.dashboard_ingest.service.get_signal_store", unexpected_global_store)
         monkeypatch.setattr(backends_mod, "get_active_backends", lambda: [CompleteBackend()])
 
-        result = await di.learn_backend_dashboards("grafana")
+        result = await di.learn_backend_dashboards("grafana", store=signal_store)
 
         dashboard = signal_store.get_ingested_dashboard("removed-dashboard", backend_name="grafana")
         assert result["stale_marked"] == 1

@@ -60,8 +60,6 @@ class CorroborationService:
             status=status,
         )
         snapshot_id = self.repository.save_corroboration(summary, tenant_id)
-        for candidate in candidates:
-            self.repository.save_candidate(candidate.model_copy(update={"corroboration": summary}))
         self.repository.append_event(
             "corroboration_updated",
             tenant_id=tenant_id,

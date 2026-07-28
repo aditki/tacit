@@ -924,7 +924,7 @@ async def learn_backend_dashboards(
 
         stale_reconciliation_complete = bool(getattr(backend, "last_dashboard_list_complete", False))
         if stale_reconciliation_complete:
-            store = get_signal_store()
+            store = store or get_signal_store()
             seen_dashboard_uids = {str(item.get("uid", "")) for item in dashboards if item.get("uid")}
             totals["stale_marked"] = store.mark_missing_dashboards_stale(
                 tenant_id=effective_tenant,

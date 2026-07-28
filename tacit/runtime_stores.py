@@ -53,6 +53,8 @@ class RuntimeStores:
         self._history_store: Any | None = None
         self._feedback_store: Any | None = None
         self._signal_store: Any | None = None
+        self._knowledge_repository: Any | None = None
+        self._knowledge_service: Any | None = None
         self._lock = threading.RLock()
 
     @staticmethod
@@ -98,3 +100,27 @@ class RuntimeStores:
                     store.load_from_yaml()
                     self._signal_store = store
         return self._signal_store
+
+    def knowledge_repository(self) -> Any:
+        """Return the Operational Knowledge repository beside the signal store."""
+        signal_store = self.signals()
+        signal_db_path = Path(signal_store._db_path)
+        if self._knowledge_repository is None or Path(self._knowledge_repository._db_path) != signal_db_path:
+            with self._lock:
+                if self._knowledge_repository is None or Path(self._knowledge_repository._db_path) != signal_db_path:
+                    from tacit.knowledge.repository import KnowledgeRepository
+
+                    self._knowledge_repository = KnowledgeRepository(signal_db_path)
+                    self._knowledge_service = None
+        return self._knowledge_repository
+
+    def knowledge(self) -> Any:
+        """Return the Operational Knowledge service for this runtime."""
+        repository = self.knowledge_repository()
+        if self._knowledge_service is None:
+            with self._lock:
+                if self._knowledge_service is None:
+                    from tacit.knowledge.service import KnowledgeService
+
+                    self._knowledge_service = KnowledgeService(repository)
+        return self._knowledge_service

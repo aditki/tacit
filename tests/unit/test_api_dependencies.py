@@ -246,8 +246,18 @@ def test_replay_route_uses_app_scoped_runtime_settings(monkeypatch):
         def get_contract(self, investigation_id, revision):
             return FakeContract()
 
-        def replay_contract(self, investigation_id, revision, *, mode, changes, runtime_settings):
+        def replay_contract(
+            self,
+            investigation_id,
+            revision,
+            *,
+            mode,
+            changes,
+            runtime_settings,
+            knowledge_service_factory,
+        ):
             seen_settings.append(runtime_settings)
+            assert knowledge_service_factory is not None
             return FakeContract()
 
     monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: FakeStore())
@@ -454,6 +464,8 @@ def test_app_scoped_database_paths_drive_pipeline_and_api_stores(tmp_path, monke
         seen_stores["feedback"] = deps.feedback_store_factory()
         assert deps.signal_store_factory is not None
         seen_stores["signals"] = deps.signal_store_factory()
+        assert deps.knowledge_service_factory is not None
+        seen_stores["knowledge"] = deps.knowledge_service_factory()
         return DashResponse(
             dashboard_url="http://dash",
             dashboard_uid="dash-1",
@@ -475,6 +487,7 @@ def test_app_scoped_database_paths_drive_pipeline_and_api_stores(tmp_path, monke
     history = client.get("/api/v1/investigations")
     feedback = client.get("/api/v1/feedback/stats")
     signals = client.get("/api/v1/signals")
+    knowledge = client.get("/api/v1/knowledge/status")
     learned = client.post(
         "/api/v1/learn/runbooks",
         json={
@@ -488,13 +501,16 @@ def test_app_scoped_database_paths_drive_pipeline_and_api_stores(tmp_path, monke
     assert history.status_code == 200
     assert feedback.status_code == 200
     assert signals.status_code == 200
+    assert knowledge.status_code == 200
     assert learned.status_code == 200, learned.text
     assert seen_stores["history"] is app.state.runtime_stores.history()
     assert seen_stores["feedback"] is app.state.runtime_stores.feedback()
     assert seen_stores["signals"] is app.state.runtime_stores.signals()
+    assert seen_stores["knowledge"] is app.state.runtime_stores.knowledge()
     assert seen_stores["history"]._db_path == tmp_path / "app" / "history.db"
     assert seen_stores["feedback"]._db_path == tmp_path / "app" / "feedback.db"
     assert seen_stores["signals"]._db_path == tmp_path / "app" / "signals.db"
+    assert seen_stores["knowledge"].repository._db_path == tmp_path / "app" / "signals.db"
     assert seen_stores["signals"].list_learned_artifacts(artifact_type="runbook")
 
 

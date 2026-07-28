@@ -15,6 +15,7 @@ import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -910,6 +911,7 @@ class InvestigationStore:
         mode: ReplayMode = ReplayMode.EXACT,
         changes: CounterfactualChanges | None = None,
         runtime_settings: Settings | None = None,
+        knowledge_service_factory: Callable[[], Any] | None = None,
     ) -> InvestigationContract | None:
         """Rebuild a contract from captured inputs without external refetch."""
         contract = self.get_contract(investigation_id, revision)
@@ -966,7 +968,9 @@ class InvestigationStore:
                 from tacit.knowledge.scope import investigation_knowledge_scope
                 from tacit.knowledge.service import get_knowledge_service
 
-                knowledge_service = get_knowledge_service()
+                knowledge_service = (
+                    knowledge_service_factory() if knowledge_service_factory is not None else get_knowledge_service()
+                )
                 active_settings = runtime_settings or settings
                 configured_tenant = str(getattr(active_settings, "knowledge_tenant_id", "default") or "default")
                 snapshot_tenant = str(snapshot.request.tenant_id or "")

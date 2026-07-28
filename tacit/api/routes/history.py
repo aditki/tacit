@@ -233,6 +233,7 @@ async def replay_investigation(
             mode=replay_request.mode,
             changes=replay_request.changes,
             runtime_settings=deps.settings,
+            knowledge_service_factory=deps.knowledge_service_factory,
         )
     except (history_mod.StaleRevisionError, history_mod.ReplayError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

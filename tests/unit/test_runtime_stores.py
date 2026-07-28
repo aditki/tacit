@@ -6,6 +6,7 @@ from tacit.cli import cli
 from tacit.config import Settings
 from tacit.dependencies import build_pipeline_dependencies
 from tacit.runtime_stores import RuntimeStores
+from tacit.signals.store import SignalStore
 
 
 def _unexpected_global_store():
@@ -31,9 +32,13 @@ def test_configured_runtime_owns_and_reuses_all_stores(tmp_path):
     assert dependencies.feedback_store_factory() is stores.feedback()
     assert dependencies.signal_store_factory is not None
     assert dependencies.signal_store_factory() is stores.signals()
+    assert dependencies.knowledge_service_factory is not None
+    assert dependencies.knowledge_service_factory() is stores.knowledge()
     assert stores.history()._db_path == tmp_path / "state" / "history.db"
     assert stores.feedback()._db_path == tmp_path / "state" / "feedback.db"
     assert stores.signals()._db_path == tmp_path / "state" / "signals.db"
+    assert stores.knowledge_repository()._db_path == tmp_path / "state" / "signals.db"
+    assert stores.knowledge().repository is stores.knowledge_repository()
 
 
 def test_cli_history_uses_the_same_settings_backed_store_owner(tmp_path, monkeypatch):
@@ -48,3 +53,17 @@ def test_cli_history_uses_the_same_settings_backed_store_owner(tmp_path, monkeyp
 
     assert result.exit_code == 0, result.output
     assert (tmp_path / "cli" / "history.db").exists()
+
+
+def test_injected_signal_store_also_scopes_operational_knowledge(tmp_path):
+    injected = SignalStore(tmp_path / "injected-signals.db")
+    dependencies = build_pipeline_dependencies(
+        Settings(_env_file=None),
+        signal_store_factory=lambda: injected,
+    )
+
+    assert dependencies.knowledge_service_factory is not None
+    service = dependencies.knowledge_service_factory()
+
+    assert service.repository._db_path == injected._db_path
+    assert dependencies.knowledge_service_factory() is service
