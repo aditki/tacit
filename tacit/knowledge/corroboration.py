@@ -122,7 +122,17 @@ class ConflictDetectionService:
         for other in rows:
             if other["proposition_key"] == proposition_key:
                 continue
-            if current["kind"] != other["kind"] or current["subject_ref"] != other["subject_ref"]:
+            if current["kind"] != other["kind"]:
+                continue
+            signal_mapping = current["kind"] == KnowledgeKind.SIGNAL_MAPPING.value
+            if signal_mapping:
+                # A signal can have many metric patterns. Conflict only when
+                # one metric is assigned incompatible semantic meanings.
+                if current["object_ref"] != other["object_ref"]:
+                    continue
+                if current["subject_ref"] == other["subject_ref"] and current["concept_ref"] == other["concept_ref"]:
+                    continue
+            elif current["subject_ref"] != other["subject_ref"]:
                 continue
             predicates = {current["predicate"], other["predicate"]}
             directly_negated = predicates == {"depends_on", "does_not_depend_on"}
@@ -141,6 +151,7 @@ class ConflictDetectionService:
                 continue
             if (
                 not directly_negated
+                and not signal_mapping
                 and current["object_ref"] == other["object_ref"]
                 and current["concept_ref"] == other["concept_ref"]
             ):

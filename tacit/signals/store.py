@@ -77,6 +77,7 @@ from tacit.signals.resolution import (
 )
 from tacit.signals.schema import (
     DEFAULT_DB_PATH,
+    GLOBAL_BOOTSTRAP_TENANT_ID,
     SQLITE_BUSY_TIMEOUT_MS,
 )
 
@@ -213,9 +214,9 @@ class SignalStore:
             mapping_rows = conn.execute(
                 """SELECT signal_type, COUNT(*) AS mapping_count
                    FROM signal_metric_mappings
-                   WHERE tenant_id = ? OR (tenant_id = 'default' AND source_type = 'bootstrap')
+                   WHERE tenant_id IN (?, ?)
                    GROUP BY signal_type""",
-                (tenant_id,),
+                (tenant_id, GLOBAL_BOOTSTRAP_TENANT_ID),
             ).fetchall()
         definitions = {row["signal_type"]: dict(row) for row in global_rows}
         for row in tenant_rows:
@@ -252,9 +253,9 @@ class SignalStore:
             mappings = conn.execute(
                 """SELECT * FROM signal_metric_mappings
                    WHERE signal_type = ?
-                     AND (tenant_id = ? OR (tenant_id = 'default' AND source_type = 'bootstrap'))
+                     AND tenant_id IN (?, ?)
                    ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END, confidence DESC""",
-                (signal_type, tenant_id, tenant_id),
+                (signal_type, tenant_id, GLOBAL_BOOTSTRAP_TENANT_ID, tenant_id),
             ).fetchall()
 
         result = dict(st)
@@ -274,7 +275,7 @@ class SignalStore:
         context_datasource_types: list[str] | None = None,
         context_environments: list[str] | None = None,
         context_archetypes: list[str] | None = None,
-        source_type: str = "bootstrap",
+        source_type: str = "teach",
         source_refs: list[str] | None = None,
         inference_version: str = "",
         review_state: str = "trusted",
@@ -294,15 +295,22 @@ class SignalStore:
         if not 0.0 <= confidence <= 1.0:
             raise ValueError(f"confidence must be within [0.0, 1.0], got {confidence!r}")
         now = time.time()
+        storage_tenant = GLOBAL_BOOTSTRAP_TENANT_ID if source_type == "bootstrap" else tenant_id
         with self._conn() as conn:
             # Ensure signal type exists
-            existing = conn.execute(
-                """SELECT 1 FROM signal_types WHERE signal_type = ?
-                   UNION ALL
-                   SELECT 1 FROM tenant_signal_types WHERE tenant_id = ? AND signal_type = ?
-                   LIMIT 1""",
-                (signal_type, tenant_id, signal_type),
-            ).fetchone()
+            if source_type == "bootstrap":
+                existing = conn.execute(
+                    "SELECT 1 FROM signal_types WHERE signal_type = ?",
+                    (signal_type,),
+                ).fetchone()
+            else:
+                existing = conn.execute(
+                    """SELECT 1 FROM signal_types WHERE signal_type = ?
+                       UNION ALL
+                       SELECT 1 FROM tenant_signal_types WHERE tenant_id = ? AND signal_type = ?
+                       LIMIT 1""",
+                    (signal_type, tenant_id, signal_type),
+                ).fetchone()
             if existing is None:
                 if source_type == "bootstrap":
                     conn.execute(
@@ -331,7 +339,7 @@ class SignalStore:
                           source_refs, inference_version, review_state
                     FROM signal_metric_mappings
                     WHERE tenant_id = ? AND signal_type = ? AND metric_pattern = ?""",
-                (tenant_id, signal_type, metric_pattern),
+                (storage_tenant, signal_type, metric_pattern),
             ).fetchone()
 
             def _merge(provided: list[str] | None, existing_json: str | None) -> list[str]:
@@ -392,7 +400,7 @@ class SignalStore:
                        last_seen = excluded.last_seen,
                        use_count = signal_metric_mappings.use_count + 1""",
                 (
-                    tenant_id,
+                    storage_tenant,
                     signal_type,
                     metric_pattern,
                     confidence,
@@ -530,10 +538,10 @@ class SignalStore:
             rows = conn.execute(
                 """SELECT * FROM signal_metric_mappings
                    WHERE signal_type = ?
-                     AND (tenant_id = ? OR (tenant_id = 'default' AND source_type = 'bootstrap'))
+                     AND tenant_id IN (?, ?)
                      AND review_state IN ('approved', 'trusted')
                    ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END, confidence DESC""",
-                (signal_type, tenant_id, tenant_id),
+                (signal_type, tenant_id, GLOBAL_BOOTSTRAP_TENANT_ID, tenant_id),
             ).fetchall()
 
         now = time.time()
@@ -2138,7 +2146,8 @@ class SignalStore:
         """Summary statistics for the signal store."""
         with self._conn() as conn:
             mapping_count = conn.execute(
-                "SELECT COUNT(*) FROM signal_metric_mappings WHERE tenant_id = ?", (tenant_id,)
+                "SELECT COUNT(*) FROM signal_metric_mappings WHERE tenant_id IN (?, ?)",
+                (tenant_id, GLOBAL_BOOTSTRAP_TENANT_ID),
             ).fetchone()[0]
             ingested_count = conn.execute(
                 "SELECT COUNT(*) FROM ingested_dashboards WHERE tenant_id = ?", (tenant_id,)
@@ -2152,8 +2161,10 @@ class SignalStore:
 
             by_source = conn.execute(
                 """SELECT source_type, COUNT(*) as n
-                   FROM signal_metric_mappings WHERE tenant_id = ? GROUP BY source_type""",
-                (tenant_id,),
+                   FROM signal_metric_mappings
+                   WHERE tenant_id IN (?, ?)
+                   GROUP BY source_type""",
+                (tenant_id, GLOBAL_BOOTSTRAP_TENANT_ID),
             ).fetchall()
 
         visible_definitions = self.list_signal_types(tenant_id=tenant_id)

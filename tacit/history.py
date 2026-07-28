@@ -601,11 +601,7 @@ class InvestigationStore:
                 "SELECT tenant_id FROM investigations WHERE id=?",
                 (investigation_id,),
             ).fetchone()
-            if (
-                current > 0
-                and investigation_row is not None
-                and str(investigation_row["tenant_id"] or "default") != incoming_tenant
-            ):
+            if investigation_row is not None and str(investigation_row["tenant_id"] or "default") != incoming_tenant:
                 raise StaleRevisionError("investigation tenant cannot change across revisions")
             candidate_row = None
             if applied_candidate_id is not None:

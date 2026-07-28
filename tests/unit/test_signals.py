@@ -37,6 +37,7 @@ from tacit.signals import (
     _metric_matches_pattern,
 )
 from tacit.signals.migrations import ensure_mapping_tenant_scope
+from tacit.signals.schema import GLOBAL_BOOTSTRAP_TENANT_ID
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -125,6 +126,45 @@ def test_bootstrap_signal_mappings_are_available_to_every_tenant(signal_store):
 
     assert signal_store.resolve_signal("request_latency", catalog, tenant_id="tenant-a")
     assert signal_store.resolve_signal("request_latency", catalog, tenant_id="tenant-b")
+
+
+def test_default_tenant_mapping_cannot_mutate_global_bootstrap(signal_store):
+    signal_store.add_mapping(
+        "request_latency",
+        "http_request_duration_seconds",
+        confidence=0.9,
+        source_type="bootstrap",
+    )
+    signal_store.add_mapping(
+        "request_latency",
+        "http_request_duration_seconds",
+        confidence=0.95,
+        source_type="teach",
+        review_state="approved",
+        tenant_id="default",
+    )
+
+    with signal_store._conn() as conn:
+        rows = conn.execute("""SELECT tenant_id, source_type FROM signal_metric_mappings
+               WHERE signal_type='request_latency' AND metric_pattern='http_request_duration_seconds'
+               ORDER BY tenant_id""").fetchall()
+
+    assert {(row["tenant_id"], row["source_type"]) for row in rows} == {
+        (GLOBAL_BOOTSTRAP_TENANT_ID, "bootstrap"),
+        ("default", "teach"),
+    }
+    assert signal_store.get_mappings_for_signal("request_latency", tenant_id="default")[0]["source_type"] == "teach"
+
+    signal_store.set_mapping_review_state(
+        "request_latency",
+        "http_request_duration_seconds",
+        "candidate",
+        tenant_id="default",
+    )
+
+    tenant_b = signal_store.get_mappings_for_signal("request_latency", tenant_id="tenant-b")
+    assert len(tenant_b) == 1
+    assert tenant_b[0]["source_type"] == "bootstrap"
 
 
 def test_context_rejected_tenant_override_does_not_hide_bootstrap_mapping(signal_store):
@@ -401,11 +441,17 @@ def test_legacy_mappings_and_learning_index_migrate_to_default_tenant(tmp_path):
 
     store = SignalStore(db_path=db_path)
 
+    with store._conn() as conn:
+        migrated_mapping = conn.execute("""SELECT tenant_id FROM signal_metric_mappings
+               WHERE signal_type='latency' AND metric_pattern='legacy_latency_seconds'""").fetchone()
+
     assert store.resolve_signal(
         "latency",
         [_metric_entry("legacy_latency_seconds")],
         tenant_id="default",
     )
+    assert migrated_mapping is not None
+    assert migrated_mapping["tenant_id"] == GLOBAL_BOOTSTRAP_TENANT_ID
     assert store.search_learning_context("legacy", tenant_id="default")
     store.add_mapping("latency", "legacy_latency_seconds", confidence=0.8, tenant_id="tenant-b")
 
@@ -3214,13 +3260,13 @@ class TestPromQLExtractionBug7:
         assert "process_resident_memory_bytes" in metrics
 
 
-# ── Bug 9: teach upsert must preserve global context fields ─────────────
+# ── Bug 9: tenant teaching must preserve global bootstrap fallback ─────
 
 
 class TestTeachUpsertContext:
-    """Mappings keep global scope unless an existing scoped mapping is updated."""
+    """Tenant-scoped mappings override, but never mutate, global defaults."""
 
-    def test_upsert_preserves_global_context_services(self, signal_store):
+    def test_tenant_mapping_preserves_global_context_fallback(self, signal_store):
         signal_store.add_mapping(
             "request_latency",
             "checkout_latency_seconds",
@@ -3236,9 +3282,13 @@ class TestTeachUpsertContext:
             source_type="teach",
         )
 
-        mappings = signal_store.get_mappings_for_signal("request_latency")
-        assert len(mappings) == 1
-        assert mappings[0]["context_services"] == []
+        checkout_mappings = signal_store.get_mappings_for_signal("request_latency", context_service="checkout")
+        payments_mappings = signal_store.get_mappings_for_signal("request_latency", context_service="payments")
+
+        assert len(checkout_mappings) == 1
+        assert checkout_mappings[0]["context_services"] == ["checkout"]
+        assert len(payments_mappings) == 1
+        assert payments_mappings[0]["context_services"] == []
 
     def test_upsert_unions_existing_scoped_context_services(self, signal_store):
         signal_store.add_mapping(

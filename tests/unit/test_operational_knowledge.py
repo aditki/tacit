@@ -743,6 +743,72 @@ def test_reviewed_support_reopens_conflict_resolved_by_correction(tmp_path: Path
     )
 
 
+def test_signal_mapping_allows_multiple_metrics_for_one_signal(tmp_path: Path):
+    service = _service(tmp_path)
+    first = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="latency-metric-a",
+        typed_payload={},
+        proposition={
+            "subject_ref": "concept:latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:metric_a_seconds",
+        },
+        provenance_refs=["catalog:metric-a"],
+    )
+    second = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="latency-metric-b",
+        typed_payload={},
+        proposition={
+            "subject_ref": "concept:latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:metric_b_seconds",
+        },
+        provenance_refs=["catalog:metric-b"],
+    )
+    service.review_candidate(first.id, approved=True, reviewer="operator")
+    service.review_candidate(second.id, approved=True, reviewer="operator")
+
+    conflicts = service.conflicts.analyze("default", first.proposition.proposition_key)
+
+    assert conflicts == []
+
+
+def test_signal_mapping_conflicts_when_one_metric_has_incompatible_meanings(tmp_path: Path):
+    service = _service(tmp_path)
+    first = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="latency-shared-metric",
+        typed_payload={},
+        proposition={
+            "subject_ref": "concept:latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:shared_metric_seconds",
+        },
+        provenance_refs=["catalog:latency"],
+    )
+    second = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="saturation-shared-metric",
+        typed_payload={},
+        proposition={
+            "subject_ref": "concept:saturation",
+            "predicate": "represented_by",
+            "object_ref": "concept:shared_metric_seconds",
+        },
+        provenance_refs=["catalog:saturation"],
+    )
+    service.review_candidate(first.id, approved=True, reviewer="operator")
+    service.review_candidate(second.id, approved=True, reviewer="operator")
+
+    conflicts = service.conflicts.analyze("default", first.proposition.proposition_key)
+
+    assert len(conflicts) == 1
+    assert conflicts[0].conflict_kind.value == "competing_signal_mapping"
+    assert conflicts[0].resolution_status == ConflictResolutionStatus.UNRESOLVED
+
+
 def test_conflict_scope_analysis_includes_services(tmp_path: Path):
     service = _service(tmp_path)
     first = service.create_candidate(
@@ -752,7 +818,7 @@ def test_conflict_scope_analysis_includes_services(tmp_path: Path):
         proposition={
             "subject_ref": "concept:latency",
             "predicate": "represented_by",
-            "object_ref": "concept:checkout_latency_seconds",
+            "object_ref": "concept:shared_metric_seconds",
         },
         scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
         provenance_refs=["catalog:checkout"],
@@ -762,9 +828,9 @@ def test_conflict_scope_analysis_includes_services(tmp_path: Path):
         payload_ref="payment-signal",
         typed_payload={},
         proposition={
-            "subject_ref": "concept:latency",
+            "subject_ref": "concept:saturation",
             "predicate": "represented_by",
-            "object_ref": "concept:payment_latency_seconds",
+            "object_ref": "concept:shared_metric_seconds",
         },
         scope=KnowledgeScope(service_refs=["entity:service:payment"]),
         provenance_refs=["catalog:payment"],
@@ -788,7 +854,7 @@ def test_conflict_scope_analysis_includes_archetypes(tmp_path: Path):
         proposition={
             "subject_ref": "concept:latency",
             "predicate": "represented_by",
-            "object_ref": "concept:request_latency_seconds",
+            "object_ref": "concept:shared_metric_seconds",
         },
         scope=KnowledgeScope(
             service_refs=["entity:service:checkout"],
@@ -801,9 +867,9 @@ def test_conflict_scope_analysis_includes_archetypes(tmp_path: Path):
         payload_ref="queue-signal",
         typed_payload={},
         proposition={
-            "subject_ref": "concept:latency",
+            "subject_ref": "concept:queue-pressure",
             "predicate": "represented_by",
-            "object_ref": "concept:queue_age_seconds",
+            "object_ref": "concept:shared_metric_seconds",
         },
         scope=KnowledgeScope(
             service_refs=["entity:service:checkout"],

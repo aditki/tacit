@@ -191,7 +191,8 @@ class GrafanaBackend:
                 break
 
             previous_count = len(out)
-            for item in dashboards:
+            page_truncated = False
+            for index, item in enumerate(dashboards):
                 uid = item.get("uid") if isinstance(item, dict) else ""
                 if not uid or uid in seen:
                     continue
@@ -206,9 +207,10 @@ class GrafanaBackend:
                     }
                 )
                 if len(out) >= limit:
+                    page_truncated = index < len(dashboards) - 1
                     break
 
-            if len(dashboards) < page_limit:
+            if len(dashboards) < page_limit and not page_truncated:
                 self.last_dashboard_list_complete = True
                 break
             if len(out) == previous_count:

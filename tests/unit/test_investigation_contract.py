@@ -1217,6 +1217,21 @@ def test_legacy_migration_and_assessment_bundle_are_portable(tmp_path):
     assert {"manifest.json", "contract.json", "expected_outcomes.json", "revisions.json"} <= names
 
 
+def test_legacy_migration_preserves_the_investigation_row_tenant(tmp_path):
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+    )
+    investigation_id = store.start("Legacy tenant investigation", tenant_id="tenant-a")
+    store.finish(investigation_id, status="success")
+
+    migrated = store.migrate_legacy_investigation(investigation_id)
+
+    assert migrated is not None
+    assert migrated.request.scope.tenant_id == "tenant-a"
+    assert store.get(investigation_id)["tenant_id"] == "tenant-a"
+
+
 def test_assessment_bundle_excludes_revisions_newer_than_the_export(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
@@ -2328,7 +2343,7 @@ def test_contract_api_rejects_unsupported_schema_in_history(tmp_path, monkeypatc
 
 def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch):
     store = InvestigationStore(db_path=tmp_path / "history.db")
-    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
     tenant_request = draft.request.model_copy(
         update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}
@@ -2377,7 +2392,7 @@ def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch
 
 def test_refresh_rejects_investigation_outside_configured_tenant(tmp_path, monkeypatch):
     store = InvestigationStore(db_path=tmp_path / "history.db")
-    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
     tenant_request = draft.request.model_copy(
         update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}
@@ -2411,7 +2426,7 @@ def test_refresh_rejects_investigation_outside_configured_tenant(tmp_path, monke
 
 def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, monkeypatch):
     store = InvestigationStore(db_path=tmp_path / "history.db")
-    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
     tenant_request = draft.request.model_copy(
         update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}

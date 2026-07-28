@@ -594,6 +594,26 @@ def test_grafana_backend_list_dashboards_paginates_search_results():
     print("[PASS] test_grafana_backend_list_dashboards_paginates_search_results")
 
 
+def test_grafana_dashboard_limit_does_not_claim_a_complete_crawl():
+    from tacit.backends.grafana import GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE, GrafanaBackend
+
+    first_page = [{"uid": f"dash-{index}"} for index in range(GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE)]
+    second_page = [{"uid": f"dash-{GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE + index}"} for index in range(200)]
+    mock_client = AsyncMock()
+    mock_client._get.side_effect = [first_page, second_page]
+    backend = GrafanaBackend(client=mock_client)
+
+    dashboards = asyncio.run(backend.list_dashboards(limit=600))
+
+    assert len(dashboards) == 600
+    assert backend.last_dashboard_list_complete is False
+    assert mock_client._get.call_args_list[1].kwargs["params"] == {
+        "type": "dash-db",
+        "limit": GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE,
+        "page": 2,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 14. GrafanaBackend — discover returns empty when no searchable datasources
 # ═══════════════════════════════════════════════════════════════════════════

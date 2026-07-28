@@ -549,7 +549,10 @@ class InvestigationContractAssembler:
                 normalized_intent=str(record.get("problem_type", "")),
                 requester=str(record.get("user_id") or record.get("channel_id") or ""),
                 time_window=TimeWindow(label=str(record.get("timerange", ""))),
-                scope=InvestigationScope(services=list(record.get("intent_services") or [])),
+                scope=InvestigationScope(
+                    tenant_id=str(record.get("tenant_id") or "default"),
+                    services=list(record.get("intent_services") or []),
+                ),
             ),
             operational_ir=OperationalIR(
                 summary=str(record.get("intent_summary", "")),

@@ -6,6 +6,9 @@ from pathlib import Path
 
 DEFAULT_DB_PATH = Path("data/tacit_signals.db")
 SQLITE_BUSY_TIMEOUT_MS = 30_000
+# Invalid as an API tenant id, so global defaults cannot be selected or mutated
+# through tenant-scoped product paths.
+GLOBAL_BOOTSTRAP_TENANT_ID = "*bootstrap*"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS signal_types (

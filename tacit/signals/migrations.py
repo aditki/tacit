@@ -8,7 +8,7 @@ from contextlib import contextmanager
 
 import structlog
 
-from tacit.signals.schema import FTS_SCHEMA_SQL, SCHEMA_SQL
+from tacit.signals.schema import FTS_SCHEMA_SQL, GLOBAL_BOOTSTRAP_TENANT_ID, SCHEMA_SQL
 
 logger = structlog.get_logger()
 
@@ -53,6 +53,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_artifact_tenant_scope(conn)
     ensure_mapping_columns(conn)
     ensure_mapping_tenant_scope(conn)
+    ensure_global_bootstrap_mapping_scope(conn)
     ensure_rejected_candidate_tenant_scope(conn)
 
 
@@ -149,6 +150,23 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern)")
         conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_tenant_signal
                ON signal_metric_mappings(tenant_id, signal_type)""")
+
+
+def ensure_global_bootstrap_mapping_scope(conn: sqlite3.Connection) -> None:
+    """Move legacy global defaults out of the real ``default`` tenant."""
+    moved = conn.execute(
+        """UPDATE OR IGNORE signal_metric_mappings SET tenant_id=?
+           WHERE tenant_id='default' AND source_type='bootstrap'""",
+        (GLOBAL_BOOTSTRAP_TENANT_ID,),
+    ).rowcount
+    deduplicated = conn.execute("""DELETE FROM signal_metric_mappings
+           WHERE tenant_id='default' AND source_type='bootstrap'""").rowcount
+    if moved or deduplicated:
+        logger.info(
+            "bootstrap_signal_mappings_migrated",
+            moved=moved,
+            deduplicated=deduplicated,
+        )
 
 
 def ensure_ingested_dashboard_backend_scope(conn: sqlite3.Connection) -> None:
