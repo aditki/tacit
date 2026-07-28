@@ -19,7 +19,7 @@ from typing import Any
 
 import structlog
 
-from tacit.config import settings
+from tacit.config import Settings, settings
 
 _UID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")
 
@@ -48,7 +48,8 @@ def _db_path() -> Path:
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS dashboard_provenance (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    dashboard_uid   TEXT NOT NULL UNIQUE,
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
+    dashboard_uid   TEXT NOT NULL,
     prompt          TEXT NOT NULL,
     problem_type    TEXT NOT NULL DEFAULT '',
     archetypes      TEXT NOT NULL DEFAULT '[]',   -- JSON array of {type, confidence}
@@ -58,11 +59,13 @@ CREATE TABLE IF NOT EXISTS dashboard_provenance (
     dashboard_url   TEXT NOT NULL DEFAULT '',
     user_id         TEXT NOT NULL DEFAULT '',
     channel_id      TEXT NOT NULL DEFAULT '',
-    created_at      REAL NOT NULL
+    created_at      REAL NOT NULL,
+    UNIQUE (tenant_id, dashboard_uid)
 );
 
 CREATE TABLE IF NOT EXISTS feedback (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
     dashboard_uid   TEXT NOT NULL,
     reviewer        TEXT NOT NULL DEFAULT '',      -- user id or email
     symptom_visibility  INTEGER CHECK(symptom_visibility BETWEEN 1 AND 5),
@@ -72,19 +75,23 @@ CREATE TABLE IF NOT EXISTS feedback (
     overall_useful  INTEGER CHECK(overall_useful IN (0, 1)),
     comment         TEXT NOT NULL DEFAULT '',
     created_at      REAL NOT NULL,
-    FOREIGN KEY (dashboard_uid) REFERENCES dashboard_provenance(dashboard_uid)
+    FOREIGN KEY (tenant_id, dashboard_uid)
+        REFERENCES dashboard_provenance(tenant_id, dashboard_uid)
 );
 
-CREATE INDEX IF NOT EXISTS idx_provenance_uid ON dashboard_provenance(dashboard_uid);
-CREATE INDEX IF NOT EXISTS idx_feedback_uid ON feedback(dashboard_uid);
+CREATE INDEX IF NOT EXISTS idx_provenance_tenant_uid
+    ON dashboard_provenance(tenant_id, dashboard_uid);
+CREATE INDEX IF NOT EXISTS idx_feedback_tenant_uid
+    ON feedback(tenant_id, dashboard_uid);
 """
 
 
 class FeedbackStore:
     """SQLite-backed store for dashboard provenance and human feedback."""
 
-    def __init__(self, db_path: Path | None = None):
+    def __init__(self, db_path: Path | None = None, *, runtime_settings: Settings | None = None):
         self._db_path = db_path or _db_path()
+        self._settings = runtime_settings or settings
         self._ensure_schema()
 
     @contextmanager
@@ -104,8 +111,114 @@ class FeedbackStore:
 
     def _ensure_schema(self):
         with self._conn() as conn:
+            if self._tenant_migration_required(conn):
+                self._migrate_tenant_scope(conn)
             conn.executescript(_SCHEMA_SQL)
         logger.info("feedback_store_init", db_path=str(self._db_path))
+
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+        return (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            ).fetchone()
+            is not None
+        )
+
+    @classmethod
+    def _tenant_migration_required(cls, conn: sqlite3.Connection) -> bool:
+        for table_name in ("dashboard_provenance", "feedback"):
+            if not cls._table_exists(conn, table_name):
+                continue
+            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+            if "tenant_id" not in columns:
+                return True
+        return False
+
+    def _migrate_tenant_scope(self, conn: sqlite3.Connection) -> None:
+        """Atomically rebuild legacy feedback tables around tenant-scoped keys."""
+        configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+        legacy_tenant = configured_tenant if configured_tenant != "*" else "default"
+        has_provenance = self._table_exists(conn, "dashboard_provenance")
+        has_feedback = self._table_exists(conn, "feedback")
+        provenance_columns = (
+            {row[1] for row in conn.execute("PRAGMA table_info(dashboard_provenance)")} if has_provenance else set()
+        )
+        feedback_columns = {row[1] for row in conn.execute("PRAGMA table_info(feedback)")} if has_feedback else set()
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if has_feedback:
+                conn.execute("ALTER TABLE feedback RENAME TO feedback_legacy_tenant")
+            if has_provenance:
+                conn.execute("ALTER TABLE dashboard_provenance RENAME TO dashboard_provenance_legacy_tenant")
+            conn.execute("""CREATE TABLE dashboard_provenance (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       tenant_id TEXT NOT NULL DEFAULT 'default',
+                       dashboard_uid TEXT NOT NULL,
+                       prompt TEXT NOT NULL,
+                       problem_type TEXT NOT NULL DEFAULT '',
+                       archetypes TEXT NOT NULL DEFAULT '[]',
+                       metrics_used TEXT NOT NULL DEFAULT '[]',
+                       panel_count INTEGER NOT NULL DEFAULT 0,
+                       path_used TEXT NOT NULL DEFAULT '',
+                       dashboard_url TEXT NOT NULL DEFAULT '',
+                       user_id TEXT NOT NULL DEFAULT '',
+                       channel_id TEXT NOT NULL DEFAULT '',
+                       created_at REAL NOT NULL,
+                       UNIQUE (tenant_id, dashboard_uid)
+                   )""")
+            conn.execute("""CREATE TABLE feedback (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       tenant_id TEXT NOT NULL DEFAULT 'default',
+                       dashboard_uid TEXT NOT NULL,
+                       reviewer TEXT NOT NULL DEFAULT '',
+                       symptom_visibility INTEGER CHECK(symptom_visibility BETWEEN 1 AND 5),
+                       root_cause_support INTEGER CHECK(root_cause_support BETWEEN 1 AND 5),
+                       noise_level INTEGER CHECK(noise_level BETWEEN 1 AND 5),
+                       investigation_speed INTEGER CHECK(investigation_speed BETWEEN 1 AND 5),
+                       overall_useful INTEGER CHECK(overall_useful IN (0, 1)),
+                       comment TEXT NOT NULL DEFAULT '',
+                       created_at REAL NOT NULL,
+                       FOREIGN KEY (tenant_id, dashboard_uid)
+                           REFERENCES dashboard_provenance(tenant_id, dashboard_uid)
+                   )""")
+            if has_provenance:
+                tenant_expression = "COALESCE(NULLIF(tenant_id, ''), ?)" if "tenant_id" in provenance_columns else "?"
+                conn.execute(
+                    f"""INSERT INTO dashboard_provenance
+                           (id, tenant_id, dashboard_uid, prompt, problem_type, archetypes,
+                            metrics_used, panel_count, path_used, dashboard_url, user_id,
+                            channel_id, created_at)
+                         SELECT id, {tenant_expression}, dashboard_uid, prompt, problem_type,
+                                archetypes, metrics_used, panel_count, path_used, dashboard_url,
+                                user_id, channel_id, created_at
+                         FROM dashboard_provenance_legacy_tenant""",
+                    (legacy_tenant,),
+                )
+            if has_feedback:
+                tenant_expression = "COALESCE(NULLIF(tenant_id, ''), ?)" if "tenant_id" in feedback_columns else "?"
+                conn.execute(
+                    f"""INSERT INTO feedback
+                           (id, tenant_id, dashboard_uid, reviewer, symptom_visibility,
+                            root_cause_support, noise_level, investigation_speed,
+                            overall_useful, comment, created_at)
+                         SELECT id, {tenant_expression}, dashboard_uid, reviewer,
+                                symptom_visibility, root_cause_support, noise_level,
+                                investigation_speed, overall_useful, comment, created_at
+                         FROM feedback_legacy_tenant""",
+                    (legacy_tenant,),
+                )
+            if has_feedback:
+                conn.execute("DROP TABLE feedback_legacy_tenant")
+            if has_provenance:
+                conn.execute("DROP TABLE dashboard_provenance_legacy_tenant")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        logger.info("feedback_tenant_scope_migrated", tenant_id=legacy_tenant)
 
     # ── Provenance ────────────────────────────────────────────────────────
 
@@ -122,17 +235,30 @@ class FeedbackStore:
         dashboard_url: str = "",
         user_id: str = "",
         channel_id: str = "",
+        tenant_id: str = "default",
     ) -> None:
         """Store dashboard generation provenance."""
         dashboard_uid = _sanitize_uid(dashboard_uid)
         with self._conn() as conn:
             conn.execute(
-                """INSERT OR REPLACE INTO dashboard_provenance
-                   (dashboard_uid, prompt, problem_type, archetypes,
+                """INSERT INTO dashboard_provenance
+                   (tenant_id, dashboard_uid, prompt, problem_type, archetypes,
                     metrics_used, panel_count, path_used, dashboard_url,
                     user_id, channel_id, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(tenant_id, dashboard_uid) DO UPDATE SET
+                       prompt=excluded.prompt,
+                       problem_type=excluded.problem_type,
+                       archetypes=excluded.archetypes,
+                       metrics_used=excluded.metrics_used,
+                       panel_count=excluded.panel_count,
+                       path_used=excluded.path_used,
+                       dashboard_url=excluded.dashboard_url,
+                       user_id=excluded.user_id,
+                       channel_id=excluded.channel_id,
+                       created_at=excluded.created_at""",
                 (
+                    tenant_id,
                     dashboard_uid,
                     prompt,
                     problem_type,
@@ -146,15 +272,15 @@ class FeedbackStore:
                     time.time(),
                 ),
             )
-        logger.info("provenance_recorded", dashboard_uid=dashboard_uid)
+        logger.info("provenance_recorded", dashboard_uid=dashboard_uid, tenant_id=tenant_id)
 
-    def get_provenance(self, dashboard_uid: str) -> dict[str, Any] | None:
+    def get_provenance(self, dashboard_uid: str, *, tenant_id: str = "default") -> dict[str, Any] | None:
         """Retrieve provenance for a dashboard."""
         dashboard_uid = _sanitize_uid(dashboard_uid)
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT * FROM dashboard_provenance WHERE dashboard_uid = ?",
-                (dashboard_uid,),
+                "SELECT * FROM dashboard_provenance WHERE tenant_id = ? AND dashboard_uid = ?",
+                (tenant_id, dashboard_uid),
             ).fetchone()
         if row is None:
             return None
@@ -175,16 +301,18 @@ class FeedbackStore:
         overall_useful: bool | None = None,
         comment: str = "",
         reviewer: str = "",
+        tenant_id: str = "default",
     ) -> int:
         """Store human feedback for a dashboard. Returns feedback id."""
         dashboard_uid = _sanitize_uid(dashboard_uid)
         with self._conn() as conn:
             cursor = conn.execute(
                 """INSERT INTO feedback
-                   (dashboard_uid, reviewer, symptom_visibility, root_cause_support,
+                   (tenant_id, dashboard_uid, reviewer, symptom_visibility, root_cause_support,
                     noise_level, investigation_speed, overall_useful, comment, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
+                    tenant_id,
                     dashboard_uid,
                     reviewer,
                     symptom_visibility,
@@ -197,23 +325,32 @@ class FeedbackStore:
                 ),
             )
             feedback_id = cursor.lastrowid
-        logger.info("feedback_submitted", dashboard_uid=dashboard_uid, feedback_id=feedback_id)
+        logger.info(
+            "feedback_submitted",
+            dashboard_uid=dashboard_uid,
+            feedback_id=feedback_id,
+            tenant_id=tenant_id,
+        )
         return feedback_id
 
-    def get_feedback(self, dashboard_uid: str) -> list[dict[str, Any]]:
+    def get_feedback(self, dashboard_uid: str, *, tenant_id: str = "default") -> list[dict[str, Any]]:
         """Retrieve all feedback for a dashboard."""
         dashboard_uid = _sanitize_uid(dashboard_uid)
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM feedback WHERE dashboard_uid = ? ORDER BY created_at DESC",
-                (dashboard_uid,),
+                """SELECT * FROM feedback
+                   WHERE tenant_id = ? AND dashboard_uid = ? ORDER BY created_at DESC""",
+                (tenant_id, dashboard_uid),
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_aggregate_stats(self) -> dict[str, Any]:
+    def get_aggregate_stats(self, *, tenant_id: str = "default") -> dict[str, Any]:
         """Aggregate feedback statistics across all dashboards."""
         with self._conn() as conn:
-            total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+            total = conn.execute(
+                "SELECT COUNT(*) FROM feedback WHERE tenant_id = ?",
+                (tenant_id,),
+            ).fetchone()[0]
             if total == 0:
                 return {
                     "total_feedback": 0,
@@ -225,16 +362,18 @@ class FeedbackStore:
                     "avg_investigation_speed": None,
                 }
 
-            row = conn.execute("""
-                SELECT
-                    COUNT(*) as total,
-                    AVG(symptom_visibility) as avg_symptom,
-                    AVG(root_cause_support) as avg_root_cause,
-                    AVG(noise_level) as avg_noise,
-                    AVG(investigation_speed) as avg_speed,
-                    AVG(CAST(overall_useful AS FLOAT)) as useful_rate
-                FROM feedback
-            """).fetchone()
+            row = conn.execute(
+                """SELECT
+                       COUNT(*) as total,
+                       AVG(symptom_visibility) as avg_symptom,
+                       AVG(root_cause_support) as avg_root_cause,
+                       AVG(noise_level) as avg_noise,
+                       AVG(investigation_speed) as avg_speed,
+                       AVG(CAST(overall_useful AS FLOAT)) as useful_rate
+                   FROM feedback
+                   WHERE tenant_id = ?""",
+                (tenant_id,),
+            ).fetchone()
 
             return {
                 "total_feedback": row["total"],
@@ -243,12 +382,15 @@ class FeedbackStore:
                 "avg_noise_level": round(row["avg_noise"] or 0, 2),
                 "avg_investigation_speed": round(row["avg_speed"] or 0, 2),
                 "useful_rate": round(row["useful_rate"] or 0, 3),
-                "total_dashboards": conn.execute("SELECT COUNT(DISTINCT dashboard_uid) FROM feedback").fetchone()[0],
+                "total_dashboards": conn.execute(
+                    "SELECT COUNT(DISTINCT dashboard_uid) FROM feedback WHERE tenant_id = ?",
+                    (tenant_id,),
+                ).fetchone()[0],
             }
 
     # ── Feedback Analysis (closes the loop) ───────────────────────────
 
-    def analyze(self) -> dict[str, Any]:
+    def analyze(self, *, tenant_id: str = "default") -> dict[str, Any]:
         """Analyze feedback to produce actionable improvement signals.
 
         Returns a report with:
@@ -261,27 +403,33 @@ class FeedbackStore:
         - recommendations: ordered list of concrete actions
         """
         with self._conn() as conn:
-            total = conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+            total = conn.execute(
+                "SELECT COUNT(*) FROM feedback WHERE tenant_id = ?",
+                (tenant_id,),
+            ).fetchone()[0]
             if total == 0:
                 return {"status": "no_feedback", "recommendations": []}
 
             report: dict[str, Any] = {"total_feedback": total}
 
             # ── Per-archetype quality ──────────────────────────────────
-            rows = conn.execute("""
-                SELECT
-                    p.problem_type,
-                    COUNT(*) as n,
-                    AVG(f.symptom_visibility) as avg_symptom,
-                    AVG(f.root_cause_support) as avg_root_cause,
-                    AVG(f.noise_level) as avg_noise,
-                    AVG(f.investigation_speed) as avg_speed,
-                    AVG(CAST(f.overall_useful AS FLOAT)) as useful_rate
-                FROM feedback f
-                JOIN dashboard_provenance p ON f.dashboard_uid = p.dashboard_uid
-                GROUP BY p.problem_type
-                ORDER BY useful_rate ASC
-            """).fetchall()
+            rows = conn.execute(
+                """SELECT
+                       p.problem_type,
+                       COUNT(*) as n,
+                       AVG(f.symptom_visibility) as avg_symptom,
+                       AVG(f.root_cause_support) as avg_root_cause,
+                       AVG(f.noise_level) as avg_noise,
+                       AVG(f.investigation_speed) as avg_speed,
+                       AVG(CAST(f.overall_useful AS FLOAT)) as useful_rate
+                   FROM feedback f
+                   JOIN dashboard_provenance p
+                     ON f.tenant_id = p.tenant_id AND f.dashboard_uid = p.dashboard_uid
+                   WHERE f.tenant_id = ?
+                   GROUP BY p.problem_type
+                   ORDER BY useful_rate ASC""",
+                (tenant_id,),
+            ).fetchall()
             report["per_archetype_quality"] = [
                 {
                     "archetype": r["problem_type"],
@@ -296,15 +444,18 @@ class FeedbackStore:
             ]
 
             # ── Noisy dashboards (noise_level <= 2) ───────────────────
-            rows = conn.execute("""
-                SELECT p.dashboard_uid, p.prompt, p.problem_type,
-                       p.metrics_used, f.noise_level, f.comment
-                FROM feedback f
-                JOIN dashboard_provenance p ON f.dashboard_uid = p.dashboard_uid
-                WHERE f.noise_level IS NOT NULL AND f.noise_level <= 2
-                ORDER BY f.noise_level ASC
-                LIMIT 20
-            """).fetchall()
+            rows = conn.execute(
+                """SELECT p.dashboard_uid, p.prompt, p.problem_type,
+                          p.metrics_used, f.noise_level, f.comment
+                   FROM feedback f
+                   JOIN dashboard_provenance p
+                     ON f.tenant_id = p.tenant_id AND f.dashboard_uid = p.dashboard_uid
+                   WHERE f.tenant_id = ?
+                     AND f.noise_level IS NOT NULL AND f.noise_level <= 2
+                   ORDER BY f.noise_level ASC
+                   LIMIT 20""",
+                (tenant_id,),
+            ).fetchall()
             report["noisy_dashboards"] = [
                 {
                     "dashboard_uid": r["dashboard_uid"],
@@ -318,15 +469,18 @@ class FeedbackStore:
             ]
 
             # ── Low symptom visibility (symptom <= 2) ─────────────────
-            rows = conn.execute("""
-                SELECT p.dashboard_uid, p.prompt, p.problem_type,
-                       p.metrics_used, f.symptom_visibility, f.comment
-                FROM feedback f
-                JOIN dashboard_provenance p ON f.dashboard_uid = p.dashboard_uid
-                WHERE f.symptom_visibility IS NOT NULL AND f.symptom_visibility <= 2
-                ORDER BY f.symptom_visibility ASC
-                LIMIT 20
-            """).fetchall()
+            rows = conn.execute(
+                """SELECT p.dashboard_uid, p.prompt, p.problem_type,
+                          p.metrics_used, f.symptom_visibility, f.comment
+                   FROM feedback f
+                   JOIN dashboard_provenance p
+                     ON f.tenant_id = p.tenant_id AND f.dashboard_uid = p.dashboard_uid
+                   WHERE f.tenant_id = ?
+                     AND f.symptom_visibility IS NOT NULL AND f.symptom_visibility <= 2
+                   ORDER BY f.symptom_visibility ASC
+                   LIMIT 20""",
+                (tenant_id,),
+            ).fetchall()
             report["low_symptom_dashboards"] = [
                 {
                     "dashboard_uid": r["dashboard_uid"],
@@ -340,14 +494,16 @@ class FeedbackStore:
             ]
 
             # ── Archetype gaps (freeform path but useful) ─────────────
-            rows = conn.execute("""
-                SELECT p.dashboard_uid, p.prompt, p.problem_type,
-                       f.overall_useful, f.comment
-                FROM feedback f
-                JOIN dashboard_provenance p ON f.dashboard_uid = p.dashboard_uid
-                WHERE p.path_used = 'freeform' AND f.overall_useful = 1
-                LIMIT 20
-            """).fetchall()
+            rows = conn.execute(
+                """SELECT p.dashboard_uid, p.prompt, p.problem_type,
+                          f.overall_useful, f.comment
+                   FROM feedback f
+                   JOIN dashboard_provenance p
+                     ON f.tenant_id = p.tenant_id AND f.dashboard_uid = p.dashboard_uid
+                   WHERE f.tenant_id = ? AND p.path_used = 'freeform' AND f.overall_useful = 1
+                   LIMIT 20""",
+                (tenant_id,),
+            ).fetchall()
             report["archetype_gaps"] = [
                 {
                     "prompt": r["prompt"][:120],
@@ -362,12 +518,14 @@ class FeedbackStore:
             good_metrics: dict[str, int] = {}
             bad_metrics: dict[str, int] = {}
 
-            rows = conn.execute("""
-                SELECT p.metrics_used, f.overall_useful
-                FROM feedback f
-                JOIN dashboard_provenance p ON f.dashboard_uid = p.dashboard_uid
-                WHERE f.overall_useful IS NOT NULL
-            """).fetchall()
+            rows = conn.execute(
+                """SELECT p.metrics_used, f.overall_useful
+                   FROM feedback f
+                   JOIN dashboard_provenance p
+                     ON f.tenant_id = p.tenant_id AND f.dashboard_uid = p.dashboard_uid
+                   WHERE f.tenant_id = ? AND f.overall_useful IS NOT NULL""",
+                (tenant_id,),
+            ).fetchall()
             for r in rows:
                 metrics = json.loads(r["metrics_used"])
                 bucket = good_metrics if r["overall_useful"] else bad_metrics
@@ -394,13 +552,15 @@ class FeedbackStore:
 
             # ── Confidence calibration ────────────────────────────────
             # Do high-confidence archetypes actually produce better dashboards?
-            rows = conn.execute("""
-                SELECT p.archetypes, f.overall_useful,
-                       f.symptom_visibility, f.noise_level
-                FROM feedback f
-                JOIN dashboard_provenance p ON f.dashboard_uid = p.dashboard_uid
-                WHERE f.overall_useful IS NOT NULL
-            """).fetchall()
+            rows = conn.execute(
+                """SELECT p.archetypes, f.overall_useful,
+                          f.symptom_visibility, f.noise_level
+                   FROM feedback f
+                   JOIN dashboard_provenance p
+                     ON f.tenant_id = p.tenant_id AND f.dashboard_uid = p.dashboard_uid
+                   WHERE f.tenant_id = ? AND f.overall_useful IS NOT NULL""",
+                (tenant_id,),
+            ).fetchall()
 
             high_conf: list[dict[str, Any]] = []
             low_conf: list[dict[str, Any]] = []

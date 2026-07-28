@@ -705,7 +705,7 @@
         statusEl.style.color = '#9ca3af';
         const resp = await fetch(`${BASE}/api/v1/feedback`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: knowledgeHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify(body),
         });
         if (resp.ok) {
@@ -729,8 +729,8 @@
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
         const [stats, analysis] = await Promise.all([
-          fetchJson(`${BASE}/api/v1/feedback/stats`),
-          fetchJson(`${BASE}/api/v1/feedback/analysis`),
+          fetchJson(`${BASE}/api/v1/feedback/stats`, { headers: knowledgeHeaders() }),
+          fetchJson(`${BASE}/api/v1/feedback/analysis`, { headers: knowledgeHeaders() }),
         ]);
 
         if (!stats.total_feedback && stats.total_feedback !== 0) {

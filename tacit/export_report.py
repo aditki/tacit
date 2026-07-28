@@ -426,7 +426,12 @@ def redact_text(value: str) -> str:
     return value
 
 
-def build_assessment_report(*, anonymous: bool, stores: Any | None = None) -> AssessmentReport:
+def build_assessment_report(
+    *,
+    anonymous: bool,
+    stores: Any | None = None,
+    tenant_id: str | None = None,
+) -> AssessmentReport:
     """Build the report sections from local Tacit stores."""
     if stores is None:
         from tacit.config import settings
@@ -434,19 +439,29 @@ def build_assessment_report(*, anonymous: bool, stores: Any | None = None) -> As
 
         stores = RuntimeStores(settings)
 
+    from fastapi import HTTPException
+
+    from tacit.api.security import resolve_knowledge_tenant
+
+    configured_tenant = str(getattr(stores.settings, "knowledge_tenant_id", "default") or "default")
+    try:
+        selected_tenant = resolve_knowledge_tenant(configured_tenant, tenant_id)
+    except HTTPException as exc:
+        raise ValueError(str(exc.detail)) from exc
+
     generated_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     history_store = stores.history()
     feedback_store = stores.feedback()
     signal_store = stores.signals()
 
-    investigations = _collect_recent_investigations(history_store)
-    history_stats = history_store.stats()
-    feedback_stats = feedback_store.get_aggregate_stats()
-    feedback_analysis = feedback_store.analyze()
-    signal_stats = signal_store.stats()
-    dashboards = signal_store.list_ingested_dashboards(limit=EXPORT_ROW_LIMIT)
-    alerts = signal_store.list_ingested_alerts(limit=EXPORT_ROW_LIMIT)
-    learned_artifacts = signal_store.list_learned_artifacts(limit=EXPORT_ROW_LIMIT)
+    investigations = _collect_recent_investigations(history_store, tenant_id=selected_tenant)
+    history_stats = history_store.stats(tenant_id=selected_tenant)
+    feedback_stats = feedback_store.get_aggregate_stats(tenant_id=selected_tenant)
+    feedback_analysis = feedback_store.analyze(tenant_id=selected_tenant)
+    signal_stats = signal_store.stats(tenant_id=selected_tenant)
+    dashboards = signal_store.list_ingested_dashboards(limit=EXPORT_ROW_LIMIT, tenant_id=selected_tenant)
+    alerts = signal_store.list_ingested_alerts(limit=EXPORT_ROW_LIMIT, tenant_id=selected_tenant)
+    learned_artifacts = signal_store.list_learned_artifacts(limit=EXPORT_ROW_LIMIT, tenant_id=selected_tenant)
     collection = _collection_metadata(
         investigations=investigations,
         history_stats=history_stats,
@@ -491,9 +506,10 @@ def export_assessment_report(
     anonymous: bool = False,
     validate: bool = False,
     stores: Any | None = None,
+    tenant_id: str | None = None,
 ) -> ExportResult:
     """Write a tar.gz assessment bundle and return export metadata."""
-    report = build_assessment_report(anonymous=anonymous, stores=stores)
+    report = build_assessment_report(anonymous=anonymous, stores=stores, tenant_id=tenant_id)
     if anonymous:
         report = ReportAnonymizer().anonymize_report(report)
         from tacit.evaluation_summary import build_evaluation_summary
@@ -825,12 +841,12 @@ def _anonymous_tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo:
     return info
 
 
-def _collect_recent_investigations(history_store: Any) -> list[dict[str, Any]]:
+def _collect_recent_investigations(history_store: Any, *, tenant_id: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     offset = 0
     while len(out) < EXPORT_ROW_LIMIT:
         limit = min(EXPORT_PAGE_SIZE, EXPORT_ROW_LIMIT - len(out))
-        page = history_store.list_recent(limit=limit, offset=offset)
+        page = history_store.list_recent(limit=limit, offset=offset, tenant_id=tenant_id)
         if not page:
             break
         out.extend(page)

@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from tacit.config import Settings
 from tacit.export_report import (
     ANONYMOUS_BUNDLE_FILES,
     ReportAnonymizer,
+    build_assessment_report,
     export_assessment_report,
     validate_report_for_leakage,
 )
@@ -24,7 +27,7 @@ SENSITIVE_STRINGS = (
 
 
 class FakeHistoryStore:
-    def stats(self):
+    def stats(self, *, tenant_id=None):
         return {
             "total": 1,
             "succeeded": 1,
@@ -37,7 +40,7 @@ class FakeHistoryStore:
             "freeform_path": 0,
         }
 
-    def list_recent(self, limit=50, offset=0, status=None, user_id=None):
+    def list_recent(self, limit=50, offset=0, status=None, user_id=None, tenant_id=None):
         return [
             {
                 "id": "inv-1",
@@ -61,7 +64,7 @@ class FakeHistoryStore:
 
 
 class FakeFeedbackStore:
-    def get_aggregate_stats(self):
+    def get_aggregate_stats(self, *, tenant_id="default"):
         return {
             "total_feedback": 1,
             "total_dashboards": 1,
@@ -72,7 +75,7 @@ class FakeFeedbackStore:
             "avg_investigation_speed": 5,
         }
 
-    def analyze(self):
+    def analyze(self, *, tenant_id="default"):
         return {
             "total_feedback": 1,
             "recommendations": ["raw recommendation mentioning https://internal.example.company"],
@@ -81,7 +84,7 @@ class FakeFeedbackStore:
 
 
 class FakeSignalStore:
-    def stats(self):
+    def stats(self, *, tenant_id="default"):
         return {
             "signal_types": 2,
             "metric_mappings": 3,
@@ -95,7 +98,7 @@ class FakeSignalStore:
             "signals_by_category": {"latency": 1, "prod-us-east-1-payments-vip": 1},
         }
 
-    def list_ingested_dashboards(self, status=None, limit=50):
+    def list_ingested_dashboards(self, status=None, limit=50, *, tenant_id="default"):
         return [
             {
                 "dashboard_uid": "checkout-dashboard",
@@ -108,7 +111,7 @@ class FakeSignalStore:
             }
         ]
 
-    def list_ingested_alerts(self, status=None, limit=50):
+    def list_ingested_alerts(self, status=None, limit=50, *, tenant_id="default"):
         return [
             {
                 "alert_uid": "checkout-alert",
@@ -120,7 +123,7 @@ class FakeSignalStore:
             }
         ]
 
-    def list_learned_artifacts(self, *, artifact_type=None, limit=50):
+    def list_learned_artifacts(self, *, tenant_id="default", artifact_type=None, limit=50):
         return [
             {
                 "artifact_id": "runbook-1",
@@ -136,6 +139,61 @@ def fake_stores(monkeypatch):
     monkeypatch.setattr("tacit.history.get_investigation_store", lambda: FakeHistoryStore())
     monkeypatch.setattr("tacit.feedback.get_feedback_store", lambda: FakeFeedbackStore())
     monkeypatch.setattr("tacit.signals.get_signal_store", lambda: FakeSignalStore())
+
+
+def test_assessment_report_scopes_every_store_to_the_configured_tenant():
+    seen: list[tuple[str, str | None]] = []
+
+    class ScopedHistoryStore(FakeHistoryStore):
+        def stats(self, *, tenant_id=None):
+            seen.append(("history_stats", tenant_id))
+            return super().stats(tenant_id=tenant_id)
+
+        def list_recent(self, limit=50, offset=0, status=None, user_id=None, tenant_id=None):
+            seen.append(("history_rows", tenant_id))
+            return super().list_recent(limit, offset, status, user_id, tenant_id)
+
+    class ScopedFeedbackStore(FakeFeedbackStore):
+        def get_aggregate_stats(self, *, tenant_id="default"):
+            seen.append(("feedback_stats", tenant_id))
+            return super().get_aggregate_stats(tenant_id=tenant_id)
+
+        def analyze(self, *, tenant_id="default"):
+            seen.append(("feedback_analysis", tenant_id))
+            return super().analyze(tenant_id=tenant_id)
+
+    class ScopedSignalStore(FakeSignalStore):
+        def stats(self, *, tenant_id="default"):
+            seen.append(("signal_stats", tenant_id))
+            return super().stats(tenant_id=tenant_id)
+
+        def list_ingested_dashboards(self, status=None, limit=50, *, tenant_id="default"):
+            seen.append(("dashboards", tenant_id))
+            return super().list_ingested_dashboards(status, limit, tenant_id=tenant_id)
+
+        def list_ingested_alerts(self, status=None, limit=50, *, tenant_id="default"):
+            seen.append(("alerts", tenant_id))
+            return super().list_ingested_alerts(status, limit, tenant_id=tenant_id)
+
+        def list_learned_artifacts(self, *, tenant_id="default", artifact_type=None, limit=50):
+            seen.append(("artifacts", tenant_id))
+            return super().list_learned_artifacts(
+                tenant_id=tenant_id,
+                artifact_type=artifact_type,
+                limit=limit,
+            )
+
+    stores = SimpleNamespace(
+        settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+        history=lambda: ScopedHistoryStore(),
+        feedback=lambda: ScopedFeedbackStore(),
+        signals=lambda: ScopedSignalStore(),
+    )
+
+    build_assessment_report(anonymous=False, stores=stores)
+
+    assert seen
+    assert {tenant_id for _, tenant_id in seen} == {"tenant-a"}
 
 
 def test_anonymous_export_writes_safe_bundle_files(tmp_path: Path, fake_stores):

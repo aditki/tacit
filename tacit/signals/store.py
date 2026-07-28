@@ -1448,30 +1448,31 @@ class SignalStore:
         *,
         tenant_id: str = "default",
         artifact_type: str | None = None,
+        stale: bool | None = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """List learned operational artifacts."""
+        conditions = ["tenant_id = ?"]
+        params: list[Any] = [tenant_id]
+        if artifact_type:
+            conditions.append("artifact_type = ?")
+            params.append(artifact_type)
+        if stale is not None:
+            conditions.append("stale = ?")
+            params.append(int(stale))
+        params.extend([limit, offset])
         with self._conn() as conn:
-            if artifact_type:
-                rows = conn.execute(
-                    """SELECT id, tenant_id, artifact_id, artifact_type, source_vendor, source_instance,
-                              external_id, title, provenance_url, fingerprint,
-                              stale, missing_since, first_seen_at, last_seen_at,
-                              updated_at, created_at
-                       FROM learned_artifacts
-                       WHERE tenant_id = ? AND artifact_type = ? ORDER BY updated_at DESC LIMIT ?""",
-                    (tenant_id, artifact_type, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """SELECT id, tenant_id, artifact_id, artifact_type, source_vendor, source_instance,
-                              external_id, title, provenance_url, fingerprint,
-                              stale, missing_since, first_seen_at, last_seen_at,
-                              updated_at, created_at
-                       FROM learned_artifacts WHERE tenant_id = ?
-                       ORDER BY updated_at DESC LIMIT ?""",
-                    (tenant_id, limit),
-                ).fetchall()
+            rows = conn.execute(
+                f"""SELECT id, tenant_id, artifact_id, artifact_type, source_vendor, source_instance,
+                           external_id, title, provenance_url, fingerprint,
+                           stale, missing_since, first_seen_at, last_seen_at,
+                           updated_at, created_at
+                    FROM learned_artifacts
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+                params,
+            ).fetchall()
         return [_deserialize_learned_artifact(row) for row in rows]
 
     def get_learned_artifact(self, artifact_id: str, *, tenant_id: str = "default") -> dict[str, Any] | None:

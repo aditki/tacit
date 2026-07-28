@@ -5,6 +5,7 @@ from click.testing import CliRunner
 from tacit.cli import cli
 from tacit.config import Settings
 from tacit.dependencies import build_pipeline_dependencies
+from tacit.history import InvestigationStore
 from tacit.runtime_stores import RuntimeStores
 from tacit.signals.store import SignalStore
 
@@ -39,6 +40,26 @@ def test_configured_runtime_owns_and_reuses_all_stores(tmp_path):
     assert stores.signals()._db_path == tmp_path / "state" / "signals.db"
     assert stores.knowledge_repository()._db_path == tmp_path / "state" / "signals.db"
     assert stores.knowledge().repository is stores.knowledge_repository()
+
+
+def test_configured_runtime_passes_settings_into_legacy_history_migration(tmp_path):
+    db_path = tmp_path / "state" / "history.db"
+    db_path.parent.mkdir(parents=True)
+    legacy_store = InvestigationStore(db_path)
+    investigation_id = legacy_store.start("Legacy tenant")
+    with legacy_store._conn() as conn:
+        conn.execute("DROP INDEX IF EXISTS idx_inv_tenant_started")
+        conn.execute("ALTER TABLE investigations DROP COLUMN tenant_id")
+
+    runtime_settings = Settings(
+        _env_file=None,
+        history_db_path=str(db_path),
+        knowledge_tenant_id="tenant-a",
+    )
+    store = RuntimeStores(runtime_settings).history()
+
+    assert store._settings is runtime_settings
+    assert store.get(investigation_id)["tenant_id"] == "tenant-a"
 
 
 def test_cli_history_uses_the_same_settings_backed_store_owner(tmp_path, monkeypatch):

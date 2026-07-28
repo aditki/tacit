@@ -67,6 +67,7 @@ def safe_record_provenance(
             dashboard_url=dashboard_url,
             user_id=request.user_id,
             channel_id=request.channel_id,
+            tenant_id=request.tenant_id or "default",
         )
     except Exception:
         logger.warning("provenance_record_failed", exc_info=True)

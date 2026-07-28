@@ -429,6 +429,7 @@ async def _run_pipeline_inner(
                 recorder=runtime.recorder,
                 timings=runtime.timings,
                 started_at=runtime.started_at,
+                tenant_id=request.tenant_id or "default",
             )
             runtime.add_tokens(freeform.token_usage)
             if freeform.failure is not None:

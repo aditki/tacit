@@ -15,10 +15,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+import structlog
+
 from tacit.signals import get_signal_store as _default_get_signal_store
 
 MAX_ARTIFACT_BODY_LENGTH = 200_000
 MAX_SOURCE_EXCERPT_LENGTH = 2_000
+logger = structlog.get_logger()
 
 
 def get_signal_store():
@@ -726,17 +729,38 @@ def _reconcile_stale_artifact_knowledge(*, store, tenant_id: str, artifact_type:
     from tacit.knowledge.service import KnowledgeService
 
     service = KnowledgeService(KnowledgeRepository(store._db_path))
-    for artifact in store.list_learned_artifacts(
-        tenant_id=tenant_id,
-        artifact_type=artifact_type,
-        limit=10_000,
-    ):
-        if artifact.get("stale"):
+    offset = 0
+    page_size = 1_000
+    pages = 0
+    reconciled = 0
+    while True:
+        artifacts = store.list_learned_artifacts(
+            tenant_id=tenant_id,
+            artifact_type=artifact_type,
+            stale=True,
+            limit=page_size,
+            offset=offset,
+        )
+        if not artifacts:
+            break
+        pages += 1
+        for artifact in artifacts:
             service.reconcile_source_lifecycle(
                 provenance_ref=f"prov_artifact:{artifact['artifact_id']}",
                 tenant_id=tenant_id,
                 source_stale=True,
             )
+            reconciled += 1
+        offset += len(artifacts)
+        if len(artifacts) < page_size:
+            break
+    logger.info(
+        "stale_artifact_knowledge_reconciled",
+        tenant_id=tenant_id,
+        artifact_type=artifact_type,
+        pages=pages,
+        reconciled=reconciled,
+    )
 
 
 def _preserve_review_states(rows: list[dict[str, Any]], existing_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

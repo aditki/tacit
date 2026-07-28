@@ -29,28 +29,35 @@ MAX_LLM_CANDIDATES = 60
 # Cached metric quality scores from the feedback store.
 # Refreshed at most every 10 minutes to avoid hitting SQLite on every request.
 
-_metric_quality_caches: dict[tuple[str, str], tuple[float, dict[str, float]]] = {}
+_metric_quality_caches: dict[tuple[str, str, str], tuple[float, dict[str, float]]] = {}
 _QUALITY_CACHE_TTL = 600  # seconds
 
 
-def _feedback_store_cache_key(store: Any) -> tuple[str, str]:
+def _feedback_store_cache_key(store: Any, tenant_id: str) -> tuple[str, str, str]:
     db_path = getattr(store, "_db_path", None)
     if db_path is not None:
-        return "db_path", str(Path(db_path).expanduser().resolve())
-    return "instance", str(id(store))
+        return "db_path", str(Path(db_path).expanduser().resolve()), tenant_id
+    return "instance", str(id(store)), tenant_id
 
 
-def invalidate_metric_quality_cache(store: Any | None = None) -> None:
+def invalidate_metric_quality_cache(store: Any | None = None, *, tenant_id: str | None = None) -> None:
     """Invalidate feedback-derived ranking scores globally or for one store."""
     if store is None:
         _metric_quality_caches.clear()
         return
-    _metric_quality_caches.pop(_feedback_store_cache_key(store), None)
+    if tenant_id is not None:
+        _metric_quality_caches.pop(_feedback_store_cache_key(store, tenant_id), None)
+        return
+    store_key = _feedback_store_cache_key(store, "")[:2]
+    for cache_key in list(_metric_quality_caches):
+        if cache_key[:2] == store_key:
+            _metric_quality_caches.pop(cache_key, None)
 
 
 def _load_metric_quality(
     feedback_store: Any | None = None,
     feedback_store_factory: Callable[[], Any] | None = None,
+    tenant_id: str = "default",
 ) -> dict[str, float]:
     """Load metric quality scores from feedback analysis.
 
@@ -77,7 +84,7 @@ def _load_metric_quality(
         )
         return {}
 
-    cache_key = _feedback_store_cache_key(feedback_store)
+    cache_key = _feedback_store_cache_key(feedback_store, tenant_id)
     now = time.monotonic()
     cached = _metric_quality_caches.get(cache_key)
     if cached is not None and now < cached[0]:
@@ -85,7 +92,7 @@ def _load_metric_quality(
         return cached[1]
 
     try:
-        report = feedback_store.analyze()
+        report = feedback_store.analyze(tenant_id=tenant_id)
         quality_list = report.get("metric_quality", [])
         scores = {m["metric"]: m["quality_score"] for m in quality_list}
         _metric_quality_caches[cache_key] = (now + _QUALITY_CACHE_TTL, scores)
@@ -176,6 +183,7 @@ def prerank_metrics(
     *,
     feedback_store: Any | None = None,
     feedback_store_factory: Callable[[], Any] | None = None,
+    tenant_id: str = "default",
 ) -> list[MetricEntry]:
     """Rank and truncate the metric catalog before sending to the LLM.
 
@@ -186,7 +194,7 @@ def prerank_metrics(
         return catalog
 
     # Load feedback quality scores (cached, lightweight)
-    feedback_scores = _load_metric_quality(feedback_store, feedback_store_factory)
+    feedback_scores = _load_metric_quality(feedback_store, feedback_store_factory, tenant_id)
 
     scored = [
         (entry, _score_metric(entry.name, intent.keywords, intent.services, feedback_scores)) for entry in catalog

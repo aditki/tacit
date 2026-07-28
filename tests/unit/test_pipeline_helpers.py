@@ -494,6 +494,7 @@ def test_safe_record_provenance_records_when_available():
 
     assert store.provenance[0]["dashboard_uid"] == "dash-1"
     assert store.provenance[0]["metrics_used"] == ["up"]
+    assert store.provenance[0]["tenant_id"] == "default"
 
 
 def test_safe_record_provenance_swallows_noncritical_errors():

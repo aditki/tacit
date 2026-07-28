@@ -76,10 +76,29 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
     assert approve.status_code == 200, approve.text
     approved = approve.json()
     assert approved["status"] == "approved"
-    assert approved["mappings_created"] >= 5
+    assert approved["mappings_created"] == 0
     assert approved["archetype_registered"] is False
     assert approved["archetype_quarantined"] is True
     assert len(list(quarantine_path.rglob("*.yaml"))) == 1
+
+    candidates = client.get(
+        "/api/v1/knowledge/candidates",
+        params={"kind": "signal_mapping", "limit": 100},
+    )
+    assert candidates.status_code == 200, candidates.text
+    signal_candidates = candidates.json()
+    assert len(signal_candidates) >= 5
+    for candidate in signal_candidates:
+        promoted = client.post(
+            f"/api/v1/knowledge/candidates/{candidate['id']}/review",
+            json={
+                "decision": "trust",
+                "reviewer": "e2e-live-verifier",
+                "live_verified": True,
+            },
+        )
+        assert promoted.status_code == 200, promoted.text
+        assert promoted.json()["knowledge_revision"] is not None
 
     learned_sources = signal_store.stats()["mappings_by_source"]
     assert learned_sources.get("dashboard_ingest", 0) >= 5

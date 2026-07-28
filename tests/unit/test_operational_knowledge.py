@@ -6,12 +6,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from click import ClickException
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from tacit.api.app import create_app
-from tacit.cli import cli
+from tacit.cli import _knowledge_tenant, cli
 from tacit.config import Settings
 from tacit.knowledge.enums import (
     ConflictResolutionStatus,
@@ -2904,6 +2905,14 @@ def test_artifact_learning_cli_missing_tenant_exits_nonzero(tmp_path: Path, monk
     assert incident_result.exit_code != 0
     assert "--tenant is required" in runbook_result.output
     assert "--tenant is required" in incident_result.output
+
+
+def test_cli_rejects_the_reserved_bootstrap_tenant():
+    with pytest.raises(ClickException, match="Invalid knowledge tenant"):
+        _knowledge_tenant(
+            "*bootstrap*",
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        )
 
 
 def test_pending_cli_learning_preserves_wildcard_tenant(monkeypatch: pytest.MonkeyPatch):

@@ -103,23 +103,31 @@ def test_dashboard_upload_approval_search_and_service_question_e2e(client, isola
         params={"q": "checkout latency", "service": "checkout", "include_candidates": "false"},
     )
     assert approved_search.status_code == 200
-    assert approved_search.json()["count"] >= 1
-    assert approved_search.json()["results"][0]["review_state"] == "approved"
+    assert approved_search.json()["count"] == 0
 
-    service = client.get("/api/v1/services/checkout", params={"include_candidates": "false"})
+    governed_search = client.get(
+        "/api/v1/learning/search",
+        params={"q": "checkout latency", "service": "checkout"},
+    )
+    assert governed_search.status_code == 200
+    assert governed_search.json()["count"] >= 1
+    assert governed_search.json()["results"][0]["review_state"] == "candidate"
+
+    service = client.get("/api/v1/services/checkout")
     assert service.status_code == 200
     service_body = service.json()
-    assert service_body["trusted_context_rows"] >= 1
+    assert service_body["trusted_context_rows"] == 0
+    assert service_body["candidate_context_rows"] >= 1
     assert any(metric["metric"] == "checkout_custom_latency_ms" for metric in service_body["top_metrics"])
 
-    service_cli = runner.invoke(cli, ["learn", "service", "checkout", "--approved-only"])
+    service_cli = runner.invoke(cli, ["learn", "service", "checkout"])
     assert service_cli.exit_code == 0
     assert "Checkout Service Health" in service_cli.output
     assert "checkout_custom_latency_ms" in service_cli.output
 
     search_cli = runner.invoke(
         cli,
-        ["learn", "search", "checkout latency", "--service", "checkout", "--approved-only"],
+        ["learn", "search", "checkout latency", "--service", "checkout"],
     )
     assert search_cli.exit_code == 0
     assert "checkout_custom_latency_ms" in search_cli.output
@@ -317,10 +325,11 @@ def test_bulk_grafana_learning_cli_indexes_backend_dashboards_e2e(isolated_learn
     assert result.exit_code == 0
     assert "Learned from 1 grafana dashboards" in result.output
     assert "Indexed context rows: 2" in result.output
-    assert "Mappings created: 2" in result.output
+    assert "Mappings created: 0" in result.output
 
-    summary = isolated_learning_store.describe_service("checkout", include_candidates=False)
-    assert summary["trusted_context_rows"] == 2
+    summary = isolated_learning_store.describe_service("checkout", include_candidates=True)
+    assert summary["trusted_context_rows"] == 0
+    assert summary["candidate_context_rows"] == 2
     assert {metric["metric"] for metric in summary["top_metrics"]} == {
         "checkout_custom_latency_ms",
         "checkout_5xx_count",

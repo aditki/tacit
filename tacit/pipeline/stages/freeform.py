@@ -37,6 +37,7 @@ async def build_freeform_dashboard(
     recorder: PipelineRecorder,
     timings: dict[str, float],
     started_at: float,
+    tenant_id: str = "default",
 ) -> FreeformBuildResult:
     """Build a dashboard through LLM metric discovery and query generation."""
     if not metric_catalog:
@@ -58,6 +59,7 @@ async def build_freeform_dashboard(
         intent,
         metric_catalog,
         feedback_store_factory=deps.feedback_store_factory,
+        tenant_id=tenant_id,
     )
     stage_log(
         "metric_ranking",

@@ -5,7 +5,13 @@ import time
 
 import pytest
 
-from tacit.artifact_learning import IncidentExtractor, RunbookExtractor, artifact_from_text, learn_artifact
+from tacit.artifact_learning import (
+    IncidentExtractor,
+    RunbookExtractor,
+    _reconcile_stale_artifact_knowledge,
+    artifact_from_text,
+    learn_artifact,
+)
 from tacit.signals import SignalStore
 
 
@@ -997,3 +1003,43 @@ def test_stale_runbook_reappears_as_restored_and_reindexed(tmp_path, monkeypatch
     assert restored_row["first_seen_at"] == first_row["first_seen_at"]
     if store._learning_index_available():
         assert store.search_learning_context("redis_cache_misses_total")
+
+
+def test_stale_artifact_knowledge_reconciliation_pages_past_ten_thousand(monkeypatch):
+    total = 10_005
+    requested_offsets: list[int] = []
+    reconciled: list[str] = []
+
+    class FakeStore:
+        _db_path = "/tmp/signals.db"
+
+        def list_learned_artifacts(self, *, tenant_id, artifact_type, stale, limit, offset):
+            assert tenant_id == "tenant-a"
+            assert artifact_type == "runbook"
+            assert stale is True
+            requested_offsets.append(offset)
+            remaining = max(0, total - offset)
+            return [
+                {"artifact_id": f"artifact-{index}", "stale": True}
+                for index in range(offset, offset + min(limit, remaining))
+            ]
+
+    class FakeKnowledgeService:
+        def reconcile_source_lifecycle(self, *, provenance_ref, tenant_id, source_stale):
+            assert tenant_id == "tenant-a"
+            assert source_stale is True
+            reconciled.append(provenance_ref)
+
+    service = FakeKnowledgeService()
+    monkeypatch.setattr("tacit.knowledge.repository.KnowledgeRepository", lambda _path: object())
+    monkeypatch.setattr("tacit.knowledge.service.KnowledgeService", lambda _repository: service)
+
+    _reconcile_stale_artifact_knowledge(
+        store=FakeStore(),
+        tenant_id="tenant-a",
+        artifact_type="runbook",
+    )
+
+    assert requested_offsets == list(range(0, total, 1_000))
+    assert len(reconciled) == total
+    assert reconciled[-1] == "prov_artifact:artifact-10004"

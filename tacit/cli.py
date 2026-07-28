@@ -1889,7 +1889,8 @@ def serve(host: str, port: int, reload: bool, no_slack: bool):
 @click.option("--anonymous", is_flag=True, help="Create a shareable anonymized assessment bundle")
 @click.option("--output", type=click.Path(dir_okay=False, path_type=Path), default=None, help="Output tar.gz path")
 @click.option("--validate", "validate_bundle", is_flag=True, help="Fail if anonymous leakage checks find issues")
-def export_report(anonymous: bool, output: Path | None, validate_bundle: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def export_report(anonymous: bool, output: Path | None, validate_bundle: bool, tenant: str | None):
     """Export a local or anonymous Tacit assessment bundle."""
     _header("Export Assessment Report")
     _load_env()
@@ -1903,6 +1904,7 @@ def export_report(anonymous: bool, output: Path | None, validate_bundle: bool):
             anonymous=anonymous,
             validate=validate_bundle,
             stores=stores,
+            tenant_id=_knowledge_tenant(tenant, runtime_settings=stores.settings),
         )
     except ValueError as exc:
         _fail(str(exc))
@@ -1928,16 +1930,20 @@ def knowledge():
     pass
 
 
-def _knowledge_tenant(tenant: str | None) -> str:
+def _knowledge_tenant(tenant: str | None, *, runtime_settings: Any | None = None) -> str:
+    from fastapi import HTTPException
+
+    from tacit.api.security import resolve_knowledge_tenant
     from tacit.config import settings
 
-    configured = settings.knowledge_tenant_id or "default"
-    if configured == "*" and not tenant:
-        raise click.ClickException("--tenant is required when the configured tenant is '*'")
-    requested = tenant or configured
-    if configured != "*" and requested != configured:
-        raise click.ClickException("tenant access denied")
-    return requested
+    configured = (runtime_settings or settings).knowledge_tenant_id or "default"
+    try:
+        return resolve_knowledge_tenant(configured, tenant)
+    except HTTPException as exc:
+        detail = str(exc.detail)
+        if configured == "*" and not tenant:
+            detail = "--tenant is required when the configured tenant is '*'"
+        raise click.ClickException(detail) from exc
 
 
 def _knowledge_json(value: Any) -> None:
