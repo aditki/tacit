@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import pytest
-from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
 from tacit.api.app import create_app
 from tacit.backends.base import DashboardFeatures
 from tacit.config import Settings
 from tacit.models.schemas import DashRequest, DashResponse
+from tests.http_client import TestClient
 
 
 def test_chart_route_uses_app_scoped_pipeline_settings(monkeypatch):
@@ -284,3 +284,40 @@ def test_artifact_dry_runs_do_not_initialize_signal_storage(endpoint, payload):
     assert response.status_code == 200, response.text
     assert response.json()["dry_run"] is True
     assert store_calls == 0
+
+
+def test_auth_enabled_disables_wildcard_cors_without_allowlist():
+    app = create_app(runtime_settings=Settings(api_auth_enabled=True, api_auth_key="secret"))
+
+    response = TestClient(app).options(
+        "/api/v1/signals",
+        headers={
+            "Origin": "https://console.example",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "X-API-Key",
+        },
+    )
+
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_auth_enabled_uses_configured_cors_allowlist():
+    app = create_app(
+        runtime_settings=Settings(
+            api_auth_enabled=True,
+            api_auth_key="secret",
+            api_cors_allowed_origins="https://console.example, https://ops.example",
+        )
+    )
+
+    response = TestClient(app).options(
+        "/api/v1/signals",
+        headers={
+            "Origin": "https://console.example",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "X-API-Key",
+        },
+    )
+
+    assert response.headers["access-control-allow-origin"] == "https://console.example"
+    assert "X-API-Key" in response.headers["access-control-allow-headers"]

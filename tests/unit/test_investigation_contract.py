@@ -14,7 +14,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from tacit import __version__
@@ -73,6 +72,7 @@ from tacit.models.schemas import (
 )
 from tacit.pipeline.completion import complete_pipeline
 from tacit.pipeline.recording import PipelineRecorder
+from tests.http_client import TestClient
 
 
 def _draft_contract(

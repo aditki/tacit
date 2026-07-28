@@ -88,6 +88,8 @@ learned_archetypes:
 # ── HTTP API Auth ────────────────────────────────────────────────────────────
 api:
   auth_enabled: false          # set true to require X-API-Key header
+  # cors_allowed_origins: https://ops.example.com,https://review.example.com
+  # When auth is enabled and this is empty, browser access is same-origin only.
   # auth_key: use API_AUTH_KEY env var
 
 # ── App ──────────────────────────────────────────────────────────────────────

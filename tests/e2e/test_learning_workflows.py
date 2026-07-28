@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import pytest
 from click.testing import CliRunner
-from fastapi.testclient import TestClient
 
 import tacit.backends as backends_mod
 import tacit.signals as signals_mod
 from tacit.backends.base import AlertFeatures, DashboardFeatures
 from tacit.cli import cli
 from tacit.main import app
+from tests.http_client import TestClient
 
 
 @pytest.fixture

@@ -17,12 +17,11 @@ import pytest
 if sys.version_info < (3, 12):  # pragma: no cover - env guard  # noqa: UP036
     pytest.skip("Tacit API contract requires Python 3.12", allow_module_level=True)
 
-from fastapi.testclient import TestClient
-
 import tacit.dashboard_ingest as di
 import tacit.signals as signals_mod
 from tacit.main import app
 from tacit.signals import SignalStore
+from tests.http_client import TestClient
 
 
 @pytest.fixture

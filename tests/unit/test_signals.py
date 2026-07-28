@@ -6,7 +6,6 @@ Covers both PromQL (Grafana) and SignalFlow (SignalFx) extraction.
 from __future__ import annotations
 
 import sqlite3
-import tempfile
 import time
 from importlib.resources import files
 from pathlib import Path
@@ -1969,9 +1968,9 @@ signals:
         mappings = store.get_mappings_for_signal("test_latency")
         assert len(mappings) == 2
 
-    def test_load_project_signals_yaml(self):
+    def test_load_project_signals_yaml(self, tmp_path):
         """Verify the actual project signals.yaml loads without errors."""
-        db_path = Path(tempfile.mktemp(suffix=".db"))
+        db_path = tmp_path / "project-signals.db"
         try:
             store = SignalStore(db_path=db_path)
             count = store.load_from_yaml()

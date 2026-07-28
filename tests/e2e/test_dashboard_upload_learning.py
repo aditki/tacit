@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 import tacit.archetypes.templates as templates
 import tacit.pipeline as pipeline_mod
@@ -21,6 +20,7 @@ from tests.e2e.framework import (
     load_scenario,
     scenario_catalog,
 )
+from tests.http_client import TestClient
 
 SCENARIO_PATH = Path(__file__).parent / "scenarios" / "checkout_upload_incident.yaml"
 

@@ -25,7 +25,19 @@
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
     }
-    .subtitle { color: #9ca3af; font-size: 0.9rem; margin-bottom: 1.5rem; }
+    .subtitle { color: #9ca3af; font-size: 0.9rem; margin-bottom: 1rem; }
+    .auth-bar {
+      width: 100%; max-width: 640px; display: flex; gap: 0.6rem; flex-wrap: wrap;
+      align-items: center; margin-bottom: 1.5rem; padding: 0.9rem 1rem;
+      background: #1a1d27; border: 1px solid #2d3040; border-radius: 12px;
+    }
+    .auth-bar label { font-size: 0.8rem; color: #9ca3af; min-width: 52px; }
+    .auth-input {
+      flex: 1; min-width: 220px; background: #0f1117; border: 1px solid #3b3f54;
+      border-radius: 8px; color: #e4e6eb; padding: 0.55rem 0.75rem; font-size: 0.85rem;
+    }
+    .auth-input:focus { outline: none; border-color: #6366f1; }
+    .auth-status { font-size: 0.75rem; color: #6b7280; }
 
     /* Tabs */
     .tabs { display: flex; gap: 0.25rem; margin-bottom: 1.5rem; }
@@ -260,6 +272,18 @@
 <body>
   <h1>Tacit</h1>
   <p class="subtitle">Operational investigations with evidence and governed knowledge</p>
+  <div class="auth-bar">
+    <label for="api-key-input">API key</label>
+    <input
+      class="auth-input"
+      type="password"
+      id="api-key-input"
+      placeholder="Optional for local dev; required when API auth is enabled"
+      autocomplete="off"
+    >
+    <button class="btn-secondary btn-sm" type="button" onclick="clearApiKey()">Clear</button>
+    <span class="auth-status" id="api-key-status">No API key set; open local deployments still work.</span>
+  </div>
 
   <div class="tabs">
     <div class="tab active" onclick="switchTab('generate')">Generate</div>
@@ -426,9 +450,63 @@
   <script>
     const LOCAL_API_BASE = 'http://127.0.0.1:8000';
     const BASE = window.location.protocol === 'file:' ? LOCAL_API_BASE : window.location.origin;
+    const API_KEY_STORAGE_KEY = 'tacit.api_key';
     let lastDashboardUid = null;
 
     const TAB_ORDER = ['generate','learning','knowledge','signals','insights','archetypes','history'];
+
+    function currentApiKey() {
+      const input = document.getElementById('api-key-input');
+      return input ? input.value.trim() : '';
+    }
+
+    function updateApiKeyStatus(message = '') {
+      const status = document.getElementById('api-key-status');
+      if (!status) return;
+      if (message) {
+        status.textContent = message;
+        return;
+      }
+      status.textContent = currentApiKey()
+        ? 'Sending X-API-Key with browser API requests.'
+        : 'No API key set; open local deployments still work.';
+    }
+
+    function persistApiKey() {
+      const value = currentApiKey();
+      if (value) localStorage.setItem(API_KEY_STORAGE_KEY, value);
+      else localStorage.removeItem(API_KEY_STORAGE_KEY);
+      updateApiKeyStatus();
+    }
+
+    function clearApiKey() {
+      const input = document.getElementById('api-key-input');
+      if (!input) return;
+      input.value = '';
+      localStorage.removeItem(API_KEY_STORAGE_KEY);
+      updateApiKeyStatus();
+    }
+
+    function initializeApiKey() {
+      const input = document.getElementById('api-key-input');
+      if (!input) return;
+      const stored = localStorage.getItem(API_KEY_STORAGE_KEY);
+      if (stored) input.value = stored;
+      input.addEventListener('input', persistApiKey);
+      input.addEventListener('change', persistApiKey);
+      updateApiKeyStatus();
+    }
+
+    function authHeaders(headers = {}) {
+      const merged = new Headers(headers || {});
+      const apiKey = currentApiKey();
+      if (apiKey) merged.set('X-API-Key', apiKey);
+      return merged;
+    }
+
+    async function apiFetch(url, options = {}) {
+      return window.fetch(url, { ...options, headers: authHeaders(options.headers) });
+    }
 
     /* ── Tabs ──────────────────────────────────────────────────── */
     function switchTab(name) {
@@ -445,6 +523,7 @@
     }
 
     function fill(el) { document.getElementById('prompt').value = el.textContent; }
+    initializeApiKey();
 
     /* ── Generate (streams live pipeline stages over SSE) ──────── */
     const STAGE_LABELS = {
@@ -498,7 +577,7 @@
     }
 
     async function streamChart(payload, onStage) {
-      const resp = await fetch(`${BASE}/api/v1/chart/stream`, {
+      const resp = await apiFetch(`${BASE}/api/v1/chart/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -569,7 +648,7 @@
           if (streamErr instanceof PipelineStreamError) throw streamErr;
           // Fall back to the non-streaming endpoint (older servers / proxies)
           console.warn('SSE stream failed, falling back to /api/v1/chart:', streamErr);
-          const resp = await fetch(`${BASE}/api/v1/chart`, {
+          const resp = await apiFetch(`${BASE}/api/v1/chart`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
@@ -584,7 +663,7 @@
         let contract = null;
         if (data.investigation_id) {
           const revisionQuery = data.investigation_revision == null ? '' : `?revision=${data.investigation_revision}`;
-          const contractResp = await fetch(`${BASE}/api/v1/investigations/${encodeURIComponent(data.investigation_id)}/contract${revisionQuery}`);
+          const contractResp = await apiFetch(`${BASE}/api/v1/investigations/${encodeURIComponent(data.investigation_id)}/contract${revisionQuery}`);
           if (contractResp.ok) contract = await contractResp.json();
         }
         const dashUrl = data.dashboard_url ? data.dashboard_url.replace('http://localhost:3000', 'http://' + window.location.hostname + ':3000') : '';
@@ -684,7 +763,7 @@
       try {
         statusEl.textContent = 'Submitting...';
         statusEl.style.color = '#9ca3af';
-        const resp = await fetch(`${BASE}/api/v1/feedback`, {
+        const resp = await apiFetch(`${BASE}/api/v1/feedback`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -753,7 +832,7 @@
       const el = document.getElementById('archetypes-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const resp = await fetch(`${BASE}/api/v1/archetypes`);
+        const resp = await apiFetch(`${BASE}/api/v1/archetypes`);
         const data = await resp.json();
         let html = '';
         for (const a of data.archetypes) {
@@ -773,7 +852,7 @@
 
     async function reloadArchetypes() {
       try {
-        await fetch(`${BASE}/api/v1/archetypes/reload`, { method: 'POST' });
+        await apiFetch(`${BASE}/api/v1/archetypes/reload`, { method: 'POST' });
         loadArchetypes();
       } catch(e) { alert('Reload failed: ' + e.message); }
     }
@@ -785,7 +864,7 @@
       const status = document.getElementById('hist-status').value;
       const qs = status ? `?status=${status}&limit=50` : '?limit=50';
       try {
-        const resp = await fetch(`${BASE}/api/v1/investigations${qs}`);
+        const resp = await apiFetch(`${BASE}/api/v1/investigations${qs}`);
         const data = await resp.json();
         if (!data.investigations || data.investigations.length === 0) {
           el.innerHTML = '<div class="status">No investigations yet. Generate a dashboard to see history.</div>';
@@ -822,7 +901,7 @@
       const el = document.getElementById('history-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const resp = await fetch(`${BASE}/api/v1/investigations/${id}`);
+        const resp = await apiFetch(`${BASE}/api/v1/investigations/${id}`);
         if (!resp.ok) throw new Error('Not found');
         const inv = await resp.json();
         const badge = statusBadge(inv.status);
@@ -902,7 +981,7 @@
       const el = document.getElementById('history-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const resp = await fetch(`${BASE}/api/v1/investigations/stats`);
+        const resp = await apiFetch(`${BASE}/api/v1/investigations/stats`);
         const s = await resp.json();
         if (!s.total) {
           el.innerHTML = '<div class="status">No investigations recorded yet.</div>';
@@ -951,7 +1030,7 @@
     }
 
     async function fetchJson(url, options) {
-      const resp = await fetch(url, options);
+      const resp = await apiFetch(url, options);
       const text = await resp.text();
       let body = null;
       if (text) {
@@ -991,7 +1070,7 @@
       try {
         const body = { dashboard_uid: uid, auto_approve: autoApprove };
         if (backend) body.backend = backend;
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboard`, {
+        const resp = await apiFetch(`${BASE}/api/v1/learn/dashboard`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -1080,7 +1159,7 @@
 
       try {
         const dashboard = JSON.parse(await file.text());
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboard/json`, {
+        const resp = await apiFetch(`${BASE}/api/v1/learn/dashboard/json`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1109,7 +1188,7 @@
       const el = document.getElementById('ingested-list');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboards`);
+        const resp = await apiFetch(`${BASE}/api/v1/learn/dashboards`);
         const data = await resp.json();
         const dashboards = data.dashboards || [];
         if (!dashboards.length) {
@@ -1169,7 +1248,7 @@
     async function reviewDashboard(uid, action, backend = '') {
       try {
         const backendQuery = backend ? `?backend=${encodeURIComponent(backend)}` : '';
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboards/${encodeURIComponent(uid)}/${encodeURIComponent(action)}${backendQuery}`, { method: 'POST' });
+        const resp = await apiFetch(`${BASE}/api/v1/learn/dashboards/${encodeURIComponent(uid)}/${encodeURIComponent(action)}${backendQuery}`, { method: 'POST' });
         if (!resp.ok) throw new Error(`${action} failed`);
         loadIngestedDashboards();
       } catch (e) { alert(`${action} failed: ` + e.message); }
@@ -1186,8 +1265,8 @@
       content.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
         const [queueResp, statusResp] = await Promise.all([
-          fetch(`${BASE}/api/v1/knowledge/review-queue`),
-          fetch(`${BASE}/api/v1/knowledge/status`),
+          apiFetch(`${BASE}/api/v1/knowledge/review-queue`),
+          apiFetch(`${BASE}/api/v1/knowledge/status`),
         ]);
         if (!queueResp.ok || !statusResp.ok) throw new Error(`HTTP ${queueResp.status || statusResp.status}`);
         const queue = await queueResp.json();
@@ -1234,7 +1313,7 @@
     }
 
     async function reviewKnowledgeCandidate(candidateId, decision) {
-      const response = await fetch(`${BASE}/api/v1/knowledge/candidates/${encodeURIComponent(candidateId)}/review`, {
+      const response = await apiFetch(`${BASE}/api/v1/knowledge/candidates/${encodeURIComponent(candidateId)}/review`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ decision, reviewer: 'web-ui', evaluate: true }),
@@ -1254,8 +1333,8 @@
 
       try {
         const [listResp, statsResp] = await Promise.all([
-          fetch(`${BASE}/api/v1/signals`),
-          fetch(`${BASE}/api/v1/signals/stats`),
+          apiFetch(`${BASE}/api/v1/signals`),
+          apiFetch(`${BASE}/api/v1/signals/stats`),
         ]);
         const signals = await listResp.json();
         const stats = await statsResp.json();
@@ -1301,7 +1380,7 @@
       const el = document.getElementById('signals-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const resp = await fetch(`${BASE}/api/v1/signals/${encodeURIComponent(signalType)}`);
+        const resp = await apiFetch(`${BASE}/api/v1/signals/${encodeURIComponent(signalType)}`);
         if (!resp.ok) throw new Error('Not found');
         const data = await resp.json();
         const mappings = data.mappings || [];
@@ -1354,7 +1433,7 @@
           metric_patterns: [{ pattern: metric, confidence }],
         };
         if (service) body.services = [service];
-        const resp = await fetch(`${BASE}/api/v1/signals/teach`, {
+        const resp = await apiFetch(`${BASE}/api/v1/signals/teach`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),

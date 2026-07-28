@@ -184,6 +184,10 @@ class Settings(BaseSettings):
     # HTTP API auth
     api_auth_enabled: bool = False  # set True to require API key
     api_auth_key: str = Field(default="", repr=False)
+    # Comma-separated cross-origin allowlist. When auth is enabled, same-origin
+    # requests continue to work by default but cross-origin browser callers must
+    # be listed here explicitly.
+    api_cors_allowed_origins: str = ""
     knowledge_tenant_id: str = "default"
     knowledge_permissions: str = (
         "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.correct,knowledge.export,"

@@ -74,12 +74,27 @@ DESCRIPTION = (
     "generated output remains quarantined\n\n"
     "### Authentication\n"
     "When `API_AUTH_ENABLED=true`, pass your key via the `X-API-Key` header. "
+    "The built-in web UI can store that key locally for same-origin requests. "
     "When disabled (default for development), all endpoints are open.\n\n"
     "### Interactive docs\n"
     "- **Swagger UI** — you are here (`/docs`)\n"
     "- **ReDoc** — alternative view at [`/redoc`](/redoc)\n"
     "- **Web UI** — interactive investigation workspace at [`/`](/)\n"
 )
+
+
+def _cors_origins_for(runtime_settings: Settings) -> list[str]:
+    raw_origins = getattr(runtime_settings, "api_cors_allowed_origins", "")
+    configured = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    if getattr(runtime_settings, "api_auth_enabled", False):
+        return configured
+    return configured or ["*"]
+
+
+def _cors_headers_for(runtime_settings: Settings) -> list[str]:
+    if getattr(runtime_settings, "api_auth_enabled", False):
+        return ["Content-Type", "X-API-Key"]
+    return ["*"]
 
 
 def create_app(
@@ -105,9 +120,9 @@ def create_app(
     app.state.runtime_stores = RuntimeStores(runtime_settings)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=_cors_origins_for(runtime_settings),
         allow_methods=["*"],
-        allow_headers=["*"],
+        allow_headers=_cors_headers_for(runtime_settings),
     )
     if include_default_routes:
         from tacit.api.routes import include_routes

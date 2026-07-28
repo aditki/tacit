@@ -52,6 +52,8 @@ tacit serve --host 127.0.0.1 --port 8000 --no-slack
 ```
 
 Then open `http://127.0.0.1:8000`.
+If `API_AUTH_ENABLED=true`, enter the API key in the built-in UI so browser
+requests include the `X-API-Key` header.
 
 ## Common Commands
 
@@ -85,6 +87,7 @@ Useful settings include:
 - `SIGNALS_DB_PATH`
 - `API_AUTH_ENABLED`
 - `API_AUTH_KEY`
+- `API_CORS_ALLOWED_ORIGINS`
 
 ## More Documentation
 

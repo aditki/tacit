@@ -19,7 +19,8 @@ uv run pytest -m "not integration"                  # explicit non-integration f
 ```
 
 CI runs `unit` first, then `integration` only if unit passes (see
-`.github/workflows/ci.yml`).
+`.github/workflows/ci.yml`). The opt-in E2E suite now has its own scheduled and
+manual workflow in `.github/workflows/e2e.yml`.
 
 ## How the contract layer works
 

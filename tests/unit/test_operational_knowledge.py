@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from tacit.api.app import create_app
@@ -39,6 +38,7 @@ from tacit.operational_learning_benchmark import (
     load_operational_learning_corpus,
     run_operational_learning_benchmark,
 )
+from tests.http_client import TestClient
 
 
 def _service(tmp_path: Path, tenant_id: str = "default") -> KnowledgeService:
