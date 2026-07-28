@@ -347,6 +347,8 @@ class KnowledgeService:
             promotion_policy_ref=policy.policy_id,
             last_evaluated_at=decision.evaluated_at,
             eligibility_reason_codes=decision.reason_codes,
+            authoritative_source=authoritative_source,
+            live_verified=live_verified,
         )
         state = candidate.state.model_copy(update={"eligibility": decision.resulting_eligibility})
         candidate = candidate.model_copy(
@@ -395,6 +397,10 @@ class KnowledgeService:
                 "scope": canonical_scope_payload(candidate.scope),
                 "state": state.model_dump(mode="json"),
                 "policy": [policy.policy_id, policy.version],
+                "promotion_inputs": {
+                    "authoritative_source": authoritative_source,
+                    "live_verified": live_verified,
+                },
                 "conflicts": sorted(conflict.id for conflict in conflicts),
                 "contributors": contributor_refs,
                 "provenance": provenance_refs,
@@ -461,8 +467,7 @@ class KnowledgeService:
         usage: list[KnowledgeUsage] = []
         for revision in self.repository.list_current_revisions(scope.tenant_id):
             disposition, reasons = self._disposition(revision, scope)
-            applied = disposition == KnowledgeUsageDisposition.APPLIED
-            if applied:
+            if disposition == KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED:
                 selected.append(KnowledgeSnapshotItem(knowledge_ref=revision.knowledge_id, revision=revision.revision))
             usage.append(
                 KnowledgeUsage(
@@ -470,9 +475,9 @@ class KnowledgeService:
                     knowledge_ref=revision.knowledge_id,
                     knowledge_revision=revision.revision,
                     disposition=disposition,
-                    used_for=self._used_for(revision) if applied else [],
+                    used_for=[],
                     target_ref=revision.proposition.object_ref or revision.proposition.subject_ref,
-                    score_delta=self._score_delta(revision) if applied else 0.0,
+                    score_delta=0.0,
                     decision_ref=revision.decision_ref,
                     provenance_refs=revision.provenance_refs,
                     reason_codes=reasons,
@@ -481,11 +486,15 @@ class KnowledgeService:
         return self._save_snapshot(scope.tenant_id, selected), usage
 
     def snapshot_from_usage(self, tenant_id: str, usage: list[KnowledgeUsage]) -> KnowledgeSnapshot:
-        """Persist the final applied set after live-evidence reconciliation."""
+        """Persist the final selected set after reconciliation and stage consumption."""
         selected = [
             KnowledgeSnapshotItem(knowledge_ref=item.knowledge_ref, revision=item.knowledge_revision)
             for item in usage
-            if item.disposition == KnowledgeUsageDisposition.APPLIED
+            if item.disposition
+            in {
+                KnowledgeUsageDisposition.APPLIED,
+                KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+            }
         ]
         return self._save_snapshot(tenant_id, selected)
 
@@ -505,14 +514,19 @@ class KnowledgeService:
         return self.repository.save_snapshot(snapshot)
 
     def apply_to_ranking(self, ranking, usage: list[KnowledgeUsage]):
-        """Apply bounded contextual lift without converting context into telemetry."""
+        """Apply dependency knowledge and return stage-confirmed usage records."""
         from tacit.models.schemas import CulpritCandidate
 
         candidates = list(ranking.candidates)
         original_candidate_count = len(candidates)
-        applicable: list[tuple[KnowledgeUsage, KnowledgeRevision]] = []
-        for item in usage:
-            if item.disposition != KnowledgeUsageDisposition.APPLIED:
+        updated_usage = list(usage)
+        applicable: list[tuple[int, KnowledgeUsage, KnowledgeRevision]] = []
+        selectable = {
+            KnowledgeUsageDisposition.APPLIED,
+            KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+        }
+        for index, item in enumerate(usage):
+            if item.disposition not in selectable:
                 continue
             revision = self.repository.get_revision(
                 item.knowledge_ref,
@@ -520,13 +534,39 @@ class KnowledgeService:
                 tenant_id=item.tenant_id,
             )
             if revision is not None and revision.proposition.kind == KnowledgeKind.DEPENDENCY:
-                applicable.append((item, revision))
+                applicable.append((index, item, revision))
+                updated_usage[index] = item.model_copy(
+                    update={
+                        "disposition": KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+                        "used_for": [],
+                        "score_delta": 0.0,
+                    }
+                )
 
         excluded_refs = {
             self._candidate_ref(revision.proposition.object_ref)
-            for _, revision in applicable
+            for _, _, revision in applicable
             if revision.proposition.predicate == Predicate.DOES_NOT_DEPEND_ON
         }
+        ranked_refs = {f"{candidate.suspect_type}:{candidate.suspect}" for candidate in candidates}
+        matched_exclusions = excluded_refs.intersection(ranked_refs)
+        for index, item, revision in applicable:
+            candidate_ref = self._candidate_ref(revision.proposition.object_ref)
+            if revision.proposition.predicate != Predicate.DOES_NOT_DEPEND_ON:
+                continue
+            if candidate_ref not in matched_exclusions:
+                continue
+            reason_codes = list(item.reason_codes)
+            if "ranking_candidate_excluded" not in reason_codes:
+                reason_codes.append("ranking_candidate_excluded")
+            updated_usage[index] = item.model_copy(
+                update={
+                    "disposition": KnowledgeUsageDisposition.APPLIED,
+                    "used_for": ["candidate_exclusion"],
+                    "score_delta": 0.0,
+                    "reason_codes": reason_codes,
+                }
+            )
         candidates = [
             candidate
             for candidate in candidates
@@ -534,37 +574,61 @@ class KnowledgeService:
         ]
         excluded_ranked_candidate = len(candidates) < original_candidate_count
         by_ref = {f"{candidate.suspect_type}:{candidate.suspect}": candidate for candidate in candidates}
-        for item, revision in applicable:
+        for index, item, revision in applicable:
             candidate_ref = self._candidate_ref(revision.proposition.object_ref)
-            if candidate_ref in excluded_refs:
+            if revision.proposition.predicate == Predicate.DOES_NOT_DEPEND_ON or candidate_ref in excluded_refs:
                 continue
-            if item.score_delta <= 0:
+            requested_delta = self._score_delta(revision)
+            if requested_delta <= 0:
                 continue
             reason = (
                 f"Operational Knowledge {revision.knowledge_id} revision {revision.revision} "
                 "provides scoped dependency context."
             )
             existing = by_ref.get(candidate_ref)
+            used_for: list[str]
+            applied_delta: float
             if existing is not None:
+                updated_score = min(1.0, existing.score + requested_delta)
+                contextual_reasons = list(existing.contextual_reasons)
+                if reason not in contextual_reasons:
+                    contextual_reasons.append(reason)
+                if updated_score == existing.score and contextual_reasons == existing.contextual_reasons:
+                    continue
                 updated = existing.model_copy(
                     update={
-                        "score": min(1.0, existing.score + item.score_delta),
-                        "contextual_reasons": [*existing.contextual_reasons, reason],
+                        "score": updated_score,
+                        "contextual_reasons": contextual_reasons,
                     }
                 )
                 candidates[candidates.index(existing)] = updated
                 by_ref[candidate_ref] = updated
+                used_for = ["ranking"]
+                applied_delta = updated_score - existing.score
             else:
                 suspect_type, suspect = candidate_ref.split(":", 1)
                 added = CulpritCandidate(
                     rank=len(candidates) + 1,
                     suspect=suspect,
                     suspect_type=suspect_type,
-                    score=item.score_delta,
+                    score=requested_delta,
                     contextual_reasons=[reason],
                 )
                 candidates.append(added)
                 by_ref[candidate_ref] = added
+                used_for = ["candidate_generation", "ranking"]
+                applied_delta = requested_delta
+            reason_codes = list(item.reason_codes)
+            if "ranking_changed" not in reason_codes:
+                reason_codes.append("ranking_changed")
+            updated_usage[index] = item.model_copy(
+                update={
+                    "disposition": KnowledgeUsageDisposition.APPLIED,
+                    "used_for": used_for,
+                    "score_delta": applied_delta,
+                    "reason_codes": reason_codes,
+                }
+            )
         candidates.sort(key=lambda candidate: (-candidate.score, candidate.suspect_type, candidate.suspect))
         candidates = [candidate.model_copy(update={"rank": index}) for index, candidate in enumerate(candidates, 1)]
         update: dict[str, Any] = {"candidates": candidates}
@@ -577,7 +641,7 @@ class KnowledgeService:
                     "abstention_reason": "operational_knowledge_excluded_ranked_candidates",
                 }
             )
-        return ranking.model_copy(update=update)
+        return ranking.model_copy(update=update), updated_usage
 
     def reconcile_live_observations(self, usage: list[KnowledgeUsage], observations) -> list[KnowledgeUsage]:
         """Let exact negative runtime evidence veto matching contextual knowledge."""
@@ -599,7 +663,10 @@ class KnowledgeService:
                 item.knowledge_revision,
                 tenant_id=item.tenant_id,
             )
-            if revision is None or item.disposition != KnowledgeUsageDisposition.APPLIED:
+            if revision is None or item.disposition not in {
+                KnowledgeUsageDisposition.APPLIED,
+                KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+            }:
                 reconciled.append(item)
                 continue
             proposition = revision.proposition
@@ -686,9 +753,18 @@ class KnowledgeService:
         explanation: str,
         created_by: str,
         target_ref: str = "",
+        target_revision: int | None = None,
         tenant_id: str = "default",
     ) -> tuple[KnowledgeCorrection, KnowledgeCandidate]:
         correction_type = CorrectionType(correction_type)
+        target = None
+        if target_ref:
+            target = self.repository.get_revision(target_ref, target_revision, tenant_id=tenant_id)
+            if target is None:
+                if target_revision is None:
+                    raise ValueError("correction target does not exist in the tenant")
+                raise ValueError(f"correction target revision {target_revision} does not exist in the tenant")
+            target_revision = target.revision
         correction_id = _id(
             "correction",
             [
@@ -699,6 +775,7 @@ class KnowledgeService:
                 proposed,
                 scope.model_dump(mode="json"),
                 target_ref,
+                target_revision,
             ],
         )
         existing_correction = self.repository.get_correction(correction_id, tenant_id)
@@ -707,12 +784,18 @@ class KnowledgeService:
                 existing_correction.knowledge_candidate_ref,
                 tenant_id,
             )
-        original = {}
-        if target_ref:
+        if target is not None:
             current = self.repository.get_revision(target_ref, tenant_id=tenant_id)
             if current is None:
                 raise ValueError("correction target does not exist in the tenant")
-            original = current.proposition.model_dump(mode="json")
+            if current.revision != target_revision:
+                raise ValueError(
+                    f"correction target advanced from revision {target_revision} to {current.revision}; "
+                    "rebase the correction"
+                )
+        original = {}
+        if target is not None:
+            original = target.proposition.model_dump(mode="json")
         kind = self._kind_for_correction(correction_type, proposed)
         evidence = KnowledgeEvidenceReference(
             evidence_ref=correction_id,
@@ -739,6 +822,7 @@ class KnowledgeService:
             investigation_revision=investigation_revision,
             correction_type=correction_type,
             target_ref=target_ref,
+            target_revision=target_revision,
             original=original,
             proposed=proposed,
             scope=scope,
@@ -776,9 +860,23 @@ class KnowledgeService:
             raise ValueError(f"{correction.correction_type.value} correction requires target_ref")
         target = None
         if correction.target_ref:
-            target = self.repository.get_revision(correction.target_ref, tenant_id=tenant_id)
+            if correction.target_revision is None:
+                raise ValueError("correction target revision is unavailable; recreate the correction")
+            target = self.repository.get_revision(
+                correction.target_ref,
+                correction.target_revision,
+                tenant_id=tenant_id,
+            )
             if target is None:
+                raise ValueError("correction target knowledge revision not found")
+            current_target = self.repository.get_revision(correction.target_ref, tenant_id=tenant_id)
+            if current_target is None:
                 raise ValueError("correction target knowledge item not found")
+            if current_target.revision != correction.target_revision:
+                raise ValueError(
+                    f"correction target advanced from revision {correction.target_revision} "
+                    f"to {current_target.revision}; rebase the correction"
+                )
         candidate = self.review_candidate(
             correction.knowledge_candidate_ref,
             approved=approved,
@@ -948,12 +1046,18 @@ class KnowledgeService:
                 current.proposition.proposition_key,
             )
             if surviving_candidates:
-                _, supported_revision = self.evaluate_candidate(
-                    surviving_candidates[0].id,
-                    tenant_id=tenant_id,
-                )
+                supported_revision = None
+                for survivor in surviving_candidates:
+                    _, supported_revision = self.evaluate_candidate(
+                        survivor.id,
+                        tenant_id=tenant_id,
+                        authoritative_source=survivor.policy.authoritative_source,
+                        live_verified=survivor.policy.live_verified,
+                    )
+                    if supported_revision is not None:
+                        lifecycle_revisions.append(supported_revision)
+                        break
                 if supported_revision is not None:
-                    lifecycle_revisions.append(supported_revision)
                     continue
             lifecycle_revisions.append(
                 self._retire_knowledge(
@@ -1199,20 +1303,6 @@ class KnowledgeService:
         return KnowledgeKind(proposed.get("kind", KnowledgeKind.ARTIFACT_QUALITY.value))
 
     @staticmethod
-    def _used_for(revision: KnowledgeRevision) -> list[str]:
-        kind = revision.proposition.kind
-        if kind == KnowledgeKind.DEPENDENCY and revision.proposition.predicate == Predicate.DOES_NOT_DEPEND_ON:
-            return ["candidate_exclusion"]
-        return {
-            KnowledgeKind.DEPENDENCY: ["candidate_generation", "ranking"],
-            KnowledgeKind.OWNERSHIP: ["routing", "context"],
-            KnowledgeKind.SIGNAL_MAPPING: ["evidence_resolution"],
-            KnowledgeKind.EVIDENCE_REQUIREMENT: ["evidence_requirement"],
-            KnowledgeKind.ARTIFACT_QUALITY: ["artifact_filtering"],
-            KnowledgeKind.INVESTIGATION_PATTERN: ["context"],
-        }[kind]
-
-    @staticmethod
     def _score_delta(revision: KnowledgeRevision) -> float:
         return (
             0.08
@@ -1272,7 +1362,7 @@ class KnowledgeService:
         ]
         if conflicts:
             return KnowledgeUsageDisposition.REJECTED_BY_CONFLICT, ["unresolved_conflict"]
-        return KnowledgeUsageDisposition.APPLIED, ["eligible_under_recorded_policy"]
+        return KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED, ["eligible_under_recorded_policy"]
 
     @staticmethod
     def _state_decision(candidate, decision_type, reason):

@@ -11,8 +11,8 @@ import tacit.history as history_mod
 from tacit.api.dependencies import get_history_store, get_pipeline_dependencies
 from tacit.api.security import (
     KnowledgeAction,
+    assert_contract_tenant_access,
     assert_knowledge_action,
-    assert_tenant_access,
     knowledge_tenant,
     verify_api_key,
 )
@@ -45,19 +45,12 @@ class CorrectionReviewRequest(BaseModel):
 
 
 def _require_contract_tenant(request: Request, contract, runtime_settings, store=None) -> str:
-    configured = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
-    contract_tenant = str(contract.request.scope.tenant_id or "")
-    contract_investigation = getattr(contract, "investigation", None)
-    investigation_id = str(getattr(contract_investigation, "id", ""))
-    investigation = (
-        store.get(investigation_id) if store is not None and investigation_id and hasattr(store, "get") else None
+    return assert_contract_tenant_access(
+        request,
+        contract,
+        store=store,
+        runtime_settings=runtime_settings,
     )
-    recorded = str((investigation or {}).get("tenant_id") or contract_tenant)
-    if not recorded and configured != "*":
-        recorded = configured
-    if contract_tenant not in {"", "default", recorded}:
-        raise HTTPException(status_code=403, detail="Tenant access denied")
-    return assert_tenant_access(request, recorded)
 
 
 def _authorized_contract(
@@ -151,9 +144,7 @@ async def list_investigation_revisions(
     tags=["History"],
     summary="List investigation runs and lifecycle status",
 )
-async def list_investigation_runs(
-    investigation_id: str, request: Request, store: Any = Depends(get_history_store)
-):
+async def list_investigation_runs(investigation_id: str, request: Request, store: Any = Depends(get_history_store)):
     _authorize_investigation(request, store, investigation_id)
     runs = store.list_runs(investigation_id)
     if not runs and store.get(investigation_id) is None:
@@ -285,9 +276,7 @@ async def create_correction_candidate(
     tags=["History"],
     summary="List correction candidates",
 )
-async def list_correction_candidates(
-    investigation_id: str, request: Request, store: Any = Depends(get_history_store)
-):
+async def list_correction_candidates(investigation_id: str, request: Request, store: Any = Depends(get_history_store)):
     _authorize_investigation(request, store, investigation_id)
     candidates = store.list_knowledge_candidates(investigation_id)
     if not candidates and store.get(investigation_id) is None:
@@ -386,9 +375,7 @@ async def refresh_investigation(
     tags=["History"],
     summary="Migrate a legacy history record to Investigation Contract v1",
 )
-async def migrate_investigation(
-    investigation_id: str, request: Request, store: Any = Depends(get_history_store)
-):
+async def migrate_investigation(investigation_id: str, request: Request, store: Any = Depends(get_history_store)):
     _authorize_investigation(request, store, investigation_id)
     contract = store.migrate_legacy_investigation(investigation_id)
     if contract is None:

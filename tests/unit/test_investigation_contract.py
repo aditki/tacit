@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from tacit import __version__
 from tacit.agents.providers.base import TokenUsage
 from tacit.api.app import create_app
-from tacit.api.dependencies import get_pipeline_dependencies
+from tacit.api.dependencies import get_history_store, get_pipeline_dependencies
 from tacit.backends.base import PublishResult
 from tacit.config import Settings
 from tacit.dependencies import PipelineDependencies
@@ -55,6 +55,8 @@ from tacit.investigation_replay import (
 )
 from tacit.knowledge.enums import KnowledgeUsageDisposition
 from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
+from tacit.knowledge.repository import KnowledgeRepository
+from tacit.knowledge.service import KnowledgeService
 from tacit.models.schemas import (
     ContextChunk,
     CulpritCandidate,
@@ -785,20 +787,23 @@ def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, m
 
         def apply_to_ranking(self, ranking, usage):
             self.seen_score = ranking.candidates[0].score
-            return ranking.model_copy(
-                update={
-                    "candidates": [
-                        ranking.candidates[0].model_copy(
-                            update={
-                                "score": ranking.candidates[0].score + 0.10,
-                                "contextual_reasons": [
-                                    *ranking.candidates[0].contextual_reasons,
-                                    "fresh operational knowledge",
-                                ],
-                            }
-                        )
-                    ]
-                }
+            return (
+                ranking.model_copy(
+                    update={
+                        "candidates": [
+                            ranking.candidates[0].model_copy(
+                                update={
+                                    "score": ranking.candidates[0].score + 0.10,
+                                    "contextual_reasons": [
+                                        *ranking.candidates[0].contextual_reasons,
+                                        "fresh operational knowledge",
+                                    ],
+                                }
+                            )
+                        ]
+                    }
+                ),
+                usage,
             )
 
         def persist_usage(self, usage, *, investigation_id, investigation_revision):
@@ -863,7 +868,7 @@ def test_current_engine_replay_snapshots_reconciled_knowledge_usage(tmp_path, mo
             )
 
         def apply_to_ranking(self, ranking, usage):
-            return ranking
+            return ranking, usage
 
         def persist_usage(self, usage, *, investigation_id, investigation_revision):
             self.persisted = True
@@ -917,7 +922,7 @@ def test_current_engine_replay_succeeds_when_usage_persistence_fails(tmp_path, m
             )
 
         def apply_to_ranking(self, ranking, usage):
-            return ranking
+            return ranking, usage
 
         def persist_usage(self, usage, *, investigation_id, investigation_revision):
             raise OSError("knowledge database unavailable")
@@ -987,7 +992,7 @@ def test_current_engine_replay_rejects_pinned_tenant_mismatch(tmp_path, monkeypa
             )
 
         def apply_to_ranking(self, ranking, usage):
-            return ranking
+            return ranking, usage
 
     monkeypatch.setattr(
         "tacit.knowledge.service.get_knowledge_service",
@@ -2464,7 +2469,9 @@ def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
 
     monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
     runtime_settings = Settings(knowledge_tenant_id="*")
-    client = TestClient(create_app(runtime_settings=runtime_settings))
+    app = create_app(runtime_settings=runtime_settings)
+    app.dependency_overrides[get_history_store] = lambda: store
+    client = TestClient(app)
     headers = {"X-Tacit-Tenant": "tenant-a"}
     own_id = investigation_ids["tenant-a"]
     other_id = investigation_ids["tenant-b"]
@@ -2554,6 +2561,53 @@ def test_investigation_tenant_is_immutable_across_revisions(tmp_path):
         store.persist_contract_revision(draft.model_copy(update={"request": tenant_b_request}))
 
 
+def test_knowledge_correction_uses_target_revision_from_contract_usage(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Revision-pinned correction")
+    draft = _draft_contract(investigation_id)
+    usage = KnowledgeUsage(
+        tenant_id=draft.request.scope.tenant_id,
+        knowledge_ref="knowledge_checkout_dependency",
+        knowledge_revision=3,
+        disposition=KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+    )
+    store.persist_contract_revision(draft.model_copy(update={"knowledge_usage": [usage]}))
+    captured = {}
+
+    class CapturingKnowledgeService:
+        def create_correction(self, **kwargs):
+            captured.update(kwargs)
+            raise ValueError("captured correction request")
+
+    monkeypatch.setattr(
+        "tacit.api.routes.knowledge.get_knowledge_service",
+        lambda: CapturingKnowledgeService(),
+    )
+    app = create_app(runtime_settings=Settings(knowledge_tenant_id="default"))
+    app.dependency_overrides[get_history_store] = lambda: store
+
+    response = TestClient(app).post(
+        "/api/v1/knowledge/corrections",
+        json={
+            "investigation_id": investigation_id,
+            "investigation_revision": 1,
+            "correction_type": "knowledge_incorrect",
+            "target_ref": usage.knowledge_ref,
+            "proposed": {
+                "subject_ref": "concept:artifact-quality",
+                "predicate": "useful_for_investigation",
+                "concept_ref": "concept:incorrect-knowledge",
+            },
+            "explanation": "The referenced knowledge revision is incorrect.",
+            "created_by": "operator",
+        },
+    )
+
+    assert response.status_code == 400
+    assert captured["target_ref"] == usage.knowledge_ref
+    assert captured["target_revision"] == usage.knowledge_revision
+
+
 def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeypatch):
     db_path = tmp_path / "legacy-history.db"
     store = InvestigationStore(db_path=db_path)
@@ -2598,8 +2652,14 @@ def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeyp
         )
 
     monkeypatch.setattr("tacit.api.routes.history.run_pipeline", fake_refresh)
+    knowledge_service = KnowledgeService(KnowledgeRepository(tmp_path / "knowledge.db"))
+    monkeypatch.setattr(
+        "tacit.api.routes.knowledge.get_knowledge_service",
+        lambda: knowledge_service,
+    )
     app = create_app(runtime_settings=runtime_settings)
     app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
+    app.dependency_overrides[get_history_store] = lambda: migrated
     client = TestClient(app)
 
     assert migrated.get(investigation_id)["tenant_id"] == "tenant-a"
@@ -2609,6 +2669,23 @@ def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeyp
     refresh = client.post(f"/api/v1/investigations/{investigation_id}/refresh")
     assert refresh.status_code == 200
     assert seen_tenants == ["tenant-a"]
+    correction = client.post(
+        "/api/v1/knowledge/corrections",
+        json={
+            "investigation_id": investigation_id,
+            "investigation_revision": 1,
+            "correction_type": "artifact_quality",
+            "proposed": {
+                "subject_ref": "concept:artifact-quality",
+                "predicate": "useful_for_investigation",
+                "concept_ref": "concept:legacy-correction",
+            },
+            "explanation": "Authorize using the migrated investigation tenant.",
+            "created_by": "operator",
+        },
+    )
+    assert correction.status_code == 200, correction.text
+    assert correction.json()["correction"]["tenant_id"] == "tenant-a"
 
 
 def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp_path, monkeypatch):

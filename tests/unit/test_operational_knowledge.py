@@ -297,7 +297,7 @@ def test_resolution_normalization_corroboration_and_promotion(tmp_path: Path):
     )
     assert snapshot_a.id == snapshot_b.id
     assert snapshot_a.items[0].revision == 1
-    assert usage_a[0].disposition.value == "applied"
+    assert usage_a[0].disposition.value == "considered_not_applied"
     contradicted = service.reconcile_live_observations(
         usage_a,
         [
@@ -357,7 +357,7 @@ def test_knowledge_candidate_clears_empty_ranking_abstention(tmp_path: Path):
         )
     )
 
-    ranking = service.apply_to_ranking(
+    ranking, applied_usage = service.apply_to_ranking(
         CulpritRanking(abstained=True, abstention_reason="no_rankable_candidates"),
         usage,
     )
@@ -365,6 +365,8 @@ def test_knowledge_candidate_clears_empty_ranking_abstention(tmp_path: Path):
     assert len(ranking.candidates) == 1
     assert ranking.abstained is False
     assert ranking.abstention_reason == ""
+    assert applied_usage[0].disposition.value == "applied"
+    assert applied_usage[0].used_for == ["candidate_generation", "ranking"]
 
 
 def test_duplicate_lineage_does_not_inflate_corroboration(tmp_path: Path):
@@ -442,7 +444,7 @@ def test_scope_matching_requires_version_constraints(tmp_path: Path):
     )
 
     assert usage_without_version[0].disposition.value == "rejected_by_scope"
-    assert usage_with_version[0].disposition.value == "applied"
+    assert usage_with_version[0].disposition.value == "considered_not_applied"
 
 
 def test_proposition_keys_canonicalize_scope_list_order(tmp_path: Path):
@@ -1028,7 +1030,7 @@ def test_migrated_signal_mapping_preserves_candidate_metric(tmp_path: Path):
     assert candidate.proposition.object_ref == "concept:http_request_duration_seconds"
 
 
-def test_signal_mapping_usage_does_not_claim_unapplied_score_delta(tmp_path: Path):
+def test_signal_mapping_usage_remains_considered_until_a_stage_consumes_it(tmp_path: Path):
     service = _service(tmp_path)
     candidate = service.create_candidate(
         kind=KnowledgeKind.SIGNAL_MAPPING,
@@ -1049,8 +1051,8 @@ def test_signal_mapping_usage_does_not_claim_unapplied_score_delta(tmp_path: Pat
 
     _, usage = service.create_snapshot(KnowledgeScope(service_refs=["entity:service:checkout"]))
 
-    assert usage[0].disposition.value == "applied"
-    assert usage[0].used_for == ["evidence_resolution"]
+    assert usage[0].disposition.value == "considered_not_applied"
+    assert usage[0].used_for == []
     assert usage[0].score_delta == 0
 
 
@@ -1110,9 +1112,9 @@ def test_negative_dependency_excludes_matching_ranked_candidate(tmp_path: Path):
             service_refs=["entity:service:checkout"],
         )
     )
-    applied = next(item for item in usage if item.knowledge_ref == revision.knowledge_id)
+    considered = next(item for item in usage if item.knowledge_ref == revision.knowledge_id)
     reconciled = service.reconcile_live_observations(
-        [applied],
+        [considered],
         [
             EvidenceObservation(
                 requirement_id="redis_health",
@@ -1122,7 +1124,7 @@ def test_negative_dependency_excludes_matching_ranked_candidate(tmp_path: Path):
         ],
     )
 
-    ranking = service.apply_to_ranking(
+    ranking, applied_usage = service.apply_to_ranking(
         CulpritRanking(
             abstained=False,
             candidates=[
@@ -1137,12 +1139,44 @@ def test_negative_dependency_excludes_matching_ranked_candidate(tmp_path: Path):
         reconciled,
     )
 
-    assert applied.used_for == ["candidate_exclusion"]
-    assert applied.score_delta == 0
-    assert reconciled[0].disposition.value == "applied"
+    assert considered.disposition.value == "considered_not_applied"
+    assert considered.used_for == []
+    assert applied_usage[0].disposition.value == "applied"
+    assert applied_usage[0].used_for == ["candidate_exclusion"]
+    assert applied_usage[0].score_delta == 0
     assert ranking.candidates == []
     assert ranking.abstained is True
     assert ranking.abstention_reason == "operational_knowledge_excluded_ranked_candidates"
+
+
+def test_negative_dependency_without_matching_candidate_remains_considered(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref="negative-no-match",
+        family=SourceFamily.HUMAN_CORRECTION,
+        lineage_group="negative-no-match",
+        predicate="does_not_depend_on",
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, authoritative_source=True)
+    assert revision is not None
+    _, usage = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        )
+    )
+
+    ranking, resulting_usage = service.apply_to_ranking(
+        CulpritRanking(abstained=True, abstention_reason="no_rankable_candidates"),
+        usage,
+    )
+
+    assert ranking.candidates == []
+    assert resulting_usage[0].disposition.value == "considered_not_applied"
+    assert resulting_usage[0].used_for == []
+    assert resulting_usage[0].score_delta == 0
 
 
 def test_dependency_subject_must_match_investigation_service(tmp_path: Path):
@@ -1291,6 +1325,81 @@ def test_correction_creates_candidate_revision_and_impact(tmp_path: Path):
     assert service.impact(original.knowledge_id).recommended_action == "replay_current"
 
 
+def test_correction_rejects_target_that_advanced_after_creation(tmp_path: Path):
+    service = _service(tmp_path)
+    _, original = _promoted_dependency(service)
+    correction, correction_candidate = service.create_correction(
+        investigation_id="inv_revision_pinned",
+        investigation_revision=1,
+        correction_type=CorrectionType.KNOWLEDGE_INCORRECT,
+        target_ref=original.knowledge_id,
+        target_revision=original.revision,
+        proposed={
+            "subject_ref": "concept:artifact-quality",
+            "predicate": "useful_for_investigation",
+            "concept_ref": "concept:incorrect-knowledge",
+        },
+        scope=KnowledgeScope(),
+        explanation="The investigation showed this revision was incorrect.",
+        created_by="operator",
+    )
+    assert correction.target_revision == original.revision
+
+    additional = _dependency(
+        service,
+        payload_ref="incident-new-support",
+        family=SourceFamily.INCIDENT,
+        lineage_group="incident-new-support",
+    )
+    service.review_candidate(additional.id, approved=True, reviewer="operator")
+    _, advanced = service.evaluate_candidate(additional.id)
+    assert advanced is not None
+    assert advanced.revision > original.revision
+
+    with pytest.raises(ValueError, match="advanced from revision 1 to 2"):
+        service.review_correction(
+            correction.id,
+            approved=True,
+            reviewer="operator",
+            authoritative=True,
+        )
+
+    stored_candidate = service.repository.get_candidate(correction_candidate.id)
+    assert stored_candidate is not None
+    assert stored_candidate.state.review_state == ReviewState.CANDIDATE
+
+
+def test_correction_creation_rejects_an_already_stale_target_revision(tmp_path: Path):
+    service = _service(tmp_path)
+    _, original = _promoted_dependency(service)
+    additional = _dependency(
+        service,
+        payload_ref="dashboard-new-support",
+        family=SourceFamily.ALERT,
+        lineage_group="dashboard-new-support",
+    )
+    service.review_candidate(additional.id, approved=True, reviewer="operator")
+    _, advanced = service.evaluate_candidate(additional.id)
+    assert advanced is not None
+
+    with pytest.raises(ValueError, match="advanced from revision 1 to 2"):
+        service.create_correction(
+            investigation_id="inv_stale_at_submit",
+            investigation_revision=1,
+            correction_type=CorrectionType.KNOWLEDGE_INCORRECT,
+            target_ref=original.knowledge_id,
+            target_revision=original.revision,
+            proposed={
+                "subject_ref": "concept:artifact-quality",
+                "predicate": "useful_for_investigation",
+                "concept_ref": "concept:incorrect-knowledge",
+            },
+            scope=KnowledgeScope(),
+            explanation="This correction was based on an older investigation.",
+            created_by="operator",
+        )
+
+
 def test_authoritative_signal_correction_promotes(tmp_path: Path):
     service = _service(tmp_path)
     correction, _ = service.create_correction(
@@ -1431,7 +1540,7 @@ def test_pending_counter_proposition_does_not_disable_active_knowledge(tmp_path:
 
     assert conflicts == []
     active_usage = next(item for item in usage if item.knowledge_ref == active.knowledge_id)
-    assert active_usage.disposition.value == "applied"
+    assert active_usage.disposition.value == "considered_not_applied"
 
 
 def test_complementary_evidence_requirements_do_not_conflict(tmp_path: Path):
@@ -1496,6 +1605,108 @@ def test_removed_source_keeps_knowledge_active_when_independent_support_remains(
     assert set(current.promoted_from_candidate_refs) == (set(active.promoted_from_candidate_refs) - {removed.id}) | {
         survivor.id
     }
+
+
+def test_removed_source_reuses_authoritative_override_from_surviving_candidate(tmp_path: Path):
+    service = _service(tmp_path)
+    service.register_entity(
+        Entity(
+            id="entity:team:payments",
+            kind=EntityKind.TEAM,
+            canonical_name="payments",
+            scope=KnowledgeScope(),
+            provenance_refs=["catalog:team"],
+        )
+    )
+    candidates = []
+    latest = None
+    for source in ("catalog-a", "catalog-b"):
+        candidate = service.create_candidate(
+            kind=KnowledgeKind.OWNERSHIP,
+            payload_ref=source,
+            typed_payload={},
+            proposition={
+                "subject_ref": "entity:service:checkout",
+                "predicate": "owned_by",
+                "object_ref": "entity:team:payments",
+            },
+            scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+            evidence=[
+                KnowledgeEvidenceReference(
+                    evidence_ref=f"evidence:{source}",
+                    source_family=SourceFamily.SERVICE_CATALOG,
+                    lineage_group=source,
+                    provenance_refs=[f"provenance:{source}"],
+                )
+            ],
+            provenance_refs=[f"provenance:{source}"],
+        )
+        service.review_candidate(candidate.id, approved=True, reviewer="operator")
+        _, latest = service.evaluate_candidate(candidate.id, authoritative_source=True)
+        assert latest is not None
+        candidates.append(candidate)
+
+    persisted_survivor = service.repository.get_candidate(candidates[1].id)
+    assert persisted_survivor is not None
+    assert persisted_survivor.policy.authoritative_source is True
+
+    service.reconcile_source_lifecycle(
+        provenance_ref="provenance:catalog-a",
+        active_candidate_ids=set(),
+    )
+
+    current = service.repository.get_revision(latest.knowledge_id)
+    assert current is not None
+    assert current.state.lifecycle_status == LifecycleStatus.ACTIVE
+    assert current.state.eligibility == KnowledgeEligibility.CONTEXTUAL_ONLY
+    assert current.promoted_from_candidate_refs == [candidates[1].id]
+
+
+def test_removed_source_reuses_live_verified_override_from_surviving_candidate(tmp_path: Path):
+    service = _service(tmp_path)
+    candidates = []
+    latest = None
+    for source, family in (("dashboard-a", SourceFamily.DASHBOARD), ("alert-b", SourceFamily.ALERT)):
+        candidate = service.create_candidate(
+            kind=KnowledgeKind.SIGNAL_MAPPING,
+            payload_ref=source,
+            typed_payload={"metric": "http_request_duration_seconds"},
+            proposition={
+                "subject_ref": "concept:latency",
+                "predicate": "represented_by",
+                "object_ref": "concept:http_request_duration_seconds",
+                "concept_ref": "signal:latency",
+            },
+            scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+            evidence=[
+                KnowledgeEvidenceReference(
+                    evidence_ref=f"evidence:{source}",
+                    source_family=family,
+                    lineage_group=source,
+                    provenance_refs=[f"provenance:{source}"],
+                )
+            ],
+            provenance_refs=[f"provenance:{source}"],
+        )
+        service.review_candidate(candidate.id, approved=True, reviewer="operator")
+        _, latest = service.evaluate_candidate(candidate.id, live_verified=True)
+        assert latest is not None
+        candidates.append(candidate)
+
+    persisted_survivor = service.repository.get_candidate(candidates[1].id)
+    assert persisted_survivor is not None
+    assert persisted_survivor.policy.live_verified is True
+
+    service.reconcile_source_lifecycle(
+        provenance_ref="provenance:dashboard-a",
+        active_candidate_ids=set(),
+    )
+
+    current = service.repository.get_revision(latest.knowledge_id)
+    assert current is not None
+    assert current.state.lifecycle_status == LifecycleStatus.ACTIVE
+    assert current.state.eligibility == KnowledgeEligibility.LIVE_VERIFIED
+    assert current.promoted_from_candidate_refs == [candidates[1].id]
 
 
 def test_rejecting_promoted_contributor_recomputes_current_knowledge(tmp_path: Path):
@@ -1717,7 +1928,7 @@ def test_investigation_scope_extracts_supported_prompt_dimensions():
     scope = investigation_knowledge_scope(
         tenant_id="tenant-a",
         prompt=(
-            "Investigate checkout in production us-east-1, cluster: prod-east, " "namespace payments on release v2.4.1"
+            "Investigate checkout in production us-east-1, cluster: prod-east, namespace payments on release v2.4.1"
         ),
         services=["Checkout API"],
         archetype_ids=["latency_investigation"],

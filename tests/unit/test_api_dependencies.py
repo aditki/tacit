@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
 from tacit.api.app import create_app
+from tacit.api.dependencies import get_signal_store
 from tacit.api.security import (
     KnowledgeAction,
     assert_knowledge_action,
@@ -536,3 +537,42 @@ def test_artifact_dry_runs_do_not_initialize_signal_storage(endpoint, payload):
     assert response.status_code == 200, response.text
     assert response.json()["dry_run"] is True
     assert store_calls == 0
+
+
+def test_alert_dry_runs_preserve_selected_wildcard_tenant(monkeypatch):
+    seen: list[tuple[str, str | None]] = []
+
+    async def ingest_alert(**kwargs):
+        seen.append(("single", kwargs["tenant_id"]))
+        return {"alert_uid": kwargs["alert_uid"], "dry_run": True}
+
+    async def learn_alerts(*args, **kwargs):
+        seen.append(("bulk", kwargs["tenant_id"]))
+        return {
+            "alerts_learned": 0,
+            "signals_inferred": 0,
+            "mappings_created": 0,
+            "warnings": [],
+            "dry_run": True,
+        }
+
+    monkeypatch.setattr("tacit.alert_ingest.ingest_alert", ingest_alert)
+    monkeypatch.setattr("tacit.alert_ingest.learn_backend_alerts", learn_alerts)
+    app = create_app(runtime_settings=Settings(knowledge_tenant_id="*"))
+    app.dependency_overrides[get_signal_store] = lambda: object()
+    client = TestClient(app)
+    headers = {"X-Tacit-Tenant": "tenant-a"}
+
+    single = client.post(
+        "/api/v1/learn/alerts",
+        headers=headers,
+        json={"alert_uid": "checkout-latency", "backend": "grafana", "dry_run": True},
+    )
+    bulk = client.post(
+        "/api/v1/learn/backends/grafana/alerts?dry_run=true",
+        headers=headers,
+    )
+
+    assert single.status_code == 200, single.text
+    assert bulk.status_code == 200, bulk.text
+    assert seen == [("single", "tenant-a"), ("bulk", "tenant-a")]

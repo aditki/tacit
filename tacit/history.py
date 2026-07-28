@@ -995,15 +995,16 @@ class InvestigationStore:
                     knowledge_usage,
                     snapshot.evidence_observations,
                 )
-                knowledge_snapshot = knowledge_service.snapshot_from_usage(tenant_id, knowledge_usage)
                 baseline_ranking = snapshot.baseline_culprit_ranking or snapshot.culprit_ranking
+                replay_ranking, knowledge_usage = knowledge_service.apply_to_ranking(
+                    baseline_ranking,
+                    knowledge_usage,
+                )
+                knowledge_snapshot = knowledge_service.snapshot_from_usage(tenant_id, knowledge_usage)
                 replay_snapshot = snapshot.model_copy(
                     update={
                         "request": snapshot.request.model_copy(update={"tenant_id": tenant_id}),
-                        "culprit_ranking": knowledge_service.apply_to_ranking(
-                            baseline_ranking,
-                            knowledge_usage,
-                        ),
+                        "culprit_ranking": replay_ranking,
                         "knowledge_snapshot_ref": knowledge_snapshot.id,
                         "knowledge_usage": knowledge_usage,
                     }

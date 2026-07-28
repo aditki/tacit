@@ -133,7 +133,7 @@ async def learn_from_alert(
     from tacit.config import settings
 
     _authorize_signal_approval(request, payload.auto_approve and not payload.dry_run)
-    tenant_id = None if payload.dry_run else knowledge_tenant(request)
+    tenant_id = knowledge_tenant(request)
     try:
         return await _call_ingest_alert(
             ingest_alert,
@@ -342,7 +342,7 @@ async def learn_backend_alert_rules(
     from tacit.config import settings
 
     _authorize_signal_approval(request, auto_approve and not dry_run)
-    tenant_id = None if dry_run else knowledge_tenant(request)
+    tenant_id = knowledge_tenant(request)
     try:
         return await _call_learn_backend_alerts(
             learn_backend_alerts,

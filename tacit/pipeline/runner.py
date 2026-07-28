@@ -526,8 +526,11 @@ async def _run_pipeline_inner(
                 knowledge_usage,
                 validation_result.evidence_observations,
             )
+            culprit_ranking, knowledge_usage = knowledge_service.apply_to_ranking(
+                culprit_ranking,
+                knowledge_usage,
+            )
             knowledge_snapshot = knowledge_service.snapshot_from_usage(tenant_id, knowledge_usage)
-            culprit_ranking = knowledge_service.apply_to_ranking(culprit_ranking, knowledge_usage)
         except Exception:
             logger.warning("operational_knowledge_selection_failed", exc_info=True)
         ranking_status = "passed" if culprit_ranking.candidates else "skipped"

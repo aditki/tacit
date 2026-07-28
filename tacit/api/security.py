@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import secrets
 from enum import StrEnum
-from typing import Final
+from typing import Any, Final
 
 from fastapi import HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
@@ -73,6 +73,34 @@ def assert_tenant_access(request: Request, resource_tenant: str) -> str:
     if not resource_tenant or selected_tenant != resource_tenant:
         raise HTTPException(status_code=403, detail="Tenant access denied")
     return selected_tenant
+
+
+def assert_contract_tenant_access(
+    request: Request,
+    contract: Any,
+    *,
+    store: Any | None = None,
+    runtime_settings: Any | None = None,
+) -> str:
+    """Authorize a contract using the recorded row tenant for legacy payloads."""
+    active_settings = runtime_settings or getattr(request.app.state, "settings", settings)
+    configured = str(getattr(active_settings, "knowledge_tenant_id", "default") or "default")
+    contract_tenant = str(contract.request.scope.tenant_id or "")
+    investigation_id = str(getattr(getattr(contract, "investigation", None), "id", ""))
+    investigation = (
+        store.get(investigation_id) if store is not None and investigation_id and hasattr(store, "get") else None
+    )
+    recorded_tenant = str((investigation or {}).get("tenant_id") or "")
+    if not recorded_tenant:
+        if contract_tenant not in {"", "default"}:
+            recorded_tenant = contract_tenant
+        elif configured != "*":
+            recorded_tenant = configured
+        else:
+            recorded_tenant = contract_tenant
+    if contract_tenant not in {"", "default", recorded_tenant}:
+        raise HTTPException(status_code=403, detail="Tenant access denied")
+    return assert_tenant_access(request, recorded_tenant)
 
 
 def resolve_knowledge_tenant(

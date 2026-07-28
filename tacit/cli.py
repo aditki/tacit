@@ -1523,9 +1523,7 @@ def learn_pagerduty(
 @click.option("--dry-run", is_flag=True, help="Preview alert ingestion without persisting learned context")
 @click.option("--limit", default=500, show_default=True, help="Maximum alerts to crawl")
 @click.option("--tenant", default=None, help="Knowledge tenant (required for persistence in wildcard mode)")
-def learn_alerts(
-    source: str, alert_uid: str, auto_approve: bool, dry_run: bool, limit: int, tenant: str | None
-):
+def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool, limit: int, tenant: str | None):
     """Crawl or preview alert rules from a backend."""
     _header(f"Learn {source.title()} Alerts")
     _load_env()

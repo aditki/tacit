@@ -7,11 +7,11 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-import tacit.history as history_mod
+from tacit.api.dependencies import get_history_store
 from tacit.api.security import (
     KnowledgeAction,
+    assert_contract_tenant_access,
     assert_knowledge_action,
-    assert_tenant_access,
     knowledge_tenant,
     require_knowledge_action,
     verify_api_key,
@@ -267,16 +267,23 @@ async def create_alias(payload: AliasRequest, request: Request):
     tags=["Operational Knowledge"],
     dependencies=[Depends(require_knowledge_action(KnowledgeAction.CORRECT))],
 )
-async def create_correction(payload: CorrectionRequest, request: Request):
-    tenant_id = _tenant(request)
-    contract = history_mod.get_investigation_store().get_contract(
+async def create_correction(
+    payload: CorrectionRequest,
+    request: Request,
+    history_store: Any = Depends(get_history_store),
+):
+    contract = history_store.get_contract(
         payload.investigation_id,
         payload.investigation_revision,
     )
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation revision not found")
-    assert_tenant_access(request, str(contract.request.scope.tenant_id or "default"))
-    if payload.target_ref and payload.target_ref not in {usage.knowledge_ref for usage in contract.knowledge_usage}:
+    tenant_id = assert_contract_tenant_access(request, contract, store=history_store)
+    target_usage = next(
+        (usage for usage in contract.knowledge_usage if usage.knowledge_ref == payload.target_ref),
+        None,
+    )
+    if payload.target_ref and target_usage is None:
         raise HTTPException(
             status_code=400,
             detail="Correction target was not considered by the referenced investigation revision",
@@ -291,6 +298,7 @@ async def create_correction(payload: CorrectionRequest, request: Request):
             explanation=payload.explanation,
             created_by=payload.created_by,
             target_ref=payload.target_ref,
+            target_revision=target_usage.knowledge_revision if target_usage is not None else None,
             tenant_id=tenant_id,
         )
         return {

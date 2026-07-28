@@ -168,6 +168,8 @@ class CandidatePolicyState(BaseModel):
     promotion_policy_ref: str = ""
     last_evaluated_at: datetime | None = None
     eligibility_reason_codes: list[str] = Field(default_factory=list)
+    authoritative_source: bool = False
+    live_verified: bool = False
 
 
 class MigrationProvenance(BaseModel):
@@ -230,6 +232,8 @@ class PromotionDecision(BaseModel):
     resulting_eligibility: KnowledgeEligibility
     reason_codes: list[str] = Field(default_factory=list)
     input_fingerprint: str
+    authoritative_source: bool = False
+    live_verified: bool = False
     evaluated_at: datetime = Field(default_factory=utc_now)
 
 
@@ -336,6 +340,7 @@ class KnowledgeCorrection(BaseModel):
     investigation_revision: int
     correction_type: CorrectionType
     target_ref: str = ""
+    target_revision: int | None = Field(default=None, ge=1)
     original: dict[str, Any] = Field(default_factory=dict)
     proposed: dict[str, Any]
     scope: KnowledgeScope
@@ -349,6 +354,8 @@ class KnowledgeCorrection(BaseModel):
     def validate_correction_tenant(self) -> KnowledgeCorrection:
         if self.scope.tenant_id != self.tenant_id:
             raise ValueError("knowledge correction tenant and scope tenant must match")
+        if not self.target_ref and self.target_revision is not None:
+            raise ValueError("target_revision requires target_ref")
         return self
 
 

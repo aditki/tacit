@@ -1117,19 +1117,24 @@ class InvestigationContractAssembler:
             )
             sequence += 1
         for usage in knowledge_usage:
+            if usage.disposition == KnowledgeUsageDisposition.APPLIED:
+                action = "applied_knowledge"
+                reason = "Applied an exact Operational Knowledge revision after a consuming stage changed output."
+            elif usage.disposition == KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED:
+                action = "considered_knowledge"
+                reason = "Considered an eligible Operational Knowledge revision without claiming stage impact."
+            else:
+                action = "rejected_knowledge"
+                reason = "Rejected an Operational Knowledge revision under recorded policy or live evidence."
             decisions.append(
                 DecisionLogEntry(
                     id=f"decision_{sequence:02d}",
                     sequence=sequence,
                     stage="operational_knowledge",
-                    action=(
-                        "applied_knowledge"
-                        if usage.disposition == KnowledgeUsageDisposition.APPLIED
-                        else "rejected_knowledge"
-                    ),
+                    action=action,
                     subject_ref=usage.knowledge_ref,
                     reason_code=usage.disposition.value,
-                    reason="Applied or rejected an exact Operational Knowledge revision under recorded policy.",
+                    reason=reason,
                     inputs=[f"{usage.knowledge_ref}@{usage.knowledge_revision}"],
                     output_ref=usage.target_ref,
                     mechanism={"type": "deterministic_policy", "version": "knowledge-selection-v1"},

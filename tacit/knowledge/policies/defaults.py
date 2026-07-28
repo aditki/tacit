@@ -61,6 +61,8 @@ class ConservativePromotionPolicy:
             resulting_eligibility=resulting,
             reason_codes=[] if eligible else sorted(set(reasons)),
             input_fingerprint=fingerprint,
+            authoritative_source=context.authoritative_source,
+            live_verified=context.live_verified,
         )
 
     def _kind_reasons(self, candidate: KnowledgeCandidate, context: PromotionContext) -> list[str]:
