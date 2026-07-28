@@ -78,9 +78,7 @@ class CorroborationService:
 
     def contributing_candidates(self, tenant_id: str, proposition_key: str) -> list[KnowledgeCandidate]:
         candidates = self.reviewed_candidates(tenant_id, proposition_key)
-        contributing_ids = {
-            candidate.id for candidate, _ in self._independent_evidence(candidates)
-        }
+        contributing_ids = {candidate.id for candidate, _ in self._independent_evidence(candidates)}
         return [candidate for candidate in candidates if candidate.id in contributing_ids]
 
     @staticmethod
@@ -165,11 +163,16 @@ class ConflictDetectionService:
                 and existing.resolution_reason == "counter_proposition_rejected"
                 and conflict.resolution_status == ConflictResolutionStatus.UNRESOLVED
             )
-            if existing and not reopened and existing.resolution_status in {
-                ConflictResolutionStatus.RESOLVED_BY_AUTHORITY,
-                ConflictResolutionStatus.RESOLVED_BY_REVIEW,
-                ConflictResolutionStatus.SUPERSEDED,
-            }:
+            if (
+                existing
+                and not reopened
+                and existing.resolution_status
+                in {
+                    ConflictResolutionStatus.RESOLVED_BY_AUTHORITY,
+                    ConflictResolutionStatus.RESOLVED_BY_REVIEW,
+                    ConflictResolutionStatus.SUPERSEDED,
+                }
+            ):
                 conflict = existing
             self.repository.save_conflict(conflict)
             self.repository.append_event(

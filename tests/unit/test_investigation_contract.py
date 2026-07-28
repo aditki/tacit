@@ -936,9 +936,7 @@ def test_current_engine_replay_uses_pinned_knowledge_tenant(tmp_path, monkeypatc
     investigation_id = store.start("Why did checkout latency increase?")
     draft = _draft_contract(investigation_id)
     snapshot = _snapshot_for(draft)
-    snapshot = snapshot.model_copy(
-        update={"request": snapshot.request.model_copy(update={"tenant_id": "tenant-b"})}
-    )
+    snapshot = snapshot.model_copy(update={"request": snapshot.request.model_copy(update={"tenant_id": "tenant-b"})})
     store.persist_contract_revision(draft, snapshot=snapshot)
     monkeypatch.setattr("tacit.history.settings.knowledge_tenant_id", "tenant-a")
     captured: dict[str, str] = {}
@@ -946,12 +944,15 @@ def test_current_engine_replay_uses_pinned_knowledge_tenant(tmp_path, monkeypatc
     class CapturingKnowledgeService:
         def create_snapshot(self, scope):
             captured["tenant_id"] = scope.tenant_id
-            return KnowledgeSnapshot(
-                id="knowledge_snapshot_pinned",
-                tenant_id=scope.tenant_id,
-                items=[],
-                fingerprint="sha256:pinned",
-            ), []
+            return (
+                KnowledgeSnapshot(
+                    id="knowledge_snapshot_pinned",
+                    tenant_id=scope.tenant_id,
+                    items=[],
+                    fingerprint="sha256:pinned",
+                ),
+                [],
+            )
 
         def reconcile_live_observations(self, usage, observations):
             return usage

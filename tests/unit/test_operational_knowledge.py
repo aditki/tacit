@@ -497,10 +497,7 @@ def test_new_candidate_reopens_conflict_resolved_by_rejection(tmp_path: Path):
     assert conflicts[0].resolution_status == ConflictResolutionStatus.UNRESOLVED
     assert conflicts[0].resolution_reason == ""
     assert service.repository.list_conflicts("default", unresolved_only=True) == conflicts
-    assert any(
-        event["event_type"] == "conflict_reopened"
-        for event in service.repository.list_events("default")
-    )
+    assert any(event["event_type"] == "conflict_reopened" for event in service.repository.list_events("default"))
 
 
 def test_conflict_scope_analysis_includes_services(tmp_path: Path):

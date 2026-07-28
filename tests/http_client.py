@@ -10,6 +10,7 @@ from fastapi import FastAPI
 
 class TestClient:
     """Sync-style API test client backed by httpx ASGI transport."""
+
     __test__ = False
 
     def __init__(

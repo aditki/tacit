@@ -345,11 +345,7 @@ class KnowledgeService:
                 for item in contributors
                 for provenance_ref in [
                     *item.provenance_refs,
-                    *[
-                        ref
-                        for evidence in item.evidence.items
-                        for ref in evidence.provenance_refs
-                    ],
+                    *[ref for evidence in item.evidence.items for ref in evidence.provenance_refs],
                 ]
             }
         )
