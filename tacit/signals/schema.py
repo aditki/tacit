@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     -- Provenance
     source_type         TEXT NOT NULL DEFAULT 'bootstrap',
     source_refs         TEXT NOT NULL DEFAULT '[]',
+    -- Stable Operational Knowledge identity. Empty for legacy/non-governed rows.
+    governance_ref      TEXT NOT NULL DEFAULT '',
     -- Which inference ruleset produced this (for invalidate/replay).
     inference_version   TEXT NOT NULL DEFAULT '',
     -- Lifecycle: heuristic mappings start 'candidate' → 'approved' → 'trusted';
@@ -62,7 +64,7 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     created_at          REAL NOT NULL,
     last_seen           REAL NOT NULL,
 
-    UNIQUE(tenant_id, signal_type, metric_pattern)
+    UNIQUE(tenant_id, signal_type, metric_pattern, governance_ref)
 );
 
 -- Inferred candidates that were NOT auto-taught (negative training data).

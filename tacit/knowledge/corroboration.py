@@ -133,12 +133,10 @@ class ConflictDetectionService:
                 continue
             signal_mapping = current["kind"] == KnowledgeKind.SIGNAL_MAPPING.value
             if signal_mapping:
-                # A signal can have many metric patterns. Conflict only when
-                # one metric is assigned incompatible semantic meanings.
-                if current["object_ref"] != other["object_ref"]:
-                    continue
-                if current["subject_ref"] == other["subject_ref"] and current["concept_ref"] == other["concept_ref"]:
-                    continue
+                # Signal resolution is many-to-many in both directions. A
+                # conflict requires an explicit exclusivity rule, which v1
+                # propositions do not currently represent.
+                continue
             elif current["subject_ref"] != other["subject_ref"]:
                 continue
             predicates = {current["predicate"], other["predicate"]}

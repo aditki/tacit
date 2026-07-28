@@ -989,7 +989,12 @@ class KnowledgeService:
         )
         superseded = False
         if revision and target is not None and replaceable_conflicts and correction.target_ref != revision.knowledge_id:
-            self.supersede(correction.target_ref, candidate.id, tenant_id=tenant_id)
+            self.supersede(
+                correction.target_ref,
+                candidate.id,
+                tenant_id=tenant_id,
+                expected_revision=correction.target_revision,
+            )
             superseded = True
         if superseded:
             for conflict in replaceable_conflicts:
@@ -1020,8 +1025,13 @@ class KnowledgeService:
         replacement_candidate_id: str,
         *,
         tenant_id: str = "default",
+        expected_revision: int | None = None,
     ) -> KnowledgeRevision:
-        current = self.repository.get_revision(knowledge_id, tenant_id=tenant_id)
+        current = self.repository.get_revision(
+            knowledge_id,
+            expected_revision,
+            tenant_id=tenant_id,
+        )
         candidate = self._require_candidate(replacement_candidate_id, tenant_id)
         if current is None:
             raise ValueError("knowledge item not found")
@@ -1044,7 +1054,12 @@ class KnowledgeService:
                 "created_at": utc_now(),
             }
         )
-        self.repository.persist_revision(revision, candidate_id=candidate.id, decision_ref=decision.decision_id)
+        self.repository.persist_revision(
+            revision,
+            candidate_id=candidate.id,
+            decision_ref=decision.decision_id,
+            expected_parent_revision=expected_revision,
+        )
         self._sync_signal_mapping_state(revision)
         self.repository.append_event(
             "knowledge_superseded",
@@ -1200,13 +1215,7 @@ class KnowledgeService:
         )
         store = SignalStore(self.repository._db_path)
         for metric_pattern in metric_patterns:
-            updated = store.set_mapping_review_state(
-                signal_type,
-                metric_pattern,
-                review_state=review_state,
-                tenant_id=revision.tenant_id,
-            )
-            if active and not updated:
+            if active:
                 store.add_mapping(
                     signal_type,
                     metric_pattern,
@@ -1232,9 +1241,18 @@ class KnowledgeService:
                         f"{revision.knowledge_id}@{revision.revision}",
                         *revision.provenance_refs,
                     ],
+                    governance_ref=revision.knowledge_id,
                     inference_version=f"{revision.policy_id}:{revision.policy_version}",
                     review_state=review_state,
                     tenant_id=revision.tenant_id,
+                )
+            else:
+                store.set_mapping_review_state(
+                    signal_type,
+                    metric_pattern,
+                    review_state=review_state,
+                    tenant_id=revision.tenant_id,
+                    governance_ref=revision.knowledge_id,
                 )
 
     def _signal_metric_patterns(self, revision: KnowledgeRevision) -> list[str]:

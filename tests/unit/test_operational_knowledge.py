@@ -49,6 +49,7 @@ from tacit.knowledge.repository import (
     CandidateEvaluationConflictError,
     CandidateReviewConflictError,
     KnowledgeRepository,
+    KnowledgeRevisionConflictError,
 )
 from tacit.knowledge.scope import investigation_knowledge_scope
 from tacit.knowledge.service import KnowledgeService
@@ -776,7 +777,7 @@ def test_signal_mapping_allows_multiple_metrics_for_one_signal(tmp_path: Path):
     assert conflicts == []
 
 
-def test_signal_mapping_conflicts_when_one_metric_has_incompatible_meanings(tmp_path: Path):
+def test_signal_mapping_allows_multiple_meanings_for_one_metric(tmp_path: Path):
     service = _service(tmp_path)
     first = service.create_candidate(
         kind=KnowledgeKind.SIGNAL_MAPPING,
@@ -805,33 +806,41 @@ def test_signal_mapping_conflicts_when_one_metric_has_incompatible_meanings(tmp_
 
     conflicts = service.conflicts.analyze("default", first.proposition.proposition_key)
 
-    assert len(conflicts) == 1
-    assert conflicts[0].conflict_kind.value == "competing_signal_mapping"
-    assert conflicts[0].resolution_status == ConflictResolutionStatus.UNRESOLVED
+    assert conflicts == []
 
 
 def test_conflict_scope_analysis_includes_services(tmp_path: Path):
     service = _service(tmp_path)
+    for team in ("payments", "platform"):
+        service.register_entity(
+            Entity(
+                id=f"entity:team:{team}",
+                kind=EntityKind.TEAM,
+                canonical_name=team,
+                scope=KnowledgeScope(),
+                provenance_refs=["catalog:team"],
+            )
+        )
     first = service.create_candidate(
-        kind=KnowledgeKind.SIGNAL_MAPPING,
-        payload_ref="checkout-signal",
+        kind=KnowledgeKind.OWNERSHIP,
+        payload_ref="checkout-owner",
         typed_payload={},
         proposition={
-            "subject_ref": "concept:latency",
-            "predicate": "represented_by",
-            "object_ref": "concept:shared_metric_seconds",
+            "subject_ref": "entity:service:checkout",
+            "predicate": "owned_by",
+            "object_ref": "entity:team:payments",
         },
         scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
         provenance_refs=["catalog:checkout"],
     )
     second = service.create_candidate(
-        kind=KnowledgeKind.SIGNAL_MAPPING,
-        payload_ref="payment-signal",
+        kind=KnowledgeKind.OWNERSHIP,
+        payload_ref="payment-owner",
         typed_payload={},
         proposition={
-            "subject_ref": "concept:saturation",
-            "predicate": "represented_by",
-            "object_ref": "concept:shared_metric_seconds",
+            "subject_ref": "entity:service:checkout",
+            "predicate": "owned_by",
+            "object_ref": "entity:team:platform",
         },
         scope=KnowledgeScope(service_refs=["entity:service:payment"]),
         provenance_refs=["catalog:payment"],
@@ -848,14 +857,24 @@ def test_conflict_scope_analysis_includes_services(tmp_path: Path):
 
 def test_conflict_scope_analysis_includes_archetypes(tmp_path: Path):
     service = _service(tmp_path)
+    for team in ("payments", "platform"):
+        service.register_entity(
+            Entity(
+                id=f"entity:team:{team}",
+                kind=EntityKind.TEAM,
+                canonical_name=team,
+                scope=KnowledgeScope(),
+                provenance_refs=["catalog:team"],
+            )
+        )
     first = service.create_candidate(
-        kind=KnowledgeKind.SIGNAL_MAPPING,
-        payload_ref="latency-signal",
+        kind=KnowledgeKind.OWNERSHIP,
+        payload_ref="http-owner",
         typed_payload={},
         proposition={
-            "subject_ref": "concept:latency",
-            "predicate": "represented_by",
-            "object_ref": "concept:shared_metric_seconds",
+            "subject_ref": "entity:service:checkout",
+            "predicate": "owned_by",
+            "object_ref": "entity:team:payments",
         },
         scope=KnowledgeScope(
             service_refs=["entity:service:checkout"],
@@ -864,13 +883,13 @@ def test_conflict_scope_analysis_includes_archetypes(tmp_path: Path):
         provenance_refs=["catalog:http"],
     )
     second = service.create_candidate(
-        kind=KnowledgeKind.SIGNAL_MAPPING,
-        payload_ref="queue-signal",
+        kind=KnowledgeKind.OWNERSHIP,
+        payload_ref="queue-owner",
         typed_payload={},
         proposition={
-            "subject_ref": "concept:queue-pressure",
-            "predicate": "represented_by",
-            "object_ref": "concept:shared_metric_seconds",
+            "subject_ref": "entity:service:checkout",
+            "predicate": "owned_by",
+            "object_ref": "entity:team:platform",
         },
         scope=KnowledgeScope(
             service_refs=["entity:service:checkout"],
@@ -997,6 +1016,51 @@ def test_alias_scope_defaults_to_alias_tenant(tmp_path: Path):
 
     assert alias.scope.tenant_id == "tenant-a"
     assert candidate.entity_resolution.status.value == "resolved"
+
+
+def test_exact_alias_resolution_enforces_alias_scope(tmp_path: Path):
+    service = _service(tmp_path)
+    service.register_alias(
+        EntityAlias(
+            id="alias-production-storefront",
+            raw_value="Storefront",
+            normalized_value="storefront",
+            entity_ref="entity:service:checkout",
+            scope=KnowledgeScope(environment_refs=["environment:production"]),
+            method=EntityBindingMethod.HUMAN_CORRECTION,
+            review_state=ReviewState.APPROVED,
+            provenance_refs=["operator:alias"],
+        )
+    )
+
+    staging = service.create_candidate(
+        kind=KnowledgeKind.DEPENDENCY,
+        payload_ref="staging-scoped-alias",
+        typed_payload={},
+        proposition={
+            "subject_ref": "Storefront",
+            "predicate": "depends_on",
+            "object_ref": "redis-session",
+        },
+        scope=KnowledgeScope(environment_refs=["environment:staging"]),
+        provenance_refs=["runbook:staging"],
+    )
+    production = service.create_candidate(
+        kind=KnowledgeKind.DEPENDENCY,
+        payload_ref="production-scoped-alias",
+        typed_payload={},
+        proposition={
+            "subject_ref": "Storefront",
+            "predicate": "depends_on",
+            "object_ref": "redis-session",
+        },
+        scope=KnowledgeScope(environment_refs=["environment:production"]),
+        provenance_refs=["runbook:production"],
+    )
+
+    assert staging.entity_resolution.status.value == "unresolved"
+    assert production.entity_resolution.status.value == "resolved"
+    assert production.entity_resolution.candidate_bindings[0].method == EntityBindingMethod.EXACT_ALIAS
 
 
 def test_candidate_can_rebind_after_entity_resolution_is_repaired(tmp_path: Path):
@@ -1471,6 +1535,69 @@ def test_correction_rejects_target_that_advanced_after_creation(tmp_path: Path):
     assert stored_candidate.state.review_state == ReviewState.CANDIDATE
 
 
+def test_correction_supersession_rechecks_target_under_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    _, original = _promoted_dependency(service)
+    correction, _ = service.create_correction(
+        investigation_id="inv-concurrent-correction",
+        investigation_revision=1,
+        correction_type=CorrectionType.DEPENDENCY,
+        target_ref=original.knowledge_id,
+        target_revision=original.revision,
+        proposed={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "does_not_depend_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=original.scope,
+        explanation="Replace the reviewed dependency.",
+        created_by="operator",
+    )
+    concurrent_support = _dependency(
+        service,
+        payload_ref="concurrent-support",
+        family=SourceFamily.INCIDENT,
+        lineage_group="concurrent-support",
+    )
+    service.review_candidate(concurrent_support.id, approved=True, reviewer="operator")
+    supersede = service.supersede
+
+    def advance_then_supersede(*args, **kwargs):
+        advanced = original.model_copy(
+            update={
+                "revision": original.revision + 1,
+                "parent_revision": original.revision,
+                "revision_reason": "concurrent_update",
+                "semantic_fingerprint": f"{original.semantic_fingerprint}:concurrent",
+                "created_at": datetime.now(UTC),
+            }
+        )
+        service.repository.persist_revision(
+            advanced,
+            candidate_id=concurrent_support.id,
+            decision_ref="decision-concurrent-update",
+        )
+        return supersede(*args, **kwargs)
+
+    monkeypatch.setattr(service, "supersede", advance_then_supersede)
+
+    with pytest.raises(KnowledgeRevisionConflictError, match="advanced from revision 1 to 2"):
+        service.review_correction(
+            correction.id,
+            approved=True,
+            reviewer="operator",
+            authoritative=True,
+        )
+
+    current = service.repository.get_revision(original.knowledge_id)
+    assert current is not None
+    assert current.revision == 2
+    assert current.state.lifecycle_status == LifecycleStatus.ACTIVE
+
+
 def test_correction_creation_rejects_an_already_stale_target_revision(tmp_path: Path):
     service = _service(tmp_path)
     _, original = _promoted_dependency(service)
@@ -1536,6 +1663,81 @@ def test_authoritative_signal_correction_promotes(tmp_path: Path):
         context_service="checkout",
     )
     assert [mapping["metric_pattern"] for mapping in mappings] == ["http_request_duration_seconds"]
+
+
+def test_governed_signal_projection_preserves_each_revision_scope(tmp_path: Path):
+    service = _service(tmp_path)
+
+    def promote_for(service_name: str) -> KnowledgeRevision:
+        correction, _ = service.create_correction(
+            investigation_id=f"inv-{service_name}-latency",
+            investigation_revision=1,
+            correction_type=CorrectionType.SIGNAL_MEANING,
+            proposed={
+                "subject_ref": "concept:latency",
+                "predicate": "represented_by",
+                "object_ref": "concept:shared_latency_seconds",
+                "concept_ref": "signal:request_latency",
+                "metric_pattern": "shared_latency_seconds",
+            },
+            scope=KnowledgeScope(service_refs=[f"entity:service:{service_name}"]),
+            explanation=f"Approve the {service_name} latency mapping.",
+            created_by="operator",
+        )
+        _, revision = service.review_correction(
+            correction.id,
+            approved=True,
+            reviewer="reviewer",
+            authoritative=True,
+        )
+        assert revision is not None
+        return revision
+
+    checkout = promote_for("checkout")
+    payments = promote_for("payments")
+
+    from tacit.signals.store import SignalStore
+
+    store = SignalStore(service.repository._db_path)
+    with store._conn() as conn:
+        rows = conn.execute("""SELECT governance_ref, context_services, review_state
+               FROM signal_metric_mappings
+               WHERE tenant_id='default' AND signal_type='request_latency'
+                 AND metric_pattern='shared_latency_seconds'
+               ORDER BY governance_ref""").fetchall()
+    assert len(rows) == 2
+    assert {row["governance_ref"] for row in rows} == {checkout.knowledge_id, payments.knowledge_id}
+    assert {row["context_services"] for row in rows} == {'["checkout"]', '["payments"]'}
+
+    stale, _ = service.create_correction(
+        investigation_id="inv-checkout-stale",
+        investigation_revision=2,
+        correction_type=CorrectionType.KNOWLEDGE_STALE,
+        target_ref=checkout.knowledge_id,
+        target_revision=checkout.revision,
+        proposed={
+            "subject_ref": "concept:artifact-quality",
+            "predicate": "useful_for_investigation",
+            "concept_ref": "concept:stale-knowledge",
+        },
+        scope=checkout.scope,
+        explanation="The checkout mapping is stale.",
+        created_by="operator",
+    )
+    service.review_correction(stale.id, approved=True, reviewer="reviewer")
+
+    assert (
+        store.get_mappings_for_signal(
+            "request_latency",
+            context_service="checkout",
+        )
+        == []
+    )
+    active_payments = store.get_mappings_for_signal(
+        "request_latency",
+        context_service="payments",
+    )
+    assert [mapping["governance_ref"] for mapping in active_payments] == [payments.knowledge_id]
 
 
 def test_entity_mapping_correction_registers_alias_without_signal_revision(tmp_path: Path):
@@ -2756,6 +2958,33 @@ def test_api_reports_concurrent_candidate_review_as_conflict(monkeypatch: pytest
 
     assert response.status_code == 409
     assert response.json()["detail"] == "candidate review state changed; reload before reviewing"
+
+
+def test_api_reports_stale_correction_supersession_as_conflict(monkeypatch: pytest.MonkeyPatch):
+    import tacit.api.routes.knowledge as routes
+
+    class ConflictingService:
+        def review_correction(self, *args, **kwargs):
+            raise KnowledgeRevisionConflictError(
+                "knowledge target advanced from revision 1 to 2; rebase the correction"
+            )
+
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: ConflictingService())
+    client = TestClient(
+        create_app(
+            runtime_settings=Settings(
+                knowledge_permissions="knowledge.read,knowledge.review",
+            )
+        )
+    )
+
+    response = client.post(
+        "/api/v1/knowledge/corrections/correction-concurrent/review",
+        json={"decision": "approve", "reviewer": "operator"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "knowledge target advanced from revision 1 to 2; rebase the correction"
 
 
 def test_alias_upsert_updates_lookup_columns(tmp_path: Path):

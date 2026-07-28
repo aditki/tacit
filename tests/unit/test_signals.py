@@ -380,6 +380,54 @@ def test_signal_mapping_activates_after_governed_corroboration(signal_store):
     assert signal_store.resolve_signal("checkout_latency", catalog, tenant_id="tenant-b") == []
 
 
+def test_governed_mapping_scopes_and_lifecycles_are_independent(signal_store):
+    for knowledge_id, service in (("knowledge-checkout", "checkout"), ("knowledge-payments", "payments")):
+        signal_store.add_mapping(
+            "request_latency",
+            "shared_latency_seconds",
+            confidence=0.9,
+            context_services=[service],
+            source_type="operational_knowledge",
+            source_refs=[f"{knowledge_id}@1"],
+            governance_ref=knowledge_id,
+            review_state="approved",
+            tenant_id="tenant-a",
+        )
+
+    with signal_store._conn() as conn:
+        rows = conn.execute("""SELECT governance_ref, context_services FROM signal_metric_mappings
+               WHERE tenant_id='tenant-a' AND signal_type='request_latency'
+                 AND metric_pattern='shared_latency_seconds'
+               ORDER BY governance_ref""").fetchall()
+
+    assert [(row["governance_ref"], row["context_services"]) for row in rows] == [
+        ("knowledge-checkout", '["checkout"]'),
+        ("knowledge-payments", '["payments"]'),
+    ]
+
+    assert signal_store.set_mapping_review_state(
+        "request_latency",
+        "shared_latency_seconds",
+        "candidate",
+        tenant_id="tenant-a",
+        governance_ref="knowledge-checkout",
+    )
+    assert (
+        signal_store.get_mappings_for_signal(
+            "request_latency",
+            context_service="checkout",
+            tenant_id="tenant-a",
+        )
+        == []
+    )
+    payments = signal_store.get_mappings_for_signal(
+        "request_latency",
+        context_service="payments",
+        tenant_id="tenant-a",
+    )
+    assert [mapping["governance_ref"] for mapping in payments] == ["knowledge-payments"]
+
+
 def test_learning_context_index_is_tenant_scoped(signal_store):
     for tenant_id, title, metric in (
         ("tenant-a", "Tenant A Checkout", "tenant_a_checkout_latency"),
@@ -468,7 +516,7 @@ def test_legacy_mappings_and_learning_index_migrate_to_default_tenant(tmp_path):
     store = SignalStore(db_path=db_path)
 
     with store._conn() as conn:
-        migrated_mapping = conn.execute("""SELECT tenant_id FROM signal_metric_mappings
+        migrated_mapping = conn.execute("""SELECT tenant_id, governance_ref FROM signal_metric_mappings
                WHERE signal_type='latency' AND metric_pattern='legacy_latency_seconds'""").fetchone()
 
     assert store.resolve_signal(
@@ -478,6 +526,7 @@ def test_legacy_mappings_and_learning_index_migrate_to_default_tenant(tmp_path):
     )
     assert migrated_mapping is not None
     assert migrated_mapping["tenant_id"] == GLOBAL_BOOTSTRAP_TENANT_ID
+    assert migrated_mapping["governance_ref"] == ""
     assert store.search_learning_context("legacy", tenant_id="default")
     store.add_mapping("latency", "legacy_latency_seconds", confidence=0.8, tenant_id="tenant-b")
 

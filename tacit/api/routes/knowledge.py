@@ -335,6 +335,8 @@ async def review_correction(correction_id: str, payload: CorrectionReviewRequest
             "correction": correction.model_dump(mode="json"),
             "knowledge_revision": revision.model_dump(mode="json") if revision else None,
         }
+    except KnowledgeRevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

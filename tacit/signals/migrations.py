@@ -197,7 +197,7 @@ def ensure_rejected_candidate_tenant_scope(
 
 
 def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str = "default") -> None:
-    """Ensure learned signal mappings are isolated by tenant."""
+    """Ensure mappings are tenant-isolated and governed scopes remain independent."""
     unique_indexes = [
         [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
         for index in conn.execute("PRAGMA index_list(signal_metric_mappings)").fetchall()
@@ -205,14 +205,20 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str 
     ]
     has_legacy_foreign_key = bool(conn.execute("PRAGMA foreign_key_list(signal_metric_mappings)").fetchall())
     if (
-        ["tenant_id", "signal_type", "metric_pattern"] in unique_indexes
+        ["tenant_id", "signal_type", "metric_pattern", "governance_ref"] in unique_indexes
+        and ["tenant_id", "signal_type", "metric_pattern"] not in unique_indexes
         and ["signal_type", "metric_pattern"] not in unique_indexes
         and not has_legacy_foreign_key
     ):
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_tenant_signal
+               ON signal_metric_mappings(tenant_id, signal_type)""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_governance
+               ON signal_metric_mappings(tenant_id, governance_ref) WHERE governance_ref != ''""")
         return
     old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
     legacy_literal = _tenant_sql_literal(legacy_tenant)
     tenant_select = f"COALESCE(tenant_id, {legacy_literal})" if "tenant_id" in old_columns else legacy_literal
+    governance_select = "COALESCE(governance_ref, '')" if "governance_ref" in old_columns else "''"
     with atomic_rebuild(conn, "rebuild_signal_metric_mappings"):
         conn.execute("ALTER TABLE signal_metric_mappings RENAME TO signal_metric_mappings_old")
         conn.execute("""CREATE TABLE signal_metric_mappings (
@@ -225,19 +231,20 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str 
             context_environments TEXT NOT NULL DEFAULT '[]',
             context_archetypes TEXT NOT NULL DEFAULT '[]',
             source_type TEXT NOT NULL DEFAULT 'bootstrap', source_refs TEXT NOT NULL DEFAULT '[]',
+            governance_ref TEXT NOT NULL DEFAULT '',
             inference_version TEXT NOT NULL DEFAULT '', review_state TEXT NOT NULL DEFAULT 'trusted',
             use_count INTEGER NOT NULL DEFAULT 0, positive_feedback INTEGER NOT NULL DEFAULT 0,
             negative_feedback INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, last_seen REAL NOT NULL,
-            UNIQUE(tenant_id, signal_type, metric_pattern)
+            UNIQUE(tenant_id, signal_type, metric_pattern, governance_ref)
         )""")
         conn.execute(f"""INSERT INTO signal_metric_mappings
             (id, tenant_id, signal_type, metric_pattern, confidence, context_services,
              context_datasource_types, context_environments, context_archetypes,
-             source_type, source_refs, inference_version, review_state, use_count,
+             source_type, source_refs, governance_ref, inference_version, review_state, use_count,
              positive_feedback, negative_feedback, created_at, last_seen)
             SELECT id, {tenant_select}, signal_type, metric_pattern, confidence, context_services,
                    context_datasource_types, context_environments, context_archetypes,
-                   source_type, source_refs, inference_version, review_state, use_count,
+                   source_type, source_refs, {governance_select}, inference_version, review_state, use_count,
                    positive_feedback, negative_feedback, created_at, last_seen
             FROM signal_metric_mappings_old""")
         conn.execute("DROP TABLE signal_metric_mappings_old")
@@ -245,6 +252,8 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern)")
         conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_tenant_signal
                ON signal_metric_mappings(tenant_id, signal_type)""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_governance
+               ON signal_metric_mappings(tenant_id, governance_ref) WHERE governance_ref != ''""")
 
 
 def ensure_global_bootstrap_mapping_scope(conn: sqlite3.Connection) -> None:

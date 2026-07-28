@@ -636,13 +636,10 @@ class KnowledgeRepository:
             params.append(expected_kind)
         with self._conn() as conn:
             rows = conn.execute(
-                f"""SELECT DISTINCT e.entity_json FROM entities e
-                    LEFT JOIN entity_aliases a ON a.tenant_id=e.tenant_id AND a.entity_ref=e.id
+                f"""SELECT e.entity_json FROM entities e
                     WHERE e.tenant_id=? AND e.status='active'
-                      AND (e.normalized_name=? OR (
-                        a.normalized_value=? AND a.review_state IN ('approved', 'trusted')
-                        AND a.lifecycle_status='active')){kind_clause}""",
-                [tenant_id, normalized_value, normalized_value, *params[2:]],
+                      AND e.normalized_name=?{kind_clause}""",
+                params,
             ).fetchall()
         return [Entity.model_validate_json(row["entity_json"]) for row in rows]
 
@@ -872,6 +869,7 @@ class KnowledgeRepository:
         candidate_id: str,
         decision_ref: str,
         expected_candidate: KnowledgeCandidate | None = None,
+        expected_parent_revision: int | None = None,
     ) -> KnowledgeRevision:
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -896,6 +894,11 @@ class KnowledgeRepository:
                 (revision.tenant_id, revision.knowledge_id),
             ).fetchone()
             current = int(row["current_revision"]) if row else 0
+            if expected_parent_revision is not None and current != expected_parent_revision:
+                raise KnowledgeRevisionConflictError(
+                    f"knowledge target advanced from revision {expected_parent_revision} to {current}; "
+                    "rebase the correction"
+                )
             if revision.revision != current + 1:
                 raise KnowledgeRevisionConflictError(
                     f"expected knowledge revision {current + 1}, got {revision.revision}"

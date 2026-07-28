@@ -296,6 +296,7 @@ class SignalStore:
         context_archetypes: list[str] | None = None,
         source_type: str = "teach",
         source_refs: list[str] | None = None,
+        governance_ref: str = "",
         inference_version: str = "",
         review_state: str = "trusted",
         tenant_id: str = "default",
@@ -357,8 +358,9 @@ class SignalStore:
                           context_environments, context_archetypes,
                           source_refs, inference_version, review_state
                     FROM signal_metric_mappings
-                    WHERE tenant_id = ? AND signal_type = ? AND metric_pattern = ?""",
-                (storage_tenant, signal_type, metric_pattern),
+                    WHERE tenant_id = ? AND signal_type = ? AND metric_pattern = ?
+                      AND governance_ref = ?""",
+                (storage_tenant, signal_type, metric_pattern, governance_ref),
             ).fetchone()
 
             def _merge(provided: list[str] | None, existing_json: str | None) -> list[str]:
@@ -391,11 +393,11 @@ class SignalStore:
                 """INSERT INTO signal_metric_mappings
                    (tenant_id, signal_type, metric_pattern, confidence,
                     context_services, context_datasource_types,
-                    context_environments, context_archetypes,
-                    source_type, source_refs, inference_version, review_state,
-                    created_at, last_seen)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(tenant_id, signal_type, metric_pattern) DO UPDATE SET
+                   context_environments, context_archetypes,
+                    source_type, source_refs, governance_ref, inference_version,
+                    review_state, created_at, last_seen)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(tenant_id, signal_type, metric_pattern, governance_ref) DO UPDATE SET
                        confidence = MAX(excluded.confidence, signal_metric_mappings.confidence),
                        inference_version = excluded.inference_version,
                        review_state = excluded.review_state,
@@ -429,6 +431,7 @@ class SignalStore:
                     json.dumps(archetypes),
                     source_type,
                     json.dumps(refs),
+                    governance_ref,
                     merged_inference_version,
                     merged_review_state,
                     now,
@@ -527,13 +530,14 @@ class SignalStore:
         review_state: str,
         *,
         tenant_id: str = "default",
+        governance_ref: str = "",
     ) -> bool:
         """Activate or deactivate a tenant mapping after governance evaluation."""
         with self._conn() as conn:
             updated = conn.execute(
                 """UPDATE signal_metric_mappings SET review_state=?, last_seen=?
-                   WHERE tenant_id=? AND signal_type=? AND metric_pattern=?""",
-                (review_state, time.time(), tenant_id, signal_type, metric_pattern),
+                   WHERE tenant_id=? AND signal_type=? AND metric_pattern=? AND governance_ref=?""",
+                (review_state, time.time(), tenant_id, signal_type, metric_pattern, governance_ref),
             )
             return updated.rowcount == 1
 
