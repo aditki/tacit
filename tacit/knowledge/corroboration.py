@@ -88,6 +88,7 @@ class CorroborationService:
         candidates: list[KnowledgeCandidate],
     ) -> list[tuple[KnowledgeCandidate, KnowledgeEvidenceReference]]:
         lineage_groups: dict[str, tuple[KnowledgeCandidate, KnowledgeEvidenceReference]] = {}
+        unknown_lineage_seen = False
         for candidate in candidates:
             for item in candidate.evidence.items:
                 if item.evidence_role != EvidenceRole.SUPPORTING or item.lineage_kind in {
@@ -96,6 +97,12 @@ class CorroborationService:
                     LineageKind.SAME_VENDOR_EXPORT,
                     LineageKind.SAME_SOURCE_REVISION,
                 }:
+                    continue
+                if item.lineage_kind == LineageKind.UNKNOWN:
+                    if unknown_lineage_seen:
+                        continue
+                    unknown_lineage_seen = True
+                    lineage_groups["unknown_lineage"] = (candidate, item)
                     continue
                 group = item.lineage_group or item.evidence_ref
                 lineage_groups.setdefault(group, (candidate, item))

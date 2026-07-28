@@ -3,17 +3,39 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
+
 import tacit.feedback as feedback_mod
 import tacit.history as history_mod
 import tacit.signals.store as signals_store_mod
 from tacit.alert_ingest import ingest_alert_features
 from tacit.backends.base import AlertFeatures
-from tacit.config import create_settings
+from tacit.config import Settings, create_settings
 from tacit.feedback import FeedbackStore
 from tacit.history import InvestigationStore
 from tacit.knowledge.enums import SourceFamily
 from tacit.knowledge.repository import KnowledgeRepository
 from tacit.signals import SignalStore
+
+
+async def test_alert_dry_run_enforces_runtime_tenant_boundary(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    features = AlertFeatures(
+        alert_uid="cross-tenant-alert",
+        alert_title="Cross tenant alert",
+        backend_name="grafana",
+        query_language="promql",
+        metrics_found=["checkout_requests_total"],
+    )
+
+    with pytest.raises(ValueError, match="Tenant access denied"):
+        await ingest_alert_features(
+            features,
+            dry_run=True,
+            runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+            store=store,
+            tenant_id="tenant-b",
+        )
 
 
 def _clear_store_path_environment(monkeypatch) -> None:

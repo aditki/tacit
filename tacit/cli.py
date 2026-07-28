@@ -1414,12 +1414,24 @@ def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool,
         if file_path:
             from tacit.artifact_learning import learn_runbook_file
 
-            result = learn_runbook_file(file_path, dry_run=dry_run, store=signal_store, tenant_id=tenant_id)
+            result = learn_runbook_file(
+                file_path,
+                dry_run=dry_run,
+                runtime_settings=stores.settings,
+                store=signal_store,
+                tenant_id=tenant_id,
+            )
         else:
             from tacit.artifact_learning import learn_runbook_dir
 
             assert dir_path is not None
-            result = learn_runbook_dir(dir_path, dry_run=dry_run, store=signal_store, tenant_id=tenant_id)
+            result = learn_runbook_dir(
+                dir_path,
+                dry_run=dry_run,
+                runtime_settings=stores.settings,
+                store=signal_store,
+                tenant_id=tenant_id,
+            )
     except Exception as e:
         _fail(f"Runbook learning failed: {e}")
         return
@@ -1447,12 +1459,24 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
         if file_path:
             from tacit.artifact_learning import learn_incident_file
 
-            result = learn_incident_file(file_path, dry_run=dry_run, store=signal_store, tenant_id=tenant_id)
+            result = learn_incident_file(
+                file_path,
+                dry_run=dry_run,
+                runtime_settings=stores.settings,
+                store=signal_store,
+                tenant_id=tenant_id,
+            )
         else:
             from tacit.artifact_learning import learn_incident_dir
 
             assert dir_path is not None
-            result = learn_incident_dir(dir_path, dry_run=dry_run, store=signal_store, tenant_id=tenant_id)
+            result = learn_incident_dir(
+                dir_path,
+                dry_run=dry_run,
+                runtime_settings=stores.settings,
+                store=signal_store,
+                tenant_id=tenant_id,
+            )
     except Exception as e:
         _fail(f"Incident learning failed: {e}")
         return
@@ -1710,6 +1734,7 @@ def learn_reject(dashboard_uid: str, backend: str, tenant: str | None):
             dashboard_uid=dashboard_uid,
             backend_name=backend or None,
             store=stores.signals(),
+            runtime_settings=getattr(stores, "settings", None),
             tenant_id=tenant_id,
         )
     except LookupError:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import secrets
 from enum import StrEnum
 from typing import Any, Final
@@ -11,9 +10,10 @@ from fastapi import HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 
 from tacit.config import settings
+from tacit.tenancy import MAX_TENANT_LENGTH as MAX_TENANT_LENGTH
+from tacit.tenancy import TenantBoundaryError, resolve_tenant_boundary
 
 MAX_PROMPT_LENGTH = 2000
-MAX_TENANT_LENGTH = 128
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -110,17 +110,14 @@ def resolve_knowledge_tenant(
     reject_pinned_override: bool = True,
 ) -> str:
     """Resolve and validate a tenant against a pinned or wildcard boundary."""
-    configured = configured_value.strip() or "default"
-    requested = (requested_value or "").strip()
-    if configured == "*" and not requested:
-        raise HTTPException(status_code=400, detail="Knowledge tenant is required")
-    if configured != "*":
-        if reject_pinned_override and requested and requested != configured:
-            raise HTTPException(status_code=403, detail="Tenant access denied")
-        requested = configured
-    if not requested or len(requested) > MAX_TENANT_LENGTH or re.fullmatch(r"[A-Za-z0-9_.:-]+", requested) is None:
-        raise HTTPException(status_code=400, detail="Invalid knowledge tenant")
-    return requested
+    try:
+        return resolve_tenant_boundary(
+            configured_value,
+            requested_value,
+            reject_pinned_override=reject_pinned_override,
+        )
+    except TenantBoundaryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
 def require_knowledge_permission(permission: str):

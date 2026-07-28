@@ -150,11 +150,13 @@ async def ingest_alert_features(
     *,
     auto_approve: bool = False,
     dry_run: bool = False,
+    runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted alert features."""
-    effective_tenant = tenant_id if dry_run else resolve_learning_tenant(tenant_id)
+    active_settings = runtime_settings or settings
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     store = store or get_signal_store()
     status = "approved" if auto_approve else "pending"
     panel = alert_to_panel(features)
@@ -190,6 +192,7 @@ async def ingest_alert_features(
                 backend_name=features.backend_name,
                 tenant_id=effective_tenant,
                 source_type="alert_ingest",
+                runtime_settings=active_settings,
                 governed_candidate_ids=governed_candidate_ids,
                 governed_pairs=governed_pairs,
             ):
@@ -336,6 +339,7 @@ async def ingest_alert(
             features,
             auto_approve=auto_approve,
             dry_run=dry_run,
+            runtime_settings=runtime_settings,
             store=store,
             tenant_id=tenant_id,
         )
@@ -358,8 +362,8 @@ async def learn_backend_alerts(
     """Crawl a backend and learn from every discoverable alert rule."""
     from tacit.backends import get_active_backends
 
-    effective_tenant = tenant_id if dry_run else resolve_learning_tenant(tenant_id)
     active_settings = runtime_settings or settings
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
     if not all_backends:
         raise RuntimeError("No active backends configured for alert ingestion")
@@ -397,6 +401,7 @@ async def learn_backend_alerts(
                         backend=backend,
                         auto_approve=auto_approve,
                         dry_run=dry_run,
+                        runtime_settings=active_settings,
                         store=store,
                         tenant_id=effective_tenant,
                     )

@@ -185,6 +185,7 @@ async def learn_from_runbook(
             artifact,
             RunbookExtractor(),
             dry_run=payload.dry_run,
+            runtime_settings=stores.settings,
             store=store,
             tenant_id=knowledge_tenant(request),
         )
@@ -224,6 +225,7 @@ async def learn_from_incident(
             artifact,
             IncidentExtractor(),
             dry_run=payload.dry_run,
+            runtime_settings=stores.settings,
             store=store,
             tenant_id=knowledge_tenant(request),
         )
@@ -569,6 +571,7 @@ async def reject_ingested_dashboard(
     store: Any = Depends(get_signal_store),
 ):
     """Reject a pending ingested dashboard."""
+    from tacit.config import settings
     from tacit.dashboard_ingest import reject_ingested_dashboard_record
 
     assert_knowledge_action(request, KnowledgeAction.REJECT)
@@ -577,6 +580,7 @@ async def reject_ingested_dashboard(
             dashboard_uid=dashboard_uid,
             backend_name=backend,
             store=store,
+            runtime_settings=getattr(request.app.state, "settings", settings),
             tenant_id=knowledge_tenant(request),
         )
     except LookupError:

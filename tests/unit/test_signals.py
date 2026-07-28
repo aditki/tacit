@@ -15,6 +15,7 @@ import pytest
 
 from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from tacit.backends.base import DashboardFeatures
+from tacit.config import Settings
 from tacit.dashboard_ingest import (
     approve_ingested_dashboard_record,
     build_learning_impact_report,
@@ -77,6 +78,28 @@ def test_signal_approval_validates_wildcard_tenant_before_activation(signal_stor
             dashboard_uid="wildcard-tenant",
         )
     assert signal_store.get_signal_type("wildcard_tenant_signal") is None
+
+
+def test_signal_approval_enforces_supplied_runtime_tenant(signal_store):
+    runtime_settings = Settings(knowledge_tenant_id="tenant-a")
+
+    with pytest.raises(ValueError, match="Tenant access denied"):
+        persist_inferred_signal_review(
+            store=signal_store,
+            sig={
+                "signal_type": "cross_tenant_signal",
+                "metric": "cross_tenant_metric",
+                "source": "heuristic",
+                "auto_teach_eligible": True,
+                "confidence": 0.9,
+            },
+            source_ref="dashboard:cross-tenant",
+            dashboard_uid="cross-tenant",
+            tenant_id="tenant-b",
+            runtime_settings=runtime_settings,
+        )
+
+    assert signal_store.get_signal_type("cross_tenant_signal", tenant_id="tenant-b") is None
 
 
 def test_signal_mapping_resolution_is_tenant_scoped(signal_store, monkeypatch):
@@ -316,6 +339,7 @@ def test_mapping_tenant_rebuild_rolls_back_on_copy_failure(tmp_path):
 
 
 def test_signal_mapping_activates_after_governed_corroboration(signal_store):
+    runtime_settings = Settings(knowledge_tenant_id="tenant-a")
     first_persisted = persist_inferred_signal_review(
         store=signal_store,
         sig={
@@ -328,6 +352,7 @@ def test_signal_mapping_activates_after_governed_corroboration(signal_store):
         source_ref="grafana:checkout",
         dashboard_uid="checkout",
         tenant_id="tenant-a",
+        runtime_settings=runtime_settings,
     )
     catalog = [_metric_entry("checkout_latency_seconds")]
 
@@ -347,6 +372,7 @@ def test_signal_mapping_activates_after_governed_corroboration(signal_store):
         source_type="alert_ingest",
         dashboard_uid="checkout-alert",
         tenant_id="tenant-a",
+        runtime_settings=runtime_settings,
     )
 
     assert second_persisted is True
@@ -454,6 +480,121 @@ def test_legacy_mappings_and_learning_index_migrate_to_default_tenant(tmp_path):
     assert migrated_mapping["tenant_id"] == GLOBAL_BOOTSTRAP_TENANT_ID
     assert store.search_learning_context("legacy", tenant_id="default")
     store.add_mapping("latency", "legacy_latency_seconds", confidence=0.8, tenant_id="tenant-b")
+
+
+def test_legacy_signal_data_and_custom_definitions_migrate_to_pinned_tenant(tmp_path):
+    db_path = tmp_path / "legacy-pinned-signals.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE signal_types (
+                signal_type TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE signal_metric_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, signal_type TEXT NOT NULL,
+                metric_pattern TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0.5,
+                context_services TEXT NOT NULL DEFAULT '[]',
+                context_datasource_types TEXT NOT NULL DEFAULT '[]',
+                context_environments TEXT NOT NULL DEFAULT '[]', context_archetypes TEXT NOT NULL DEFAULT '[]',
+                source_type TEXT NOT NULL DEFAULT 'bootstrap', source_refs TEXT NOT NULL DEFAULT '[]',
+                inference_version TEXT NOT NULL DEFAULT '', review_state TEXT NOT NULL DEFAULT 'trusted',
+                use_count INTEGER NOT NULL DEFAULT 0, positive_feedback INTEGER NOT NULL DEFAULT 0,
+                negative_feedback INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, last_seen REAL NOT NULL,
+                UNIQUE(signal_type, metric_pattern)
+            );
+            CREATE VIRTUAL TABLE learning_context_fts USING fts5(
+                source_kind, source_id UNINDEXED, backend_name UNINDEXED, dashboard_uid UNINDEXED,
+                dashboard_title, dashboard_tags, panel_title, metric_name, query_text, service,
+                signal_type, review_state UNINDEXED, reason, provenance, indexed_at UNINDEXED
+            );
+            CREATE TABLE rejected_signal_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, dashboard_uid TEXT NOT NULL DEFAULT '',
+                backend_name TEXT NOT NULL DEFAULT '', metric TEXT NOT NULL,
+                signal_family TEXT NOT NULL DEFAULT '', signal_name TEXT NOT NULL DEFAULT '',
+                score REAL NOT NULL DEFAULT 0.0, margin REAL NOT NULL DEFAULT 0.0,
+                why_not TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '[]',
+                inference_version TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL
+            );
+            INSERT INTO signal_types VALUES
+                ('request_latency', 'Built in', 'latency', 'seconds', 1, 1),
+                ('acme_queue_pressure', 'Acme only', 'saturation', 'count', 1, 1);
+            INSERT INTO signal_metric_mappings
+                (signal_type, metric_pattern, confidence, source_type, created_at, last_seen)
+            VALUES
+                ('request_latency', 'http_request_duration_seconds', 0.9, 'bootstrap', 1, 1),
+                ('acme_queue_pressure', 'acme_queue_waiting', 0.9, 'teach', 1, 1);
+            INSERT INTO learning_context_fts
+                (source_kind, source_id, dashboard_title, metric_name, review_state, indexed_at)
+            VALUES ('dashboard_panel', 'legacy-acme', 'Legacy Acme', 'acme_queue_waiting', 'approved', 1);
+            INSERT INTO rejected_signal_candidates (metric, why_not, created_at)
+            VALUES ('legacy_rejected_metric', 'low_score', 1);
+        """)
+
+    store = SignalStore(
+        db_path=db_path,
+        runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+    )
+
+    tenant_a = {row["signal_type"]: row for row in store.list_signal_types(tenant_id="tenant-a")}
+    tenant_b = {row["signal_type"]: row for row in store.list_signal_types(tenant_id="tenant-b")}
+    with store._conn() as conn:
+        mapping_tenants = {
+            row["metric_pattern"]: row["tenant_id"]
+            for row in conn.execute("SELECT metric_pattern, tenant_id FROM signal_metric_mappings").fetchall()
+        }
+        rejected_tenant = conn.execute(
+            "SELECT tenant_id FROM rejected_signal_candidates WHERE metric='legacy_rejected_metric'"
+        ).fetchone()["tenant_id"]
+
+    assert "acme_queue_pressure" in tenant_a
+    assert "acme_queue_pressure" not in tenant_b
+    assert "request_latency" in tenant_a and "request_latency" in tenant_b
+    assert tenant_a["request_latency"]["description"] == "Built in"
+    assert tenant_b["request_latency"]["description"] != "Built in"
+    assert mapping_tenants["acme_queue_waiting"] == "tenant-a"
+    assert mapping_tenants["http_request_duration_seconds"] == GLOBAL_BOOTSTRAP_TENANT_ID
+    assert rejected_tenant == "tenant-a"
+    assert store.search_learning_context("legacy", tenant_id="tenant-a")
+    assert store.search_learning_context("legacy", tenant_id="tenant-b") == []
+
+
+def test_legacy_alerts_migrate_to_pinned_tenant(tmp_path):
+    db_path = tmp_path / "legacy-alerts.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE ingested_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, alert_uid TEXT NOT NULL,
+                backend_name TEXT NOT NULL DEFAULT '', source_vendor TEXT NOT NULL DEFAULT '',
+                source_instance TEXT NOT NULL DEFAULT '', external_id TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '', alert_title TEXT NOT NULL DEFAULT '',
+                alert_tags TEXT NOT NULL DEFAULT '[]', condition TEXT NOT NULL DEFAULT '',
+                severity TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+                labels TEXT NOT NULL DEFAULT '{}', annotations TEXT NOT NULL DEFAULT '{}',
+                metrics_found TEXT NOT NULL DEFAULT '[]', query_transformations TEXT NOT NULL DEFAULT '[]',
+                service_hints TEXT NOT NULL DEFAULT '[]', dashboard_uid TEXT NOT NULL DEFAULT '',
+                panel_title TEXT NOT NULL DEFAULT '', source_url TEXT NOT NULL DEFAULT '',
+                provenance_url TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0.0,
+                stale INTEGER NOT NULL DEFAULT 0, missing_since REAL,
+                status TEXT NOT NULL DEFAULT 'pending', signals_inferred TEXT NOT NULL DEFAULT '[]',
+                first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL,
+                updated_at REAL NOT NULL, created_at REAL NOT NULL, reviewed_at REAL,
+                UNIQUE(alert_uid, backend_name)
+            );
+            INSERT INTO ingested_alerts
+                (alert_uid, backend_name, alert_title, first_seen_at, last_seen_at, updated_at, created_at)
+            VALUES ('legacy-alert', 'grafana', 'Legacy Alert', 1, 1, 1, 1);
+        """)
+
+    store = SignalStore(
+        db_path=db_path,
+        runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+    )
+
+    alert = store.get_ingested_alert("legacy-alert", "grafana", tenant_id="tenant-a")
+    assert alert is not None
+    assert alert["tenant_id"] == "tenant-a"
+    assert store.get_ingested_alert("legacy-alert", "grafana", tenant_id="default") is None
 
 
 @pytest.fixture
@@ -2313,8 +2454,17 @@ class TestIngestedDashboards:
         assert signal_store.get_ingested_dashboard("shared-dash", backend_name="grafana")["status"] == "approved"
         assert signal_store.get_ingested_dashboard("shared-dash", backend_name="signalfx")["status"] == "pending"
 
-    def test_existing_uid_unique_table_migrates_to_backend_scope(self, tmp_path):
-        db_path = tmp_path / "legacy_signals.db"
+    @pytest.mark.parametrize(
+        ("configured_tenant", "expected_tenant"),
+        [("default", "default"), ("tenant-a", "tenant-a")],
+    )
+    def test_existing_uid_unique_table_migrates_to_backend_scope(
+        self,
+        tmp_path,
+        configured_tenant: str,
+        expected_tenant: str,
+    ):
+        db_path = tmp_path / f"legacy_signals_{configured_tenant}.db"
         with sqlite3.connect(db_path) as conn:
             conn.executescript("""
                 CREATE TABLE ingested_dashboards (
@@ -2341,18 +2491,26 @@ class TestIngestedDashboards:
                 VALUES ('shared-dash', 'Legacy Grafana', 1.0);
             """)
 
-        store = SignalStore(db_path=db_path)
+        store = SignalStore(
+            db_path=db_path,
+            runtime_settings=Settings(knowledge_tenant_id=configured_tenant),
+        )
         store.record_ingested_dashboard(
             "shared-dash",
+            tenant_id=expected_tenant,
             backend_name="signalfx",
             dashboard_title="SignalFx Dashboard",
         )
 
-        legacy = store.get_ingested_dashboard("shared-dash", backend_name="")
-        signalfx = store.get_ingested_dashboard("shared-dash", backend_name="signalfx")
+        legacy = store.get_ingested_dashboard("shared-dash", backend_name="", tenant_id=expected_tenant)
+        signalfx = store.get_ingested_dashboard(
+            "shared-dash",
+            backend_name="signalfx",
+            tenant_id=expected_tenant,
+        )
 
         assert legacy is not None
-        assert legacy["tenant_id"] == "default"
+        assert legacy["tenant_id"] == expected_tenant
         assert signalfx is not None
         assert legacy["dashboard_title"] == "Legacy Grafana"
         assert signalfx["dashboard_title"] == "SignalFx Dashboard"

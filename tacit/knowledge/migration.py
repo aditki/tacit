@@ -23,6 +23,10 @@ def migrate_artifact_extractions(
     artifact_id: str,
     artifact_type: str,
     artifact_fingerprint: str = "",
+    artifact_content_fingerprint: str = "",
+    source_vendor: str = "",
+    source_instance: str = "",
+    external_id: str = "",
     rows: dict[str, list[dict[str, Any]]],
     service: KnowledgeService,
     tenant_id: str = "default",
@@ -38,14 +42,21 @@ def migrate_artifact_extractions(
         for row in rows.get(collection, []):
             legacy_id = str(row["id"])
             proposition = _proposition(kind, row)
+            lineage_group, lineage_kind = _artifact_lineage(
+                row,
+                artifact_id=artifact_id,
+                artifact_fingerprint=artifact_fingerprint,
+                artifact_content_fingerprint=artifact_content_fingerprint,
+                source_vendor=source_vendor,
+                source_instance=source_instance,
+                external_id=external_id,
+            )
             evidence = KnowledgeEvidenceReference(
                 evidence_ref=f"artifact:{artifact_id}:{row['id']}",
                 evidence_role=EvidenceRole.SUPPORTING,
                 source_family=_source_family(artifact_type),
-                lineage_group=(
-                    f"artifact_content:{artifact_fingerprint}" if artifact_fingerprint else f"artifact:{artifact_id}"
-                ),
-                lineage_kind=LineageKind.INDEPENDENT,
+                lineage_group=lineage_group,
+                lineage_kind=lineage_kind,
                 provenance_refs=[f"prov_artifact:{artifact_id}"],
             )
             if kind == KnowledgeKind.DEPENDENCY:
@@ -98,6 +109,36 @@ def migrate_artifact_extractions(
     return created
 
 
+def _artifact_lineage(
+    row: dict[str, Any],
+    *,
+    artifact_id: str,
+    artifact_fingerprint: str,
+    artifact_content_fingerprint: str,
+    source_vendor: str,
+    source_instance: str,
+    external_id: str,
+) -> tuple[str, LineageKind]:
+    explicit_group = str(row.get("lineage_group") or "").strip()
+    explicit_kind = str(row.get("lineage_kind") or "").strip()
+    copied_from = str(row.get("copied_from") or "").strip()
+    if copied_from:
+        return explicit_group or f"artifact_copy:{copied_from}", LineageKind.COPIED_FROM
+    if explicit_kind:
+        try:
+            kind = LineageKind(explicit_kind)
+        except ValueError:
+            kind = LineageKind.UNKNOWN
+        return explicit_group or f"artifact:{artifact_id}", kind
+    content_key = artifact_content_fingerprint or artifact_fingerprint
+    group = explicit_group or (f"artifact_content:{content_key}" if content_key else f"artifact:{artifact_id}")
+    if source_instance and external_id:
+        return group, LineageKind.INDEPENDENT
+    if source_vendor:
+        return group, LineageKind.SAME_VENDOR_EXPORT
+    return group, LineageKind.UNKNOWN
+
+
 def migrate_signal_mapping(
     row: dict[str, Any],
     *,
@@ -135,9 +176,9 @@ def migrate_signal_mapping(
         },
         scope=KnowledgeScope(
             tenant_id=tenant_id,
-            service_refs=[normalize_service_ref(str(value)) for value in row.get("context_services", [])],
-            environment_refs=[str(value) for value in row.get("context_environments", [])],
-            archetype_refs=[str(value) for value in row.get("context_archetypes", [])],
+            service_refs=[normalize_service_ref(str(value)) for value in (row.get("context_services") or [])],
+            environment_refs=[str(value) for value in (row.get("context_environments") or [])],
+            archetype_refs=[str(value) for value in (row.get("context_archetypes") or [])],
         ),
         evidence=evidence,
         provenance_refs=source_refs,

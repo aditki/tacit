@@ -1538,6 +1538,125 @@ def test_authoritative_signal_correction_promotes(tmp_path: Path):
     assert [mapping["metric_pattern"] for mapping in mappings] == ["http_request_duration_seconds"]
 
 
+def test_entity_mapping_correction_registers_alias_without_signal_revision(tmp_path: Path):
+    service = _service(tmp_path)
+    service.register_entity(
+        Entity(
+            id="entity:service:checkout",
+            kind=EntityKind.SERVICE,
+            canonical_name="checkout",
+            scope=KnowledgeScope(),
+            provenance_refs=["catalog:checkout"],
+        )
+    )
+    correction, candidate = service.create_correction(
+        investigation_id="inv_entity_mapping",
+        investigation_revision=1,
+        correction_type=CorrectionType.ENTITY_MAPPING,
+        proposed={
+            "raw_value": "Checkout API",
+            "entity_ref": "entity:service:checkout",
+        },
+        scope=KnowledgeScope(),
+        explanation="Bind the observed service alias to the catalog entity.",
+        created_by="operator",
+    )
+
+    reviewed, revision = service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="reviewer",
+    )
+    resolution = service.entity_resolution.resolve(
+        "Checkout API",
+        EntityKind.SERVICE,
+        KnowledgeScope(),
+        [f"prov_{correction.id}"],
+    )
+
+    assert candidate.kind == KnowledgeKind.ARTIFACT_QUALITY
+    assert reviewed.review_state == ReviewState.APPROVED
+    assert revision is None
+    assert resolution.selected_entity_ref == "entity:service:checkout"
+    assert service.repository.find_aliases("default", "checkout-api")
+    assert service.repository.list_current_revisions("default") == []
+
+
+def test_promoted_signal_mapping_preserves_exact_backend_metric_pattern(tmp_path: Path):
+    service = _service(tmp_path)
+    exact_pattern = "AWS/ApplicationELB/TargetResponseTime"
+    candidate_id = migrate_signal_mapping(
+        {
+            "id": "cloudwatch-target-response-time",
+            "signal_type": "request_latency",
+            "metric_pattern": exact_pattern,
+            "source_type": "human",
+            "source_refs": ["manual:cloudwatch-review"],
+            "review_state": "trusted",
+        },
+        service=service,
+    )
+
+    _decision, revision = service.evaluate_candidate(
+        candidate_id,
+        authoritative_source=True,
+    )
+
+    assert revision is not None
+    from tacit.signals.store import SignalStore
+
+    patterns = {
+        mapping["metric_pattern"]
+        for mapping in SignalStore(service.repository._db_path).get_mappings_for_signal("request_latency")
+    }
+    assert exact_pattern in patterns
+    assert "aws-applicationelb-targetresponsetime" not in patterns
+
+
+def test_manual_signal_teaching_creates_governed_revision_before_activation(tmp_path: Path):
+    db_path = tmp_path / "signals.db"
+    app = create_app(
+        runtime_settings=Settings(
+            signals_db_path=str(db_path),
+            knowledge_tenant_id="tenant-a",
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/signals/teach",
+        json={
+            "signal_type": "request_latency",
+            "metric_patterns": [
+                {
+                    "pattern": "AWS/ApplicationELB/TargetResponseTime",
+                    "confidence": 0.95,
+                }
+            ],
+            "category": "latency",
+            "taught_by": "operator",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["mappings_created"] == 1
+    stores = app.state.runtime_stores
+    revisions = stores.knowledge_repository().list_current_revisions("tenant-a")
+    assert len(revisions) == 1
+    assert revisions[0].state.eligibility != KnowledgeEligibility.INELIGIBLE
+    candidate = stores.knowledge_repository().get_candidate(
+        revisions[0].promoted_from_candidate_refs[0],
+        "tenant-a",
+    )
+    assert candidate is not None
+    assert candidate.policy.authoritative_source is False
+    mappings = stores.signals().get_mappings_for_signal("request_latency", tenant_id="tenant-a")
+    taught = [mapping for mapping in mappings if mapping["metric_pattern"] == "AWS/ApplicationELB/TargetResponseTime"]
+    assert len(taught) == 1
+    assert taught[0]["source_type"] == "operational_knowledge"
+    assert taught[0]["confidence"] == 0.95
+
+
 @pytest.mark.parametrize(
     ("correction_type", "expected_status"),
     [
@@ -2287,7 +2406,7 @@ def test_migration_preserves_payload_review_and_provenance(tmp_path: Path):
     assert service.repository.get_candidate(ids[0]).state.review_state == ReviewState.APPROVED
 
 
-def test_approved_legacy_rows_enter_promotion_evaluation(tmp_path: Path):
+def test_approved_legacy_rows_with_unknown_lineage_remain_unpromoted(tmp_path: Path):
     service = _service(tmp_path)
     base_row = {
         "source_entity": "entity:service:checkout",
@@ -2306,7 +2425,7 @@ def test_approved_legacy_rows_enter_promotion_evaluation(tmp_path: Path):
     assert first is not None
     assert service.repository.find_knowledge_by_proposition("default", first.proposition.proposition_key) is None
 
-    migrate_artifact_extractions(
+    second_ids = migrate_artifact_extractions(
         artifact_id="artifact_dashboard",
         artifact_type="dashboard",
         rows={"dependency_hints": [{"id": "dep_dashboard", **base_row}]},
@@ -2314,7 +2433,11 @@ def test_approved_legacy_rows_enter_promotion_evaluation(tmp_path: Path):
     )
 
     promoted = service.repository.find_knowledge_by_proposition("default", first.proposition.proposition_key)
-    assert promoted is not None
+    second = service.repository.get_candidate(second_ids[0])
+    assert promoted is None
+    assert second is not None
+    assert second.policy.last_evaluated_at is not None
+    assert "insufficient_independent_sources" in second.policy.eligibility_reason_codes
 
 
 def test_migration_reingest_preserves_governed_rejection(tmp_path: Path):

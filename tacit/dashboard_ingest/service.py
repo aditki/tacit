@@ -189,6 +189,7 @@ def persist_inferred_signal_review(
     backend_name: str = "",
     tenant_id: str | None = None,
     source_type: str = "dashboard_ingest",
+    runtime_settings: Settings | None = None,
     governed_candidate_ids: set[str] | None = None,
     governed_pairs: set[tuple[str, str]] | None = None,
 ) -> bool:
@@ -197,7 +198,7 @@ def persist_inferred_signal_review(
     metric = sig.get("metric", "")
     confidence = sig.get("confidence", 0.6)
     is_heuristic = sig.get("source") == "heuristic"
-    effective_tenant = resolve_learning_tenant(tenant_id)
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
 
     if is_heuristic:
         should_teach = bool(metric) and bool(sig.get("auto_teach_eligible"))
@@ -226,6 +227,7 @@ def persist_inferred_signal_review(
             source_ref=source_ref,
             source_type=source_type,
             tenant_id=effective_tenant,
+            runtime_settings=runtime_settings,
         )
         if governed_candidate_ids is not None:
             governed_candidate_ids.add(governed_candidate_id)
@@ -267,8 +269,9 @@ def _govern_signal_mapping(
     source_ref: str,
     source_type: str,
     tenant_id: str | None,
+    runtime_settings: Settings | None = None,
 ) -> str:
-    effective_tenant = resolve_learning_tenant(tenant_id)
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
     from tacit.knowledge.migration import migrate_signal_mapping
     from tacit.knowledge.repository import KnowledgeRepository
     from tacit.knowledge.service import KnowledgeService
@@ -339,11 +342,25 @@ def reconcile_signal_source(
     )
 
 
-def resolve_learning_tenant(tenant_id: str | None) -> str:
-    configured_tenant = str(settings.knowledge_tenant_id or "default")
-    if not tenant_id and configured_tenant == "*":
-        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
-    return tenant_id or configured_tenant
+def resolve_learning_tenant(
+    tenant_id: str | None,
+    *,
+    runtime_settings: Settings | None = None,
+) -> str:
+    """Resolve an ingestion tenant against the active runtime boundary."""
+    from tacit.tenancy import TenantBoundaryError, resolve_tenant_boundary
+
+    active_settings = runtime_settings or settings
+    try:
+        return resolve_tenant_boundary(
+            str(active_settings.knowledge_tenant_id or "default"),
+            tenant_id,
+        )
+    except TenantBoundaryError as exc:
+        detail = exc.detail
+        if detail == "Knowledge tenant is required":
+            detail = "tenant_id is required when knowledge_tenant_id is '*'"
+        raise ValueError(detail) from exc
 
 
 def register_generated_archetype_if_enabled(archetype_yaml: str, *, dashboard_uid: str = "") -> bool:
@@ -424,7 +441,7 @@ def approve_ingested_dashboard_record(
 ) -> dict[str, Any]:
     """Approve a pending ingested dashboard and activate learned artifacts."""
     store = store or get_signal_store()
-    effective_tenant = resolve_learning_tenant(tenant_id)
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
     ingested = store.get_ingested_dashboard(
         dashboard_uid,
         backend_name=backend_name,
@@ -458,6 +475,7 @@ def approve_ingested_dashboard_record(
                 dashboard_uid=dashboard_uid,
                 backend_name=ingested.get("backend_name", ""),
                 tenant_id=effective_tenant,
+                runtime_settings=runtime_settings,
                 governed_candidate_ids=governed_candidate_ids,
                 governed_pairs=governed_pairs,
             ):
@@ -485,6 +503,7 @@ def approve_ingested_dashboard_record(
                             dashboard_uid=dashboard_uid,
                             backend_name=ingested.get("backend_name", ""),
                             tenant_id=effective_tenant,
+                            runtime_settings=runtime_settings,
                             governed_candidate_ids=governed_candidate_ids,
                             governed_pairs=governed_pairs,
                         ):
@@ -530,11 +549,12 @@ def reject_ingested_dashboard_record(
     dashboard_uid: str,
     backend_name: str | None = None,
     store: Any | None = None,
+    runtime_settings: Settings | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Reject a pending ingested dashboard and persist heuristic negatives."""
     store = store or get_signal_store()
-    effective_tenant = resolve_learning_tenant(tenant_id)
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
     ingested = store.get_ingested_dashboard(
         dashboard_uid,
         backend_name=backend_name,
@@ -597,7 +617,7 @@ async def ingest_dashboard_features(
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted dashboard features."""
     active_settings = runtime_settings or settings
-    effective_tenant = resolve_learning_tenant(tenant_id)
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     extracted = _features_to_dict(features)
 
     signals = infer_signals_from_metrics(
@@ -676,6 +696,7 @@ async def ingest_dashboard_features(
                 dashboard_uid=features.dashboard_uid,
                 backend_name=features.backend_name,
                 tenant_id=effective_tenant,
+                runtime_settings=active_settings,
                 governed_candidate_ids=governed_candidate_ids,
                 governed_pairs=governed_pairs,
             ):
@@ -847,8 +868,8 @@ async def learn_backend_dashboards(
 
     from tacit.backends import get_active_backends
 
-    effective_tenant = resolve_learning_tenant(tenant_id)
     active_settings = runtime_settings or settings
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
     if not all_backends:
         raise RuntimeError("No active backends configured for dashboard learning")

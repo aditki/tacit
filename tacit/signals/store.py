@@ -30,7 +30,7 @@ from typing import Any
 
 import structlog
 
-from tacit.config import settings
+from tacit.config import Settings, settings
 from tacit.models.schemas import MetricEntry
 from tacit.signals.confidence import TRUST_THRESHOLD, stronger_review_state
 from tacit.signals.learning_index import (
@@ -110,8 +110,9 @@ def _stronger_review_state(existing: str, incoming: str) -> str:
     return stronger_review_state(existing, incoming)
 
 
-def _db_path() -> Path:
-    custom = settings.signals_db_path
+def _db_path(runtime_settings: Settings | None = None) -> Path:
+    active_settings = runtime_settings or settings
+    custom = active_settings.signals_db_path
     path = Path(custom) if custom else _DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
@@ -120,8 +121,11 @@ def _db_path() -> Path:
 class SignalStore:
     """SQLite-backed semantic signal mapping store."""
 
-    def __init__(self, db_path: Path | None = None):
-        self._db_path = db_path or _db_path()
+    def __init__(self, db_path: Path | None = None, *, runtime_settings: Settings | None = None):
+        self._settings = runtime_settings or settings
+        configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+        self._legacy_tenant = configured_tenant if configured_tenant != "*" else "default"
+        self._db_path = db_path or _db_path(self._settings)
         self._ensure_schema()
 
     @contextmanager
@@ -140,26 +144,41 @@ class SignalStore:
             conn.close()
 
     def _ensure_schema(self):
+        bootstrap_signal_definitions: dict[str, dict[str, Any]] | None = None
+        try:
+            import yaml
+
+            resource = files("tacit.data").joinpath("signals.yaml")
+            if resource.is_file():
+                with resource.open() as stream:
+                    bootstrap_data = yaml.safe_load(stream) or {}
+                bootstrap_signal_definitions = dict(bootstrap_data.get("signals", {}))
+        except Exception as exc:
+            logger.warning("signals_bootstrap_taxonomy_unavailable", error=str(exc))
         with self._conn() as conn:
-            ensure_schema(conn)
+            ensure_schema(
+                conn,
+                legacy_tenant=self._legacy_tenant,
+                bootstrap_signal_definitions=bootstrap_signal_definitions,
+            )
         logger.info("signal_store_init", db_path=str(self._db_path))
 
     def _ensure_learning_index(self, conn: sqlite3.Connection) -> None:
         """Create the FTS5 operational knowledge index when available."""
-        ensure_learning_index(conn)
+        ensure_learning_index(conn, legacy_tenant=self._legacy_tenant)
 
     def _ensure_mapping_columns(self, conn: sqlite3.Connection) -> None:
         """Add newer columns to signal_metric_mappings on pre-existing DBs."""
         ensure_mapping_columns(conn)
 
     def _ensure_ingested_dashboard_backend_scope(self, conn: sqlite3.Connection) -> None:
-        ensure_ingested_dashboard_backend_scope(conn)
+        ensure_ingested_dashboard_backend_scope(conn, legacy_tenant=self._legacy_tenant)
 
     def _ensure_ingested_alert_columns(self, conn: sqlite3.Connection) -> None:
         ensure_ingested_alert_columns(conn)
 
     def _rebuild_ingested_dashboards_table(self, conn: sqlite3.Connection) -> None:
-        rebuild_ingested_dashboards_table(conn)
+        rebuild_ingested_dashboards_table(conn, legacy_tenant=self._legacy_tenant)
 
     # ── Signal type CRUD ─────────────────────────────────────────────────
 

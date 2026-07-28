@@ -12,6 +12,7 @@ from tacit.artifact_learning import (
     artifact_from_text,
     learn_artifact,
 )
+from tacit.config import Settings
 from tacit.signals import SignalStore
 
 
@@ -337,6 +338,17 @@ def test_artifact_learning_requires_explicit_tenant_for_wildcard_config(monkeypa
 
     with pytest.raises(ValueError, match="tenant_id is required"):
         learn_artifact(_artifact("## Checks\n- check Redis misses"), RunbookExtractor(), dry_run=True)
+
+
+def test_artifact_learning_enforces_supplied_runtime_tenant():
+    with pytest.raises(ValueError, match="Tenant access denied"):
+        learn_artifact(
+            _artifact("## Checks\n- check Redis misses"),
+            RunbookExtractor(),
+            dry_run=True,
+            runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+            tenant_id="tenant-b",
+        )
 
 
 def test_incident_resolution_section_body_is_not_indexed(tmp_path, monkeypatch):
@@ -816,8 +828,16 @@ def test_learned_artifacts_and_extractions_are_tenant_scoped(tmp_path):
     assert [row["tenant_id"] for row in store.list_learned_artifacts(tenant_id="tenant-a")] == ["tenant-a"]
 
 
-def test_legacy_artifact_rows_migrate_to_default_tenant(tmp_path):
-    db_path = tmp_path / "legacy-signals.db"
+@pytest.mark.parametrize(
+    ("configured_tenant", "expected_tenant"),
+    [("default", "default"), ("tenant-a", "tenant-a")],
+)
+def test_legacy_artifact_rows_migrate_to_configured_tenant(
+    tmp_path,
+    configured_tenant: str,
+    expected_tenant: str,
+):
+    db_path = tmp_path / f"legacy-signals-{configured_tenant}.db"
     with sqlite3.connect(db_path) as conn:
         conn.executescript("""
             CREATE TABLE learned_artifacts (
@@ -847,12 +867,15 @@ def test_legacy_artifact_rows_migrate_to_default_tenant(tmp_path):
             VALUES ('legacy-requirement', 'legacy-artifact', 'checkout', 'latency', 1);
         """)
 
-    store = SignalStore(db_path=db_path)
-    artifact = store.get_learned_artifact("legacy-artifact")
-    extractions = store.list_artifact_extractions("legacy-artifact")
+    store = SignalStore(
+        db_path=db_path,
+        runtime_settings=Settings(knowledge_tenant_id=configured_tenant),
+    )
+    artifact = store.get_learned_artifact("legacy-artifact", tenant_id=expected_tenant)
+    extractions = store.list_artifact_extractions("legacy-artifact", tenant_id=expected_tenant)
 
-    assert artifact is not None and artifact["tenant_id"] == "default"
-    assert extractions["evidence_requirements"][0]["tenant_id"] == "default"
+    assert artifact is not None and artifact["tenant_id"] == expected_tenant
+    assert extractions["evidence_requirements"][0]["tenant_id"] == expected_tenant
     store.record_learned_artifact(
         tenant_id="tenant-b",
         artifact_id="legacy-artifact",
@@ -860,6 +883,75 @@ def test_legacy_artifact_rows_migrate_to_default_tenant(tmp_path):
         title="Tenant B",
     )
     assert store.get_learned_artifact("legacy-artifact", tenant_id="tenant-b") is not None
+
+
+def test_copied_artifact_bodies_share_lineage_despite_renamed_titles(tmp_path):
+    from tacit.knowledge.enums import EntityKind
+    from tacit.knowledge.models import Entity, KnowledgeScope
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    service = KnowledgeService(KnowledgeRepository(store._db_path))
+    for entity_id, kind, name in (
+        ("entity:service:checkout", EntityKind.SERVICE, "checkout"),
+        ("entity:datastore:redis-session", EntityKind.DATASTORE, "redis-session"),
+    ):
+        service.register_entity(
+            Entity(
+                id=entity_id,
+                kind=kind,
+                canonical_name=name,
+                scope=KnowledgeScope(),
+                provenance_refs=[f"catalog:{name}"],
+            )
+        )
+    artifacts = [
+        artifact_from_text(
+            artifact_type="runbook",
+            title=title,
+            body_text=(
+                f"# {heading}\n"
+                "checkout depends on redis-session for cache operations. "
+                f"verify latency errors saturation and {traffic_word} before rollback"
+            ),
+            external_id=external_id,
+            source_vendor="file",
+            source_instance=source_instance,
+        )
+        for title, heading, external_id, source_instance, traffic_word in (
+            ("Checkout Runbook", "Checkout Runbook", "/team-a/checkout.md", "/team-a", "traffic"),
+            ("Renamed Copy", "Completely Different Title", "/team-b/copy.md", "/team-b", "throughput"),
+        )
+    ]
+    candidate_ids = []
+    for artifact in artifacts:
+        result = learn_artifact(artifact, RunbookExtractor(), store=store)
+        learned_candidate_ids = result["knowledge_candidate_ids"]
+        assert isinstance(learned_candidate_ids, list)
+        candidate_ids.extend(str(candidate_id) for candidate_id in learned_candidate_ids)
+
+    dependency_ids = []
+    for candidate_id in candidate_ids:
+        stored_candidate = service.repository.get_candidate(candidate_id)
+        assert stored_candidate is not None
+        if stored_candidate.kind.value == "dependency":
+            dependency_ids.append(candidate_id)
+    for candidate_id in dependency_ids:
+        service.review_candidate(candidate_id, approved=True, reviewer="operator")
+    candidate = service.repository.get_candidate(dependency_ids[0])
+    assert candidate is not None
+
+    summary, _ = service.corroboration.analyze("default", candidate.proposition.proposition_key)
+    lineage_groups = set()
+    for candidate_id in dependency_ids:
+        stored_candidate = service.repository.get_candidate(candidate_id)
+        assert stored_candidate is not None
+        lineage_groups.add(stored_candidate.evidence.items[0].lineage_group)
+
+    assert len(lineage_groups) == 1
+    assert summary.raw_source_count == 2
+    assert summary.independent_source_count == 1
 
 
 def test_missing_artifact_stale_marking_is_scoped_to_crawled_source(tmp_path):

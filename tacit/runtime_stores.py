@@ -102,7 +102,10 @@ class RuntimeStores:
                 if self._signal_store is None:
                     from tacit.signals import SignalStore
 
-                    store = SignalStore(self._configured_path(self.settings.signals_db_path))
+                    store = SignalStore(
+                        self._configured_path(self.settings.signals_db_path),
+                        runtime_settings=self.settings,
+                    )
                     store.load_from_yaml()
                     self._signal_store = store
         return self._signal_store

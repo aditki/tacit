@@ -11,8 +11,10 @@ from tacit.knowledge.enums import (
     ConflictKind,
     ConflictResolutionStatus,
     CorrectionType,
+    EntityBindingMethod,
     EntityKind,
     EntityResolutionStatus,
+    EntityStatus,
     EvidenceRole,
     KnowledgeEligibility,
     KnowledgeKind,
@@ -52,6 +54,7 @@ from tacit.knowledge.models import (
 from tacit.knowledge.normalization import (
     PropositionNormalizer,
     canonical_scope_payload,
+    normalize_entity,
     normalize_service_ref,
     stable_fingerprint,
 )
@@ -119,9 +122,23 @@ class KnowledgeService:
         entity = self.repository.get_entity(alias.entity_ref, alias.tenant_id)
         if entity is None:
             raise ValueError("alias target entity does not exist in the tenant")
+        if entity.status != EntityStatus.ACTIVE:
+            raise ValueError("alias target entity is not active")
         if alias.scope.tenant_id != alias.tenant_id:
             alias = alias.model_copy(update={"scope": alias.scope.model_copy(update={"tenant_id": alias.tenant_id})})
-        return self.repository.save_alias(alias)
+        saved = self.repository.save_alias(alias)
+        self.repository.append_event(
+            "entity_alias_registered",
+            tenant_id=alias.tenant_id,
+            subject_ref=alias.entity_ref,
+            dimensions={
+                "review_state": alias.review_state.value,
+                "lifecycle_status": alias.lifecycle_status.value,
+                "reason_code": alias.method.value,
+            },
+            payload={"alias_id": alias.id, "normalized_value": alias.normalized_value},
+        )
+        return saved
 
     def create_candidate(
         self,
@@ -810,6 +827,18 @@ class KnowledgeService:
         if target is not None:
             original = target.proposition.model_dump(mode="json")
         kind = self._kind_for_correction(correction_type, proposed)
+        candidate_proposition = proposed
+        if correction_type == CorrectionType.ENTITY_MAPPING:
+            raw_value, entity_ref = self._entity_mapping_values(proposed)
+            entity = self.repository.get_entity(entity_ref, tenant_id)
+            if entity is None or entity.status != EntityStatus.ACTIVE:
+                raise ValueError("entity_mapping correction target entity is not active in the tenant")
+            candidate_proposition = {
+                "subject_ref": f"concept:{raw_value}",
+                "predicate": Predicate.USEFUL_FOR_INVESTIGATION,
+                "object_ref": entity_ref,
+                "source_wording": str(proposed.get("source_wording") or ""),
+            }
         evidence = KnowledgeEvidenceReference(
             evidence_ref=correction_id,
             evidence_role=EvidenceRole.CONTRADICTING if target_ref else EvidenceRole.SUPPORTING,
@@ -822,7 +851,7 @@ class KnowledgeService:
             kind=kind,
             payload_ref=correction_id,
             typed_payload={"correction_type": correction_type.value, **proposed},
-            proposition=proposed,
+            proposition=candidate_proposition,
             scope=scope,
             evidence=[evidence],
             provenance_refs=[f"prov_{correction_id}"],
@@ -899,6 +928,29 @@ class KnowledgeService:
         correction = correction.model_copy(update={"review_state": candidate.state.review_state})
         self.repository.save_correction(correction)
         if not approved:
+            return correction, None
+        if correction.correction_type == CorrectionType.ENTITY_MAPPING:
+            raw_value, entity_ref = self._entity_mapping_values(correction.proposed)
+            alias = EntityAlias(
+                id=_id(
+                    "alias",
+                    [
+                        correction.tenant_id,
+                        normalize_entity(raw_value),
+                        entity_ref,
+                        correction.scope.model_dump(mode="json"),
+                    ],
+                ),
+                tenant_id=correction.tenant_id,
+                raw_value=raw_value,
+                normalized_value=normalize_entity(raw_value),
+                entity_ref=entity_ref,
+                scope=correction.scope,
+                method=EntityBindingMethod.HUMAN_CORRECTION,
+                review_state=ReviewState.APPROVED,
+                provenance_refs=[f"prov_{correction.id}"],
+            )
+            self.register_alias(alias)
             return correction, None
         if correction.correction_type in {
             CorrectionType.KNOWLEDGE_STALE,
@@ -1134,8 +1186,8 @@ class KnowledgeService:
         from tacit.signals.store import SignalStore
 
         signal_type = revision.proposition.concept_ref.removeprefix("signal:")
-        metric_pattern = revision.proposition.object_ref.removeprefix("concept:")
-        if not signal_type or not metric_pattern:
+        metric_patterns = self._signal_metric_patterns(revision)
+        if not signal_type or not metric_patterns:
             return
         active = (
             revision.state.lifecycle_status == LifecycleStatus.ACTIVE
@@ -1147,38 +1199,93 @@ class KnowledgeService:
             else ReviewState.CANDIDATE.value
         )
         store = SignalStore(self.repository._db_path)
-        updated = store.set_mapping_review_state(
-            signal_type,
-            metric_pattern,
-            review_state,
-            tenant_id=revision.tenant_id,
-        )
-        if active and not updated:
-            store.add_mapping(
+        for metric_pattern in metric_patterns:
+            updated = store.set_mapping_review_state(
                 signal_type,
                 metric_pattern,
-                confidence=0.5,
-                context_services=self._resolver_scope_values(
-                    revision.scope.service_refs,
-                    "entity:service:",
-                ),
-                context_environments=self._resolver_scope_values(
-                    revision.scope.environment_refs,
-                    "environment:",
-                ),
-                context_archetypes=self._resolver_scope_values(
-                    revision.scope.archetype_refs,
-                    "archetype:",
-                ),
-                source_type="operational_knowledge",
-                source_refs=[
-                    f"{revision.knowledge_id}@{revision.revision}",
-                    *revision.provenance_refs,
-                ],
-                inference_version=f"{revision.policy_id}:{revision.policy_version}",
                 review_state=review_state,
                 tenant_id=revision.tenant_id,
             )
+            if active and not updated:
+                store.add_mapping(
+                    signal_type,
+                    metric_pattern,
+                    confidence=self._signal_mapping_confidence(revision, metric_pattern),
+                    context_services=self._resolver_scope_values(
+                        revision.scope.service_refs,
+                        "entity:service:",
+                    ),
+                    context_environments=self._resolver_scope_values(
+                        revision.scope.environment_refs,
+                        "environment:",
+                    ),
+                    context_datasource_types=self._signal_mapping_payload_values(
+                        revision,
+                        "context_datasource_types",
+                    ),
+                    context_archetypes=self._resolver_scope_values(
+                        revision.scope.archetype_refs,
+                        "archetype:",
+                    ),
+                    source_type="operational_knowledge",
+                    source_refs=[
+                        f"{revision.knowledge_id}@{revision.revision}",
+                        *revision.provenance_refs,
+                    ],
+                    inference_version=f"{revision.policy_id}:{revision.policy_version}",
+                    review_state=review_state,
+                    tenant_id=revision.tenant_id,
+                )
+
+    def _signal_metric_patterns(self, revision: KnowledgeRevision) -> list[str]:
+        """Recover resolver-exact patterns from immutable candidate payloads."""
+        patterns: set[str] = set()
+        for candidate_id in revision.promoted_from_candidate_refs:
+            candidate = self.repository.get_candidate(candidate_id, revision.tenant_id)
+            if candidate is None:
+                continue
+            for field in ("metric_pattern", "candidate_metric", "metric"):
+                value = str(candidate.typed_payload.get(field) or "").strip()
+                if value:
+                    patterns.add(value)
+                    break
+        if not patterns:
+            fallback = revision.proposition.object_ref.removeprefix("concept:").strip()
+            if fallback:
+                patterns.add(fallback)
+        return sorted(patterns)
+
+    def _signal_mapping_payload_values(self, revision: KnowledgeRevision, field: str) -> list[str]:
+        values: set[str] = set()
+        for candidate_id in revision.promoted_from_candidate_refs:
+            candidate = self.repository.get_candidate(candidate_id, revision.tenant_id)
+            if candidate is None:
+                continue
+            raw_values = candidate.typed_payload.get(field, [])
+            if isinstance(raw_values, list):
+                values.update(str(value).strip() for value in raw_values if str(value).strip())
+        return sorted(values)
+
+    def _signal_mapping_confidence(self, revision: KnowledgeRevision, metric_pattern: str) -> float:
+        confidences: list[float] = []
+        for candidate_id in revision.promoted_from_candidate_refs:
+            candidate = self.repository.get_candidate(candidate_id, revision.tenant_id)
+            if candidate is None:
+                continue
+            exact_pattern = str(
+                candidate.typed_payload.get("metric_pattern")
+                or candidate.typed_payload.get("candidate_metric")
+                or candidate.typed_payload.get("metric")
+                or ""
+            ).strip()
+            if exact_pattern != metric_pattern:
+                continue
+            try:
+                confidence = float(candidate.typed_payload.get("confidence", 0.5))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            confidences.append(max(0.0, min(1.0, confidence)))
+        return max(confidences, default=0.5)
 
     @staticmethod
     def _resolver_scope_values(refs: list[str], prefix: str) -> list[str]:
@@ -1343,11 +1450,21 @@ class KnowledgeService:
             return KnowledgeKind.DEPENDENCY
         if correction_type == CorrectionType.OWNERSHIP:
             return KnowledgeKind.OWNERSHIP
-        if correction_type in {CorrectionType.SIGNAL_MEANING, CorrectionType.ENTITY_MAPPING}:
+        if correction_type == CorrectionType.SIGNAL_MEANING:
             return KnowledgeKind.SIGNAL_MAPPING
+        if correction_type == CorrectionType.ENTITY_MAPPING:
+            return KnowledgeKind.ARTIFACT_QUALITY
         if correction_type in {CorrectionType.MISSING_CHECK, CorrectionType.OBSERVATION_DISPUTE}:
             return KnowledgeKind.EVIDENCE_REQUIREMENT
         return KnowledgeKind(proposed.get("kind", KnowledgeKind.ARTIFACT_QUALITY.value))
+
+    @staticmethod
+    def _entity_mapping_values(proposed: dict[str, Any]) -> tuple[str, str]:
+        raw_value = str(proposed.get("raw_value") or proposed.get("alias") or proposed.get("subject_ref") or "").strip()
+        entity_ref = str(proposed.get("entity_ref") or proposed.get("object_ref") or "").strip()
+        if not raw_value or not entity_ref:
+            raise ValueError("entity_mapping correction requires raw_value and entity_ref")
+        return raw_value, entity_ref
 
     @staticmethod
     def _score_delta(revision: KnowledgeRevision) -> float:

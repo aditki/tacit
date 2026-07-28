@@ -82,10 +82,15 @@ class ConservativePromotionPolicy:
                 return ["signal_concept_unresolved"]
             if not candidate.proposition.object_ref:
                 return ["signal_metric_unresolved"]
+            trusted_human_mapping = (
+                candidate.state.review_state == ReviewState.TRUSTED
+                and SourceFamily.HUMAN_CORRECTION in corroboration.source_families
+            )
             if (
                 not context.authoritative_source
                 and not context.live_verified
                 and corroboration.independent_source_count < 2
+                and not trusted_human_mapping
             ):
                 return ["live_coverage_or_repeated_resolution_required"]
         elif self.knowledge_kind == KnowledgeKind.EVIDENCE_REQUIREMENT:

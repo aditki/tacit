@@ -17,6 +17,7 @@ from typing import Any, Protocol
 
 import structlog
 
+from tacit.config import Settings
 from tacit.signals import get_signal_store as _default_get_signal_store
 
 MAX_ARTIFACT_BODY_LENGTH = 200_000
@@ -170,6 +171,20 @@ def _now() -> datetime:
 
 def _fingerprint(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _artifact_content_fingerprint(body_text: str) -> str:
+    """Build a MinHash-style lineage signature tolerant of small copied edits."""
+    lines = body_text.splitlines()
+    first_content = next((index for index, line in enumerate(lines) if line.strip()), None)
+    if first_content is not None and lines[first_content].lstrip().startswith("#"):
+        lines.pop(first_content)
+    tokens = re.sub(r"[^a-z0-9]+", " ", "\n".join(lines).casefold()).split()
+    if not tokens:
+        return _fingerprint("")
+    shingle_size = min(5, len(tokens))
+    shingles = {" ".join(tokens[index : index + shingle_size]) for index in range(len(tokens) - shingle_size + 1)}
+    return min(_fingerprint(shingle) for shingle in shingles)
 
 
 def _row_id(*parts: str) -> str:
@@ -714,14 +729,14 @@ def _has_missing_extractions(existing: dict[str, int], expected: dict[str, int])
     return any(existing.get(key, 0) < count for key, count in expected.items())
 
 
-def _resolve_tenant_id(tenant_id: str | None) -> str:
-    if tenant_id is None:
-        from tacit.config import settings
+def _resolve_tenant_id(
+    tenant_id: str | None,
+    *,
+    runtime_settings: Settings | None = None,
+) -> str:
+    from tacit.dashboard_ingest.service import resolve_learning_tenant
 
-        tenant_id = settings.knowledge_tenant_id
-    if tenant_id == "*":
-        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
-    return tenant_id
+    return resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
 
 
 def _reconcile_stale_artifact_knowledge(*, store, tenant_id: str, artifact_type: str) -> None:
@@ -780,10 +795,11 @@ def learn_artifact(
     extractor: ArtifactExtractor,
     *,
     dry_run: bool = False,
+    runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
-    tenant_id = _resolve_tenant_id(tenant_id)
+    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=runtime_settings)
     result = extractor.extract(artifact)
     evidence_rows = _as_store_rows(result.evidence_requirements)
     ownership_rows = _as_store_rows(result.ownership_hints)
@@ -893,6 +909,10 @@ def learn_artifact(
             artifact_id=artifact.id,
             artifact_type=artifact.artifact_type,
             artifact_fingerprint=artifact.fingerprint,
+            artifact_content_fingerprint=_artifact_content_fingerprint(artifact.body_text),
+            source_vendor=artifact.source_vendor or "",
+            source_instance=artifact.source_instance or "",
+            external_id=artifact.external_id,
             rows={
                 "evidence_requirements": evidence_rows,
                 "ownership_hints": ownership_rows,
@@ -943,11 +963,17 @@ def learn_runbook_file(
     path: Path,
     *,
     dry_run: bool = False,
+    runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
     return learn_artifact(
-        runbook_from_file(path), RunbookExtractor(), dry_run=dry_run, store=store, tenant_id=tenant_id
+        runbook_from_file(path),
+        RunbookExtractor(),
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        tenant_id=tenant_id,
     )
 
 
@@ -969,11 +995,17 @@ def learn_incident_file(
     path: Path,
     *,
     dry_run: bool = False,
+    runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
     return learn_artifact(
-        incident_from_file(path), IncidentExtractor(), dry_run=dry_run, store=store, tenant_id=tenant_id
+        incident_from_file(path),
+        IncidentExtractor(),
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        tenant_id=tenant_id,
     )
 
 
@@ -981,12 +1013,22 @@ def learn_incident_dir(
     path: Path,
     *,
     dry_run: bool = False,
+    runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
-    tenant_id = _resolve_tenant_id(tenant_id)
+    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=runtime_settings)
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
-    learned = [learn_incident_file(file, dry_run=dry_run, store=store, tenant_id=tenant_id) for file in files]
+    learned = [
+        learn_incident_file(
+            file,
+            dry_run=dry_run,
+            runtime_settings=runtime_settings,
+            store=store,
+            tenant_id=tenant_id,
+        )
+        for file in files
+    ]
 
     def _count(key: str) -> int:
         total = 0
@@ -1036,12 +1078,22 @@ def learn_runbook_dir(
     path: Path,
     *,
     dry_run: bool = False,
+    runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
-    tenant_id = _resolve_tenant_id(tenant_id)
+    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=runtime_settings)
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
-    learned = [learn_runbook_file(file, dry_run=dry_run, store=store, tenant_id=tenant_id) for file in files]
+    learned = [
+        learn_runbook_file(
+            file,
+            dry_run=dry_run,
+            runtime_settings=runtime_settings,
+            store=store,
+            tenant_id=tenant_id,
+        )
+        for file in files
+    ]
 
     def _count(key: str) -> int:
         total = 0

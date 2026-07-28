@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Any
 
 import structlog
 
@@ -41,46 +42,134 @@ def execute_script_statements(conn: sqlite3.Connection, script: str) -> None:
         raise ValueError("incomplete SQL migration statement")
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_schema(
+    conn: sqlite3.Connection,
+    *,
+    legacy_tenant: str = "default",
+    bootstrap_signal_definitions: dict[str, dict[str, Any]] | None = None,
+) -> None:
     """Install base schema and run additive migrations."""
+    had_tenant_signal_types = _table_exists(conn, "tenant_signal_types")
     conn.executescript(SCHEMA_SQL)
-    ensure_learning_index(conn)
+    if not had_tenant_signal_types and bootstrap_signal_definitions is not None:
+        migrate_legacy_signal_definitions(
+            conn,
+            legacy_tenant=legacy_tenant,
+            bootstrap_signal_definitions=bootstrap_signal_definitions,
+        )
+    elif not had_tenant_signal_types:
+        logger.warning(
+            "legacy_signal_definition_migration_skipped",
+            tenant_id=legacy_tenant,
+            reason="bootstrap_taxonomy_unavailable",
+        )
+    ensure_learning_index(conn, legacy_tenant=legacy_tenant)
     ensure_ingested_dashboard_columns(conn)
-    ensure_ingested_dashboard_backend_scope(conn)
+    ensure_ingested_dashboard_backend_scope(conn, legacy_tenant=legacy_tenant)
     ensure_ingested_alert_columns(conn)
-    ensure_ingested_alert_tenant_scope(conn)
+    ensure_ingested_alert_tenant_scope(conn, legacy_tenant=legacy_tenant)
     ensure_artifact_learning_columns(conn)
-    ensure_artifact_tenant_scope(conn)
+    ensure_artifact_tenant_scope(conn, legacy_tenant=legacy_tenant)
     ensure_mapping_columns(conn)
-    ensure_mapping_tenant_scope(conn)
+    ensure_mapping_tenant_scope(conn, legacy_tenant=legacy_tenant)
     ensure_global_bootstrap_mapping_scope(conn)
-    ensure_rejected_candidate_tenant_scope(conn)
+    ensure_rejected_candidate_tenant_scope(conn, legacy_tenant=legacy_tenant)
 
 
-def ensure_learning_index(conn: sqlite3.Connection) -> None:
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _tenant_sql_literal(tenant_id: str) -> str:
+    """Return a safely quoted literal for DDL-adjacent INSERT...SELECT migrations."""
+    return "'" + tenant_id.replace("'", "''") + "'"
+
+
+def migrate_legacy_signal_definitions(
+    conn: sqlite3.Connection,
+    *,
+    legacy_tenant: str,
+    bootstrap_signal_definitions: dict[str, dict[str, Any]],
+) -> None:
+    """Move pre-tenant custom definitions while retaining configured taxonomy globals."""
+    rows = conn.execute("SELECT * FROM signal_types").fetchall()
+    migrated = 0
+    for row in rows:
+        signal_type = str(row["signal_type"])
+        bootstrap = bootstrap_signal_definitions.get(signal_type)
+        expected = {
+            "description": str((bootstrap or {}).get("description") or ""),
+            "category": str((bootstrap or {}).get("category") or ""),
+            "unit": str((bootstrap or {}).get("unit") or ""),
+        }
+        tenant_override = bootstrap is None or any(str(row[field]) != value for field, value in expected.items())
+        if not tenant_override:
+            continue
+        conn.execute(
+            """INSERT OR IGNORE INTO tenant_signal_types
+               (tenant_id, signal_type, description, category, unit, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                legacy_tenant,
+                row["signal_type"],
+                row["description"],
+                row["category"],
+                row["unit"],
+                row["created_at"],
+                row["updated_at"],
+            ),
+        )
+        if bootstrap is None:
+            conn.execute("DELETE FROM signal_types WHERE signal_type=?", (signal_type,))
+        else:
+            conn.execute(
+                """UPDATE signal_types
+                   SET description=?, category=?, unit=?
+                   WHERE signal_type=?""",
+                (expected["description"], expected["category"], expected["unit"], signal_type),
+            )
+        migrated += 1
+    if migrated:
+        logger.info(
+            "legacy_signal_definitions_tenant_scoped",
+            tenant_id=legacy_tenant,
+            definitions=migrated,
+        )
+
+
+def ensure_learning_index(conn: sqlite3.Connection, *, legacy_tenant: str = "default") -> None:
     """Create the FTS5 operational knowledge index when available."""
     try:
         conn.execute(FTS_SCHEMA_SQL)
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(learning_context_fts)").fetchall()}
         if columns and "tenant_id" not in columns:
-            rebuild_learning_index(conn)
+            rebuild_learning_index(conn, legacy_tenant=legacy_tenant)
     except sqlite3.OperationalError as exc:
         logger.warning("learning_context_fts_unavailable", error=str(exc))
 
 
-def rebuild_learning_index(conn: sqlite3.Connection) -> None:
-    """Migrate legacy learning-index rows into the default tenant."""
+def rebuild_learning_index(conn: sqlite3.Connection, *, legacy_tenant: str = "default") -> None:
+    """Migrate legacy learning-index rows into the configured legacy tenant."""
     with atomic_rebuild(conn, "rebuild_learning_context_fts"):
         conn.execute("ALTER TABLE learning_context_fts RENAME TO learning_context_fts_old")
         conn.execute(FTS_SCHEMA_SQL)
-        conn.execute("""INSERT INTO learning_context_fts
+        conn.execute(
+            """INSERT INTO learning_context_fts
             (tenant_id, source_kind, source_id, backend_name, dashboard_uid,
              dashboard_title, dashboard_tags, panel_title, metric_name, query_text,
              service, signal_type, review_state, reason, provenance, indexed_at)
-            SELECT 'default', source_kind, source_id, backend_name, dashboard_uid,
+            SELECT ?, source_kind, source_id, backend_name, dashboard_uid,
                    dashboard_title, dashboard_tags, panel_title, metric_name, query_text,
                    service, signal_type, review_state, reason, provenance, indexed_at
-            FROM learning_context_fts_old""")
+            FROM learning_context_fts_old""",
+            (legacy_tenant,),
+        )
         conn.execute("DROP TABLE learning_context_fts_old")
 
 
@@ -93,16 +182,21 @@ def ensure_mapping_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN review_state TEXT NOT NULL DEFAULT 'trusted'")
 
 
-def ensure_rejected_candidate_tenant_scope(conn: sqlite3.Connection) -> None:
+def ensure_rejected_candidate_tenant_scope(
+    conn: sqlite3.Connection,
+    *,
+    legacy_tenant: str = "default",
+) -> None:
     """Keep negative signal-training records within their tenant boundary."""
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(rejected_signal_candidates)").fetchall()}
     if "tenant_id" not in columns:
         conn.execute("ALTER TABLE rejected_signal_candidates ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
+        conn.execute("UPDATE rejected_signal_candidates SET tenant_id=?", (legacy_tenant,))
     conn.execute("""CREATE INDEX IF NOT EXISTS idx_rejected_signal_tenant_created
            ON rejected_signal_candidates(tenant_id, created_at)""")
 
 
-def ensure_mapping_tenant_scope(conn: sqlite3.Connection) -> None:
+def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str = "default") -> None:
     """Ensure learned signal mappings are isolated by tenant."""
     unique_indexes = [
         [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
@@ -117,7 +211,8 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection) -> None:
     ):
         return
     old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
-    tenant_select = "COALESCE(tenant_id, 'default')" if "tenant_id" in old_columns else "'default'"
+    legacy_literal = _tenant_sql_literal(legacy_tenant)
+    tenant_select = f"COALESCE(tenant_id, {legacy_literal})" if "tenant_id" in old_columns else legacy_literal
     with atomic_rebuild(conn, "rebuild_signal_metric_mappings"):
         conn.execute("ALTER TABLE signal_metric_mappings RENAME TO signal_metric_mappings_old")
         conn.execute("""CREATE TABLE signal_metric_mappings (
@@ -156,11 +251,14 @@ def ensure_global_bootstrap_mapping_scope(conn: sqlite3.Connection) -> None:
     """Move legacy global defaults out of the real ``default`` tenant."""
     moved = conn.execute(
         """UPDATE OR IGNORE signal_metric_mappings SET tenant_id=?
-           WHERE tenant_id='default' AND source_type='bootstrap'""",
+           WHERE tenant_id != ? AND source_type='bootstrap'""",
+        (GLOBAL_BOOTSTRAP_TENANT_ID, GLOBAL_BOOTSTRAP_TENANT_ID),
+    ).rowcount
+    deduplicated = conn.execute(
+        """DELETE FROM signal_metric_mappings
+           WHERE tenant_id != ? AND source_type='bootstrap'""",
         (GLOBAL_BOOTSTRAP_TENANT_ID,),
     ).rowcount
-    deduplicated = conn.execute("""DELETE FROM signal_metric_mappings
-           WHERE tenant_id='default' AND source_type='bootstrap'""").rowcount
     if moved or deduplicated:
         logger.info(
             "bootstrap_signal_mappings_migrated",
@@ -169,7 +267,11 @@ def ensure_global_bootstrap_mapping_scope(conn: sqlite3.Connection) -> None:
         )
 
 
-def ensure_ingested_dashboard_backend_scope(conn: sqlite3.Connection) -> None:
+def ensure_ingested_dashboard_backend_scope(
+    conn: sqlite3.Connection,
+    *,
+    legacy_tenant: str = "default",
+) -> None:
     """Ensure ingested dashboard uniqueness includes tenant and backend identity."""
     columns = [row["name"] for row in conn.execute("PRAGMA table_info(ingested_dashboards)").fetchall()]
     if "backend_name" not in columns:
@@ -182,7 +284,7 @@ def ensure_ingested_dashboard_backend_scope(conn: sqlite3.Connection) -> None:
         indexed_cols = [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
         if indexed_cols == ["tenant_id", "dashboard_uid", "backend_name"]:
             return
-    rebuild_ingested_dashboards_table(conn)
+    rebuild_ingested_dashboards_table(conn, legacy_tenant=legacy_tenant)
 
 
 def ensure_ingested_dashboard_columns(conn: sqlite3.Connection) -> None:
@@ -218,7 +320,11 @@ def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE ingested_alerts ADD COLUMN {name} {ddl}")
 
 
-def ensure_ingested_alert_tenant_scope(conn: sqlite3.Connection) -> None:
+def ensure_ingested_alert_tenant_scope(
+    conn: sqlite3.Connection,
+    *,
+    legacy_tenant: str = "default",
+) -> None:
     """Ensure ingested alert uniqueness includes tenant and backend identity."""
     for index in conn.execute("PRAGMA index_list(ingested_alerts)").fetchall():
         if not index["unique"]:
@@ -226,7 +332,7 @@ def ensure_ingested_alert_tenant_scope(conn: sqlite3.Connection) -> None:
         indexed_cols = [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
         if indexed_cols == ["tenant_id", "alert_uid", "backend_name"]:
             return
-    rebuild_ingested_alerts_table(conn)
+    rebuild_ingested_alerts_table(conn, legacy_tenant=legacy_tenant)
 
 
 def ensure_artifact_learning_columns(conn: sqlite3.Connection) -> None:
@@ -255,7 +361,7 @@ def ensure_artifact_learning_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN source_type TEXT NOT NULL DEFAULT ''")
 
 
-def ensure_artifact_tenant_scope(conn: sqlite3.Connection) -> None:
+def ensure_artifact_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str = "default") -> None:
     """Migrate learned artifacts and extracted rows to tenant-scoped identities."""
     unique_indexes = [
         [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
@@ -276,7 +382,7 @@ def ensure_artifact_tenant_scope(conn: sqlite3.Connection) -> None:
     if artifact_key_is_scoped and extraction_keys_are_scoped:
         ensure_artifact_tenant_indexes(conn)
         return
-    rebuild_artifact_learning_tables(conn)
+    rebuild_artifact_learning_tables(conn, legacy_tenant=legacy_tenant)
 
 
 def ensure_artifact_tenant_indexes(conn: sqlite3.Connection) -> None:
@@ -298,7 +404,7 @@ def ensure_artifact_tenant_indexes(conn: sqlite3.Connection) -> None:
     )
 
 
-def rebuild_artifact_learning_tables(conn: sqlite3.Connection) -> None:
+def rebuild_artifact_learning_tables(conn: sqlite3.Connection, *, legacy_tenant: str = "default") -> None:
     """Rebuild legacy artifact tables with tenant-qualified primary keys."""
     tables = (
         "learned_artifacts",
@@ -307,11 +413,12 @@ def rebuild_artifact_learning_tables(conn: sqlite3.Connection) -> None:
         "dependency_hints",
         "signal_mapping_candidates",
     )
+    legacy_literal = _tenant_sql_literal(legacy_tenant)
     tenant_select = {
         table: (
-            "COALESCE(tenant_id, 'default')"
+            f"COALESCE(tenant_id, {legacy_literal})"
             if "tenant_id" in {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-            else "'default'"
+            else legacy_literal
         )
         for table in tables
     }
@@ -405,10 +512,11 @@ def _rebuild_artifact_learning_tables(
     ensure_artifact_tenant_indexes(conn)
 
 
-def rebuild_ingested_dashboards_table(conn: sqlite3.Connection) -> None:
+def rebuild_ingested_dashboards_table(conn: sqlite3.Connection, *, legacy_tenant: str = "default") -> None:
     """Rebuild legacy ingested dashboards with tenant/backend-scoped uniqueness."""
     old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ingested_dashboards)").fetchall()}
-    tenant_select = "COALESCE(tenant_id, 'default')" if "tenant_id" in old_columns else "'default'"
+    legacy_literal = _tenant_sql_literal(legacy_tenant)
+    tenant_select = f"COALESCE(tenant_id, {legacy_literal})" if "tenant_id" in old_columns else legacy_literal
     with atomic_rebuild(conn, "rebuild_ingested_dashboards"):
         _rebuild_ingested_dashboards_table(conn, tenant_select)
 
@@ -464,10 +572,11 @@ def _rebuild_ingested_dashboards_table(conn: sqlite3.Connection, tenant_select: 
            ON ingested_dashboards(tenant_id, dashboard_uid, backend_name)""")
 
 
-def rebuild_ingested_alerts_table(conn: sqlite3.Connection) -> None:
+def rebuild_ingested_alerts_table(conn: sqlite3.Connection, *, legacy_tenant: str = "default") -> None:
     """Rebuild legacy ingested alerts with tenant/backend-scoped uniqueness."""
     old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ingested_alerts)").fetchall()}
-    tenant_select = "COALESCE(tenant_id, 'default')" if "tenant_id" in old_columns else "'default'"
+    legacy_literal = _tenant_sql_literal(legacy_tenant)
+    tenant_select = f"COALESCE(tenant_id, {legacy_literal})" if "tenant_id" in old_columns else legacy_literal
     with atomic_rebuild(conn, "rebuild_ingested_alerts"):
         _rebuild_ingested_alerts_table(conn, tenant_select)
 
