@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from typing import Any
 
 import structlog
 
+from tacit.config import settings
 from tacit.knowledge.corroboration import ConflictDetectionService, CorroborationService
 from tacit.knowledge.entities import EntityResolutionService
 from tacit.knowledge.enums import (
@@ -65,11 +67,15 @@ from tacit.knowledge.normalization import (
 from tacit.knowledge.policies import default_policies
 from tacit.knowledge.repository import (
     CandidateEvaluationConflictError,
+    CandidateLifecycleConflictError,
+    CandidateMergeConflictError,
     CandidateReviewConflictError,
     KnowledgeRepository,
     KnowledgeRevisionConflictError,
     get_knowledge_repository,
 )
+from tacit.knowledge.usage import KnowledgeRevisionRef, KnowledgeStageUse
+from tacit.tenancy import resolve_tenant_boundary
 
 PROMPT_INJECTION_RE = re.compile(
     r"\b(ignore (?:all |the )?(?:previous|system) instructions|system prompt|developer message|"
@@ -100,26 +106,66 @@ def _source_family(value: str) -> SourceFamily:
 
 
 class KnowledgeService:
-    def __init__(self, repository: KnowledgeRepository | None = None):
+    def __init__(
+        self,
+        repository: KnowledgeRepository | None = None,
+        *,
+        signal_store: Any | None = None,
+        runtime_settings: Any | None = None,
+    ):
         self.repository = repository or get_knowledge_repository()
-        self._signal_store_instance: Any | None = None
+        self._signal_store_instance = signal_store
+        self._runtime_settings = runtime_settings or getattr(signal_store, "_settings", None) or settings
         self.entity_resolution = EntityResolutionService(self.repository)
         self.normalizer = PropositionNormalizer()
         self.corroboration = CorroborationService(self.repository)
         self.conflicts = ConflictDetectionService(self.repository)
         self.policies = default_policies()
 
+    def _resolve_tenant(self, tenant_id: str | None) -> str:
+        return resolve_tenant_boundary(
+            str(getattr(self._runtime_settings, "knowledge_tenant_id", "default") or "default"),
+            tenant_id,
+        )
+
+    def _record_tenant(self, record: Any) -> str:
+        requested = record.tenant_id if "tenant_id" in record.model_fields_set else None
+        return self._resolve_tenant(requested)
+
+    @staticmethod
+    def _scope_for_tenant(scope: KnowledgeScope | None, tenant_id: str) -> KnowledgeScope:
+        if scope is None:
+            return KnowledgeScope(tenant_id=tenant_id)
+        tenant_was_explicit = "tenant_id" in scope.model_fields_set
+        scope = KnowledgeScope.model_validate(scope)
+        if scope.tenant_id == tenant_id:
+            return scope
+        if tenant_was_explicit:
+            raise ValueError("knowledge scope cannot cross tenants")
+        return scope.model_copy(update={"tenant_id": tenant_id})
+
+    def _validated_usage(self, usage: list[KnowledgeUsage]) -> list[KnowledgeUsage]:
+        validated: list[KnowledgeUsage] = []
+        resolved_tenants: set[str] = set()
+        for item in usage:
+            requested = item.tenant_id if "tenant_id" in item.model_fields_set else None
+            tenant_id = self._resolve_tenant(requested)
+            resolved_tenants.add(tenant_id)
+            validated.append(item if item.tenant_id == tenant_id else item.model_copy(update={"tenant_id": tenant_id}))
+        if len(resolved_tenants) > 1:
+            raise ValueError("knowledge usage batch cannot cross tenants")
+        return validated
+
     def register_entity(self, entity: Entity) -> Entity:
+        tenant_id = self._record_tenant(entity)
+        scope = self._scope_for_tenant(entity.scope, tenant_id)
+        entity = entity.model_copy(update={"tenant_id": tenant_id, "scope": scope})
         existing = self.repository.get_entity(normalize_entity(entity.id), entity.tenant_id)
         if existing is not None and existing.kind != entity.kind:
             raise ValueError("entity kind cannot change for an existing entity id")
         canonical_id = normalize_entity_id(entity.id, entity.kind)
         if canonical_id != entity.id:
             entity = entity.model_copy(update={"id": canonical_id})
-        if entity.scope.tenant_id != entity.tenant_id:
-            entity = entity.model_copy(
-                update={"scope": entity.scope.model_copy(update={"tenant_id": entity.tenant_id})}
-            )
         saved = self.repository.save_entity(entity)
         self.repository.append_event(
             "entity_resolved",
@@ -131,13 +177,14 @@ class KnowledgeService:
         return saved
 
     def register_alias(self, alias: EntityAlias) -> EntityAlias:
+        tenant_id = self._record_tenant(alias)
+        scope = self._scope_for_tenant(alias.scope, tenant_id)
+        alias = alias.model_copy(update={"tenant_id": tenant_id, "scope": scope})
         entity = self.repository.get_entity(alias.entity_ref, alias.tenant_id)
         if entity is None:
             raise ValueError("alias target entity does not exist in the tenant")
         if entity.status != EntityStatus.ACTIVE:
             raise ValueError("alias target entity is not active")
-        if alias.scope.tenant_id != alias.tenant_id:
-            alias = alias.model_copy(update={"scope": alias.scope.model_copy(update={"tenant_id": alias.tenant_id})})
         saved = self.repository.save_alias(alias)
         self.repository.append_event(
             "entity_alias_registered",
@@ -162,15 +209,14 @@ class KnowledgeService:
         scope: KnowledgeScope | None = None,
         evidence: list[KnowledgeEvidenceReference] | None = None,
         provenance_refs: list[str],
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         candidate_id: str | None = None,
         migration_provenance: MigrationProvenance | None = None,
         reactivate_stale: bool = False,
     ) -> KnowledgeCandidate:
+        tenant_id = self._resolve_tenant(tenant_id)
         knowledge_kind = KnowledgeKind(kind)
-        scope = KnowledgeScope.model_validate((scope or KnowledgeScope(tenant_id=tenant_id)).model_dump(mode="python"))
-        if scope.tenant_id != tenant_id:
-            raise ValueError("candidate scope cannot cross tenants")
+        scope = self._scope_for_tenant(scope, tenant_id)
         raw = proposition if isinstance(proposition, dict) else proposition.model_dump(mode="python")
         subject_raw = str(raw.get("subject_ref", ""))
         object_raw = str(raw.get("object_ref", ""))
@@ -232,30 +278,41 @@ class KnowledgeService:
             created_at=now,
             updated_at=now,
         )
-        existing = self.repository.get_candidate(candidate.id, tenant_id)
-        if existing is not None:
-            proposition_changed = existing.proposition.proposition_key != candidate.proposition.proposition_key
-            if proposition_changed and not self._is_entity_resolution_repair(existing, candidate):
-                raise ValueError("candidate identity cannot be reused for a different proposition")
-            existing_state = existing.state
-            if reactivate_stale and existing_state.lifecycle_status == LifecycleStatus.STALE:
-                existing_state = transition_lifecycle_state(existing_state, LifecycleStatus.ACTIVE)
-            candidate = candidate.model_copy(
-                update={
-                    "state": existing_state,
-                    "corroboration": existing.corroboration,
-                    "policy": existing.policy,
-                    "security_flags": sorted(set(existing.security_flags + candidate.security_flags)),
-                    "created_at": existing.created_at,
-                }
-            )
-        self.repository.save_candidate(candidate)
+        extracted_candidate = candidate
         first_evidence = evidence_model.items[0] if evidence_model.items else None
-        self.repository.save_proposition(
-            candidate,
-            lineage_group=(first_evidence.lineage_group if first_evidence else payload_ref),
-            independence_class=(first_evidence.lineage_kind.value if first_evidence else LineageKind.UNKNOWN.value),
-        )
+        for _attempt in range(5):
+            existing = self.repository.get_candidate(candidate.id, tenant_id)
+            candidate = extracted_candidate
+            if existing is not None:
+                proposition_changed = existing.proposition.proposition_key != candidate.proposition.proposition_key
+                if proposition_changed and not self._is_entity_resolution_repair(existing, candidate):
+                    raise ValueError("candidate identity cannot be reused for a different proposition")
+                existing_state = existing.state
+                if reactivate_stale and existing_state.lifecycle_status == LifecycleStatus.STALE:
+                    existing_state = transition_lifecycle_state(existing_state, LifecycleStatus.ACTIVE)
+                candidate = candidate.model_copy(
+                    update={
+                        "state": existing_state,
+                        "corroboration": existing.corroboration,
+                        "policy": existing.policy,
+                        "security_flags": sorted(set(existing.security_flags + candidate.security_flags)),
+                        "created_at": existing.created_at,
+                    }
+                )
+            try:
+                self.repository.save_candidate_with_proposition(
+                    candidate,
+                    lineage_group=(first_evidence.lineage_group if first_evidence else payload_ref),
+                    independence_class=(
+                        first_evidence.lineage_kind.value if first_evidence else LineageKind.UNKNOWN.value
+                    ),
+                    expected=existing,
+                )
+                break
+            except CandidateMergeConflictError:
+                continue
+        else:
+            raise CandidateMergeConflictError("candidate kept changing during re-ingestion")
         self.repository.append_event(
             "candidate_created",
             tenant_id=tenant_id,
@@ -289,67 +346,110 @@ class KnowledgeService:
         *,
         approved: bool,
         reviewer: str,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         trust: bool = False,
         can_trust: bool = False,
+        _correction_id: str | None = None,
     ) -> KnowledgeCandidate:
+        tenant_id = self._resolve_tenant(tenant_id)
         candidate = self._require_candidate(candidate_id, tenant_id)
+        self._require_candidate_workflow(candidate_id, tenant_id, _correction_id)
         if trust and not can_trust:
             raise PermissionError("knowledge.trust permission is required")
         review_state = ReviewState.TRUSTED if trust else ReviewState.APPROVED if approved else ReviewState.REJECTED
         if candidate.state.review_state == review_state:
             if review_state == ReviewState.REJECTED:
-                self._reconcile_removed_candidates(
-                    [candidate],
-                    lifecycle_status=LifecycleStatus.WITHDRAWN,
-                    reason="candidate_rejected",
-                )
+                if candidate.kind == KnowledgeKind.SIGNAL_MAPPING:
+                    self._signal_store()
+                with self.repository.transaction():
+                    current = self._require_candidate(candidate_id, tenant_id)
+                    if current.state.review_state != ReviewState.REJECTED:
+                        raise CandidateReviewConflictError("candidate changed; reload before reviewing")
+                    self._reconcile_removed_candidates(
+                        [current],
+                        lifecycle_status=LifecycleStatus.WITHDRAWN,
+                        reason="candidate_rejected",
+                    )
             return candidate
         state = transition_review_state(candidate.state, review_state)
         updated = candidate.model_copy(update={"state": state, "updated_at": utc_now()})
+        if review_state == ReviewState.REJECTED and candidate.kind == KnowledgeKind.SIGNAL_MAPPING:
+            self._signal_store()
         try:
-            self.repository.transition_candidate_review(
-                updated,
-                expected_states={candidate.state.review_state.value},
-            )
+            with self.repository.transaction():
+                self.repository.transition_candidate_review(updated, expected=candidate)
+                if review_state == ReviewState.REJECTED:
+                    decision = self._state_decision(updated, PromotionDecisionType.REJECT, "rejected_by_review")
+                    self.repository.save_promotion_decision(decision, tenant_id)
+                    self._resolve_conflicts_for_rejected_proposition(updated, reviewer)
+                    self._reconcile_removed_candidates(
+                        [updated],
+                        lifecycle_status=LifecycleStatus.WITHDRAWN,
+                        reason="candidate_rejected",
+                    )
+                self.repository.append_event(
+                    (
+                        "correction_reviewed"
+                        if candidate.kind == KnowledgeKind.ARTIFACT_QUALITY
+                        else "promotion_evaluated"
+                    ),
+                    tenant_id=tenant_id,
+                    subject_ref=candidate_id,
+                    dimensions={
+                        "knowledge_kind": candidate.kind.value,
+                        "review_state": review_state.value,
+                        "eligibility": state.eligibility.value,
+                        "reason_code": "reviewed_by_human",
+                    },
+                    payload={"reviewer": reviewer},
+                )
         except CandidateReviewConflictError:
             concurrent = self.repository.get_candidate(candidate.id, tenant_id)
             if concurrent is not None and concurrent.state.review_state == review_state:
                 return concurrent
             raise
-        if review_state == ReviewState.REJECTED:
-            decision = self._state_decision(updated, PromotionDecisionType.REJECT, "rejected_by_review")
-            self.repository.save_promotion_decision(decision, tenant_id)
-            self._resolve_conflicts_for_rejected_proposition(updated, reviewer)
-            self._reconcile_removed_candidates(
-                [updated],
-                lifecycle_status=LifecycleStatus.WITHDRAWN,
-                reason="candidate_rejected",
-            )
-        self.repository.append_event(
-            "correction_reviewed" if candidate.kind == KnowledgeKind.ARTIFACT_QUALITY else "promotion_evaluated",
-            tenant_id=tenant_id,
-            subject_ref=candidate_id,
-            dimensions={
-                "knowledge_kind": candidate.kind.value,
-                "review_state": review_state.value,
-                "eligibility": state.eligibility.value,
-                "reason_code": "reviewed_by_human",
-            },
-            payload={"reviewer": reviewer},
-        )
         return updated
 
     def evaluate_candidate(
         self,
         candidate_id: str,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         authoritative_source: bool = False,
         live_verified: bool = False,
         ignored_conflict_ids: set[str] | None = None,
+        _correction_id: str | None = None,
     ) -> tuple[PromotionDecision, KnowledgeRevision | None]:
+        tenant_id = self._resolve_tenant(tenant_id)
+        observed = self._require_candidate(candidate_id, tenant_id)
+        self._require_candidate_workflow(candidate_id, tenant_id, _correction_id)
+        if observed.kind == KnowledgeKind.SIGNAL_MAPPING:
+            # SignalStore schema initialization uses its own connection. Resolve
+            # it before taking the authority write lock used by the projection.
+            self._signal_store()
+        with self.repository.transaction():
+            return self._evaluate_candidate_in_transaction(
+                candidate_id,
+                tenant_id=tenant_id,
+                authoritative_source=authoritative_source,
+                live_verified=live_verified,
+                ignored_conflict_ids=ignored_conflict_ids,
+                _correction_id=_correction_id,
+            )
+
+    def _evaluate_candidate_in_transaction(
+        self,
+        candidate_id: str,
+        *,
+        tenant_id: str,
+        authoritative_source: bool,
+        live_verified: bool,
+        ignored_conflict_ids: set[str] | None,
+        _correction_id: str | None,
+    ) -> tuple[PromotionDecision, KnowledgeRevision | None]:
+        """Evaluate and persist authority while one immediate write lock is held."""
         candidate = self._require_candidate(candidate_id, tenant_id)
+        self._require_candidate_workflow(candidate_id, tenant_id, _correction_id)
         evaluated_candidate = candidate
         summary, corroboration_ref = self.corroboration.analyze(tenant_id, candidate.proposition.proposition_key)
         conflicts = self.conflicts.analyze(
@@ -431,6 +531,11 @@ class KnowledgeService:
         existing = self.repository.find_knowledge_by_proposition(tenant_id, candidate.proposition.proposition_key)
         knowledge_id = existing.id if existing else _id("knowledge", [tenant_id, candidate.proposition.proposition_key])
         revision_number = existing.current_revision + 1 if existing else 1
+        resolver_payload = (
+            self._build_signal_mapping_resolver_payload(candidate, contributors)
+            if candidate.kind == KnowledgeKind.SIGNAL_MAPPING
+            else {}
+        )
         semantic = stable_fingerprint(
             {
                 "proposition": candidate.proposition.model_dump(mode="json"),
@@ -444,13 +549,17 @@ class KnowledgeService:
                 "conflicts": sorted(conflict.id for conflict in conflicts),
                 "contributors": contributor_refs,
                 "provenance": provenance_refs,
+                "resolver_payload": resolver_payload,
             }
         )
         current_revision = (
             self.repository.get_revision(existing.id, tenant_id=tenant_id) if existing is not None else None
         )
         if current_revision is not None and current_revision.semantic_fingerprint == semantic:
-            self._sync_signal_mapping_state(current_revision)
+            current_revision = self._repair_signal_mapping_projection(
+                current_revision,
+                expected_semantic_fingerprint=semantic,
+            )
             return decision, current_revision
         revision = KnowledgeRevision(
             knowledge_id=knowledge_id,
@@ -467,6 +576,7 @@ class KnowledgeService:
             decision_ref=decision.decision_id,
             promoted_from_candidate_refs=contributor_refs,
             provenance_refs=provenance_refs,
+            resolver_payload=resolver_payload,
             revision_reason="promoted" if revision_number == 1 else "corroborated",
             semantic_fingerprint=semantic,
         )
@@ -476,12 +586,16 @@ class KnowledgeService:
                 candidate_id=candidate.id,
                 decision_ref=decision.decision_id,
                 expected_candidate=candidate,
+                expected_contributors=contributors,
             )
         except KnowledgeRevisionConflictError:
             concurrent_revision = self.repository.get_revision(knowledge_id, tenant_id=tenant_id)
             if concurrent_revision is None or concurrent_revision.semantic_fingerprint != revision.semantic_fingerprint:
                 raise
-            self._sync_signal_mapping_state(concurrent_revision)
+            concurrent_revision = self._repair_signal_mapping_projection(
+                concurrent_revision,
+                expected_semantic_fingerprint=revision.semantic_fingerprint,
+            )
             return decision, concurrent_revision
         self.repository.append_event(
             "knowledge_promoted" if revision_number == 1 else "knowledge_revised",
@@ -503,6 +617,8 @@ class KnowledgeService:
         self,
         scope: KnowledgeScope,
     ) -> tuple[KnowledgeSnapshot, list[KnowledgeUsage]]:
+        requested_tenant = scope.tenant_id if "tenant_id" in scope.model_fields_set else None
+        scope = self._scope_for_tenant(scope, self._resolve_tenant(requested_tenant))
         selected: list[KnowledgeSnapshotItem] = []
         usage: list[KnowledgeUsage] = []
         for revision in self.repository.list_current_revisions(scope.tenant_id):
@@ -525,8 +641,12 @@ class KnowledgeService:
             )
         return self._save_snapshot(scope.tenant_id, selected), usage
 
-    def snapshot_from_usage(self, tenant_id: str, usage: list[KnowledgeUsage]) -> KnowledgeSnapshot:
+    def snapshot_from_usage(self, tenant_id: str | None, usage: list[KnowledgeUsage]) -> KnowledgeSnapshot:
         """Persist the final selected set after reconciliation and stage consumption."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        usage = self._validated_usage(usage)
+        if any(item.tenant_id != tenant_id for item in usage):
+            raise ValueError("knowledge usage cannot cross tenants")
         selected = [
             KnowledgeSnapshotItem(knowledge_ref=item.knowledge_ref, revision=item.knowledge_revision)
             for item in usage
@@ -541,7 +661,7 @@ class KnowledgeService:
     def apply_compilation_usage(
         self,
         usage: list[KnowledgeUsage],
-        applied_knowledge_refs: set[str] | frozenset[str],
+        applied_knowledge_refs: Collection[KnowledgeRevisionRef | str],
     ) -> list[KnowledgeUsage]:
         """Mark governed signal mappings whose resolver rows changed compilation."""
         return self._apply_signal_mapping_stage_usage(
@@ -554,29 +674,65 @@ class KnowledgeService:
     def apply_evidence_usage(
         self,
         usage: list[KnowledgeUsage],
-        applied_knowledge_refs: set[str] | frozenset[str],
+        applied_knowledge_refs: Collection[KnowledgeRevisionRef | str],
+        refs_by_requirement: dict[str, set[KnowledgeRevisionRef] | frozenset[KnowledgeRevisionRef]] | None = None,
     ) -> list[KnowledgeUsage]:
         """Mark governed mappings that selected an evidence metric."""
+        reason_codes_by_ref: dict[KnowledgeRevisionRef, set[str]] = {}
+        for requirement_id, refs in (refs_by_requirement or {}).items():
+            for revision_ref in refs:
+                reason_codes_by_ref.setdefault(revision_ref, set()).add(f"evidence_requirement:{requirement_id}")
         return self._apply_signal_mapping_stage_usage(
             usage,
             applied_knowledge_refs,
             stage="evidence_resolution",
             reason_code="signal_mapping_selected_for_evidence",
+            reason_codes_by_ref=reason_codes_by_ref,
         )
+
+    def apply_stage_usage(
+        self,
+        usage: list[KnowledgeUsage],
+        stage_uses: list[KnowledgeStageUse] | tuple[KnowledgeStageUse, ...],
+    ) -> list[KnowledgeUsage]:
+        """Reconcile exact resolver effects confirmed by non-query stages."""
+        reconciled = usage
+        grouped: dict[tuple[str, str], set[KnowledgeRevisionRef]] = {}
+        reason_codes_by_group: dict[tuple[str, str], dict[KnowledgeRevisionRef, set[str]]] = {}
+        for use in stage_uses:
+            group = (use.stage.value, use.effect.value)
+            grouped.setdefault(group, set()).add(use.revision_ref)
+            reason_codes_by_group.setdefault(group, {}).setdefault(use.revision_ref, set()).add(
+                f"stage_target:{use.stage.value}:{use.target_ref}"
+            )
+        for (stage, effect), revision_refs in grouped.items():
+            reconciled = self._apply_signal_mapping_stage_usage(
+                reconciled,
+                revision_refs,
+                stage=stage,
+                reason_code=effect,
+                reason_codes_by_ref=reason_codes_by_group[(stage, effect)],
+            )
+        return reconciled
 
     def _apply_signal_mapping_stage_usage(
         self,
         usage: list[KnowledgeUsage],
-        applied_knowledge_refs: set[str] | frozenset[str],
+        applied_knowledge_refs: Collection[KnowledgeRevisionRef | str],
         *,
         stage: str,
         reason_code: str,
+        reason_codes_by_ref: dict[KnowledgeRevisionRef, set[str]] | None = None,
     ) -> list[KnowledgeUsage]:
+        usage = self._validated_usage(usage)
         if not applied_knowledge_refs:
             return usage
+        exact_refs = {item for item in applied_knowledge_refs if isinstance(item, KnowledgeRevisionRef)}
+        legacy_refs = {item for item in applied_knowledge_refs if isinstance(item, str)}
         reconciled = list(usage)
         for index, item in enumerate(usage):
-            if item.knowledge_ref not in applied_knowledge_refs:
+            item_ref = KnowledgeRevisionRef(item.knowledge_ref, item.knowledge_revision)
+            if item_ref not in exact_refs and item.knowledge_ref not in legacy_refs:
                 continue
             if item.disposition not in {
                 KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
@@ -600,6 +756,9 @@ class KnowledgeService:
             reason_codes = list(item.reason_codes)
             if reason_code not in reason_codes:
                 reason_codes.append(reason_code)
+            for extra_reason in sorted((reason_codes_by_ref or {}).get(item_ref, set())):
+                if extra_reason not in reason_codes:
+                    reason_codes.append(extra_reason)
             used_for = list(item.used_for)
             if stage not in used_for:
                 used_for.append(stage)
@@ -611,21 +770,44 @@ class KnowledgeService:
                     "reason_codes": reason_codes,
                 }
             )
-        audited_refs = {
-            item.knowledge_ref
+        audited_exact_refs = {
+            KnowledgeRevisionRef(item.knowledge_ref, item.knowledge_revision)
             for item in reconciled
             if item.disposition == KnowledgeUsageDisposition.APPLIED and stage in item.used_for
         }
-        missing_refs = set(applied_knowledge_refs).difference(audited_refs)
-        if missing_refs:
+        audited_legacy_refs = {item.knowledge_ref for item in reconciled if stage in item.used_for}
+        missing_exact_refs = exact_refs.difference(audited_exact_refs)
+        missing_legacy_refs = legacy_refs.difference(audited_legacy_refs)
+        if missing_exact_refs or missing_legacy_refs:
+            requested_revisions = {ref.knowledge_ref: ref.knowledge_revision for ref in missing_exact_refs}
+            selected_revisions = {
+                item.knowledge_ref: item.knowledge_revision
+                for item in usage
+                if item.knowledge_ref in requested_revisions
+            }
+            if selected_revisions:
+                logger.error(
+                    "knowledge_stage_revision_mismatch",
+                    stage=stage,
+                    requested_revisions=requested_revisions,
+                    selected_revisions=selected_revisions,
+                )
             logger.error(
                 "governed_stage_usage_missing",
                 stage=stage,
-                knowledge_refs=sorted(missing_refs),
+                knowledge_refs=sorted(
+                    [f"{ref.knowledge_ref}@{ref.knowledge_revision}" for ref in missing_exact_refs]
+                    + list(missing_legacy_refs)
+                ),
             )
             raise RuntimeError(
                 f"Governed {stage} references were not present in the selected knowledge snapshot: "
-                + ", ".join(sorted(missing_refs))
+                + ", ".join(
+                    sorted(
+                        [f"{ref.knowledge_ref}@{ref.knowledge_revision}" for ref in missing_exact_refs]
+                        + list(missing_legacy_refs)
+                    )
+                )
             )
         return reconciled
 
@@ -648,6 +830,7 @@ class KnowledgeService:
         """Apply dependency knowledge and return stage-confirmed usage records."""
         from tacit.models.schemas import CulpritCandidate
 
+        usage = self._validated_usage(usage)
         candidates = list(ranking.candidates)
         original_candidate_count = len(candidates)
         updated_usage = list(usage)
@@ -776,6 +959,7 @@ class KnowledgeService:
         """Let exact negative runtime evidence veto matching contextual knowledge."""
         from tacit.models.schemas import EvidenceObservationOutcome
 
+        usage = self._validated_usage(usage)
         negative_refs = {
             value.strip().casefold()
             for observation in observations
@@ -820,7 +1004,7 @@ class KnowledgeService:
             if (
                 proposition.kind == KnowledgeKind.SIGNAL_MAPPING
                 and item.disposition == KnowledgeUsageDisposition.APPLIED
-                and set(item.used_for).intersection({"query_compilation", "evidence_resolution"})
+                and set(item.used_for).intersection({"archetype_selection", "query_compilation", "evidence_resolution"})
             ):
                 reason_codes = list(item.reason_codes)
                 if "live_negative_observation_after_applied_stage" not in reason_codes:
@@ -846,6 +1030,7 @@ class KnowledgeService:
         investigation_id: str,
         investigation_revision: int,
     ) -> list[KnowledgeUsage]:
+        usage = self._validated_usage(usage)
         persisted = []
         for item in usage:
             updated = item.model_copy(
@@ -893,8 +1078,39 @@ class KnowledgeService:
         created_by: str,
         target_ref: str = "",
         target_revision: int | None = None,
+        tenant_id: str | None = None,
+    ) -> tuple[KnowledgeCorrection, KnowledgeCandidate]:
+        tenant_id = self._resolve_tenant(tenant_id)
+        scope = self._scope_for_tenant(scope, tenant_id)
+        with self.repository.transaction():
+            return self._create_correction_in_transaction(
+                investigation_id=investigation_id,
+                investigation_revision=investigation_revision,
+                correction_type=correction_type,
+                proposed=proposed,
+                scope=scope,
+                explanation=explanation,
+                created_by=created_by,
+                target_ref=target_ref,
+                target_revision=target_revision,
+                tenant_id=tenant_id,
+            )
+
+    def _create_correction_in_transaction(
+        self,
+        *,
+        investigation_id: str,
+        investigation_revision: int,
+        correction_type: CorrectionType | str,
+        proposed: dict[str, Any],
+        scope: KnowledgeScope,
+        explanation: str,
+        created_by: str,
+        target_ref: str = "",
+        target_revision: int | None = None,
         tenant_id: str = "default",
     ) -> tuple[KnowledgeCorrection, KnowledgeCandidate]:
+        """Create correction ownership and its candidate under one write lock."""
         correction_type = CorrectionType(correction_type)
         target = None
         if target_ref:
@@ -997,10 +1213,11 @@ class KnowledgeService:
         *,
         approved: bool,
         reviewer: str,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         authoritative: bool = False,
     ) -> tuple[KnowledgeCorrection, KnowledgeRevision | None]:
         """Review and apply a correction within one locked write transaction."""
+        tenant_id = self._resolve_tenant(tenant_id)
         correction = self.repository.get_correction(correction_id, tenant_id)
         if correction is not None:
             candidate = self.repository.get_candidate(correction.knowledge_candidate_ref, tenant_id)
@@ -1034,6 +1251,35 @@ class KnowledgeService:
         correction = self.repository.get_correction(correction_id, tenant_id)
         if correction is None:
             raise ValueError("knowledge correction not found")
+        if not approved and correction.review_state == ReviewState.REJECTED:
+            if correction.correction_type != CorrectionType.ENTITY_MAPPING:
+                return correction, None
+            alias_ref = correction.applied_alias_ref or self._entity_mapping_alias(correction).id
+            alias = self.repository.get_alias(alias_ref, tenant_id)
+            if (
+                alias is not None
+                and alias.review_state == ReviewState.REJECTED
+                and alias.lifecycle_status == LifecycleStatus.WITHDRAWN
+            ):
+                return correction, None
+        if approved and correction.applied_alias_ref:
+            alias = self.repository.get_alias(correction.applied_alias_ref, tenant_id)
+            if alias is None:
+                raise ValueError("applied correction alias is missing from entity history")
+            if alias.review_state not in {ReviewState.APPROVED, ReviewState.TRUSTED} or (
+                alias.lifecycle_status != LifecycleStatus.ACTIVE
+            ):
+                raise ValueError("applied correction alias is no longer active")
+            return correction, None
+        if approved and correction.applied_knowledge_ref:
+            applied = self.repository.get_revision(
+                correction.applied_knowledge_ref,
+                correction.applied_knowledge_revision,
+                tenant_id=tenant_id,
+            )
+            if applied is None:
+                raise ValueError("applied correction result is missing from immutable knowledge history")
+            return correction, applied
         if (
             approved
             and correction.correction_type in {CorrectionType.KNOWLEDGE_STALE, CorrectionType.KNOWLEDGE_INCORRECT}
@@ -1064,33 +1310,42 @@ class KnowledgeService:
             approved=approved,
             reviewer=reviewer,
             tenant_id=tenant_id,
+            _correction_id=correction.id,
         )
         correction = correction.model_copy(update={"review_state": candidate.state.review_state})
-        self.repository.save_correction(correction)
         if not approved:
+            if correction.correction_type == CorrectionType.ENTITY_MAPPING:
+                alias_ref = correction.applied_alias_ref or self._entity_mapping_alias(correction).id
+                alias = self.repository.get_alias(alias_ref, tenant_id)
+                if alias is not None:
+                    alias = alias.model_copy(
+                        update={
+                            "review_state": ReviewState.REJECTED,
+                            "lifecycle_status": LifecycleStatus.WITHDRAWN,
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    self.repository.save_alias(alias)
+                    correction = correction.model_copy(update={"applied_alias_ref": alias.id})
+                    self.repository.append_event(
+                        "entity_alias_retired",
+                        tenant_id=tenant_id,
+                        subject_ref=alias.entity_ref,
+                        dimensions={
+                            "review_state": alias.review_state.value,
+                            "lifecycle_status": alias.lifecycle_status.value,
+                            "reason_code": "correction_rejected",
+                        },
+                        payload={"alias_id": alias.id, "correction_id": correction.id},
+                    )
+            self.repository.save_correction(correction)
             return correction, None
+        self.repository.save_correction(correction)
         if correction.correction_type == CorrectionType.ENTITY_MAPPING:
-            raw_value, entity_ref = self._entity_mapping_values(correction.proposed)
-            alias = EntityAlias(
-                id=_id(
-                    "alias",
-                    [
-                        correction.tenant_id,
-                        normalize_entity(raw_value),
-                        entity_ref,
-                        correction.scope.model_dump(mode="json"),
-                    ],
-                ),
-                tenant_id=correction.tenant_id,
-                raw_value=raw_value,
-                normalized_value=normalize_entity(raw_value),
-                entity_ref=entity_ref,
-                scope=correction.scope,
-                method=EntityBindingMethod.HUMAN_CORRECTION,
-                review_state=ReviewState.APPROVED,
-                provenance_refs=[f"prov_{correction.id}"],
-            )
+            alias = self._entity_mapping_alias(correction)
             self.register_alias(alias)
+            correction = correction.model_copy(update={"applied_alias_ref": alias.id})
+            correction = self.repository.save_correction(correction)
             return correction, None
         if correction.correction_type in {
             CorrectionType.KNOWLEDGE_STALE,
@@ -1108,6 +1363,13 @@ class KnowledgeService:
                 lifecycle_status=lifecycle_status,
                 reason=correction.correction_type.value,
             )
+            correction = correction.model_copy(
+                update={
+                    "applied_knowledge_ref": retired_revision.knowledge_id,
+                    "applied_knowledge_revision": retired_revision.revision,
+                }
+            )
+            self.repository.save_correction(correction)
             return correction, retired_revision
         conflicts = self.conflicts.analyze(
             tenant_id,
@@ -1126,6 +1388,7 @@ class KnowledgeService:
             tenant_id=tenant_id,
             authoritative_source=authoritative,
             ignored_conflict_ids={conflict.id for conflict in replaceable_conflicts},
+            _correction_id=correction.id,
         )
         superseded = False
         if revision and target is not None and replaceable_conflicts and correction.target_ref != revision.knowledge_id:
@@ -1157,6 +1420,14 @@ class KnowledgeService:
                     },
                     payload={"candidate_id": candidate.id},
                 )
+        if revision is not None:
+            correction = correction.model_copy(
+                update={
+                    "applied_knowledge_ref": revision.knowledge_id,
+                    "applied_knowledge_revision": revision.revision,
+                }
+            )
+            self.repository.save_correction(correction)
         return correction, revision
 
     def supersede(
@@ -1164,9 +1435,10 @@ class KnowledgeService:
         knowledge_id: str,
         replacement_candidate_id: str,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         expected_revision: int | None = None,
     ) -> KnowledgeRevision:
+        tenant_id = self._resolve_tenant(tenant_id)
         current = self.repository.get_revision(
             knowledge_id,
             expected_revision,
@@ -1217,30 +1489,79 @@ class KnowledgeService:
         self,
         *,
         provenance_ref: str,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         active_candidate_ids: set[str] | None = None,
         source_stale: bool = False,
     ) -> list[KnowledgeRevision]:
         """Retire candidates and promoted knowledge no longer backed by a live source."""
-        retired_candidates: list[KnowledgeCandidate] = []
+        tenant_id = self._resolve_tenant(tenant_id)
+        matching_candidates: list[KnowledgeCandidate] = []
         for candidate in self.repository.list_candidates(tenant_id, limit=None):
             evidence_refs = {ref for evidence in candidate.evidence.items for ref in evidence.provenance_refs}
             if provenance_ref not in set(candidate.provenance_refs).union(evidence_refs):
                 continue
             if not source_stale and active_candidate_ids is not None and candidate.id in active_candidate_ids:
                 continue
-            if candidate.state.lifecycle_status != LifecycleStatus.ACTIVE:
-                continue
-            state = transition_lifecycle_state(candidate.state, LifecycleStatus.STALE)
-            updated = candidate.model_copy(update={"state": state, "updated_at": utc_now()})
-            self.repository.save_candidate(updated)
-            retired_candidates.append(updated)
+            matching_candidates.append(candidate)
 
-        return self._reconcile_removed_candidates(
-            retired_candidates,
-            lifecycle_status=LifecycleStatus.STALE,
-            reason="source_stale" if source_stale else "source_changed",
-        )
+        if any(candidate.kind == KnowledgeKind.SIGNAL_MAPPING for candidate in matching_candidates):
+            self._signal_store()
+        try:
+            with self.repository.transaction():
+                retired_candidates: list[KnowledgeCandidate] = []
+                for observed in matching_candidates:
+                    current_candidate = self.repository.get_candidate(observed.id, tenant_id)
+                    if current_candidate is None:
+                        continue
+                    if current_candidate != observed:
+                        logger.info(
+                            "source_lifecycle_transition_skipped",
+                            tenant_id=tenant_id,
+                            candidate_id=observed.id,
+                            reason="source_generation_advanced",
+                            observed_updated_at=observed.updated_at.isoformat(),
+                            current_updated_at=current_candidate.updated_at.isoformat(),
+                        )
+                        continue
+                    if observed.state.lifecycle_status == LifecycleStatus.STALE:
+                        # A previous split write may have retired the candidate but
+                        # not its authority revision. Reconcile it idempotently.
+                        retired_candidates.append(observed)
+                        continue
+                    if observed.state.lifecycle_status != LifecycleStatus.ACTIVE:
+                        continue
+                    state = transition_lifecycle_state(observed.state, LifecycleStatus.STALE)
+                    updated = observed.model_copy(update={"state": state, "updated_at": utc_now()})
+                    try:
+                        self.repository.transition_candidate_lifecycle(updated, expected=observed)
+                    except CandidateLifecycleConflictError:
+                        current = self.repository.get_candidate(observed.id, tenant_id)
+                        logger.info(
+                            "source_lifecycle_transition_skipped",
+                            tenant_id=tenant_id,
+                            candidate_id=observed.id,
+                            reason="candidate_state_advanced",
+                            winning_review_state=(current.state.review_state.value if current else "missing"),
+                            winning_lifecycle_status=(current.state.lifecycle_status.value if current else "missing"),
+                        )
+                        continue
+                    retired_candidates.append(updated)
+
+                return self._reconcile_removed_candidates(
+                    retired_candidates,
+                    lifecycle_status=LifecycleStatus.STALE,
+                    reason="source_stale" if source_stale else "source_changed",
+                )
+        except Exception:
+            logger.error(
+                "source_lifecycle_reconciliation_failed",
+                tenant_id=tenant_id,
+                provenance_ref=provenance_ref,
+                candidate_count=len(matching_candidates),
+                source_stale=source_stale,
+                exc_info=True,
+            )
+            raise
 
     def _reconcile_removed_candidates(
         self,
@@ -1267,11 +1588,13 @@ class KnowledgeService:
             if surviving_candidates:
                 supported_revision = None
                 for survivor in surviving_candidates:
+                    correction = self.repository.get_correction_for_candidate(survivor.id, tenant_id)
                     _, supported_revision = self.evaluate_candidate(
                         survivor.id,
                         tenant_id=tenant_id,
                         authoritative_source=survivor.policy.authoritative_source,
                         live_verified=survivor.policy.live_verified,
+                        _correction_id=correction.id if correction is not None else None,
                     )
                     if supported_revision is not None:
                         lifecycle_revisions.append(supported_revision)
@@ -1336,8 +1659,40 @@ class KnowledgeService:
         if self._signal_store_instance is None:
             from tacit.signals.store import SignalStore
 
-            self._signal_store_instance = SignalStore(self.repository._db_path)
+            self._signal_store_instance = SignalStore(
+                self.repository._db_path,
+                runtime_settings=self._runtime_settings,
+            )
         return self._signal_store_instance
+
+    def _repair_signal_mapping_projection(
+        self,
+        revision: KnowledgeRevision,
+        *,
+        expected_semantic_fingerprint: str,
+    ) -> KnowledgeRevision:
+        """Repair an idempotent projection from the current revision under a write lock."""
+        if revision.proposition.kind != KnowledgeKind.SIGNAL_MAPPING:
+            return revision
+        store = self._signal_store()
+        with self.repository.transaction() as conn:
+            current = self.repository.get_revision(revision.knowledge_id, tenant_id=revision.tenant_id)
+            if current is None:
+                raise KnowledgeRevisionConflictError("knowledge item disappeared while repairing its projection")
+            if current.semantic_fingerprint != expected_semantic_fingerprint:
+                raise KnowledgeRevisionConflictError(
+                    f"knowledge item advanced from revision {revision.revision} to {current.revision}; "
+                    "reload before repairing its projection"
+                )
+            self._sync_signal_mapping_state(current, store=store, connection=conn)
+            logger.info(
+                "governed_signal_projection_reconciled",
+                tenant_id=current.tenant_id,
+                knowledge_id=current.knowledge_id,
+                requested_revision=revision.revision,
+                authoritative_revision=current.revision,
+            )
+            return current
 
     def _persist_revision_with_projection(
         self,
@@ -1346,6 +1701,7 @@ class KnowledgeService:
         candidate_id: str,
         decision_ref: str,
         expected_candidate: KnowledgeCandidate | None = None,
+        expected_contributors: list[KnowledgeCandidate] | None = None,
         expected_parent_revision: int | None = None,
     ) -> KnowledgeRevision:
         store = self._signal_store() if revision.proposition.kind == KnowledgeKind.SIGNAL_MAPPING else None
@@ -1356,6 +1712,7 @@ class KnowledgeService:
                     candidate_id=candidate_id,
                     decision_ref=decision_ref,
                     expected_candidate=expected_candidate,
+                    expected_contributors=expected_contributors,
                     expected_parent_revision=expected_parent_revision,
                 )
                 self._sync_signal_mapping_state(persisted, store=store, connection=conn)
@@ -1381,118 +1738,154 @@ class KnowledgeService:
         """Project governed signal eligibility into the legacy resolver index."""
         if revision.proposition.kind != KnowledgeKind.SIGNAL_MAPPING:
             return
+        store = store or self._signal_store()
+        deactivated = store.deactivate_governed_mappings(
+            tenant_id=revision.tenant_id,
+            governance_ref=revision.knowledge_id,
+            connection=connection,
+        )
         signal_type = revision.proposition.concept_ref.removeprefix("signal:")
         metric_patterns = self._signal_metric_patterns(revision)
-        if not signal_type or not metric_patterns:
-            return
         active = (
             revision.state.lifecycle_status == LifecycleStatus.ACTIVE
             and revision.state.eligibility != KnowledgeEligibility.INELIGIBLE
         )
+        if not active:
+            logger.info(
+                "governed_signal_projection_deactivated",
+                tenant_id=revision.tenant_id,
+                knowledge_id=revision.knowledge_id,
+                knowledge_revision=revision.revision,
+                mapping_count=deactivated,
+                lifecycle_status=revision.state.lifecycle_status.value,
+                eligibility=revision.state.eligibility.value,
+            )
+            return
+        if not signal_type or not metric_patterns:
+            raise ValueError("active governed signal mapping requires a signal and exact metric pattern")
         review_state = (
             revision.state.review_state.value
             if active and revision.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
             else ReviewState.CANDIDATE.value
         )
-        store = store or self._signal_store()
         for metric_pattern in metric_patterns:
-            if active:
-                store.add_mapping(
-                    signal_type,
-                    metric_pattern,
-                    confidence=self._signal_mapping_confidence(revision, metric_pattern),
-                    context_services=self._resolver_scope_values(
-                        revision.scope.service_refs,
-                        "entity:service:",
-                    ),
-                    context_environments=self._resolver_scope_values(
-                        revision.scope.environment_refs,
-                        "environment:",
-                    ),
-                    context_datasource_types=self._signal_mapping_payload_values(
-                        revision,
-                        "context_datasource_types",
-                    ),
-                    context_archetypes=self._resolver_scope_values(
-                        revision.scope.archetype_refs,
-                        "archetype:",
-                    ),
-                    context_regions=self._resolver_scope_values(revision.scope.region_refs, "region:"),
-                    context_clusters=self._resolver_scope_values(revision.scope.cluster_refs, "cluster:"),
-                    context_namespaces=self._resolver_scope_values(revision.scope.namespace_refs, "namespace:"),
-                    context_versions=self._resolver_scope_values(revision.scope.version_constraints, "version:"),
-                    valid_from=revision.scope.valid_from.timestamp() if revision.scope.valid_from else None,
-                    valid_until=revision.scope.valid_until.timestamp() if revision.scope.valid_until else None,
-                    source_type="operational_knowledge",
-                    source_refs=[
-                        f"{revision.knowledge_id}@{revision.revision}",
-                        *revision.provenance_refs,
-                    ],
-                    governance_ref=revision.knowledge_id,
-                    inference_version=f"{revision.policy_id}:{revision.policy_version}",
-                    review_state=review_state,
-                    tenant_id=revision.tenant_id,
-                    connection=connection,
-                )
-            else:
-                store.set_mapping_review_state(
-                    signal_type,
-                    metric_pattern,
-                    review_state=review_state,
-                    tenant_id=revision.tenant_id,
-                    governance_ref=revision.knowledge_id,
-                    connection=connection,
-                )
+            store.add_mapping(
+                signal_type,
+                metric_pattern,
+                confidence=self._signal_mapping_confidence(revision, metric_pattern),
+                context_services=self._resolver_scope_values(
+                    revision.scope.service_refs,
+                    "entity:service:",
+                ),
+                context_environments=self._resolver_scope_values(
+                    revision.scope.environment_refs,
+                    "environment:",
+                ),
+                context_datasource_types=self._signal_mapping_payload_values(
+                    revision,
+                    "context_datasource_types",
+                ),
+                context_archetypes=self._resolver_scope_values(
+                    revision.scope.archetype_refs,
+                    "archetype:",
+                ),
+                context_regions=self._resolver_scope_values(revision.scope.region_refs, "region:"),
+                context_clusters=self._resolver_scope_values(revision.scope.cluster_refs, "cluster:"),
+                context_namespaces=self._resolver_scope_values(revision.scope.namespace_refs, "namespace:"),
+                context_versions=self._resolver_scope_values(revision.scope.version_constraints, "version:"),
+                valid_from=revision.scope.valid_from.timestamp() if revision.scope.valid_from else None,
+                valid_until=revision.scope.valid_until.timestamp() if revision.scope.valid_until else None,
+                source_type="operational_knowledge",
+                source_refs=[
+                    f"{revision.knowledge_id}@{revision.revision}",
+                    *revision.provenance_refs,
+                ],
+                governance_ref=revision.knowledge_id,
+                governance_revision=revision.revision,
+                inference_version=f"{revision.policy_id}:{revision.policy_version}",
+                review_state=review_state,
+                tenant_id=revision.tenant_id,
+                connection=connection,
+                replace_existing=True,
+                increment_use_count=False,
+            )
 
     def _signal_metric_patterns(self, revision: KnowledgeRevision) -> list[str]:
-        """Recover resolver-exact patterns from immutable candidate payloads."""
-        patterns: set[str] = set()
-        for candidate_id in revision.promoted_from_candidate_refs:
-            candidate = self.repository.get_candidate(candidate_id, revision.tenant_id)
-            if candidate is None:
-                continue
-            for field in ("metric_pattern", "candidate_metric", "metric"):
-                value = str(candidate.typed_payload.get(field) or "").strip()
-                if value:
-                    patterns.add(value)
-                    break
-        if not patterns:
-            fallback = revision.proposition.object_ref.removeprefix("concept:").strip()
-            if fallback:
-                patterns.add(fallback)
-        return sorted(patterns)
+        """Read resolver-exact patterns frozen into the immutable revision."""
+        return sorted(
+            {
+                str(mapping.get("metric_pattern") or "").strip()
+                for mapping in revision.resolver_payload.get("mappings", [])
+                if str(mapping.get("metric_pattern") or "").strip()
+            }
+        )
 
     def _signal_mapping_payload_values(self, revision: KnowledgeRevision, field: str) -> list[str]:
         values: set[str] = set()
-        for candidate_id in revision.promoted_from_candidate_refs:
-            candidate = self.repository.get_candidate(candidate_id, revision.tenant_id)
-            if candidate is None:
-                continue
-            raw_values = candidate.typed_payload.get(field, [])
+        for mapping in revision.resolver_payload.get("mappings", []):
+            raw_values = mapping.get(field, [])
             if isinstance(raw_values, list):
                 values.update(str(value).strip() for value in raw_values if str(value).strip())
         return sorted(values)
 
     def _signal_mapping_confidence(self, revision: KnowledgeRevision, metric_pattern: str) -> float:
-        confidences: list[float] = []
-        for candidate_id in revision.promoted_from_candidate_refs:
-            candidate = self.repository.get_candidate(candidate_id, revision.tenant_id)
-            if candidate is None:
-                continue
-            exact_pattern = str(
-                candidate.typed_payload.get("metric_pattern")
-                or candidate.typed_payload.get("candidate_metric")
-                or candidate.typed_payload.get("metric")
-                or ""
-            ).strip()
-            if exact_pattern != metric_pattern:
+        confidences = []
+        for mapping in revision.resolver_payload.get("mappings", []):
+            if str(mapping.get("metric_pattern") or "").strip() != metric_pattern:
                 continue
             try:
-                confidence = float(candidate.typed_payload.get("confidence", 0.5))
+                confidence = float(mapping.get("confidence", 0.5))
             except (TypeError, ValueError):
                 confidence = 0.5
             confidences.append(max(0.0, min(1.0, confidence)))
         return max(confidences, default=0.5)
+
+    @staticmethod
+    def _build_signal_mapping_resolver_payload(
+        candidate: KnowledgeCandidate,
+        contributors: list[KnowledgeCandidate],
+    ) -> dict[str, Any]:
+        """Freeze exact resolver inputs so revisions never depend on mutable candidates."""
+        mappings: dict[str, dict[str, Any]] = {}
+        for contributor in contributors or [candidate]:
+            pattern = (
+                str(
+                    contributor.typed_payload.get("metric_pattern")
+                    or contributor.typed_payload.get("candidate_metric")
+                    or contributor.typed_payload.get("metric")
+                    or contributor.typed_payload.get("object_ref")
+                    or contributor.proposition.object_ref
+                    or ""
+                )
+                .removeprefix("concept:")
+                .strip()
+            )
+            if not pattern:
+                continue
+            try:
+                confidence = float(contributor.typed_payload.get("confidence", 0.5))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            confidence = max(0.0, min(1.0, confidence))
+            datasource_types = contributor.typed_payload.get("context_datasource_types", [])
+            if not isinstance(datasource_types, list):
+                datasource_types = []
+            existing = mappings.setdefault(
+                pattern,
+                {
+                    "metric_pattern": pattern,
+                    "confidence": confidence,
+                    "context_datasource_types": [],
+                },
+            )
+            existing["confidence"] = max(float(existing["confidence"]), confidence)
+            existing["context_datasource_types"] = sorted(
+                {
+                    *existing["context_datasource_types"],
+                    *[str(value).strip() for value in datasource_types if str(value).strip()],
+                }
+            )
+        return {"mappings": [mappings[key] for key in sorted(mappings)]}
 
     @staticmethod
     def _resolver_scope_values(refs: list[str], prefix: str) -> list[str]:
@@ -1501,7 +1894,8 @@ class KnowledgeService:
         }
         return sorted(values)
 
-    def impact(self, knowledge_id: str, tenant_id: str = "default") -> KnowledgeImpact:
+    def impact(self, knowledge_id: str, tenant_id: str | None = None) -> KnowledgeImpact:
+        tenant_id = self._resolve_tenant(tenant_id)
         usage = self.repository.list_usage(tenant_id=tenant_id, knowledge_id=knowledge_id)
         seen = set()
         affected = []
@@ -1515,7 +1909,8 @@ class KnowledgeService:
             affected.append({"investigation_id": key[0], "revision": key[1]})
         return KnowledgeImpact(knowledge_ref=knowledge_id, affected_investigations=affected)
 
-    def explain(self, knowledge_id: str, tenant_id: str = "default") -> dict[str, Any]:
+    def explain(self, knowledge_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+        tenant_id = self._resolve_tenant(tenant_id)
         item = self.repository.get_knowledge_item(knowledge_id, tenant_id)
         if item is None:
             raise ValueError("knowledge item not found")
@@ -1556,6 +1951,16 @@ class KnowledgeService:
         if candidate is None:
             raise ValueError("knowledge candidate not found")
         return candidate
+
+    def _require_candidate_workflow(
+        self,
+        candidate_id: str,
+        tenant_id: str,
+        correction_id: str | None,
+    ) -> None:
+        correction = self.repository.get_correction_for_candidate(candidate_id, tenant_id)
+        if correction is not None and correction.id != correction_id:
+            raise PermissionError("correction candidates must be reviewed through the correction workflow")
 
     @staticmethod
     def _is_entity_resolution_repair(
@@ -1675,6 +2080,29 @@ class KnowledgeService:
             raise ValueError("entity_mapping correction requires raw_value and entity_ref")
         return raw_value, entity_ref
 
+    @classmethod
+    def _entity_mapping_alias(cls, correction: KnowledgeCorrection) -> EntityAlias:
+        raw_value, entity_ref = cls._entity_mapping_values(correction.proposed)
+        return EntityAlias(
+            id=_id(
+                "alias",
+                [
+                    correction.tenant_id,
+                    normalize_entity(raw_value),
+                    entity_ref,
+                    correction.scope.model_dump(mode="json"),
+                ],
+            ),
+            tenant_id=correction.tenant_id,
+            raw_value=raw_value,
+            normalized_value=normalize_entity(raw_value),
+            entity_ref=entity_ref,
+            scope=correction.scope,
+            method=EntityBindingMethod.HUMAN_CORRECTION,
+            review_state=ReviewState.APPROVED,
+            provenance_refs=[f"prov_{correction.id}"],
+        )
+
     @staticmethod
     def _score_delta(revision: KnowledgeRevision) -> float:
         return (
@@ -1748,4 +2176,4 @@ class KnowledgeService:
 
 
 def get_knowledge_service() -> KnowledgeService:
-    return KnowledgeService(get_knowledge_repository())
+    return KnowledgeService(get_knowledge_repository(), runtime_settings=settings)

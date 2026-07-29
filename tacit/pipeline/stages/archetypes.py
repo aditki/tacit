@@ -26,6 +26,12 @@ from tacit.archetypes.templates import (
     get_archetypes_by_learning_context,
 )
 from tacit.config import Settings
+from tacit.knowledge.usage import (
+    KnowledgeRevisionRef,
+    KnowledgeStageUse,
+    KnowledgeUsageEffect,
+    KnowledgeUsageStage,
+)
 from tacit.logging import stage_log
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
 
@@ -40,6 +46,7 @@ class ArchetypeSelection:
     unexpected_cross_service_matches: int
     retrieval_mode: ArchetypeRetrievalMode
     target_language: str
+    knowledge_stage_uses: tuple[KnowledgeStageUse, ...] = ()
 
     @property
     def retrieval_reason_code(self) -> str:
@@ -61,10 +68,26 @@ class ArchetypeCompilation:
     def applied_knowledge_refs(self) -> frozenset[str]:
         return frozenset(use.knowledge_ref for use in self.knowledge_query_uses)
 
+    @property
+    def applied_knowledge_revision_refs(self) -> frozenset[KnowledgeRevisionRef]:
+        return frozenset(
+            KnowledgeRevisionRef(use.knowledge_ref, use.knowledge_revision)
+            for use in self.knowledge_query_uses
+            if use.knowledge_revision > 0
+        )
+
     def surviving_knowledge_refs(self, dashboard_spec: DashboardSpec) -> frozenset[str]:
         surviving_query_ids = dashboard_query_identities(dashboard_spec)
         return frozenset(
             use.knowledge_ref for use in self.knowledge_query_uses if use.query_identity() in surviving_query_ids
+        )
+
+    def surviving_knowledge_revision_refs(self, dashboard_spec: DashboardSpec) -> frozenset[KnowledgeRevisionRef]:
+        surviving_query_ids = dashboard_query_identities(dashboard_spec)
+        return frozenset(
+            KnowledgeRevisionRef(use.knowledge_ref, use.knowledge_revision)
+            for use in self.knowledge_query_uses
+            if use.knowledge_revision > 0 and use.query_identity() in surviving_query_ids
         )
 
 
@@ -80,19 +103,48 @@ def select_archetypes(
     archetype_kind: str = "investigation_dashboard",
     signal_store: Any | None = None,
     knowledge_scope: Any | None = None,
+    confirmed_keywords: list[str] | None = None,
 ) -> ArchetypeSelection:
     """Select authoritative curated archetypes and discover shadow-only generated candidates."""
-    ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
-    ranked_ids = {arch.id for arch, _ in ranked_archetypes}
-    learned_archetypes = get_archetypes_by_learning_context(
-        intent,
-        metric_catalog,
-        min_confidence=0.35,
-        exclude_ids=ranked_ids,
-    )
-    if learned_archetypes:
-        ranked_archetypes.extend(learned_archetypes)
-        ranked_archetypes.sort(key=lambda item: item[1], reverse=True)
+
+    def retrieve(candidate_intent: Intent) -> tuple[list[tuple[Any, float]], list[tuple[Any, float]]]:
+        candidates = get_archetypes_by_confidence(candidate_intent.archetypes, min_confidence=0.3)
+        ranked_ids = {arch.id for arch, _ in candidates}
+        learned = get_archetypes_by_learning_context(
+            candidate_intent,
+            metric_catalog,
+            min_confidence=0.35,
+            exclude_ids=ranked_ids,
+        )
+        if learned:
+            candidates.extend(learned)
+            candidates.sort(key=lambda item: item[1], reverse=True)
+        if not candidates:
+            legacy = get_archetype(candidate_intent.problem_type)
+            if legacy is not None:
+                candidates = [(legacy, 0.9)]
+        return candidates, learned
+
+    def coverage_rank(
+        candidates: list[tuple[Any, float]],
+        stage_uses: list[KnowledgeStageUse] | None = None,
+    ) -> list[tuple[Any, float]]:
+        if not candidates:
+            return candidates
+        return rank_archetypes_by_coverage(
+            candidates,
+            catalog_for_compile,
+            target_language=target_language,
+            services=intent.services,
+            max_archetypes=settings.max_blended_archetypes,
+            min_secondary_coverage=settings.min_secondary_coverage,
+            signal_store=signal_store,
+            tenant_id=tenant_id or "default",
+            knowledge_scope=knowledge_scope,
+            knowledge_stage_uses=stage_uses,
+        )
+
+    ranked_archetypes, learned_archetypes = retrieve(intent)
 
     retrieval_mode = ArchetypeRetrievalMode(
         getattr(settings, "learned_archetypes_retrieval_mode", ArchetypeRetrievalMode.CURATED_ONLY)
@@ -127,23 +179,44 @@ def select_archetypes(
             archetype.service_refs != exact_query.service_refs for archetype, _ in shadow_archetypes
         )
 
-    if not ranked_archetypes:
-        legacy = get_archetype(intent.problem_type)
-        if legacy is not None:
-            ranked_archetypes = [(legacy, 0.9)]
+    knowledge_stage_uses: list[KnowledgeStageUse] = []
+    ranked_archetypes = coverage_rank(ranked_archetypes, knowledge_stage_uses)
 
-    if ranked_archetypes:
-        ranked_archetypes = rank_archetypes_by_coverage(
-            ranked_archetypes,
-            catalog_for_compile,
-            target_language=target_language,
-            services=intent.services,
-            max_archetypes=settings.max_blended_archetypes,
-            min_secondary_coverage=settings.min_secondary_coverage,
-            signal_store=signal_store,
-            tenant_id=tenant_id or "default",
-            knowledge_scope=knowledge_scope,
+    refs_by_keyword: dict[str, frozenset[KnowledgeRevisionRef]] = getattr(
+        confirmed_keywords,
+        "revision_refs_by_keyword",
+        {},
+    )
+    added_keywords: frozenset[str] = getattr(confirmed_keywords, "added_keywords", frozenset())
+    selected_positions = {archetype.id: index for index, (archetype, _) in enumerate(ranked_archetypes)}
+    discovery_refs = {revision_ref for refs in refs_by_keyword.values() for revision_ref in refs}
+    for revision_ref in sorted(discovery_refs):
+        attributable_keywords = {
+            keyword for keyword, refs in refs_by_keyword.items() if keyword in added_keywords and revision_ref in refs
+        }
+        if not attributable_keywords:
+            continue
+        counterfactual_intent = intent.model_copy(
+            update={
+                "keywords": [keyword for keyword in intent.keywords if keyword not in attributable_keywords],
+            }
         )
+        counterfactual_candidates, _ = retrieve(counterfactual_intent)
+        counterfactual_ranked = coverage_rank(counterfactual_candidates)
+        counterfactual_positions = {archetype.id: index for index, (archetype, _) in enumerate(counterfactual_ranked)}
+        for archetype_id, selected_position in selected_positions.items():
+            if counterfactual_positions.get(archetype_id) == selected_position:
+                continue
+            use = KnowledgeStageUse(
+                revision_ref=revision_ref,
+                stage=KnowledgeUsageStage.ARCHETYPE_SELECTION,
+                effect=KnowledgeUsageEffect.ARCHETYPE_SELECTED_BY_LIVE_COVERAGE,
+                target_ref=f"archetype:{archetype_id}",
+            )
+            if use not in knowledge_stage_uses:
+                knowledge_stage_uses.append(use)
+
+    applied_stage_refs = {use.revision_ref for use in knowledge_stage_uses}
 
     return ArchetypeSelection(
         ranked_archetypes=ranked_archetypes,
@@ -152,13 +225,14 @@ def select_archetypes(
         experimental_retrieval=experimental_retrieval,
         context_sources={
             "curated_archetypes": len(ranked_archetypes),
-            "operational_knowledge_items": 0,
+            "operational_knowledge_items": len(applied_stage_refs),
             "generated_archetypes": 0,
             "shadow_generated_archetypes": len(shadow_archetypes),
         },
         unexpected_cross_service_matches=unexpected_cross_service_matches,
         retrieval_mode=retrieval_mode,
         target_language=target_language,
+        knowledge_stage_uses=tuple(knowledge_stage_uses),
     )
 
 

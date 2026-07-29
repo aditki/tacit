@@ -10,10 +10,32 @@ import structlog
 
 from tacit.backends.base import DashboardBackend
 from tacit.catalog import catalog_for_services
+from tacit.knowledge.usage import KnowledgeRevisionRef
 from tacit.models.schemas import Intent, MetricEntry
 from tacit.signals.availability import resolve_signal_store
 
 logger = structlog.get_logger()
+
+
+class ConfirmedKeywords(list[str]):
+    """Confirmed keywords with the exact governed mappings that confirmed them.
+
+    This remains list-compatible for the existing discovery-stage boundary while
+    retaining immutable attribution until archetype routing can prove an effect.
+    """
+
+    def __init__(
+        self,
+        values: Iterable[str] = (),
+        *,
+        revision_refs_by_keyword: dict[str, set[KnowledgeRevisionRef]] | None = None,
+        added_keywords: Iterable[str] = (),
+    ) -> None:
+        super().__init__(values)
+        self.revision_refs_by_keyword = {
+            keyword: frozenset(refs) for keyword, refs in (revision_refs_by_keyword or {}).items() if refs
+        }
+        self.added_keywords = frozenset(added_keywords)
 
 
 @dataclass
@@ -138,7 +160,7 @@ def confirm_colloquial_keywords(
     signal_store: Any | None = None,
     tenant_id: str = "default",
     knowledge_scope: Any | None = None,
-) -> list[str]:
+) -> ConfirmedKeywords:
     """Promote low-confidence colloquial evidence only after live signal coverage.
 
     A metaphor implying "cache" becomes a real keyword only if a cache signal
@@ -146,24 +168,25 @@ def confirm_colloquial_keywords(
     store instead of a global substring match.
     """
     if not intent.keyword_evidence or not metric_catalog:
-        return []
+        return ConfirmedKeywords()
 
     try:
-        from tacit.agents.synonyms import SynonymEvidence, confirm_colloquial
+        from tacit.agents.synonyms import KEYWORD_SIGNALS, SynonymEvidence, confirm_colloquial
         from tacit.archetypes.engine import _datasource_type_for_language
         from tacit.signals import get_signal_store
 
         signal_store = resolve_signal_store(signal_store, get_signal_store)
         if signal_store is None:
-            return []
+            return ConfirmedKeywords()
         resolve_cache: dict[str, bool] = {}
+        revision_ref_by_signal: dict[str, KnowledgeRevisionRef] = {}
         confirmation_catalog = catalog_for_services(metric_catalog, intent.services)
         context_service = intent.services[0] if intent.services else ""
 
         def signal_resolves(sig: str) -> bool:
             if sig not in resolve_cache:
                 try:
-                    hits = signal_store.resolve_signal(
+                    hits = signal_store.resolve_signal_details(
                         sig,
                         confirmation_catalog,
                         context_service=context_service,
@@ -173,6 +196,8 @@ def confirm_colloquial_keywords(
                         knowledge_scope=knowledge_scope,
                     )
                     resolve_cache[sig] = bool(hits)
+                    if hits and hits[0].knowledge_revision_ref is not None:
+                        revision_ref_by_signal[sig] = hits[0].knowledge_revision_ref
                 except Exception:
                     resolve_cache[sig] = False
             return resolve_cache[sig]
@@ -187,10 +212,24 @@ def confirm_colloquial_keywords(
             for e in intent.keyword_evidence
         ]
         confirmed = confirm_colloquial(evidence, signal_resolves)
+        added_keywords: list[str] = []
         for kw in confirmed:
             if kw not in intent.keywords:
                 intent.keywords.append(kw)
-        return confirmed
+                added_keywords.append(kw)
+        revision_refs_by_keyword = {
+            keyword: {
+                revision_ref_by_signal[signal]
+                for signal in KEYWORD_SIGNALS.get(keyword, ())
+                if signal in revision_ref_by_signal
+            }
+            for keyword in confirmed
+        }
+        return ConfirmedKeywords(
+            confirmed,
+            revision_refs_by_keyword=revision_refs_by_keyword,
+            added_keywords=added_keywords,
+        )
     except Exception:
         logger.warning("colloquial_confirmation_failed", exc_info=True)
-        return []
+        return ConfirmedKeywords()

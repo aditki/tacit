@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     source_refs         TEXT NOT NULL DEFAULT '[]',
     -- Stable Operational Knowledge identity. Empty for legacy/non-governed rows.
     governance_ref      TEXT NOT NULL DEFAULT '',
+    governance_revision INTEGER NOT NULL DEFAULT 0,
     -- Which inference ruleset produced this (for invalidate/replay).
     inference_version   TEXT NOT NULL DEFAULT '',
     -- Lifecycle: heuristic mappings start 'candidate' → 'approved' → 'trusted';
@@ -259,6 +260,23 @@ CREATE TABLE IF NOT EXISTS signal_mapping_candidates (
 CREATE INDEX IF NOT EXISTS idx_smm_signal ON signal_metric_mappings(signal_type);
 CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern);
 CREATE INDEX IF NOT EXISTS idx_ingested_alert_uid_backend ON ingested_alerts(alert_uid, backend_name);
+
+CREATE TABLE IF NOT EXISTS signal_tenant_migration_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS signal_migration_quarantine (
+    source_table       TEXT NOT NULL,
+    source_row_key     TEXT NOT NULL,
+    original_tenant_id TEXT NOT NULL,
+    target_tenant_id   TEXT NOT NULL,
+    reason             TEXT NOT NULL,
+    payload_json       TEXT NOT NULL,
+    quarantined_at     REAL NOT NULL,
+    PRIMARY KEY (source_table, source_row_key, reason)
+);
 """
 
 FTS_SCHEMA_SQL = """

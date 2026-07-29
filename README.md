@@ -277,6 +277,17 @@ API_AUTH_ENABLED=true
 API_AUTH_KEY=<strong-token>
 ```
 
+For a wildcard multi-tenant runtime, bind each API key to one tenant and send
+that tenant in `X-Tacit-Tenant`:
+
+```bash
+KNOWLEDGE_TENANT_ID=*
+KNOWLEDGE_TENANT_API_KEYS='{"tenant-a":"strong-key-a","tenant-b":"strong-key-b"}'
+```
+
+Chart request bodies cannot select a different tenant from the authenticated
+`X-Tacit-Tenant` boundary.
+
 ## Slack
 
 Tacit can run as a Slack bot through Socket Mode. Mention it in a channel or use

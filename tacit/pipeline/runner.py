@@ -251,7 +251,16 @@ async def _run_pipeline_inner(
     t_start = time.monotonic()
     timings: dict[str, float] = {}
     history = deps.history_store_factory()
+    current_contract = None
     if investigation_id:
+        if not hasattr(history, "get_contract"):
+            raise ValueError("existing investigations require a tenant-aware history store")
+        current_contract = history.get_contract(
+            investigation_id,
+            tenant_id=request.tenant_id,
+        )
+        if current_contract is None:
+            raise ValueError("investigation not found for the selected tenant")
         inv_id = investigation_id
     elif "tenant_id" in inspect.signature(history.start).parameters:
         inv_id = history.start(
@@ -262,9 +271,8 @@ async def _run_pipeline_inner(
         )
     else:
         inv_id = history.start(request.prompt, request.user_id or "", request.channel_id or "")
-    if base_revision is None and investigation_id and hasattr(history, "get_contract"):
-        current_contract = history.get_contract(investigation_id)
-        base_revision = current_contract.investigation.revision if current_contract else None
+    if base_revision is None and current_contract is not None:
+        base_revision = current_contract.investigation.revision
     run_id = None
     if hasattr(history, "start_run"):
         try:
@@ -358,7 +366,16 @@ async def _run_pipeline_inner(
         catalog_for_compile = catalog_discovery.catalog_for_compile
         confirmed_keywords = discovery_stage.confirmed_keywords
         if confirmed_keywords:
-            logger.info("colloquial_evidence_confirmed", keywords=confirmed_keywords)
+            confirmed_revision_refs = {
+                revision_ref
+                for refs in getattr(confirmed_keywords, "revision_refs_by_keyword", {}).values()
+                for revision_ref in refs
+            }
+            logger.info(
+                "colloquial_evidence_confirmed",
+                keywords=confirmed_keywords,
+                governed_revision_count=len(confirmed_revision_refs),
+            )
 
         if not catalog_for_compile:
             return handle_empty_catalog(
@@ -383,6 +400,7 @@ async def _run_pipeline_inner(
             signal_store=signal_store,
             tenant_id=request.tenant_id,
             knowledge_scope=knowledge_scope,
+            confirmed_keywords=confirmed_keywords,
         )
         ranked_archetypes = selection.ranked_archetypes
         learned_archetypes = selection.learned_archetypes
@@ -537,8 +555,14 @@ async def _run_pipeline_inner(
             tenant_id = request.tenant_id or getattr(runtime_settings, "knowledge_tenant_id", "default")
             knowledge_service = resolve_knowledge_service(deps, signal_store=signal_store)
             knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(knowledge_scope)
+            knowledge_usage = knowledge_service.apply_stage_usage(
+                knowledge_usage,
+                selection.knowledge_stage_uses,
+            )
             surviving_compilation_refs = (
-                compilation.surviving_knowledge_refs(dashboard_spec) if compilation is not None else frozenset()
+                compilation.surviving_knowledge_revision_refs(dashboard_spec)
+                if compilation is not None
+                else frozenset()
             )
             knowledge_usage = knowledge_service.apply_compilation_usage(
                 knowledge_usage,
@@ -549,29 +573,43 @@ async def _run_pipeline_inner(
                 for observation in validation_result.evidence_observations
                 if observation.valid_query and observation.survived
             }
-            surviving_evidence_refs = set(validation_result.applied_knowledge_refs)
+            surviving_evidence_refs = set(validation_result.applied_knowledge_revision_refs)
+            surviving_evidence_refs_by_requirement = {
+                requirement_id: set(refs)
+                for requirement_id, refs in (validation_result.knowledge_revision_refs_by_requirement or {}).items()
+            }
             for requirement_id in surviving_requirement_ids:
-                surviving_evidence_refs.update(
-                    evidence_stage.knowledge_refs_by_requirement.get(requirement_id, frozenset())
+                requirement_refs = set(
+                    evidence_stage.knowledge_revision_refs_by_requirement.get(requirement_id, frozenset())
                 )
+                surviving_evidence_refs.update(requirement_refs)
+                if requirement_refs:
+                    surviving_evidence_refs_by_requirement.setdefault(requirement_id, set()).update(requirement_refs)
             knowledge_usage = knowledge_service.apply_evidence_usage(
                 knowledge_usage,
                 surviving_evidence_refs,
+                surviving_evidence_refs_by_requirement,
             )
             if evidence_stage.applied_knowledge_refs or validation_result.applied_knowledge_refs:
                 logger.info(
                     "governed_evidence_usage_reconciled",
                     selected_knowledge_refs=sorted(evidence_stage.applied_knowledge_refs),
                     rescue_knowledge_refs=sorted(validation_result.applied_knowledge_refs),
-                    surviving_knowledge_refs=sorted(surviving_evidence_refs),
+                    surviving_knowledge_refs=[
+                        f"{ref.knowledge_ref}@{ref.knowledge_revision}" for ref in sorted(surviving_evidence_refs)
+                    ],
                 )
             if compilation is not None and compilation.applied_knowledge_refs:
                 logger.info(
                     "governed_compilation_usage_reconciled",
                     selected_knowledge_refs=sorted(compilation.applied_knowledge_refs),
-                    surviving_knowledge_refs=sorted(surviving_compilation_refs),
+                    surviving_knowledge_refs=[
+                        f"{ref.knowledge_ref}@{ref.knowledge_revision}" for ref in sorted(surviving_compilation_refs)
+                    ],
                     dropped_knowledge_refs=sorted(
-                        compilation.applied_knowledge_refs.difference(surviving_compilation_refs)
+                        compilation.applied_knowledge_refs.difference(
+                            {ref.knowledge_ref for ref in surviving_compilation_refs}
+                        )
                     ),
                 )
             knowledge_usage = knowledge_service.reconcile_live_observations(
@@ -586,6 +624,7 @@ async def _run_pipeline_inner(
         except Exception as exc:
             logger.warning("operational_knowledge_selection_failed", exc_info=True)
             governed_stage_refs = set(validation_result.applied_knowledge_refs)
+            governed_stage_refs.update(use.knowledge_ref for use in selection.knowledge_stage_uses)
             for requirement_id, refs in evidence_stage.knowledge_refs_by_requirement.items():
                 if requirement_id in {
                     observation.requirement_id

@@ -68,7 +68,7 @@ def _contract_text(response, contract) -> str:
     )
 
 
-def _load_contract(deps: PipelineDependencies | None, response):
+def _load_contract(deps: PipelineDependencies | None, response, *, tenant_id: str):
     if not response.investigation_id:
         return None
     try:
@@ -78,7 +78,11 @@ def _load_contract(deps: PipelineDependencies | None, response):
             from tacit.history import get_investigation_store
 
             store = get_investigation_store()
-        return store.get_contract(response.investigation_id, response.investigation_revision)
+        return store.get_contract(
+            response.investigation_id,
+            response.investigation_revision,
+            tenant_id=tenant_id,
+        )
     except Exception:
         logger.warning("slack_contract_load_failed", investigation_id=response.investigation_id, exc_info=True)
         return None
@@ -118,7 +122,7 @@ async def handle_mention(
             tenant_id=_tenant_for_slack(event, deps),
         )
         response = await run_pipeline(request, deps)
-        contract_text = _contract_text(response, _load_contract(deps, response))
+        contract_text = _contract_text(response, _load_contract(deps, response, tenant_id=request.tenant_id))
 
         if response.dashboard_url:
             blocks = [
@@ -172,7 +176,7 @@ async def handle_slash_command(
             tenant_id=_tenant_for_slack(command, deps),
         )
         response = await run_pipeline(request, deps)
-        contract_text = _contract_text(response, _load_contract(deps, response))
+        contract_text = _contract_text(response, _load_contract(deps, response, tenant_id=request.tenant_id))
 
         if response.dashboard_url:
             blocks = [

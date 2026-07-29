@@ -192,6 +192,31 @@ def test_grafana_alert_threshold_details_change_condition_for_fingerprint():
 
 
 @pytest.mark.asyncio
+async def test_direct_alert_auto_approval_requires_teach_permissions():
+    from tacit.config import Settings
+
+    features = AlertFeatures(
+        alert_uid="protected-alert",
+        alert_title="Protected alert",
+        backend_name="grafana",
+        query_language="promql",
+        condition="A > 1",
+        metrics_found=["protected_metric"],
+    )
+
+    with pytest.raises(PermissionError, match="knowledge.review"):
+        await ingest_alert_features(
+            features,
+            auto_approve=True,
+            store=object(),
+            runtime_settings=Settings(
+                _env_file=None,
+                knowledge_permissions="knowledge.read",
+            ),
+        )
+
+
+@pytest.mark.asyncio
 async def test_grafana_backend_resolves_datasource_uid_for_managed_alerts():
     class FakeGrafanaClient:
         base_url = "http://grafana.example"

@@ -185,8 +185,9 @@ class Settings(BaseSettings):
     api_auth_enabled: bool = False  # set True to require API key
     api_auth_key: str = Field(default="", repr=False)
     knowledge_tenant_id: str = "default"
+    knowledge_tenant_api_keys: dict[str, str] = Field(default_factory=dict, repr=False)
     knowledge_permissions: str = (
-        "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.correct,knowledge.export,"
+        "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.correct,knowledge.apply,knowledge.export,"
         "knowledge.override"
     )
 

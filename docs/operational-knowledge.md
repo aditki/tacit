@@ -27,10 +27,14 @@ tacit knowledge review <candidate-id> --reject --reviewer <actor>
 
 Trust is a separate privileged action using `--trust`. The web workspace contains the same focused review
 queue. REST clients use `/api/v1/knowledge`; configured permissions are `knowledge.read`, `knowledge.review`,
-`knowledge.trust`, `knowledge.reject`, `knowledge.correct`, `knowledge.export`, and `knowledge.override`.
+`knowledge.trust`, `knowledge.reject`, `knowledge.correct`, `knowledge.apply`, `knowledge.export`, and
+`knowledge.override`.
 The override permission is required to assert authoritative-source or live-verification policy inputs during
 review, including authoritative correction reviews. When `knowledge_tenant_id` is `*`, artifact-learning CLI
 commands require `--tenant <tenant-id>` so governed candidates cannot be written to a wildcard scope.
+HTTP wildcard deployments must also configure `knowledge_tenant_api_keys` as a tenant-to-key map. The
+`X-Tacit-Tenant` header selects the tenant bound to that key; a shared `api_auth_key` is not accepted as a
+cross-tenant credential, and chart body fields cannot override the authenticated tenant.
 
 ## Evaluation
 

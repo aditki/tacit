@@ -6,11 +6,11 @@ import asyncio
 import json
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from tacit.api.dependencies import get_pipeline_dependencies
-from tacit.api.security import resolve_knowledge_tenant, sanitize_prompt, verify_api_key
+from tacit.api.security import knowledge_tenant, resolve_knowledge_tenant, sanitize_prompt, verify_api_key
 from tacit.dependencies import PipelineDependencies
 from tacit.models.schemas import DashRequest, DashResponse
 from tacit.pipeline import run_pipeline
@@ -20,11 +20,13 @@ logger = structlog.get_logger()
 router = APIRouter()
 
 
-def _configured_tenant(request: DashRequest, deps: PipelineDependencies) -> str:
-    return resolve_knowledge_tenant(
-        getattr(deps.settings, "knowledge_tenant_id", "default"),
-        request.tenant_id,
-    )
+def _configured_tenant(request: DashRequest, http_request: Request, deps: PipelineDependencies) -> str:
+    selected_tenant = knowledge_tenant(http_request)
+    configured_tenant = getattr(deps.settings, "knowledge_tenant_id", "default")
+    resolved_tenant = resolve_knowledge_tenant(configured_tenant, selected_tenant)
+    if request.tenant_id and request.tenant_id != resolved_tenant:
+        raise HTTPException(status_code=403, detail="Tenant access denied")
+    return resolved_tenant
 
 
 @router.post(
@@ -37,11 +39,15 @@ def _configured_tenant(request: DashRequest, deps: PipelineDependencies) -> str:
 )
 async def create_chart(
     request: DashRequest,
+    http_request: Request,
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     """Generate a Grafana dashboard from a natural-language prompt."""
     request = request.model_copy(
-        update={"prompt": sanitize_prompt(request.prompt), "tenant_id": _configured_tenant(request, deps)}
+        update={
+            "prompt": sanitize_prompt(request.prompt),
+            "tenant_id": _configured_tenant(request, http_request, deps),
+        }
     )
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
@@ -66,6 +72,7 @@ def _sse_frame(event: str, data: dict) -> str:
 )
 async def create_chart_stream(
     request: DashRequest,
+    http_request: Request,
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     """Stream pipeline progress as Server-Sent Events.
@@ -75,7 +82,10 @@ async def create_chart_stream(
     `result` event containing the standard DashResponse JSON.
     """
     request = request.model_copy(
-        update={"prompt": sanitize_prompt(request.prompt), "tenant_id": _configured_tenant(request, deps)}
+        update={
+            "prompt": sanitize_prompt(request.prompt),
+            "tenant_id": _configured_tenant(request, http_request, deps),
+        }
     )
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")

@@ -322,6 +322,7 @@ class KnowledgeRevision(BaseModel):
     decision_ref: str
     promoted_from_candidate_refs: list[str] = Field(default_factory=list)
     provenance_refs: list[str] = Field(default_factory=list)
+    resolver_payload: dict[str, Any] = Field(default_factory=dict)
     revision_reason: str = "promoted"
     semantic_fingerprint: str
     created_at: datetime = Field(default_factory=utc_now)
@@ -392,6 +393,9 @@ class KnowledgeCorrection(BaseModel):
     created_by: str
     created_at: datetime = Field(default_factory=utc_now)
     knowledge_candidate_ref: str = ""
+    applied_knowledge_ref: str = ""
+    applied_knowledge_revision: int | None = Field(default=None, ge=1)
+    applied_alias_ref: str = ""
 
     @model_validator(mode="after")
     def validate_correction_tenant(self) -> KnowledgeCorrection:
@@ -399,6 +403,8 @@ class KnowledgeCorrection(BaseModel):
             raise ValueError("knowledge correction tenant and scope tenant must match")
         if not self.target_ref and self.target_revision is not None:
             raise ValueError("target_revision requires target_ref")
+        if bool(self.applied_knowledge_ref) != (self.applied_knowledge_revision is not None):
+            raise ValueError("applied knowledge reference and revision must be recorded together")
         return self
 
 

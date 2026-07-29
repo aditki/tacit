@@ -52,6 +52,7 @@ from tacit.investigation_replay import (
     CounterfactualChanges,
     InvestigationReplaySnapshot,
     ReplayMode,
+    apply_counterfactual,
 )
 from tacit.knowledge.enums import KnowledgeUsageDisposition
 from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
@@ -448,7 +449,7 @@ def test_chart_route_uses_configured_tenant_when_request_omits_it(monkeypatch):
     assert captured["request"].tenant_id == "tenant-a"
 
 
-def test_chart_route_allows_body_tenant_for_wildcard_configuration(monkeypatch):
+def test_chart_route_requires_header_tenant_for_wildcard_configuration(monkeypatch):
     captured: dict[str, DashRequest] = {}
 
     async def fake_run_pipeline(request: DashRequest, deps):
@@ -464,13 +465,25 @@ def test_chart_route_allows_body_tenant_for_wildcard_configuration(monkeypatch):
     )
     client = TestClient(app)
 
-    response = client.post(
+    body_only = client.post(
         "/api/v1/chart",
         json={"prompt": "Investigate checkout latency", "tenant_id": "tenant-b"},
     )
+    response = client.post(
+        "/api/v1/chart",
+        headers={"X-Tacit-Tenant": "tenant-b"},
+        json={"prompt": "Investigate checkout latency", "tenant_id": "tenant-b"},
+    )
+    mismatch = client.post(
+        "/api/v1/chart",
+        headers={"X-Tacit-Tenant": "tenant-a"},
+        json={"prompt": "Investigate checkout latency", "tenant_id": "tenant-b"},
+    )
 
+    assert body_only.status_code == 400
     assert response.status_code == 200
     assert captured["request"].tenant_id == "tenant-b"
+    assert mismatch.status_code == 403
 
 
 async def test_direct_pipeline_rejects_configured_tenant_mismatch(monkeypatch):
@@ -604,6 +617,40 @@ def test_counterfactual_replay_resorts_candidates_after_score_changes(tmp_path):
     assert replayed.grounding.maximum_trustworthy_conclusion["text"].startswith("cache:shared-cache")
 
 
+def test_counterfactual_score_override_abstains_when_the_new_leader_has_no_runtime_support():
+    ranking = CulpritRanking(
+        abstained=False,
+        telemetry_status="evidenced",
+        candidates=[
+            CulpritCandidate(
+                rank=1,
+                suspect="checkout",
+                suspect_type="service",
+                score=0.8,
+                supporting_requirement_ids=["er_01"],
+            ),
+            CulpritCandidate(
+                rank=2,
+                suspect="shared-cache",
+                suspect_type="cache",
+                score=0.5,
+                supporting_requirement_ids=["er_02"],
+            ),
+        ],
+    )
+    snapshot = _snapshot_for(_draft_contract(culprit_ranking=ranking)).model_copy(update={"culprit_ranking": ranking})
+
+    replayed = apply_counterfactual(
+        snapshot,
+        CounterfactualChanges(candidate_score_overrides={"cache:shared-cache": 0.95}),
+    )
+
+    assert replayed.culprit_ranking.candidates[0].suspect == "shared-cache"
+    assert replayed.culprit_ranking.abstained is True
+    assert replayed.culprit_ranking.abstention_reason == "counterfactual_leading_candidate_unsupported"
+    assert replayed.culprit_ranking.telemetry_status == "evidenced"
+
+
 def test_counterfactual_candidate_removal_downgrades_matching_knowledge_usage(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
@@ -635,6 +682,343 @@ def test_counterfactual_candidate_removal_downgrades_matching_knowledge_usage(tm
     assert usage.used_for == []
     assert usage.score_delta == 0
     assert "counterfactual_candidate_removed" in usage.reason_codes
+
+
+def test_counterfactual_observation_removal_reconciles_candidate_evidence_and_score():
+    snapshot = _snapshot_for(_draft_contract())
+
+    replayed = apply_counterfactual(
+        snapshot,
+        CounterfactualChanges(remove_observation_ids=["obs_01"]),
+    )
+
+    candidate = replayed.culprit_ranking.candidates[0]
+    assert candidate.runtime_evidence == []
+    assert candidate.supporting_requirement_ids == []
+    assert candidate.missing_requirement_ids == ["er_01"]
+    assert candidate.score == pytest.approx(0.31)
+    assert candidate.confidence == "low"
+    assert replayed.culprit_ranking.abstained is True
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        CounterfactualChanges(remove_observation_ids=["obs_01"]),
+        CounterfactualChanges(reject_requirement_ids=["er_01"]),
+    ],
+)
+def test_counterfactual_evidence_removal_downgrades_matching_knowledge_usage(tmp_path, changes):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
+    usage = KnowledgeUsage(
+        tenant_id="",
+        knowledge_ref="knowledge_latency_mapping",
+        knowledge_revision=1,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        used_for=["evidence_resolution"],
+        target_ref="concept:http_request_duration_seconds_bucket",
+        reason_codes=[
+            "signal_mapping_selected_for_evidence",
+            "evidence_requirement:er_01",
+        ],
+    )
+    draft = _draft_contract(investigation_id).model_copy(update={"knowledge_usage": [usage]})
+    snapshot = _snapshot_for(draft).model_copy(update={"knowledge_usage": [usage]})
+    store.persist_contract_revision(draft, snapshot=snapshot)
+
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.COUNTERFACTUAL,
+        changes=changes,
+    )
+
+    assert replayed is not None
+    replayed_usage = replayed.knowledge_usage[0]
+    assert replayed_usage.disposition == KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED
+    assert replayed_usage.used_for == []
+    assert replayed_usage.score_delta == 0
+    assert "counterfactual_evidence_removed" in replayed_usage.reason_codes
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        CounterfactualChanges(remove_observation_ids=["obs_01"]),
+        CounterfactualChanges(reject_requirement_ids=["er_01"]),
+    ],
+)
+def test_counterfactual_evidence_removal_preserves_usage_with_another_linked_requirement(changes):
+    usage = KnowledgeUsage(
+        tenant_id="",
+        knowledge_ref="knowledge_shared_mapping",
+        knowledge_revision=1,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        used_for=["evidence_resolution"],
+        reason_codes=[
+            "signal_mapping_selected_for_evidence",
+            "evidence_requirement:er_01",
+            "evidence_requirement:er_02",
+        ],
+    )
+    snapshot = _snapshot_for(_draft_contract()).model_copy(
+        update={
+            "evidence_observations": [
+                EvidenceObservation(
+                    requirement_id="er_01",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                ),
+                EvidenceObservation(
+                    requirement_id="er_02",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                ),
+            ],
+            "knowledge_usage": [usage],
+        }
+    )
+
+    replayed = apply_counterfactual(snapshot, changes)
+
+    assert replayed.knowledge_usage == [usage]
+
+
+def test_counterfactual_duplicate_observation_removal_preserves_linked_usage():
+    usage = KnowledgeUsage(
+        tenant_id="",
+        knowledge_ref="knowledge_latency_mapping",
+        knowledge_revision=1,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        used_for=["evidence_resolution"],
+        reason_codes=["evidence_requirement:er_01"],
+    )
+    snapshot = _snapshot_for(_draft_contract()).model_copy(
+        update={
+            "evidence_observations": [
+                EvidenceObservation(
+                    requirement_id="er_01",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                ),
+                EvidenceObservation(
+                    requirement_id="er_01",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                ),
+            ],
+            "knowledge_usage": [usage],
+        }
+    )
+
+    replayed = apply_counterfactual(
+        snapshot,
+        CounterfactualChanges(remove_observation_ids=["obs_01"]),
+    )
+
+    assert replayed.knowledge_usage == [usage]
+
+
+@pytest.mark.parametrize(
+    ("observations", "expected_disposition"),
+    [
+        (
+            [
+                EvidenceObservation(
+                    requirement_id="er_01",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                ),
+                EvidenceObservation(
+                    requirement_id="er_02",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                ),
+            ],
+            KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+        ),
+        (
+            [
+                EvidenceObservation(
+                    requirement_id="er_01",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                )
+            ],
+            KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+        ),
+    ],
+)
+def test_counterfactual_unlinked_evidence_usage_fails_closed_without_metric_attribution(
+    observations,
+    expected_disposition,
+):
+    usage = KnowledgeUsage(
+        tenant_id="",
+        knowledge_ref="legacy_knowledge_mapping",
+        knowledge_revision=1,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        used_for=["evidence_resolution"],
+        reason_codes=["legacy_usage_without_requirement_links"],
+    )
+    snapshot = _snapshot_for(_draft_contract()).model_copy(
+        update={"evidence_observations": observations, "knowledge_usage": [usage]}
+    )
+
+    replayed = apply_counterfactual(
+        snapshot,
+        CounterfactualChanges(remove_observation_ids=["obs_01"]),
+    )
+
+    replayed_usage = replayed.knowledge_usage[0]
+    assert replayed_usage.disposition == expected_disposition
+    if expected_disposition == KnowledgeUsageDisposition.APPLIED:
+        assert replayed_usage == usage
+    else:
+        assert replayed_usage.used_for == []
+        assert "counterfactual_evidence_removed" in replayed_usage.reason_codes
+
+
+def test_counterfactual_preserves_evidence_usage_for_a_surviving_valid_empty_query():
+    usage = KnowledgeUsage(
+        tenant_id="",
+        knowledge_ref="knowledge_empty_query_mapping",
+        knowledge_revision=1,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        used_for=["evidence_resolution"],
+        target_ref="concept:checkout_errors_total",
+        reason_codes=["evidence_requirement:er_02"],
+    )
+    snapshot = _snapshot_for(_draft_contract()).model_copy(
+        update={
+            "evidence_observations": [
+                EvidenceObservation(
+                    requirement_id="er_01",
+                    resolution_metric="checkout_latency_seconds",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                ),
+                EvidenceObservation(
+                    requirement_id="er_02",
+                    resolution_metric="checkout_errors_total",
+                    outcome=EvidenceObservationOutcome.MISSING_EVIDENCE,
+                    valid_query=True,
+                    non_empty=False,
+                    survived=True,
+                ),
+            ],
+            "knowledge_usage": [usage],
+        }
+    )
+
+    replayed = apply_counterfactual(
+        snapshot,
+        CounterfactualChanges(remove_observation_ids=["obs_01"]),
+    )
+
+    assert replayed.knowledge_usage == [usage]
+
+
+def test_counterfactual_unlinked_usage_preserves_a_matching_surviving_metric():
+    usage = KnowledgeUsage(
+        tenant_id="",
+        knowledge_ref="legacy_errors_mapping",
+        knowledge_revision=1,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        used_for=["evidence_resolution"],
+        target_ref="concept:checkout_errors_total",
+        reason_codes=["legacy_usage_without_requirement_links"],
+    )
+    snapshot = _snapshot_for(_draft_contract()).model_copy(
+        update={
+            "evidence_observations": [
+                EvidenceObservation(
+                    requirement_id="er_01",
+                    resolution_metric="checkout_latency_seconds",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                ),
+                EvidenceObservation(
+                    requirement_id="er_02",
+                    resolution_metric="checkout_errors_total",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                ),
+            ],
+            "knowledge_usage": [usage],
+        }
+    )
+
+    replayed = apply_counterfactual(
+        snapshot,
+        CounterfactualChanges(remove_observation_ids=["obs_01"]),
+    )
+
+    assert replayed.knowledge_usage == [usage]
+
+
+def test_counterfactual_unlinked_usage_ignores_unrelated_surviving_evidence():
+    usage = KnowledgeUsage(
+        tenant_id="",
+        knowledge_ref="legacy_latency_mapping",
+        knowledge_revision=1,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        used_for=["evidence_resolution"],
+        target_ref="concept:checkout_latency_seconds",
+        reason_codes=["legacy_usage_without_requirement_links"],
+    )
+    snapshot = _snapshot_for(_draft_contract()).model_copy(
+        update={
+            "evidence_observations": [
+                EvidenceObservation(
+                    requirement_id="er_01",
+                    resolution_metric="checkout_latency_seconds",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                ),
+                EvidenceObservation(
+                    requirement_id="er_02",
+                    resolution_metric="checkout_errors_total",
+                    outcome=EvidenceObservationOutcome.SUPPORTED_OBSERVATION,
+                    valid_query=True,
+                    non_empty=True,
+                    survived=True,
+                ),
+            ],
+            "knowledge_usage": [usage],
+        }
+    )
+
+    replayed = apply_counterfactual(
+        snapshot,
+        CounterfactualChanges(remove_observation_ids=["obs_01"]),
+    )
+
+    replayed_usage = replayed.knowledge_usage[0]
+    assert replayed_usage.disposition == KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED
+    assert "counterfactual_evidence_removed" in replayed_usage.reason_codes
 
 
 def test_counterfactual_observation_removal_records_an_explicit_gap(tmp_path):
@@ -877,9 +1261,11 @@ def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, m
             return usage
 
     fake = FakeKnowledgeService()
-    monkeypatch.setattr("tacit.knowledge.service.get_knowledge_service", lambda: fake)
-
-    replayed = store.replay_contract(investigation_id, mode=ReplayMode.CURRENT_ENGINE)
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.CURRENT_ENGINE,
+        knowledge_service_factory=lambda: fake,
+    )
 
     assert fake.seen_score == 0.40
     assert replayed.candidate_rankings[0].score == 0.50
@@ -943,13 +1329,150 @@ def test_current_engine_replay_snapshots_reconciled_knowledge_usage(tmp_path, mo
             return usage
 
     fake = ContradictingKnowledgeService()
-    monkeypatch.setattr("tacit.knowledge.service.get_knowledge_service", lambda: fake)
-
-    replayed = store.replay_contract(investigation_id, mode=ReplayMode.CURRENT_ENGINE)
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.CURRENT_ENGINE,
+        knowledge_service_factory=lambda: fake,
+    )
 
     assert replayed.knowledge_snapshot_ref == "knowledge_snapshot_after_reconciliation"
     assert replayed.knowledge_usage[0].disposition == KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION
     assert fake.persisted is True
+
+
+def test_current_engine_replay_preserves_exact_usage_for_captured_stages(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    historical_usage = KnowledgeUsage(
+        tenant_id="",
+        knowledge_ref="knowledge_latency_mapping",
+        knowledge_revision=1,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        used_for=["query_compilation"],
+        target_ref="concept:http_request_duration_seconds_bucket",
+        reason_codes=["signal_mapping_selected_for_compilation"],
+    )
+    draft = _draft_contract(investigation_id).model_copy(update={"knowledge_usage": [historical_usage]})
+    snapshot = _snapshot_for(draft).model_copy(update={"knowledge_usage": [historical_usage]})
+    store.persist_contract_revision(draft, snapshot=snapshot)
+    captured_usage: list[KnowledgeUsage] = []
+
+    class CurrentKnowledgeService:
+        def create_snapshot(self, scope):
+            current = KnowledgeUsage(
+                tenant_id=scope.tenant_id,
+                knowledge_ref="knowledge_latency_mapping",
+                knowledge_revision=2,
+                disposition=KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+                target_ref="concept:new_latency_metric",
+            )
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_current",
+                tenant_id=scope.tenant_id,
+                items=[],
+                fingerprint="sha256:current",
+            ), [current]
+
+        def reconcile_live_observations(self, usage, observations):
+            return usage
+
+        def apply_to_ranking(self, ranking, usage):
+            return ranking, usage
+
+        def snapshot_from_usage(self, tenant_id, usage):
+            captured_usage[:] = usage
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_exact_usage",
+                tenant_id=tenant_id,
+                items=[],
+                fingerprint="sha256:exact-usage",
+            )
+
+        def persist_usage(self, usage, *, investigation_id, investigation_revision):
+            return usage
+
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.CURRENT_ENGINE,
+        knowledge_service_factory=CurrentKnowledgeService,
+    )
+
+    assert replayed is not None
+    assert replayed.queries[0].expression == draft.queries[0].expression
+    usage_by_revision = {item.knowledge_revision: item for item in captured_usage}
+    assert usage_by_revision[2].disposition == KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED
+    assert usage_by_revision[2].used_for == []
+    assert usage_by_revision[1].disposition == KnowledgeUsageDisposition.APPLIED
+    assert usage_by_revision[1].used_for == ["query_compilation"]
+    assert "current_engine_reused_captured_stage_output" in usage_by_revision[1].reason_codes
+
+
+def test_current_engine_replay_builds_default_knowledge_service_from_store_settings(tmp_path, monkeypatch):
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-a",
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=runtime_settings,
+    )
+    investigation_id = store.start("Why did checkout latency increase?", tenant_id="tenant-a")
+    draft = _draft_contract(investigation_id)
+    tenant_request = draft.request.model_copy(
+        update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}
+    )
+    tenant_draft = draft.model_copy(update={"request": tenant_request})
+    tenant_snapshot = _snapshot_for(tenant_draft).model_copy(
+        update={"request": _snapshot_for(tenant_draft).request.model_copy(update={"tenant_id": "tenant-a"})}
+    )
+    store.persist_contract_revision(tenant_draft, snapshot=tenant_snapshot)
+    seen_settings: list[Settings] = []
+
+    class FakeKnowledgeService:
+        def create_snapshot(self, scope):
+            return (
+                KnowledgeSnapshot(
+                    id="knowledge_snapshot_scoped",
+                    tenant_id=scope.tenant_id,
+                    items=[],
+                    fingerprint="sha256:scoped",
+                ),
+                [],
+            )
+
+        def reconcile_live_observations(self, usage, observations):
+            return usage
+
+        def apply_to_ranking(self, ranking, usage):
+            return ranking, usage
+
+        def snapshot_from_usage(self, tenant_id, usage):
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_scoped",
+                tenant_id=tenant_id,
+                items=[],
+                fingerprint="sha256:scoped",
+            )
+
+    class CapturingRuntimeStores:
+        def __init__(self, supplied_settings):
+            seen_settings.append(supplied_settings)
+
+        def knowledge(self):
+            return FakeKnowledgeService()
+
+    monkeypatch.setattr("tacit.runtime_stores.RuntimeStores", CapturingRuntimeStores)
+
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.CURRENT_ENGINE,
+        tenant_id="tenant-a",
+    )
+
+    assert replayed is not None
+    assert replayed.request.scope.tenant_id == "tenant-a"
+    assert seen_settings == [runtime_settings]
 
 
 def test_current_engine_replay_succeeds_when_usage_persistence_fails(tmp_path, monkeypatch):
@@ -1007,30 +1530,45 @@ def test_current_engine_replay_succeeds_when_usage_persistence_fails(tmp_path, m
     assert replay_run["error_code"] == ""
 
 
-def test_current_engine_replay_requires_concrete_tenant_in_wildcard_mode(tmp_path, monkeypatch):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
-    investigation_id = store.start("Why did checkout latency increase?")
+def test_current_engine_replay_requires_concrete_tenant_in_wildcard_mode(tmp_path):
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
+    investigation_id = store.start("Why did checkout latency increase?", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
+    draft = draft.model_copy(
+        update={
+            "request": draft.request.model_copy(
+                update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}
+            )
+        }
+    )
     store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
-    monkeypatch.setattr("tacit.history.settings.knowledge_tenant_id", "*")
+    runs_before = store.list_runs(investigation_id, tenant_id="tenant-a")
 
-    with pytest.raises(ReplayError, match="tenant_id is required"):
+    with pytest.raises(ReplayError, match="Knowledge tenant is required"):
         store.replay_contract(investigation_id, mode=ReplayMode.CURRENT_ENGINE)
 
-    assert len(store.list_revisions(investigation_id)) == 1
-    replay_run = store.list_runs(investigation_id)[-1]
-    assert replay_run["status"] == "failed"
-    assert replay_run["error_code"] == "replay_failed"
+    assert len(store.list_revisions(investigation_id, tenant_id="tenant-a")) == 1
+    assert store.list_runs(investigation_id, tenant_id="tenant-a") == runs_before
 
 
 def test_current_engine_replay_rejects_pinned_tenant_mismatch(tmp_path, monkeypatch):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
-    investigation_id = store.start("Why did checkout latency increase?")
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="tenant-a")
+    store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=runtime_settings)
+    investigation_id = store.start("Why did checkout latency increase?", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
+    draft = draft.model_copy(
+        update={
+            "request": draft.request.model_copy(
+                update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}
+            )
+        }
+    )
     snapshot = _snapshot_for(draft)
     snapshot = snapshot.model_copy(update={"request": snapshot.request.model_copy(update={"tenant_id": "tenant-b"})})
     store.persist_contract_revision(draft, snapshot=snapshot)
-    monkeypatch.setattr("tacit.history.settings.knowledge_tenant_id", "default")
     captured: dict[str, str] = {}
 
     class CapturingKnowledgeService:
@@ -1069,7 +1607,8 @@ def test_current_engine_replay_rejects_pinned_tenant_mismatch(tmp_path, monkeypa
         store.replay_contract(
             investigation_id,
             mode=ReplayMode.CURRENT_ENGINE,
-            runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+            runtime_settings=runtime_settings,
+            tenant_id="tenant-a",
         )
 
     assert captured == {}
@@ -1298,6 +1837,80 @@ def test_legacy_migration_preserves_the_investigation_row_tenant(tmp_path):
     assert store.get(investigation_id)["tenant_id"] == "tenant-a"
 
 
+def _legacy_placeholder_investigation(tmp_path, name: str):
+    db_path = tmp_path / f"{name}.db"
+    original = InvestigationStore(db_path=db_path)
+    investigation_id = original.start("Legacy pinned investigation")
+    draft = _draft_contract(investigation_id)
+    original.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+    with original._conn() as conn:
+        conn.execute(
+            "UPDATE investigations SET tenant_id='tenant-a' WHERE id=?",
+            (investigation_id,),
+        )
+        conn.execute(
+            """UPDATE investigation_tenant_assignments
+               SET tenant_id='tenant-a', assignment_source='test_legacy_owner'
+               WHERE investigation_id=?""",
+            (investigation_id,),
+        )
+    return (
+        InvestigationStore(
+            db_path=db_path,
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+        ),
+        investigation_id,
+    )
+
+
+def test_counterfactual_derived_from_legacy_placeholder_uses_pinned_tenant(tmp_path):
+    store, investigation_id = _legacy_placeholder_investigation(tmp_path, "counterfactual-placeholder")
+
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.COUNTERFACTUAL,
+        changes=CounterfactualChanges(remove_observation_ids=["obs_01"]),
+        tenant_id="tenant-a",
+    )
+
+    assert replayed is not None
+    assert replayed.request.scope.tenant_id == "tenant-a"
+    persisted_snapshot = store.get_snapshot(investigation_id, 2, tenant_id="tenant-a")
+    assert persisted_snapshot is not None
+    assert persisted_snapshot.request.tenant_id == "tenant-a"
+
+
+def test_correction_derived_from_legacy_placeholder_uses_pinned_tenant(tmp_path):
+    store, investigation_id = _legacy_placeholder_investigation(tmp_path, "correction-placeholder")
+    candidate = store.create_knowledge_candidate(
+        investigation_id,
+        revision=1,
+        correction_text="The shared cache was saturated.",
+        tenant_id="tenant-a",
+    )
+    assert candidate is not None
+    reviewed = store.review_knowledge_candidate(
+        investigation_id,
+        candidate.id,
+        approved=True,
+        reviewed_by="reviewer",
+        tenant_id="tenant-a",
+    )
+    assert reviewed is not None
+
+    corrected = store.apply_knowledge_candidate(
+        investigation_id,
+        candidate.id,
+        tenant_id="tenant-a",
+    )
+
+    assert corrected is not None
+    assert corrected.request.scope.tenant_id == "tenant-a"
+    persisted_snapshot = store.get_snapshot(investigation_id, 2, tenant_id="tenant-a")
+    assert persisted_snapshot is not None
+    assert persisted_snapshot.request.tenant_id == "tenant-a"
+
+
 def test_assessment_bundle_excludes_revisions_newer_than_the_export(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="sdet")
@@ -1428,6 +2041,49 @@ async def test_failed_refresh_does_not_overwrite_current_investigation_row(tmp_p
     assert current["dashboard_url"] == "http://grafana/current"
     assert current["current_revision"] == 1
     assert store.list_runs(investigation_id)[-1]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_direct_refresh_rejects_a_cross_tenant_investigation_before_starting_a_run(tmp_path):
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
+    investigation_id = store.start("Tenant B investigation", tenant_id="tenant-b")
+    draft = _draft_contract(investigation_id)
+    draft = draft.model_copy(
+        update={
+            "request": draft.request.model_copy(
+                update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-b"})}
+            )
+        }
+    )
+    store.persist_contract_revision(draft)
+    runs_before = store.list_runs(investigation_id, tenant_id="tenant-b")
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_tenant_id="*",
+        ),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    with pytest.raises(ValueError, match="investigation not found for the selected tenant"):
+        await run_pipeline(
+            DashRequest(prompt="Refresh", tenant_id="tenant-a"),
+            deps,
+            investigation_id=investigation_id,
+            run_type=InvestigationRunType.REFRESH,
+        )
+
+    assert store.list_runs(investigation_id, tenant_id="tenant-b") == runs_before
 
 
 async def test_pipeline_preserves_a_caller_supplied_base_revision(monkeypatch):
@@ -2233,9 +2889,9 @@ def test_contract_api_rejects_non_exact_replay_without_captured_inputs(tmp_path,
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Legacy investigation", user_id="api")
     store.persist_contract_revision(_draft_contract(investigation_id))
-    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
-
-    response = TestClient(create_app()).post(
+    app = create_app()
+    app.dependency_overrides[get_history_store] = lambda: store
+    response = TestClient(app).post(
         f"/api/v1/investigations/{investigation_id}/replay",
         json={"mode": "counterfactual", "changes": {"remove_observation_ids": ["obs_01"]}},
     )
@@ -2251,9 +2907,9 @@ def test_contract_api_routes_expose_revision_replay_and_correction_candidate(tmp
     wrong_investigation_id = store.start("Different investigation", user_id="api")
     draft = _draft_contract(investigation_id)
     persisted = store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
-    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
-
-    client = TestClient(create_app())
+    app = create_app()
+    app.dependency_overrides[get_history_store] = lambda: store
+    client = TestClient(app)
 
     contract_response = client.get(f"/api/v1/investigations/{investigation_id}/contract")
     assert contract_response.status_code == 200
@@ -2322,9 +2978,9 @@ def test_legacy_correction_mutations_require_action_permissions(tmp_path, monkey
         created_by="reviewer",
     )
     assert candidate is not None
-    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
-
-    read_only = TestClient(create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read")))
+    read_only_app = create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read"))
+    read_only_app.dependency_overrides[get_history_store] = lambda: store
+    read_only = TestClient(read_only_app)
     create_response = read_only.post(
         f"/api/v1/investigations/{investigation_id}/corrections",
         json={"correction_text": "Unauthorized correction", "created_by": "reviewer"},
@@ -2351,19 +3007,19 @@ def test_legacy_correction_mutations_require_action_permissions(tmp_path, monkey
         approved=True,
         reviewed_by="authorized-reviewer",
     )
-    no_correction_permission = TestClient(
-        create_app(
-            runtime_settings=Settings(
-                knowledge_permissions="knowledge.read,knowledge.review,knowledge.reject",
-            )
+    no_correction_permission_app = create_app(
+        runtime_settings=Settings(
+            knowledge_permissions="knowledge.read,knowledge.review,knowledge.reject",
         )
     )
+    no_correction_permission_app.dependency_overrides[get_history_store] = lambda: store
+    no_correction_permission = TestClient(no_correction_permission_app)
     apply_response = no_correction_permission.post(
         f"/api/v1/investigations/{investigation_id}/corrections/{candidate.id}/apply"
     )
 
     assert apply_response.status_code == 403
-    assert apply_response.json()["detail"] == "Missing permission: knowledge.correct"
+    assert apply_response.json()["detail"] == "Missing permission: knowledge.apply"
     assert len(store.list_revisions(investigation_id)) == 1
 
 
@@ -2371,17 +3027,20 @@ def test_assessment_bundle_export_requires_export_permission(tmp_path, monkeypat
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="api")
     store.persist_contract_revision(_draft_contract(investigation_id))
-    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
-
-    denied = TestClient(create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read"))).get(
-        f"/api/v1/investigations/{investigation_id}/assessment-bundle"
-    )
-    allowed = TestClient(create_app(runtime_settings=Settings(knowledge_permissions="knowledge.export"))).get(
-        f"/api/v1/investigations/{investigation_id}/assessment-bundle"
-    )
+    denied_app = create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read"))
+    denied_app.dependency_overrides[get_history_store] = lambda: store
+    denied = TestClient(denied_app).get(f"/api/v1/investigations/{investigation_id}/assessment-bundle")
+    export_only_app = create_app(runtime_settings=Settings(knowledge_permissions="knowledge.export"))
+    export_only_app.dependency_overrides[get_history_store] = lambda: store
+    export_only = TestClient(export_only_app).get(f"/api/v1/investigations/{investigation_id}/assessment-bundle")
+    allowed_app = create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read,knowledge.export"))
+    allowed_app.dependency_overrides[get_history_store] = lambda: store
+    allowed = TestClient(allowed_app).get(f"/api/v1/investigations/{investigation_id}/assessment-bundle")
 
     assert denied.status_code == 403
     assert denied.json()["detail"] == "Missing permission: knowledge.export"
+    assert export_only.status_code == 403
+    assert export_only.json()["detail"] == "Missing permission: knowledge.read"
     assert allowed.status_code == 200
     assert allowed.headers["content-type"] == "application/gzip"
 
@@ -2399,16 +3058,19 @@ def test_contract_api_rejects_unsupported_schema_in_history(tmp_path, monkeypatc
                WHERE investigation_id=? AND revision=?""",
             ("2.0", json.dumps(payload), investigation_id, persisted.investigation.revision),
         )
-    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
-
     assert store.get_contract(investigation_id) is None
-    response = TestClient(create_app()).get(f"/api/v1/investigations/{investigation_id}/contract")
+    app = create_app()
+    app.dependency_overrides[get_history_store] = lambda: store
+    response = TestClient(app).get(f"/api/v1/investigations/{investigation_id}/contract")
 
     assert response.status_code == 404
 
 
 def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
     investigation_id = store.start("Why did checkout latency increase?", user_id="api", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
     tenant_request = draft.request.model_copy(
@@ -2457,15 +3119,21 @@ def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch
 
 
 def test_refresh_rejects_investigation_outside_configured_tenant(tmp_path, monkeypatch):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
-    investigation_id = store.start("Why did checkout latency increase?", user_id="api", tenant_id="tenant-a")
+    db_path = tmp_path / "history.db"
+    seed_store = InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+    investigation_id = seed_store.start("Why did checkout latency increase?", user_id="api", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
     tenant_request = draft.request.model_copy(
         update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}
     )
-    store.persist_contract_revision(draft.model_copy(update={"request": tenant_request}))
+    seed_store.persist_contract_revision(draft.model_copy(update={"request": tenant_request}))
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="tenant-b")
+    store = InvestigationStore(db_path=db_path, runtime_settings=runtime_settings)
     deps = PipelineDependencies(
-        settings=Settings(knowledge_tenant_id="tenant-b"),
+        settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -2485,13 +3153,14 @@ def test_refresh_rejects_investigation_outside_configured_tenant(tmp_path, monke
 
     response = TestClient(app).post(f"/api/v1/investigations/{investigation_id}/refresh")
 
-    assert response.status_code == 403
-    assert response.json()["detail"] == "Tenant access denied"
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Investigation contract not found"
     assert called is False
 
 
 def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, monkeypatch):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
+    settings = Settings(_env_file=None, knowledge_tenant_id="*")
+    store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=settings)
     investigation_id = store.start("Why did checkout latency increase?", user_id="api", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
     tenant_request = draft.request.model_copy(
@@ -2503,7 +3172,6 @@ def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, mo
             update={"request": _snapshot_for(draft).request.model_copy(update={"tenant_id": "tenant-a"})}
         ),
     )
-    settings = Settings(knowledge_tenant_id="*")
     deps = PipelineDependencies(
         settings=settings,
         backend_factory=lambda: [],
@@ -2512,11 +3180,11 @@ def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, mo
         llm_cache={},
         cache_key_factory=lambda *parts: ":".join(parts),
     )
-    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
     app = create_app(runtime_settings=settings)
     app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
+    app.dependency_overrides[get_history_store] = lambda: store
     client = TestClient(app)
-    run_count = len(store.list_runs(investigation_id))
+    run_count = len(store.list_runs(investigation_id, tenant_id="tenant-a"))
 
     replay = client.post(
         f"/api/v1/investigations/{investigation_id}/replay",
@@ -2527,13 +3195,14 @@ def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, mo
         headers={"X-Tacit-Tenant": "tenant-b"},
     )
 
-    assert replay.status_code == 403
-    assert refresh.status_code == 403
-    assert len(store.list_runs(investigation_id)) == run_count
+    assert replay.status_code == 404
+    assert refresh.status_code == 404
+    assert len(store.list_runs(investigation_id, tenant_id="tenant-a")) == run_count
 
 
 def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
+    runtime_settings = Settings(knowledge_tenant_id="*")
+    store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=runtime_settings)
     investigation_ids = {}
     for tenant_id in ("tenant-a", "tenant-b"):
         investigation_id = store.start(
@@ -2548,8 +3217,6 @@ def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
         store.persist_contract_revision(draft.model_copy(update={"request": tenant_request}))
         investigation_ids[tenant_id] = investigation_id
 
-    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: store)
-    runtime_settings = Settings(knowledge_tenant_id="*")
     app = create_app(runtime_settings=runtime_settings)
     app.dependency_overrides[get_history_store] = lambda: store
     client = TestClient(app)
@@ -2559,8 +3226,11 @@ def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
 
     listing = client.get("/api/v1/investigations", headers=headers)
     stats = client.get("/api/v1/investigations/stats", headers=headers)
+    detail = client.get(f"/api/v1/investigations/{own_id}", headers=headers)
     assert [item["id"] for item in listing.json()["investigations"]] == [own_id]
     assert stats.json()["total"] == 1
+    assert detail.status_code == 200
+    assert detail.json()["id"] == own_id
 
     blocked_requests = (
         ("get", f"/api/v1/investigations/{other_id}"),
@@ -2575,14 +3245,14 @@ def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
     )
     for method, path in blocked_requests:
         response = client.request(method, path, headers=headers)
-        assert response.status_code == 403, path
+        assert response.status_code == 404, path
 
     correction = client.post(
         f"/api/v1/investigations/{other_id}/corrections",
         headers=headers,
         json={"correction_text": "Cross-tenant correction", "created_by": "reviewer"},
     )
-    assert correction.status_code == 403
+    assert correction.status_code == 404
     correction_review = client.post(
         f"/api/v1/investigations/{other_id}/corrections/missing/review",
         headers=headers,
@@ -2592,8 +3262,8 @@ def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
         f"/api/v1/investigations/{other_id}/corrections/missing/apply",
         headers=headers,
     )
-    assert correction_review.status_code == 403
-    assert correction_apply.status_code == 403
+    assert correction_review.status_code == 404
+    assert correction_apply.status_code == 404
 
     knowledge_correction_payload = {
         "investigation_id": other_id,
@@ -2612,7 +3282,7 @@ def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
         headers=headers,
         json=knowledge_correction_payload,
     )
-    assert knowledge_correction.status_code == 403
+    assert knowledge_correction.status_code == 404
 
     unrelated_target = client.post(
         "/api/v1/knowledge/corrections",
@@ -2627,7 +3297,10 @@ def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
 
 
 def test_investigation_tenant_is_immutable_across_revisions(tmp_path):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
     investigation_id = store.start("Tenant-bound investigation", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
     tenant_a_request = draft.request.model_copy(
@@ -2709,7 +3382,6 @@ def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeyp
         db_path=db_path,
         runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
     )
-    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: migrated)
     runtime_settings = Settings(knowledge_tenant_id="tenant-a")
     deps = PipelineDependencies(
         settings=runtime_settings,
@@ -2733,7 +3405,10 @@ def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeyp
         )
 
     monkeypatch.setattr("tacit.api.routes.history.run_pipeline", fake_refresh)
-    knowledge_service = KnowledgeService(KnowledgeRepository(tmp_path / "knowledge.db"))
+    knowledge_service = KnowledgeService(
+        KnowledgeRepository(tmp_path / "knowledge.db"),
+        runtime_settings=runtime_settings,
+    )
     monkeypatch.setattr(
         "tacit.api.routes.knowledge.get_knowledge_service",
         lambda request: knowledge_service,
@@ -2767,6 +3442,44 @@ def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeyp
     )
     assert correction.status_code == 200, correction.text
     assert correction.json()["correction"]["tenant_id"] == "tenant-a"
+
+
+def test_wildcard_history_migration_refuses_ownerless_rows_before_schema_mutation(tmp_path):
+    db_path = tmp_path / "ownerless-history.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""CREATE TABLE investigations (
+                   id TEXT PRIMARY KEY,
+                   prompt TEXT NOT NULL
+               );
+               INSERT INTO investigations (id, prompt) VALUES ('private-inv', 'Private prompt');""")
+
+    with pytest.raises(RuntimeError, match="Legacy investigation history has no tenant owner"):
+        InvestigationStore(
+            db_path=db_path,
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "tenant_id" not in columns
+    assert "current_revision" not in columns
+    assert "investigation_revisions" not in tables
+
+
+def test_wildcard_history_stats_require_and_filter_by_tenant(tmp_path):
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
+    store.start("Tenant A", tenant_id="tenant-a")
+    store.start("Tenant B", tenant_id="tenant-b")
+
+    with pytest.raises(ValueError, match="tenant"):
+        store.stats()
+
+    assert store.stats(tenant_id="tenant-a")["total"] == 1
+    assert store.stats(tenant_id="tenant-b")["total"] == 1
 
 
 def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp_path, monkeypatch):

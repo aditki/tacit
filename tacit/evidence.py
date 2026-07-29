@@ -17,6 +17,7 @@ from typing import Any
 
 from tacit.archetypes.schema import InvestigationArchetype
 from tacit.catalog import catalog_for_services
+from tacit.knowledge.usage import KnowledgeRevisionRef
 from tacit.models.schemas import (
     DashboardSpec,
     EvidenceLifecycleStatus,
@@ -152,6 +153,8 @@ def resolve_requirements_for_archetype(
     knowledge_scope: Any | None = None,
     applied_governance_refs: set[str] | None = None,
     governance_refs_by_requirement: dict[str, set[str]] | None = None,
+    applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
+    governance_revision_refs_by_requirement: dict[str, set[KnowledgeRevisionRef]] | None = None,
 ) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
     """Resolve one archetype's evidence needs against the live catalog."""
     from tacit.archetypes.engine import (
@@ -233,7 +236,7 @@ def resolve_requirements_for_archetype(
             continue
 
         signal_type = requirement.signal_type
-        inferred_by = ""
+        inferred_by: KnowledgeRevisionRef | None = None
         if not signal_type and default_metric:
             for language in sorted(query_languages or {target_language}):
                 language_catalog = [
@@ -312,15 +315,27 @@ def resolve_requirements_for_archetype(
         entry, score = selected.entry, selected.confidence
         if applied_governance_refs is not None:
             if inferred_by:
-                applied_governance_refs.add(inferred_by)
+                applied_governance_refs.add(inferred_by.knowledge_ref)
             if selected.governance_ref:
                 applied_governance_refs.add(selected.governance_ref)
         if governance_refs_by_requirement is not None:
             refs = governance_refs_by_requirement.setdefault(requirement.id, set())
             if inferred_by:
-                refs.add(inferred_by)
+                refs.add(inferred_by.knowledge_ref)
             if selected.governance_ref:
                 refs.add(selected.governance_ref)
+        selected_revision_ref = selected.knowledge_revision_ref
+        if applied_governance_revision_refs is not None:
+            if inferred_by is not None:
+                applied_governance_revision_refs.add(inferred_by)
+            if selected_revision_ref is not None:
+                applied_governance_revision_refs.add(selected_revision_ref)
+        if governance_revision_refs_by_requirement is not None:
+            revision_refs = governance_revision_refs_by_requirement.setdefault(requirement.id, set())
+            if inferred_by is not None:
+                revision_refs.add(inferred_by)
+            if selected_revision_ref is not None:
+                revision_refs.add(selected_revision_ref)
         resolutions.append(
             resolved_from_entry(
                 requirement,
@@ -345,6 +360,8 @@ def resolve_requirements_for_archetypes(
     knowledge_scope: Any | None = None,
     applied_governance_refs: set[str] | None = None,
     governance_refs_by_requirement: dict[str, set[str]] | None = None,
+    applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
+    governance_revision_refs_by_requirement: dict[str, set[KnowledgeRevisionRef]] | None = None,
 ) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
     """Resolve evidence needs for all selected archetypes."""
     requirements: list[EvidenceRequirement] = []
@@ -360,6 +377,8 @@ def resolve_requirements_for_archetypes(
             knowledge_scope=knowledge_scope,
             applied_governance_refs=applied_governance_refs,
             governance_refs_by_requirement=governance_refs_by_requirement,
+            applied_governance_revision_refs=applied_governance_revision_refs,
+            governance_revision_refs_by_requirement=governance_revision_refs_by_requirement,
         )
         requirements.extend(arch_requirements)
         resolutions.extend(arch_resolutions)

@@ -20,6 +20,7 @@ from typing import Any
 import structlog
 
 from tacit.config import Settings, settings
+from tacit.tenancy import resolve_tenant_boundary
 
 _UID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")
 
@@ -37,9 +38,10 @@ _DEFAULT_DB_PATH = Path("data/tacit_feedback.db")
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 
-def _db_path() -> Path:
+def _db_path(runtime_settings: Settings | None = None) -> Path:
     """Resolve DB path from settings or default."""
-    custom = settings.feedback_db_path
+    active_settings = runtime_settings or settings
+    custom = active_settings.feedback_db_path
     path = Path(custom) if custom else _DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
@@ -83,6 +85,12 @@ CREATE INDEX IF NOT EXISTS idx_provenance_tenant_uid
     ON dashboard_provenance(tenant_id, dashboard_uid);
 CREATE INDEX IF NOT EXISTS idx_feedback_tenant_uid
     ON feedback(tenant_id, dashboard_uid);
+
+CREATE TABLE IF NOT EXISTS feedback_tenant_migration_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -90,8 +98,8 @@ class FeedbackStore:
     """SQLite-backed store for dashboard provenance and human feedback."""
 
     def __init__(self, db_path: Path | None = None, *, runtime_settings: Settings | None = None):
-        self._db_path = db_path or _db_path()
         self._settings = runtime_settings or settings
+        self._db_path = db_path or _db_path(self._settings)
         self._ensure_schema()
 
     @contextmanager
@@ -111,9 +119,12 @@ class FeedbackStore:
 
     def _ensure_schema(self):
         with self._conn() as conn:
+            self._require_confirmed_default_tenant_owner(conn)
             if self._tenant_migration_required(conn):
+                self._require_legacy_tenant_owner(conn)
                 self._migrate_tenant_scope(conn)
             conn.executescript(_SCHEMA_SQL)
+            self._reconcile_default_tenant_owner(conn)
         logger.info("feedback_store_init", db_path=str(self._db_path))
 
     @staticmethod
@@ -136,10 +147,86 @@ class FeedbackStore:
                 return True
         return False
 
+    def _require_legacy_tenant_owner(self, conn: sqlite3.Connection) -> None:
+        """Refuse to guess ownership for populated pre-tenant feedback stores."""
+        configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+        if configured_tenant != "*":
+            return
+        ownerless_tables: list[str] = []
+        for table_name in ("dashboard_provenance", "feedback"):
+            if not self._table_exists(conn, table_name):
+                continue
+            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+            if "tenant_id" in columns:
+                continue
+            if conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone() is not None:
+                ownerless_tables.append(table_name)
+        if not ownerless_tables:
+            return
+        logger.error("legacy_feedback_owner_required", tables=ownerless_tables)
+        raise RuntimeError(
+            "Legacy feedback data has no tenant owner. Start once with knowledge_tenant_id pinned to its owner "
+            "before enabling wildcard tenancy. Affected tables: " + ", ".join(ownerless_tables)
+        )
+
+    def _require_confirmed_default_tenant_owner(self, conn: sqlite3.Connection) -> None:
+        """Refuse ambiguous default rows written by the previous migration."""
+        configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+        if configured_tenant != "*":
+            return
+        if self._table_exists(conn, "feedback_tenant_migration_metadata"):
+            marker = conn.execute(
+                "SELECT 1 FROM feedback_tenant_migration_metadata WHERE key='default_owner_v1'"
+            ).fetchone()
+            if marker is not None:
+                return
+        ambiguous_tables = []
+        for table_name in ("dashboard_provenance", "feedback"):
+            if not self._table_exists(conn, table_name):
+                continue
+            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+            if "tenant_id" not in columns:
+                continue
+            if conn.execute(f"SELECT 1 FROM {table_name} WHERE tenant_id='default' LIMIT 1").fetchone() is not None:
+                ambiguous_tables.append(table_name)
+        if ambiguous_tables:
+            logger.error("legacy_feedback_default_owner_unconfirmed", tables=ambiguous_tables)
+            raise RuntimeError(
+                "Previously migrated feedback has unconfirmed default-tenant ownership. Start once with "
+                "knowledge_tenant_id pinned to its owner before enabling wildcard tenancy. Affected tables: "
+                + ", ".join(ambiguous_tables)
+            )
+
+    def _reconcile_default_tenant_owner(self, conn: sqlite3.Connection) -> None:
+        marker = conn.execute(
+            "SELECT value FROM feedback_tenant_migration_metadata WHERE key='default_owner_v1'"
+        ).fetchone()
+        if marker is not None:
+            return
+        configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+        if configured_tenant not in {"*", "default"}:
+            conn.execute("UPDATE feedback SET tenant_id=? WHERE tenant_id='default'", (configured_tenant,))
+            conn.execute(
+                "UPDATE dashboard_provenance SET tenant_id=? WHERE tenant_id='default'",
+                (configured_tenant,),
+            )
+        conn.execute(
+            """INSERT INTO feedback_tenant_migration_metadata (key, value, updated_at)
+               VALUES ('default_owner_v1', ?, ?)""",
+            (configured_tenant, time.time()),
+        )
+
     def _migrate_tenant_scope(self, conn: sqlite3.Connection) -> None:
         """Atomically rebuild legacy feedback tables around tenant-scoped keys."""
         configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+        # Wildcard migration reaches this point only after the owner preflight
+        # proves that no pre-tenant rows need assignment.
         legacy_tenant = configured_tenant if configured_tenant != "*" else "default"
+        if configured_tenant == "*":
+            logger.info(
+                "legacy_feedback_wildcard_rebuild_without_ownerless_rows",
+                placeholder_tenant=legacy_tenant,
+            )
         has_provenance = self._table_exists(conn, "dashboard_provenance")
         has_feedback = self._table_exists(conn, "feedback")
         provenance_columns = (
@@ -220,6 +307,12 @@ class FeedbackStore:
             raise
         logger.info("feedback_tenant_scope_migrated", tenant_id=legacy_tenant)
 
+    def _resolve_tenant(self, tenant_id: str | None) -> str:
+        return resolve_tenant_boundary(
+            str(self._settings.knowledge_tenant_id or "default"),
+            tenant_id,
+        )
+
     # ── Provenance ────────────────────────────────────────────────────────
 
     def record_provenance(
@@ -235,9 +328,10 @@ class FeedbackStore:
         dashboard_url: str = "",
         user_id: str = "",
         channel_id: str = "",
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> None:
         """Store dashboard generation provenance."""
+        tenant_id = self._resolve_tenant(tenant_id)
         dashboard_uid = _sanitize_uid(dashboard_uid)
         with self._conn() as conn:
             conn.execute(
@@ -274,8 +368,14 @@ class FeedbackStore:
             )
         logger.info("provenance_recorded", dashboard_uid=dashboard_uid, tenant_id=tenant_id)
 
-    def get_provenance(self, dashboard_uid: str, *, tenant_id: str = "default") -> dict[str, Any] | None:
+    def get_provenance(
+        self,
+        dashboard_uid: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """Retrieve provenance for a dashboard."""
+        tenant_id = self._resolve_tenant(tenant_id)
         dashboard_uid = _sanitize_uid(dashboard_uid)
         with self._conn() as conn:
             row = conn.execute(
@@ -301,9 +401,10 @@ class FeedbackStore:
         overall_useful: bool | None = None,
         comment: str = "",
         reviewer: str = "",
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> int:
         """Store human feedback for a dashboard. Returns feedback id."""
+        tenant_id = self._resolve_tenant(tenant_id)
         dashboard_uid = _sanitize_uid(dashboard_uid)
         with self._conn() as conn:
             cursor = conn.execute(
@@ -333,8 +434,14 @@ class FeedbackStore:
         )
         return feedback_id
 
-    def get_feedback(self, dashboard_uid: str, *, tenant_id: str = "default") -> list[dict[str, Any]]:
+    def get_feedback(
+        self,
+        dashboard_uid: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Retrieve all feedback for a dashboard."""
+        tenant_id = self._resolve_tenant(tenant_id)
         dashboard_uid = _sanitize_uid(dashboard_uid)
         with self._conn() as conn:
             rows = conn.execute(
@@ -344,8 +451,9 @@ class FeedbackStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_aggregate_stats(self, *, tenant_id: str = "default") -> dict[str, Any]:
+    def get_aggregate_stats(self, *, tenant_id: str | None = None) -> dict[str, Any]:
         """Aggregate feedback statistics across all dashboards."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             total = conn.execute(
                 "SELECT COUNT(*) FROM feedback WHERE tenant_id = ?",
@@ -390,7 +498,7 @@ class FeedbackStore:
 
     # ── Feedback Analysis (closes the loop) ───────────────────────────
 
-    def analyze(self, *, tenant_id: str = "default") -> dict[str, Any]:
+    def analyze(self, *, tenant_id: str | None = None) -> dict[str, Any]:
         """Analyze feedback to produce actionable improvement signals.
 
         Returns a report with:
@@ -402,6 +510,7 @@ class FeedbackStore:
         - confidence_calibration: are high-confidence archetypes actually better?
         - recommendations: ordered list of concrete actions
         """
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             total = conn.execute(
                 "SELECT COUNT(*) FROM feedback WHERE tenant_id = ?",

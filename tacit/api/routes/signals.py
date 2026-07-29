@@ -21,6 +21,7 @@ router = APIRouter(dependencies=[Depends(verify_api_key)])
 )
 async def list_signals(request: Request, store: Any = Depends(get_signal_store)):
     """List all registered semantic signal types."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
     return {"signal_types": store.list_signal_types(tenant_id=knowledge_tenant(request))}
 
 
@@ -32,6 +33,7 @@ async def list_signals(request: Request, store: Any = Depends(get_signal_store))
 )
 async def signal_stats(request: Request, store: Any = Depends(get_signal_store)):
     """Summary statistics for the signal mapping store."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
     return store.stats(tenant_id=knowledge_tenant(request))
 
 
@@ -43,6 +45,7 @@ async def signal_stats(request: Request, store: Any = Depends(get_signal_store))
 )
 async def get_signal(signal_type: str, request: Request, store: Any = Depends(get_signal_store)):
     """Get a signal type with all its metric mappings."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
     result = store.get_signal_type(signal_type, tenant_id=knowledge_tenant(request))
     if result is None:
         raise HTTPException(status_code=404, detail=f"Signal type '{signal_type}' not found")

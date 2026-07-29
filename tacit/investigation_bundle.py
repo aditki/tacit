@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from tacit.history import InvestigationStore
+from tacit.tenancy import resolve_tenant_boundary
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -22,13 +23,28 @@ def build_investigation_bundle(
     investigation_id: str,
     *,
     revision: int | None = None,
+    tenant_id: str | None = None,
 ) -> bytes:
-    contract = store.get_contract(investigation_id, revision)
+    runtime_settings = getattr(store, "_settings", None)
+    if runtime_settings is None and tenant_id is None:
+        raise ValueError("tenant_id is required when the history store has no runtime settings")
+    if runtime_settings is not None:
+        tenant_id = resolve_tenant_boundary(
+            str(runtime_settings.knowledge_tenant_id or "default"),
+            tenant_id,
+        )
+    contract = store.get_contract(investigation_id, revision, tenant_id=tenant_id)
     if contract is None:
         raise ValueError("Investigation contract not found")
-    snapshot = store.get_snapshot(investigation_id, contract.investigation.revision)
+    snapshot = store.get_snapshot(
+        investigation_id,
+        contract.investigation.revision,
+        tenant_id=tenant_id,
+    )
     revisions = [
-        item for item in store.list_revisions(investigation_id) if item["revision"] <= contract.investigation.revision
+        item
+        for item in store.list_revisions(investigation_id, tenant_id=tenant_id)
+        if item["revision"] <= contract.investigation.revision
     ]
     files: dict[str, bytes] = {
         "contract.json": _json_bytes(contract.model_dump(mode="json", by_alias=True)),
@@ -51,6 +67,7 @@ def build_investigation_bundle(
             investigation_id,
             previous[-1]["revision"],
             contract.investigation.revision,
+            tenant_id=tenant_id,
         )
         files["comparison.json"] = _json_bytes(comparison)
     manifest = {
@@ -82,7 +99,15 @@ def export_investigation_bundle(
     output: Path,
     *,
     revision: int | None = None,
+    tenant_id: str | None = None,
 ) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_bytes(build_investigation_bundle(store, investigation_id, revision=revision))
+    output.write_bytes(
+        build_investigation_bundle(
+            store,
+            investigation_id,
+            revision=revision,
+            tenant_id=tenant_id,
+        )
+    )
     return output

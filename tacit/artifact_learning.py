@@ -743,7 +743,7 @@ def _reconcile_stale_artifact_knowledge(*, store, tenant_id: str, artifact_type:
     from tacit.knowledge.repository import KnowledgeRepository
     from tacit.knowledge.service import KnowledgeService
 
-    service = KnowledgeService(KnowledgeRepository(store._db_path))
+    service = KnowledgeService(KnowledgeRepository(store._db_path), signal_store=store)
     offset = 0
     page_size = 1_000
     pages = 0
@@ -904,7 +904,7 @@ def learn_artifact(
         from tacit.knowledge.repository import KnowledgeRepository
         from tacit.knowledge.service import KnowledgeService
 
-        service = KnowledgeService(KnowledgeRepository(store._db_path))
+        service = KnowledgeService(KnowledgeRepository(store._db_path), signal_store=store)
         governed_candidate_ids = migrate_artifact_extractions(
             artifact_id=artifact.id,
             artifact_type=artifact.artifact_type,

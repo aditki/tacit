@@ -197,11 +197,15 @@ def persist_inferred_signal_review(
     governed_pairs: set[tuple[str, str]] | None = None,
 ) -> bool:
     """Persist one inferred signal using the same gate for all approval paths."""
+    from tacit.api.security import KnowledgeAction, enforce_knowledge_action
+
+    active_settings = runtime_settings or settings
+    enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
     signal_type = sig["signal_type"]
     metric = sig.get("metric", "")
     confidence = sig.get("confidence", 0.6)
     is_heuristic = sig.get("source") == "heuristic"
-    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
 
     should_teach = _governable_signal(sig)
 
@@ -284,6 +288,7 @@ def _existing_governed_candidate_ids(
     tenant_id: str,
     source_ref: str,
     active_pairs: set[tuple[str, str]],
+    source_fingerprint: str = "",
 ) -> set[str]:
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.repository import KnowledgeRepository
@@ -295,6 +300,15 @@ def _existing_governed_candidate_ids(
         if source_ref not in set(candidate.provenance_refs).union(evidence_refs):
             continue
         if candidate.kind != KnowledgeKind.SIGNAL_MAPPING:
+            continue
+        source_evidence = [item for item in candidate.evidence.items if source_ref in item.provenance_refs]
+        if source_fingerprint and not any(item.lineage_group == source_fingerprint for item in source_evidence):
+            logger.info(
+                "source_lineage_changed_pending_review",
+                tenant_id=tenant_id,
+                source_ref=source_ref,
+                candidate_id=candidate.id,
+            )
             continue
         metric = str(
             candidate.typed_payload.get("metric_pattern")
@@ -337,7 +351,11 @@ def _govern_signal_mapping(
             "source_fingerprint": source_fingerprint,
             "review_state": "approved" if sig.get("source") == "heuristic" else "trusted",
         },
-        service=KnowledgeService(KnowledgeRepository(store._db_path)),
+        service=KnowledgeService(
+            KnowledgeRepository(store._db_path),
+            signal_store=store,
+            runtime_settings=runtime_settings,
+        ),
         tenant_id=effective_tenant,
     )
 
@@ -405,7 +423,7 @@ def reconcile_signal_source(
         source_ref=source_ref,
         active_pairs=active_pairs,
     )
-    KnowledgeService(KnowledgeRepository(store._db_path)).reconcile_source_lifecycle(
+    KnowledgeService(KnowledgeRepository(store._db_path), signal_store=store).reconcile_source_lifecycle(
         provenance_ref=source_ref,
         tenant_id=tenant_id,
         active_candidate_ids=active_candidate_ids,
@@ -510,8 +528,12 @@ def approve_ingested_dashboard_record(
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Approve a pending ingested dashboard and activate learned artifacts."""
+    from tacit.api.security import KnowledgeAction, enforce_knowledge_action
+
+    active_settings = runtime_settings or settings
+    enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
     store = store or get_signal_store()
-    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     ingested = store.get_ingested_dashboard(
         dashboard_uid,
         backend_name=backend_name,
@@ -546,7 +568,7 @@ def approve_ingested_dashboard_record(
                 dashboard_uid=dashboard_uid,
                 backend_name=ingested.get("backend_name", ""),
                 tenant_id=effective_tenant,
-                runtime_settings=runtime_settings,
+                runtime_settings=active_settings,
                 source_fingerprint=source_fingerprint,
                 governed_candidate_ids=governed_candidate_ids,
                 governed_pairs=governed_pairs,
@@ -575,7 +597,7 @@ def approve_ingested_dashboard_record(
                             dashboard_uid=dashboard_uid,
                             backend_name=ingested.get("backend_name", ""),
                             tenant_id=effective_tenant,
-                            runtime_settings=runtime_settings,
+                            runtime_settings=active_settings,
                             source_fingerprint=source_fingerprint,
                             governed_candidate_ids=governed_candidate_ids,
                             governed_pairs=governed_pairs,
@@ -602,7 +624,7 @@ def approve_ingested_dashboard_record(
     quarantine_paths = quarantine_generated_archetype_if_enabled(
         ingested.get("archetype_generated", ""),
         dashboard_uid=dashboard_uid,
-        runtime_settings=runtime_settings,
+        runtime_settings=active_settings,
     )
 
     return {
@@ -690,6 +712,10 @@ async def ingest_dashboard_features(
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted dashboard features."""
     active_settings = runtime_settings or settings
+    if auto_approve:
+        from tacit.api.security import KnowledgeAction, enforce_knowledge_action
+
+        enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     extracted = _features_to_dict(features)
 
@@ -796,6 +822,7 @@ async def ingest_dashboard_features(
             tenant_id=effective_tenant,
             source_ref=source_ref,
             active_pairs=governed_pairs,
+            source_fingerprint=source_fingerprint,
         )
         logger.info(
             "dashboard_ingested_pending",
@@ -1038,7 +1065,7 @@ async def learn_backend_dashboards(
                 from tacit.knowledge.repository import KnowledgeRepository
                 from tacit.knowledge.service import KnowledgeService
 
-                knowledge_service = KnowledgeService(KnowledgeRepository(store._db_path))
+                knowledge_service = KnowledgeService(KnowledgeRepository(store._db_path), signal_store=store)
                 offset = 0
                 page_size = 500
                 reconciled_count = 0

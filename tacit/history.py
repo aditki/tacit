@@ -45,11 +45,17 @@ from tacit.investigation_replay import (
     apply_counterfactual,
     rebuild_contract,
 )
+from tacit.knowledge.enums import KnowledgeUsageDisposition
+from tacit.knowledge.models import KnowledgeUsage
+from tacit.tenancy import resolve_tenant_boundary
 
 logger = structlog.get_logger()
 
 _DEFAULT_DB_PATH = Path("data/tacit_history.db")
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
+_CURRENT_ENGINE_REBUILT_STAGES = frozenset(
+    {"candidate_exclusion", "candidate_generation", "ranking", "ranking_context"}
+)
 
 
 class StaleRevisionError(ValueError):
@@ -68,8 +74,113 @@ class ExactReplayMismatchError(ReplayError):
     """Raised when captured inputs no longer rebuild the persisted exact output."""
 
 
-def _db_path() -> Path:
-    custom = settings.history_db_path
+def _merge_current_engine_replay_usage(
+    current_usage: list[KnowledgeUsage],
+    historical_usage: list[KnowledgeUsage],
+    *,
+    tenant_id: str,
+) -> list[KnowledgeUsage]:
+    """Retain exact attribution for captured stages that current-engine replay does not rebuild."""
+    merged = [item.model_copy(update={"tenant_id": tenant_id}) for item in current_usage]
+    positions = {(item.knowledge_ref, item.knowledge_revision): index for index, item in enumerate(merged)}
+    for historical in historical_usage:
+        if historical.disposition != KnowledgeUsageDisposition.APPLIED:
+            continue
+        reused_stages = [stage for stage in historical.used_for if stage not in _CURRENT_ENGINE_REBUILT_STAGES]
+        if not reused_stages:
+            continue
+        key = (historical.knowledge_ref, historical.knowledge_revision)
+        reason_codes = list(historical.reason_codes)
+        if "current_engine_reused_captured_stage_output" not in reason_codes:
+            reason_codes.append("current_engine_reused_captured_stage_output")
+        index = positions.get(key)
+        if index is None:
+            positions[key] = len(merged)
+            merged.append(
+                historical.model_copy(
+                    update={
+                        "tenant_id": tenant_id,
+                        "used_for": reused_stages,
+                        "score_delta": 0.0,
+                        "reason_codes": reason_codes,
+                    }
+                )
+            )
+            continue
+        current = merged[index]
+        used_for = list(current.used_for)
+        for stage in reused_stages:
+            if stage not in used_for:
+                used_for.append(stage)
+        merged_reasons = list(current.reason_codes)
+        for reason in reason_codes:
+            if reason not in merged_reasons:
+                merged_reasons.append(reason)
+        merged[index] = current.model_copy(
+            update={
+                "disposition": historical.disposition,
+                "used_for": used_for,
+                "reason_codes": merged_reasons,
+            }
+        )
+    return merged
+
+
+def _normalize_legacy_snapshot_tenant(
+    snapshot: InvestigationReplaySnapshot,
+    *,
+    selected_tenant: str,
+    configured_tenant: str,
+) -> InvestigationReplaySnapshot:
+    snapshot_tenant = str(snapshot.request.tenant_id or "")
+    if snapshot_tenant == selected_tenant:
+        return snapshot
+    legacy_placeholder = configured_tenant != "*" and snapshot_tenant in {"", "default"}
+    if not legacy_placeholder:
+        raise ReplayError(
+            f"investigation tenant {snapshot_tenant!r} does not match configured tenant {selected_tenant!r}"
+        )
+    return snapshot.model_copy(
+        update={
+            "request": snapshot.request.model_copy(update={"tenant_id": selected_tenant}),
+            "knowledge_usage": [
+                item.model_copy(update={"tenant_id": selected_tenant}) for item in snapshot.knowledge_usage
+            ],
+        }
+    )
+
+
+def _normalize_legacy_contract_tenant(
+    contract: InvestigationContract,
+    *,
+    selected_tenant: str,
+    configured_tenant: str,
+) -> InvestigationContract:
+    contract_tenant = str(contract.request.scope.tenant_id or "")
+    if contract_tenant == selected_tenant:
+        return contract
+    legacy_placeholder = configured_tenant != "*" and contract_tenant in {"", "default"}
+    if not legacy_placeholder:
+        raise StaleRevisionError(
+            f"investigation tenant {contract_tenant!r} does not match configured tenant {selected_tenant!r}"
+        )
+    return contract.model_copy(
+        update={
+            "request": contract.request.model_copy(
+                update={
+                    "scope": contract.request.scope.model_copy(update={"tenant_id": selected_tenant}),
+                }
+            ),
+            "knowledge_usage": [
+                item.model_copy(update={"tenant_id": selected_tenant}) for item in contract.knowledge_usage
+            ],
+        }
+    )
+
+
+def _db_path(runtime_settings: Settings | None = None) -> Path:
+    active_settings = runtime_settings or settings
+    custom = active_settings.history_db_path
     path = Path(custom) if custom else _DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
@@ -134,6 +245,14 @@ CREATE INDEX IF NOT EXISTS idx_inv_status ON investigations(status);
 CREATE INDEX IF NOT EXISTS idx_inv_user ON investigations(user_id);
 CREATE INDEX IF NOT EXISTS idx_inv_started ON investigations(started_at);
 CREATE INDEX IF NOT EXISTS idx_inv_dashboard ON investigations(dashboard_uid);
+
+CREATE TABLE IF NOT EXISTS investigation_tenant_assignments (
+    investigation_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    assignment_source TEXT NOT NULL,
+    assigned_at REAL NOT NULL,
+    FOREIGN KEY (investigation_id) REFERENCES investigations(id)
+);
 
 CREATE TABLE IF NOT EXISTS investigation_revisions (
     investigation_id   TEXT NOT NULL,
@@ -218,12 +337,25 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_investigation
 """
 
 
+def _execute_schema_statements(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a schema script without sqlite3.executescript's implicit commit."""
+    pending: list[str] = []
+    for line in script.splitlines():
+        pending.append(line)
+        statement = "\n".join(pending).strip()
+        if statement and sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            pending.clear()
+    if "\n".join(pending).strip():
+        raise RuntimeError("History schema contains an incomplete SQL statement")
+
+
 class InvestigationStore:
     """SQLite-backed investigation history."""
 
     def __init__(self, db_path: Path | None = None, *, runtime_settings: Settings | None = None):
-        self._db_path = db_path or _db_path()
         self._settings = runtime_settings or settings
+        self._db_path = db_path or _db_path(self._settings)
         self._ensure_schema()
 
     @contextmanager
@@ -243,7 +375,27 @@ class InvestigationStore:
 
     def _ensure_schema(self):
         with self._conn() as conn:
-            conn.executescript(_SCHEMA_SQL)
+            conn.execute("BEGIN IMMEDIATE")
+            investigations_existed = self._table_exists(conn, "investigations")
+            existing_columns = (
+                {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
+                if investigations_existed
+                else set()
+            )
+            tenant_column_existed = "tenant_id" in existing_columns
+            tenant_index_existed = self._index_exists(conn, "idx_inv_tenant_started")
+            tenant_migration_required = investigations_existed and (
+                not tenant_column_existed or not tenant_index_existed
+            )
+            if investigations_existed and tenant_column_existed:
+                self._require_confirmed_default_tenant_owner(conn)
+            if tenant_migration_required:
+                self._require_legacy_tenant_owner(
+                    conn,
+                    tenant_column_existed=tenant_column_existed,
+                )
+
+            _execute_schema_statements(conn, _SCHEMA_SQL)
             columns = {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
             if "stage_outcomes" not in columns:
                 conn.execute("ALTER TABLE investigations ADD COLUMN stage_outcomes TEXT NOT NULL DEFAULT '{}'")
@@ -251,23 +403,12 @@ class InvestigationStore:
                 conn.execute("ALTER TABLE investigations ADD COLUMN current_revision INTEGER NOT NULL DEFAULT 0")
             if "tenant_id" not in columns:
                 conn.execute("ALTER TABLE investigations ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
-                configured_tenant = str(self._settings.knowledge_tenant_id or "default")
-                legacy_tenant = configured_tenant if configured_tenant != "*" else "default"
-                rows = conn.execute("""SELECT i.id, r.contract_json
-                       FROM investigations i
-                       LEFT JOIN investigation_revisions r
-                         ON r.investigation_id = i.id AND r.revision = i.current_revision""").fetchall()
-                for row in rows:
-                    tenant_id = legacy_tenant
-                    if row["contract_json"]:
-                        try:
-                            payload = json.loads(row["contract_json"])
-                            scope = payload.get("request", {}).get("scope", {})
-                            if "tenant_id" in scope and scope["tenant_id"]:
-                                tenant_id = str(scope["tenant_id"])
-                        except (TypeError, ValueError):
-                            pass
-                    conn.execute("UPDATE investigations SET tenant_id=? WHERE id=?", (tenant_id, row["id"]))
+            if tenant_migration_required:
+                self._backfill_legacy_tenants(
+                    conn,
+                    tenant_column_existed=tenant_column_existed,
+                )
+            self._reconcile_tenant_assignments(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_tenant_started ON investigations(tenant_id, started_at)")
             candidate_columns = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_candidates)")}
             if "reviewed_by" not in candidate_columns:
@@ -278,6 +419,212 @@ class InvestigationStore:
                 conn.execute("ALTER TABLE knowledge_candidates ADD COLUMN applied_revision INTEGER")
         logger.info("investigation_store_init", db_path=str(self._db_path))
 
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+        return (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _index_exists(conn: sqlite3.Connection, index_name: str) -> bool:
+        return (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                (index_name,),
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _concrete_legacy_tenant(value: Any) -> str | None:
+        tenant_id = str(value or "").strip()
+        if tenant_id in {"", "default", "*"}:
+            return None
+        try:
+            return resolve_tenant_boundary("*", tenant_id)
+        except ValueError:
+            return None
+
+    def _legacy_contract_tenant(self, conn: sqlite3.Connection, investigation_id: str) -> str | None:
+        if not self._table_exists(conn, "investigation_revisions"):
+            return None
+        contract_row = conn.execute(
+            """SELECT contract_json FROM investigation_revisions
+               WHERE investigation_id=? ORDER BY revision DESC LIMIT 1""",
+            (investigation_id,),
+        ).fetchone()
+        if contract_row is None or not contract_row["contract_json"]:
+            return None
+        try:
+            payload = json.loads(contract_row["contract_json"])
+            return self._concrete_legacy_tenant(payload.get("request", {}).get("scope", {}).get("tenant_id"))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _legacy_row_tenant(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        tenant_column_existed: bool,
+    ) -> str | None:
+        if tenant_column_existed:
+            row_tenant = self._concrete_legacy_tenant(row["tenant_id"])
+            if row_tenant is not None:
+                return row_tenant
+        return self._legacy_contract_tenant(conn, str(row["id"]))
+
+    def _legacy_investigation_rows(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        tenant_column_existed: bool,
+    ) -> list[sqlite3.Row]:
+        selected = "id, tenant_id" if tenant_column_existed else "id"
+        return conn.execute(f"SELECT {selected} FROM investigations").fetchall()
+
+    def _require_legacy_tenant_owner(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        tenant_column_existed: bool,
+    ) -> None:
+        """Fail before schema mutation when wildcard history rows have no owner."""
+        configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+        if configured_tenant != "*":
+            return
+        ownerless_ids: list[str] = []
+        for row in self._legacy_investigation_rows(
+            conn,
+            tenant_column_existed=tenant_column_existed,
+        ):
+            if (
+                self._legacy_row_tenant(
+                    conn,
+                    row,
+                    tenant_column_existed=tenant_column_existed,
+                )
+                is None
+            ):
+                ownerless_ids.append(str(row["id"]))
+        if ownerless_ids:
+            logger.error(
+                "legacy_history_owner_required",
+                ownerless_count=len(ownerless_ids),
+                sample_investigation_ids=ownerless_ids[:5],
+            )
+            raise RuntimeError(
+                "Legacy investigation history has no tenant owner. Start once with knowledge_tenant_id pinned "
+                "to its owner before enabling wildcard tenancy."
+            )
+
+    def _require_confirmed_default_tenant_owner(self, conn: sqlite3.Connection) -> None:
+        """Reject synthetic default ownership left by the previous migration."""
+        configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+        if configured_tenant != "*":
+            return
+        has_assignments = self._table_exists(conn, "investigation_tenant_assignments")
+        ownerless_ids = []
+        for row in conn.execute("SELECT id FROM investigations WHERE tenant_id='default'").fetchall():
+            assignment = (
+                conn.execute(
+                    """SELECT 1 FROM investigation_tenant_assignments
+                       WHERE investigation_id=? AND tenant_id='default'""",
+                    (row["id"],),
+                ).fetchone()
+                if has_assignments
+                else None
+            )
+            if assignment is None:
+                ownerless_ids.append(str(row["id"]))
+        if ownerless_ids:
+            logger.error(
+                "legacy_history_default_owner_unconfirmed",
+                ownerless_count=len(ownerless_ids),
+                sample_investigation_ids=ownerless_ids[:5],
+            )
+            raise RuntimeError(
+                "Previously migrated investigation history has unconfirmed default-tenant ownership. "
+                "Start once with knowledge_tenant_id pinned to its owner before enabling wildcard tenancy."
+            )
+
+    def _reconcile_tenant_assignments(self, conn: sqlite3.Connection) -> None:
+        configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+        for row in conn.execute("SELECT id, tenant_id FROM investigations").fetchall():
+            assignment = conn.execute(
+                """SELECT tenant_id FROM investigation_tenant_assignments
+                   WHERE investigation_id=?""",
+                (row["id"],),
+            ).fetchone()
+            if assignment is not None:
+                assigned_tenant = str(assignment["tenant_id"])
+            elif row["tenant_id"] != "default":
+                assigned_tenant = str(row["tenant_id"])
+            elif configured_tenant != "*":
+                assigned_tenant = configured_tenant
+            else:
+                raise RuntimeError("default-tenant investigation ownership has not been confirmed")
+            conn.execute(
+                "UPDATE investigations SET tenant_id=? WHERE id=?",
+                (assigned_tenant, row["id"]),
+            )
+            conn.execute(
+                """INSERT INTO investigation_tenant_assignments (
+                       investigation_id, tenant_id, assignment_source, assigned_at
+                   ) VALUES (?, ?, 'configured_or_recorded_owner', ?)
+                   ON CONFLICT(investigation_id) DO UPDATE SET
+                       tenant_id=excluded.tenant_id,
+                       assignment_source=excluded.assignment_source,
+                       assigned_at=excluded.assigned_at""",
+                (row["id"], assigned_tenant, time.time()),
+            )
+
+    def _backfill_legacy_tenants(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        tenant_column_existed: bool,
+    ) -> None:
+        configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+        fallback_tenant = configured_tenant if configured_tenant != "*" else None
+        migrated = 0
+        for row in self._legacy_investigation_rows(conn, tenant_column_existed=True):
+            tenant_id = self._legacy_row_tenant(
+                conn,
+                row,
+                tenant_column_existed=tenant_column_existed,
+            )
+            if tenant_id is None:
+                tenant_id = fallback_tenant
+            if tenant_id is None:
+                raise RuntimeError(
+                    "Legacy investigation history has no tenant owner. Start once with knowledge_tenant_id pinned "
+                    "to its owner before enabling wildcard tenancy."
+                )
+            conn.execute("UPDATE investigations SET tenant_id=? WHERE id=?", (tenant_id, row["id"]))
+            conn.execute(
+                """INSERT INTO investigation_tenant_assignments (
+                       investigation_id, tenant_id, assignment_source, assigned_at
+                   ) VALUES (?, ?, 'legacy_migration', ?)
+                   ON CONFLICT(investigation_id) DO UPDATE SET
+                       tenant_id=excluded.tenant_id,
+                       assignment_source=excluded.assignment_source,
+                       assigned_at=excluded.assigned_at""",
+                (row["id"], tenant_id, time.time()),
+            )
+            migrated += 1
+        if migrated:
+            logger.info(
+                "legacy_history_tenants_backfilled",
+                investigation_count=migrated,
+                configured_tenant=configured_tenant,
+                partial_migration=tenant_column_existed,
+            )
+
     # ── Write operations ──────────────────────────────────────────────────
 
     def start(
@@ -285,15 +632,22 @@ class InvestigationStore:
         prompt: str,
         user_id: str = "",
         channel_id: str = "",
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> str:
         """Record the start of a new investigation. Returns investigation ID."""
+        tenant_id = self._resolve_tenant(tenant_id)
         inv_id = uuid.uuid4().hex[:16]
         with self._conn() as conn:
             conn.execute(
                 """INSERT INTO investigations (id, tenant_id, prompt, user_id, channel_id, started_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (inv_id, tenant_id or "default", prompt, user_id, channel_id, time.time()),
+            )
+            conn.execute(
+                """INSERT INTO investigation_tenant_assignments (
+                       investigation_id, tenant_id, assignment_source, assigned_at
+                   ) VALUES (?, ?, 'runtime_boundary', ?)""",
+                (inv_id, tenant_id or "default", time.time()),
             )
         return inv_id
 
@@ -790,27 +1144,51 @@ class InvestigationStore:
                 )
         return stamped
 
-    def get_snapshot(self, investigation_id: str, revision: int | None = None) -> InvestigationReplaySnapshot | None:
+    def get_snapshot(
+        self,
+        investigation_id: str,
+        revision: int | None = None,
+        *,
+        tenant_id: str | None = None,
+    ) -> InvestigationReplaySnapshot | None:
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
+            tenant_join = " JOIN investigations i ON i.id=s.investigation_id"
+            tenant_clause = " AND i.tenant_id=?"
             if revision is None:
                 row = conn.execute(
-                    """SELECT snapshot_json FROM investigation_snapshots
-                       WHERE investigation_id=? ORDER BY revision DESC LIMIT 1""",
-                    (investigation_id,),
+                    f"""SELECT s.snapshot_json FROM investigation_snapshots s{tenant_join}
+                       WHERE s.investigation_id=?{tenant_clause} ORDER BY s.revision DESC LIMIT 1""",
+                    (investigation_id, tenant_id),
                 ).fetchone()
             else:
                 row = conn.execute(
-                    """SELECT snapshot_json FROM investigation_snapshots
-                       WHERE investigation_id=? AND revision=?""",
-                    (investigation_id, revision),
+                    f"""SELECT s.snapshot_json FROM investigation_snapshots s{tenant_join}
+                       WHERE s.investigation_id=? AND s.revision=?{tenant_clause}""",
+                    (investigation_id, revision, tenant_id),
                 ).fetchone()
         return InvestigationReplaySnapshot.model_validate_json(row["snapshot_json"]) if row else None
 
-    def list_runs(self, investigation_id: str) -> list[dict[str, Any]]:
+    def _resolve_tenant(self, tenant_id: str | None) -> str:
+        return resolve_tenant_boundary(
+            str(self._settings.knowledge_tenant_id or "default"),
+            tenant_id,
+        )
+
+    def list_runs(
+        self,
+        investigation_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        selected_tenant = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM investigation_runs WHERE investigation_id=? ORDER BY started_at ASC",
-                (investigation_id,),
+                """SELECT r.* FROM investigation_runs r
+                   JOIN investigations i ON i.id=r.investigation_id
+                   WHERE r.investigation_id=? AND i.tenant_id=?
+                   ORDER BY r.started_at ASC""",
+                (investigation_id, selected_tenant),
             ).fetchall()
         runs: list[dict[str, Any]] = []
         for row in rows:
@@ -819,19 +1197,30 @@ class InvestigationStore:
             runs.append(item)
         return runs
 
-    def list_events(self, investigation_id: str, run_id: str | None = None) -> list[dict[str, Any]]:
+    def list_events(
+        self,
+        investigation_id: str,
+        run_id: str | None = None,
+        *,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        selected_tenant = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             if run_id is None:
                 rows = conn.execute(
-                    """SELECT * FROM investigation_events WHERE investigation_id=?
-                       ORDER BY created_at ASC, sequence ASC""",
-                    (investigation_id,),
+                    """SELECT e.* FROM investigation_events e
+                       JOIN investigations i ON i.id=e.investigation_id
+                       WHERE e.investigation_id=? AND i.tenant_id=?
+                       ORDER BY e.created_at ASC, e.sequence ASC""",
+                    (investigation_id, selected_tenant),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """SELECT * FROM investigation_events WHERE investigation_id=? AND run_id=?
-                       ORDER BY sequence ASC""",
-                    (investigation_id, run_id),
+                    """SELECT e.* FROM investigation_events e
+                       JOIN investigations i ON i.id=e.investigation_id
+                       WHERE e.investigation_id=? AND e.run_id=? AND i.tenant_id=?
+                       ORDER BY e.sequence ASC""",
+                    (investigation_id, run_id, selected_tenant),
                 ).fetchall()
         events: list[dict[str, Any]] = []
         for row in rows:
@@ -840,34 +1229,45 @@ class InvestigationStore:
             events.append(item)
         return events
 
-    def list_revisions(self, investigation_id: str) -> list[dict[str, Any]]:
+    def list_revisions(self, investigation_id: str, *, tenant_id: str | None = None) -> list[dict[str, Any]]:
         """List immutable contract revisions for one investigation."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT investigation_id, revision, parent_revision, schema_version,
-                          input_fingerprint, output_fingerprint, engine_version, created_at, reason
-                   FROM investigation_revisions
-                   WHERE investigation_id=?
-                   ORDER BY revision ASC""",
-                (investigation_id,),
+                """SELECT r.investigation_id, r.revision, r.parent_revision, r.schema_version,
+                           r.input_fingerprint, r.output_fingerprint, r.engine_version, r.created_at, r.reason
+                    FROM investigation_revisions r
+                    JOIN investigations i ON i.id=r.investigation_id
+                    WHERE r.investigation_id=? AND i.tenant_id=?
+                    ORDER BY r.revision ASC""",
+                (investigation_id, tenant_id),
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def get_contract(self, investigation_id: str, revision: int | None = None) -> InvestigationContract | None:
+    def get_contract(
+        self,
+        investigation_id: str,
+        revision: int | None = None,
+        *,
+        tenant_id: str | None = None,
+    ) -> InvestigationContract | None:
         """Load a contract by revision, or the current revision when omitted."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
+            tenant_join = " JOIN investigations i ON i.id=r.investigation_id"
+            tenant_clause = " AND i.tenant_id=?"
             if revision is None:
                 row = conn.execute(
-                    """SELECT contract_json FROM investigation_revisions
-                       WHERE investigation_id=?
-                       ORDER BY revision DESC LIMIT 1""",
-                    (investigation_id,),
+                    f"""SELECT r.contract_json FROM investigation_revisions r{tenant_join}
+                       WHERE r.investigation_id=?{tenant_clause}
+                       ORDER BY r.revision DESC LIMIT 1""",
+                    (investigation_id, tenant_id),
                 ).fetchone()
             else:
                 row = conn.execute(
-                    """SELECT contract_json FROM investigation_revisions
-                       WHERE investigation_id=? AND revision=?""",
-                    (investigation_id, revision),
+                    f"""SELECT r.contract_json FROM investigation_revisions r{tenant_join}
+                       WHERE r.investigation_id=? AND r.revision=?{tenant_clause}""",
+                    (investigation_id, revision, tenant_id),
                 ).fetchone()
         if row is None:
             return None
@@ -881,12 +1281,20 @@ class InvestigationStore:
             )
             return None
 
-    def _uses_legacy_v1_fingerprint(self, investigation_id: str, revision: int) -> bool:
+    def _uses_legacy_v1_fingerprint(
+        self,
+        investigation_id: str,
+        revision: int,
+        *,
+        tenant_id: str | None = None,
+    ) -> bool:
         with self._conn() as conn:
+            tenant_join = " JOIN investigations i ON i.id=r.investigation_id" if tenant_id else ""
+            tenant_clause = " AND i.tenant_id=?" if tenant_id else ""
             row = conn.execute(
-                """SELECT contract_json FROM investigation_revisions
-                   WHERE investigation_id=? AND revision=?""",
-                (investigation_id, revision),
+                f"""SELECT r.contract_json FROM investigation_revisions r{tenant_join}
+                   WHERE r.investigation_id=? AND r.revision=?{tenant_clause}""",
+                (investigation_id, revision, tenant_id) if tenant_id else (investigation_id, revision),
             ).fetchone()
         if row is None:
             return False
@@ -908,16 +1316,28 @@ class InvestigationStore:
         changes: CounterfactualChanges | None = None,
         runtime_settings: Settings | None = None,
         knowledge_service_factory: Callable[[], Any] | None = None,
+        tenant_id: str | None = None,
     ) -> InvestigationContract | None:
         """Rebuild a contract from captured inputs without external refetch."""
-        contract = self.get_contract(investigation_id, revision)
+        active_settings = runtime_settings or self._settings
+        configured_tenant = str(getattr(active_settings, "knowledge_tenant_id", "default") or "default")
+        try:
+            selected_tenant = resolve_tenant_boundary(configured_tenant, tenant_id)
+        except ValueError as exc:
+            raise ReplayError(str(exc)) from exc
+        contract = self.get_contract(investigation_id, revision, tenant_id=selected_tenant)
         if contract is None:
             return None
         legacy_v1_fingerprint = self._uses_legacy_v1_fingerprint(
             investigation_id,
             contract.investigation.revision,
+            tenant_id=selected_tenant,
         )
-        snapshot = self.get_snapshot(investigation_id, contract.investigation.revision)
+        snapshot = self.get_snapshot(
+            investigation_id,
+            contract.investigation.revision,
+            tenant_id=selected_tenant,
+        )
         run_id = self.start_run(
             investigation_id,
             run_type=InvestigationRunType.REPLAY,
@@ -960,50 +1380,56 @@ class InvestigationStore:
             return contract
         try:
             replay_snapshot = snapshot
+            if mode != ReplayMode.EXACT:
+                replay_snapshot = _normalize_legacy_snapshot_tenant(
+                    replay_snapshot,
+                    selected_tenant=selected_tenant,
+                    configured_tenant=configured_tenant,
+                )
             if mode == ReplayMode.CURRENT_ENGINE:
                 from tacit.knowledge.scope import investigation_knowledge_scope
-                from tacit.knowledge.service import get_knowledge_service
 
-                knowledge_service = (
-                    knowledge_service_factory() if knowledge_service_factory is not None else get_knowledge_service()
-                )
-                active_settings = runtime_settings or settings
-                configured_tenant = str(getattr(active_settings, "knowledge_tenant_id", "default") or "default")
-                snapshot_tenant = str(snapshot.request.tenant_id or "")
-                if configured_tenant == "*" and not snapshot_tenant:
-                    raise ReplayError("tenant_id is required for current-engine replay when knowledge_tenant_id is '*'")
-                if configured_tenant != "*" and snapshot_tenant and snapshot_tenant != configured_tenant:
-                    raise ReplayError(
-                        f"investigation tenant {snapshot_tenant!r} does not match configured tenant "
-                        f"{configured_tenant!r}"
-                    )
-                tenant_id = snapshot_tenant or configured_tenant
+                if knowledge_service_factory is not None:
+                    knowledge_service = knowledge_service_factory()
+                else:
+                    from tacit.runtime_stores import RuntimeStores
+
+                    knowledge_service = RuntimeStores(active_settings).knowledge()
                 archetype_ids = {
-                    *[match.type for match in snapshot.intent.archetypes],
-                    snapshot.intent.problem_type,
-                    *[panel.source_archetype for panel in snapshot.dashboard_spec.panels if panel.source_archetype],
+                    *[match.type for match in replay_snapshot.intent.archetypes],
+                    replay_snapshot.intent.problem_type,
+                    *[
+                        panel.source_archetype
+                        for panel in replay_snapshot.dashboard_spec.panels
+                        if panel.source_archetype
+                    ],
                 }
-                knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(
+                _, knowledge_usage = knowledge_service.create_snapshot(
                     investigation_knowledge_scope(
-                        tenant_id=tenant_id,
-                        prompt=snapshot.request.prompt,
-                        services=snapshot.intent.services,
+                        tenant_id=selected_tenant,
+                        prompt=replay_snapshot.request.prompt,
+                        services=replay_snapshot.intent.services,
                         archetype_ids=archetype_ids,
                     )
                 )
                 knowledge_usage = knowledge_service.reconcile_live_observations(
                     knowledge_usage,
-                    snapshot.evidence_observations,
+                    replay_snapshot.evidence_observations,
                 )
-                baseline_ranking = snapshot.baseline_culprit_ranking or snapshot.culprit_ranking
+                baseline_ranking = replay_snapshot.baseline_culprit_ranking or replay_snapshot.culprit_ranking
                 replay_ranking, knowledge_usage = knowledge_service.apply_to_ranking(
                     baseline_ranking,
                     knowledge_usage,
                 )
-                knowledge_snapshot = knowledge_service.snapshot_from_usage(tenant_id, knowledge_usage)
-                replay_snapshot = snapshot.model_copy(
+                knowledge_usage = _merge_current_engine_replay_usage(
+                    knowledge_usage,
+                    replay_snapshot.knowledge_usage,
+                    tenant_id=selected_tenant,
+                )
+                knowledge_snapshot = knowledge_service.snapshot_from_usage(selected_tenant, knowledge_usage)
+                replay_snapshot = replay_snapshot.model_copy(
                     update={
-                        "request": snapshot.request.model_copy(update={"tenant_id": tenant_id}),
+                        "request": replay_snapshot.request.model_copy(update={"tenant_id": selected_tenant}),
                         "culprit_ranking": replay_ranking,
                         "knowledge_snapshot_ref": knowledge_snapshot.id,
                         "knowledge_usage": knowledge_usage,
@@ -1044,7 +1470,7 @@ class InvestigationStore:
                 return rebuilt
             reason = "current-engine-replay" if mode == ReplayMode.CURRENT_ENGINE else "counterfactual-replay"
             persisted_snapshot = (
-                apply_counterfactual(snapshot, changes or CounterfactualChanges())
+                apply_counterfactual(replay_snapshot, changes or CounterfactualChanges())
                 if mode == ReplayMode.COUNTERFACTUAL
                 else replay_snapshot
             )
@@ -1091,9 +1517,16 @@ class InvestigationStore:
             )
             raise
 
-    def compare_revisions(self, investigation_id: str, left: int, right: int) -> dict[str, Any] | None:
-        left_contract = self.get_contract(investigation_id, left)
-        right_contract = self.get_contract(investigation_id, right)
+    def compare_revisions(
+        self,
+        investigation_id: str,
+        left: int,
+        right: int,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        left_contract = self.get_contract(investigation_id, left, tenant_id=tenant_id)
+        right_contract = self.get_contract(investigation_id, right, tenant_id=tenant_id)
         if left_contract is None or right_contract is None:
             return None
         left_payload = normalized_output_payload(left_contract)
@@ -1123,9 +1556,11 @@ class InvestigationStore:
         target_ref: str = "",
         created_by: str = "",
         expires_at: datetime | None = None,
+        tenant_id: str | None = None,
     ) -> KnowledgeCandidate | None:
         """Store a human correction as a reviewable knowledge candidate."""
-        contract = self.get_contract(investigation_id, revision)
+        selected_tenant = self._resolve_tenant(tenant_id)
+        contract = self.get_contract(investigation_id, revision, tenant_id=selected_tenant)
         if contract is None:
             return None
         now = utc_now()
@@ -1173,11 +1608,20 @@ class InvestigationStore:
             )
         return candidate
 
-    def list_knowledge_candidates(self, investigation_id: str) -> list[KnowledgeCandidate]:
+    def list_knowledge_candidates(
+        self,
+        investigation_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> list[KnowledgeCandidate]:
+        selected_tenant = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM knowledge_candidates WHERE investigation_id=? ORDER BY created_at ASC",
-                (investigation_id,),
+                """SELECT c.* FROM knowledge_candidates c
+                   JOIN investigations i ON i.id=c.investigation_id
+                   WHERE c.investigation_id=? AND i.tenant_id=?
+                   ORDER BY c.created_at ASC""",
+                (investigation_id, selected_tenant),
             ).fetchall()
         return [self._candidate_from_row(row) for row in rows]
 
@@ -1188,13 +1632,17 @@ class InvestigationStore:
         *,
         approved: bool,
         reviewed_by: str,
+        tenant_id: str | None = None,
     ) -> KnowledgeCandidate | None:
+        selected_tenant = self._resolve_tenant(tenant_id)
         now = utc_now()
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT * FROM knowledge_candidates WHERE id=? AND investigation_id=?",
-                (candidate_id, investigation_id),
+                """SELECT c.* FROM knowledge_candidates c
+                   JOIN investigations i ON i.id=c.investigation_id
+                   WHERE c.id=? AND c.investigation_id=? AND i.tenant_id=?""",
+                (candidate_id, investigation_id, selected_tenant),
             ).fetchone()
             if row is None:
                 return None
@@ -1206,7 +1654,11 @@ class InvestigationStore:
             updated = conn.execute(
                 """UPDATE knowledge_candidates
                    SET status=?, reviewed_by=?, reviewed_at=?, provenance_json=?
-                   WHERE id=? AND investigation_id=? AND status=?""",
+                   WHERE id=? AND investigation_id=? AND status=?
+                     AND EXISTS (
+                         SELECT 1 FROM investigations i
+                         WHERE i.id=knowledge_candidates.investigation_id AND i.tenant_id=?
+                     )""",
                 (
                     status.value,
                     reviewed_by,
@@ -1215,12 +1667,15 @@ class InvestigationStore:
                     candidate_id,
                     investigation_id,
                     KnowledgeCandidateStatus.PENDING_REVIEW.value,
+                    selected_tenant,
                 ),
             )
             if updated.rowcount != 1:
                 current_row = conn.execute(
-                    "SELECT * FROM knowledge_candidates WHERE id=? AND investigation_id=?",
-                    (candidate_id, investigation_id),
+                    """SELECT c.* FROM knowledge_candidates c
+                       JOIN investigations i ON i.id=c.investigation_id
+                       WHERE c.id=? AND c.investigation_id=? AND i.tenant_id=?""",
+                    (candidate_id, investigation_id, selected_tenant),
                 ).fetchone()
                 return self._candidate_from_row(current_row) if current_row is not None else None
         return candidate.model_copy(
@@ -1236,17 +1691,26 @@ class InvestigationStore:
         self,
         investigation_id: str,
         candidate_id: str,
+        *,
+        tenant_id: str | None = None,
     ) -> InvestigationContract | None:
+        selected_tenant = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT * FROM knowledge_candidates WHERE id=? AND investigation_id=?",
-                (candidate_id, investigation_id),
+                """SELECT c.* FROM knowledge_candidates c
+                   JOIN investigations i ON i.id=c.investigation_id
+                   WHERE c.id=? AND c.investigation_id=? AND i.tenant_id=?""",
+                (candidate_id, investigation_id, selected_tenant),
             ).fetchone()
         if row is None:
             return None
         candidate = self._candidate_from_row(row)
         if candidate.status == KnowledgeCandidateStatus.APPLIED and candidate.applied_revision is not None:
-            return self.get_contract(candidate.investigation_id, candidate.applied_revision)
+            return self.get_contract(
+                candidate.investigation_id,
+                candidate.applied_revision,
+                tenant_id=selected_tenant,
+            )
         if candidate.status != KnowledgeCandidateStatus.APPROVED:
             return None
         if candidate.expires_at and candidate.expires_at <= utc_now():
@@ -1256,19 +1720,29 @@ class InvestigationStore:
             with self._conn() as conn:
                 conn.execute(
                     """UPDATE knowledge_candidates SET status=?, provenance_json=?
-                       WHERE id=? AND investigation_id=? AND status=?""",
+                       WHERE id=? AND investigation_id=? AND status=?
+                         AND EXISTS (
+                             SELECT 1 FROM investigations i
+                             WHERE i.id=knowledge_candidates.investigation_id AND i.tenant_id=?
+                         )""",
                     (
                         KnowledgeCandidateStatus.EXPIRED.value,
                         provenance.model_dump_json(),
                         candidate_id,
                         investigation_id,
                         KnowledgeCandidateStatus.APPROVED.value,
+                        selected_tenant,
                     ),
                 )
             return None
-        contract = self.get_contract(candidate.investigation_id)
+        contract = self.get_contract(candidate.investigation_id, tenant_id=selected_tenant)
         if contract is None or contract.investigation.revision != candidate.revision:
             return None
+        contract = _normalize_legacy_contract_tenant(
+            contract,
+            selected_tenant=selected_tenant,
+            configured_tenant=str(self._settings.knowledge_tenant_id or "default"),
+        )
         provenance = candidate.provenance.model_copy(update={"review_state": "approved"})
         decision = DecisionLogEntry(
             id=f"decision_{len(contract.decision_log) + 1:02d}",
@@ -1290,8 +1764,17 @@ class InvestigationStore:
                 "decision_log": [*contract.decision_log, decision],
             }
         )
-        snapshot = self.get_snapshot(candidate.investigation_id, contract.investigation.revision)
+        snapshot = self.get_snapshot(
+            candidate.investigation_id,
+            contract.investigation.revision,
+            tenant_id=selected_tenant,
+        )
         if snapshot is not None:
+            snapshot = _normalize_legacy_snapshot_tenant(
+                snapshot,
+                selected_tenant=selected_tenant,
+                configured_tenant=str(self._settings.knowledge_tenant_id or "default"),
+            )
             snapshot = snapshot.model_copy(
                 update={
                     "corrections": [*snapshot.corrections, CorrectionReference(correction_ref=candidate.id)],
@@ -1311,8 +1794,10 @@ class InvestigationStore:
         except StaleRevisionError:
             with self._conn() as conn:
                 current_row = conn.execute(
-                    "SELECT * FROM knowledge_candidates WHERE id=? AND investigation_id=?",
-                    (candidate_id, investigation_id),
+                    """SELECT c.* FROM knowledge_candidates c
+                       JOIN investigations i ON i.id=c.investigation_id
+                       WHERE c.id=? AND c.investigation_id=? AND i.tenant_id=?""",
+                    (candidate_id, investigation_id, selected_tenant),
                 ).fetchone()
             if current_row is not None:
                 current_candidate = self._candidate_from_row(current_row)
@@ -1320,15 +1805,25 @@ class InvestigationStore:
                     current_candidate.status == KnowledgeCandidateStatus.APPLIED
                     and current_candidate.applied_revision is not None
                 ):
-                    return self.get_contract(investigation_id, current_candidate.applied_revision)
+                    return self.get_contract(
+                        investigation_id,
+                        current_candidate.applied_revision,
+                        tenant_id=selected_tenant,
+                    )
             return None
         return persisted
 
-    def migrate_legacy_investigation(self, investigation_id: str) -> InvestigationContract | None:
-        existing = self.get_contract(investigation_id)
+    def migrate_legacy_investigation(
+        self,
+        investigation_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> InvestigationContract | None:
+        selected_tenant = self._resolve_tenant(tenant_id)
+        existing = self.get_contract(investigation_id, tenant_id=selected_tenant)
         if existing is not None:
             return existing
-        record = self.get(investigation_id)
+        record = self.get(investigation_id, tenant_id=selected_tenant)
         if record is None:
             return None
         contract = InvestigationContractAssembler().from_legacy_history(record)
@@ -1361,18 +1856,28 @@ class InvestigationStore:
 
     # ── Read operations ──────────────────────────────────────────────────
 
-    def get(self, inv_id: str) -> dict[str, Any] | None:
+    def get(self, inv_id: str, *, tenant_id: str | None = None) -> dict[str, Any] | None:
         """Get a single investigation by ID."""
-        with self._conn() as conn:
-            row = conn.execute("SELECT * FROM investigations WHERE id=?", (inv_id,)).fetchone()
-            return self._row_to_dict(row) if row else None
-
-    def get_by_dashboard(self, dashboard_uid: str) -> dict[str, Any] | None:
-        """Get investigation by dashboard UID."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT * FROM investigations WHERE dashboard_uid=?",
-                (dashboard_uid,),
+                "SELECT * FROM investigations WHERE id=? AND tenant_id=?",
+                (inv_id, tenant_id),
+            ).fetchone()
+            return self._row_to_dict(row) if row else None
+
+    def get_by_dashboard(
+        self,
+        dashboard_uid: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Get investigation by dashboard UID."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM investigations WHERE dashboard_uid=? AND tenant_id=?",
+                (dashboard_uid, tenant_id),
             ).fetchone()
             return self._row_to_dict(row) if row else None
 
@@ -1385,13 +1890,11 @@ class InvestigationStore:
         tenant_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """List recent investigations, newest first."""
+        tenant_id = self._resolve_tenant(tenant_id)
         query = "SELECT * FROM investigations"
         params: list[Any] = []
-        conditions: list[str] = []
-
-        if tenant_id:
-            conditions.append("tenant_id=?")
-            params.append(tenant_id)
+        conditions: list[str] = ["tenant_id=?"]
+        params.append(tenant_id)
 
         if status:
             conditions.append("status=?")
@@ -1410,7 +1913,11 @@ class InvestigationStore:
             return [self._row_to_dict(r) for r in rows]
 
     def stats(self, *, tenant_id: str | None = None) -> dict[str, Any]:
-        """Aggregate stats across all investigations."""
+        """Aggregate one tenant's stats; wildcard runtimes must select a tenant."""
+        tenant_id = resolve_tenant_boundary(
+            str(self._settings.knowledge_tenant_id or "default"),
+            tenant_id,
+        )
         with self._conn() as conn:
             query = """
                 SELECT
@@ -1426,10 +1933,8 @@ class InvestigationStore:
                     SUM(CASE WHEN path_used='freeform' THEN 1 ELSE 0 END) as freeform_path
                 FROM investigations
             """
-            params: tuple[Any, ...] = ()
-            if tenant_id:
-                query += " WHERE tenant_id=?"
-                params = (tenant_id,)
+            query += " WHERE tenant_id=?"
+            params: tuple[Any, ...] = (tenant_id,)
             row = conn.execute(query, params).fetchone()
             return dict(row) if row else {}
 

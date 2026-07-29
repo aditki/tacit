@@ -16,6 +16,12 @@ import structlog
 from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from tacit.catalog import catalog_for_services, metric_matches_services
 from tacit.config import settings
+from tacit.knowledge.usage import (
+    KnowledgeRevisionRef,
+    KnowledgeStageUse,
+    KnowledgeUsageEffect,
+    KnowledgeUsageStage,
+)
 from tacit.models.schemas import (
     DashboardSpec,
     Intent,
@@ -40,23 +46,40 @@ class KnowledgeQueryUse:
     """One governed mapping's contribution to a compiled query."""
 
     knowledge_ref: str
+    knowledge_revision: int
     source_archetype: str
     panel_title: str
     query_expr: str
     datasource_uid: str
     datasource_type: str
     query_language: str
+    requirement_id: str = ""
 
     @classmethod
-    def from_query(cls, knowledge_ref: str, panel: PanelSpec, query: PanelQuery) -> KnowledgeQueryUse:
+    def from_query(
+        cls,
+        knowledge_ref: str | KnowledgeRevisionRef,
+        panel: PanelSpec,
+        query: PanelQuery,
+        *,
+        knowledge_revision: int = 0,
+        requirement_id: str = "",
+    ) -> KnowledgeQueryUse:
+        if isinstance(knowledge_ref, KnowledgeRevisionRef):
+            knowledge_revision = knowledge_ref.knowledge_revision
+            raw_ref = knowledge_ref.knowledge_ref
+        else:
+            raw_ref = knowledge_ref
         return cls(
-            knowledge_ref=knowledge_ref,
+            knowledge_ref=raw_ref,
+            knowledge_revision=knowledge_revision,
             source_archetype=panel.source_archetype,
             panel_title=panel.title,
             query_expr=query.expr,
             datasource_uid=query.datasource_uid,
             datasource_type=query.datasource_type,
             query_language=query.query_language,
+            requirement_id=requirement_id,
         )
 
     def query_identity(self) -> tuple[str, str, str, str, str, str]:
@@ -688,10 +711,10 @@ def _legacy_metric_signal_details(
     target_language: str,
     tenant_id: str = "default",
     knowledge_scope: Any | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, KnowledgeRevisionRef | None]:
     """Infer the taxonomy signal represented by a legacy required metric."""
     if not catalog:
-        return "", ""
+        return "", None
     exemplar = catalog[0]
     pseudo = MetricEntry(
         name=default_metric,
@@ -700,7 +723,7 @@ def _legacy_metric_signal_details(
         datasource_type=exemplar.datasource_type,
         query_language=target_language or exemplar.query_language,
     )
-    candidates: list[tuple[str, float, str]] = []
+    candidates: list[tuple[str, float, KnowledgeRevisionRef | None]] = []
     for signal in store.list_signal_types(tenant_id=tenant_id):
         signal_type = str(signal.get("signal_type", ""))
         if not signal_type:
@@ -714,9 +737,9 @@ def _legacy_metric_signal_details(
             knowledge_scope=knowledge_scope,
         )
         if matches:
-            candidates.append((signal_type, matches[0].confidence, matches[0].governance_ref))
+            candidates.append((signal_type, matches[0].confidence, matches[0].knowledge_revision_ref))
     candidates.sort(key=lambda item: item[1], reverse=True)
-    return (candidates[0][0], candidates[0][2]) if candidates else ("", "")
+    return (candidates[0][0], candidates[0][2]) if candidates else ("", None)
 
 
 def _legacy_metric_signal(
@@ -791,7 +814,7 @@ def _resolve_legacy_required_metrics(
     intent: Intent,
     target_language: str,
     tenant_id: str = "default",
-    governance_refs_by_default_metric: dict[str, set[str]] | None = None,
+    governance_refs_by_default_metric: dict[str, set[KnowledgeRevisionRef]] | None = None,
     knowledge_scope: Any | None = None,
 ) -> dict[str, str]:
     """Resolve legacy required_metrics through the semantic taxonomy."""
@@ -851,8 +874,8 @@ def _resolve_legacy_required_metrics(
                 (match for match in resolved_details if match.entry == candidate and match.confidence == confidence),
                 None,
             )
-            if selected_match is not None and selected_match.governance_ref:
-                refs.add(selected_match.governance_ref)
+            if selected_match is not None and selected_match.knowledge_revision_ref is not None:
+                refs.add(selected_match.knowledge_revision_ref)
         logger.info(
             "legacy_metric_signal_resolved",
             archetype=archetype.id,
@@ -871,7 +894,7 @@ def _resolve_archetype_signals(
     target_language: str = "promql",
     signal_store: Any | None = None,
     tenant_id: str = "default",
-    governance_refs_by_resolved_metric: dict[str, set[str]] | None = None,
+    governance_refs_by_template_query: dict[tuple[int, int], set[KnowledgeRevisionRef]] | None = None,
     knowledge_scope: Any | None = None,
 ) -> InvestigationArchetype:
     """Resolve signal bindings and substitute metrics if needed.
@@ -891,7 +914,7 @@ def _resolve_archetype_signals(
         store = resolve_signal_store(signal_store, get_signal_store)
         if store is None:
             return archetype
-        refs_by_default_metric: dict[str, set[str]] = {}
+        refs_by_default_metric: dict[str, set[KnowledgeRevisionRef]] = {}
         substitutions = store.resolve_signals_for_archetype(
             signal_bindings=archetype.signal_bindings,
             catalog=catalog,
@@ -902,7 +925,7 @@ def _resolve_archetype_signals(
             target_query_language=target_language,
             tenant_id=tenant_id,
             knowledge_scope=knowledge_scope,
-            governance_refs_by_default_metric=refs_by_default_metric,
+            governance_revision_refs_by_default_metric=refs_by_default_metric,
         )
         legacy_substitutions = _resolve_legacy_required_metrics(
             archetype,
@@ -922,12 +945,18 @@ def _resolve_archetype_signals(
                 archetype=archetype.id,
                 substitutions=substitutions,
             )
+            if governance_refs_by_template_query is not None:
+                for panel_index, panel in enumerate(archetype.panels):
+                    for query_index, query in enumerate(panel.queries):
+                        refs = {
+                            revision_ref
+                            for default_metric in substitutions
+                            if _query_references_metric(query.expr, default_metric)
+                            for revision_ref in refs_by_default_metric.get(default_metric, set())
+                        }
+                        if refs:
+                            governance_refs_by_template_query[(panel_index, query_index)] = refs
             resolved_archetype = _apply_metric_substitutions(archetype, substitutions)
-            if governance_refs_by_resolved_metric is not None:
-                for default_metric, resolved_metric in substitutions.items():
-                    refs = refs_by_default_metric.get(default_metric, set())
-                    if refs:
-                        governance_refs_by_resolved_metric.setdefault(resolved_metric, set()).update(refs)
             return resolved_archetype
     except Exception:
         logger.warning("signal_resolution_failed", archetype=archetype.id, exc_info=True)
@@ -957,7 +986,7 @@ def compile_archetype(
     target_language: 'promql' (default) or 'signalflow'
     """
     # Resolve signals → actual metrics before compiling templates
-    governance_refs_by_resolved_metric: dict[str, set[str]] = {}
+    governance_refs_by_template_query: dict[tuple[int, int], set[KnowledgeRevisionRef]] = {}
     archetype = _resolve_archetype_signals(
         archetype,
         catalog,
@@ -965,7 +994,7 @@ def compile_archetype(
         target_language,
         signal_store,
         tenant_id,
-        governance_refs_by_resolved_metric,
+        governance_refs_by_template_query,
         knowledge_scope,
     )
 
@@ -994,9 +1023,10 @@ def compile_archetype(
     panels: list[PanelSpec] = []
     skipped = 0
 
-    for pt in archetype.panels:
+    for panel_index, pt in enumerate(archetype.panels):
         panel_queries: list[PanelQuery] = []
-        for qt in pt.queries:
+        query_uses: list[tuple[PanelQuery, set[KnowledgeRevisionRef]]] = []
+        for query_index, qt in enumerate(pt.queries):
             # Determine whether this query is PromQL. An explicit non-PromQL
             # query_language (signalflow/logql/cloudwatch/…) — or a SignalFx
             # datasource tag — marks it as a native query to honor verbatim.
@@ -1037,17 +1067,22 @@ def compile_archetype(
                     native_metric_names,
                 )
 
-            panel_queries.append(
-                PanelQuery(
-                    expr=expr,
-                    legend_format=qt.legend_format,
-                    datasource_uid=query_target.datasource_uid,
-                    datasource_type=query_target.datasource_type,
-                    query_language=query_target.query_language,
-                    cloudwatch_namespace=qt.cloudwatch_namespace,
-                    cloudwatch_stat=qt.cloudwatch_stat,
-                    cloudwatch_dimensions=qt.cloudwatch_dimensions,
-                    cloudwatch_region=qt.cloudwatch_region,
+            compiled_query = PanelQuery(
+                expr=expr,
+                legend_format=qt.legend_format,
+                datasource_uid=query_target.datasource_uid,
+                datasource_type=query_target.datasource_type,
+                query_language=query_target.query_language,
+                cloudwatch_namespace=qt.cloudwatch_namespace,
+                cloudwatch_stat=qt.cloudwatch_stat,
+                cloudwatch_dimensions=qt.cloudwatch_dimensions,
+                cloudwatch_region=qt.cloudwatch_region,
+            )
+            panel_queries.append(compiled_query)
+            query_uses.append(
+                (
+                    compiled_query,
+                    governance_refs_by_template_query.get((panel_index, query_index), set()),
                 )
             )
 
@@ -1055,17 +1090,21 @@ def compile_archetype(
             skipped += 1
             continue
 
-        panels.append(
-            PanelSpec(
-                title=pt.title,
-                description=pt.description,
-                panel_type=pt.panel_type,
-                row=pt.row,
-                source_archetype=archetype.id,
-                queries=panel_queries,
-                unit=pt.unit,
-            )
+        compiled_panel = PanelSpec(
+            title=pt.title,
+            description=pt.description,
+            panel_type=pt.panel_type,
+            row=pt.row,
+            source_archetype=archetype.id,
+            queries=panel_queries,
+            unit=pt.unit,
         )
+        panels.append(compiled_panel)
+        if knowledge_query_uses is not None:
+            for query, refs in query_uses:
+                knowledge_query_uses.extend(
+                    KnowledgeQueryUse.from_query(revision_ref, compiled_panel, query) for revision_ref in sorted(refs)
+                )
 
     # Build title from archetype name + service
     service_name = intent.services[0] if intent.services else "Service"
@@ -1077,19 +1116,6 @@ def compile_archetype(
         timerange=intent.timerange or archetype.default_timerange,
         panels=panels,
     )
-    if knowledge_query_uses is not None:
-        for panel in spec.panels:
-            for query in panel.queries:
-                refs = {
-                    knowledge_ref
-                    for metric, metric_refs in governance_refs_by_resolved_metric.items()
-                    if metric and _query_references_metric(query.expr, metric)
-                    for knowledge_ref in metric_refs
-                }
-                knowledge_query_uses.extend(
-                    KnowledgeQueryUse.from_query(knowledge_ref, panel, query) for knowledge_ref in sorted(refs)
-                )
-
     logger.info(
         "archetype_compiled",
         archetype=archetype.id,
@@ -1142,6 +1168,8 @@ def _archetype_live_coverage(
     signal_store: Any | None = None,
     tenant_id: str = "default",
     knowledge_scope: Any | None = None,
+    knowledge_stage_uses: list[KnowledgeStageUse] | None = None,
+    excluded_knowledge_refs: set[KnowledgeRevisionRef] | None = None,
 ) -> float | None:
     """Fraction of an archetype's declared evidence covered by the live catalog.
 
@@ -1176,7 +1204,34 @@ def _archetype_live_coverage(
             continue
         if store is not None:
             try:
-                if store.resolve_signal(
+                resolve_details = getattr(store, "resolve_signal_details", None)
+                matches = (
+                    resolve_details(
+                        sig,
+                        coverage_catalog,
+                        context_service=services[0] if services else "",
+                        context_datasource_type=_datasource_type_for_language(target_language),
+                        context_archetype=archetype.id,
+                        tenant_id=tenant_id,
+                        knowledge_scope=knowledge_scope,
+                        **({"excluded_knowledge_refs": excluded_knowledge_refs} if excluded_knowledge_refs else {}),
+                    )
+                    if callable(resolve_details)
+                    else []
+                )
+                if matches:
+                    resolved += 1
+                    revision_ref = matches[0].knowledge_revision_ref
+                    if knowledge_stage_uses is not None and revision_ref is not None:
+                        knowledge_stage_uses.append(
+                            KnowledgeStageUse(
+                                revision_ref=revision_ref,
+                                stage=KnowledgeUsageStage.ARCHETYPE_SELECTION,
+                                effect=KnowledgeUsageEffect.ARCHETYPE_SELECTED_BY_LIVE_COVERAGE,
+                                target_ref=f"archetype:{archetype.id}",
+                            )
+                        )
+                elif not callable(resolve_details) and store.resolve_signal(
                     sig,
                     coverage_catalog,
                     context_service=services[0] if services else "",
@@ -1213,6 +1268,7 @@ def rank_archetypes_by_coverage(
     signal_store: Any | None = None,
     tenant_id: str = "default",
     knowledge_scope: Any | None = None,
+    knowledge_stage_uses: list[KnowledgeStageUse] | None = None,
 ) -> list[tuple[InvestigationArchetype, float]]:
     """Re-rank archetypes by classifier_confidence × live signal coverage.
 
@@ -1225,42 +1281,81 @@ def rank_archetypes_by_coverage(
     if not ranked_archetypes:
         return ranked_archetypes
 
-    scored: list[tuple[InvestigationArchetype, float, float, float]] = []
-    for arch, confidence in ranked_archetypes:
-        coverage = _archetype_live_coverage(
-            arch,
-            catalog,
-            target_language,
-            services,
-            signal_store,
-            tenant_id,
-            knowledge_scope,
-        )
-        # Unknown coverage (no declared signals) keeps the classifier confidence.
+    ScoredArchetype = tuple[InvestigationArchetype, float, float, float, tuple[KnowledgeStageUse, ...]]
+
+    def effective_score(arch: InvestigationArchetype, confidence: float, coverage: float | None) -> float:
         effective = confidence if coverage is None else confidence * coverage
         is_learned = bool({"learned", "auto-generated"} & set(arch.tags))
         if is_learned and coverage is not None and coverage >= settings.learned_archetype_min_coverage:
-            # Learned and classifier retrieval scores are not calibrated on
-            # the same scale. Prefer learned context only with strong live
-            # evidence, and keep the adjustment deliberately bounded.
             effective += settings.learned_archetype_boost * coverage
-        scored.append((arch, confidence, coverage if coverage is not None else -1.0, effective))
+        return effective
 
-    scored.sort(key=lambda x: x[3], reverse=True)
-
-    kept: list[tuple[InvestigationArchetype, float]] = []
-    for rank, (arch, confidence, coverage, effective) in enumerate(scored):
-        if rank > 0 and coverage >= 0.0 and coverage < min_secondary_coverage:
-            logger.info(
-                "archetype_dropped_low_coverage",
-                archetype=arch.id,
-                confidence=confidence,
-                coverage=round(coverage, 3),
+    def score_archetypes(excluded_refs: set[KnowledgeRevisionRef] | None = None) -> list[ScoredArchetype]:
+        scored_candidates: list[ScoredArchetype] = []
+        for arch, confidence in ranked_archetypes:
+            candidate_knowledge_uses: list[KnowledgeStageUse] = []
+            coverage = _archetype_live_coverage(
+                arch,
+                catalog,
+                target_language,
+                services,
+                signal_store,
+                tenant_id,
+                knowledge_scope,
+                candidate_knowledge_uses,
+                excluded_refs,
             )
-            continue
-        kept.append((arch, confidence))
-        if max_archetypes is not None and len(kept) >= max_archetypes:
-            break
+            scored_candidates.append(
+                (
+                    arch,
+                    confidence,
+                    coverage if coverage is not None else -1.0,
+                    effective_score(arch, confidence, coverage),
+                    tuple(candidate_knowledge_uses),
+                )
+            )
+        return sorted(scored_candidates, key=lambda item: item[3], reverse=True)
+
+    def select(scored_candidates: list[ScoredArchetype], *, emit_diagnostics: bool) -> list[ScoredArchetype]:
+        selected: list[ScoredArchetype] = []
+        for rank, candidate in enumerate(scored_candidates):
+            arch, confidence, coverage, _, _ = candidate
+            if rank > 0 and coverage >= 0.0 and coverage < min_secondary_coverage:
+                if emit_diagnostics:
+                    logger.info(
+                        "archetype_dropped_low_coverage",
+                        archetype=arch.id,
+                        confidence=confidence,
+                        coverage=round(coverage, 3),
+                    )
+                continue
+            selected.append(candidate)
+            if max_archetypes is not None and len(selected) >= max_archetypes:
+                break
+        return selected
+
+    selected = select(score_archetypes(), emit_diagnostics=True)
+    kept = [(arch, confidence) for arch, confidence, _, _, _ in selected]
+    selected_knowledge_uses = [use for _, _, _, _, uses in selected for use in uses]
+    if knowledge_stage_uses is not None and selected_knowledge_uses:
+        selected_ids = [arch.id for arch, _, _, _, _ in selected]
+        selected_positions = {archetype_id: index for index, archetype_id in enumerate(selected_ids)}
+        causal_targets: dict[KnowledgeRevisionRef, set[str]] = {}
+        for revision_ref in {use.revision_ref for use in selected_knowledge_uses}:
+            counterfactual = select(
+                score_archetypes({revision_ref}),
+                emit_diagnostics=False,
+            )
+            counterfactual_positions = {arch.id: index for index, (arch, _, _, _, _) in enumerate(counterfactual)}
+            causal_targets[revision_ref] = {
+                archetype_id
+                for archetype_id, selected_position in selected_positions.items()
+                if counterfactual_positions.get(archetype_id) != selected_position
+            }
+        for use in selected_knowledge_uses:
+            target_archetype = use.target_ref.removeprefix("archetype:")
+            if target_archetype in causal_targets.get(use.revision_ref, set()) and use not in knowledge_stage_uses:
+                knowledge_stage_uses.append(use)
 
     return kept
 

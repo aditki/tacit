@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tacit.api.app import create_app
@@ -112,7 +113,10 @@ def test_preranking_tolerates_feedback_store_initialization_failure():
 
 
 def test_feedback_store_isolates_duplicate_dashboard_uids_by_tenant(tmp_path):
-    store = FeedbackStore(tmp_path / "feedback.db")
+    store = FeedbackStore(
+        tmp_path / "feedback.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
     store.record_provenance(
         "shared-dashboard",
         "Tenant A prompt",
@@ -143,6 +147,35 @@ def test_feedback_store_isolates_duplicate_dashboard_uids_by_tenant(tmp_path):
     assert [row["reviewer"] for row in store.get_feedback("shared-dashboard", tenant_id="tenant-a")] == ["reviewer-a"]
     assert store.get_aggregate_stats(tenant_id="tenant-a")["useful_rate"] == 1.0
     assert store.get_aggregate_stats(tenant_id="tenant-b")["useful_rate"] == 0
+
+
+def test_wildcard_feedback_store_requires_an_explicit_tenant(tmp_path):
+    store = FeedbackStore(
+        tmp_path / "feedback.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
+
+    operations = [
+        lambda: store.record_provenance("dashboard", "Prompt"),
+        lambda: store.get_provenance("dashboard"),
+        lambda: store.submit_feedback("dashboard", overall_useful=True),
+        lambda: store.get_feedback("dashboard"),
+        lambda: store.get_aggregate_stats(),
+        lambda: store.analyze(),
+    ]
+    for operation in operations:
+        with pytest.raises(ValueError, match="tenant"):
+            operation()
+
+
+def test_feedback_store_rejects_cross_tenant_calls_in_a_pinned_runtime(tmp_path):
+    store = FeedbackStore(
+        tmp_path / "feedback.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+
+    with pytest.raises(ValueError, match="Tenant access denied"):
+        store.get_aggregate_stats(tenant_id="tenant-b")
 
 
 def test_feedback_migration_uses_the_configured_pinned_tenant(tmp_path):
@@ -187,8 +220,106 @@ def test_feedback_migration_uses_the_configured_pinned_tenant(tmp_path):
     )
 
     assert store.get_provenance("legacy-dashboard", tenant_id="tenant-a") is not None
-    assert store.get_provenance("legacy-dashboard", tenant_id="default") is None
+    with pytest.raises(ValueError, match="Tenant access denied"):
+        store.get_provenance("legacy-dashboard", tenant_id="default")
     assert store.get_feedback("legacy-dashboard", tenant_id="tenant-a")[0]["reviewer"] == "legacy-reviewer"
+
+
+def test_wildcard_feedback_migration_refuses_ownerless_rows_before_schema_mutation(tmp_path):
+    db_path = tmp_path / "ownerless-feedback.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""CREATE TABLE dashboard_provenance (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   dashboard_uid TEXT NOT NULL UNIQUE
+               );
+               INSERT INTO dashboard_provenance (dashboard_uid) VALUES ('private-dashboard');""")
+
+    with pytest.raises(RuntimeError, match="Legacy feedback data has no tenant owner"):
+        FeedbackStore(
+            db_path,
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(dashboard_provenance)")}
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "tenant_id" not in columns
+    assert "dashboard_provenance_legacy_tenant" not in tables
+    assert "feedback" not in tables
+
+
+def test_wildcard_feedback_migration_rebuilds_empty_legacy_tables(tmp_path):
+    db_path = tmp_path / "empty-legacy-feedback.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""CREATE TABLE dashboard_provenance (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   dashboard_uid TEXT NOT NULL UNIQUE,
+                   prompt TEXT NOT NULL,
+                   problem_type TEXT NOT NULL DEFAULT '',
+                   archetypes TEXT NOT NULL DEFAULT '[]',
+                   metrics_used TEXT NOT NULL DEFAULT '[]',
+                   panel_count INTEGER NOT NULL DEFAULT 0,
+                   path_used TEXT NOT NULL DEFAULT '',
+                   dashboard_url TEXT NOT NULL DEFAULT '',
+                   user_id TEXT NOT NULL DEFAULT '',
+                   channel_id TEXT NOT NULL DEFAULT '',
+                   created_at REAL NOT NULL
+               );
+               CREATE TABLE feedback (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   dashboard_uid TEXT NOT NULL,
+                   reviewer TEXT NOT NULL DEFAULT '',
+                   symptom_visibility INTEGER,
+                   root_cause_support INTEGER,
+                   noise_level INTEGER,
+                   investigation_speed INTEGER,
+                   overall_useful INTEGER,
+                   comment TEXT NOT NULL DEFAULT '',
+                   created_at REAL NOT NULL
+               );""")
+
+    store = FeedbackStore(
+        db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
+    store.record_provenance("tenant-a-dashboard", "Tenant A prompt", tenant_id="tenant-a")
+
+    assert store.get_provenance("tenant-a-dashboard", tenant_id="tenant-a") is not None
+    assert store.get_provenance("tenant-a-dashboard", tenant_id="default") is None
+    with sqlite3.connect(db_path) as conn:
+        provenance_columns = {row[1] for row in conn.execute("PRAGMA table_info(dashboard_provenance)")}
+        feedback_columns = {row[1] for row in conn.execute("PRAGMA table_info(feedback)")}
+    assert "tenant_id" in provenance_columns
+    assert "tenant_id" in feedback_columns
+
+
+def test_complete_schema_default_feedback_requires_and_records_a_migration_owner(tmp_path):
+    db_path = tmp_path / "previously-migrated-feedback.db"
+    original = FeedbackStore(db_path, runtime_settings=Settings(_env_file=None))
+    original.record_provenance("legacy-dashboard", "Legacy prompt")
+    original.submit_feedback("legacy-dashboard", reviewer="legacy", overall_useful=True)
+    with original._conn() as conn:
+        conn.execute("DROP TABLE feedback_tenant_migration_metadata")
+
+    with pytest.raises(RuntimeError, match="unconfirmed default-tenant ownership"):
+        FeedbackStore(
+            db_path,
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        )
+
+    pinned = FeedbackStore(
+        db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+    assert pinned.get_provenance("legacy-dashboard", tenant_id="tenant-a") is not None
+    assert pinned.get_feedback("legacy-dashboard", tenant_id="tenant-a")[0]["reviewer"] == "legacy"
+
+    wildcard = FeedbackStore(
+        db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
+    assert wildcard.get_provenance("legacy-dashboard", tenant_id="tenant-a") is not None
+    assert wildcard.get_provenance("legacy-dashboard", tenant_id="default") is None
 
 
 def test_feedback_api_requires_and_applies_the_selected_wildcard_tenant(tmp_path):
@@ -227,7 +358,10 @@ def test_feedback_api_requires_and_applies_the_selected_wildcard_tenant(tmp_path
 
 def test_feedback_metric_quality_cache_is_tenant_scoped(tmp_path):
     invalidate_metric_quality_cache()
-    store = FeedbackStore(tmp_path / "feedback.db")
+    store = FeedbackStore(
+        tmp_path / "feedback.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
     for tenant_id, useful_metric, poor_metric in (
         ("tenant-a", "alpha_latency", "beta_latency"),
         ("tenant-b", "beta_latency", "alpha_latency"),

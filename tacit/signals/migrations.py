@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -12,6 +16,44 @@ import structlog
 from tacit.signals.schema import FTS_SCHEMA_SQL, GLOBAL_BOOTSTRAP_TENANT_ID, SCHEMA_SQL
 
 logger = structlog.get_logger()
+
+_RETARGETABLE_TENANT_TABLES = (
+    "tenant_signal_types",
+    "rejected_signal_candidates",
+    "ingested_dashboards",
+    "ingested_alerts",
+    "learned_artifacts",
+    "evidence_requirements",
+    "ownership_hints",
+    "dependency_hints",
+    "signal_mapping_candidates",
+    "learning_context_fts",
+)
+
+_GOVERNED_TENANT_TABLES = (
+    "knowledge_candidates",
+    "knowledge_candidate_evidence",
+    "promotion_decisions",
+    "entities",
+    "entity_aliases",
+    "entity_resolution_attempts",
+    "knowledge_propositions",
+    "proposition_candidates",
+    "knowledge_conflicts",
+    "corroboration_snapshots",
+    "operational_knowledge",
+    "operational_knowledge_revisions",
+    "candidate_promotions",
+    "knowledge_snapshots",
+    "knowledge_usage_events",
+    "knowledge_corrections",
+    "knowledge_events",
+)
+
+_TENANT_OWNED_TABLES = (*_RETARGETABLE_TENANT_TABLES, *_GOVERNED_TENANT_TABLES)
+
+_DEFAULT_OWNER_MARKER = "default_owner_v1"
+_SIGNAL_DEFINITION_SCOPE_MARKER = "signal_definition_scope_v1"
 
 
 @contextmanager
@@ -49,25 +91,30 @@ def ensure_schema(
     bootstrap_signal_definitions: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """Install base schema and run additive migrations."""
+    require_bootstrap_taxonomy_for_legacy_definitions(
+        conn,
+        bootstrap_signal_definitions=bootstrap_signal_definitions,
+    )
+    require_confirmed_default_tenant_owner(conn, legacy_tenant=legacy_tenant)
     require_legacy_tenant_owner(
         conn,
         legacy_tenant=legacy_tenant,
         bootstrap_signal_definitions=bootstrap_signal_definitions,
     )
     migration_tenant = legacy_tenant or "default"
-    had_tenant_signal_types = _table_exists(conn, "tenant_signal_types")
+    definition_scope_complete = _migration_marker_exists(conn, _SIGNAL_DEFINITION_SCOPE_MARKER)
     execute_script_statements(conn, SCHEMA_SQL)
-    if not had_tenant_signal_types and bootstrap_signal_definitions is not None:
-        migrate_legacy_signal_definitions(
+    if not definition_scope_complete:
+        if bootstrap_signal_definitions is not None:
+            migrate_legacy_signal_definitions(
+                conn,
+                legacy_tenant=migration_tenant,
+                bootstrap_signal_definitions=bootstrap_signal_definitions,
+            )
+        _record_migration_marker(
             conn,
-            legacy_tenant=migration_tenant,
-            bootstrap_signal_definitions=bootstrap_signal_definitions,
-        )
-    elif not had_tenant_signal_types:
-        logger.warning(
-            "legacy_signal_definition_migration_skipped",
-            tenant_id=migration_tenant,
-            reason="bootstrap_taxonomy_unavailable",
+            _SIGNAL_DEFINITION_SCOPE_MARKER,
+            migration_tenant,
         )
     ensure_learning_index(conn, legacy_tenant=migration_tenant)
     ensure_ingested_dashboard_columns(conn)
@@ -78,8 +125,222 @@ def ensure_schema(
     ensure_artifact_tenant_scope(conn, legacy_tenant=migration_tenant)
     ensure_mapping_columns(conn)
     ensure_mapping_tenant_scope(conn, legacy_tenant=migration_tenant)
+    reconcile_default_tenant_owner(conn, legacy_tenant=legacy_tenant)
     ensure_global_bootstrap_mapping_scope(conn)
+    quarantine_governed_mappings_without_revisions(conn)
+    quarantine_legacy_ungoverned_mappings(conn)
     ensure_rejected_candidate_tenant_scope(conn, legacy_tenant=migration_tenant)
+
+
+def _migration_marker_exists(conn: sqlite3.Connection, key: str) -> bool:
+    if not _table_exists(conn, "signal_tenant_migration_metadata"):
+        return False
+    return (
+        conn.execute(
+            "SELECT 1 FROM signal_tenant_migration_metadata WHERE key=?",
+            (key,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _record_migration_marker(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """INSERT INTO signal_tenant_migration_metadata (key, value, updated_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET
+               value=excluded.value,
+               updated_at=excluded.updated_at""",
+        (key, value, time.time()),
+    )
+
+
+def require_bootstrap_taxonomy_for_legacy_definitions(
+    conn: sqlite3.Connection,
+    *,
+    bootstrap_signal_definitions: dict[str, dict[str, Any]] | None,
+) -> None:
+    """Refuse to classify legacy signal definitions without the product taxonomy."""
+    if _migration_marker_exists(conn, _SIGNAL_DEFINITION_SCOPE_MARKER):
+        return
+    if not _table_exists(conn, "signal_types"):
+        return
+    has_legacy_definitions = conn.execute("SELECT 1 FROM signal_types LIMIT 1").fetchone() is not None
+    if not has_legacy_definitions or bootstrap_signal_definitions is not None:
+        return
+    logger.error("legacy_signal_definition_migration_blocked", reason="bootstrap_taxonomy_unavailable")
+    raise RuntimeError(
+        "Legacy signal definitions cannot be tenant-scoped because the bootstrap taxonomy is unavailable. "
+        "Restore tacit/data/signals.yaml and retry the migration."
+    )
+
+
+def _table_has_default_rows(conn: sqlite3.Connection, table: str) -> bool:
+    if not _table_exists(conn, table):
+        return False
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if "tenant_id" not in columns:
+        return False
+    return conn.execute(f"SELECT 1 FROM {table} WHERE tenant_id='default' LIMIT 1").fetchone() is not None
+
+
+def require_confirmed_default_tenant_owner(
+    conn: sqlite3.Connection,
+    *,
+    legacy_tenant: str | None,
+) -> None:
+    """Refuse synthetic default ownership left by an earlier tenant migration."""
+    if legacy_tenant is not None:
+        return
+    if _table_exists(conn, "signal_tenant_migration_metadata"):
+        marker = conn.execute(
+            "SELECT 1 FROM signal_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_MARKER,),
+        ).fetchone()
+        if marker is not None:
+            return
+    ambiguous_tables = [table for table in _TENANT_OWNED_TABLES if _table_has_default_rows(conn, table)]
+    if _table_exists(conn, "signal_metric_mappings"):
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
+        if "tenant_id" in columns:
+            source_filter = " AND source_type!='bootstrap'" if "source_type" in columns else ""
+            if (
+                conn.execute(
+                    f"SELECT 1 FROM signal_metric_mappings WHERE tenant_id='default'{source_filter} LIMIT 1"
+                ).fetchone()
+                is not None
+            ):
+                ambiguous_tables.append("signal_metric_mappings")
+    if ambiguous_tables:
+        tables = sorted(set(ambiguous_tables))
+        logger.error("signal_default_owner_unconfirmed", tables=tables)
+        raise RuntimeError(
+            "Previously migrated signal and knowledge data has unconfirmed default-tenant ownership. "
+            "Start once with knowledge_tenant_id pinned to its owner before enabling wildcard tenancy. "
+            "Affected tables: " + ", ".join(tables)
+        )
+
+
+def _tenant_column_exists(conn: sqlite3.Connection, table: str) -> bool:
+    if not _table_exists(conn, table):
+        return False
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    return "tenant_id" in columns
+
+
+def _archive_rows_for_migration(
+    conn: sqlite3.Connection,
+    *,
+    table: str,
+    where: str,
+    parameters: tuple[Any, ...],
+    target_tenant: str,
+    reason: str,
+) -> int:
+    rows = conn.execute(f"SELECT * FROM {table} WHERE {where}", parameters).fetchall()
+    for row in rows:
+        payload = json.dumps(dict(row), sort_keys=True, separators=(",", ":"), default=str)
+        row_key = hashlib.sha256(f"{table}\0{payload}".encode()).hexdigest()
+        original_tenant = str(row["tenant_id"]) if "tenant_id" in row.keys() else "default"
+        conn.execute(
+            """INSERT OR IGNORE INTO signal_migration_quarantine
+               (source_table, source_row_key, original_tenant_id, target_tenant_id,
+                reason, payload_json, quarantined_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (table, row_key, original_tenant, target_tenant, reason, payload, time.time()),
+        )
+    return len(rows)
+
+
+def _quarantine_default_governed_state(conn: sqlite3.Connection, target_tenant: str) -> dict[str, int]:
+    """Preserve legacy governed rows without rewriting tenant-derived identities."""
+    counts: dict[str, int] = {}
+    default_knowledge_ids: set[str] = set()
+    for table in ("operational_knowledge", "operational_knowledge_revisions"):
+        if not _tenant_column_exists(conn, table):
+            continue
+        default_knowledge_ids.update(
+            str(row["knowledge_id"])
+            for row in conn.execute(f"SELECT DISTINCT knowledge_id FROM {table} WHERE tenant_id='default'").fetchall()
+        )
+    for table in _GOVERNED_TENANT_TABLES:
+        if not _tenant_column_exists(conn, table):
+            continue
+        count = _archive_rows_for_migration(
+            conn,
+            table=table,
+            where="tenant_id='default'",
+            parameters=(),
+            target_tenant=target_tenant,
+            reason="tenant_identity_requires_remigration",
+        )
+        if count:
+            counts[table] = count
+
+    if _tenant_column_exists(conn, "signal_metric_mappings"):
+        projection_where = "tenant_id='default' AND governance_ref!=''"
+        projection_parameters: tuple[Any, ...] = ()
+        if default_knowledge_ids:
+            placeholders = ", ".join("?" for _ in default_knowledge_ids)
+            projection_where = f"({projection_where}) OR governance_ref IN ({placeholders})"
+            projection_parameters = tuple(sorted(default_knowledge_ids))
+        count = _archive_rows_for_migration(
+            conn,
+            table="signal_metric_mappings",
+            where=projection_where,
+            parameters=projection_parameters,
+            target_tenant=target_tenant,
+            reason="governed_projection_requires_rebuild",
+        )
+        if count:
+            counts["signal_metric_mappings"] = count
+
+    for table in reversed(_GOVERNED_TENANT_TABLES):
+        if _tenant_column_exists(conn, table):
+            conn.execute(f"DELETE FROM {table} WHERE tenant_id='default'")
+    if _tenant_column_exists(conn, "signal_metric_mappings"):
+        conn.execute(
+            f"DELETE FROM signal_metric_mappings WHERE {projection_where}",
+            projection_parameters,
+        )
+    return counts
+
+
+def reconcile_default_tenant_owner(
+    conn: sqlite3.Connection,
+    *,
+    legacy_tenant: str | None,
+) -> None:
+    """Record explicit ownership without rewriting immutable governed identities."""
+    marker = conn.execute(
+        "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+        (_DEFAULT_OWNER_MARKER,),
+    ).fetchone()
+    if marker is not None:
+        return
+    owner = legacy_tenant or "*"
+    if owner not in {"*", "default"}:
+        with atomic_rebuild(conn, "retarget_default_signal_owner"):
+            quarantined = _quarantine_default_governed_state(conn, owner)
+            for table in _RETARGETABLE_TENANT_TABLES:
+                if _table_has_default_rows(conn, table):
+                    conn.execute(f"UPDATE {table} SET tenant_id=? WHERE tenant_id='default'", (owner,))
+            if _table_exists(conn, "signal_metric_mappings"):
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
+                if "tenant_id" in columns:
+                    source_filter = " AND source_type!='bootstrap'" if "source_type" in columns else ""
+                    conn.execute(
+                        f"UPDATE signal_metric_mappings SET tenant_id=? " f"WHERE tenant_id='default'{source_filter}",
+                        (owner,),
+                    )
+            if quarantined:
+                logger.warning(
+                    "legacy_governed_state_quarantined",
+                    target_tenant=owner,
+                    rows=sum(quarantined.values()),
+                    tables=quarantined,
+                )
+    _record_migration_marker(conn, _DEFAULT_OWNER_MARKER, owner)
 
 
 def require_legacy_tenant_owner(
@@ -213,6 +474,8 @@ def ensure_learning_index(conn: sqlite3.Connection, *, legacy_tenant: str = "def
         if columns and "tenant_id" not in columns:
             rebuild_learning_index(conn, legacy_tenant=legacy_tenant)
     except sqlite3.OperationalError as exc:
+        if "no such module: fts5" not in str(exc).casefold():
+            raise
         logger.warning("learning_context_fts_unavailable", error=str(exc))
 
 
@@ -242,6 +505,8 @@ def ensure_mapping_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN inference_version TEXT NOT NULL DEFAULT ''")
     if "review_state" not in columns:
         conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN review_state TEXT NOT NULL DEFAULT 'trusted'")
+    if "governance_revision" not in columns:
+        conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN governance_revision INTEGER NOT NULL DEFAULT 0")
     for column in ("context_regions", "context_clusters", "context_namespaces", "context_versions"):
         if column not in columns:
             conn.execute(f"ALTER TABLE signal_metric_mappings ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'")
@@ -287,6 +552,7 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str 
     legacy_literal = _tenant_sql_literal(legacy_tenant)
     tenant_select = f"COALESCE(tenant_id, {legacy_literal})" if "tenant_id" in old_columns else legacy_literal
     governance_select = "COALESCE(governance_ref, '')" if "governance_ref" in old_columns else "''"
+    governance_revision_select = "COALESCE(governance_revision, 0)" if "governance_revision" in old_columns else "0"
     scope_selects = {
         column: column if column in old_columns else "'[]'"
         for column in ("context_regions", "context_clusters", "context_namespaces", "context_versions")
@@ -311,6 +577,7 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str 
             valid_from REAL, valid_until REAL,
             source_type TEXT NOT NULL DEFAULT 'bootstrap', source_refs TEXT NOT NULL DEFAULT '[]',
             governance_ref TEXT NOT NULL DEFAULT '',
+            governance_revision INTEGER NOT NULL DEFAULT 0,
             inference_version TEXT NOT NULL DEFAULT '', review_state TEXT NOT NULL DEFAULT 'trusted',
             use_count INTEGER NOT NULL DEFAULT 0, positive_feedback INTEGER NOT NULL DEFAULT 0,
             negative_feedback INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, last_seen REAL NOT NULL,
@@ -321,14 +588,16 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str 
              context_datasource_types, context_environments, context_archetypes,
              context_regions, context_clusters, context_namespaces, context_versions,
              valid_from, valid_until,
-             source_type, source_refs, governance_ref, inference_version, review_state, use_count,
+             source_type, source_refs, governance_ref, governance_revision,
+             inference_version, review_state, use_count,
              positive_feedback, negative_feedback, created_at, last_seen)
             SELECT id, {tenant_select}, signal_type, metric_pattern, confidence, context_services,
                    context_datasource_types, context_environments, context_archetypes,
                    {scope_selects["context_regions"]}, {scope_selects["context_clusters"]},
                    {scope_selects["context_namespaces"]}, {scope_selects["context_versions"]},
                    {valid_from_select}, {valid_until_select},
-                   source_type, source_refs, {governance_select}, inference_version, review_state, use_count,
+                   source_type, source_refs, {governance_select}, {governance_revision_select},
+                   inference_version, review_state, use_count,
                    positive_feedback, negative_feedback, created_at, last_seen
             FROM signal_metric_mappings_old""")
         conn.execute("DROP TABLE signal_metric_mappings_old")
@@ -358,6 +627,185 @@ def ensure_global_bootstrap_mapping_scope(conn: sqlite3.Connection) -> None:
             moved=moved,
             deduplicated=deduplicated,
         )
+
+
+def quarantine_legacy_ungoverned_mappings(conn: sqlite3.Connection) -> None:
+    """Prevent trusted organizational mappings from bypassing governance after upgrade."""
+    quarantined = conn.execute("""UPDATE signal_metric_mappings
+              SET review_state='candidate'
+            WHERE source_type!='bootstrap' AND governance_ref=''
+              AND review_state IN ('approved', 'trusted')""").rowcount
+    if quarantined:
+        logger.warning("legacy_ungoverned_signal_mappings_quarantined", count=quarantined)
+
+
+def _json_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or "[]")
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, list):
+        return []
+    return sorted({str(item).strip() for item in value if str(item).strip()})
+
+
+def _scope_values(scope: dict[str, Any], field: str, prefix: str) -> list[str]:
+    values = []
+    for value in _json_values(scope.get(field, [])):
+        values.append(value.removeprefix(prefix))
+    return sorted(set(values))
+
+
+def _timestamp(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+
+
+def _same_optional_float(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    return abs(float(left) - float(right)) <= 1e-9
+
+
+def _projection_matches_immutable_authority(conn: sqlite3.Connection, mapping: sqlite3.Row) -> tuple[bool, str]:
+    governance_revision = int(mapping["governance_revision"] or 0)
+    if governance_revision < 1:
+        return False, "unversioned_projection"
+    if not _table_exists(conn, "operational_knowledge") or not _table_exists(conn, "operational_knowledge_revisions"):
+        return False, "authority_table_missing"
+    authority = conn.execute(
+        """SELECT revision.content_json, revision.review_state,
+                  revision.lifecycle_status, revision.eligibility
+           FROM operational_knowledge item
+           JOIN operational_knowledge_revisions revision
+             ON revision.tenant_id=item.tenant_id
+            AND revision.knowledge_id=item.knowledge_id
+            AND revision.revision=item.current_revision
+           WHERE revision.tenant_id=? AND revision.knowledge_id=? AND revision.revision=?
+             AND item.status='active'""",
+        (mapping["tenant_id"], mapping["governance_ref"], governance_revision),
+    ).fetchone()
+    if authority is None:
+        return False, "authority_revision_missing"
+    if (
+        str(authority["review_state"]) not in {"approved", "trusted"}
+        or str(authority["lifecycle_status"]) != "active"
+        or str(authority["eligibility"]) == "ineligible"
+    ):
+        return False, "authority_revision_inactive"
+    try:
+        content = json.loads(authority["content_json"])
+    except (TypeError, json.JSONDecodeError):
+        return False, "authority_revision_invalid"
+    state = content.get("state", {})
+    if any(
+        str(state.get(field) or "") != str(authority[column])
+        for field, column in (
+            ("review_state", "review_state"),
+            ("lifecycle_status", "lifecycle_status"),
+            ("eligibility", "eligibility"),
+        )
+    ):
+        return False, "authority_state_mismatch"
+
+    proposition = content.get("proposition", {})
+    if proposition.get("kind") != "signal_mapping":
+        return False, "authority_kind_mismatch"
+    expected_signal = str(proposition.get("concept_ref") or "").removeprefix("signal:")
+    if expected_signal != str(mapping["signal_type"]):
+        return False, "authority_signal_mismatch"
+
+    resolver_mappings = content.get("resolver_payload", {}).get("mappings", [])
+    if not isinstance(resolver_mappings, list):
+        return False, "authority_resolver_payload_missing"
+    exact_mapping = next(
+        (
+            item
+            for item in resolver_mappings
+            if isinstance(item, dict) and str(item.get("metric_pattern") or "") == str(mapping["metric_pattern"])
+        ),
+        None,
+    )
+    if exact_mapping is None:
+        return False, "authority_metric_mismatch"
+    try:
+        expected_confidence = max(0.0, min(1.0, float(exact_mapping.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        expected_confidence = 0.5
+    if abs(float(mapping["confidence"]) - expected_confidence) > 1e-9:
+        return False, "authority_confidence_mismatch"
+    if str(mapping["source_type"]) != "operational_knowledge":
+        return False, "authority_source_type_mismatch"
+    if str(mapping["review_state"]) in {"approved", "trusted"} and str(mapping["review_state"]) != str(
+        authority["review_state"]
+    ):
+        return False, "authority_review_state_mismatch"
+
+    scope = content.get("scope", {})
+    expected_scope = {
+        "context_services": _scope_values(scope, "service_refs", "entity:service:"),
+        "context_environments": _scope_values(scope, "environment_refs", "environment:"),
+        "context_archetypes": _scope_values(scope, "archetype_refs", "archetype:"),
+        "context_regions": _scope_values(scope, "region_refs", "region:"),
+        "context_clusters": _scope_values(scope, "cluster_refs", "cluster:"),
+        "context_namespaces": _scope_values(scope, "namespace_refs", "namespace:"),
+        "context_versions": _scope_values(scope, "version_constraints", "version:"),
+        "context_datasource_types": sorted(
+            {
+                value
+                for item in resolver_mappings
+                if isinstance(item, dict)
+                for value in _json_values(item.get("context_datasource_types", []))
+            }
+        ),
+    }
+    for field, expected_values in expected_scope.items():
+        if _json_values(mapping[field]) != expected_values:
+            return False, f"authority_{field}_mismatch"
+
+    try:
+        expected_valid_from = _timestamp(scope.get("valid_from"))
+        expected_valid_until = _timestamp(scope.get("valid_until"))
+    except (TypeError, ValueError):
+        return False, "authority_validity_invalid"
+    if not _same_optional_float(mapping["valid_from"], expected_valid_from):
+        return False, "authority_valid_from_mismatch"
+    if not _same_optional_float(mapping["valid_until"], expected_valid_until):
+        return False, "authority_valid_until_mismatch"
+    expected_inference_version = f"{content.get('policy_id', '')}:{content.get('policy_version', '')}"
+    if str(mapping["inference_version"] or "") != expected_inference_version:
+        return False, "authority_policy_mismatch"
+    return True, "validated"
+
+
+def quarantine_governed_mappings_without_revisions(conn: sqlite3.Connection) -> None:
+    """Quarantine projections that immutable authority cannot validate exactly."""
+    rows = conn.execute("SELECT * FROM signal_metric_mappings WHERE governance_ref!=''").fetchall()
+    invalid: list[tuple[sqlite3.Row, str]] = []
+    for row in rows:
+        matches, reason = _projection_matches_immutable_authority(conn, row)
+        if not matches:
+            invalid.append((row, reason))
+    if not invalid:
+        return
+    conn.executemany(
+        "UPDATE signal_metric_mappings SET review_state='candidate' WHERE id=?",
+        [(row["id"],) for row, _ in invalid],
+    )
+    reason_counts: dict[str, int] = {}
+    for _, reason in invalid:
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    logger.warning(
+        "governed_signal_mapping_revision_unknown",
+        mappings=len(invalid),
+        quarantined=sum(str(row["review_state"]) != "candidate" for row, _ in invalid),
+        reasons=reason_counts,
+        sample_patterns=sorted({str(row["metric_pattern"]) for row, _ in invalid})[:5],
+    )
 
 
 def ensure_ingested_dashboard_backend_scope(

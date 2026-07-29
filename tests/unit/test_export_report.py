@@ -135,10 +135,13 @@ class FakeSignalStore:
 
 
 @pytest.fixture
-def fake_stores(monkeypatch):
-    monkeypatch.setattr("tacit.history.get_investigation_store", lambda: FakeHistoryStore())
-    monkeypatch.setattr("tacit.feedback.get_feedback_store", lambda: FakeFeedbackStore())
-    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: FakeSignalStore())
+def fake_stores():
+    return SimpleNamespace(
+        settings=Settings(_env_file=None),
+        history=FakeHistoryStore,
+        feedback=FakeFeedbackStore,
+        signals=FakeSignalStore,
+    )
 
 
 def test_assessment_report_scopes_every_store_to_the_configured_tenant():
@@ -199,7 +202,7 @@ def test_assessment_report_scopes_every_store_to_the_configured_tenant():
 def test_anonymous_export_writes_safe_bundle_files(tmp_path: Path, fake_stores):
     output = tmp_path / "bundle.tar.gz"
 
-    result = export_assessment_report(output=output, anonymous=True, validate=True)
+    result = export_assessment_report(output=output, anonymous=True, validate=True, stores=fake_stores)
 
     assert result.output_path == output.resolve()
     assert result.validation_report["passed"] is True
@@ -234,7 +237,7 @@ def test_anonymous_export_includes_evaluation_summary_when_results_exist(tmp_pat
     monkeypatch.setenv("TACIT_EVALUATION_RESULTS_DIR", str(evaluation_dir))
     output = tmp_path / "bundle.tar.gz"
 
-    result = export_assessment_report(output=output, anonymous=True, validate=True)
+    result = export_assessment_report(output=output, anonymous=True, validate=True, stores=fake_stores)
 
     assert result.validation_report["passed"] is True
     with tarfile.open(output, "r:gz") as tar:
@@ -257,7 +260,7 @@ def test_anonymous_export_includes_evaluation_summary_when_results_exist(tmp_pat
 def test_raw_export_includes_local_details(tmp_path: Path, fake_stores):
     output = tmp_path / "raw.tar.gz"
 
-    result = export_assessment_report(output=output, anonymous=False)
+    result = export_assessment_report(output=output, anonymous=False, stores=fake_stores)
 
     with tarfile.open(output, "r:gz") as tar:
         names = tar.getnames()

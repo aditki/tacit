@@ -73,7 +73,11 @@ def build_pipeline_dependencies(
             from tacit.knowledge.repository import KnowledgeRepository
             from tacit.knowledge.service import KnowledgeService
 
-            scoped_knowledge_service = KnowledgeService(KnowledgeRepository(db_path))
+            scoped_knowledge_service = KnowledgeService(
+                KnowledgeRepository(db_path),
+                signal_store=signal_store,
+                runtime_settings=runtime_settings,
+            )
             scoped_knowledge_path = db_path
         return scoped_knowledge_service
 
@@ -156,7 +160,11 @@ def resolve_knowledge_service(
         from tacit.knowledge.repository import KnowledgeRepository
         from tacit.knowledge.service import KnowledgeService
 
-        return KnowledgeService(KnowledgeRepository(db_path))
+        return KnowledgeService(
+            KnowledgeRepository(db_path),
+            signal_store=active_signal_store,
+            runtime_settings=deps.settings,
+        )
     logger.error(
         "knowledge_service_scoped_store_unavailable",
         signal_store_type=type(active_signal_store).__name__ if active_signal_store is not None else "none",

@@ -275,9 +275,11 @@ async def create_correction(
     request: Request,
     history_store: Any = Depends(get_history_store),
 ):
+    selected_tenant = _tenant(request)
     contract = history_store.get_contract(
         payload.investigation_id,
         payload.investigation_revision,
+        tenant_id=selected_tenant,
     )
     if contract is None:
         raise HTTPException(status_code=404, detail="Investigation revision not found")
@@ -321,6 +323,8 @@ async def review_correction(correction_id: str, payload: CorrectionReviewRequest
         request,
         KnowledgeAction.APPROVE if payload.decision == "approve" else KnowledgeAction.REJECT,
     )
+    if payload.decision == "approve":
+        assert_knowledge_action(request, KnowledgeAction.APPLY)
     if payload.authoritative:
         assert_knowledge_action(request, KnowledgeAction.OVERRIDE)
     try:

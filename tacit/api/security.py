@@ -26,6 +26,7 @@ class KnowledgeAction(StrEnum):
     TRUST = "trust"
     REJECT = "reject"
     CORRECT = "correct"
+    APPLY = "apply"
     EXPORT = "export"
     OVERRIDE = "override"
     TEACH_SIGNALS = "teach_signals"
@@ -37,7 +38,8 @@ KNOWLEDGE_ACTION_PERMISSIONS: Final[dict[KnowledgeAction, tuple[str, ...]]] = {
     KnowledgeAction.TRUST: ("knowledge.review", "knowledge.trust"),
     KnowledgeAction.REJECT: ("knowledge.reject",),
     KnowledgeAction.CORRECT: ("knowledge.correct",),
-    KnowledgeAction.EXPORT: ("knowledge.export",),
+    KnowledgeAction.APPLY: ("knowledge.apply",),
+    KnowledgeAction.EXPORT: ("knowledge.read", "knowledge.export"),
     KnowledgeAction.OVERRIDE: ("knowledge.override",),
     KnowledgeAction.TEACH_SIGNALS: ("knowledge.review", "knowledge.trust"),
 }
@@ -48,7 +50,16 @@ async def verify_api_key(request: Request, api_key: str | None = Security(api_ke
     runtime_settings = getattr(request.app.state, "settings", settings)
     if not runtime_settings.api_auth_enabled:
         return
-    if not api_key or not secrets.compare_digest(api_key, runtime_settings.api_auth_key):
+    configured_tenant = str(runtime_settings.knowledge_tenant_id or "default")
+    expected_key = runtime_settings.api_auth_key
+    if configured_tenant == "*":
+        selected_tenant = resolve_knowledge_tenant(
+            configured_tenant,
+            request.headers.get("X-Tacit-Tenant"),
+        )
+        tenant_keys = dict(getattr(runtime_settings, "knowledge_tenant_api_keys", {}) or {})
+        expected_key = tenant_keys.get(selected_tenant, "")
+    if not api_key or not expected_key or not secrets.compare_digest(api_key, expected_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
@@ -87,8 +98,11 @@ def assert_contract_tenant_access(
     configured = str(getattr(active_settings, "knowledge_tenant_id", "default") or "default")
     contract_tenant = str(contract.request.scope.tenant_id or "")
     investigation_id = str(getattr(getattr(contract, "investigation", None), "id", ""))
+    selected_tenant = knowledge_tenant(request)
     investigation = (
-        store.get(investigation_id) if store is not None and investigation_id and hasattr(store, "get") else None
+        store.get(investigation_id, tenant_id=selected_tenant)
+        if store is not None and investigation_id and hasattr(store, "get")
+        else None
     )
     recorded_tenant = str((investigation or {}).get("tenant_id") or "")
     if not recorded_tenant:
@@ -100,7 +114,9 @@ def assert_contract_tenant_access(
             recorded_tenant = contract_tenant
     if contract_tenant not in {"", "default", recorded_tenant}:
         raise HTTPException(status_code=403, detail="Tenant access denied")
-    return assert_tenant_access(request, recorded_tenant)
+    if selected_tenant != recorded_tenant:
+        raise HTTPException(status_code=403, detail="Tenant access denied")
+    return selected_tenant
 
 
 def resolve_knowledge_tenant(

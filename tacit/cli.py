@@ -318,11 +318,13 @@ def _split_config(config: dict) -> tuple[dict, dict]:
 
 # ── tacit doctor ─────────────────────────────────────────────────────────
 @cli.command()
-def doctor():
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def doctor(tenant: str | None):
     """Validate Grafana, datasources, LLM connectivity, and cache state."""
     _header("Tacit Doctor")
     _load_env()
     stores = _cli_runtime_stores()
+    selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -417,7 +419,7 @@ def doctor():
     try:
         from tacit.assess import build_assessment
 
-        _report = build_assessment(stores=stores)
+        _report = build_assessment(stores=stores, tenant_id=selected_tenant)
         _inv = _report["inventory"]
         knowledge = {
             "dashboards": _inv["dashboards_ingested"],
@@ -918,7 +920,11 @@ def investigate(prompt: str | None, json_output: bool, open_browser: bool, tenan
         result = await run_pipeline(DashRequest(prompt=prompt, user_id="cli", tenant_id=tenant_id), deps)
         contract = None
         if result.investigation_id:
-            contract = stores.history().get_contract(result.investigation_id, result.investigation_revision)
+            contract = stores.history().get_contract(
+                result.investigation_id,
+                result.investigation_revision,
+                tenant_id=tenant_id,
+            )
         return result, contract
 
     try:
@@ -1130,7 +1136,8 @@ def demo(tear_down: bool, no_build: bool, skip_generate: bool, open_browser: boo
 @cli.command()
 @click.option("--json", "as_json", is_flag=True, help="Emit the raw assessment as JSON")
 @click.option("--llm", "with_llm", is_flag=True, help="Add an LLM narrative on top of the deterministic report")
-def assess(as_json: bool, with_llm: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def assess(as_json: bool, with_llm: bool, tenant: str | None):
     """Operational knowledge assessment — fully deterministic, zero API keys.
 
     Reports what Tacit has ingested, extracted, resolved, and failed to
@@ -1143,8 +1150,8 @@ def assess(as_json: bool, with_llm: bool):
     _load_env()
     from tacit.assess import build_assessment
 
-    stores = _cli_runtime_stores()
-    report = build_assessment(stores=stores)
+    stores, selected_tenant = _cli_knowledge_read_context(tenant)
+    report = build_assessment(stores=stores, tenant_id=selected_tenant)
 
     if as_json:
         import json as json_module
@@ -1322,8 +1329,8 @@ def learn_status(tenant: str | None):
     """Show governed learning inventory and review status."""
     _load_env()
 
-    tenant_id = _knowledge_tenant(tenant)
-    click.echo(json.dumps(_cli_knowledge_repository().stats(tenant_id), indent=2, sort_keys=True))
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    click.echo(json.dumps(stores.knowledge_repository().stats(tenant_id), indent=2, sort_keys=True))
 
 
 def _print_bulk_learning_summary(result: dict):
@@ -1836,14 +1843,15 @@ def learn_search(query: str, service: str, approved_only: bool, limit: int, tena
 
     from tacit.signals import LearningIndexUnavailable
 
-    store = _cli_runtime_stores().signals()
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    store = stores.signals()
     try:
         rows = store.search_learning_context(
             query,
             service=service,
             include_candidates=not approved_only,
             limit=limit,
-            tenant_id=_knowledge_tenant(tenant),
+            tenant_id=tenant_id,
         )
     except LearningIndexUnavailable as e:
         _fail(str(e))
@@ -1874,16 +1882,13 @@ def learn_service(service: str, approved_only: bool, limit: int, tenant: str | N
 
     from tacit.signals import LearningIndexUnavailable
 
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
     try:
-        summary = (
-            _cli_runtime_stores()
-            .signals()
-            .describe_service(
-                service,
-                include_candidates=not approved_only,
-                limit=limit,
-                tenant_id=_knowledge_tenant(tenant),
-            )
+        summary = stores.signals().describe_service(
+            service,
+            include_candidates=not approved_only,
+            limit=limit,
+            tenant_id=tenant_id,
         )
     except LearningIndexUnavailable as e:
         _fail(str(e))
@@ -1971,9 +1976,11 @@ def export_report(anonymous: bool, output: Path | None, validate_bundle: bool, t
     _header("Export Assessment Report")
     _load_env()
 
+    from tacit.api.security import KnowledgeAction
     from tacit.export_report import export_assessment_report
 
     stores = _cli_runtime_stores()
+    _require_cli_knowledge_action(KnowledgeAction.EXPORT, stores.settings)
     try:
         result = export_assessment_report(
             output=output,
@@ -2022,6 +2029,15 @@ def _knowledge_tenant(tenant: str | None, *, runtime_settings: Any | None = None
         raise click.ClickException(detail) from exc
 
 
+def _cli_knowledge_read_context(tenant: str | None) -> tuple[Any, str]:
+    """Resolve one authorized, settings-backed store graph for a CLI read."""
+    from tacit.api.security import KnowledgeAction
+
+    stores = _cli_runtime_stores()
+    _require_cli_knowledge_action(KnowledgeAction.READ, stores.settings)
+    return stores, _knowledge_tenant(tenant, runtime_settings=stores.settings)
+
+
 def _knowledge_json(value: Any) -> None:
     if isinstance(value, list):
         value = [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in value]
@@ -2036,7 +2052,8 @@ def knowledge_status(tenant: str | None):
     """Show lifecycle counts and pending work."""
     _load_env()
 
-    _knowledge_json(_cli_knowledge_repository().stats(_knowledge_tenant(tenant)))
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    _knowledge_json(stores.knowledge_repository().stats(tenant_id))
 
 
 @knowledge.command("list")
@@ -2047,7 +2064,8 @@ def knowledge_list(tenant: str | None, kind: str | None, status: str | None):
     """List current knowledge revisions."""
     _load_env()
 
-    values = _cli_knowledge_repository().list_current_revisions(_knowledge_tenant(tenant))
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    values = stores.knowledge_repository().list_current_revisions(tenant_id)
     if kind:
         values = [item for item in values if item.proposition.kind.value == kind]
     if status:
@@ -2064,10 +2082,9 @@ def knowledge_candidates(tenant: str | None, kind: str | None, review_state: str
     """List extracted candidates awaiting governance."""
     _load_env()
 
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
     _knowledge_json(
-        _cli_knowledge_repository().list_candidates(
-            _knowledge_tenant(tenant), kind=kind, review_state=review_state, limit=limit
-        )
+        stores.knowledge_repository().list_candidates(tenant_id, kind=kind, review_state=review_state, limit=limit)
     )
 
 
@@ -2079,9 +2096,8 @@ def knowledge_show(knowledge_id: str, revision: int | None, tenant: str | None):
     """Show one immutable knowledge revision."""
     _load_env()
 
-    value = _cli_knowledge_repository().get_revision(
-        knowledge_id, revision=revision, tenant_id=_knowledge_tenant(tenant)
-    )
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    value = stores.knowledge_repository().get_revision(knowledge_id, revision=revision, tenant_id=tenant_id)
     if value is None:
         raise click.ClickException("knowledge item not found")
     _knowledge_json(value)
@@ -2094,8 +2110,9 @@ def knowledge_explain(knowledge_id: str, tenant: str | None):
     """Explain provenance, policy, conflicts, and investigation use."""
     _load_env()
 
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
     try:
-        _knowledge_json(_cli_knowledge_service().explain(knowledge_id, _knowledge_tenant(tenant)))
+        _knowledge_json(stores.knowledge().explain(knowledge_id, tenant_id))
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -2107,9 +2124,10 @@ def knowledge_conflicts(tenant: str | None, unresolved_only: bool):
     """List proposition conflicts."""
     _load_env()
 
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
     _knowledge_json(
-        _cli_knowledge_repository().list_conflicts(
-            _knowledge_tenant(tenant),
+        stores.knowledge_repository().list_conflicts(
+            tenant_id,
             unresolved_only=unresolved_only,
         )
     )
@@ -2195,7 +2213,8 @@ def knowledge_history(knowledge_id: str, tenant: str | None):
     """List immutable revisions for one knowledge item."""
     _load_env()
 
-    _knowledge_json(_cli_knowledge_repository().list_revisions(knowledge_id, _knowledge_tenant(tenant)))
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    _knowledge_json(stores.knowledge_repository().list_revisions(knowledge_id, tenant_id))
 
 
 @knowledge.command("usage")
@@ -2205,9 +2224,10 @@ def knowledge_usage(knowledge_id: str, tenant: str | None):
     """List investigations that considered a knowledge item."""
     _load_env()
 
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
     _knowledge_json(
-        _cli_knowledge_repository().list_usage(
-            tenant_id=_knowledge_tenant(tenant),
+        stores.knowledge_repository().list_usage(
+            tenant_id=tenant_id,
             knowledge_id=knowledge_id,
         )
     )
@@ -2224,12 +2244,19 @@ def history():
 @click.option("--limit", "-n", default=20, type=int, help="Number of records")
 @click.option("--status", type=click.Choice(["success", "failed", "timeout"]), default=None)
 @click.option("--user", default=None, help="Filter by user ID")
-def history_list(limit: int, status: str | None, user: str | None):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_list(limit: int, status: str | None, user: str | None, tenant: str | None):
     """List recent investigations."""
     _load_env()
 
-    store = _cli_runtime_stores().history()
-    investigations = store.list_recent(limit=limit, status=status, user_id=user)
+    stores = _cli_runtime_stores()
+    selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    investigations = stores.history().list_recent(
+        limit=limit,
+        status=status,
+        user_id=user,
+        tenant_id=selected_tenant,
+    )
 
     if not investigations:
         _info("No investigations found.")
@@ -2272,12 +2299,14 @@ def history_list(limit: int, status: str | None, user: str | None):
 
 @history.command("show")
 @click.argument("investigation_id")
-def history_show(investigation_id: str):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_show(investigation_id: str, tenant: str | None):
     """Show full details of a single investigation."""
     _load_env()
 
-    store = _cli_runtime_stores().history()
-    inv = store.get(investigation_id)
+    stores = _cli_runtime_stores()
+    selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    inv = stores.history().get(investigation_id, tenant_id=selected_tenant)
 
     if inv is None:
         _fail(f"Investigation {investigation_id} not found")
@@ -2357,11 +2386,18 @@ def history_show(investigation_id: str):
 @history.command("contract")
 @click.argument("investigation_id")
 @click.option("--revision", type=int, default=None)
-def history_contract(investigation_id: str, revision: int | None):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_contract(investigation_id: str, revision: int | None, tenant: str | None):
     """Print the canonical contract for an investigation."""
     _load_env()
 
-    contract = _cli_runtime_stores().history().get_contract(investigation_id, revision)
+    stores = _cli_runtime_stores()
+    selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    contract = stores.history().get_contract(
+        investigation_id,
+        revision,
+        tenant_id=selected_tenant,
+    )
     if contract is None:
         raise click.ClickException("Investigation contract not found")
     click.echo(json.dumps(contract.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True))
@@ -2381,8 +2417,12 @@ def history_replay(investigation_id: str, revision: int | None, mode: str, tenan
     stores = _cli_runtime_stores()
     selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
     history_store = stores.history()
-    existing_contract = history_store.get_contract(investigation_id, revision)
-    investigation = history_store.get(investigation_id)
+    existing_contract = history_store.get_contract(
+        investigation_id,
+        revision,
+        tenant_id=selected_tenant,
+    )
+    investigation = history_store.get(investigation_id, tenant_id=selected_tenant)
     if existing_contract is None or investigation is None:
         raise click.ClickException("Investigation or captured inputs not found")
     recorded_tenant = str(investigation.get("tenant_id") or existing_contract.request.scope.tenant_id or "default")
@@ -2395,6 +2435,7 @@ def history_replay(investigation_id: str, revision: int | None, mode: str, tenan
             mode=ReplayMode(mode),
             runtime_settings=stores.settings,
             knowledge_service_factory=stores.knowledge,
+            tenant_id=selected_tenant,
         )
     except (StaleRevisionError, ReplayError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -2407,11 +2448,19 @@ def history_replay(investigation_id: str, revision: int | None, mode: str, tenan
 @click.argument("investigation_id")
 @click.argument("left", type=int)
 @click.argument("right", type=int)
-def history_compare(investigation_id: str, left: int, right: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_compare(investigation_id: str, left: int, right: int, tenant: str | None):
     """Compare two immutable investigation revisions."""
     _load_env()
 
-    comparison = _cli_runtime_stores().history().compare_revisions(investigation_id, left, right)
+    stores = _cli_runtime_stores()
+    selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    comparison = stores.history().compare_revisions(
+        investigation_id,
+        left,
+        right,
+        tenant_id=selected_tenant,
+    )
     if comparison is None:
         raise click.ClickException("Investigation revision not found")
     click.echo(json.dumps(comparison, indent=2, sort_keys=True))
@@ -2421,18 +2470,24 @@ def history_compare(investigation_id: str, left: int, right: int):
 @click.argument("investigation_id")
 @click.option("--revision", type=int, default=None)
 @click.option("--output", type=click.Path(dir_okay=False, path_type=Path), default=None)
-def history_export(investigation_id: str, revision: int | None, output: Path | None):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_export(investigation_id: str, revision: int | None, output: Path | None, tenant: str | None):
     """Export one investigation as a portable Assessment Bundle."""
     _load_env()
+    from tacit.api.security import KnowledgeAction
     from tacit.investigation_bundle import export_investigation_bundle
 
+    stores = _cli_runtime_stores()
+    selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    _require_cli_knowledge_action(KnowledgeAction.EXPORT, stores.settings)
     target = output or Path(f"tacit-investigation-{investigation_id}.tar.gz")
     try:
         export_investigation_bundle(
-            _cli_runtime_stores().history(),
+            stores.history(),
             investigation_id,
             target,
             revision=revision,
+            tenant_id=selected_tenant,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -2440,12 +2495,14 @@ def history_export(investigation_id: str, revision: int | None, output: Path | N
 
 
 @history.command("stats")
-def history_stats():
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_stats(tenant: str | None):
     """Show aggregate investigation statistics."""
     _load_env()
 
-    store = _cli_runtime_stores().history()
-    s = store.stats()
+    stores = _cli_runtime_stores()
+    selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    s = stores.history().stats(tenant_id=selected_tenant)
 
     _header("Investigation Stats")
     total = s.get("total", 0)

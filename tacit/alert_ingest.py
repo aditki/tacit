@@ -176,6 +176,10 @@ async def ingest_alert_features(
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted alert features."""
     active_settings = runtime_settings or settings
+    if auto_approve and not dry_run:
+        from tacit.api.security import KnowledgeAction, enforce_knowledge_action
+
+        enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     store = store or get_signal_store()
     status = "approved" if auto_approve else "pending"
@@ -278,6 +282,7 @@ async def ingest_alert_features(
                 tenant_id=effective_tenant,
                 source_ref=source_ref,
                 active_pairs=governed_pairs,
+                source_fingerprint=mapping_fingerprint,
             )
         reconcile_signal_source(
             store=store,
@@ -482,7 +487,7 @@ async def learn_backend_alerts(
                 from tacit.knowledge.repository import KnowledgeRepository
                 from tacit.knowledge.service import KnowledgeService
 
-                knowledge_service = KnowledgeService(KnowledgeRepository(store._db_path))
+                knowledge_service = KnowledgeService(KnowledgeRepository(store._db_path), signal_store=store)
                 offset = 0
                 page_size = 500
                 reconciled_count = 0

@@ -139,6 +139,7 @@ def test_evidence_resolution_reports_the_governed_mapping_that_selected_the_metr
         context_archetypes=["resource-saturation"],
         source_type="operational_knowledge",
         governance_ref="knowledge_cpu_mapping",
+        governance_revision=1,
         review_state="approved",
     )
     applied_refs: set[str] = set()

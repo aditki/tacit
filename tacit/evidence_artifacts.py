@@ -7,6 +7,7 @@ from typing import Any
 
 from tacit.catalog import catalog_for_services
 from tacit.evidence import SUPPORTED_OBSERVATION
+from tacit.knowledge.usage import KnowledgeRevisionRef
 from tacit.models.schemas import (
     DashboardSpec,
     EvidenceObservation,
@@ -305,7 +306,7 @@ def build_symptom_evidence_dashboard(
     seen: set[tuple[str, str, str]] = set()
 
     for requirement in requirements:
-        resolution_refs: set[str] = set()
+        resolution_refs: set[KnowledgeRevisionRef] = set()
         resolution = resolutions_by_id.get(requirement.id)
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             resolution = _resolve_direct_symptom_evidence(
@@ -316,7 +317,7 @@ def build_symptom_evidence_dashboard(
                 signal_store=signal_store,
                 tenant_id=tenant_id,
                 knowledge_scope=knowledge_scope,
-                applied_governance_refs=resolution_refs,
+                applied_governance_revision_refs=resolution_refs,
             )
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             continue
@@ -365,8 +366,15 @@ def build_symptom_evidence_dashboard(
         if knowledge_query_uses is not None and resolution_refs:
             from tacit.archetypes.engine import KnowledgeQueryUse
 
-            for knowledge_ref in sorted(resolution_refs):
-                knowledge_query_uses.append(KnowledgeQueryUse.from_query(knowledge_ref, panel, panel.queries[0]))
+            for revision_ref in sorted(resolution_refs):
+                knowledge_query_uses.append(
+                    KnowledgeQueryUse.from_query(
+                        revision_ref,
+                        panel,
+                        panel.queries[0],
+                        requirement_id=requirement.id,
+                    )
+                )
 
     return (
         DashboardSpec(
@@ -407,7 +415,7 @@ def build_evidence_gap_dashboard(
         )
 
     for requirement in requirements:
-        resolution_refs: set[str] = set()
+        resolution_refs: set[KnowledgeRevisionRef] = set()
         resolution = resolutions_by_id.get(requirement.id)
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             resolution = _resolve_evidence_gap_observation(
@@ -418,7 +426,7 @@ def build_evidence_gap_dashboard(
                 signal_store=signal_store,
                 tenant_id=tenant_id,
                 knowledge_scope=knowledge_scope,
-                applied_governance_refs=resolution_refs,
+                applied_governance_revision_refs=resolution_refs,
             )
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             continue
@@ -474,8 +482,15 @@ def build_evidence_gap_dashboard(
         if knowledge_query_uses is not None and resolution_refs:
             from tacit.archetypes.engine import KnowledgeQueryUse
 
-            for knowledge_ref in sorted(resolution_refs):
-                knowledge_query_uses.append(KnowledgeQueryUse.from_query(knowledge_ref, panel, panel.queries[0]))
+            for revision_ref in sorted(resolution_refs):
+                knowledge_query_uses.append(
+                    KnowledgeQueryUse.from_query(
+                        revision_ref,
+                        panel,
+                        panel.queries[0],
+                        requirement_id=requirement.id,
+                    )
+                )
 
     return (
         DashboardSpec(
@@ -556,6 +571,7 @@ def _resolve_direct_symptom_evidence(
     tenant_id: str = "default",
     knowledge_scope: Any | None = None,
     applied_governance_refs: set[str] | None = None,
+    applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
 ) -> EvidenceResolution | None:
     """Resolve symptom evidence for direct observation panels."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal_details
@@ -569,7 +585,7 @@ def _resolve_direct_symptom_evidence(
         entry for entry in catalog if (entry.query_language or "").lower() in {"", target_language.lower()}
     ]
     scoped_catalog = catalog_for_services(target_catalog, intent.services, include_unscoped=True)
-    inferred_by = ""
+    inferred_by: KnowledgeRevisionRef | None = None
     signal_type = requirement.signal_type
     if not signal_type:
         signal_type, inferred_by = _legacy_metric_signal_details(
@@ -606,9 +622,14 @@ def _resolve_direct_symptom_evidence(
     entry, score = selected.entry, selected.confidence
     if applied_governance_refs is not None:
         if inferred_by:
-            applied_governance_refs.add(inferred_by)
+            applied_governance_refs.add(inferred_by.knowledge_ref)
         if selected.governance_ref:
             applied_governance_refs.add(selected.governance_ref)
+    if applied_governance_revision_refs is not None:
+        if inferred_by is not None:
+            applied_governance_revision_refs.add(inferred_by)
+        if selected.knowledge_revision_ref is not None:
+            applied_governance_revision_refs.add(selected.knowledge_revision_ref)
     return EvidenceResolution(
         requirement_id=requirement.id,
         status=EvidenceResolutionStatus.RESOLVED,
@@ -632,6 +653,7 @@ def _resolve_evidence_gap_observation(
     tenant_id: str = "default",
     knowledge_scope: Any | None = None,
     applied_governance_refs: set[str] | None = None,
+    applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
 ) -> EvidenceResolution | None:
     """Resolve an evidence gap only when ownership is specific enough to observe safely."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal_details
@@ -645,7 +667,7 @@ def _resolve_evidence_gap_observation(
         entry for entry in catalog if (entry.query_language or "").lower() in {"", target_language.lower()}
     ]
     scoped_catalog = catalog_for_services(target_catalog, intent.services, include_unscoped=False)
-    inferred_by = ""
+    inferred_by: KnowledgeRevisionRef | None = None
     signal_type = requirement.signal_type
     if not signal_type:
         signal_type, inferred_by = _legacy_metric_signal_details(
@@ -684,9 +706,14 @@ def _resolve_evidence_gap_observation(
     entry, score = selected.entry, selected.confidence
     if applied_governance_refs is not None:
         if inferred_by:
-            applied_governance_refs.add(inferred_by)
+            applied_governance_refs.add(inferred_by.knowledge_ref)
         if selected.governance_ref:
             applied_governance_refs.add(selected.governance_ref)
+    if applied_governance_revision_refs is not None:
+        if inferred_by is not None:
+            applied_governance_revision_refs.add(inferred_by)
+        if selected.knowledge_revision_ref is not None:
+            applied_governance_revision_refs.add(selected.knowledge_revision_ref)
     return EvidenceResolution(
         requirement_id=requirement.id,
         status=EvidenceResolutionStatus.RESOLVED,

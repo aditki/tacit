@@ -42,6 +42,26 @@ def test_configured_runtime_owns_and_reuses_all_stores(tmp_path):
     assert stores.signals()._db_path == tmp_path / "state" / "signals.db"
     assert stores.knowledge_repository()._db_path == tmp_path / "state" / "signals.db"
     assert stores.knowledge().repository is stores.knowledge_repository()
+    assert stores.knowledge()._signal_store() is stores.signals()
+
+
+def test_default_paths_still_use_runtime_settings_instead_of_global_fallbacks(tmp_path, monkeypatch):
+    monkeypatch.setattr("tacit.history._DEFAULT_DB_PATH", tmp_path / "defaults" / "history.db")
+    monkeypatch.setattr("tacit.feedback._DEFAULT_DB_PATH", tmp_path / "defaults" / "feedback.db")
+    monkeypatch.setattr("tacit.signals.store._DEFAULT_DB_PATH", tmp_path / "defaults" / "signals.db")
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="tenant-a")
+    stores = RuntimeStores(runtime_settings)
+
+    history = stores.history()
+    feedback = stores.feedback()
+    signals = stores.signals()
+
+    assert history._settings is runtime_settings
+    assert feedback._settings is runtime_settings
+    assert signals._settings is runtime_settings
+    assert history._db_path == tmp_path / "defaults" / "history.db"
+    assert feedback._db_path == tmp_path / "defaults" / "feedback.db"
+    assert signals._db_path == tmp_path / "defaults" / "signals.db"
 
 
 def test_configured_runtime_passes_settings_into_legacy_history_migration(tmp_path):
@@ -89,6 +109,7 @@ def test_injected_signal_store_also_scopes_operational_knowledge(tmp_path):
     service = dependencies.knowledge_service_factory()
 
     assert service.repository._db_path == injected._db_path
+    assert service._signal_store() is injected
     assert dependencies.knowledge_service_factory() is service
 
 
@@ -102,16 +123,17 @@ def test_cli_history_replay_requires_and_authorizes_wildcard_tenant(monkeypatch)
     class FakeHistory:
         replay_calls = 0
 
-        def get_contract(self, investigation_id, revision=None):
+        def get_contract(self, investigation_id, revision=None, *, tenant_id=None):
             assert investigation_id == "inv-a"
-            return FakeContract()
+            return FakeContract() if tenant_id == "tenant-a" else None
 
-        def get(self, investigation_id):
+        def get(self, investigation_id, *, tenant_id=None):
             assert investigation_id == "inv-a"
-            return {"tenant_id": "tenant-a"}
+            return {"tenant_id": "tenant-a"} if tenant_id == "tenant-a" else None
 
-        def replay_contract(self, investigation_id, revision=None, **_kwargs):
+        def replay_contract(self, investigation_id, revision=None, *, tenant_id=None, **_kwargs):
             assert investigation_id == "inv-a"
+            assert tenant_id == "tenant-a"
             self.replay_calls += 1
             return FakeContract()
 
@@ -138,6 +160,41 @@ def test_cli_history_replay_requires_and_authorizes_wildcard_tenant(monkeypatch)
     assert missing.exit_code != 0
     assert "--tenant is required" in missing.output
     assert denied.exit_code != 0
-    assert "Tenant access denied" in denied.output
+    assert "not found" in denied.output
     assert allowed.exit_code == 0, allowed.output
     assert stores.history_store.replay_calls == 1
+
+
+def test_doctor_requires_and_propagates_wildcard_tenant(tmp_path, monkeypatch):
+    selected: list[str] = []
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("TACIT_CONFIG", str(config_file))
+
+    class Stores:
+        settings = Settings(_env_file=None, knowledge_tenant_id="*")
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", Stores)
+    monkeypatch.setattr("tacit.cli.CONFIG_FILE", config_file)
+    monkeypatch.setattr("tacit.cli._check_archetypes", lambda: True)
+    monkeypatch.setattr("tacit.cli._check_grafana", lambda: True)
+    monkeypatch.setattr("tacit.cli._check_llm", lambda: True)
+    monkeypatch.setattr("tacit.cli._check_datasources", lambda: True)
+
+    def assessment(*, stores, tenant_id):
+        selected.append(tenant_id)
+        return {
+            "inventory": {"dashboards_ingested": 0, "alerts_ingested": 0, "runbooks": 0, "incidents": 0},
+            "readiness": {"level": "Low"},
+        }
+
+    monkeypatch.setattr("tacit.assess.build_assessment", assessment)
+    runner = CliRunner()
+
+    missing = runner.invoke(cli, ["doctor"])
+    allowed = runner.invoke(cli, ["doctor", "--tenant", "tenant-a"])
+
+    assert missing.exit_code != 0
+    assert "--tenant is required" in missing.output
+    assert allowed.exit_code == 0, allowed.output
+    assert selected == ["tenant-a"]

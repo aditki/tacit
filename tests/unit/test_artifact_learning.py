@@ -794,7 +794,10 @@ def test_list_learned_artifacts_omits_body_text(tmp_path):
 
 
 def test_learned_artifacts_and_extractions_are_tenant_scoped(tmp_path):
-    store = SignalStore(db_path=tmp_path / "signals.db")
+    store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
     for tenant_id, title in (("tenant-a", "Tenant A"), ("tenant-b", "Tenant B")):
         store.record_learned_artifact(
             tenant_id=tenant_id,
@@ -876,13 +879,17 @@ def test_legacy_artifact_rows_migrate_to_configured_tenant(
 
     assert artifact is not None and artifact["tenant_id"] == expected_tenant
     assert extractions["evidence_requirements"][0]["tenant_id"] == expected_tenant
-    store.record_learned_artifact(
+    wildcard_store = SignalStore(
+        db_path=db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
+    wildcard_store.record_learned_artifact(
         tenant_id="tenant-b",
         artifact_id="legacy-artifact",
         artifact_type="runbook",
         title="Tenant B",
     )
-    assert store.get_learned_artifact("legacy-artifact", tenant_id="tenant-b") is not None
+    assert wildcard_store.get_learned_artifact("legacy-artifact", tenant_id="tenant-b") is not None
 
 
 def test_copied_artifact_bodies_share_lineage_despite_renamed_titles(tmp_path):
@@ -1124,7 +1131,10 @@ def test_stale_artifact_knowledge_reconciliation_pages_past_ten_thousand(monkeyp
 
     service = FakeKnowledgeService()
     monkeypatch.setattr("tacit.knowledge.repository.KnowledgeRepository", lambda _path: object())
-    monkeypatch.setattr("tacit.knowledge.service.KnowledgeService", lambda _repository: service)
+    monkeypatch.setattr(
+        "tacit.knowledge.service.KnowledgeService",
+        lambda _repository, **_kwargs: service,
+    )
 
     _reconcile_stale_artifact_knowledge(
         store=FakeStore(),

@@ -1,8 +1,39 @@
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from tacit.cli import cli
+from tacit.config import Settings
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["assess", "--json"],
+        ["learn", "status"],
+        ["learn", "search", "checkout"],
+        ["learn", "service", "checkout"],
+        ["knowledge", "status"],
+        ["knowledge", "list"],
+        ["knowledge", "candidates"],
+        ["knowledge", "show", "knowledge-x"],
+        ["knowledge", "explain", "knowledge-x"],
+        ["knowledge", "conflicts"],
+        ["knowledge", "history", "knowledge-x"],
+        ["knowledge", "usage", "knowledge-x"],
+    ],
+)
+def test_cli_knowledge_reads_require_read_permission(command, monkeypatch):
+    class ReadDeniedStores:
+        settings = Settings(_env_file=None, knowledge_permissions="")
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", ReadDeniedStores)
+
+    result = CliRunner().invoke(cli, command)
+
+    assert result.exit_code != 0
+    assert "missing permission: knowledge.read" in result.output
 
 
 def test_pypi_quickstart_uses_registered_init_command():

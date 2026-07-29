@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import structlog
@@ -17,6 +17,7 @@ from tacit.evidence_artifacts import (
     missing_critical_evidence_gap_requirements,
     missing_critical_symptom_requirements,
 )
+from tacit.knowledge.usage import KnowledgeRevisionRef
 from tacit.models.schemas import (
     DashboardSpec,
     EvidenceObservation,
@@ -39,6 +40,8 @@ class ValidationEvidenceResult:
     evidence_observations: list[EvidenceObservation]
     evidence_summary: dict[str, object]
     applied_knowledge_refs: frozenset[str] = frozenset()
+    applied_knowledge_revision_refs: frozenset[KnowledgeRevisionRef] = frozenset()
+    knowledge_revision_refs_by_requirement: dict[str, frozenset[KnowledgeRevisionRef]] = field(default_factory=dict)
 
 
 def _append_validated_panels(
@@ -385,6 +388,17 @@ async def validate_dashboard_and_evidence(
     applied_knowledge_refs = frozenset(
         use.knowledge_ref for use in rescue_knowledge_query_uses if use.query_identity() in surviving_query_ids
     )
+    applied_knowledge_revision_refs = frozenset(
+        KnowledgeRevisionRef(use.knowledge_ref, use.knowledge_revision)
+        for use in rescue_knowledge_query_uses
+        if use.knowledge_revision > 0 and use.query_identity() in surviving_query_ids
+    )
+    knowledge_revision_refs_by_requirement: dict[str, set[KnowledgeRevisionRef]] = {}
+    for use in rescue_knowledge_query_uses:
+        if use.requirement_id and use.knowledge_revision > 0 and use.query_identity() in surviving_query_ids:
+            knowledge_revision_refs_by_requirement.setdefault(use.requirement_id, set()).add(
+                KnowledgeRevisionRef(use.knowledge_ref, use.knowledge_revision)
+            )
     return ValidationEvidenceResult(
         dashboard_spec=dashboard_spec,
         validation_warnings=validation_warnings,
@@ -392,4 +406,8 @@ async def validate_dashboard_and_evidence(
         evidence_observations=evidence_observations,
         evidence_summary=evidence_summary,
         applied_knowledge_refs=applied_knowledge_refs,
+        applied_knowledge_revision_refs=applied_knowledge_revision_refs,
+        knowledge_revision_refs_by_requirement={
+            key: frozenset(value) for key, value in knowledge_revision_refs_by_requirement.items()
+        },
     )

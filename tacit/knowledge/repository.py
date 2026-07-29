@@ -15,6 +15,12 @@ from typing import Any
 import structlog
 
 from tacit.config import settings
+from tacit.knowledge.enums import (
+    EntityResolutionStatus,
+    LifecycleStatus,
+    PromotionDecisionType,
+    ReviewState,
+)
 from tacit.knowledge.models import (
     CorroborationSummary,
     Entity,
@@ -33,6 +39,15 @@ from tacit.knowledge.normalization import normalize_entity
 from tacit.signals.schema import SQLITE_BUSY_TIMEOUT_MS
 
 logger = structlog.get_logger()
+_UNSET = object()
+
+
+def _candidate_matches_json(raw: str, expected: KnowledgeCandidate) -> bool:
+    """Compare candidate state after model defaults normalize legacy JSON."""
+    try:
+        return KnowledgeCandidate.model_validate_json(raw) == expected
+    except ValueError:
+        return False
 
 
 class CandidateReviewConflictError(ValueError):
@@ -41,6 +56,14 @@ class CandidateReviewConflictError(ValueError):
 
 class CandidateEvaluationConflictError(ValueError):
     """Raised when a candidate changes while its promotion policy is evaluated."""
+
+
+class CandidateLifecycleConflictError(ValueError):
+    """Raised when source lifecycle reconciliation loses to a concurrent transition."""
+
+
+class CandidateMergeConflictError(ValueError):
+    """Raised when re-ingestion loses to a concurrent candidate transition."""
 
 
 class KnowledgeRevisionConflictError(ValueError):
@@ -285,6 +308,8 @@ CREATE TABLE IF NOT EXISTS knowledge_corrections (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_knowledge_corrections_candidate
+    ON knowledge_corrections(tenant_id, candidate_ref);
 
 CREATE TABLE IF NOT EXISTS knowledge_events (
     event_id TEXT PRIMARY KEY,
@@ -413,49 +438,79 @@ class KnowledgeRepository:
             ).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload_json"])} for row in rows]
 
-    def save_candidate(self, candidate: KnowledgeCandidate) -> KnowledgeCandidate:
-        with self._conn() as conn:
+    def save_candidate(
+        self,
+        candidate: KnowledgeCandidate,
+        *,
+        expected: KnowledgeCandidate | None | object = _UNSET,
+    ) -> KnowledgeCandidate:
+        with self.transaction() as conn:
             existing = conn.execute(
-                "SELECT tenant_id FROM knowledge_candidates WHERE id=?",
+                "SELECT tenant_id, candidate_json FROM knowledge_candidates WHERE id=?",
                 (candidate.id,),
             ).fetchone()
             if existing and existing["tenant_id"] != candidate.tenant_id:
                 raise ValueError("candidate id already belongs to another tenant")
-            conn.execute(
-                """INSERT INTO knowledge_candidates (
-                   id, tenant_id, kind, payload_ref, proposition_key, scope_json, review_state,
-                   lifecycle_status, eligibility, entity_resolution_status, promotion_policy_id,
-                   promotion_policy_version, candidate_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                   proposition_key=excluded.proposition_key, scope_json=excluded.scope_json,
-                   review_state=excluded.review_state, lifecycle_status=excluded.lifecycle_status,
-                   eligibility=excluded.eligibility, entity_resolution_status=excluded.entity_resolution_status,
-                   promotion_policy_id=excluded.promotion_policy_id,
-                   promotion_policy_version=excluded.promotion_policy_version,
-                   candidate_json=excluded.candidate_json, updated_at=excluded.updated_at""",
-                (
-                    candidate.id,
-                    candidate.tenant_id,
-                    candidate.kind.value,
-                    candidate.payload_ref,
-                    candidate.proposition.proposition_key,
-                    candidate.scope.model_dump_json(),
-                    candidate.state.review_state.value,
-                    candidate.state.lifecycle_status.value,
-                    candidate.state.eligibility.value,
-                    candidate.entity_resolution.status.value,
-                    candidate.policy.promotion_policy_ref,
-                    (
-                        candidate.policy.promotion_policy_ref.rsplit("-", 1)[-1]
-                        if candidate.policy.promotion_policy_ref
-                        else ""
-                    ),
-                    candidate.model_dump_json(),
-                    _ts(candidate.created_at),
-                    _ts(candidate.updated_at),
-                ),
+            if expected is not _UNSET:
+                matches_expected = (
+                    existing is not None
+                    and isinstance(expected, KnowledgeCandidate)
+                    and _candidate_matches_json(str(existing["candidate_json"]), expected)
+                )
+                if not matches_expected and not (existing is None and expected is None):
+                    raise CandidateMergeConflictError("candidate changed during re-ingestion; retry the merge")
+            policy_version = (
+                candidate.policy.promotion_policy_ref.rsplit("-", 1)[-1]
+                if candidate.policy.promotion_policy_ref
+                else ""
             )
+            if existing is None:
+                conn.execute(
+                    """INSERT INTO knowledge_candidates (
+                       id, tenant_id, kind, payload_ref, proposition_key, scope_json, review_state,
+                       lifecycle_status, eligibility, entity_resolution_status, promotion_policy_id,
+                       promotion_policy_version, candidate_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        candidate.id,
+                        candidate.tenant_id,
+                        candidate.kind.value,
+                        candidate.payload_ref,
+                        candidate.proposition.proposition_key,
+                        candidate.scope.model_dump_json(),
+                        candidate.state.review_state.value,
+                        candidate.state.lifecycle_status.value,
+                        candidate.state.eligibility.value,
+                        candidate.entity_resolution.status.value,
+                        candidate.policy.promotion_policy_ref,
+                        policy_version,
+                        candidate.model_dump_json(),
+                        _ts(candidate.created_at),
+                        _ts(candidate.updated_at),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """UPDATE knowledge_candidates SET
+                           proposition_key=?, scope_json=?, review_state=?, lifecycle_status=?,
+                           eligibility=?, entity_resolution_status=?, promotion_policy_id=?,
+                           promotion_policy_version=?, candidate_json=?, updated_at=?
+                       WHERE id=? AND tenant_id=?""",
+                    (
+                        candidate.proposition.proposition_key,
+                        candidate.scope.model_dump_json(),
+                        candidate.state.review_state.value,
+                        candidate.state.lifecycle_status.value,
+                        candidate.state.eligibility.value,
+                        candidate.entity_resolution.status.value,
+                        candidate.policy.promotion_policy_ref,
+                        policy_version,
+                        candidate.model_dump_json(),
+                        _ts(candidate.updated_at),
+                        candidate.id,
+                        candidate.tenant_id,
+                    ),
+                )
             conn.execute("DELETE FROM knowledge_candidate_evidence WHERE candidate_id=?", (candidate.id,))
             for evidence in candidate.evidence.items:
                 conn.execute(
@@ -477,6 +532,20 @@ class KnowledgeRepository:
                 )
         return candidate
 
+    def save_candidate_with_proposition(
+        self,
+        candidate: KnowledgeCandidate,
+        *,
+        lineage_group: str,
+        independence_class: str,
+        expected: KnowledgeCandidate | None | object = _UNSET,
+    ) -> KnowledgeCandidate:
+        """Commit a candidate and its proposition membership as one unit."""
+        with self.transaction():
+            self.save_candidate(candidate, expected=expected)
+            self.save_proposition(candidate, lineage_group, independence_class)
+        return candidate
+
     def get_candidate(self, candidate_id: str, tenant_id: str = "default") -> KnowledgeCandidate | None:
         with self._conn() as conn:
             row = conn.execute(
@@ -493,12 +562,26 @@ class KnowledgeRepository:
     ) -> KnowledgeCandidate:
         """Persist policy output only if no reviewer or lifecycle writer won first."""
         with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT candidate_json FROM knowledge_candidates WHERE id=? AND tenant_id=?",
+                (candidate.id, candidate.tenant_id),
+            ).fetchone()
+            if existing is None or not _candidate_matches_json(str(existing["candidate_json"]), expected):
+                logger.info(
+                    "knowledge_candidate_evaluation_conflict",
+                    tenant_id=candidate.tenant_id,
+                    candidate_id=candidate.id,
+                    phase="policy_state_persist",
+                )
+                raise CandidateEvaluationConflictError(
+                    "candidate changed during policy evaluation; reload before evaluating"
+                )
             cursor = conn.execute(
                 """UPDATE knowledge_candidates SET
                        review_state=?, lifecycle_status=?, eligibility=?,
                        promotion_policy_id=?, promotion_policy_version=?,
                        candidate_json=?, updated_at=?
-                   WHERE id=? AND tenant_id=? AND candidate_json=?""",
+                   WHERE id=? AND tenant_id=?""",
                 (
                     candidate.state.review_state.value,
                     candidate.state.lifecycle_status.value,
@@ -513,7 +596,6 @@ class KnowledgeRepository:
                     _ts(candidate.updated_at),
                     candidate.id,
                     candidate.tenant_id,
-                    expected.model_dump_json(),
                 ),
             )
             if cursor.rowcount != 1:
@@ -528,32 +610,96 @@ class KnowledgeRepository:
                 )
         return candidate
 
+    def transition_candidate_lifecycle(
+        self,
+        candidate: KnowledgeCandidate,
+        *,
+        expected: KnowledgeCandidate,
+    ) -> KnowledgeCandidate:
+        """Persist a source lifecycle transition without overwriting reviewer state."""
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT candidate_json FROM knowledge_candidates WHERE id=? AND tenant_id=?",
+                (candidate.id, candidate.tenant_id),
+            ).fetchone()
+            if existing is None or not _candidate_matches_json(str(existing["candidate_json"]), expected):
+                logger.info(
+                    "knowledge_candidate_lifecycle_conflict",
+                    tenant_id=candidate.tenant_id,
+                    candidate_id=candidate.id,
+                    expected_review_state=expected.state.review_state.value,
+                    expected_lifecycle_status=expected.state.lifecycle_status.value,
+                )
+                raise CandidateLifecycleConflictError("candidate changed during source lifecycle reconciliation")
+            cursor = conn.execute(
+                """UPDATE knowledge_candidates SET
+                       review_state=?, lifecycle_status=?, eligibility=?, candidate_json=?, updated_at=?
+                   WHERE id=? AND tenant_id=?""",
+                (
+                    candidate.state.review_state.value,
+                    candidate.state.lifecycle_status.value,
+                    candidate.state.eligibility.value,
+                    candidate.model_dump_json(),
+                    _ts(candidate.updated_at),
+                    candidate.id,
+                    candidate.tenant_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                logger.info(
+                    "knowledge_candidate_lifecycle_conflict",
+                    tenant_id=candidate.tenant_id,
+                    candidate_id=candidate.id,
+                    expected_review_state=expected.state.review_state.value,
+                    expected_lifecycle_status=expected.state.lifecycle_status.value,
+                )
+                raise CandidateLifecycleConflictError("candidate changed during source lifecycle reconciliation")
+        return candidate
+
     def transition_candidate_review(
         self,
         candidate: KnowledgeCandidate,
         *,
-        expected_states: set[str],
+        expected: KnowledgeCandidate,
     ) -> KnowledgeCandidate:
-        """Atomically apply one authorized review transition."""
+        """Apply a review only if no reviewer or lifecycle writer won first."""
         with self.transaction() as conn:
-            placeholders = ",".join("?" for _ in expected_states)
-            params = [
-                candidate.state.review_state.value,
-                candidate.state.eligibility.value,
-                candidate.model_dump_json(),
-                _ts(candidate.updated_at),
-                candidate.id,
-                candidate.tenant_id,
-                *sorted(expected_states),
-            ]
+            existing = conn.execute(
+                "SELECT candidate_json FROM knowledge_candidates WHERE id=? AND tenant_id=?",
+                (candidate.id, candidate.tenant_id),
+            ).fetchone()
+            if existing is None or not _candidate_matches_json(str(existing["candidate_json"]), expected):
+                logger.info(
+                    "knowledge_candidate_review_conflict",
+                    tenant_id=candidate.tenant_id,
+                    candidate_id=candidate.id,
+                    expected_review_state=expected.state.review_state.value,
+                    expected_lifecycle_status=expected.state.lifecycle_status.value,
+                )
+                raise CandidateReviewConflictError("candidate changed; reload before reviewing")
             cursor = conn.execute(
-                f"""UPDATE knowledge_candidates
-                    SET review_state=?, eligibility=?, candidate_json=?, updated_at=?
-                    WHERE id=? AND tenant_id=? AND review_state IN ({placeholders})""",
-                params,
+                """UPDATE knowledge_candidates
+                   SET review_state=?, lifecycle_status=?, eligibility=?, candidate_json=?, updated_at=?
+                   WHERE id=? AND tenant_id=?""",
+                (
+                    candidate.state.review_state.value,
+                    candidate.state.lifecycle_status.value,
+                    candidate.state.eligibility.value,
+                    candidate.model_dump_json(),
+                    _ts(candidate.updated_at),
+                    candidate.id,
+                    candidate.tenant_id,
+                ),
             )
             if cursor.rowcount != 1:
-                raise CandidateReviewConflictError("candidate review state changed; reload before reviewing")
+                logger.info(
+                    "knowledge_candidate_review_conflict",
+                    tenant_id=candidate.tenant_id,
+                    candidate_id=candidate.id,
+                    expected_review_state=expected.state.review_state.value,
+                    expected_lifecycle_status=expected.state.lifecycle_status.value,
+                )
+                raise CandidateReviewConflictError("candidate changed; reload before reviewing")
         return candidate
 
     def list_candidates(
@@ -645,6 +791,14 @@ class KnowledgeRepository:
                 ),
             )
         return alias
+
+    def get_alias(self, alias_id: str, tenant_id: str = "default") -> EntityAlias | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT alias_json FROM entity_aliases WHERE tenant_id=? AND alias_id=?",
+                (tenant_id, alias_id),
+            ).fetchone()
+        return EntityAlias.model_validate_json(row["alias_json"]) if row else None
 
     def find_entities(
         self,
@@ -892,6 +1046,7 @@ class KnowledgeRepository:
         candidate_id: str,
         decision_ref: str,
         expected_candidate: KnowledgeCandidate | None = None,
+        expected_contributors: list[KnowledgeCandidate] | None = None,
         expected_parent_revision: int | None = None,
     ) -> KnowledgeRevision:
         with self.transaction() as conn:
@@ -901,7 +1056,10 @@ class KnowledgeRepository:
             ).fetchone()
             if candidate is None:
                 raise ValueError("promotion candidate does not belong to the knowledge tenant")
-            if expected_candidate is not None and candidate["candidate_json"] != expected_candidate.model_dump_json():
+            if expected_candidate is not None and not _candidate_matches_json(
+                str(candidate["candidate_json"]),
+                expected_candidate,
+            ):
                 logger.info(
                     "knowledge_candidate_evaluation_conflict",
                     tenant_id=revision.tenant_id,
@@ -911,6 +1069,64 @@ class KnowledgeRepository:
                 raise CandidateEvaluationConflictError(
                     "candidate changed before promotion persistence; reload before evaluating"
                 )
+            if expected_contributors is not None:
+                expected_refs = {item.id for item in expected_contributors}
+                if expected_refs != set(revision.promoted_from_candidate_refs):
+                    raise CandidateEvaluationConflictError("promotion contributors changed before revision persistence")
+                for contributor in expected_contributors:
+                    row = conn.execute(
+                        "SELECT candidate_json FROM knowledge_candidates WHERE id=? AND tenant_id=?",
+                        (contributor.id, revision.tenant_id),
+                    ).fetchone()
+                    if row is None or not _candidate_matches_json(
+                        str(row["candidate_json"]),
+                        contributor,
+                    ):
+                        logger.info(
+                            "knowledge_contributor_evaluation_conflict",
+                            tenant_id=revision.tenant_id,
+                            candidate_id=contributor.id,
+                            knowledge_id=revision.knowledge_id,
+                        )
+                        raise CandidateEvaluationConflictError(
+                            "corroborating contributor changed before promotion persistence"
+                        )
+                    if (
+                        contributor.state.review_state not in {ReviewState.APPROVED, ReviewState.TRUSTED}
+                        or contributor.state.lifecycle_status != LifecycleStatus.ACTIVE
+                        or contributor.entity_resolution.status != EntityResolutionStatus.RESOLVED
+                    ):
+                        raise CandidateEvaluationConflictError(
+                            "corroborating contributor is no longer eligible for promotion"
+                        )
+                decision_row = conn.execute(
+                    "SELECT decision_json FROM promotion_decisions WHERE decision_id=? AND tenant_id=?",
+                    (decision_ref, revision.tenant_id),
+                ).fetchone()
+                if decision_row is None:
+                    raise CandidateEvaluationConflictError("promotion decision disappeared before revision persistence")
+                promotion_decision = PromotionDecision.model_validate_json(decision_row["decision_json"])
+                if (
+                    expected_candidate is None
+                    or promotion_decision.candidate_ref != expected_candidate.id
+                    or promotion_decision.decision != PromotionDecisionType.PROMOTE
+                    or promotion_decision.resulting_eligibility != revision.state.eligibility
+                    or promotion_decision.authoritative_source != expected_candidate.policy.authoritative_source
+                    or promotion_decision.live_verified != expected_candidate.policy.live_verified
+                ):
+                    raise CandidateEvaluationConflictError("promotion inputs changed before revision persistence")
+                corroboration_row = conn.execute(
+                    """SELECT source_summary_json FROM corroboration_snapshots
+                       WHERE snapshot_id=? AND tenant_id=?""",
+                    (revision.corroboration_snapshot_ref, revision.tenant_id),
+                ).fetchone()
+                if (
+                    expected_candidate.corroboration is None
+                    or corroboration_row is None
+                    or CorroborationSummary.model_validate_json(corroboration_row["source_summary_json"])
+                    != expected_candidate.corroboration
+                ):
+                    raise CandidateEvaluationConflictError("corroboration inputs changed before revision persistence")
             row = conn.execute(
                 "SELECT current_revision, created_at FROM operational_knowledge WHERE tenant_id=? AND knowledge_id=?",
                 (revision.tenant_id, revision.knowledge_id),
@@ -1199,6 +1415,20 @@ class KnowledgeRepository:
             row = conn.execute(
                 "SELECT correction_json FROM knowledge_corrections WHERE correction_id=? AND tenant_id=?",
                 (correction_id, tenant_id),
+            ).fetchone()
+        return KnowledgeCorrection.model_validate_json(row["correction_json"]) if row else None
+
+    def get_correction_for_candidate(
+        self,
+        candidate_id: str,
+        tenant_id: str = "default",
+    ) -> KnowledgeCorrection | None:
+        """Return the correction workflow that owns a candidate, if any."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """SELECT correction_json FROM knowledge_corrections
+                   WHERE candidate_ref=? AND tenant_id=?""",
+                (candidate_id, tenant_id),
             ).fetchone()
         return KnowledgeCorrection.model_validate_json(row["correction_json"]) if row else None
 

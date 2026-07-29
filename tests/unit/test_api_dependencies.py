@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
 from tacit.api.app import create_app
-from tacit.api.dependencies import get_signal_store
+from tacit.api.dependencies import get_history_store, get_signal_store
 from tacit.api.security import (
     KnowledgeAction,
     assert_knowledge_action,
@@ -41,7 +41,7 @@ def _security_request(runtime_settings: Settings, tenant_id: str | None = None) 
         (KnowledgeAction.TRUST, ("knowledge.review", "knowledge.trust")),
         (KnowledgeAction.REJECT, ("knowledge.reject",)),
         (KnowledgeAction.CORRECT, ("knowledge.correct",)),
-        (KnowledgeAction.EXPORT, ("knowledge.export",)),
+        (KnowledgeAction.EXPORT, ("knowledge.read", "knowledge.export")),
         (KnowledgeAction.OVERRIDE, ("knowledge.override",)),
         (KnowledgeAction.TEACH_SIGNALS, ("knowledge.review", "knowledge.trust")),
     ],
@@ -57,6 +57,35 @@ def test_knowledge_action_permission_matrix(action, required_permissions):
             assert_knowledge_action(denied, action)
         assert exc_info.value.status_code == 403
         assert exc_info.value.detail == f"Missing permission: {missing_permission}"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/api/v1/learn/dashboards",
+        "/api/v1/learn/alerts",
+        "/api/v1/learn/runbooks",
+        "/api/v1/learn/incidents",
+        "/api/v1/learning/search?q=checkout",
+        "/api/v1/services/checkout",
+        "/api/v1/signals",
+        "/api/v1/signals/stats",
+        "/api/v1/signals/request_latency",
+    ],
+)
+def test_learning_and_signal_reads_require_knowledge_read(endpoint, tmp_path):
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="",
+            signals_db_path=str(tmp_path / "signals.db"),
+        )
+    )
+
+    response = TestClient(app).get(endpoint)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.read"
 
 
 @pytest.mark.parametrize(
@@ -169,6 +198,60 @@ def test_api_auth_uses_app_scoped_settings(monkeypatch):
     assert ok.status_code == 200
 
 
+def test_wildcard_api_keys_are_bound_to_the_selected_tenant(monkeypatch):
+    runtime_settings = Settings(
+        api_auth_enabled=True,
+        api_auth_key="shared-key-must-not-cross-tenants",
+        knowledge_tenant_id="*",
+        knowledge_tenant_api_keys={
+            "tenant-a": "tenant-a-key",
+            "tenant-b": "tenant-b-key",
+        },
+    )
+    app = create_app(runtime_settings=runtime_settings)
+
+    async def fake_run_pipeline(request: DashRequest, deps):
+        return DashResponse(
+            dashboard_url="http://dash",
+            dashboard_uid="dash-1",
+            panel_count=0,
+            summary=request.tenant_id,
+        )
+
+    monkeypatch.setattr("tacit.api.routes.dashboard.run_pipeline", fake_run_pipeline)
+    client = TestClient(app)
+
+    missing_tenant = client.post(
+        "/api/v1/chart",
+        headers={"X-API-Key": "tenant-a-key"},
+        json={"prompt": "checkout latency"},
+    )
+    wrong_tenant_key = client.post(
+        "/api/v1/chart",
+        headers={"X-Tacit-Tenant": "tenant-b", "X-API-Key": "tenant-a-key"},
+        json={"prompt": "checkout latency"},
+    )
+    shared_key = client.post(
+        "/api/v1/chart",
+        headers={
+            "X-Tacit-Tenant": "tenant-a",
+            "X-API-Key": "shared-key-must-not-cross-tenants",
+        },
+        json={"prompt": "checkout latency"},
+    )
+    allowed = client.post(
+        "/api/v1/chart",
+        headers={"X-Tacit-Tenant": "tenant-b", "X-API-Key": "tenant-b-key"},
+        json={"prompt": "checkout latency", "tenant_id": "tenant-b"},
+    )
+
+    assert missing_tenant.status_code == 400
+    assert wrong_tenant_key.status_code == 401
+    assert shared_key.status_code == 401
+    assert allowed.status_code == 200
+    assert allowed.json()["summary"] == "tenant-b"
+
+
 def test_learning_dashboard_route_uses_app_scoped_backend_settings(monkeypatch, tmp_path):
     runtime_settings = Settings(
         grafana_url="http://runtime-grafana",
@@ -215,8 +298,13 @@ def test_learning_dashboard_route_uses_app_scoped_backend_settings(monkeypatch, 
     assert seen_settings == [runtime_settings]
 
 
-def test_pending_learning_requires_and_threads_wildcard_tenant(monkeypatch):
-    app = create_app(runtime_settings=Settings(knowledge_tenant_id="*"))
+def test_pending_learning_requires_and_threads_wildcard_tenant(monkeypatch, tmp_path):
+    app = create_app(
+        runtime_settings=Settings(
+            knowledge_tenant_id="*",
+            signals_db_path=str(tmp_path / "signals.db"),
+        )
+    )
     seen_tenants: list[str | None] = []
 
     async def fake_ingest_dashboard(
@@ -260,7 +348,8 @@ def test_replay_route_uses_app_scoped_runtime_settings(monkeypatch):
             return {"investigation": {"id": "inv-app-replay"}}
 
     class FakeStore:
-        def get_contract(self, investigation_id, revision):
+        def get_contract(self, investigation_id, revision, *, tenant_id=None):
+            assert tenant_id == "tenant-a"
             return FakeContract()
 
         def replay_contract(
@@ -272,14 +361,16 @@ def test_replay_route_uses_app_scoped_runtime_settings(monkeypatch):
             changes,
             runtime_settings,
             knowledge_service_factory,
+            tenant_id,
         ):
             seen_settings.append(runtime_settings)
             assert knowledge_service_factory is not None
+            assert tenant_id == "tenant-a"
             return FakeContract()
 
-    monkeypatch.setattr("tacit.api.routes.history.history_mod.get_investigation_store", lambda: FakeStore())
-
-    response = TestClient(create_app(runtime_settings=runtime_settings)).post(
+    app = create_app(runtime_settings=runtime_settings)
+    app.dependency_overrides[get_history_store] = FakeStore
+    response = TestClient(app).post(
         "/api/v1/investigations/inv-app-replay/replay",
         json={"mode": "current_engine", "changes": {}},
     )
@@ -370,7 +461,10 @@ def test_dashboard_ignore_requires_knowledge_reject_permission(monkeypatch, tmp_
 
 
 def test_artifact_lists_use_the_requested_tenant(monkeypatch, tmp_path):
-    store = SignalStore(db_path=tmp_path / "signals.db")
+    store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
     for tenant_id in ("tenant-a", "tenant-b"):
         store.record_learned_artifact(
             tenant_id=tenant_id,
@@ -378,8 +472,9 @@ def test_artifact_lists_use_the_requested_tenant(monkeypatch, tmp_path):
             artifact_type="runbook",
             title=f"{tenant_id} runbook",
         )
-    monkeypatch.setattr("tacit.api.routes.learning.signals_mod.get_signal_store", lambda: store)
-    client = TestClient(create_app(runtime_settings=Settings(knowledge_tenant_id="*")))
+    app = create_app(runtime_settings=Settings(knowledge_tenant_id="*"))
+    app.dependency_overrides[get_signal_store] = lambda: store
+    client = TestClient(app)
 
     missing = client.get("/api/v1/learn/runbooks")
     tenant_a = client.get("/api/v1/learn/runbooks", headers={"X-Tacit-Tenant": "tenant-a"})

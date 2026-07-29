@@ -381,6 +381,7 @@ async def list_ingested_dashboards(
     """List dashboards that have been ingested for learning."""
     from tacit.dashboard_ingest import build_learning_impact_report, build_signal_quality_report
 
+    assert_knowledge_action(request, KnowledgeAction.READ)
     dashboards = store.list_ingested_dashboards(
         status=status,
         limit=limit,
@@ -414,6 +415,7 @@ async def list_ingested_alerts(
     """List alerts that have been ingested for learning."""
     from tacit.dashboard_ingest import build_learning_impact_report, build_signal_quality_report
 
+    assert_knowledge_action(request, KnowledgeAction.READ)
     alerts = store.list_ingested_alerts(
         status=status,
         limit=limit,
@@ -444,6 +446,7 @@ async def list_learned_runbooks(
     store: Any = Depends(get_signal_store),
 ):
     """List runbooks learned by Tacit Artifact Learning v1."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
     tenant_id = knowledge_tenant(request)
     runbooks = store.list_learned_artifacts(tenant_id=tenant_id, artifact_type="runbook", limit=limit)
     for runbook in runbooks:
@@ -466,6 +469,7 @@ async def list_learned_incidents(
     store: Any = Depends(get_signal_store),
 ):
     """List incident history learned by Tacit Artifact Learning v1."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
     tenant_id = knowledge_tenant(request)
     incidents = store.list_learned_artifacts(tenant_id=tenant_id, artifact_type="incident", limit=limit)
     for incident in incidents:
@@ -491,6 +495,7 @@ async def search_learning_context(
     store: Any = Depends(get_signal_store),
 ):
     """Search learned dashboard/panel/metric context."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
     try:
         rows = store.search_learning_context(
             q,
@@ -518,6 +523,7 @@ async def describe_service(
     store: Any = Depends(get_signal_store),
 ):
     """Answer what is known about this service from learned context."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
     try:
         return store.describe_service(
             service_name,

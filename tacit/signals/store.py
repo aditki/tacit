@@ -32,6 +32,7 @@ from typing import Any
 import structlog
 
 from tacit.config import Settings, settings
+from tacit.knowledge.usage import KnowledgeRevisionRef
 from tacit.models.schemas import MetricEntry
 from tacit.signals.confidence import TRUST_THRESHOLD, stronger_review_state
 from tacit.signals.learning_index import (
@@ -81,6 +82,7 @@ from tacit.signals.schema import (
     GLOBAL_BOOTSTRAP_TENANT_ID,
     SQLITE_BUSY_TIMEOUT_MS,
 )
+from tacit.tenancy import resolve_tenant_boundary
 
 logger = structlog.get_logger()
 
@@ -108,6 +110,13 @@ class ResolvedSignal:
     entry: MetricEntry
     confidence: float
     governance_ref: str = ""
+    governance_revision: int = 0
+
+    @property
+    def knowledge_revision_ref(self) -> KnowledgeRevisionRef | None:
+        if not self.governance_ref or self.governance_revision < 1:
+            return None
+        return KnowledgeRevisionRef(self.governance_ref, self.governance_revision)
 
 
 def _escape_like_prefix(value: str) -> str:
@@ -141,8 +150,17 @@ class SignalStore:
     def _conn(self):
         conn = sqlite3.connect(str(self._db_path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        try:
+            if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).casefold() != "wal":
+                conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).casefold():
+                conn.close()
+                raise
+            # Another startup can be switching the database to WAL. The
+            # subsequent BEGIN IMMEDIATE is the authoritative serialization.
+            logger.info("signal_store_journal_mode_deferred", db_path=str(self._db_path))
         try:
             yield conn
             conn.commit()
@@ -165,6 +183,9 @@ class SignalStore:
         except Exception as exc:
             logger.warning("signals_bootstrap_taxonomy_unavailable", error=str(exc))
         with self._conn() as conn:
+            # Tenant ownership checks, schema rebuilds, classification markers,
+            # and projection quarantine are one serialized startup migration.
+            conn.execute("BEGIN IMMEDIATE")
             ensure_schema(
                 conn,
                 legacy_tenant=self._legacy_tenant,
@@ -189,6 +210,12 @@ class SignalStore:
     def _rebuild_ingested_dashboards_table(self, conn: sqlite3.Connection) -> None:
         rebuild_ingested_dashboards_table(conn, legacy_tenant=self._legacy_tenant or "default")
 
+    def _resolve_tenant(self, tenant_id: str | None) -> str:
+        return resolve_tenant_boundary(
+            str(self._settings.knowledge_tenant_id or "default"),
+            tenant_id,
+        )
+
     # ── Signal type CRUD ─────────────────────────────────────────────────
 
     def register_signal_type(
@@ -201,6 +228,8 @@ class SignalStore:
         tenant_id: str | None = None,
     ) -> None:
         """Register a global taxonomy definition or a tenant-specific override."""
+        if tenant_id is not None:
+            tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
         with self._conn() as conn:
             if tenant_id is None:
@@ -231,8 +260,9 @@ class SignalStore:
                     (tenant_id, signal_type, description, category, unit, now, now),
                 )
 
-    def list_signal_types(self, *, tenant_id: str = "default") -> list[dict[str, Any]]:
+    def list_signal_types(self, *, tenant_id: str | None = None) -> list[dict[str, Any]]:
         """List all registered signal types with mapping counts."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             global_rows = conn.execute("SELECT * FROM signal_types").fetchall()
             tenant_rows = conn.execute(
@@ -260,8 +290,9 @@ class SignalStore:
             result.append(definition)
         return sorted(result, key=lambda row: (row["category"], row["signal_type"]))
 
-    def get_signal_type(self, signal_type: str, *, tenant_id: str = "default") -> dict[str, Any] | None:
+    def get_signal_type(self, signal_type: str, *, tenant_id: str | None = None) -> dict[str, Any] | None:
         """Get a signal type with all its metric mappings."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             tenant_definition = conn.execute(
                 "SELECT * FROM tenant_signal_types WHERE tenant_id = ? AND signal_type = ?",
@@ -312,10 +343,13 @@ class SignalStore:
         source_type: str = "teach",
         source_refs: list[str] | None = None,
         governance_ref: str = "",
+        governance_revision: int = 0,
         inference_version: str = "",
         review_state: str = "trusted",
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         connection: sqlite3.Connection | None = None,
+        replace_existing: bool = False,
+        increment_use_count: bool = True,
     ) -> int:
         """Add or update a signal-to-metric mapping. Returns mapping ID.
 
@@ -328,8 +362,18 @@ class SignalStore:
         ('candidate' → 'approved' → 'trusted'); on conflict it is preserved
         (re-teaching never downgrades trust).
         """
+        if source_type != "bootstrap":
+            tenant_id = self._resolve_tenant(tenant_id)
+        else:
+            tenant_id = tenant_id or "default"
         if not 0.0 <= confidence <= 1.0:
             raise ValueError(f"confidence must be within [0.0, 1.0], got {confidence!r}")
+        if governance_ref and governance_revision < 1:
+            raise ValueError("governed mappings require a positive governance_revision")
+        if not governance_ref and governance_revision:
+            raise ValueError("governance_revision requires governance_ref")
+        if replace_existing and not governance_ref:
+            raise ValueError("replace_existing is reserved for governed mappings")
         now = time.time()
         storage_tenant = GLOBAL_BOOTSTRAP_TENANT_ID if source_type == "bootstrap" else tenant_id
         connection_context = nullcontext(connection) if connection is not None else self._conn()
@@ -383,6 +427,8 @@ class SignalStore:
             ).fetchone()
 
             def _merge(provided: list[str] | None, existing_json: str | None) -> list[str]:
+                if replace_existing:
+                    return list(dict.fromkeys(provided or []))
                 existing_list = json.loads(existing_json) if existing_json else []
                 if provided is None:
                     return existing_list
@@ -404,15 +450,31 @@ class SignalStore:
             clusters = _merge(context_clusters, prior["context_clusters"] if prior else None)
             namespaces = _merge(context_namespaces, prior["context_namespaces"] if prior else None)
             versions = _merge(context_versions, prior["context_versions"] if prior else None)
-            merged_valid_from = valid_from if valid_from is not None else (prior["valid_from"] if prior else None)
-            merged_valid_until = valid_until if valid_until is not None else (prior["valid_until"] if prior else None)
-            existing_refs = json.loads(prior["source_refs"]) if prior and prior["source_refs"] else []
+            merged_valid_from = (
+                valid_from if replace_existing or valid_from is not None else (prior["valid_from"] if prior else None)
+            )
+            merged_valid_until = (
+                valid_until
+                if replace_existing or valid_until is not None
+                else (prior["valid_until"] if prior else None)
+            )
+            existing_refs = (
+                [] if replace_existing else json.loads(prior["source_refs"]) if prior and prior["source_refs"] else []
+            )
             refs = list(existing_refs)
             for ref in source_refs or []:
                 if ref not in refs:
                     refs.append(ref)
-            merged_inference_version = inference_version or (prior["inference_version"] if prior else "")
-            merged_review_state = _stronger_review_state(prior["review_state"], review_state) if prior else review_state
+            merged_inference_version = (
+                inference_version
+                if replace_existing
+                else inference_version or (prior["inference_version"] if prior else "")
+            )
+            merged_review_state = (
+                review_state
+                if replace_existing
+                else _stronger_review_state(prior["review_state"], review_state) if prior else review_state
+            )
 
             cursor = conn.execute(
                 """INSERT INTO signal_metric_mappings
@@ -421,11 +483,13 @@ class SignalStore:
                     context_environments, context_archetypes, context_regions,
                     context_clusters, context_namespaces, context_versions,
                     valid_from, valid_until,
-                    source_type, source_refs, governance_ref, inference_version,
+                    source_type, source_refs, governance_ref, governance_revision, inference_version,
                     review_state, created_at, last_seen)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(tenant_id, signal_type, metric_pattern, governance_ref) DO UPDATE SET
-                       confidence = MAX(excluded.confidence, signal_metric_mappings.confidence),
+                       confidence = CASE WHEN ? THEN excluded.confidence
+                                         ELSE MAX(excluded.confidence, signal_metric_mappings.confidence) END,
+                       governance_revision = excluded.governance_revision,
                        inference_version = excluded.inference_version,
                        review_state = excluded.review_state,
                        -- excluded.context_* already holds the merged scopes.
@@ -452,7 +516,7 @@ class SignalStore:
                            ELSE excluded.source_refs
                        END,
                        last_seen = excluded.last_seen,
-                       use_count = signal_metric_mappings.use_count + 1""",
+                       use_count = signal_metric_mappings.use_count + ?""",
                 (
                     storage_tenant,
                     signal_type,
@@ -471,10 +535,13 @@ class SignalStore:
                     source_type,
                     json.dumps(refs),
                     governance_ref,
+                    governance_revision,
                     merged_inference_version,
                     merged_review_state,
                     now,
                     now,
+                    int(replace_existing),
+                    int(increment_use_count),
                 ),
             )
             return cursor.lastrowid or 0
@@ -492,7 +559,7 @@ class SignalStore:
         inference_version: str = "",
         dashboard_uid: str = "",
         backend_name: str = "",
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> int:
         """Persist an inferred candidate that was NOT auto-taught.
 
@@ -500,6 +567,7 @@ class SignalStore:
         proposed and why it was held back ('low_score'|'low_margin'|
         'single_source_only'), so the ruleset can be tuned/replayed later.
         """
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             cursor = conn.execute(
                 """INSERT INTO rejected_signal_candidates
@@ -527,9 +595,10 @@ class SignalStore:
         self,
         limit: int = 100,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return recorded rejected candidates (newest first)."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             rows = conn.execute(
                 """SELECT * FROM rejected_signal_candidates
@@ -550,9 +619,10 @@ class SignalStore:
         metric_pattern: str,
         positive: bool,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> None:
         """Record positive/negative feedback for a mapping (anti-drift)."""
+        tenant_id = self._resolve_tenant(tenant_id)
         col = "positive_feedback" if positive else "negative_feedback"
         with self._conn() as conn:
             conn.execute(
@@ -568,11 +638,12 @@ class SignalStore:
         metric_pattern: str,
         review_state: str,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         governance_ref: str = "",
         connection: sqlite3.Connection | None = None,
     ) -> bool:
         """Activate or deactivate a tenant mapping after governance evaluation."""
+        tenant_id = self._resolve_tenant(tenant_id)
         connection_context = nullcontext(connection) if connection is not None else self._conn()
         with connection_context as conn:
             assert conn is not None
@@ -583,6 +654,27 @@ class SignalStore:
             )
             return updated.rowcount == 1
 
+    def deactivate_governed_mappings(
+        self,
+        *,
+        tenant_id: str,
+        governance_ref: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> int:
+        """Deactivate every resolver row owned by one governed knowledge item."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        if not governance_ref:
+            raise ValueError("governance_ref is required")
+        connection_context = nullcontext(connection) if connection is not None else self._conn()
+        with connection_context as conn:
+            assert conn is not None
+            updated = conn.execute(
+                """UPDATE signal_metric_mappings SET review_state='candidate', last_seen=?
+                   WHERE tenant_id=? AND governance_ref=?""",
+                (time.time(), tenant_id, governance_ref),
+            )
+            return updated.rowcount
+
     def get_mappings_for_signal(
         self,
         signal_type: str,
@@ -592,14 +684,16 @@ class SignalStore:
         context_archetype: str = "",
         context_environment: str = "",
         include_decayed: bool = False,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         knowledge_scope: Any | None = None,
+        excluded_knowledge_refs: set[KnowledgeRevisionRef] | None = None,
     ) -> list[dict[str, Any]]:
         """Get all metric mappings for a signal, optionally filtered by context.
 
         Returns mappings sorted by effective confidence (adjusted for decay
         and feedback).
         """
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             rows = conn.execute(
                 """SELECT * FROM signal_metric_mappings
@@ -615,6 +709,15 @@ class SignalStore:
         seen_patterns: set[str] = set()
         for row in rows:
             m = _deserialize_mapping(row)
+            if excluded_knowledge_refs:
+                governance_ref = str(m.get("governance_ref") or "")
+                governance_revision = int(m.get("governance_revision") or 0)
+                if (
+                    governance_ref
+                    and governance_revision > 0
+                    and KnowledgeRevisionRef(governance_ref, governance_revision) in excluded_knowledge_refs
+                ):
+                    continue
 
             # Context filtering
             if not _context_matches(
@@ -674,7 +777,7 @@ class SignalStore:
         context_archetype: str = "",
         context_environment: str = "",
         target_query_language: str = "",
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         knowledge_scope: Any | None = None,
     ) -> list[tuple[MetricEntry, float]]:
         """Resolve a semantic signal while preserving the established public result shape."""
@@ -703,8 +806,9 @@ class SignalStore:
         context_archetype: str = "",
         context_environment: str = "",
         target_query_language: str = "",
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         knowledge_scope: Any | None = None,
+        excluded_knowledge_refs: set[KnowledgeRevisionRef] | None = None,
     ) -> list[ResolvedSignal]:
         """Resolve a semantic signal to actual metrics from the live catalog.
 
@@ -721,6 +825,7 @@ class SignalStore:
 
         This is the core algorithm that bridges semantic signals to real metrics.
         """
+        tenant_id = self._resolve_tenant(tenant_id)
         mappings = self.get_mappings_for_signal(
             signal_type,
             context_service=context_service,
@@ -729,6 +834,7 @@ class SignalStore:
             context_environment=context_environment,
             tenant_id=tenant_id,
             knowledge_scope=knowledge_scope,
+            excluded_knowledge_refs=excluded_knowledge_refs,
         )
 
         if not mappings:
@@ -762,6 +868,7 @@ class SignalStore:
                             entry=entry,
                             confidence=round(adjusted, 4),
                             governance_ref=str(mapping.get("governance_ref") or ""),
+                            governance_revision=int(mapping.get("governance_revision") or 0),
                         )
                     )
                     seen_metrics.add(metric_key)
@@ -779,10 +886,12 @@ class SignalStore:
         context_archetype: str = "",
         context_environment: str = "",
         target_query_language: str = "",
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         knowledge_scope: Any | None = None,
         applied_governance_refs: set[str] | None = None,
         governance_refs_by_default_metric: dict[str, set[str]] | None = None,
+        applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
+        governance_revision_refs_by_default_metric: dict[str, set[KnowledgeRevisionRef]] | None = None,
     ) -> dict[str, str]:
         """Resolve signal bindings to metric substitutions for archetype compile.
 
@@ -803,6 +912,7 @@ class SignalStore:
             Only contains entries where the default metric was NOT found in
             the catalog and a signal-based resolution succeeded.
         """
+        tenant_id = self._resolve_tenant(tenant_id)
         target_lang = target_query_language.lower()
         target_ds = context_datasource_type.lower()
         catalog_names = {
@@ -840,6 +950,11 @@ class SignalStore:
                     applied_governance_refs.add(best.governance_ref)
                 if governance_refs_by_default_metric is not None and best.governance_ref:
                     governance_refs_by_default_metric.setdefault(default_metric, set()).add(best.governance_ref)
+                revision_ref = best.knowledge_revision_ref
+                if applied_governance_revision_refs is not None and revision_ref is not None:
+                    applied_governance_revision_refs.add(revision_ref)
+                if governance_revision_refs_by_default_metric is not None and revision_ref is not None:
+                    governance_revision_refs_by_default_metric.setdefault(default_metric, set()).add(revision_ref)
                 logger.info(
                     "signal_resolved",
                     signal=signal_type,
@@ -847,6 +962,7 @@ class SignalStore:
                     resolved_to=best_entry.name,
                     confidence=best.confidence,
                     governance_ref=best.governance_ref,
+                    governance_revision=best.governance_revision,
                 )
 
         return substitutions
@@ -925,7 +1041,7 @@ class SignalStore:
         self,
         dashboard_uid: str,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         backend_name: str = "",
         dashboard_title: str = "",
         dashboard_tags: list[str] | None = None,
@@ -943,6 +1059,7 @@ class SignalStore:
         status: str = "pending",
     ) -> None:
         """Record features extracted from an ingested dashboard."""
+        tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
         with self._conn() as conn:
             conn.execute(
@@ -979,7 +1096,7 @@ class SignalStore:
     def index_dashboard_context(
         self,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         dashboard_uid: str,
         backend_name: str = "",
         dashboard_title: str = "",
@@ -996,6 +1113,7 @@ class SignalStore:
         truth. Mapping approval still lives in ``signal_metric_mappings`` and
         dashboard review state still lives in ``ingested_dashboards``.
         """
+        tenant_id = self._resolve_tenant(tenant_id)
         if not self._learning_index_available():
             return 0
 
@@ -1037,7 +1155,7 @@ class SignalStore:
         self,
         alert_uid: str,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         backend_name: str = "",
         source_vendor: str = "",
         source_instance: str = "",
@@ -1065,6 +1183,7 @@ class SignalStore:
 
         Returns ``created``, ``updated``, or ``skipped``.
         """
+        tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
         with self._conn() as conn:
             existing = conn.execute(
@@ -1160,7 +1279,7 @@ class SignalStore:
     def record_learned_artifact(
         self,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         artifact_id: str,
         artifact_type: str,
         source_vendor: str = "",
@@ -1175,6 +1294,7 @@ class SignalStore:
 
         Returns ``created``, ``updated``, ``skipped``, or ``restored``.
         """
+        tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
         with self._conn() as conn:
             existing = conn.execute(
@@ -1236,7 +1356,7 @@ class SignalStore:
     def replace_artifact_extractions(
         self,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         artifact_id: str,
         evidence_requirements: list[dict[str, Any]] | None = None,
         ownership_hints: list[dict[str, Any]] | None = None,
@@ -1244,6 +1364,7 @@ class SignalStore:
         signal_mapping_candidates: list[dict[str, Any]] | None = None,
     ) -> dict[str, int]:
         """Replace extracted IR rows for one artifact."""
+        tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
         with self._conn() as conn:
             conn.execute(
@@ -1370,7 +1491,7 @@ class SignalStore:
     def index_artifact_context(
         self,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         artifact_id: str,
         artifact_type: str,
         title: str = "",
@@ -1381,6 +1502,7 @@ class SignalStore:
         signal_mapping_candidates: list[dict[str, Any]] | None = None,
     ) -> int:
         """Index learned artifact context for retrieval when FTS5 is available."""
+        tenant_id = self._resolve_tenant(tenant_id)
         if not self._learning_index_available():
             return 0
         indexed_at = time.time()
@@ -1512,7 +1634,7 @@ class SignalStore:
     def mark_missing_artifacts_stale(
         self,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         artifact_type: str,
         seen_artifact_ids: set[str],
         source_vendor: str | None = None,
@@ -1520,6 +1642,7 @@ class SignalStore:
         external_id_prefix: str | None = None,
     ) -> int:
         """Mark previously learned artifacts stale when absent from a complete crawl."""
+        tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
         with self._conn() as conn:
             clauses = ["tenant_id = ?", "artifact_type = ?", "stale = 0"]
@@ -1571,13 +1694,14 @@ class SignalStore:
     def list_learned_artifacts(
         self,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         artifact_type: str | None = None,
         stale: bool | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         """List learned operational artifacts."""
+        tenant_id = self._resolve_tenant(tenant_id)
         conditions = ["tenant_id = ?"]
         params: list[Any] = [tenant_id]
         if artifact_type:
@@ -1600,8 +1724,14 @@ class SignalStore:
             ).fetchall()
         return [_deserialize_learned_artifact(row) for row in rows]
 
-    def get_learned_artifact(self, artifact_id: str, *, tenant_id: str = "default") -> dict[str, Any] | None:
+    def get_learned_artifact(
+        self,
+        artifact_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """Return one learned artifact by stable artifact ID."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT * FROM learned_artifacts WHERE tenant_id = ? AND artifact_id = ?",
@@ -1613,9 +1743,10 @@ class SignalStore:
         self,
         artifact_id: str,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         """Return extracted IR rows for one artifact."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             evidence = conn.execute(
                 """SELECT * FROM evidence_requirements
@@ -1642,8 +1773,14 @@ class SignalStore:
             "signal_mapping_candidates": [dict(row) for row in signal_candidates],
         }
 
-    def artifact_extraction_counts(self, artifact_id: str, *, tenant_id: str = "default") -> dict[str, int]:
+    def artifact_extraction_counts(
+        self,
+        artifact_id: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, int]:
         """Return structured extraction row counts for one artifact."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             evidence = conn.execute(
                 """SELECT COUNT(*) AS count FROM evidence_requirements
@@ -1673,11 +1810,12 @@ class SignalStore:
     def artifact_context_indexed(
         self,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         artifact_id: str,
         artifact_type: str,
     ) -> bool:
         """Return whether an artifact has rows in the optional learning index."""
+        tenant_id = self._resolve_tenant(tenant_id)
         if not self._learning_index_available():
             return True
         try:
@@ -1696,11 +1834,12 @@ class SignalStore:
     def mark_missing_alerts_stale(
         self,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         backend_name: str,
         seen_alert_uids: set[str],
     ) -> int:
         """Mark previously ingested backend alerts stale when absent from a crawl."""
+        tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
         with self._conn() as conn:
             rows = conn.execute(
@@ -1749,11 +1888,12 @@ class SignalStore:
     def mark_missing_dashboards_stale(
         self,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         backend_name: str,
         seen_dashboard_uids: set[str],
     ) -> int:
         """Mark dashboards absent from a complete backend crawl as stale."""
+        tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
         with self._conn() as conn:
             rows = conn.execute(
@@ -1801,7 +1941,7 @@ class SignalStore:
         """Remove stale provenance from active mappings, deleting unsupported rows."""
         mappings = conn.execute(
             """SELECT id, source_refs FROM signal_metric_mappings
-               WHERE tenant_id = ?""",
+               WHERE tenant_id = ? AND governance_ref = ''""",
             (tenant_id,),
         ).fetchall()
         for mapping in mappings:
@@ -1826,11 +1966,12 @@ class SignalStore:
         active_pairs: set[tuple[str, str]],
     ) -> None:
         """Remove one refreshed source from mappings it no longer supports."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             mappings = conn.execute(
                 """SELECT id, signal_type, metric_pattern, source_refs
                    FROM signal_metric_mappings
-                   WHERE tenant_id = ?""",
+                   WHERE tenant_id = ? AND governance_ref = ''""",
                 (tenant_id,),
             ).fetchall()
             for mapping in mappings:
@@ -1850,7 +1991,7 @@ class SignalStore:
     def index_alert_context(
         self,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         alert_uid: str,
         backend_name: str = "",
         alert_title: str = "",
@@ -1864,6 +2005,7 @@ class SignalStore:
         activated_pairs: set[tuple[str, str]] | None = None,
     ) -> int:
         """Index learned alert-rule context for fast operational-language retrieval."""
+        tenant_id = self._resolve_tenant(tenant_id)
         if not self._learning_index_available():
             return 0
 
@@ -1909,9 +2051,10 @@ class SignalStore:
         review_state: str,
         backend_name: str | None = None,
         activated_pairs: set[tuple[str, str]] | None = None,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> int:
         """Reflect dashboard approval/rejection in the retrieval index."""
+        tenant_id = self._resolve_tenant(tenant_id)
         if not self._learning_index_available():
             return 0
         backend = backend_name if backend_name is not None else ""
@@ -1976,9 +2119,10 @@ class SignalStore:
         service: str = "",
         include_candidates: bool = True,
         limit: int = 20,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search the learned operational knowledge index."""
+        tenant_id = self._resolve_tenant(tenant_id)
         if not self._learning_index_available():
             raise LearningIndexUnavailable(
                 "Learned-context search requires SQLite FTS5, but this SQLite build does not provide it."
@@ -2018,9 +2162,10 @@ class SignalStore:
         *,
         include_candidates: bool = True,
         limit: int = 50,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> dict[str, Any]:
         """Summarize what Tacit has learned about a service."""
+        tenant_id = self._resolve_tenant(tenant_id)
         rows = self.search_learning_context(
             service,
             service=service,
@@ -2104,9 +2249,10 @@ class SignalStore:
         dashboard_uid: str,
         backend_name: str | None = None,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Get ingested dashboard record."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             if backend_name is None:
                 rows = conn.execute(
@@ -2133,11 +2279,12 @@ class SignalStore:
         status: str | None = None,
         limit: int = 50,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         backend_name: str | None = None,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         """List ingested dashboards, optionally filtered by status."""
+        tenant_id = self._resolve_tenant(tenant_id)
         conditions = ["tenant_id = ?"]
         params: list[Any] = [tenant_id]
         if status:
@@ -2161,11 +2308,12 @@ class SignalStore:
         status: str | None = None,
         limit: int = 50,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
         backend_name: str | None = None,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         """List ingested alerts, optionally filtered by status."""
+        tenant_id = self._resolve_tenant(tenant_id)
         conditions = ["tenant_id = ?"]
         params: list[Any] = [tenant_id]
         if status:
@@ -2189,9 +2337,10 @@ class SignalStore:
         alert_uid: str,
         backend_name: str = "",
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Return one ingested alert row by backend-scoped alert UID."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             row = conn.execute(
                 """SELECT * FROM ingested_alerts
@@ -2209,9 +2358,10 @@ class SignalStore:
         backend_name: str | None = None,
         activated_pairs: set[tuple[str, str]] | None = None,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> bool:
         """Move a pending ingested dashboard to a reviewed status."""
+        tenant_id = self._resolve_tenant(tenant_id)
         if status not in {"approved", "rejected", "ignored"}:
             raise ValueError(f"unsupported ingested dashboard status: {status}")
 
@@ -2253,7 +2403,7 @@ class SignalStore:
         backend_name: str | None = None,
         activated_pairs: set[tuple[str, str]] | None = None,
         *,
-        tenant_id: str = "default",
+        tenant_id: str | None = None,
     ) -> bool:
         """Approve a pending ingested dashboard (activates its signal mappings)."""
         return self.update_ingested_dashboard_status(
@@ -2265,21 +2415,30 @@ class SignalStore:
         )
 
     def reject_ingested_dashboard(
-        self, dashboard_uid: str, backend_name: str | None = None, *, tenant_id: str = "default"
+        self,
+        dashboard_uid: str,
+        backend_name: str | None = None,
+        *,
+        tenant_id: str | None = None,
     ) -> bool:
         """Reject a pending ingested dashboard as unsuitable for learning."""
         return self.update_ingested_dashboard_status(dashboard_uid, "rejected", backend_name, tenant_id=tenant_id)
 
     def ignore_ingested_dashboard(
-        self, dashboard_uid: str, backend_name: str | None = None, *, tenant_id: str = "default"
+        self,
+        dashboard_uid: str,
+        backend_name: str | None = None,
+        *,
+        tenant_id: str | None = None,
     ) -> bool:
         """Ignore a pending ingested dashboard without treating it as negative signal data."""
         return self.update_ingested_dashboard_status(dashboard_uid, "ignored", backend_name, tenant_id=tenant_id)
 
     # ── Stats ────────────────────────────────────────────────────────────
 
-    def stats(self, *, tenant_id: str = "default") -> dict[str, Any]:
+    def stats(self, *, tenant_id: str | None = None) -> dict[str, Any]:
         """Summary statistics for the signal store."""
+        tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             mapping_count = conn.execute(
                 "SELECT COUNT(*) FROM signal_metric_mappings WHERE tenant_id IN (?, ?)",

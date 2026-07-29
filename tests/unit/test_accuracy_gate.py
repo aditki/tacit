@@ -5,12 +5,13 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from tacit.archetypes.engine import _panel_signature, blend_archetypes, rank_archetypes_by_coverage
+from tacit.archetypes.engine import _panel_signature, blend_archetypes, compile_archetype, rank_archetypes_by_coverage
 from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from tacit.cache import metric_cache
 from tacit.catalog import catalog_for_services
-from tacit.config import settings
+from tacit.config import Settings, settings
 from tacit.grafana.adapters.prometheus import PrometheusAdapter
+from tacit.knowledge.usage import KnowledgeUsageEffect, KnowledgeUsageStage
 from tacit.models.schemas import (
     ArchetypeMatch,
     DashboardSpec,
@@ -22,6 +23,8 @@ from tacit.models.schemas import (
     SignalType,
 )
 from tacit.pipeline import _discovery_keywords
+from tacit.pipeline.discovery import confirm_colloquial_keywords
+from tacit.pipeline.stages.archetypes import ArchetypeCompilation, select_archetypes
 from tacit.signals import SignalStore, _unit_compatibility
 from tacit.validation import validate_dashboard_queries
 from tests.eval.gate_harness import gate_failures
@@ -311,6 +314,112 @@ def test_archetype_ranking_prefers_live_coverage_over_raw_confidence():
     assert [archetype.id for archetype, _ in ranked] == ["covered"]
 
 
+def test_archetype_selection_attributes_the_exact_governed_mapping_revision(tmp_path):
+    uncovered = _archetype("uncovered", "missing_uncovered_metric")
+    archetype = _archetype("governed", "missing_default_metric")
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.add_mapping(
+        "governed_signal",
+        "live_metric",
+        confidence=0.9,
+        source_type="operational_knowledge",
+        source_refs=["knowledge-governed@4"],
+        governance_ref="knowledge-governed",
+        governance_revision=4,
+        review_state="approved",
+    )
+    stage_uses = []
+
+    ranked = rank_archetypes_by_coverage(
+        [(uncovered, 0.99), (archetype, 0.8)],
+        [_metric("live_metric")],
+        max_archetypes=1,
+        signal_store=store,
+        knowledge_stage_uses=stage_uses,
+    )
+
+    assert [item.id for item, _ in ranked] == ["governed"]
+    assert len(stage_uses) == 1
+    assert stage_uses[0].revision_ref.knowledge_ref == "knowledge-governed"
+    assert stage_uses[0].revision_ref.knowledge_revision == 4
+    assert stage_uses[0].stage == KnowledgeUsageStage.ARCHETYPE_SELECTION
+    assert stage_uses[0].effect == KnowledgeUsageEffect.ARCHETYPE_SELECTED_BY_LIVE_COVERAGE
+
+
+def test_archetype_selection_does_not_attribute_a_mapping_that_cannot_change_selection(tmp_path):
+    archetype = _archetype("governed", "missing_default_metric")
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.add_mapping(
+        "governed_signal",
+        "live_metric",
+        confidence=0.9,
+        source_type="operational_knowledge",
+        source_refs=["knowledge-governed@4"],
+        governance_ref="knowledge-governed",
+        governance_revision=4,
+        review_state="approved",
+    )
+    stage_uses = []
+
+    ranked = rank_archetypes_by_coverage(
+        [(archetype, 0.8)],
+        [_metric("live_metric")],
+        max_archetypes=1,
+        signal_store=store,
+        knowledge_stage_uses=stage_uses,
+    )
+
+    assert [item.id for item, _ in ranked] == ["governed"]
+    assert stage_uses == []
+
+
+def test_archetype_selection_attributes_only_targets_changed_by_each_revision(tmp_path):
+    stable = InvestigationArchetype(
+        id="stable",
+        name="stable",
+        problem_types=["stable"],
+        required_signals=["shared_signal"],
+        required_metrics=["stable_base_metric"],
+        panels=[PanelTemplate(title="stable", queries=[QueryTemplate(expr="stable_base_metric")])],
+    )
+    dependent = InvestigationArchetype(
+        id="dependent",
+        name="dependent",
+        problem_types=["dependent"],
+        required_signals=["shared_signal"],
+        panels=[PanelTemplate(title="dependent", queries=[QueryTemplate(expr="missing_default")])],
+    )
+    fallback = InvestigationArchetype(
+        id="fallback",
+        name="fallback",
+        problem_types=["fallback"],
+        required_metrics=["fallback_metric"],
+        panels=[PanelTemplate(title="fallback", queries=[QueryTemplate(expr="fallback_metric")])],
+    )
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.add_mapping(
+        "shared_signal",
+        "live_shared_metric",
+        confidence=0.9,
+        source_type="operational_knowledge",
+        governance_ref="knowledge-shared",
+        governance_revision=3,
+        review_state="approved",
+    )
+    stage_uses = []
+
+    ranked = rank_archetypes_by_coverage(
+        [(stable, 0.99), (dependent, 0.8), (fallback, 0.45)],
+        [_metric("live_shared_metric"), _metric("stable_base_metric"), _metric("fallback_metric")],
+        max_archetypes=2,
+        signal_store=store,
+        knowledge_stage_uses=stage_uses,
+    )
+
+    assert [item.id for item, _ in ranked] == ["stable", "dependent"]
+    assert [use.target_ref for use in stage_uses] == ["archetype:dependent"]
+
+
 def test_archetype_ranking_includes_required_metrics_without_signals():
     uncovered = InvestigationArchetype(
         id="uncovered-required-metrics",
@@ -423,6 +532,106 @@ def test_colloquial_confirmation_catalog_is_scoped_to_requested_service(tmp_path
         context_service="checkout-service",
         target_query_language="promql",
     )
+
+
+def test_governed_colloquial_confirmation_attributes_archetype_routing(monkeypatch, tmp_path):
+    routed = _archetype("cache-context", "live_cache_metric")
+    intent = Intent(
+        summary="the in-memory tier is squeezed",
+        domain="application",
+        services=[],
+        signals=[SignalType.METRICS],
+        keywords=["saturation"],
+        timerange="1h",
+        problem_type="general",
+        archetypes=[],
+        keyword_evidence=[{"keyword": "cache", "score": 0.4, "tier": "colloquial", "source": "in-memory tier"}],
+    )
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.add_mapping(
+        "cache_hits",
+        "live_cache_metric",
+        confidence=0.9,
+        source_type="operational_knowledge",
+        governance_ref="knowledge-cache",
+        governance_revision=7,
+        review_state="approved",
+    )
+    confirmed = confirm_colloquial_keywords(
+        intent,
+        [_metric("live_cache_metric")],
+        "promql",
+        store,
+    )
+
+    monkeypatch.setattr("tacit.pipeline.stages.archetypes.get_archetypes_by_confidence", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "tacit.pipeline.stages.archetypes.get_archetypes_by_learning_context",
+        lambda candidate_intent, *_args, **_kwargs: [(routed, 0.8)] if "cache" in candidate_intent.keywords else [],
+    )
+    monkeypatch.setattr("tacit.pipeline.stages.archetypes.get_archetype", lambda *_args, **_kwargs: None)
+
+    selection = select_archetypes(
+        intent=intent,
+        metric_catalog=[_metric("live_cache_metric")],
+        catalog_for_compile=[_metric("live_cache_metric")],
+        target_language="promql",
+        settings=Settings(_env_file=None),
+        signal_store=store,
+        confirmed_keywords=confirmed,
+    )
+
+    assert confirmed == ["cache"]
+    assert [archetype.id for archetype, _ in selection.ranked_archetypes] == ["cache-context"]
+    assert [(use.knowledge_ref, use.knowledge_revision, use.target_ref) for use in selection.knowledge_stage_uses] == [
+        ("knowledge-cache", 7, "archetype:cache-context")
+    ]
+
+
+def test_compilation_attribution_follows_the_substituted_template_query(tmp_path):
+    archetype = InvestigationArchetype(
+        id="latency",
+        name="Latency",
+        problem_types=["latency"],
+        required_signals=["request_latency"],
+        signal_bindings={"request_latency": "missing_default_metric"},
+        panels=[
+            PanelTemplate(title="Substituted", queries=[QueryTemplate(expr="missing_default_metric")]),
+            PanelTemplate(title="Unrelated", queries=[QueryTemplate(expr="live_latency_metric")]),
+        ],
+    )
+    intent = Intent(summary="latency", domain="application", problem_type="latency")
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.add_mapping(
+        "request_latency",
+        "live_latency_metric",
+        confidence=0.9,
+        source_type="operational_knowledge",
+        governance_ref="knowledge-latency",
+        governance_revision=5,
+        review_state="approved",
+    )
+    query_uses = []
+
+    dashboard = compile_archetype(
+        archetype,
+        intent,
+        [_metric("live_latency_metric")],
+        signal_store=store,
+        knowledge_query_uses=query_uses,
+    )
+
+    assert [(use.panel_title, use.knowledge_ref, use.knowledge_revision) for use in query_uses] == [
+        ("Substituted", "knowledge-latency", 5)
+    ]
+    compilation = ArchetypeCompilation(
+        dashboard_spec=dashboard,
+        primary_archetype=archetype,
+        primary_confidence=1.0,
+        knowledge_query_uses=tuple(query_uses),
+    )
+    dashboard_without_substitution = dashboard.model_copy(update={"panels": [dashboard.panels[1]]})
+    assert compilation.surviving_knowledge_revision_refs(dashboard_without_substitution) == frozenset()
 
 
 def test_archetype_ranking_prefers_strong_learned_match(monkeypatch):

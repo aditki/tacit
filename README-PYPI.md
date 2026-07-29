@@ -85,6 +85,8 @@ Useful settings include:
 - `SIGNALS_DB_PATH`
 - `API_AUTH_ENABLED`
 - `API_AUTH_KEY`
+- `KNOWLEDGE_TENANT_ID`
+- `KNOWLEDGE_TENANT_API_KEYS`
 
 ## More Documentation
 

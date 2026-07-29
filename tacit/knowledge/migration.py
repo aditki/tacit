@@ -13,8 +13,15 @@ from tacit.knowledge.enums import (
     Predicate,
     ReviewState,
 )
-from tacit.knowledge.models import KnowledgeCandidate, KnowledgeEvidenceReference, KnowledgeScope, MigrationProvenance
+from tacit.knowledge.models import (
+    KnowledgeCandidate,
+    KnowledgeEvidenceReference,
+    KnowledgeScope,
+    MigrationProvenance,
+    utc_now,
+)
 from tacit.knowledge.normalization import canonical_scope_payload, normalize_service_ref, stable_fingerprint
+from tacit.knowledge.repository import CandidateReviewConflictError
 from tacit.knowledge.service import KnowledgeService, _source_family
 
 
@@ -96,14 +103,12 @@ def migrate_artifact_extractions(
                 reactivate_stale=True,
             )
             legacy_review = str(row.get("review_state", ReviewState.CANDIDATE.value))
-            if (
-                existing is None
-                and legacy_review in {state.value for state in ReviewState}
-                and legacy_review != "candidate"
-            ):
-                state = candidate.state.model_copy(update={"review_state": ReviewState(legacy_review)})
-                candidate = candidate.model_copy(update={"state": state})
-                service.repository.save_candidate(candidate)
+            candidate = _apply_imported_review_state(
+                service,
+                candidate,
+                legacy_review,
+                was_existing=existing is not None,
+            )
             _evaluate_imported_approval(service, candidate)
             created.append(candidate.id)
     return created
@@ -202,17 +207,48 @@ def migrate_signal_mapping(
         reactivate_stale=True,
     )
     review = str(row.get("review_state", ReviewState.CANDIDATE.value))
-    if existing is None and review in {state.value for state in ReviewState} and review != ReviewState.CANDIDATE.value:
-        candidate = candidate.model_copy(
-            update={"state": candidate.state.model_copy(update={"review_state": ReviewState(review)})}
-        )
-        service.repository.save_candidate(candidate)
+    candidate = _apply_imported_review_state(
+        service,
+        candidate,
+        review,
+        was_existing=existing is not None,
+    )
     _evaluate_imported_approval(service, candidate)
     return candidate.id
 
 
 def _service_ref(value: str) -> str:
     return normalize_service_ref(value)
+
+
+def _apply_imported_review_state(
+    service: KnowledgeService,
+    candidate: KnowledgeCandidate,
+    raw_review_state: str,
+    *,
+    was_existing: bool,
+) -> KnowledgeCandidate:
+    """Import legacy review only if no governed transition won concurrently."""
+    if (
+        was_existing
+        or raw_review_state not in {state.value for state in ReviewState}
+        or raw_review_state == ReviewState.CANDIDATE.value
+        or candidate.state.review_state != ReviewState.CANDIDATE
+    ):
+        return candidate
+    updated = candidate.model_copy(
+        update={
+            "state": candidate.state.model_copy(update={"review_state": ReviewState(raw_review_state)}),
+            "updated_at": utc_now(),
+        }
+    )
+    try:
+        return service.repository.transition_candidate_review(updated, expected=candidate)
+    except CandidateReviewConflictError:
+        current = service.repository.get_candidate(candidate.id, candidate.tenant_id)
+        if current is None:
+            raise
+        return current
 
 
 def _evaluate_imported_approval(service: KnowledgeService, candidate: KnowledgeCandidate) -> None:
@@ -223,11 +259,14 @@ def _evaluate_imported_approval(service: KnowledgeService, candidate: KnowledgeC
         candidate.proposition.proposition_key,
     )
     current = service.repository.get_revision(item.id, tenant_id=candidate.tenant_id) if item is not None else None
-    if (
-        current is None
-        or current.state.lifecycle_status != LifecycleStatus.ACTIVE
-        or current.state.eligibility == KnowledgeEligibility.INELIGIBLE
-    ):
+    should_evaluate = current is None or (
+        current.state.lifecycle_status == LifecycleStatus.STALE
+        or (
+            current.state.lifecycle_status == LifecycleStatus.ACTIVE
+            and current.state.eligibility == KnowledgeEligibility.INELIGIBLE
+        )
+    )
+    if should_evaluate:
         service.evaluate_candidate(candidate.id, tenant_id=candidate.tenant_id)
 
 

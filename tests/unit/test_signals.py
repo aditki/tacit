@@ -5,13 +5,16 @@ Covers both PromQL (Grafana) and SignalFlow (SignalFx) extraction.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from importlib.resources import files
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from tacit.backends.base import DashboardFeatures
@@ -61,6 +64,47 @@ def _metric_entry(name: str) -> MetricEntry:
     )
 
 
+def _wildcard_store(store: SignalStore) -> SignalStore:
+    return SignalStore(
+        db_path=store._db_path,
+        runtime_settings=Settings(knowledge_tenant_id="*"),
+    )
+
+
+def _pinned_store(store: SignalStore, tenant_id: str) -> SignalStore:
+    return SignalStore(
+        db_path=store._db_path,
+        runtime_settings=Settings(knowledge_tenant_id=tenant_id),
+    )
+
+
+def test_wildcard_signal_store_requires_an_explicit_tenant(signal_store):
+    store = _wildcard_store(signal_store)
+
+    operations = [
+        lambda: store.list_signal_types(),
+        lambda: store.get_signal_type("request_latency"),
+        lambda: store.add_mapping("request_latency", "latency_seconds"),
+        lambda: store.resolve_signal("request_latency", [_metric_entry("latency_seconds")]),
+        lambda: store.search_learning_context("checkout"),
+        lambda: store.list_ingested_dashboards(),
+        lambda: store.list_learned_artifacts(),
+        lambda: store.stats(),
+    ]
+    for operation in operations:
+        with pytest.raises(ValueError, match="tenant"):
+            operation()
+
+
+def test_pinned_signal_store_rejects_cross_tenant_calls(signal_store):
+    store = _pinned_store(signal_store, "tenant-a")
+
+    with pytest.raises(ValueError, match="Tenant access denied"):
+        store.list_signal_types(tenant_id="tenant-b")
+    with pytest.raises(ValueError, match="Tenant access denied"):
+        store.add_mapping("request_latency", "latency_seconds", tenant_id="tenant-b")
+
+
 def test_signal_approval_validates_wildcard_tenant_before_activation(signal_store, monkeypatch):
     monkeypatch.setattr("tacit.dashboard_ingest.service.settings.knowledge_tenant_id", "*")
 
@@ -77,7 +121,47 @@ def test_signal_approval_validates_wildcard_tenant_before_activation(signal_stor
             source_ref="dashboard:wildcard-tenant",
             dashboard_uid="wildcard-tenant",
         )
-    assert signal_store.get_signal_type("wildcard_tenant_signal") is None
+    assert signal_store.get_signal_type("wildcard_tenant_signal", tenant_id="default") is None
+
+
+def test_direct_signal_approval_requires_teach_permissions(signal_store):
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read",
+    )
+
+    with pytest.raises(PermissionError, match="knowledge.review"):
+        persist_inferred_signal_review(
+            store=signal_store,
+            sig={
+                "signal_type": "protected_signal",
+                "metric": "protected_metric",
+                "source": "heuristic",
+                "auto_teach_eligible": True,
+                "confidence": 0.9,
+            },
+            source_ref="dashboard:protected",
+            dashboard_uid="protected",
+            runtime_settings=runtime_settings,
+        )
+
+    assert signal_store.get_signal_type("protected_signal") is None
+
+
+@pytest.mark.asyncio
+async def test_direct_dashboard_auto_approval_requires_teach_permissions():
+    from tacit.dashboard_ingest.service import ingest_dashboard_features
+
+    with pytest.raises(PermissionError, match="knowledge.review"):
+        await ingest_dashboard_features(
+            object(),
+            auto_approve=True,
+            store=object(),
+            runtime_settings=Settings(
+                _env_file=None,
+                knowledge_permissions="knowledge.read",
+            ),
+        )
 
 
 def test_signal_approval_enforces_supplied_runtime_tenant(signal_store):
@@ -99,10 +183,13 @@ def test_signal_approval_enforces_supplied_runtime_tenant(signal_store):
             runtime_settings=runtime_settings,
         )
 
-    assert signal_store.get_signal_type("cross_tenant_signal", tenant_id="tenant-b") is None
+    with signal_store._conn() as conn:
+        assert conn.execute("""SELECT 1 FROM tenant_signal_types
+               WHERE tenant_id='tenant-b' AND signal_type='cross_tenant_signal'""").fetchone() is None
 
 
 def test_signal_mapping_resolution_is_tenant_scoped(signal_store, monkeypatch):
+    signal_store = _wildcard_store(signal_store)
     signal_store.add_mapping(
         "request_latency",
         "tenant_a_latency_seconds",
@@ -139,6 +226,7 @@ def test_signal_mapping_resolution_is_tenant_scoped(signal_store, monkeypatch):
 
 
 def test_bootstrap_signal_mappings_are_available_to_every_tenant(signal_store):
+    signal_store = _wildcard_store(signal_store)
     signal_store.add_mapping(
         "request_latency",
         "http_request_duration_seconds",
@@ -152,6 +240,7 @@ def test_bootstrap_signal_mappings_are_available_to_every_tenant(signal_store):
 
 
 def test_default_tenant_mapping_cannot_mutate_global_bootstrap(signal_store):
+    signal_store = _wildcard_store(signal_store)
     signal_store.add_mapping(
         "request_latency",
         "http_request_duration_seconds",
@@ -191,6 +280,7 @@ def test_default_tenant_mapping_cannot_mutate_global_bootstrap(signal_store):
 
 
 def test_context_rejected_tenant_override_does_not_hide_bootstrap_mapping(signal_store):
+    signal_store = _wildcard_store(signal_store)
     signal_store.add_mapping(
         "request_latency",
         "http_request_duration_seconds",
@@ -217,6 +307,7 @@ def test_context_rejected_tenant_override_does_not_hide_bootstrap_mapping(signal
 
 
 def test_stale_alert_removes_only_its_signal_mapping_provenance(signal_store):
+    signal_store = _wildcard_store(signal_store)
     for alert_uid in ("checkout-latency", "payments-latency"):
         signal_store.record_ingested_alert(
             alert_uid,
@@ -264,6 +355,7 @@ def test_stale_alert_removes_only_its_signal_mapping_provenance(signal_store):
 
 
 def test_mapping_reconciliation_checks_all_provenance_refs(signal_store):
+    signal_store = _wildcard_store(signal_store)
     signal_store.add_mapping(
         "request_latency",
         "service_latency_seconds",
@@ -297,6 +389,7 @@ def test_mapping_reconciliation_checks_all_provenance_refs(signal_store):
 
 
 def test_rejected_signal_candidates_are_tenant_scoped(signal_store):
+    signal_store = _wildcard_store(signal_store)
     signal_store.record_rejected_candidate("tenant_a_metric", tenant_id="tenant-a")
     signal_store.record_rejected_candidate("tenant_b_metric", tenant_id="tenant-b")
 
@@ -366,7 +459,9 @@ def test_mapping_tenant_rebuild_rolls_back_on_copy_failure(tmp_path):
     assert row["confidence"] is None
 
 
-def test_signal_mapping_activates_after_governed_corroboration(signal_store):
+def test_signal_mapping_activates_after_governed_corroboration(signal_store, monkeypatch):
+    monkeypatch.setattr("tacit.signals.store.settings.knowledge_tenant_id", "tenant-a")
+    signal_store = _pinned_store(signal_store, "tenant-a")
     runtime_settings = Settings(knowledge_tenant_id="tenant-a")
     first_persisted = persist_inferred_signal_review(
         store=signal_store,
@@ -405,7 +500,14 @@ def test_signal_mapping_activates_after_governed_corroboration(signal_store):
 
     assert second_persisted is True
     assert signal_store.resolve_signal("checkout_latency", catalog, tenant_id="tenant-a")
-    assert signal_store.resolve_signal("checkout_latency", catalog, tenant_id="tenant-b") == []
+    assert (
+        _wildcard_store(signal_store).resolve_signal(
+            "checkout_latency",
+            catalog,
+            tenant_id="tenant-b",
+        )
+        == []
+    )
     with signal_store._conn() as conn:
         rows = conn.execute(
             """SELECT governance_ref, review_state
@@ -421,6 +523,7 @@ def test_signal_mapping_activates_after_governed_corroboration(signal_store):
 
 
 def test_copied_dashboard_and_alert_sources_do_not_manufacture_corroboration(signal_store):
+    signal_store = _pinned_store(signal_store, "tenant-a")
     runtime_settings = Settings(knowledge_tenant_id="tenant-a")
     signal = {
         "signal_type": "checkout_latency",
@@ -468,6 +571,7 @@ def test_copied_dashboard_and_alert_sources_do_not_manufacture_corroboration(sig
 
 
 def test_governed_mapping_scopes_and_lifecycles_are_independent(signal_store):
+    signal_store = _pinned_store(signal_store, "tenant-a")
     for knowledge_id, service in (("knowledge-checkout", "checkout"), ("knowledge-payments", "payments")):
         signal_store.add_mapping(
             "request_latency",
@@ -477,6 +581,7 @@ def test_governed_mapping_scopes_and_lifecycles_are_independent(signal_store):
             source_type="operational_knowledge",
             source_refs=[f"{knowledge_id}@1"],
             governance_ref=knowledge_id,
+            governance_revision=1,
             review_state="approved",
             tenant_id="tenant-a",
         )
@@ -527,6 +632,7 @@ def test_governed_mapping_scopes_and_lifecycles_are_independent(signal_store):
 
 
 def test_learning_context_index_is_tenant_scoped(signal_store):
+    signal_store = _wildcard_store(signal_store)
     for tenant_id, title, metric in (
         ("tenant-a", "Tenant A Checkout", "tenant_a_checkout_latency"),
         ("tenant-b", "Tenant B Checkout", "tenant_b_checkout_latency"),
@@ -548,6 +654,7 @@ def test_learning_context_index_is_tenant_scoped(signal_store):
 
 
 def test_taught_signal_definitions_are_tenant_scoped(signal_store):
+    signal_store = _wildcard_store(signal_store)
     signal_store.register_signal_type(
         "request_latency",
         description="Built-in latency",
@@ -626,7 +733,12 @@ def test_legacy_mappings_and_learning_index_migrate_to_default_tenant(tmp_path):
     assert migrated_mapping["tenant_id"] == GLOBAL_BOOTSTRAP_TENANT_ID
     assert migrated_mapping["governance_ref"] == ""
     assert store.search_learning_context("legacy", tenant_id="default")
-    store.add_mapping("latency", "legacy_latency_seconds", confidence=0.8, tenant_id="tenant-b")
+    _wildcard_store(store).add_mapping(
+        "latency",
+        "legacy_latency_seconds",
+        confidence=0.8,
+        tenant_id="tenant-b",
+    )
 
 
 def test_wildcard_migration_requires_an_explicit_owner_for_legacy_tenant_data(tmp_path):
@@ -654,6 +766,483 @@ def test_wildcard_migration_requires_an_explicit_owner_for_legacy_tenant_data(tm
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "tenant_id" not in columns
     assert "signal_metric_mappings_old" not in tables
+
+
+def test_legacy_signal_definition_migration_fails_closed_without_bootstrap_taxonomy(tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy-definitions-without-taxonomy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE signal_types (
+                signal_type TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            INSERT INTO signal_types VALUES
+                ('private_tenant_signal', 'Private definition', 'custom', 'count', 1, 1);
+        """)
+
+    def unavailable_taxonomy(_package: str):
+        raise OSError("taxonomy unavailable")
+
+    monkeypatch.setattr("tacit.signals.store.files", unavailable_taxonomy)
+
+    with pytest.raises(RuntimeError, match="bootstrap taxonomy is unavailable"):
+        SignalStore(
+            db_path=db_path,
+            runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        original = conn.execute(
+            "SELECT description FROM signal_types WHERE signal_type='private_tenant_signal'"
+        ).fetchone()
+    assert "tenant_signal_types" not in tables
+    assert "signal_tenant_migration_metadata" not in tables
+    assert original == ("Private definition",)
+
+
+def test_concurrent_signal_store_startup_serializes_schema_and_markers(tmp_path):
+    db_path = tmp_path / "concurrent-startup.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE signal_types (
+                signal_type TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            INSERT INTO signal_types VALUES
+                ('tenant_private_signal', 'Tenant private', 'custom', 'count', 1, 1);
+        """)
+
+    def initialize() -> None:
+        SignalStore(
+            db_path=db_path,
+            runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(lambda _: initialize(), range(8)))
+
+    with sqlite3.connect(db_path) as conn:
+        markers = dict(conn.execute("SELECT key, value FROM signal_tenant_migration_metadata"))
+        tenant_definition = conn.execute("""SELECT tenant_id FROM tenant_signal_types
+               WHERE signal_type='tenant_private_signal'""").fetchone()
+        global_definition = conn.execute(
+            "SELECT 1 FROM signal_types WHERE signal_type='tenant_private_signal'"
+        ).fetchone()
+        old_tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_old'").fetchall()
+
+    assert markers["default_owner_v1"] == "tenant-a"
+    assert markers["signal_definition_scope_v1"] == "tenant-a"
+    assert tenant_definition == ("tenant-a",)
+    assert global_definition is None
+    assert old_tables == []
+
+
+def test_wildcard_rejects_unconfirmed_default_owner_and_pinned_reopen_retargets_current_schema(tmp_path):
+    from tacit.knowledge.enums import KnowledgeKind
+    from tacit.knowledge.models import KnowledgeScope
+    from tacit.knowledge.service import KnowledgeService
+
+    db_path = tmp_path / "previously-default-owned.db"
+    default_settings = Settings(knowledge_tenant_id="default")
+    store = SignalStore(db_path=db_path, runtime_settings=default_settings)
+    store.record_learned_artifact(
+        tenant_id="default",
+        artifact_id="runbook:checkout",
+        artifact_type="runbook",
+        title="Checkout recovery",
+    )
+    service = KnowledgeService(KnowledgeRepository(db_path))
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.INVESTIGATION_PATTERN,
+        payload_ref="runbook:checkout",
+        typed_payload={"pattern": "check saturation"},
+        proposition={
+            "subject_ref": "concept:checkout-investigation",
+            "predicate": "useful_for_investigation",
+            "concept_ref": "concept:saturation",
+        },
+        scope=KnowledgeScope(tenant_id="default"),
+        provenance_refs=["runbook:checkout"],
+    )
+    with store._conn() as conn:
+        conn.execute("DELETE FROM signal_tenant_migration_metadata WHERE key='default_owner_v1'")
+
+    with pytest.raises(RuntimeError, match="unconfirmed default-tenant ownership"):
+        SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="*"))
+
+    with sqlite3.connect(db_path) as conn:
+        assert (
+            conn.execute("SELECT tenant_id FROM learned_artifacts WHERE artifact_id='runbook:checkout'").fetchone()[0]
+            == "default"
+        )
+        assert (
+            conn.execute(
+                "SELECT tenant_id FROM knowledge_candidates WHERE id=?",
+                (candidate.id,),
+            ).fetchone()[0]
+            == "default"
+        )
+
+    pinned = SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="tenant-a"))
+    repository = KnowledgeRepository(db_path)
+
+    assert [row["title"] for row in pinned.list_learned_artifacts(tenant_id="tenant-a")] == ["Checkout recovery"]
+    with pinned._conn() as conn:
+        assert conn.execute("SELECT 1 FROM learned_artifacts WHERE tenant_id='default'").fetchone() is None
+    assert repository.get_candidate(candidate.id, "default") is None
+    assert repository.get_candidate(candidate.id, "tenant-a") is None
+    with pinned._conn() as conn:
+        quarantined_tables = {
+            row["source_table"] for row in conn.execute("""SELECT source_table FROM signal_migration_quarantine
+                   WHERE reason='tenant_identity_requires_remigration'""").fetchall()
+        }
+    assert {"knowledge_candidates", "knowledge_propositions"} <= quarantined_tables
+
+    tenant_a_service = KnowledgeService(
+        repository,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+    tenant_a_candidate = tenant_a_service.create_candidate(
+        kind=KnowledgeKind.INVESTIGATION_PATTERN,
+        payload_ref="runbook:checkout",
+        typed_payload={"pattern": "check saturation"},
+        proposition={
+            "subject_ref": "concept:checkout-investigation",
+            "predicate": "useful_for_investigation",
+            "concept_ref": "concept:saturation",
+        },
+        scope=KnowledgeScope(tenant_id="tenant-a"),
+        provenance_refs=["runbook:checkout"],
+        tenant_id="tenant-a",
+    )
+    duplicate = tenant_a_service.create_candidate(
+        kind=KnowledgeKind.INVESTIGATION_PATTERN,
+        payload_ref="runbook:checkout",
+        typed_payload={"pattern": "check saturation"},
+        proposition={
+            "subject_ref": "concept:checkout-investigation",
+            "predicate": "useful_for_investigation",
+            "concept_ref": "concept:saturation",
+        },
+        scope=KnowledgeScope(tenant_id="tenant-a"),
+        provenance_refs=["runbook:checkout"],
+        tenant_id="tenant-a",
+    )
+    assert duplicate.id == tenant_a_candidate.id
+    assert len(repository.list_candidates("tenant-a", limit=None)) == 1
+    with pinned._conn() as conn:
+        proposition_count = conn.execute(
+            "SELECT COUNT(*) FROM knowledge_propositions WHERE tenant_id='tenant-a'"
+        ).fetchone()[0]
+    assert proposition_count == 1
+
+    wildcard = SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="*"))
+    assert wildcard.list_learned_artifacts(tenant_id="tenant-a")
+
+
+def test_startup_quarantines_unversioned_projection_without_mutating_immutable_revision(tmp_path):
+    from tacit.knowledge.enums import KnowledgeKind
+    from tacit.knowledge.models import KnowledgeScope
+    from tacit.knowledge.service import KnowledgeService
+
+    db_path = tmp_path / "governed-projection-backfill.db"
+    service = KnowledgeService(KnowledgeRepository(db_path))
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="dashboard:checkout",
+        typed_payload={"metric_pattern": "checkout_latency_seconds", "confidence": 0.91},
+        proposition={
+            "subject_ref": "concept:request-latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:checkout_latency_seconds",
+            "concept_ref": "signal:request_latency",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["dashboard:checkout"],
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, live_verified=True)
+    assert revision is not None
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """SELECT content_json, semantic_fingerprint FROM operational_knowledge_revisions
+               WHERE tenant_id='default' AND knowledge_id=? AND revision=?""",
+            (revision.knowledge_id, revision.revision),
+        ).fetchone()
+        content = json.loads(row["content_json"])
+        content.pop("resolver_payload", None)
+        legacy_content = json.dumps(content, sort_keys=True)
+        legacy_fingerprint = row["semantic_fingerprint"]
+        conn.execute(
+            """UPDATE operational_knowledge_revisions SET content_json=?
+               WHERE tenant_id='default' AND knowledge_id=? AND revision=?""",
+            (legacy_content, revision.knowledge_id, revision.revision),
+        )
+        conn.execute(
+            """UPDATE signal_metric_mappings SET governance_revision=0
+               WHERE tenant_id='default' AND governance_ref=?""",
+            (revision.knowledge_id,),
+        )
+
+    reopened = SignalStore(db_path=db_path)
+    with reopened._conn() as conn:
+        authority = conn.execute(
+            """SELECT content_json, semantic_fingerprint FROM operational_knowledge_revisions
+               WHERE tenant_id='default' AND knowledge_id=? AND revision=?""",
+            (revision.knowledge_id, revision.revision),
+        ).fetchone()
+        projection = conn.execute(
+            """SELECT governance_revision, review_state FROM signal_metric_mappings
+               WHERE tenant_id='default' AND governance_ref=?""",
+            (revision.knowledge_id,),
+        ).fetchone()
+
+    assert authority["content_json"] == legacy_content
+    assert authority["semantic_fingerprint"] == legacy_fingerprint
+    assert dict(projection) == {"governance_revision": 0, "review_state": "candidate"}
+    assert (
+        reopened.resolve_signal(
+            "request_latency",
+            [_metric_entry("checkout_latency_seconds")],
+            context_service="checkout",
+        )
+        == []
+    )
+
+
+def test_learning_index_reraises_rebuild_failures(tmp_path, monkeypatch):
+    from tacit.signals.migrations import ensure_learning_index
+
+    db_path = tmp_path / "learning-index.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    def fail_rebuild(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    try:
+        conn.execute("""CREATE VIRTUAL TABLE learning_context_fts USING fts5(
+                source_kind, source_id, backend_name, dashboard_uid,
+                dashboard_title, dashboard_tags, panel_title, metric_name,
+                query_text, service, signal_type, review_state, reason,
+                provenance, indexed_at
+            )""")
+        monkeypatch.setattr("tacit.signals.migrations.rebuild_learning_index", fail_rebuild)
+
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            ensure_learning_index(conn)
+    finally:
+        conn.close()
+
+
+def test_startup_preserves_exact_projection_validated_by_immutable_revision(tmp_path):
+    from tacit.knowledge.enums import KnowledgeKind
+    from tacit.knowledge.models import KnowledgeScope
+    from tacit.knowledge.service import KnowledgeService
+
+    db_path = tmp_path / "governed-projection-valid.db"
+    service = KnowledgeService(KnowledgeRepository(db_path))
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="dashboard:checkout",
+        typed_payload={"metric_pattern": "checkout_latency_seconds", "confidence": 0.91},
+        proposition={
+            "subject_ref": "concept:request-latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:checkout_latency_seconds",
+            "concept_ref": "signal:request_latency",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["dashboard:checkout"],
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, live_verified=True)
+    assert revision is not None
+    with sqlite3.connect(db_path) as conn:
+        before = conn.execute(
+            """SELECT content_json, semantic_fingerprint FROM operational_knowledge_revisions
+               WHERE tenant_id='default' AND knowledge_id=? AND revision=?""",
+            (revision.knowledge_id, revision.revision),
+        ).fetchone()
+
+    reopened = SignalStore(db_path=db_path)
+    resolved = reopened.resolve_signal_details(
+        "request_latency",
+        [_metric_entry("checkout_latency_seconds")],
+        context_service="checkout",
+    )
+    with sqlite3.connect(db_path) as conn:
+        after = conn.execute(
+            """SELECT content_json, semantic_fingerprint FROM operational_knowledge_revisions
+               WHERE tenant_id='default' AND knowledge_id=? AND revision=?""",
+            (revision.knowledge_id, revision.revision),
+        ).fetchone()
+
+    assert after == before
+    assert len(resolved) == 1
+    assert resolved[0].knowledge_revision_ref is not None
+    assert resolved[0].knowledge_revision_ref.knowledge_revision == revision.revision
+
+
+def test_source_reconciliation_never_mutates_governed_projection(signal_store):
+    for governance_ref in ("", "knowledge:checkout-latency"):
+        signal_store.add_mapping(
+            "request_latency",
+            "checkout_latency_seconds",
+            confidence=0.9,
+            source_type="dashboard_ingest",
+            source_refs=["grafana:checkout"],
+            governance_ref=governance_ref,
+            governance_revision=1 if governance_ref else 0,
+            review_state="approved",
+        )
+
+    signal_store.reconcile_mapping_source(
+        tenant_id="default",
+        source_type="dashboard_ingest",
+        source_ref="grafana:checkout",
+        active_pairs=set(),
+    )
+
+    with signal_store._conn() as conn:
+        rows = conn.execute("""SELECT governance_ref, source_refs, review_state FROM signal_metric_mappings
+               WHERE metric_pattern='checkout_latency_seconds' ORDER BY governance_ref""").fetchall()
+    assert [dict(row) for row in rows] == [
+        {
+            "governance_ref": "knowledge:checkout-latency",
+            "source_refs": '["grafana:checkout"]',
+            "review_state": "approved",
+        }
+    ]
+
+
+def test_excluding_preferred_revision_reveals_same_pattern_fallback(signal_store):
+    from tacit.knowledge.usage import KnowledgeRevisionRef
+
+    signal_store.add_mapping(
+        "request_latency",
+        "shared_latency_seconds",
+        confidence=0.95,
+        source_type="operational_knowledge",
+        governance_ref="knowledge:tenant-override",
+        governance_revision=2,
+        review_state="approved",
+        tenant_id="default",
+    )
+    signal_store.add_mapping(
+        "request_latency",
+        "shared_latency_seconds",
+        confidence=0.8,
+        source_type="bootstrap",
+        review_state="trusted",
+        tenant_id=GLOBAL_BOOTSTRAP_TENANT_ID,
+    )
+
+    matches = signal_store.resolve_signal_details(
+        "request_latency",
+        [_metric_entry("shared_latency_seconds")],
+        tenant_id="default",
+        excluded_knowledge_refs={KnowledgeRevisionRef("knowledge:tenant-override", 2)},
+    )
+
+    assert len(matches) == 1
+    assert matches[0].entry.name == "shared_latency_seconds"
+    assert matches[0].governance_ref == ""
+
+
+def test_legacy_ungoverned_learned_mapping_is_quarantined_on_startup(tmp_path):
+    db_path = tmp_path / "legacy-ungoverned.db"
+    store = SignalStore(db_path=db_path)
+    store.add_mapping(
+        "request_latency",
+        "private_latency_seconds",
+        confidence=0.9,
+        source_type="teach",
+        review_state="trusted",
+    )
+    assert store.resolve_signal("request_latency", [_metric_entry("private_latency_seconds")])
+
+    reopened = SignalStore(db_path=db_path)
+
+    assert reopened.resolve_signal("request_latency", [_metric_entry("private_latency_seconds")]) == []
+    with reopened._conn() as conn:
+        row = conn.execute("""SELECT review_state FROM signal_metric_mappings
+               WHERE signal_type='request_latency' AND metric_pattern='private_latency_seconds'""").fetchone()
+    assert row["review_state"] == "candidate"
+
+
+def test_legacy_governed_mapping_without_authoritative_revision_is_quarantined(tmp_path):
+    db_path = tmp_path / "legacy-governed-revision.db"
+    store = SignalStore(db_path=db_path)
+    now = time.time()
+    with store._conn() as conn:
+        for metric, knowledge_ref, governance_revision, source_refs in (
+            ("mutable_source_ref_seconds", "knowledge-mutable", 0, '["knowledge-mutable@3"]'),
+            ("zero_source_ref_seconds", "knowledge-zero", 0, '["knowledge-zero@0"]'),
+            ("negative_revision_seconds", "knowledge-negative", -1, '["knowledge-negative@8"]'),
+            ("authoritative_revision_seconds", "knowledge-valid", 2, '["knowledge-valid@99"]'),
+        ):
+            conn.execute(
+                """INSERT INTO signal_metric_mappings
+                       (tenant_id, signal_type, metric_pattern, confidence, source_type,
+                        source_refs, governance_ref, governance_revision, review_state,
+                        created_at, last_seen)
+                   VALUES ('default', 'request_latency', ?, 0.9, 'operational_knowledge',
+                           ?, ?, ?, 'approved', ?, ?)""",
+                (metric, source_refs, knowledge_ref, governance_revision, now, now),
+            )
+
+    with capture_logs() as logs:
+        reopened = SignalStore(db_path=db_path)
+
+    for metric in (
+        "authoritative_revision_seconds",
+        "mutable_source_ref_seconds",
+        "zero_source_ref_seconds",
+        "negative_revision_seconds",
+    ):
+        assert reopened.resolve_signal("request_latency", [_metric_entry(metric)]) == []
+    with reopened._conn() as conn:
+        rows = conn.execute("""SELECT governance_ref, review_state, governance_revision
+               FROM signal_metric_mappings
+               WHERE governance_ref!=''
+               ORDER BY governance_ref""").fetchall()
+    assert [dict(row) for row in rows] == [
+        {
+            "governance_ref": "knowledge-mutable",
+            "review_state": "candidate",
+            "governance_revision": 0,
+        },
+        {
+            "governance_ref": "knowledge-negative",
+            "review_state": "candidate",
+            "governance_revision": -1,
+        },
+        {
+            "governance_ref": "knowledge-valid",
+            "review_state": "candidate",
+            "governance_revision": 2,
+        },
+        {
+            "governance_ref": "knowledge-zero",
+            "review_state": "candidate",
+            "governance_revision": 0,
+        },
+    ]
+    diagnostic = next(log for log in logs if log["event"] == "governed_signal_mapping_revision_unknown")
+    assert diagnostic["mappings"] == 4
+    assert diagnostic["quarantined"] == 4
+    assert diagnostic["sample_patterns"] == [
+        "authoritative_revision_seconds",
+        "mutable_source_ref_seconds",
+        "negative_revision_seconds",
+        "zero_source_ref_seconds",
+    ]
 
 
 def test_legacy_signal_data_and_custom_definitions_migrate_to_pinned_tenant(tmp_path):
@@ -711,7 +1300,11 @@ def test_legacy_signal_data_and_custom_definitions_migrate_to_pinned_tenant(tmp_
     )
 
     tenant_a = {row["signal_type"]: row for row in store.list_signal_types(tenant_id="tenant-a")}
-    tenant_b = {row["signal_type"]: row for row in store.list_signal_types(tenant_id="tenant-b")}
+    wildcard = SignalStore(
+        db_path=db_path,
+        runtime_settings=Settings(knowledge_tenant_id="*"),
+    )
+    tenant_b = {row["signal_type"]: row for row in wildcard.list_signal_types(tenant_id="tenant-b")}
     with store._conn() as conn:
         mapping_tenants = {
             row["metric_pattern"]: row["tenant_id"]
@@ -730,7 +1323,7 @@ def test_legacy_signal_data_and_custom_definitions_migrate_to_pinned_tenant(tmp_
     assert mapping_tenants["http_request_duration_seconds"] == GLOBAL_BOOTSTRAP_TENANT_ID
     assert rejected_tenant == "tenant-a"
     assert store.search_learning_context("legacy", tenant_id="tenant-a")
-    assert store.search_learning_context("legacy", tenant_id="tenant-b") == []
+    assert wildcard.search_learning_context("legacy", tenant_id="tenant-b") == []
 
 
 def test_legacy_alerts_migrate_to_pinned_tenant(tmp_path):
@@ -768,7 +1361,9 @@ def test_legacy_alerts_migrate_to_pinned_tenant(tmp_path):
     alert = store.get_ingested_alert("legacy-alert", "grafana", tenant_id="tenant-a")
     assert alert is not None
     assert alert["tenant_id"] == "tenant-a"
-    assert store.get_ingested_alert("legacy-alert", "grafana", tenant_id="default") is None
+    with store._conn() as conn:
+        assert conn.execute("""SELECT 1 FROM ingested_alerts
+               WHERE tenant_id='default' AND alert_uid='legacy-alert'""").fetchone() is None
 
 
 @pytest.fixture
@@ -2738,6 +3333,7 @@ class TestIngestedDashboards:
         assert signalfx["dashboard_title"] == "SignalFx Dashboard"
 
     def test_pending_dashboards_are_isolated_by_tenant(self, signal_store):
+        signal_store = _wildcard_store(signal_store)
         for tenant_id, title in (("tenant-a", "Tenant A"), ("tenant-b", "Tenant B")):
             signal_store.record_ingested_dashboard(
                 "shared-dashboard",
@@ -3916,6 +4512,64 @@ async def test_pending_dashboard_refresh_retires_removed_support_without_promoti
     assert old.state.lifecycle_status.value == "stale"
     assert all("new_latency_seconds" not in candidate.payload_ref for candidate in candidates)
     assert signal_store.get_mappings_for_signal("old_latency", include_decayed=True) == []
+
+
+async def test_pending_dashboard_refresh_revalidates_changed_source_lineage(signal_store, monkeypatch):
+    from tacit import dashboard_ingest as di
+
+    inferred = [
+        {
+            "signal_type": "checkout_latency",
+            "metric": "checkout_latency_seconds",
+            "confidence": 0.9,
+            "source": "heuristic",
+            "signal_family": "latency",
+            "auto_teach_eligible": True,
+        }
+    ]
+    monkeypatch.setattr(
+        "tacit.dashboard_ingest.service.infer_signals_from_metrics",
+        lambda *args, **kwargs: inferred,
+    )
+
+    def features(query: str) -> DashboardFeatures:
+        return DashboardFeatures(
+            dashboard_uid="lineage-refresh-dashboard",
+            dashboard_title="Lineage refresh dashboard",
+            backend_name="grafana",
+            query_language="promql",
+            metrics_found=["checkout_latency_seconds"],
+            panel_count=1,
+            query_transformations=[query],
+            panels=[
+                {
+                    "title": "Latency",
+                    "metrics": ["checkout_latency_seconds"],
+                    "queries": [query],
+                }
+            ],
+        )
+
+    await di.ingest_dashboard_features(
+        features("checkout_latency_seconds"),
+        auto_approve=True,
+        store=signal_store,
+    )
+    pending = await di.ingest_dashboard_features(
+        features("rate(checkout_latency_seconds[5m])"),
+        auto_approve=False,
+        store=signal_store,
+    )
+
+    candidates = KnowledgeRepository(signal_store._db_path).list_candidates(
+        "default",
+        kind="signal_mapping",
+        limit=None,
+    )
+    original = next(candidate for candidate in candidates if "checkout_latency_seconds" in candidate.payload_ref)
+    assert pending["status"] == "pending"
+    assert original.state.lifecycle_status.value == "stale"
+    assert signal_store.get_mappings_for_signal("checkout_latency", include_decayed=True) == []
 
 
 class TestLearningTabRendering:
