@@ -12,6 +12,7 @@ from tacit.models.schemas import (
     DashboardSpec,
     DashRequest,
     Intent,
+    MetricEntry,
     PanelQuery,
     PanelSpec,
     SignalType,
@@ -20,7 +21,7 @@ from tacit.pipeline.failures import PipelineFailureFactory
 from tacit.pipeline.runner import _get_semaphore, _initialize_signal_store
 from tacit.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history, safe_record_provenance
 from tacit.pipeline.stages.archetypes import ArchetypeCompilation
-from tacit.pipeline.stages.freeform import build_freeform_dashboard
+from tacit.pipeline.stages.freeform import build_freeform_dashboard, discovery_cache_parts
 from tacit.pipeline.stages.intent import run_intent_stage
 from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE, resolve_signal_store
 
@@ -301,6 +302,40 @@ async def test_build_freeform_dashboard_no_metrics_returns_failure():
     assert result.failure is not None
     assert result.token_usage == TokenUsage()
     assert recorder.finished[0]["error"] == "No metrics found for freeform generation"
+
+
+def test_discovery_cache_identity_includes_tenant_and_complete_ranked_catalog():
+    def metric(name: str) -> MetricEntry:
+        return MetricEntry(
+            name=name,
+            datasource_uid="prom",
+            datasource_name="Prometheus",
+            datasource_type="prometheus",
+            query_language="promql",
+        )
+
+    shared = [metric(f"metric_{index}") for index in range(20)]
+    tenant_a = discovery_cache_parts(
+        tenant_id="tenant-a",
+        intent=_intent(),
+        ranked_catalog=[*shared, metric("tenant_a_tail")],
+        context_chunks=[],
+    )
+    tenant_b = discovery_cache_parts(
+        tenant_id="tenant-b",
+        intent=_intent(),
+        ranked_catalog=[*shared, metric("tenant_a_tail")],
+        context_chunks=[],
+    )
+    changed_tail = discovery_cache_parts(
+        tenant_id="tenant-a",
+        intent=_intent(),
+        ranked_catalog=[*shared, metric("tenant_b_tail")],
+        context_chunks=[],
+    )
+
+    assert tenant_a != tenant_b
+    assert tenant_a != changed_tail
 
 
 async def test_intent_stage_defers_provider_construction_for_legacy_hooks():

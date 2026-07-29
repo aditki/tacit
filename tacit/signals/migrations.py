@@ -45,35 +45,97 @@ def execute_script_statements(conn: sqlite3.Connection, script: str) -> None:
 def ensure_schema(
     conn: sqlite3.Connection,
     *,
-    legacy_tenant: str = "default",
+    legacy_tenant: str | None = "default",
     bootstrap_signal_definitions: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """Install base schema and run additive migrations."""
+    require_legacy_tenant_owner(
+        conn,
+        legacy_tenant=legacy_tenant,
+        bootstrap_signal_definitions=bootstrap_signal_definitions,
+    )
+    migration_tenant = legacy_tenant or "default"
     had_tenant_signal_types = _table_exists(conn, "tenant_signal_types")
-    conn.executescript(SCHEMA_SQL)
+    execute_script_statements(conn, SCHEMA_SQL)
     if not had_tenant_signal_types and bootstrap_signal_definitions is not None:
         migrate_legacy_signal_definitions(
             conn,
-            legacy_tenant=legacy_tenant,
+            legacy_tenant=migration_tenant,
             bootstrap_signal_definitions=bootstrap_signal_definitions,
         )
     elif not had_tenant_signal_types:
         logger.warning(
             "legacy_signal_definition_migration_skipped",
-            tenant_id=legacy_tenant,
+            tenant_id=migration_tenant,
             reason="bootstrap_taxonomy_unavailable",
         )
-    ensure_learning_index(conn, legacy_tenant=legacy_tenant)
+    ensure_learning_index(conn, legacy_tenant=migration_tenant)
     ensure_ingested_dashboard_columns(conn)
-    ensure_ingested_dashboard_backend_scope(conn, legacy_tenant=legacy_tenant)
+    ensure_ingested_dashboard_backend_scope(conn, legacy_tenant=migration_tenant)
     ensure_ingested_alert_columns(conn)
-    ensure_ingested_alert_tenant_scope(conn, legacy_tenant=legacy_tenant)
+    ensure_ingested_alert_tenant_scope(conn, legacy_tenant=migration_tenant)
     ensure_artifact_learning_columns(conn)
-    ensure_artifact_tenant_scope(conn, legacy_tenant=legacy_tenant)
+    ensure_artifact_tenant_scope(conn, legacy_tenant=migration_tenant)
     ensure_mapping_columns(conn)
-    ensure_mapping_tenant_scope(conn, legacy_tenant=legacy_tenant)
+    ensure_mapping_tenant_scope(conn, legacy_tenant=migration_tenant)
     ensure_global_bootstrap_mapping_scope(conn)
-    ensure_rejected_candidate_tenant_scope(conn, legacy_tenant=legacy_tenant)
+    ensure_rejected_candidate_tenant_scope(conn, legacy_tenant=migration_tenant)
+
+
+def require_legacy_tenant_owner(
+    conn: sqlite3.Connection,
+    *,
+    legacy_tenant: str | None,
+    bootstrap_signal_definitions: dict[str, dict[str, Any]] | None,
+) -> None:
+    """Refuse to guess ownership for pre-tenant data in wildcard deployments."""
+    if legacy_tenant is not None:
+        return
+    tenant_owned_tables: list[str] = []
+    for table in (
+        "ingested_dashboards",
+        "ingested_alerts",
+        "learned_artifacts",
+        "evidence_requirements",
+        "ownership_hints",
+        "dependency_hints",
+        "signal_mapping_candidates",
+        "learning_context_fts",
+        "rejected_signal_candidates",
+    ):
+        if not _table_exists(conn, table):
+            continue
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "tenant_id" not in columns and conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None:
+            tenant_owned_tables.append(table)
+
+    if _table_exists(conn, "signal_metric_mappings"):
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
+        if "tenant_id" not in columns:
+            where = "WHERE source_type != 'bootstrap'" if "source_type" in columns else ""
+            if conn.execute(f"SELECT 1 FROM signal_metric_mappings {where} LIMIT 1").fetchone() is not None:
+                tenant_owned_tables.append("signal_metric_mappings")
+
+    if _table_exists(conn, "signal_types") and not _table_exists(conn, "tenant_signal_types"):
+        rows = conn.execute("SELECT * FROM signal_types").fetchall()
+        if rows and bootstrap_signal_definitions is None:
+            tenant_owned_tables.append("signal_types")
+        elif bootstrap_signal_definitions is not None:
+            for row in rows:
+                expected = bootstrap_signal_definitions.get(str(row["signal_type"]))
+                if expected is None or any(
+                    str(row[field]) != str(expected.get(field) or "") for field in ("description", "category", "unit")
+                ):
+                    tenant_owned_tables.append("signal_types")
+                    break
+
+    if tenant_owned_tables:
+        tables = ", ".join(sorted(set(tenant_owned_tables)))
+        logger.error("legacy_tenant_owner_required", tables=sorted(set(tenant_owned_tables)))
+        raise RuntimeError(
+            "Legacy signal data has no tenant owner. Start once with knowledge_tenant_id pinned to its owner "
+            f"before enabling wildcard tenancy. Affected tables: {tables}"
+        )
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -180,6 +242,12 @@ def ensure_mapping_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN inference_version TEXT NOT NULL DEFAULT ''")
     if "review_state" not in columns:
         conn.execute("ALTER TABLE signal_metric_mappings ADD COLUMN review_state TEXT NOT NULL DEFAULT 'trusted'")
+    for column in ("context_regions", "context_clusters", "context_namespaces", "context_versions"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE signal_metric_mappings ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'")
+    for column in ("valid_from", "valid_until"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE signal_metric_mappings ADD COLUMN {column} REAL")
 
 
 def ensure_rejected_candidate_tenant_scope(
@@ -219,6 +287,12 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str 
     legacy_literal = _tenant_sql_literal(legacy_tenant)
     tenant_select = f"COALESCE(tenant_id, {legacy_literal})" if "tenant_id" in old_columns else legacy_literal
     governance_select = "COALESCE(governance_ref, '')" if "governance_ref" in old_columns else "''"
+    scope_selects = {
+        column: column if column in old_columns else "'[]'"
+        for column in ("context_regions", "context_clusters", "context_namespaces", "context_versions")
+    }
+    valid_from_select = "valid_from" if "valid_from" in old_columns else "NULL"
+    valid_until_select = "valid_until" if "valid_until" in old_columns else "NULL"
     with atomic_rebuild(conn, "rebuild_signal_metric_mappings"):
         conn.execute("ALTER TABLE signal_metric_mappings RENAME TO signal_metric_mappings_old")
         conn.execute("""CREATE TABLE signal_metric_mappings (
@@ -230,6 +304,11 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str 
             context_datasource_types TEXT NOT NULL DEFAULT '[]',
             context_environments TEXT NOT NULL DEFAULT '[]',
             context_archetypes TEXT NOT NULL DEFAULT '[]',
+            context_regions TEXT NOT NULL DEFAULT '[]',
+            context_clusters TEXT NOT NULL DEFAULT '[]',
+            context_namespaces TEXT NOT NULL DEFAULT '[]',
+            context_versions TEXT NOT NULL DEFAULT '[]',
+            valid_from REAL, valid_until REAL,
             source_type TEXT NOT NULL DEFAULT 'bootstrap', source_refs TEXT NOT NULL DEFAULT '[]',
             governance_ref TEXT NOT NULL DEFAULT '',
             inference_version TEXT NOT NULL DEFAULT '', review_state TEXT NOT NULL DEFAULT 'trusted',
@@ -240,10 +319,15 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str 
         conn.execute(f"""INSERT INTO signal_metric_mappings
             (id, tenant_id, signal_type, metric_pattern, confidence, context_services,
              context_datasource_types, context_environments, context_archetypes,
+             context_regions, context_clusters, context_namespaces, context_versions,
+             valid_from, valid_until,
              source_type, source_refs, governance_ref, inference_version, review_state, use_count,
              positive_feedback, negative_feedback, created_at, last_seen)
             SELECT id, {tenant_select}, signal_type, metric_pattern, confidence, context_services,
                    context_datasource_types, context_environments, context_archetypes,
+                   {scope_selects["context_regions"]}, {scope_selects["context_clusters"]},
+                   {scope_selects["context_namespaces"]}, {scope_selects["context_versions"]},
+                   {valid_from_select}, {valid_until_select},
                    source_type, source_refs, {governance_select}, inference_version, review_state, use_count,
                    positive_feedback, negative_feedback, created_at, last_seen
             FROM signal_metric_mappings_old""")
@@ -495,25 +579,25 @@ def _rebuild_artifact_learning_tables(
     """,
     )
     conn.execute(f"""INSERT INTO learned_artifacts
-        SELECT id, {tenant_select['learned_artifacts']}, artifact_id, artifact_type, source_vendor,
+        SELECT id, {tenant_select["learned_artifacts"]}, artifact_id, artifact_type, source_vendor,
                source_instance, external_id, title, body_text, provenance_url, fingerprint, stale,
                missing_since, first_seen_at, last_seen_at, updated_at, created_at
         FROM learned_artifacts_old""")
     conn.execute(f"""INSERT INTO evidence_requirements
-        SELECT {tenant_select['evidence_requirements']}, id, artifact_id, subject, evidence_kind,
+        SELECT {tenant_select["evidence_requirements"]}, id, artifact_id, subject, evidence_kind,
                target_entity, signal_hint, query_hint, priority, source_artifact_id, source_excerpt,
                source_type, confidence_prior, review_state, observation_state, extraction_hash, created_at
         FROM evidence_requirements_old""")
     conn.execute(f"""INSERT INTO ownership_hints
-        SELECT {tenant_select['ownership_hints']}, id, artifact_id, entity, owner, hint_kind,
+        SELECT {tenant_select["ownership_hints"]}, id, artifact_id, entity, owner, hint_kind,
                source_artifact_id, source_excerpt, source_type, confidence_prior, review_state,
                extraction_hash, created_at FROM ownership_hints_old""")
     conn.execute(f"""INSERT INTO dependency_hints
-        SELECT {tenant_select['dependency_hints']}, id, artifact_id, source_entity, target_entity,
+        SELECT {tenant_select["dependency_hints"]}, id, artifact_id, source_entity, target_entity,
                direction, source_artifact_id, source_excerpt, source_type, confidence_prior, review_state,
                extraction_hash, created_at FROM dependency_hints_old""")
     conn.execute(f"""INSERT INTO signal_mapping_candidates
-        SELECT {tenant_select['signal_mapping_candidates']}, id, artifact_id, source, candidate_metric,
+        SELECT {tenant_select["signal_mapping_candidates"]}, id, artifact_id, source, candidate_metric,
                symptom, signal_type, source_artifact_id, source_excerpt, query_hint, confidence_prior,
                review_state, extraction_hash, created_at FROM signal_mapping_candidates_old""")
     for table in tables:

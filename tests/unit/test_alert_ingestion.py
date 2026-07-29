@@ -1,9 +1,10 @@
 import pytest
 
-from tacit.alert_ingest import ingest_alert, learn_backend_alerts
+from tacit.alert_ingest import ingest_alert, ingest_alert_features, learn_backend_alerts
 from tacit.backends.base import AlertFeatures
 from tacit.backends.grafana import GrafanaBackend, _parse_grafana_alert_rule
 from tacit.backends.signalfx import SignalFxBackend, _parse_signalfx_detector
+from tacit.knowledge.repository import KnowledgeRepository
 
 
 def test_grafana_alert_rule_parses_to_common_alert_features():
@@ -21,7 +22,7 @@ def test_grafana_alert_rule_parses_to_common_alert_features():
                     "model": {
                         "datasource": {"type": "prometheus", "uid": "prom"},
                         "expr": (
-                            "histogram_quantile(0.95, " 'rate(checkout_latency_seconds_bucket{service="checkout"}[5m]))'
+                            'histogram_quantile(0.95, rate(checkout_latency_seconds_bucket{service="checkout"}[5m]))'
                         ),
                     },
                 }
@@ -285,6 +286,67 @@ async def test_invalid_alert_backend_closes_instantiated_clients(monkeypatch):
         await ingest_alert("checkout-latency", backend_name="grafna")
 
     assert closed == ["grafana"]
+
+
+@pytest.mark.asyncio
+async def test_pending_alert_refresh_retires_removed_support_without_promoting_replacement(tmp_path, monkeypatch):
+    from tacit.signals import SignalStore
+
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    batches = iter(
+        [
+            [
+                {
+                    "signal_type": "old_latency",
+                    "metric": "old_latency_seconds",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+            [
+                {
+                    "signal_type": "new_latency",
+                    "metric": "new_latency_seconds",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(
+        "tacit.alert_ingest.infer_signals_from_metrics",
+        lambda *args, **kwargs: next(batches),
+    )
+
+    def features(metric: str) -> AlertFeatures:
+        return AlertFeatures(
+            alert_uid="pending-refresh-alert",
+            alert_title="Pending refresh alert",
+            backend_name="grafana",
+            query_language="promql",
+            condition="A > 1",
+            metrics_found=[metric],
+            query_transformations=[metric],
+            service_hints=["checkout"],
+        )
+
+    await ingest_alert_features(features("old_latency_seconds"), auto_approve=True, store=store)
+    pending = await ingest_alert_features(features("new_latency_seconds"), auto_approve=False, store=store)
+
+    candidates = KnowledgeRepository(store._db_path).list_candidates(
+        "default",
+        kind="signal_mapping",
+        limit=None,
+    )
+    old = next(candidate for candidate in candidates if "old_latency_seconds" in candidate.payload_ref)
+    assert pending["status"] == "pending"
+    assert old.state.lifecycle_status.value == "stale"
+    assert all("new_latency_seconds" not in candidate.payload_ref for candidate in candidates)
+    assert store.get_mappings_for_signal("old_latency", include_decayed=True) == []
 
 
 @pytest.mark.asyncio

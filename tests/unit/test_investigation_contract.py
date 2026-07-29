@@ -473,7 +473,7 @@ def test_chart_route_allows_body_tenant_for_wildcard_configuration(monkeypatch):
     assert captured["request"].tenant_id == "tenant-b"
 
 
-async def test_direct_pipeline_stamps_configured_fallback_tenant(monkeypatch):
+async def test_direct_pipeline_rejects_configured_tenant_mismatch(monkeypatch):
     from tacit.pipeline import run_pipeline
 
     captured: dict[str, DashRequest] = {}
@@ -496,9 +496,10 @@ async def test_direct_pipeline_stamps_configured_fallback_tenant(monkeypatch):
         cache_key_factory=lambda *parts: ":".join(parts),
     )
 
-    await run_pipeline(DashRequest(prompt="Investigate checkout", tenant_id="tenant-b"), deps)
+    with pytest.raises(ValueError, match="Tenant access denied"):
+        await run_pipeline(DashRequest(prompt="Investigate checkout", tenant_id="tenant-b"), deps)
 
-    assert captured["request"].tenant_id == "tenant-a"
+    assert "request" not in captured
 
 
 async def test_direct_pipeline_requires_tenant_for_wildcard_configuration(monkeypatch):
@@ -525,8 +526,39 @@ async def test_direct_pipeline_requires_tenant_for_wildcard_configuration(monkey
         cache_key_factory=lambda *parts: ":".join(parts),
     )
 
-    with pytest.raises(ValueError, match="tenant_id is required"):
+    with pytest.raises(ValueError, match="Knowledge tenant is required"):
         await run_pipeline(DashRequest(prompt="Investigate checkout"), deps)
+
+    assert called is False
+
+
+@pytest.mark.parametrize("tenant_id", ["tenant with spaces", "*bootstrap*", "*"])
+async def test_direct_pipeline_rejects_invalid_wildcard_tenants(monkeypatch, tenant_id):
+    from tacit.pipeline import run_pipeline
+
+    called = False
+
+    async def fake_inner(request, deps, **kwargs):
+        nonlocal called
+        called = True
+        return DashResponse(dashboard_url="", dashboard_uid="", panel_count=0, summary="unexpected")
+
+    monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", fake_inner)
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_tenant_id="*",
+        ),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    with pytest.raises(ValueError, match="Invalid knowledge tenant"):
+        await run_pipeline(DashRequest(prompt="Investigate checkout", tenant_id=tenant_id), deps)
 
     assert called is False
 

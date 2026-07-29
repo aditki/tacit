@@ -175,10 +175,10 @@ async def run_pipeline(
     """End-to-end: natural language → Grafana dashboard URL."""
     deps = deps or _default_dependencies()
     runtime_settings = deps.settings
+    from tacit.tenancy import resolve_tenant_boundary
+
     configured_tenant = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
-    if configured_tenant == "*" and not request.tenant_id:
-        raise ValueError("tenant_id is required when knowledge_tenant_id is '*'")
-    tenant_id = request.tenant_id if configured_tenant == "*" else configured_tenant
+    tenant_id = resolve_tenant_boundary(configured_tenant, request.tenant_id)
     request = request.model_copy(update={"tenant_id": tenant_id})
     bind_request_id()
     sem = _get_semaphore(runtime_settings.pipeline_max_concurrent)
@@ -332,6 +332,14 @@ async def _run_pipeline_inner(
         context_chunks = intent_stage.context_chunks
         runtime.add_tokens(intent_stage.token_usage)
         runtime.recorder.intent(intent)
+        from tacit.knowledge.scope import investigation_knowledge_scope
+
+        knowledge_scope = investigation_knowledge_scope(
+            tenant_id=request.tenant_id,
+            prompt=request.prompt,
+            services=intent.services,
+            archetype_ids={*[match.type for match in intent.archetypes], intent.problem_type},
+        )
 
         # ── 3. Metric discovery — each backend contributes ───────────
         discovery_stage = await run_discovery_stage(
@@ -342,6 +350,7 @@ async def _run_pipeline_inner(
             recorder=runtime.recorder,
             signal_store=signal_store,
             tenant_id=request.tenant_id,
+            knowledge_scope=knowledge_scope,
         )
         catalog_discovery = discovery_stage.discovery
         metric_catalog = catalog_discovery.metric_catalog
@@ -373,9 +382,20 @@ async def _run_pipeline_inner(
             environment_refs=intent.environments,
             signal_store=signal_store,
             tenant_id=request.tenant_id,
+            knowledge_scope=knowledge_scope,
         )
         ranked_archetypes = selection.ranked_archetypes
         learned_archetypes = selection.learned_archetypes
+        knowledge_scope = investigation_knowledge_scope(
+            tenant_id=request.tenant_id,
+            prompt=request.prompt,
+            services=intent.services,
+            archetype_ids={
+                *[archetype.id for archetype, _ in ranked_archetypes],
+                *[match.type for match in intent.archetypes],
+                intent.problem_type,
+            },
+        )
         runtime.timings["archetype_select"] = time.monotonic() - t0
 
         retrieval_details: dict[str, Any] = {
@@ -418,6 +438,7 @@ async def _run_pipeline_inner(
             timings=runtime.timings,
             signal_store=signal_store,
             tenant_id=request.tenant_id,
+            knowledge_scope=knowledge_scope,
         )
         if compilation is not None:
             dashboard_spec = compilation.dashboard_spec
@@ -446,6 +467,7 @@ async def _run_pipeline_inner(
             target_language=target_language,
             signal_store=signal_store,
             tenant_id=request.tenant_id,
+            knowledge_scope=knowledge_scope,
         )
         evidence_requirements = evidence_stage.requirements
         evidence_resolutions = evidence_stage.resolutions
@@ -492,6 +514,7 @@ async def _run_pipeline_inner(
             record_stage=record_validation_stage,
             signal_store=signal_store,
             tenant_id=request.tenant_id,
+            knowledge_scope=knowledge_scope,
         )
         dashboard_spec = validation_result.dashboard_spec
         validation_warnings = validation_result.validation_warnings
@@ -508,22 +531,10 @@ async def _run_pipeline_inner(
         knowledge_snapshot = None
         knowledge_usage: list[KnowledgeUsage] = []
         try:
-            from tacit.knowledge.scope import investigation_knowledge_scope
-
             if signal_store is SIGNAL_STORE_UNAVAILABLE:
                 raise RuntimeError("Operational Knowledge store is unavailable")
 
             tenant_id = request.tenant_id or getattr(runtime_settings, "knowledge_tenant_id", "default")
-            knowledge_scope = investigation_knowledge_scope(
-                tenant_id=tenant_id,
-                prompt=request.prompt,
-                services=intent.services,
-                archetype_ids={
-                    *[archetype.id for archetype, _ in ranked_archetypes],
-                    *[match.type for match in intent.archetypes],
-                    intent.problem_type,
-                },
-            )
             knowledge_service = resolve_knowledge_service(deps, signal_store=signal_store)
             knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(knowledge_scope)
             surviving_compilation_refs = (
@@ -533,6 +544,27 @@ async def _run_pipeline_inner(
                 knowledge_usage,
                 surviving_compilation_refs,
             )
+            surviving_requirement_ids = {
+                observation.requirement_id
+                for observation in validation_result.evidence_observations
+                if observation.valid_query and observation.survived
+            }
+            surviving_evidence_refs = set(validation_result.applied_knowledge_refs)
+            for requirement_id in surviving_requirement_ids:
+                surviving_evidence_refs.update(
+                    evidence_stage.knowledge_refs_by_requirement.get(requirement_id, frozenset())
+                )
+            knowledge_usage = knowledge_service.apply_evidence_usage(
+                knowledge_usage,
+                surviving_evidence_refs,
+            )
+            if evidence_stage.applied_knowledge_refs or validation_result.applied_knowledge_refs:
+                logger.info(
+                    "governed_evidence_usage_reconciled",
+                    selected_knowledge_refs=sorted(evidence_stage.applied_knowledge_refs),
+                    rescue_knowledge_refs=sorted(validation_result.applied_knowledge_refs),
+                    surviving_knowledge_refs=sorted(surviving_evidence_refs),
+                )
             if compilation is not None and compilation.applied_knowledge_refs:
                 logger.info(
                     "governed_compilation_usage_reconciled",
@@ -553,16 +585,26 @@ async def _run_pipeline_inner(
             knowledge_snapshot = knowledge_service.snapshot_from_usage(tenant_id, knowledge_usage)
         except Exception as exc:
             logger.warning("operational_knowledge_selection_failed", exc_info=True)
-            if compilation is not None and compilation.applied_knowledge_refs:
+            governed_stage_refs = set(validation_result.applied_knowledge_refs)
+            for requirement_id, refs in evidence_stage.knowledge_refs_by_requirement.items():
+                if requirement_id in {
+                    observation.requirement_id
+                    for observation in validation_result.evidence_observations
+                    if observation.valid_query and observation.survived
+                }:
+                    governed_stage_refs.update(refs)
+            if compilation is not None:
+                governed_stage_refs.update(compilation.applied_knowledge_refs)
+            if governed_stage_refs:
                 runtime.recorder.stage(
                     "knowledge_audit",
                     "failed",
-                    "governed_compilation_audit_failed",
-                    knowledge_refs=sorted(compilation.applied_knowledge_refs),
+                    "governed_stage_audit_failed",
+                    knowledge_refs=sorted(governed_stage_refs),
                     error_type=type(exc).__name__,
                 )
                 raise FatalPipelineError(
-                    "Governed mappings changed compilation but their usage audit could not be persisted"
+                    "Governed mappings changed an investigation stage but their usage audit could not be persisted"
                 ) from exc
         ranking_status = "passed" if culprit_ranking.candidates else "skipped"
         ranking_reason = (

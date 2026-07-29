@@ -24,6 +24,8 @@ curated registry or normal retrieval.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 from pathlib import Path
 from typing import Any
@@ -189,6 +191,7 @@ def persist_inferred_signal_review(
     backend_name: str = "",
     tenant_id: str | None = None,
     source_type: str = "dashboard_ingest",
+    source_fingerprint: str = "",
     runtime_settings: Settings | None = None,
     governed_candidate_ids: set[str] | None = None,
     governed_pairs: set[tuple[str, str]] | None = None,
@@ -200,10 +203,7 @@ def persist_inferred_signal_review(
     is_heuristic = sig.get("source") == "heuristic"
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
 
-    if is_heuristic:
-        should_teach = bool(metric) and bool(sig.get("auto_teach_eligible"))
-    else:
-        should_teach = bool(metric) and confidence >= 0.5
+    should_teach = _governable_signal(sig)
 
     if should_teach:
         if governed_pairs is not None:
@@ -226,6 +226,7 @@ def persist_inferred_signal_review(
             sig=sig,
             source_ref=source_ref,
             source_type=source_type,
+            source_fingerprint=source_fingerprint,
             tenant_id=effective_tenant,
             runtime_settings=runtime_settings,
         )
@@ -264,12 +265,56 @@ def persist_inferred_signal_review(
     return False
 
 
+def _governable_signal(sig: dict[str, Any]) -> bool:
+    metric = str(sig.get("metric") or "")
+    if sig.get("source") == "heuristic":
+        return bool(metric) and bool(sig.get("auto_teach_eligible"))
+    return bool(metric) and float(sig.get("confidence", 0.6)) >= 0.5
+
+
+def _governable_signal_pairs(signals: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    return {
+        (str(sig.get("metric") or ""), str(sig.get("signal_type") or "")) for sig in signals if _governable_signal(sig)
+    }
+
+
+def _existing_governed_candidate_ids(
+    *,
+    store: Any,
+    tenant_id: str,
+    source_ref: str,
+    active_pairs: set[tuple[str, str]],
+) -> set[str]:
+    from tacit.knowledge.enums import KnowledgeKind
+    from tacit.knowledge.repository import KnowledgeRepository
+
+    repository = KnowledgeRepository(store._db_path)
+    active: set[str] = set()
+    for candidate in repository.list_candidates(tenant_id, limit=None):
+        evidence_refs = {ref for evidence in candidate.evidence.items for ref in evidence.provenance_refs}
+        if source_ref not in set(candidate.provenance_refs).union(evidence_refs):
+            continue
+        if candidate.kind != KnowledgeKind.SIGNAL_MAPPING:
+            continue
+        metric = str(
+            candidate.typed_payload.get("metric_pattern")
+            or candidate.typed_payload.get("candidate_metric")
+            or candidate.typed_payload.get("metric")
+            or ""
+        )
+        signal = str(candidate.typed_payload.get("signal_type") or "")
+        if (metric, signal) in active_pairs:
+            active.add(candidate.id)
+    return active
+
+
 def _govern_signal_mapping(
     *,
     store: Any,
     sig: dict[str, Any],
     source_ref: str,
     source_type: str,
+    source_fingerprint: str = "",
     tenant_id: str | None,
     runtime_settings: Settings | None = None,
 ) -> str:
@@ -289,11 +334,32 @@ def _govern_signal_mapping(
             "context_archetypes": sig.get("archetypes", []),
             "source_type": source_type,
             "source_refs": [source_ref],
+            "source_fingerprint": source_fingerprint,
             "review_state": "approved" if sig.get("source") == "heuristic" else "trusted",
         },
         service=KnowledgeService(KnowledgeRepository(store._db_path)),
         tenant_id=effective_tenant,
     )
+
+
+def _dashboard_content_fingerprint(features: Any) -> str:
+    payload = _features_to_dict(features) if not isinstance(features, dict) else features
+    content = {
+        key: payload.get(key)
+        for key in (
+            "dashboard_tags",
+            "metrics_found",
+            "panel_count",
+            "row_groups",
+            "metric_cooccurrence",
+            "aggregation_patterns",
+            "query_transformations",
+            "panel_titles",
+            "alert_links",
+            "drilldown_links",
+        )
+    }
+    return hashlib.sha256(json.dumps(content, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _active_governed_signal_mapping_ref(
@@ -470,6 +536,7 @@ def approve_ingested_dashboard_record(
     governed_pairs: set[tuple[str, str]] = set()
     governed_candidate_ids: set[str] = set()
     source_ref = f"{ingested['backend_name']}:{dashboard_uid}" if ingested.get("backend_name") else dashboard_uid
+    source_fingerprint = _dashboard_content_fingerprint(ingested)
     for sig in ingested.get("signals_inferred", []):
         if isinstance(sig, dict):
             if persist_inferred_signal_review(
@@ -480,6 +547,7 @@ def approve_ingested_dashboard_record(
                 backend_name=ingested.get("backend_name", ""),
                 tenant_id=effective_tenant,
                 runtime_settings=runtime_settings,
+                source_fingerprint=source_fingerprint,
                 governed_candidate_ids=governed_candidate_ids,
                 governed_pairs=governed_pairs,
             ):
@@ -508,6 +576,7 @@ def approve_ingested_dashboard_record(
                             backend_name=ingested.get("backend_name", ""),
                             tenant_id=effective_tenant,
                             runtime_settings=runtime_settings,
+                            source_fingerprint=source_fingerprint,
                             governed_candidate_ids=governed_candidate_ids,
                             governed_pairs=governed_pairs,
                         ):
@@ -640,6 +709,7 @@ async def ingest_dashboard_features(
     source_ref = (
         f"{features.backend_name}:{features.dashboard_uid}" if features.backend_name else features.dashboard_uid
     )
+    source_fingerprint = _dashboard_content_fingerprint(extracted)
     archetype_yaml = ""
     generation_enabled = bool(getattr(active_settings, "learned_archetypes_generation_enabled", False))
     if generation_enabled:
@@ -689,7 +759,7 @@ async def ingest_dashboard_features(
         else []
     )
     activated_pairs: set[tuple[str, str]] = set()
-    governed_pairs: set[tuple[str, str]] = set()
+    governed_pairs = _governable_signal_pairs(signals)
     governed_candidate_ids: set[str] = set()
     if auto_approve:
         for sig in signals:
@@ -701,19 +771,12 @@ async def ingest_dashboard_features(
                 backend_name=features.backend_name,
                 tenant_id=effective_tenant,
                 runtime_settings=active_settings,
+                source_fingerprint=source_fingerprint,
                 governed_candidate_ids=governed_candidate_ids,
                 governed_pairs=governed_pairs,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
-        reconcile_signal_source(
-            store=store,
-            tenant_id=effective_tenant,
-            source_type="dashboard_ingest",
-            source_ref=source_ref,
-            active_pairs=governed_pairs,
-            active_candidate_ids=governed_candidate_ids,
-        )
         teachable_count = len(governed_pairs)
         learning_impact["candidate_mappings_pending_approval"] = max(0, teachable_count - mappings_created)
         learning_impact["new_active_mappings_after_approval"] = mappings_created
@@ -728,6 +791,12 @@ async def ingest_dashboard_features(
             archetype_quarantined=bool(quarantine_paths),
         )
     else:
+        governed_candidate_ids = _existing_governed_candidate_ids(
+            store=store,
+            tenant_id=effective_tenant,
+            source_ref=source_ref,
+            active_pairs=governed_pairs,
+        )
         logger.info(
             "dashboard_ingested_pending",
             uid=features.dashboard_uid,
@@ -735,6 +804,15 @@ async def ingest_dashboard_features(
             metrics=len(features.metrics_found),
             signals=len(signals),
         )
+
+    reconcile_signal_source(
+        store=store,
+        tenant_id=effective_tenant,
+        source_type="dashboard_ingest",
+        source_ref=source_ref,
+        active_pairs=governed_pairs,
+        active_candidate_ids=governed_candidate_ids,
+    )
 
     indexed_context_rows = store.index_dashboard_context(
         tenant_id=effective_tenant,

@@ -23,7 +23,7 @@ import json
 import os
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -133,7 +133,7 @@ class SignalStore:
     def __init__(self, db_path: Path | None = None, *, runtime_settings: Settings | None = None):
         self._settings = runtime_settings or settings
         configured_tenant = str(self._settings.knowledge_tenant_id or "default")
-        self._legacy_tenant = configured_tenant if configured_tenant != "*" else "default"
+        self._legacy_tenant = configured_tenant if configured_tenant != "*" else None
         self._db_path = db_path or _db_path(self._settings)
         self._ensure_schema()
 
@@ -174,20 +174,20 @@ class SignalStore:
 
     def _ensure_learning_index(self, conn: sqlite3.Connection) -> None:
         """Create the FTS5 operational knowledge index when available."""
-        ensure_learning_index(conn, legacy_tenant=self._legacy_tenant)
+        ensure_learning_index(conn, legacy_tenant=self._legacy_tenant or "default")
 
     def _ensure_mapping_columns(self, conn: sqlite3.Connection) -> None:
         """Add newer columns to signal_metric_mappings on pre-existing DBs."""
         ensure_mapping_columns(conn)
 
     def _ensure_ingested_dashboard_backend_scope(self, conn: sqlite3.Connection) -> None:
-        ensure_ingested_dashboard_backend_scope(conn, legacy_tenant=self._legacy_tenant)
+        ensure_ingested_dashboard_backend_scope(conn, legacy_tenant=self._legacy_tenant or "default")
 
     def _ensure_ingested_alert_columns(self, conn: sqlite3.Connection) -> None:
         ensure_ingested_alert_columns(conn)
 
     def _rebuild_ingested_dashboards_table(self, conn: sqlite3.Connection) -> None:
-        rebuild_ingested_dashboards_table(conn, legacy_tenant=self._legacy_tenant)
+        rebuild_ingested_dashboards_table(conn, legacy_tenant=self._legacy_tenant or "default")
 
     # ── Signal type CRUD ─────────────────────────────────────────────────
 
@@ -303,12 +303,19 @@ class SignalStore:
         context_datasource_types: list[str] | None = None,
         context_environments: list[str] | None = None,
         context_archetypes: list[str] | None = None,
+        context_regions: list[str] | None = None,
+        context_clusters: list[str] | None = None,
+        context_namespaces: list[str] | None = None,
+        context_versions: list[str] | None = None,
+        valid_from: float | None = None,
+        valid_until: float | None = None,
         source_type: str = "teach",
         source_refs: list[str] | None = None,
         governance_ref: str = "",
         inference_version: str = "",
         review_state: str = "trusted",
         tenant_id: str = "default",
+        connection: sqlite3.Connection | None = None,
     ) -> int:
         """Add or update a signal-to-metric mapping. Returns mapping ID.
 
@@ -325,7 +332,9 @@ class SignalStore:
             raise ValueError(f"confidence must be within [0.0, 1.0], got {confidence!r}")
         now = time.time()
         storage_tenant = GLOBAL_BOOTSTRAP_TENANT_ID if source_type == "bootstrap" else tenant_id
-        with self._conn() as conn:
+        connection_context = nullcontext(connection) if connection is not None else self._conn()
+        with connection_context as conn:
+            assert conn is not None
             # Ensure signal type exists
             if source_type == "bootstrap":
                 existing = conn.execute(
@@ -364,8 +373,9 @@ class SignalStore:
             #   [...] → union with existing
             prior = conn.execute(
                 """SELECT context_services, context_datasource_types,
-                          context_environments, context_archetypes,
-                          source_refs, inference_version, review_state
+                          context_environments, context_archetypes, context_regions,
+                          context_clusters, context_namespaces, context_versions,
+                          valid_from, valid_until, source_refs, inference_version, review_state
                     FROM signal_metric_mappings
                     WHERE tenant_id = ? AND signal_type = ? AND metric_pattern = ?
                       AND governance_ref = ?""",
@@ -390,6 +400,12 @@ class SignalStore:
             ds_types = _merge(context_datasource_types, prior["context_datasource_types"] if prior else None)
             environments = _merge(context_environments, prior["context_environments"] if prior else None)
             archetypes = _merge(context_archetypes, prior["context_archetypes"] if prior else None)
+            regions = _merge(context_regions, prior["context_regions"] if prior else None)
+            clusters = _merge(context_clusters, prior["context_clusters"] if prior else None)
+            namespaces = _merge(context_namespaces, prior["context_namespaces"] if prior else None)
+            versions = _merge(context_versions, prior["context_versions"] if prior else None)
+            merged_valid_from = valid_from if valid_from is not None else (prior["valid_from"] if prior else None)
+            merged_valid_until = valid_until if valid_until is not None else (prior["valid_until"] if prior else None)
             existing_refs = json.loads(prior["source_refs"]) if prior and prior["source_refs"] else []
             refs = list(existing_refs)
             for ref in source_refs or []:
@@ -402,10 +418,12 @@ class SignalStore:
                 """INSERT INTO signal_metric_mappings
                    (tenant_id, signal_type, metric_pattern, confidence,
                     context_services, context_datasource_types,
-                   context_environments, context_archetypes,
+                    context_environments, context_archetypes, context_regions,
+                    context_clusters, context_namespaces, context_versions,
+                    valid_from, valid_until,
                     source_type, source_refs, governance_ref, inference_version,
                     review_state, created_at, last_seen)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(tenant_id, signal_type, metric_pattern, governance_ref) DO UPDATE SET
                        confidence = MAX(excluded.confidence, signal_metric_mappings.confidence),
                        inference_version = excluded.inference_version,
@@ -415,6 +433,12 @@ class SignalStore:
                        context_datasource_types = excluded.context_datasource_types,
                        context_environments = excluded.context_environments,
                        context_archetypes = excluded.context_archetypes,
+                       context_regions = excluded.context_regions,
+                       context_clusters = excluded.context_clusters,
+                       context_namespaces = excluded.context_namespaces,
+                       context_versions = excluded.context_versions,
+                       valid_from = excluded.valid_from,
+                       valid_until = excluded.valid_until,
                        source_type = CASE
                            WHEN excluded.source_type = 'bootstrap'
                                 AND signal_metric_mappings.source_type <> 'bootstrap'
@@ -438,6 +462,12 @@ class SignalStore:
                     json.dumps(ds_types),
                     json.dumps(environments),
                     json.dumps(archetypes),
+                    json.dumps(regions),
+                    json.dumps(clusters),
+                    json.dumps(namespaces),
+                    json.dumps(versions),
+                    merged_valid_from,
+                    merged_valid_until,
                     source_type,
                     json.dumps(refs),
                     governance_ref,
@@ -540,9 +570,12 @@ class SignalStore:
         *,
         tenant_id: str = "default",
         governance_ref: str = "",
+        connection: sqlite3.Connection | None = None,
     ) -> bool:
         """Activate or deactivate a tenant mapping after governance evaluation."""
-        with self._conn() as conn:
+        connection_context = nullcontext(connection) if connection is not None else self._conn()
+        with connection_context as conn:
+            assert conn is not None
             updated = conn.execute(
                 """UPDATE signal_metric_mappings SET review_state=?, last_seen=?
                    WHERE tenant_id=? AND signal_type=? AND metric_pattern=? AND governance_ref=?""",
@@ -560,6 +593,7 @@ class SignalStore:
         context_environment: str = "",
         include_decayed: bool = False,
         tenant_id: str = "default",
+        knowledge_scope: Any | None = None,
     ) -> list[dict[str, Any]]:
         """Get all metric mappings for a signal, optionally filtered by context.
 
@@ -585,6 +619,16 @@ class SignalStore:
             # Context filtering
             if not _context_matches(
                 m, context_service, context_datasource_type, context_archetype, context_environment
+            ):
+                continue
+            if m.get("governance_ref") and not _governed_scope_matches(
+                m,
+                knowledge_scope=knowledge_scope,
+                context_service=context_service,
+                context_datasource_type=context_datasource_type,
+                context_archetype=context_archetype,
+                context_environment=context_environment,
+                now=now,
             ):
                 continue
 
@@ -631,6 +675,7 @@ class SignalStore:
         context_environment: str = "",
         target_query_language: str = "",
         tenant_id: str = "default",
+        knowledge_scope: Any | None = None,
     ) -> list[tuple[MetricEntry, float]]:
         """Resolve a semantic signal while preserving the established public result shape."""
         return [
@@ -644,6 +689,7 @@ class SignalStore:
                 context_environment=context_environment,
                 target_query_language=target_query_language,
                 tenant_id=tenant_id,
+                knowledge_scope=knowledge_scope,
             )
         ]
 
@@ -658,6 +704,7 @@ class SignalStore:
         context_environment: str = "",
         target_query_language: str = "",
         tenant_id: str = "default",
+        knowledge_scope: Any | None = None,
     ) -> list[ResolvedSignal]:
         """Resolve a semantic signal to actual metrics from the live catalog.
 
@@ -681,6 +728,7 @@ class SignalStore:
             context_archetype=context_archetype,
             context_environment=context_environment,
             tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
         )
 
         if not mappings:
@@ -732,6 +780,7 @@ class SignalStore:
         context_environment: str = "",
         target_query_language: str = "",
         tenant_id: str = "default",
+        knowledge_scope: Any | None = None,
         applied_governance_refs: set[str] | None = None,
         governance_refs_by_default_metric: dict[str, set[str]] | None = None,
     ) -> dict[str, str]:
@@ -780,6 +829,7 @@ class SignalStore:
                 context_environment=context_environment,
                 target_query_language=target_query_language,
                 tenant_id=tenant_id,
+                knowledge_scope=knowledge_scope,
             )
 
             if resolved:
@@ -1485,7 +1535,7 @@ class SignalStore:
                 params.append(f"{_escape_like_prefix(external_id_prefix)}%")
             rows = conn.execute(
                 f"""SELECT artifact_id FROM learned_artifacts
-                    WHERE {' AND '.join(clauses)}""",
+                    WHERE {" AND ".join(clauses)}""",
                 params,
             ).fetchall()
             missing = [row["artifact_id"] for row in rows if row["artifact_id"] not in seen_artifact_ids]
@@ -1544,7 +1594,7 @@ class SignalStore:
                            stale, missing_since, first_seen_at, last_seen_at,
                            updated_at, created_at
                     FROM learned_artifacts
-                    WHERE {' AND '.join(conditions)}
+                    WHERE {" AND ".join(conditions)}
                     ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
                 params,
             ).fetchall()
@@ -1951,7 +2001,7 @@ class SignalStore:
 
         sql = f"""SELECT rowid, *, bm25(learning_context_fts) AS rank
                   FROM learning_context_fts
-                  WHERE {' AND '.join(clauses)}
+                  WHERE {" AND ".join(clauses)}
                   ORDER BY rank
                   LIMIT ?"""
         with self._conn() as conn:
@@ -2100,7 +2150,7 @@ class SignalStore:
         with self._conn() as conn:
             rows = conn.execute(
                 f"""SELECT * FROM ingested_dashboards
-                    WHERE {' AND '.join(conditions)}
+                    WHERE {" AND ".join(conditions)}
                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
                 params,
             ).fetchall()
@@ -2128,7 +2178,7 @@ class SignalStore:
         with self._conn() as conn:
             rows = conn.execute(
                 f"""SELECT * FROM ingested_alerts
-                    WHERE {' AND '.join(conditions)}
+                    WHERE {" AND ".join(conditions)}
                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
                 params,
             ).fetchall()
@@ -2287,6 +2337,73 @@ def _merge_signal_definition(
     return merged
 
 
+def _governed_scope_matches(
+    mapping: dict[str, Any],
+    *,
+    knowledge_scope: Any | None,
+    context_service: str,
+    context_datasource_type: str,
+    context_archetype: str,
+    context_environment: str,
+    now: float,
+) -> bool:
+    """Fail closed when an immutable mapping's complete scope is unavailable or mismatched."""
+    if knowledge_scope is not None and str(getattr(knowledge_scope, "tenant_id", "")) != mapping["tenant_id"]:
+        return False
+
+    def normalized(values: Any, *prefixes: str) -> set[str]:
+        result: set[str] = set()
+        for raw in values or []:
+            value = str(raw).strip().casefold()
+            for prefix in prefixes:
+                if value.startswith(prefix):
+                    value = value.removeprefix(prefix)
+                    break
+            if value:
+                result.add(value)
+        return result
+
+    scope_values = {
+        "context_services": normalized(
+            getattr(knowledge_scope, "service_refs", []) if knowledge_scope is not None else [context_service],
+            "entity:service:",
+            "service:",
+        ),
+        "context_environments": normalized(
+            getattr(knowledge_scope, "environment_refs", []) if knowledge_scope is not None else [context_environment],
+            "environment:",
+        ),
+        "context_archetypes": normalized(
+            getattr(knowledge_scope, "archetype_refs", []) if knowledge_scope is not None else [context_archetype],
+            "archetype:",
+        ),
+        "context_regions": normalized(
+            getattr(knowledge_scope, "region_refs", []) if knowledge_scope is not None else [],
+            "region:",
+        ),
+        "context_clusters": normalized(
+            getattr(knowledge_scope, "cluster_refs", []) if knowledge_scope is not None else [],
+            "cluster:",
+        ),
+        "context_namespaces": normalized(
+            getattr(knowledge_scope, "namespace_refs", []) if knowledge_scope is not None else [],
+            "namespace:",
+        ),
+        "context_versions": normalized(
+            getattr(knowledge_scope, "version_constraints", []) if knowledge_scope is not None else [],
+            "version:",
+        ),
+        "context_datasource_types": normalized([context_datasource_type]),
+    }
+    for field, actual in scope_values.items():
+        required = normalized(mapping.get(field))
+        if required and not required.intersection(actual):
+            return False
+    valid_from = mapping.get("valid_from")
+    valid_until = mapping.get("valid_until")
+    return not ((valid_from is not None and now < valid_from) or (valid_until is not None and now >= valid_until))
+
+
 def _deserialize_mapping(row: sqlite3.Row) -> dict[str, Any]:
     """Convert a DB row to a dict with deserialized JSON fields."""
     d = dict(row)
@@ -2295,6 +2412,10 @@ def _deserialize_mapping(row: sqlite3.Row) -> dict[str, Any]:
         "context_datasource_types",
         "context_environments",
         "context_archetypes",
+        "context_regions",
+        "context_clusters",
+        "context_namespaces",
+        "context_versions",
         "source_refs",
     ):
         if field in d and isinstance(d[field], str):

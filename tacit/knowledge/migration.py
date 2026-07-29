@@ -150,13 +150,19 @@ def migrate_signal_mapping(
     metric = str(row.get("metric_pattern") or row.get("candidate_metric") or "unknown")
     record_ref = str(row.get("id") or f"{signal}:{metric}")
     source_refs = [str(value) for value in row.get("source_refs", [])] or [f"signal_mapping:{record_ref}"]
+    lineage_group = str(row.get("lineage_group") or row.get("source_fingerprint") or "").strip()
+    raw_lineage_kind = str(row.get("lineage_kind") or LineageKind.INDEPENDENT.value)
+    try:
+        lineage_kind = LineageKind(raw_lineage_kind)
+    except ValueError:
+        lineage_kind = LineageKind.UNKNOWN
     evidence = [
         KnowledgeEvidenceReference(
             evidence_ref=f"signal_mapping:{record_ref}:{index}",
             evidence_role=EvidenceRole.SUPPORTING,
             source_family=_source_family(str(row.get("source_type") or "unknown")),
-            lineage_group=source_ref,
-            lineage_kind=LineageKind.INDEPENDENT,
+            lineage_group=lineage_group or source_ref,
+            lineage_kind=lineage_kind,
             provenance_refs=[source_ref],
         )
         for index, source_ref in enumerate(source_refs, 1)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +20,40 @@ from tacit.pipeline.recording import PipelineRecorder
 from tacit.ranking import prerank_metrics
 
 logger = structlog.get_logger()
+
+
+def _cache_identity(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return value
+    return str(value)
+
+
+def discovery_cache_parts(
+    *,
+    tenant_id: str,
+    intent: Intent,
+    ranked_catalog: list[MetricEntry],
+    context_chunks: list[Any],
+) -> tuple[str, ...]:
+    """Return the complete tenant-scoped identity for metric discovery."""
+    return (
+        "discovery",
+        tenant_id,
+        intent.summary,
+        ",".join(intent.keywords),
+        json.dumps(
+            [_cache_identity(entry) for entry in ranked_catalog],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            [_cache_identity(chunk) for chunk in context_chunks],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -69,10 +104,12 @@ async def build_freeform_dashboard(
     )
 
     discovery_cache_key = deps.cache_key_factory(
-        "discovery",
-        intent.summary,
-        ",".join(intent.keywords),
-        ",".join(e.name for e in ranked_catalog[:20]),
+        *discovery_cache_parts(
+            tenant_id=tenant_id,
+            intent=intent,
+            ranked_catalog=ranked_catalog,
+            context_chunks=context_chunks,
+        )
     )
     provider = deps.llm_provider_factory() if deps.llm_provider_factory else None
     cached_discovery = deps.llm_cache.get(discovery_cache_key)
@@ -96,6 +133,7 @@ async def build_freeform_dashboard(
         catalog_size=len(ranked_catalog),
         metrics_selected=len(discovery.metrics),
         cached=discovery_cached,
+        tenant_id=tenant_id,
     )
 
     if not discovery.metrics:

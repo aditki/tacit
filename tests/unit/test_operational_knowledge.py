@@ -4,6 +4,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click import ClickException
@@ -748,7 +749,7 @@ def test_new_candidate_reopens_conflict_resolved_by_rejection(tmp_path: Path):
 def test_reviewed_support_reopens_conflict_resolved_by_correction(tmp_path: Path):
     service = _service(tmp_path)
     _, original = _promoted_dependency(service)
-    correction, _ = service.create_correction(
+    correction, correction_candidate = service.create_correction(
         investigation_id="inv-reopen-correction",
         investigation_revision=1,
         correction_type="dependency",
@@ -1144,6 +1145,59 @@ def test_exact_alias_resolution_enforces_alias_scope(tmp_path: Path):
     assert production.entity_resolution.candidate_bindings[0].method == EntityBindingMethod.EXACT_ALIAS
 
 
+def test_alias_resolution_also_enforces_the_target_entity_scope(tmp_path: Path):
+    service = _service(tmp_path)
+    service.register_entity(
+        Entity(
+            id="entity:service:production-storefront",
+            kind=EntityKind.SERVICE,
+            canonical_name="production-storefront",
+            scope=KnowledgeScope(environment_refs=["environment:production"]),
+            provenance_refs=["catalog:production"],
+        )
+    )
+    service.register_alias(
+        EntityAlias(
+            id="alias-storefront-wide",
+            raw_value="Storefront",
+            normalized_value="storefront",
+            entity_ref="entity:service:production-storefront",
+            scope=KnowledgeScope(),
+            method=EntityBindingMethod.HUMAN_CORRECTION,
+            review_state=ReviewState.APPROVED,
+            provenance_refs=["operator:alias"],
+        )
+    )
+
+    staging = service.create_candidate(
+        kind=KnowledgeKind.DEPENDENCY,
+        payload_ref="staging-target-scoped-alias",
+        typed_payload={},
+        proposition={
+            "subject_ref": "Storefront",
+            "predicate": "depends_on",
+            "object_ref": "redis-session",
+        },
+        scope=KnowledgeScope(environment_refs=["environment:staging"]),
+        provenance_refs=["runbook:staging"],
+    )
+    production = service.create_candidate(
+        kind=KnowledgeKind.DEPENDENCY,
+        payload_ref="production-target-scoped-alias",
+        typed_payload={},
+        proposition={
+            "subject_ref": "Storefront",
+            "predicate": "depends_on",
+            "object_ref": "redis-session",
+        },
+        scope=KnowledgeScope(environment_refs=["environment:production"]),
+        provenance_refs=["runbook:production"],
+    )
+
+    assert staging.entity_resolution.status.value == "unresolved"
+    assert production.entity_resolution.status.value == "resolved"
+
+
 def test_candidate_can_rebind_after_entity_resolution_is_repaired(tmp_path: Path):
     service = _service(tmp_path)
     kwargs = {
@@ -1303,6 +1357,45 @@ def test_signal_mapping_usage_remains_considered_until_a_stage_consumes_it(tmp_p
     assert usage[0].score_delta == 0
 
 
+def test_live_negative_evidence_preserves_already_applied_signal_stage_effects(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="signal:checkout-latency",
+        typed_payload={"metric_pattern": "checkout_latency_seconds"},
+        proposition={
+            "subject_ref": "concept:request_latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:checkout_latency_seconds",
+            "concept_ref": "signal:request_latency",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["dashboard:checkout"],
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, live_verified=True)
+    assert revision is not None
+    _, usage = service.create_snapshot(KnowledgeScope(service_refs=["entity:service:checkout"]))
+    usage = service.apply_compilation_usage(usage, {revision.knowledge_id})
+    usage = service.apply_evidence_usage(usage, {revision.knowledge_id})
+
+    reconciled = service.reconcile_live_observations(
+        usage,
+        [
+            EvidenceObservation(
+                requirement_id="checkout_latency",
+                resolution_metric="checkout_latency_seconds",
+                outcome=EvidenceObservationOutcome.NEGATIVE_EVIDENCE,
+            )
+        ],
+    )
+
+    applied = reconciled[0]
+    assert applied.disposition == KnowledgeUsageDisposition.APPLIED
+    assert applied.used_for == ["query_compilation", "evidence_resolution"]
+    assert "live_negative_observation_after_applied_stage" in applied.reason_codes
+
+
 def test_compilation_usage_fails_when_a_governed_reference_is_missing_from_the_snapshot(tmp_path: Path):
     service = _service(tmp_path)
 
@@ -1310,7 +1403,7 @@ def test_compilation_usage_fails_when_a_governed_reference_is_missing_from_the_s
         service.apply_compilation_usage([], {"knowledge-missing"})
 
 
-def test_idempotent_promotion_repairs_a_missing_signal_projection(tmp_path: Path, monkeypatch):
+def test_projection_failure_rolls_back_revision_and_retry_succeeds(tmp_path: Path, monkeypatch):
     from tacit.signals.store import SignalStore
 
     service = _service(tmp_path)
@@ -1335,12 +1428,12 @@ def test_idempotent_promotion_repairs_a_missing_signal_projection(tmp_path: Path
     original_sync = service._sync_signal_mapping_state
     sync_attempts = 0
 
-    def flaky_sync(revision):
+    def flaky_sync(revision, **kwargs):
         nonlocal sync_attempts
         sync_attempts += 1
         if sync_attempts == 1:
             raise OSError("resolver projection unavailable")
-        original_sync(revision)
+        original_sync(revision, **kwargs)
 
     monkeypatch.setattr(service, "_sync_signal_mapping_state", flaky_sync)
 
@@ -1351,14 +1444,14 @@ def test_idempotent_promotion_repairs_a_missing_signal_projection(tmp_path: Path
         "default",
         candidate.proposition.proposition_key,
     )
-    assert knowledge is not None
-    persisted = service.repository.get_revision(knowledge.id)
-    assert persisted is not None
+    assert knowledge is None
     signal_store = SignalStore(service.repository._db_path)
     assert not any(
         row["metric_pattern"] == "custom_checkout_latency_seconds"
         for row in signal_store.get_mappings_for_signal(
             "request_latency",
+            context_service="checkout",
+            context_datasource_type="prometheus",
             tenant_id="default",
             include_decayed=True,
         )
@@ -1367,15 +1460,18 @@ def test_idempotent_promotion_repairs_a_missing_signal_projection(tmp_path: Path
     _, repaired = service.evaluate_candidate(candidate.id, live_verified=True)
 
     assert repaired is not None
-    assert repaired.revision == persisted.revision
+    assert repaired.revision == 1
     mappings = signal_store.get_mappings_for_signal(
         "request_latency",
+        context_service="checkout",
+        context_datasource_type="prometheus",
         tenant_id="default",
         include_decayed=True,
     )
     projection = next(row for row in mappings if row["metric_pattern"] == "custom_checkout_latency_seconds")
     assert projection["governance_ref"] == repaired.knowledge_id
     assert sync_attempts == 2
+    assert len(service.repository.list_revisions(repaired.knowledge_id)) == 1
 
 
 @pytest.mark.parametrize(
@@ -1721,7 +1817,7 @@ def test_correction_supersession_rechecks_target_under_write_lock(
 ):
     service = _service(tmp_path)
     _, original = _promoted_dependency(service)
-    correction, _ = service.create_correction(
+    correction, correction_candidate = service.create_correction(
         investigation_id="inv-concurrent-correction",
         investigation_revision=1,
         correction_type=CorrectionType.DEPENDENCY,
@@ -1774,8 +1870,14 @@ def test_correction_supersession_rechecks_target_under_write_lock(
 
     current = service.repository.get_revision(original.knowledge_id)
     assert current is not None
-    assert current.revision == 2
+    assert current.revision == 1
     assert current.state.lifecycle_status == LifecycleStatus.ACTIVE
+    stored_correction = service.repository.get_correction(correction.id)
+    assert stored_correction is not None
+    assert stored_correction.review_state == ReviewState.CANDIDATE
+    stored_candidate = service.repository.get_candidate(correction_candidate.id)
+    assert stored_candidate is not None
+    assert stored_candidate.state.review_state == ReviewState.CANDIDATE
 
 
 def test_correction_creation_rejects_an_already_stale_target_revision(tmp_path: Path):
@@ -1925,6 +2027,72 @@ def test_governed_signal_projection_preserves_each_revision_scope(tmp_path: Path
         context_service="payments",
     )
     assert [mapping["governance_ref"] for mapping in active_payments] == [payments.knowledge_id]
+
+
+def test_governed_signal_projection_preserves_complete_scope_and_validity(tmp_path: Path):
+    service = _service(tmp_path)
+    now = datetime.now(UTC)
+    scope = KnowledgeScope(
+        environment_refs=["environment:production"],
+        region_refs=["region:us-east-1"],
+        cluster_refs=["cluster:prod-a"],
+        namespace_refs=["namespace:checkout"],
+        service_refs=["entity:service:checkout"],
+        archetype_refs=["archetype:resource-saturation"],
+        version_constraints=["version:v2"],
+        valid_from=now - timedelta(minutes=5),
+        valid_until=now + timedelta(minutes=5),
+    )
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="signal:fully-scoped-latency",
+        typed_payload={
+            "metric_pattern": "fully_scoped_latency_seconds",
+            "context_datasource_types": ["prometheus"],
+        },
+        proposition={
+            "subject_ref": "concept:request_latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:fully_scoped_latency_seconds",
+            "concept_ref": "signal:request_latency",
+        },
+        scope=scope,
+        provenance_refs=["operator:fully-scoped"],
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, live_verified=True)
+    assert revision is not None
+
+    from tacit.signals.store import SignalStore
+
+    store = SignalStore(service.repository._db_path)
+    matches = store.get_mappings_for_signal(
+        "request_latency",
+        context_service="checkout",
+        context_datasource_type="prometheus",
+        context_archetype="resource-saturation",
+        context_environment="production",
+        knowledge_scope=scope,
+    )
+    wrong_region = scope.model_copy(update={"region_refs": ["region:us-west-2"]})
+    misses = store.get_mappings_for_signal(
+        "request_latency",
+        context_service="checkout",
+        context_datasource_type="prometheus",
+        context_archetype="resource-saturation",
+        context_environment="production",
+        knowledge_scope=wrong_region,
+    )
+
+    assert [mapping["governance_ref"] for mapping in matches] == [revision.knowledge_id]
+    assert misses == []
+    projection = matches[0]
+    assert projection["context_regions"] == ["us-east-1"]
+    assert projection["context_clusters"] == ["prod-a"]
+    assert projection["context_namespaces"] == ["checkout"]
+    assert projection["context_versions"] == ["v2"]
+    assert projection["valid_from"] == pytest.approx(scope.valid_from.timestamp())
+    assert projection["valid_until"] == pytest.approx(scope.valid_until.timestamp())
 
 
 def test_entity_mapping_correction_registers_alias_without_signal_revision(tmp_path: Path):
@@ -2429,7 +2597,6 @@ def test_repeated_candidate_evaluation_reuses_unchanged_revision(tmp_path: Path)
 
 def test_concurrent_candidate_evaluation_reuses_the_committed_revision(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     service = _service(tmp_path)
     first = _dependency(
@@ -2446,15 +2613,6 @@ def test_concurrent_candidate_evaluation_reuses_the_committed_revision(
     )
     service.review_candidate(first.id, approved=True, reviewer="reviewer")
     service.review_candidate(second.id, approved=True, reviewer="reviewer")
-    barrier = threading.Barrier(2)
-    persist_revision = service.repository.persist_revision
-
-    def synchronized_persist(revision, **kwargs):
-        barrier.wait(timeout=5)
-        return persist_revision(revision, **kwargs)
-
-    monkeypatch.setattr(service.repository, "persist_revision", synchronized_persist)
-
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _: service.evaluate_candidate(first.id), range(2)))
 
@@ -3457,6 +3615,38 @@ def test_cli_trust_requires_review_and_trust_permissions(monkeypatch: pytest.Mon
     assert "missing permission: knowledge.review" in result.output
 
 
+@pytest.mark.parametrize(
+    ("arguments", "permissions", "missing_permission"),
+    [
+        (["learn", "dashboard", "dash-1", "--auto-approve"], "knowledge.read", "knowledge.review"),
+        (["learn", "approve", "dash-1"], "knowledge.read,knowledge.review", "knowledge.trust"),
+        (["learn", "reject", "dash-1"], "knowledge.read", "knowledge.reject"),
+        (["learn", "ignore", "dash-1"], "knowledge.read", "knowledge.reject"),
+    ],
+)
+def test_cli_learning_transitions_enforce_semantic_permissions(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+    permissions: str,
+    missing_permission: str,
+):
+    class ForbiddenStores:
+        settings = SimpleNamespace(
+            knowledge_tenant_id="default",
+            knowledge_permissions=permissions,
+        )
+
+        def signals(self):
+            raise AssertionError("unauthorized learning transition reached persistence")
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: ForbiddenStores())
+
+    result = CliRunner().invoke(cli, arguments)
+
+    assert result.exit_code != 0
+    assert f"missing permission: {missing_permission}" in result.output
+
+
 def test_cli_exposes_phase_three_commands():
     runner = CliRunner()
     assert runner.invoke(cli, ["knowledge", "--help"]).exit_code == 0
@@ -3514,10 +3704,20 @@ def test_pending_cli_learning_preserves_wildcard_tenant(monkeypatch: pytest.Monk
         seen.append(("alerts", kwargs["tenant_id"]))
         return {"alerts_learned": 0, "signals_inferred": 0, "mappings_created": 0, "warnings": []}
 
+    class FakeStores:
+        settings = SimpleNamespace(
+            knowledge_tenant_id="*",
+            knowledge_permissions="knowledge.read,knowledge.review,knowledge.trust,knowledge.reject",
+        )
+
+        def signals(self):
+            return object()
+
     monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
     monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard", ingest_dashboard)
     monkeypatch.setattr("tacit.dashboard_ingest.learn_backend_dashboards", learn_dashboards)
     monkeypatch.setattr("tacit.alert_ingest.learn_backend_alerts", learn_alerts)
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: FakeStores())
     runner = CliRunner()
 
     results = [
@@ -3539,6 +3739,11 @@ def test_cli_reject_and_ignore_thread_wildcard_tenant(monkeypatch: pytest.Monkey
             return True
 
     class FakeStores:
+        settings = SimpleNamespace(
+            knowledge_tenant_id="*",
+            knowledge_permissions="knowledge.read,knowledge.review,knowledge.trust,knowledge.reject",
+        )
+
         def signals(self):
             return FakeSignalStore()
 

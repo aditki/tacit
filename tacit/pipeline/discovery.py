@@ -137,6 +137,7 @@ def confirm_colloquial_keywords(
     target_query_language: str,
     signal_store: Any | None = None,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
 ) -> list[str]:
     """Promote low-confidence colloquial evidence only after live signal coverage.
 
@@ -149,6 +150,7 @@ def confirm_colloquial_keywords(
 
     try:
         from tacit.agents.synonyms import SynonymEvidence, confirm_colloquial
+        from tacit.archetypes.engine import _datasource_type_for_language
         from tacit.signals import get_signal_store
 
         signal_store = resolve_signal_store(signal_store, get_signal_store)
@@ -165,8 +167,10 @@ def confirm_colloquial_keywords(
                         sig,
                         confirmation_catalog,
                         context_service=context_service,
+                        context_datasource_type=_datasource_type_for_language(target_query_language),
                         target_query_language=target_query_language,
                         tenant_id=tenant_id,
+                        knowledge_scope=knowledge_scope,
                     )
                     resolve_cache[sig] = bool(hits)
                 except Exception:

@@ -108,6 +108,7 @@ class EntityResolutionService:
             and (entity := self.repository.get_entity(alias.entity_ref, tenant_id)) is not None
             and entity.status == EntityStatus.ACTIVE
             and self._kind_matches(entity.kind, expected_kind)
+            and entity.scope.applies_to(scope)
         ]
         refs = {entity.id: EntityBindingMethod.EXACT_NAME for entity in named}
         refs.update({alias.entity_ref: EntityBindingMethod.EXACT_ALIAS for alias in aliases})

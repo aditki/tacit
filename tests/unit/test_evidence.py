@@ -128,6 +128,38 @@ def test_evidence_resolves_prefixed_live_metrics(monkeypatch, tmp_path):
     assert all(resolution.reason_code == "live_signal_resolved" for resolution in resolutions)
 
 
+def test_evidence_resolution_reports_the_governed_mapping_that_selected_the_metric(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    store.add_mapping(
+        "cpu_usage",
+        "checkout_custom_cpu_seconds_total",
+        confidence=0.95,
+        context_services=["checkout"],
+        context_datasource_types=["prometheus"],
+        context_archetypes=["resource-saturation"],
+        source_type="operational_knowledge",
+        governance_ref="knowledge_cpu_mapping",
+        review_state="approved",
+    )
+    applied_refs: set[str] = set()
+    refs_by_requirement: dict[str, set[str]] = {}
+
+    requirements, resolutions = resolve_requirements_for_archetype(
+        _resource_archetype(),
+        _intent(),
+        [_metric("checkout_custom_cpu_seconds_total")],
+        signal_store=store,
+        applied_governance_refs=applied_refs,
+        governance_refs_by_requirement=refs_by_requirement,
+    )
+
+    cpu_requirement = next(requirement for requirement in requirements if requirement.signal_type == "cpu_usage")
+    cpu_resolution = next(resolution for resolution in resolutions if resolution.requirement_id == cpu_requirement.id)
+    assert cpu_resolution.metric == "checkout_custom_cpu_seconds_total"
+    assert applied_refs == {"knowledge_cpu_mapping"}
+    assert refs_by_requirement[cpu_requirement.id] == {"knowledge_cpu_mapping"}
+
+
 def test_evidence_record_preserves_primary_failure_and_gap_observation():
     requirements = requirements_for_archetype(_resource_archetype(), _intent())
     primary = EvidenceResolution(

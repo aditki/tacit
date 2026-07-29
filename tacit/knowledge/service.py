@@ -102,6 +102,7 @@ def _source_family(value: str) -> SourceFamily:
 class KnowledgeService:
     def __init__(self, repository: KnowledgeRepository | None = None):
         self.repository = repository or get_knowledge_repository()
+        self._signal_store_instance: Any | None = None
         self.entity_resolution = EntityResolutionService(self.repository)
         self.normalizer = PropositionNormalizer()
         self.corroboration = CorroborationService(self.repository)
@@ -470,7 +471,7 @@ class KnowledgeService:
             semantic_fingerprint=semantic,
         )
         try:
-            self.repository.persist_revision(
+            self._persist_revision_with_projection(
                 revision,
                 candidate_id=candidate.id,
                 decision_ref=decision.decision_id,
@@ -482,7 +483,6 @@ class KnowledgeService:
                 raise
             self._sync_signal_mapping_state(concurrent_revision)
             return decision, concurrent_revision
-        self._sync_signal_mapping_state(revision)
         self.repository.append_event(
             "knowledge_promoted" if revision_number == 1 else "knowledge_revised",
             tenant_id=tenant_id,
@@ -544,13 +544,44 @@ class KnowledgeService:
         applied_knowledge_refs: set[str] | frozenset[str],
     ) -> list[KnowledgeUsage]:
         """Mark governed signal mappings whose resolver rows changed compilation."""
+        return self._apply_signal_mapping_stage_usage(
+            usage,
+            applied_knowledge_refs,
+            stage="query_compilation",
+            reason_code="signal_mapping_selected_for_compilation",
+        )
+
+    def apply_evidence_usage(
+        self,
+        usage: list[KnowledgeUsage],
+        applied_knowledge_refs: set[str] | frozenset[str],
+    ) -> list[KnowledgeUsage]:
+        """Mark governed mappings that selected an evidence metric."""
+        return self._apply_signal_mapping_stage_usage(
+            usage,
+            applied_knowledge_refs,
+            stage="evidence_resolution",
+            reason_code="signal_mapping_selected_for_evidence",
+        )
+
+    def _apply_signal_mapping_stage_usage(
+        self,
+        usage: list[KnowledgeUsage],
+        applied_knowledge_refs: set[str] | frozenset[str],
+        *,
+        stage: str,
+        reason_code: str,
+    ) -> list[KnowledgeUsage]:
         if not applied_knowledge_refs:
             return usage
         reconciled = list(usage)
         for index, item in enumerate(usage):
             if item.knowledge_ref not in applied_knowledge_refs:
                 continue
-            if item.disposition != KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED:
+            if item.disposition not in {
+                KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+                KnowledgeUsageDisposition.APPLIED,
+            }:
                 logger.warning(
                     "signal_mapping_usage_disposition_mismatch",
                     tenant_id=item.tenant_id,
@@ -567,12 +598,15 @@ class KnowledgeService:
             if revision is None or revision.proposition.kind != KnowledgeKind.SIGNAL_MAPPING:
                 continue
             reason_codes = list(item.reason_codes)
-            if "signal_mapping_selected_for_compilation" not in reason_codes:
-                reason_codes.append("signal_mapping_selected_for_compilation")
+            if reason_code not in reason_codes:
+                reason_codes.append(reason_code)
+            used_for = list(item.used_for)
+            if stage not in used_for:
+                used_for.append(stage)
             reconciled[index] = item.model_copy(
                 update={
                     "disposition": KnowledgeUsageDisposition.APPLIED,
-                    "used_for": ["query_compilation"],
+                    "used_for": used_for,
                     "score_delta": 0.0,
                     "reason_codes": reason_codes,
                 }
@@ -580,16 +614,17 @@ class KnowledgeService:
         audited_refs = {
             item.knowledge_ref
             for item in reconciled
-            if item.disposition == KnowledgeUsageDisposition.APPLIED and "query_compilation" in item.used_for
+            if item.disposition == KnowledgeUsageDisposition.APPLIED and stage in item.used_for
         }
         missing_refs = set(applied_knowledge_refs).difference(audited_refs)
         if missing_refs:
             logger.error(
-                "governed_compilation_usage_missing",
+                "governed_stage_usage_missing",
+                stage=stage,
                 knowledge_refs=sorted(missing_refs),
             )
             raise RuntimeError(
-                "Governed compilation references were not present in the selected knowledge snapshot: "
+                f"Governed {stage} references were not present in the selected knowledge snapshot: "
                 + ", ".join(sorted(missing_refs))
             )
         return reconciled
@@ -782,6 +817,16 @@ class KnowledgeService:
             if refs.isdisjoint(negative_refs):
                 reconciled.append(item)
                 continue
+            if (
+                proposition.kind == KnowledgeKind.SIGNAL_MAPPING
+                and item.disposition == KnowledgeUsageDisposition.APPLIED
+                and set(item.used_for).intersection({"query_compilation", "evidence_resolution"})
+            ):
+                reason_codes = list(item.reason_codes)
+                if "live_negative_observation_after_applied_stage" not in reason_codes:
+                    reason_codes.append("live_negative_observation_after_applied_stage")
+                reconciled.append(item.model_copy(update={"reason_codes": reason_codes}))
+                continue
             reconciled.append(
                 item.model_copy(
                     update={
@@ -955,6 +1000,37 @@ class KnowledgeService:
         tenant_id: str = "default",
         authoritative: bool = False,
     ) -> tuple[KnowledgeCorrection, KnowledgeRevision | None]:
+        """Review and apply a correction within one locked write transaction."""
+        correction = self.repository.get_correction(correction_id, tenant_id)
+        if correction is not None:
+            candidate = self.repository.get_candidate(correction.knowledge_candidate_ref, tenant_id)
+            target = (
+                self.repository.get_revision(correction.target_ref, tenant_id=tenant_id)
+                if correction.target_ref
+                else None
+            )
+            if (candidate is not None and candidate.kind == KnowledgeKind.SIGNAL_MAPPING) or (
+                target is not None and target.proposition.kind == KnowledgeKind.SIGNAL_MAPPING
+            ):
+                self._signal_store()
+        with self.repository.transaction():
+            return self._review_correction_in_transaction(
+                correction_id,
+                approved=approved,
+                reviewer=reviewer,
+                tenant_id=tenant_id,
+                authoritative=authoritative,
+            )
+
+    def _review_correction_in_transaction(
+        self,
+        correction_id: str,
+        *,
+        approved: bool,
+        reviewer: str,
+        tenant_id: str = "default",
+        authoritative: bool = False,
+    ) -> tuple[KnowledgeCorrection, KnowledgeRevision | None]:
         correction = self.repository.get_correction(correction_id, tenant_id)
         if correction is None:
             raise ValueError("knowledge correction not found")
@@ -1118,13 +1194,12 @@ class KnowledgeService:
                 "created_at": utc_now(),
             }
         )
-        self.repository.persist_revision(
+        self._persist_revision_with_projection(
             revision,
             candidate_id=candidate.id,
             decision_ref=decision.decision_id,
             expected_parent_revision=expected_revision,
         )
-        self._sync_signal_mapping_state(revision)
         self.repository.append_event(
             "knowledge_superseded",
             tenant_id=tenant_id,
@@ -1239,12 +1314,11 @@ class KnowledgeService:
                 "created_at": utc_now(),
             }
         )
-        self.repository.persist_revision(
+        self._persist_revision_with_projection(
             revision,
             candidate_id=candidate.id,
             decision_ref=decision.decision_id,
         )
-        self._sync_signal_mapping_state(revision)
         self.repository.append_event(
             "knowledge_retired",
             tenant_id=current.tenant_id,
@@ -1258,12 +1332,55 @@ class KnowledgeService:
         )
         return revision
 
-    def _sync_signal_mapping_state(self, revision: KnowledgeRevision) -> None:
+    def _signal_store(self):
+        if self._signal_store_instance is None:
+            from tacit.signals.store import SignalStore
+
+            self._signal_store_instance = SignalStore(self.repository._db_path)
+        return self._signal_store_instance
+
+    def _persist_revision_with_projection(
+        self,
+        revision: KnowledgeRevision,
+        *,
+        candidate_id: str,
+        decision_ref: str,
+        expected_candidate: KnowledgeCandidate | None = None,
+        expected_parent_revision: int | None = None,
+    ) -> KnowledgeRevision:
+        store = self._signal_store() if revision.proposition.kind == KnowledgeKind.SIGNAL_MAPPING else None
+        try:
+            with self.repository.transaction() as conn:
+                persisted = self.repository.persist_revision(
+                    revision,
+                    candidate_id=candidate_id,
+                    decision_ref=decision_ref,
+                    expected_candidate=expected_candidate,
+                    expected_parent_revision=expected_parent_revision,
+                )
+                self._sync_signal_mapping_state(persisted, store=store, connection=conn)
+        except Exception:
+            if store is not None:
+                logger.error(
+                    "governed_signal_projection_transaction_failed",
+                    tenant_id=revision.tenant_id,
+                    knowledge_id=revision.knowledge_id,
+                    knowledge_revision=revision.revision,
+                    exc_info=True,
+                )
+            raise
+        return persisted
+
+    def _sync_signal_mapping_state(
+        self,
+        revision: KnowledgeRevision,
+        *,
+        store: Any | None = None,
+        connection: Any | None = None,
+    ) -> None:
         """Project governed signal eligibility into the legacy resolver index."""
         if revision.proposition.kind != KnowledgeKind.SIGNAL_MAPPING:
             return
-        from tacit.signals.store import SignalStore
-
         signal_type = revision.proposition.concept_ref.removeprefix("signal:")
         metric_patterns = self._signal_metric_patterns(revision)
         if not signal_type or not metric_patterns:
@@ -1277,7 +1394,7 @@ class KnowledgeService:
             if active and revision.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
             else ReviewState.CANDIDATE.value
         )
-        store = SignalStore(self.repository._db_path)
+        store = store or self._signal_store()
         for metric_pattern in metric_patterns:
             if active:
                 store.add_mapping(
@@ -1300,6 +1417,12 @@ class KnowledgeService:
                         revision.scope.archetype_refs,
                         "archetype:",
                     ),
+                    context_regions=self._resolver_scope_values(revision.scope.region_refs, "region:"),
+                    context_clusters=self._resolver_scope_values(revision.scope.cluster_refs, "cluster:"),
+                    context_namespaces=self._resolver_scope_values(revision.scope.namespace_refs, "namespace:"),
+                    context_versions=self._resolver_scope_values(revision.scope.version_constraints, "version:"),
+                    valid_from=revision.scope.valid_from.timestamp() if revision.scope.valid_from else None,
+                    valid_until=revision.scope.valid_until.timestamp() if revision.scope.valid_until else None,
                     source_type="operational_knowledge",
                     source_refs=[
                         f"{revision.knowledge_id}@{revision.revision}",
@@ -1309,6 +1432,7 @@ class KnowledgeService:
                     inference_version=f"{revision.policy_id}:{revision.policy_version}",
                     review_state=review_state,
                     tenant_id=revision.tenant_id,
+                    connection=connection,
                 )
             else:
                 store.set_mapping_review_state(
@@ -1317,6 +1441,7 @@ class KnowledgeService:
                     review_state=review_state,
                     tenant_id=revision.tenant_id,
                     governance_ref=revision.knowledge_id,
+                    connection=connection,
                 )
 
     def _signal_metric_patterns(self, revision: KnowledgeRevision) -> list[str]:

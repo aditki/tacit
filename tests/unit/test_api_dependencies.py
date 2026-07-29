@@ -17,6 +17,7 @@ from tacit.api.security import (
 )
 from tacit.backends.base import DashboardFeatures
 from tacit.config import Settings
+from tacit.dependencies import PipelineDependencies, resolve_knowledge_service
 from tacit.models.schemas import DashRequest, DashResponse
 from tacit.signals import SignalStore
 
@@ -126,6 +127,22 @@ def test_chart_route_uses_app_scoped_pipeline_settings(monkeypatch):
     assert response.status_code == 200
     assert seen_settings == [runtime_settings]
     assert seen_backend_settings == [runtime_settings]
+
+
+def test_injected_signal_store_without_database_path_cannot_fall_back_globally():
+    injected_store = object()
+    deps = PipelineDependencies(
+        settings=Settings(),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        signal_store_factory=lambda: injected_store,
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    with pytest.raises(RuntimeError, match="unavailable for the active signal store"):
+        resolve_knowledge_service(deps, signal_store=injected_store)
 
 
 def test_api_auth_uses_app_scoped_settings(monkeypatch):

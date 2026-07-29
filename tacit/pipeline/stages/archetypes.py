@@ -79,6 +79,7 @@ def select_archetypes(
     environment_refs: list[str] | None = None,
     archetype_kind: str = "investigation_dashboard",
     signal_store: Any | None = None,
+    knowledge_scope: Any | None = None,
 ) -> ArchetypeSelection:
     """Select authoritative curated archetypes and discover shadow-only generated candidates."""
     ranked_archetypes = get_archetypes_by_confidence(intent.archetypes, min_confidence=0.3)
@@ -141,6 +142,7 @@ def select_archetypes(
             min_secondary_coverage=settings.min_secondary_coverage,
             signal_store=signal_store,
             tenant_id=tenant_id or "default",
+            knowledge_scope=knowledge_scope,
         )
 
     return ArchetypeSelection(
@@ -168,6 +170,7 @@ def compile_selected_archetypes(
     timings: dict[str, float],
     signal_store: Any | None = None,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
 ) -> ArchetypeCompilation | None:
     """Compile a dashboard from selected archetypes, if any."""
     if not selection.ranked_archetypes:
@@ -184,6 +187,7 @@ def compile_selected_archetypes(
             target_language=selection.target_language,
             signal_store=signal_store,
             tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
             knowledge_query_uses=knowledge_query_uses,
         )
     else:
@@ -194,6 +198,7 @@ def compile_selected_archetypes(
             target_language=selection.target_language,
             signal_store=signal_store,
             tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
             knowledge_query_uses=knowledge_query_uses,
         )
     timings["archetype_compile"] = time.monotonic() - t0

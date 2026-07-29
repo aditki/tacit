@@ -157,6 +157,8 @@ def resolve_knowledge_service(
         from tacit.knowledge.service import KnowledgeService
 
         return KnowledgeService(KnowledgeRepository(db_path))
-    from tacit.knowledge.service import get_knowledge_service
-
-    return get_knowledge_service()
+    logger.error(
+        "knowledge_service_scoped_store_unavailable",
+        signal_store_type=type(active_signal_store).__name__ if active_signal_store is not None else "none",
+    )
+    raise RuntimeError("Operational Knowledge service is unavailable for the active signal store")

@@ -525,6 +525,21 @@ def _cli_knowledge_service():
     return _cli_runtime_stores().knowledge()
 
 
+def _cli_store_settings(stores: Any) -> Any:
+    from tacit.config import settings
+
+    return getattr(stores, "settings", settings)
+
+
+def _require_cli_knowledge_action(action: Any, runtime_settings: Any) -> None:
+    from tacit.api.security import enforce_knowledge_action
+
+    try:
+        enforce_knowledge_action(runtime_settings, action)
+    except PermissionError as exc:
+        raise click.ClickException(str(exc).replace("Missing permission", "missing permission")) from exc
+
+
 def _llm_zero_key_mode() -> bool:
     """True only when deterministic fallback applies to a key-based provider."""
     try:
@@ -1238,8 +1253,13 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool, tenant
 
     import asyncio
 
+    from tacit.api.security import KnowledgeAction
+
     stores = _cli_runtime_stores()
-    tenant_id = _knowledge_tenant(tenant)
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    if auto_approve:
+        _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
 
     async def _run():
         from tacit.dashboard_ingest import ingest_dashboard
@@ -1248,7 +1268,7 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool, tenant
             dashboard_uid=dashboard_uid,
             backend_name=backend,
             auto_approve=auto_approve,
-            runtime_settings=stores.settings,
+            runtime_settings=runtime_settings,
             store=stores.signals(),
             tenant_id=tenant_id,
         )
@@ -1572,7 +1592,12 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
     import asyncio
 
     stores = _cli_runtime_stores()
-    tenant_id = None if dry_run and tenant is None else _knowledge_tenant(tenant)
+    from tacit.api.security import KnowledgeAction
+
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    if auto_approve and not dry_run:
+        _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
 
     async def _run():
         if alert_uid:
@@ -1583,7 +1608,7 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
                 backend_name=source,
                 auto_approve=auto_approve,
                 dry_run=dry_run,
-                runtime_settings=stores.settings,
+                runtime_settings=runtime_settings,
                 store=stores.signals(),
                 tenant_id=tenant_id,
             )
@@ -1594,7 +1619,7 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
             auto_approve=auto_approve,
             dry_run=dry_run,
             limit=limit,
-            runtime_settings=stores.settings,
+            runtime_settings=runtime_settings,
             store=stores.signals(),
             tenant_id=tenant_id,
         )
@@ -1642,8 +1667,13 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int, ten
 
     import asyncio
 
+    from tacit.api.security import KnowledgeAction
+
     stores = _cli_runtime_stores()
-    tenant_id = _knowledge_tenant(tenant)
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    if auto_approve:
+        _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
 
     async def _run():
         from tacit.dashboard_ingest import learn_backend_dashboards
@@ -1652,7 +1682,7 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int, ten
             backend_name,
             auto_approve=auto_approve,
             limit=limit,
-            runtime_settings=stores.settings,
+            runtime_settings=runtime_settings,
             store=stores.signals(),
             tenant_id=tenant_id,
         )
@@ -1702,16 +1732,19 @@ def learn_approve(dashboard_uid: str, backend: str, tenant: str | None):
     _header("Approve Learned Dashboard")
     _load_env()
 
+    from tacit.api.security import KnowledgeAction
     from tacit.dashboard_ingest import approve_ingested_dashboard_record
 
     stores = _cli_runtime_stores()
-    tenant_id = _knowledge_tenant(tenant)
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
     try:
         result = approve_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend or None,
             store=stores.signals(),
-            runtime_settings=stores.settings,
+            runtime_settings=runtime_settings,
             tenant_id=tenant_id,
         )
     except LookupError:
@@ -1735,10 +1768,13 @@ def learn_reject(dashboard_uid: str, backend: str, tenant: str | None):
     _header("Reject Learned Dashboard")
     _load_env()
 
+    from tacit.api.security import KnowledgeAction
     from tacit.dashboard_ingest import reject_ingested_dashboard_record
 
     stores = _cli_runtime_stores()
-    tenant_id = _knowledge_tenant(tenant)
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.REJECT, runtime_settings)
     try:
         result = reject_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
@@ -1770,8 +1806,13 @@ def learn_ignore(dashboard_uid: str, backend: str, tenant: str | None):
     _header("Ignore Learned Dashboard")
     _load_env()
 
-    store = _cli_runtime_stores().signals()
-    tenant_id = _knowledge_tenant(tenant)
+    from tacit.api.security import KnowledgeAction
+
+    stores = _cli_runtime_stores()
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.REJECT, runtime_settings)
+    store = stores.signals()
     if store.ignore_ingested_dashboard(
         dashboard_uid,
         backend_name=backend or None,

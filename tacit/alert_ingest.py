@@ -20,7 +20,12 @@ from tacit.backends.base import AlertFeatures
 from tacit.config import Settings, settings
 from tacit.dashboard_ingest import infer_signals_from_metrics, persist_inferred_signal_review
 from tacit.dashboard_ingest.reports import build_learning_impact_report, build_signal_quality_report
-from tacit.dashboard_ingest.service import reconcile_signal_source, resolve_learning_tenant
+from tacit.dashboard_ingest.service import (
+    _existing_governed_candidate_ids,
+    _governable_signal_pairs,
+    reconcile_signal_source,
+    resolve_learning_tenant,
+)
 from tacit.signals import get_signal_store as _default_get_signal_store
 from tacit.signals.learning_index import infer_services_for_learning
 
@@ -93,6 +98,21 @@ def _alert_fingerprint(features: AlertFeatures) -> str:
         "service_hints": sorted(dict.fromkeys(features.service_hints)),
         "dashboard_uid": features.dashboard_uid,
         "panel_title": features.panel_title,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _alert_mapping_fingerprint(features: AlertFeatures) -> str:
+    """Identify copied alert evidence independently of its external identity or title."""
+    payload = {
+        "condition": features.condition,
+        "severity": features.severity,
+        "enabled": features.enabled,
+        "labels": dict(sorted(features.labels.items())),
+        "annotations": dict(sorted(features.annotations.items())),
+        "metrics": sorted(dict.fromkeys(features.metrics_found)),
+        "queries": sorted(dict.fromkeys(features.query_transformations)),
+        "service_hints": sorted(dict.fromkeys(features.service_hints)),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -175,12 +195,13 @@ async def ingest_alert_features(
     service_hints = list(dict.fromkeys([*features.service_hints, *_services_for_alert(features)]))
     runbook_links = _runbook_links(features)
     fingerprint = _alert_fingerprint(features)
+    mapping_fingerprint = _alert_mapping_fingerprint(features)
     confidence = _confidence_from_signals(signals)
 
     source_ref = f"{features.backend_name}:alert:{features.alert_uid}" if features.backend_name else features.alert_uid
     mappings_created = 0
     activated_pairs: set[tuple[str, str]] = set()
-    governed_pairs: set[tuple[str, str]] = set()
+    governed_pairs = _governable_signal_pairs(signals)
     governed_candidate_ids: set[str] = set()
     if auto_approve and not dry_run:
         for sig in signals:
@@ -192,6 +213,7 @@ async def ingest_alert_features(
                 backend_name=features.backend_name,
                 tenant_id=effective_tenant,
                 source_type="alert_ingest",
+                source_fingerprint=mapping_fingerprint,
                 runtime_settings=active_settings,
                 governed_candidate_ids=governed_candidate_ids,
                 governed_pairs=governed_pairs,
@@ -250,15 +272,22 @@ async def ingest_alert_features(
             status=effective_status,
             activated_pairs=activated_pairs if auto_approve else None,
         )
-        if auto_approve:
-            reconcile_signal_source(
+        if not auto_approve:
+            governed_candidate_ids = _existing_governed_candidate_ids(
                 store=store,
                 tenant_id=effective_tenant,
-                source_type="alert_ingest",
                 source_ref=source_ref,
                 active_pairs=governed_pairs,
-                active_candidate_ids=governed_candidate_ids,
             )
+        reconcile_signal_source(
+            store=store,
+            tenant_id=effective_tenant,
+            source_type="alert_ingest",
+            source_ref=source_ref,
+            active_pairs=governed_pairs,
+            active_candidate_ids=governed_candidate_ids,
+        )
+        if auto_approve:
             teachable_count = len(governed_pairs)
             learning_impact["candidate_mappings_pending_approval"] = max(0, teachable_count - mappings_created)
             learning_impact["new_active_mappings_after_approval"] = mappings_created

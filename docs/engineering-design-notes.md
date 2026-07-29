@@ -2,7 +2,7 @@
 
 Status: living implementation guidance
 
-Last reviewed: 2026-07-28
+Last reviewed: 2026-07-29
 
 This document records recurring engineering lessons and refactor signals found
 while building Tacit's Investigation Contract, Operational Knowledge, learning,
@@ -53,8 +53,9 @@ Tenant selection is a data boundary, not request decoration.
   lookup is not enough if the lookup itself leaks another tenant's data.
 - Browser requests must send the selected tenant consistently across Generate,
   Learning, Knowledge, Signals, and History views.
-- Legacy migrations inherit the configured pinned tenant. Wildcard migrations
-  require an explicit, documented assignment policy.
+- Legacy migrations inherit the configured pinned tenant. A wildcard runtime
+  must fail before schema mutation when pre-tenant user data has no explicit
+  owner; migrate once under a pinned owner before enabling wildcard tenancy.
 
 Every tenant-aware feature should be tested across this matrix:
 
@@ -85,6 +86,11 @@ selection.
   revisions and their runtime projections.
 - Reappearing sources may preserve review history, but they need an explicit
   transition out of stale or ineligible state.
+- Authority revisions and resolver projections that share a database commit in
+  one unit of work. A retry may repair or verify an idempotent projection, but
+  it must not report an active revision whose projection failed to commit.
+- External dashboard or alert IDs establish provenance, not independence.
+  Corroboration groups copied sources by stable operational-content lineage.
 
 ### Usage is confirmed by the consuming stage
 
@@ -98,6 +104,10 @@ applied only after a stage confirms that it changed or selected an output.
 - Do not assign `used_for` from knowledge kind alone.
 - Rebuild the final knowledge snapshot after live-evidence and stage-use
   reconciliation.
+- Once a governed mapping changed compilation or evidence resolution, later
+  negative telemetry may annotate that effect but cannot erase it from usage.
+  Marking it unapplied requires rebuilding and validating the output without
+  the mapping.
 - Counterfactuals must downgrade usage when they remove the output that knowledge
   generated or changed.
 - Impact analysis includes only applied usage. Considered and rejected items
@@ -308,4 +318,3 @@ usefulness.
 - [ADR-021: Generated archetype scope](adr/021-generated-archetype-scope-context.md)
 - [ADR-022: Operational Knowledge lifecycle](adr/022-operational-knowledge-lifecycle.md)
 - [Generated archetype evaluation roadmap](generated-archetype-evaluation-roadmap.md)
-

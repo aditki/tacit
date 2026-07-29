@@ -149,12 +149,15 @@ def resolve_requirements_for_archetype(
     target_language: str = "promql",
     signal_store: Any | None = None,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    applied_governance_refs: set[str] | None = None,
+    governance_refs_by_requirement: dict[str, set[str]] | None = None,
 ) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
     """Resolve one archetype's evidence needs against the live catalog."""
     from tacit.archetypes.engine import (
         _archetype_query_languages,
         _datasource_type_for_language,
-        _legacy_metric_signal,
+        _legacy_metric_signal_details,
         _substitution_shape_compatible,
     )
     from tacit.signals import get_signal_store
@@ -230,17 +233,19 @@ def resolve_requirements_for_archetype(
             continue
 
         signal_type = requirement.signal_type
+        inferred_by = ""
         if not signal_type and default_metric:
             for language in sorted(query_languages or {target_language}):
                 language_catalog = [
                     entry for entry in target_catalog if (entry.query_language or "").lower() == language.lower()
                 ]
-                signal_type = _legacy_metric_signal(
+                signal_type, inferred_by = _legacy_metric_signal_details(
                     store,
                     default_metric,
                     language_catalog,
                     language,
                     tenant_id,
+                    knowledge_scope,
                 )
                 if signal_type:
                     break
@@ -254,11 +259,11 @@ def resolve_requirements_for_archetype(
             )
             continue
 
-        resolved: list[tuple[MetricEntry, float]] = []
+        resolved = []
         for language in sorted(query_languages or {target_language}):
             target_datasource_type = _datasource_type_for_language(language)
             resolved.extend(
-                store.resolve_signal(
+                store.resolve_signal_details(
                     signal_type,
                     resolution_catalog,
                     context_service=intent.services[0] if intent.services else "",
@@ -266,13 +271,14 @@ def resolve_requirements_for_archetype(
                     context_archetype=archetype.id,
                     target_query_language=language,
                     tenant_id=tenant_id,
+                    knowledge_scope=knowledge_scope,
                 )
             )
-        resolved.sort(key=lambda item: item[1], reverse=True)
+        resolved.sort(key=lambda item: item.confidence, reverse=True)
         compatible = [
-            (entry, score)
-            for entry, score in resolved
-            if not default_metric or _substitution_shape_compatible(archetype, default_metric, entry)
+            match
+            for match in resolved
+            if not default_metric or _substitution_shape_compatible(archetype, default_metric, match.entry)
         ]
         if not compatible:
             resolutions.append(
@@ -285,10 +291,11 @@ def resolve_requirements_for_archetype(
             continue
 
         if requirement.evidence_type != "semantic_signal":
-            best_score = compatible[0][1]
-            best = [item for item in compatible if item[1] == best_score]
+            best_score = compatible[0].confidence
+            best = [item for item in compatible if item.confidence == best_score]
             best_owners = {
-                (entry.name, entry.datasource_uid, entry.datasource_type, entry.query_language) for entry, _ in best
+                (item.entry.name, item.entry.datasource_uid, item.entry.datasource_type, item.entry.query_language)
+                for item in best
             }
             if len(best_owners) > 1:
                 resolutions.append(
@@ -301,7 +308,19 @@ def resolve_requirements_for_archetype(
                 )
                 continue
 
-        entry, score = compatible[0]
+        selected = compatible[0]
+        entry, score = selected.entry, selected.confidence
+        if applied_governance_refs is not None:
+            if inferred_by:
+                applied_governance_refs.add(inferred_by)
+            if selected.governance_ref:
+                applied_governance_refs.add(selected.governance_ref)
+        if governance_refs_by_requirement is not None:
+            refs = governance_refs_by_requirement.setdefault(requirement.id, set())
+            if inferred_by:
+                refs.add(inferred_by)
+            if selected.governance_ref:
+                refs.add(selected.governance_ref)
         resolutions.append(
             resolved_from_entry(
                 requirement,
@@ -323,6 +342,9 @@ def resolve_requirements_for_archetypes(
     target_language: str = "promql",
     signal_store: Any | None = None,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    applied_governance_refs: set[str] | None = None,
+    governance_refs_by_requirement: dict[str, set[str]] | None = None,
 ) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
     """Resolve evidence needs for all selected archetypes."""
     requirements: list[EvidenceRequirement] = []
@@ -335,6 +357,9 @@ def resolve_requirements_for_archetypes(
             target_language=target_language,
             signal_store=signal_store,
             tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
+            applied_governance_refs=applied_governance_refs,
+            governance_refs_by_requirement=governance_refs_by_requirement,
         )
         requirements.extend(arch_requirements)
         resolutions.extend(arch_resolutions)

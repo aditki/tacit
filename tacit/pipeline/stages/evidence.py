@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
@@ -18,6 +18,8 @@ logger = structlog.get_logger()
 class EvidenceStageResult:
     requirements: list[EvidenceRequirement]
     resolutions: list[EvidenceResolution]
+    applied_knowledge_refs: frozenset[str] = frozenset()
+    knowledge_refs_by_requirement: dict[str, frozenset[str]] = field(default_factory=dict)
 
 
 def run_evidence_stage(
@@ -29,12 +31,15 @@ def run_evidence_stage(
     target_language: str,
     signal_store: Any | None = None,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
 ) -> EvidenceStageResult:
     """Resolve evidence requirements for the archetypes that contributed panels."""
     if not ranked_archetypes:
         return EvidenceStageResult(requirements=[], resolutions=[])
     try:
         evidence_archetypes = contributing_archetypes(ranked_archetypes, dashboard_spec)
+        applied_knowledge_refs: set[str] = set()
+        refs_by_requirement: dict[str, set[str]] = {}
         requirements, resolutions = resolve_requirements_for_archetypes(
             evidence_archetypes,
             intent,
@@ -42,8 +47,16 @@ def run_evidence_stage(
             target_language=target_language,
             signal_store=signal_store,
             tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
+            applied_governance_refs=applied_knowledge_refs,
+            governance_refs_by_requirement=refs_by_requirement,
         )
-        return EvidenceStageResult(requirements=requirements, resolutions=resolutions)
+        return EvidenceStageResult(
+            requirements=requirements,
+            resolutions=resolutions,
+            applied_knowledge_refs=frozenset(applied_knowledge_refs),
+            knowledge_refs_by_requirement={key: frozenset(value) for key, value in refs_by_requirement.items()},
+        )
     except Exception:
         logger.warning(
             "evidence_resolution_failed",

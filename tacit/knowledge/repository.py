@@ -6,7 +6,9 @@ import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -322,10 +324,18 @@ def _ts(value) -> float:
 class KnowledgeRepository:
     def __init__(self, db_path: Path | None = None):
         self._db_path = db_path or _db_path()
+        self._transaction_connection: ContextVar[sqlite3.Connection | None] = ContextVar(
+            f"knowledge_transaction_{id(self)}",
+            default=None,
+        )
         self._ensure_schema()
 
     @contextmanager
-    def _conn(self):
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        active = self._transaction_connection.get()
+        if active is not None:
+            yield active
+            return
         conn = sqlite3.connect(str(self._db_path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -339,6 +349,21 @@ class KnowledgeRepository:
             raise
         finally:
             conn.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Run repository writes in one immediate, nestable SQLite transaction."""
+        active = self._transaction_connection.get()
+        if active is not None:
+            yield active
+            return
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            token = self._transaction_connection.set(conn)
+            try:
+                yield conn
+            finally:
+                self._transaction_connection.reset(token)
 
     def _ensure_schema(self) -> None:
         with self._conn() as conn:
@@ -467,8 +492,7 @@ class KnowledgeRepository:
         expected: KnowledgeCandidate,
     ) -> KnowledgeCandidate:
         """Persist policy output only if no reviewer or lifecycle writer won first."""
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.transaction() as conn:
             cursor = conn.execute(
                 """UPDATE knowledge_candidates SET
                        review_state=?, lifecycle_status=?, eligibility=?,
@@ -511,8 +535,7 @@ class KnowledgeRepository:
         expected_states: set[str],
     ) -> KnowledgeCandidate:
         """Atomically apply one authorized review transition."""
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.transaction() as conn:
             placeholders = ",".join("?" for _ in expected_states)
             params = [
                 candidate.state.review_state.value,
@@ -871,8 +894,7 @@ class KnowledgeRepository:
         expected_candidate: KnowledgeCandidate | None = None,
         expected_parent_revision: int | None = None,
     ) -> KnowledgeRevision:
-        with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.transaction() as conn:
             candidate = conn.execute(
                 "SELECT tenant_id, candidate_json FROM knowledge_candidates WHERE id=? AND tenant_id=?",
                 (candidate_id, revision.tenant_id),

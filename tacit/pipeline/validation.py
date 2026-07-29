@@ -38,6 +38,7 @@ class ValidationEvidenceResult:
     panels_before: int
     evidence_observations: list[EvidenceObservation]
     evidence_summary: dict[str, object]
+    applied_knowledge_refs: frozenset[str] = frozenset()
 
 
 def _append_validated_panels(
@@ -93,6 +94,8 @@ async def _preserve_symptom_evidence(
     record_stage: Callable[..., None],
     signal_store: Any | None,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    knowledge_query_uses: list[Any] | None = None,
 ) -> tuple[DashboardSpec, DashboardSpec, int]:
     initial_observations = observe_evidence(
         evidence_requirements,
@@ -120,6 +123,8 @@ async def _preserve_symptom_evidence(
         timerange=pre_validation_spec.timerange,
         signal_store=signal_store,
         tenant_id=tenant_id,
+        knowledge_scope=knowledge_scope,
+        knowledge_query_uses=knowledge_query_uses,
     )
     if not symptom_pre_validation_spec.panels:
         record_stage(
@@ -177,6 +182,8 @@ async def _preserve_gap_evidence(
     record_stage: Callable[..., None],
     signal_store: Any | None,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    knowledge_query_uses: list[Any] | None = None,
 ) -> tuple[DashboardSpec, DashboardSpec, int]:
     gap_observations = observe_evidence(
         evidence_requirements,
@@ -206,6 +213,8 @@ async def _preserve_gap_evidence(
         timerange=pre_validation_spec.timerange,
         signal_store=signal_store,
         tenant_id=tenant_id,
+        knowledge_scope=knowledge_scope,
+        knowledge_query_uses=knowledge_query_uses,
     )
     if not gap_pre_validation_spec.panels:
         record_stage(
@@ -304,11 +313,13 @@ async def validate_dashboard_and_evidence(
     record_stage: Callable[..., None],
     signal_store: Any | None = None,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
 ) -> ValidationEvidenceResult:
     """Validate dashboard queries and preserve critical evidence when possible."""
     panels_before = len(dashboard_spec.panels)
     pre_validation_spec = dashboard_spec.model_copy(deep=True)
     dashboard_spec, validation_warnings = await primary.validate_queries(dashboard_spec, catalog)
+    rescue_knowledge_query_uses: list[Any] = []
 
     if evidence_requirements:
         pre_validation_spec, dashboard_spec, panels_before = await _preserve_symptom_evidence(
@@ -325,6 +336,8 @@ async def validate_dashboard_and_evidence(
             record_stage=record_stage,
             signal_store=signal_store,
             tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
+            knowledge_query_uses=rescue_knowledge_query_uses,
         )
         pre_validation_spec, dashboard_spec, panels_before = await _preserve_gap_evidence(
             primary=primary,
@@ -340,6 +353,8 @@ async def validate_dashboard_and_evidence(
             record_stage=record_stage,
             signal_store=signal_store,
             tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
+            knowledge_query_uses=rescue_knowledge_query_uses,
         )
 
     validation_status, validation_reason = _validation_status(panels_before, len(dashboard_spec.panels))
@@ -364,10 +379,17 @@ async def validate_dashboard_and_evidence(
         evidence_reason=evidence_reason,
         record_stage=record_stage,
     )
+    from tacit.archetypes.engine import dashboard_query_identities
+
+    surviving_query_ids = dashboard_query_identities(dashboard_spec)
+    applied_knowledge_refs = frozenset(
+        use.knowledge_ref for use in rescue_knowledge_query_uses if use.query_identity() in surviving_query_ids
+    )
     return ValidationEvidenceResult(
         dashboard_spec=dashboard_spec,
         validation_warnings=validation_warnings,
         panels_before=panels_before,
         evidence_observations=evidence_observations,
         evidence_summary=evidence_summary,
+        applied_knowledge_refs=applied_knowledge_refs,
     )

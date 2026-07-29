@@ -687,6 +687,7 @@ def _legacy_metric_signal_details(
     catalog: list[MetricEntry],
     target_language: str,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
 ) -> tuple[str, str]:
     """Infer the taxonomy signal represented by a legacy required metric."""
     if not catalog:
@@ -707,8 +708,10 @@ def _legacy_metric_signal_details(
         matches = store.resolve_signal_details(
             signal_type,
             [pseudo],
+            context_datasource_type=exemplar.datasource_type,
             target_query_language=target_language,
             tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
         )
         if matches:
             candidates.append((signal_type, matches[0].confidence, matches[0].governance_ref))
@@ -722,6 +725,7 @@ def _legacy_metric_signal(
     catalog: list[MetricEntry],
     target_language: str,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
 ) -> str:
     """Infer the taxonomy signal represented by a legacy required metric."""
     signal_type, _ = _legacy_metric_signal_details(
@@ -730,6 +734,7 @@ def _legacy_metric_signal(
         catalog,
         target_language,
         tenant_id,
+        knowledge_scope,
     )
     return signal_type
 
@@ -787,6 +792,7 @@ def _resolve_legacy_required_metrics(
     target_language: str,
     tenant_id: str = "default",
     governance_refs_by_default_metric: dict[str, set[str]] | None = None,
+    knowledge_scope: Any | None = None,
 ) -> dict[str, str]:
     """Resolve legacy required_metrics through the semantic taxonomy."""
     target_datasource_type = _datasource_type_for_language(target_language)
@@ -808,6 +814,7 @@ def _resolve_legacy_required_metrics(
             target_catalog,
             target_language,
             tenant_id,
+            knowledge_scope,
         )
         if not signal_type:
             continue
@@ -820,6 +827,7 @@ def _resolve_legacy_required_metrics(
             context_environment=intent.environments[0] if intent.environments else "",
             target_query_language=target_language,
             tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
         )
         resolved = [(match.entry, match.confidence) for match in resolved_details]
         selected = _unambiguous_legacy_candidate(resolved, archetype, default_metric)
@@ -864,6 +872,7 @@ def _resolve_archetype_signals(
     signal_store: Any | None = None,
     tenant_id: str = "default",
     governance_refs_by_resolved_metric: dict[str, set[str]] | None = None,
+    knowledge_scope: Any | None = None,
 ) -> InvestigationArchetype:
     """Resolve signal bindings and substitute metrics if needed.
 
@@ -892,6 +901,7 @@ def _resolve_archetype_signals(
             context_environment=intent.environments[0] if intent.environments else "",
             target_query_language=target_language,
             tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
             governance_refs_by_default_metric=refs_by_default_metric,
         )
         legacy_substitutions = _resolve_legacy_required_metrics(
@@ -902,6 +912,7 @@ def _resolve_archetype_signals(
             target_language,
             tenant_id,
             refs_by_default_metric,
+            knowledge_scope,
         )
         for default_metric, resolved_metric in legacy_substitutions.items():
             substitutions.setdefault(default_metric, resolved_metric)
@@ -932,6 +943,7 @@ def compile_archetype(
     signal_store: Any | None = None,
     tenant_id: str = "default",
     knowledge_query_uses: list[KnowledgeQueryUse] | None = None,
+    knowledge_scope: Any | None = None,
 ) -> DashboardSpec:
     """Compile an archetype template into a concrete DashboardSpec.
 
@@ -954,6 +966,7 @@ def compile_archetype(
         signal_store,
         tenant_id,
         governance_refs_by_resolved_metric,
+        knowledge_scope,
     )
 
     rate_interval = _resolve_rate_interval(intent)
@@ -1128,6 +1141,7 @@ def _archetype_live_coverage(
     services: list[str] | None = None,
     signal_store: Any | None = None,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
 ) -> float | None:
     """Fraction of an archetype's declared evidence covered by the live catalog.
 
@@ -1166,7 +1180,10 @@ def _archetype_live_coverage(
                     sig,
                     coverage_catalog,
                     context_service=services[0] if services else "",
+                    context_datasource_type=_datasource_type_for_language(target_language),
+                    context_archetype=archetype.id,
                     tenant_id=tenant_id,
+                    knowledge_scope=knowledge_scope,
                 ):
                     resolved += 1
             except Exception:
@@ -1195,6 +1212,7 @@ def rank_archetypes_by_coverage(
     min_secondary_coverage: float = 0.0,
     signal_store: Any | None = None,
     tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
 ) -> list[tuple[InvestigationArchetype, float]]:
     """Re-rank archetypes by classifier_confidence × live signal coverage.
 
@@ -1216,6 +1234,7 @@ def rank_archetypes_by_coverage(
             services,
             signal_store,
             tenant_id,
+            knowledge_scope,
         )
         # Unknown coverage (no declared signals) keeps the classifier confidence.
         effective = confidence if coverage is None else confidence * coverage
@@ -1270,6 +1289,7 @@ def blend_archetypes(
     signal_store: Any | None = None,
     tenant_id: str = "default",
     knowledge_query_uses: list[KnowledgeQueryUse] | None = None,
+    knowledge_scope: Any | None = None,
 ) -> DashboardSpec:
     """Blend panels from multiple archetypes into a single dashboard.
 
@@ -1304,6 +1324,7 @@ def blend_archetypes(
         min_secondary_coverage=settings.min_secondary_coverage,
         signal_store=signal_store,
         tenant_id=tenant_id,
+        knowledge_scope=knowledge_scope,
     )
     max_panels = settings.max_dashboard_panels
 
@@ -1317,6 +1338,7 @@ def blend_archetypes(
         signal_store=signal_store,
         tenant_id=tenant_id,
         knowledge_query_uses=compiled_query_uses,
+        knowledge_scope=knowledge_scope,
     )
 
     # De-dup on the panel's *query signature* (the set of normalized query
@@ -1343,6 +1365,7 @@ def blend_archetypes(
             signal_store=signal_store,
             tenant_id=tenant_id,
             knowledge_query_uses=compiled_query_uses,
+            knowledge_scope=knowledge_scope,
         )
         added = 0
         for panel in secondary_spec.panels:

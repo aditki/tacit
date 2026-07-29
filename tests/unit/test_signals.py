@@ -420,6 +420,53 @@ def test_signal_mapping_activates_after_governed_corroboration(signal_store):
     assert governed["review_state"] == "approved"
 
 
+def test_copied_dashboard_and_alert_sources_do_not_manufacture_corroboration(signal_store):
+    runtime_settings = Settings(knowledge_tenant_id="tenant-a")
+    signal = {
+        "signal_type": "checkout_latency",
+        "metric": "checkout_latency_seconds",
+        "source": "heuristic",
+        "auto_teach_eligible": True,
+        "confidence": 0.9,
+    }
+
+    dashboard = persist_inferred_signal_review(
+        store=signal_store,
+        sig=signal,
+        source_ref="grafana:checkout-copy",
+        dashboard_uid="checkout-copy",
+        tenant_id="tenant-a",
+        runtime_settings=runtime_settings,
+        source_fingerprint="copied-operational-content",
+    )
+    alert = persist_inferred_signal_review(
+        store=signal_store,
+        sig=signal,
+        source_ref="grafana:alert:checkout-copy",
+        source_type="alert_ingest",
+        dashboard_uid="checkout-alert-copy",
+        tenant_id="tenant-a",
+        runtime_settings=runtime_settings,
+        source_fingerprint="copied-operational-content",
+    )
+
+    repository = KnowledgeRepository(signal_store._db_path)
+    candidates = repository.list_candidates("tenant-a", kind="signal_mapping", limit=None)
+    assert len(candidates) == 2
+    from tacit.knowledge.service import KnowledgeService
+
+    summary, _ = KnowledgeService(repository).corroboration.analyze(
+        "tenant-a",
+        candidates[0].proposition.proposition_key,
+    )
+    assert dashboard is False
+    assert alert is False
+    assert summary.raw_source_count == 2
+    assert summary.independent_source_count == 1
+    assert summary.independent_source_family_count == 1
+    assert repository.find_knowledge_by_proposition("tenant-a", candidates[0].proposition.proposition_key) is None
+
+
 def test_governed_mapping_scopes_and_lifecycles_are_independent(signal_store):
     for knowledge_id, service in (("knowledge-checkout", "checkout"), ("knowledge-payments", "payments")):
         signal_store.add_mapping(
@@ -580,6 +627,33 @@ def test_legacy_mappings_and_learning_index_migrate_to_default_tenant(tmp_path):
     assert migrated_mapping["governance_ref"] == ""
     assert store.search_learning_context("legacy", tenant_id="default")
     store.add_mapping("latency", "legacy_latency_seconds", confidence=0.8, tenant_id="tenant-b")
+
+
+def test_wildcard_migration_requires_an_explicit_owner_for_legacy_tenant_data(tmp_path):
+    db_path = tmp_path / "legacy-owner-unknown.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE signal_metric_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_type TEXT NOT NULL,
+                metric_pattern TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'teach'
+            );
+            INSERT INTO signal_metric_mappings (signal_type, metric_pattern, source_type)
+            VALUES ('request_latency', 'private_latency_seconds', 'teach');
+        """)
+
+    with pytest.raises(RuntimeError, match="Legacy signal data has no tenant owner"):
+        SignalStore(
+            db_path=db_path,
+            runtime_settings=Settings(knowledge_tenant_id="*"),
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)")}
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "tenant_id" not in columns
+    assert "signal_metric_mappings_old" not in tables
 
 
 def test_legacy_signal_data_and_custom_definitions_migrate_to_pinned_tenant(tmp_path):
@@ -767,7 +841,6 @@ def sample_catalog():
 
 
 class TestSignalStoreBasics:
-
     def test_register_and_list_signal_types(self, signal_store):
         signal_store.register_signal_type(
             "request_latency", description="Request latency", category="latency", unit="s"
@@ -800,7 +873,6 @@ class TestSignalStoreBasics:
 
 
 class TestSignalMappings:
-
     def test_add_and_retrieve_mapping(self, signal_store):
         signal_store.register_signal_type("request_latency")
         signal_store.add_mapping(
@@ -880,7 +952,6 @@ class TestSignalMappings:
 
 
 class TestContextFiltering:
-
     def test_empty_context_matches_all(self):
         mapping = {
             "context_services": [],
@@ -1005,7 +1076,6 @@ class TestContextFiltering:
 
 
 class TestConfidenceDecay:
-
     def test_bootstrap_no_decay(self):
         mapping = {
             "confidence": 0.9,
@@ -1072,7 +1142,6 @@ class TestConfidenceDecay:
 
 
 class TestMetricPatternMatching:
-
     def test_exact_match(self):
         assert _metric_matches_pattern("http_requests_total", "http_requests_total")
 
@@ -1096,7 +1165,6 @@ class TestMetricPatternMatching:
 
 
 class TestSignalResolution:
-
     def test_resolve_signal_exact_match(self, signal_store, sample_catalog):
         signal_store.add_mapping("request_rate", "http_requests_total", 0.95, source_type="bootstrap")
         resolved = signal_store.resolve_signal("request_rate", sample_catalog)
@@ -1198,7 +1266,6 @@ class TestSignalResolution:
 
 
 class TestArchetypeMetricSubstitution:
-
     def test_apply_metric_substitutions(self):
         from tacit.archetypes.engine import _apply_metric_substitutions
 
@@ -1261,7 +1328,6 @@ class TestArchetypeMetricSubstitution:
 
 
 class TestPromQLExtraction:
-
     def test_simple_metric(self):
         metrics = extract_metrics_from_promql('http_requests_total{job="api"}')
         assert "http_requests_total" in metrics
@@ -1281,7 +1347,7 @@ class TestPromQLExtraction:
         assert "histogram_quantile" not in metrics
 
     def test_multiple_metrics(self):
-        expr = 'sum(rate(http_requests_total{status=~"5.."}[5m])) / ' "sum(rate(http_requests_total[5m]))"
+        expr = 'sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))'
         metrics = extract_metrics_from_promql(expr)
         assert "http_requests_total" in metrics
 
@@ -1324,7 +1390,6 @@ class TestPromQLExtraction:
 
 
 class TestAggregationExtraction:
-
     def test_sum_rate(self):
         patterns = extract_aggregation_patterns("sum(rate(http_requests_total[5m])) by (status)")
         assert any(p["aggregation"] == "sum" and p.get("inner_function") == "rate" for p in patterns)
@@ -1342,7 +1407,6 @@ class TestAggregationExtraction:
 
 
 class TestDashboardParsing:
-
     def test_parse_simple_dashboard(self):
         dashboard_json = {
             "dashboard": {
@@ -1541,7 +1605,6 @@ class TestDashboardParsing:
 
 
 class TestSignalInference:
-
     def test_infer_signals_from_sso_metrics(self, signal_store_with_bootstrap):
         metrics = [
             "sso_auth_requests_total",
@@ -1572,7 +1635,6 @@ class TestSignalInference:
 
 
 class TestArchetypeGeneration:
-
     def test_generate_archetype_yaml(self, signal_store_with_bootstrap):
         extracted = {
             "dashboard_uid": "sso-health",
@@ -1615,7 +1677,6 @@ class TestArchetypeGeneration:
 
 
 class TestIngestedDashboards:
-
     def test_record_and_retrieve(self, signal_store):
         signal_store.record_ingested_dashboard(
             "dash-1",
@@ -2730,7 +2791,6 @@ class TestIngestedDashboards:
 
 
 class TestYAMLLoading:
-
     def test_load_bootstrap_signals(self, tmp_path):
         yaml_content = """
 signals:
@@ -3277,7 +3337,6 @@ class TestArchetypeYamlBraceEscaping:
 
 
 class TestSignalFlowCompileCompatibility:
-
     def test_raw_signalfx_query_is_not_recompiled_as_promql(self):
         from tacit.archetypes.engine import compile_archetype
         from tacit.models.schemas import ArchetypeMatch, Intent
@@ -3790,8 +3849,76 @@ async def test_dashboard_refresh_retires_removed_signal_knowledge(signal_store, 
     assert new.state.lifecycle_status.value == "active"
 
 
-class TestLearningTabRendering:
+async def test_pending_dashboard_refresh_retires_removed_support_without_promoting_replacement(
+    signal_store,
+    monkeypatch,
+):
+    from tacit import dashboard_ingest as di
 
+    batches = iter(
+        [
+            [
+                {
+                    "signal_type": "old_latency",
+                    "metric": "old_latency_seconds",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+            [
+                {
+                    "signal_type": "new_latency",
+                    "metric": "new_latency_seconds",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(
+        "tacit.dashboard_ingest.service.infer_signals_from_metrics",
+        lambda *args, **kwargs: next(batches),
+    )
+
+    def features(metric: str) -> DashboardFeatures:
+        return DashboardFeatures(
+            dashboard_uid="pending-refresh-dashboard",
+            dashboard_title="Pending refresh dashboard",
+            backend_name="grafana",
+            query_language="promql",
+            metrics_found=[metric],
+            panel_count=1,
+            panels=[{"title": "Latency", "metrics": [metric], "queries": [metric]}],
+        )
+
+    await di.ingest_dashboard_features(
+        features("old_latency_seconds"),
+        auto_approve=True,
+        store=signal_store,
+    )
+    pending = await di.ingest_dashboard_features(
+        features("new_latency_seconds"),
+        auto_approve=False,
+        store=signal_store,
+    )
+
+    candidates = KnowledgeRepository(signal_store._db_path).list_candidates(
+        "default",
+        kind="signal_mapping",
+        limit=None,
+    )
+    old = next(candidate for candidate in candidates if "old_latency_seconds" in candidate.payload_ref)
+    assert pending["status"] == "pending"
+    assert old.state.lifecycle_status.value == "stale"
+    assert all("new_latency_seconds" not in candidate.payload_ref for candidate in candidates)
+    assert signal_store.get_mappings_for_signal("old_latency", include_decayed=True) == []
+
+
+class TestLearningTabRendering:
     def _learning_load_section(self) -> str:
         html = (Path(__file__).parent.parent.parent / "tacit" / "static" / "index.html").read_text()
         return html.split("async function loadIngestedDashboards()", 1)[1].split("async function approveDashboard", 1)[

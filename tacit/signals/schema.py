@@ -43,6 +43,12 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     context_datasource_types TEXT NOT NULL DEFAULT '[]',
     context_environments    TEXT NOT NULL DEFAULT '[]',
     context_archetypes      TEXT NOT NULL DEFAULT '[]',
+    context_regions         TEXT NOT NULL DEFAULT '[]',
+    context_clusters        TEXT NOT NULL DEFAULT '[]',
+    context_namespaces      TEXT NOT NULL DEFAULT '[]',
+    context_versions        TEXT NOT NULL DEFAULT '[]',
+    valid_from              REAL,
+    valid_until             REAL,
 
     -- Provenance
     source_type         TEXT NOT NULL DEFAULT 'bootstrap',

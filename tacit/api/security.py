@@ -140,8 +140,19 @@ def require_knowledge_action(action: KnowledgeAction):
 
 def assert_knowledge_action(request: Request, action: KnowledgeAction) -> None:
     """Authorize every permission required by a semantic product action."""
+    runtime_settings = getattr(request.app.state, "settings", settings)
+    try:
+        enforce_knowledge_action(runtime_settings, action)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+def enforce_knowledge_action(runtime_settings: Any, action: KnowledgeAction) -> None:
+    """Framework-neutral semantic permission check shared by API and CLI."""
+    permissions = {value.strip() for value in str(runtime_settings.knowledge_permissions).split(",") if value.strip()}
     for permission in KNOWLEDGE_ACTION_PERMISSIONS[action]:
-        assert_knowledge_permission(request, permission)
+        if permission not in permissions:
+            raise PermissionError(f"Missing permission: {permission}")
 
 
 def assert_knowledge_permission(request: Request, permission: str) -> None:
