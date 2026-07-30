@@ -14,6 +14,7 @@ from importlib.resources import files
 from pathlib import Path
 
 import pytest
+import yaml
 from structlog.testing import capture_logs
 
 from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
@@ -40,7 +41,7 @@ from tacit.signals import (
     _effective_confidence,
     _metric_matches_pattern,
 )
-from tacit.signals.migrations import ensure_mapping_tenant_scope
+from tacit.signals.migrations import _DEFAULT_OWNER_MARKER, ensure_mapping_tenant_scope
 from tacit.signals.schema import GLOBAL_BOOTSTRAP_TENANT_ID
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -868,7 +869,10 @@ def test_wildcard_rejects_unconfirmed_default_owner_and_pinned_reopen_retargets_
         provenance_refs=["runbook:checkout"],
     )
     with store._conn() as conn:
-        conn.execute("DELETE FROM signal_tenant_migration_metadata WHERE key='default_owner_v1'")
+        conn.execute(
+            "DELETE FROM signal_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_MARKER,),
+        )
 
     with pytest.raises(RuntimeError, match="unconfirmed default-tenant ownership"):
         SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="*"))
@@ -2542,6 +2546,54 @@ class TestIngestedDashboards:
         quarantine_files = list((tmp_path / "quarantine").rglob("*.yaml"))
         assert len(quarantine_files) == 1
         assert "checkout_autoreg" in quarantine_files[0].read_text()
+
+    @pytest.mark.asyncio
+    async def test_generated_archetype_uses_resolved_wildcard_tenant(self, tmp_path):
+        from tacit import dashboard_ingest as di
+
+        runtime_settings = Settings(
+            _env_file=None,
+            knowledge_tenant_id="*",
+            learned_archetypes_tenant_id="default",
+            learned_archetypes_generation_enabled=True,
+            learned_archetypes_automatic_registration_enabled=True,
+            learned_archetypes_quarantine_path=str(tmp_path / "quarantine"),
+        )
+        signal_store = SignalStore(
+            db_path=tmp_path / "tenant-signals.db",
+            runtime_settings=runtime_settings,
+        )
+        features = DashboardFeatures(
+            dashboard_uid="tenant-a-checkout",
+            dashboard_title="Tenant A Checkout",
+            dashboard_tags=["service:checkout"],
+            backend_name="grafana_json",
+            query_language="promql",
+            metrics_found=["checkout_custom_latency_ms"],
+            panel_count=1,
+            panel_titles=["Checkout Latency"],
+            panels=[
+                {
+                    "title": "Checkout Latency",
+                    "queries": ["checkout_custom_latency_ms"],
+                    "metrics": ["checkout_custom_latency_ms"],
+                }
+            ],
+        )
+
+        result = await di.ingest_dashboard_features(
+            features,
+            auto_approve=False,
+            runtime_settings=runtime_settings,
+            store=signal_store,
+            tenant_id="tenant-a",
+        )
+
+        document = yaml.safe_load(result["archetype_yaml"])
+        assert document["archetypes"][0]["tenant_id"] == "tenant-a"
+        quarantine_files = list((tmp_path / "quarantine").rglob("*.yaml"))
+        assert len(quarantine_files) == 1
+        assert "tenant-a" in quarantine_files[0].relative_to(tmp_path / "quarantine").parts[0]
 
     @pytest.mark.asyncio
     async def test_pending_ingest_quarantines_without_activating_mappings(self, signal_store, monkeypatch, tmp_path):

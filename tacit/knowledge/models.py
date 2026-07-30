@@ -28,6 +28,7 @@ from tacit.knowledge.enums import (
     ReviewState,
     SourceFamily,
 )
+from tacit.knowledge.versioning import version_scope_applies
 
 
 def utc_now() -> datetime:
@@ -47,7 +48,8 @@ SCOPE_REFERENCE_PREFIXES = {
 
 def canonical_scope_reference(field_name: str, value: str) -> str:
     """Normalize one scope dimension to its typed reference form."""
-    normalized = re.sub(r"[^a-z0-9_.:+<>=~-]+", "-", value.strip().casefold()).strip("-")
+    invalid_characters = r"[^a-z0-9_.:+<>=~,!*-]+" if field_name == "version_constraints" else r"[^a-z0-9_.:+<>=~-]+"
+    normalized = re.sub(invalid_characters, "-", value.strip().casefold()).strip("-")
     if not normalized:
         return ""
     prefix = SCOPE_REFERENCE_PREFIXES[field_name]
@@ -113,14 +115,23 @@ class KnowledgeScope(BaseModel):
             "namespace_refs",
             "service_refs",
             "archetype_refs",
-            "version_constraints",
         ):
             required = set(getattr(self, field_name))
             actual = set(getattr(other, field_name))
             if required and not required.intersection(actual):
                 return False
+        if not version_scope_applies(self.version_constraints, other.version_constraints):
+            return False
         now = utc_now()
         return not ((self.valid_from and now < self.valid_from) or (self.valid_until and now >= self.valid_until))
+
+    def validity_overlaps(self, other: KnowledgeScope) -> bool:
+        """Return whether two validity windows share any instant."""
+        if self.valid_until and other.valid_from and self.valid_until <= other.valid_from:
+            return False
+        if other.valid_until and self.valid_from and other.valid_until <= self.valid_from:
+            return False
+        return True
 
 
 class KnowledgeProposition(BaseModel):

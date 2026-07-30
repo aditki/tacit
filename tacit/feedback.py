@@ -36,6 +36,7 @@ logger = structlog.get_logger()
 
 _DEFAULT_DB_PATH = Path("data/tacit_feedback.db")
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
+_DEFAULT_OWNER_MARKER = "default_owner_v1"
 
 
 def _db_path(runtime_settings: Settings | None = None) -> Path:
@@ -176,7 +177,8 @@ class FeedbackStore:
             return
         if self._table_exists(conn, "feedback_tenant_migration_metadata"):
             marker = conn.execute(
-                "SELECT 1 FROM feedback_tenant_migration_metadata WHERE key='default_owner_v1'"
+                "SELECT 1 FROM feedback_tenant_migration_metadata WHERE key=?",
+                (_DEFAULT_OWNER_MARKER,),
             ).fetchone()
             if marker is not None:
                 return
@@ -199,7 +201,8 @@ class FeedbackStore:
 
     def _reconcile_default_tenant_owner(self, conn: sqlite3.Connection) -> None:
         marker = conn.execute(
-            "SELECT value FROM feedback_tenant_migration_metadata WHERE key='default_owner_v1'"
+            "SELECT value FROM feedback_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_MARKER,),
         ).fetchone()
         if marker is not None:
             return
@@ -212,8 +215,8 @@ class FeedbackStore:
             )
         conn.execute(
             """INSERT INTO feedback_tenant_migration_metadata (key, value, updated_at)
-               VALUES ('default_owner_v1', ?, ?)""",
-            (configured_tenant, time.time()),
+               VALUES (?, ?, ?)""",
+            (_DEFAULT_OWNER_MARKER, configured_tenant, time.time()),
         )
 
     def _migrate_tenant_scope(self, conn: sqlite3.Connection) -> None:

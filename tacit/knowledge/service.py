@@ -1251,6 +1251,8 @@ class KnowledgeService:
         correction = self.repository.get_correction(correction_id, tenant_id)
         if correction is None:
             raise ValueError("knowledge correction not found")
+        if not approved and correction.applied_knowledge_ref:
+            raise KnowledgeRevisionConflictError("applied knowledge corrections are terminal and cannot be rejected")
         if not approved and correction.review_state == ReviewState.REJECTED:
             if correction.correction_type != CorrectionType.ENTITY_MAPPING:
                 return correction, None

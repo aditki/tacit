@@ -33,6 +33,7 @@ import structlog
 
 from tacit.config import Settings, settings
 from tacit.knowledge.usage import KnowledgeRevisionRef
+from tacit.knowledge.versioning import version_scope_applies
 from tacit.models.schemas import MetricEntry
 from tacit.signals.confidence import TRUST_THRESHOLD, stronger_review_state
 from tacit.signals.learning_index import (
@@ -2555,9 +2556,16 @@ def _governed_scope_matches(
         "context_datasource_types": normalized([context_datasource_type]),
     }
     for field, actual in scope_values.items():
+        if field == "context_versions":
+            continue
         required = normalized(mapping.get(field))
         if required and not required.intersection(actual):
             return False
+    if not version_scope_applies(
+        normalized(mapping.get("context_versions")),
+        scope_values["context_versions"],
+    ):
+        return False
     valid_from = mapping.get("valid_from")
     valid_until = mapping.get("valid_until")
     return not ((valid_from is not None and now < valid_from) or (valid_until is not None and now >= valid_until))

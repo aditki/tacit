@@ -23,6 +23,7 @@ from tacit.knowledge.models import (
 )
 from tacit.knowledge.normalization import stable_fingerprint
 from tacit.knowledge.repository import KnowledgeRepository
+from tacit.knowledge.versioning import version_scopes_overlap
 
 
 class CorroborationService:
@@ -164,6 +165,7 @@ class ConflictDetectionService:
             left_scope = KnowledgeScope.model_validate_json(current["scope_json"])
             right_scope = KnowledgeScope.model_validate_json(other["scope_json"])
             scope_compatible, scope_reason = self._scopes_overlap(left_scope, right_scope)
+            temporal_compatible = left_scope.validity_overlaps(right_scope)
             kind = (
                 ConflictKind.DIRECT_NEGATION
                 if directly_negated
@@ -181,7 +183,10 @@ class ConflictDetectionService:
                 right_proposition_ref=ordered[1],
                 resolution_status=resolution,
                 scope_analysis={"compatible": scope_compatible, "reason_code": scope_reason},
-                temporal_analysis={"compatible": True, "reason_code": None},
+                temporal_analysis={
+                    "compatible": temporal_compatible,
+                    "reason_code": None if temporal_compatible else "temporal_difference",
+                },
                 severity="high" if resolution == ConflictResolutionStatus.UNRESOLVED else "low",
                 resolution_reason="" if scope_compatible else scope_reason,
             )
@@ -254,14 +259,13 @@ class ConflictDetectionService:
             ("namespace_refs", "namespace_specific_difference"),
             ("service_refs", "service_specific_difference"),
             ("archetype_refs", "archetype_specific_difference"),
-            ("version_constraints", "version_specific_difference"),
         ):
             left_values = set(getattr(left, field_name))
             right_values = set(getattr(right, field_name))
             if left_values and right_values and left_values.isdisjoint(right_values):
                 return False, reason
-        if left.valid_until and right.valid_from and left.valid_until <= right.valid_from:
-            return False, "temporal_difference"
-        if right.valid_until and left.valid_from and right.valid_until <= left.valid_from:
+        if not version_scopes_overlap(left.version_constraints, right.version_constraints):
+            return False, "version_specific_difference"
+        if not left.validity_overlaps(right):
             return False, "temporal_difference"
         return True, "scopes_overlap"

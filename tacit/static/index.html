@@ -438,8 +438,7 @@
       return tenant;
     }
 
-    function knowledgeHeaders(extra = {}) {
-      const tenant = selectedTenant();
+    function knowledgeHeaders(extra = {}, tenant = selectedTenant()) {
       return tenant ? { ...extra, 'X-Tacit-Tenant': tenant } : extra;
     }
 
@@ -512,10 +511,10 @@
       }
     }
 
-    async function streamChart(payload, onStage) {
+    async function streamChart(payload, onStage, tenant) {
       const resp = await fetch(`${BASE}/api/v1/chart/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: knowledgeHeaders({ 'Content-Type': 'application/json' }, tenant),
         body: JSON.stringify(payload),
       });
       if (!resp.ok || !resp.body) {
@@ -581,14 +580,14 @@
       try {
         let data;
         try {
-          data = await streamChart(payload, onStage);
+          data = await streamChart(payload, onStage, tenant);
         } catch (streamErr) {
           if (streamErr instanceof PipelineStreamError) throw streamErr;
           // Fall back to the non-streaming endpoint (older servers / proxies)
           console.warn('SSE stream failed, falling back to /api/v1/chart:', streamErr);
           const resp = await fetch(`${BASE}/api/v1/chart`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: knowledgeHeaders({ 'Content-Type': 'application/json' }, tenant),
             body: JSON.stringify(payload),
           });
           if (!resp.ok) {
@@ -602,7 +601,7 @@
         if (data.investigation_id) {
           const revisionQuery = data.investigation_revision == null ? '' : `?revision=${data.investigation_revision}`;
           const contractResp = await fetch(`${BASE}/api/v1/investigations/${encodeURIComponent(data.investigation_id)}/contract${revisionQuery}`, {
-            headers: knowledgeHeaders(),
+            headers: knowledgeHeaders({}, tenant),
           });
           if (contractResp.ok) contract = await contractResp.json();
         }

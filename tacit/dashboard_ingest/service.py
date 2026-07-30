@@ -742,7 +742,7 @@ async def ingest_dashboard_features(
         archetype_yaml = generate_archetype_yaml(
             extracted,
             signals,
-            tenant_id=getattr(active_settings, "learned_archetypes_tenant_id", "default"),
+            tenant_id=effective_tenant,
             generation_version=getattr(
                 active_settings,
                 "learned_archetypes_generation_version",

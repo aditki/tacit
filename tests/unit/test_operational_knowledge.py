@@ -64,6 +64,7 @@ from tacit.knowledge.usage import (
     KnowledgeUsageEffect,
     KnowledgeUsageStage,
 )
+from tacit.knowledge.versioning import version_scopes_overlap
 from tacit.models.schemas import CulpritCandidate, CulpritRanking, EvidenceObservation, EvidenceObservationOutcome
 from tacit.operational_learning_benchmark import (
     load_operational_learning_corpus,
@@ -552,6 +553,50 @@ def test_scope_matching_requires_version_constraints(tmp_path: Path):
     assert usage_with_version[0].disposition.value == "considered_not_applied"
 
 
+def test_scope_matching_evaluates_version_ranges_against_concrete_releases(tmp_path: Path):
+    service = _service(tmp_path)
+    _promoted_dependency(service, version_constraints=["version:>=1.2"])
+
+    _, matching_usage = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+            version_constraints=["version:v2.4.1"],
+        )
+    )
+    _, rejected_usage = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+            version_constraints=["version:v1.1.9"],
+        )
+    )
+
+    assert matching_usage[0].disposition == KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED
+    assert rejected_usage[0].disposition == KnowledgeUsageDisposition.REJECTED_BY_SCOPE
+
+
+@pytest.mark.parametrize(
+    ("selector", "release", "expected"),
+    [
+        (">=1.2", "v2.4.1", True),
+        ("<2", "v2.4.1", False),
+        ("==2.*", "v2.4.1", True),
+        ("!=2.*", "v2.4.1", False),
+    ],
+)
+def test_scope_version_selector_semantics(selector: str, release: str, expected: bool):
+    governed = KnowledgeScope(version_constraints=[selector])
+    investigation = KnowledgeScope(version_constraints=[release])
+
+    assert governed.applies_to(investigation) is expected
+
+
+def test_version_scope_overlap_detects_disjoint_ranges():
+    assert version_scopes_overlap(["version:>=2"], ["version:<2"]) is False
+    assert version_scopes_overlap(["version:>=1.2,<3"], ["version:==2.*"]) is True
+
+
 def test_proposition_keys_canonicalize_scope_list_order(tmp_path: Path):
     service = _service(tmp_path)
     first = service.create_candidate(
@@ -973,6 +1018,66 @@ def test_conflict_scope_analysis_includes_archetypes(tmp_path: Path):
     assert len(conflicts) == 1
     assert conflicts[0].resolution_status == ConflictResolutionStatus.RESOLVED_BY_SCOPE
     assert conflicts[0].scope_analysis["reason_code"] == "archetype_specific_difference"
+
+
+def test_conflict_temporal_analysis_reports_disjoint_validity_windows(tmp_path: Path):
+    service = _service(tmp_path)
+    for team in ("payments", "platform"):
+        service.register_entity(
+            Entity(
+                id=f"entity:team:{team}",
+                kind=EntityKind.TEAM,
+                canonical_name=team,
+                scope=KnowledgeScope(),
+                provenance_refs=["catalog:team"],
+            )
+        )
+    boundary = datetime(2026, 7, 1, tzinfo=UTC)
+    first = service.create_candidate(
+        kind=KnowledgeKind.OWNERSHIP,
+        payload_ref="historical-owner",
+        typed_payload={},
+        proposition={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "owned_by",
+            "object_ref": "entity:team:payments",
+        },
+        scope=KnowledgeScope(
+            service_refs=["entity:service:checkout"],
+            valid_until=boundary,
+        ),
+        provenance_refs=["catalog:historical"],
+    )
+    second = service.create_candidate(
+        kind=KnowledgeKind.OWNERSHIP,
+        payload_ref="current-owner",
+        typed_payload={},
+        proposition={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "owned_by",
+            "object_ref": "entity:team:platform",
+        },
+        scope=KnowledgeScope(
+            service_refs=["entity:service:checkout"],
+            valid_from=boundary,
+        ),
+        provenance_refs=["catalog:current"],
+    )
+    service.review_candidate(first.id, approved=True, reviewer="operator")
+    service.review_candidate(second.id, approved=True, reviewer="operator")
+
+    conflicts = service.conflicts.analyze("default", first.proposition.proposition_key)
+
+    assert len(conflicts) == 1
+    assert conflicts[0].resolution_status == ConflictResolutionStatus.RESOLVED_BY_SCOPE
+    assert conflicts[0].scope_analysis == {
+        "compatible": False,
+        "reason_code": "temporal_difference",
+    }
+    assert conflicts[0].temporal_analysis == {
+        "compatible": False,
+        "reason_code": "temporal_difference",
+    }
 
 
 def test_canonical_entity_names_use_resolver_normalization(tmp_path: Path):
@@ -2330,6 +2435,47 @@ def test_targeted_correction_retry_returns_its_committed_application(tmp_path: P
     assert len(service.repository.list_revisions(original.knowledge_id)) == 2
 
 
+def test_applied_knowledge_correction_cannot_later_be_rejected(tmp_path: Path):
+    service = _service(tmp_path)
+    _, original = _promoted_dependency(service)
+    correction, candidate = service.create_correction(
+        investigation_id="inv-terminal-correction",
+        investigation_revision=1,
+        correction_type=CorrectionType.KNOWLEDGE_INCORRECT,
+        target_ref=original.knowledge_id,
+        target_revision=original.revision,
+        proposed={
+            "subject_ref": "concept:artifact-quality",
+            "predicate": "useful_for_investigation",
+            "concept_ref": "concept:incorrect-knowledge",
+        },
+        scope=KnowledgeScope(),
+        explanation="Withdraw the reviewed revision.",
+        created_by="operator",
+    )
+    applied_correction, applied = service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="operator",
+    )
+    assert applied is not None
+
+    with pytest.raises(KnowledgeRevisionConflictError, match="terminal and cannot be rejected"):
+        service.review_correction(
+            correction.id,
+            approved=False,
+            reviewer="second-operator",
+        )
+
+    stored_correction = service.repository.get_correction(correction.id)
+    stored_candidate = service.repository.get_candidate(candidate.id)
+    assert stored_correction == applied_correction
+    assert stored_correction.review_state == ReviewState.APPROVED
+    assert stored_candidate is not None
+    assert stored_candidate.state.review_state == ReviewState.APPROVED
+    assert service.repository.get_revision(original.knowledge_id).state.lifecycle_status == LifecycleStatus.WITHDRAWN
+
+
 def test_correction_supersession_rechecks_target_under_write_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2558,7 +2704,7 @@ def test_governed_signal_projection_preserves_complete_scope_and_validity(tmp_pa
         namespace_refs=["namespace:checkout"],
         service_refs=["entity:service:checkout"],
         archetype_refs=["archetype:resource-saturation"],
-        version_constraints=["version:v2"],
+        version_constraints=["version:>=2"],
         valid_from=now - timedelta(minutes=5),
         valid_until=now + timedelta(minutes=5),
     )
@@ -2585,15 +2731,16 @@ def test_governed_signal_projection_preserves_complete_scope_and_validity(tmp_pa
     from tacit.signals.store import SignalStore
 
     store = SignalStore(service.repository._db_path)
+    matching_scope = scope.model_copy(update={"version_constraints": ["version:v2.4.1"]})
     matches = store.get_mappings_for_signal(
         "request_latency",
         context_service="checkout",
         context_datasource_type="prometheus",
         context_archetype="resource-saturation",
         context_environment="production",
-        knowledge_scope=scope,
+        knowledge_scope=matching_scope,
     )
-    wrong_region = scope.model_copy(update={"region_refs": ["region:us-west-2"]})
+    wrong_region = matching_scope.model_copy(update={"region_refs": ["region:us-west-2"]})
     misses = store.get_mappings_for_signal(
         "request_latency",
         context_service="checkout",
@@ -2602,14 +2749,24 @@ def test_governed_signal_projection_preserves_complete_scope_and_validity(tmp_pa
         context_environment="production",
         knowledge_scope=wrong_region,
     )
+    wrong_version = matching_scope.model_copy(update={"version_constraints": ["version:v1.9.9"]})
+    version_misses = store.get_mappings_for_signal(
+        "request_latency",
+        context_service="checkout",
+        context_datasource_type="prometheus",
+        context_archetype="resource-saturation",
+        context_environment="production",
+        knowledge_scope=wrong_version,
+    )
 
     assert [mapping["governance_ref"] for mapping in matches] == [revision.knowledge_id]
     assert misses == []
+    assert version_misses == []
     projection = matches[0]
     assert projection["context_regions"] == ["us-east-1"]
     assert projection["context_clusters"] == ["prod-a"]
     assert projection["context_namespaces"] == ["checkout"]
-    assert projection["context_versions"] == ["v2"]
+    assert projection["context_versions"] == [">=2"]
     assert projection["valid_from"] == pytest.approx(scope.valid_from.timestamp())
     assert projection["valid_until"] == pytest.approx(scope.valid_until.timestamp())
 
@@ -4947,6 +5104,8 @@ def test_knowledge_ui_sends_selected_tenant_header():
     assert "'X-Tacit-Tenant': tenant" in html
     assert "knowledgeHeaders({ 'Content-Type': 'application/json' })" in html
     assert "if (tenant) payload.tenant_id = tenant" in html
+    assert "data = await streamChart(payload, onStage, tenant)" in html
+    assert html.count("headers: knowledgeHeaders({ 'Content-Type': 'application/json' }, tenant)") == 2
     assert "headers: knowledgeHeaders()," in html
     assert "fetch(`${BASE}/api/v1/investigations${qs}`, { headers: knowledgeHeaders() })" in html
     assert "fetch(`${BASE}/api/v1/investigations/${id}`, { headers: knowledgeHeaders() })" in html
