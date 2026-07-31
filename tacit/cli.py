@@ -524,7 +524,7 @@ def _cli_store_settings(stores: Any) -> Any:
 
 
 def _require_cli_knowledge_action(action: Any, runtime_settings: Any) -> None:
-    from tacit.api.security import enforce_knowledge_action
+    from tacit.knowledge.authorization import enforce_knowledge_action
 
     try:
         enforce_knowledge_action(runtime_settings, action)
@@ -1250,7 +1250,7 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool, tenant
 
     import asyncio
 
-    from tacit.api.security import KnowledgeAction
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
     runtime_settings = _cli_store_settings(stores)
@@ -1588,7 +1588,7 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
     import asyncio
 
     stores = _cli_runtime_stores()
-    from tacit.api.security import KnowledgeAction
+    from tacit.knowledge.authorization import KnowledgeAction
 
     runtime_settings = _cli_store_settings(stores)
     tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
@@ -1663,7 +1663,7 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int, ten
 
     import asyncio
 
-    from tacit.api.security import KnowledgeAction
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
     runtime_settings = _cli_store_settings(stores)
@@ -1728,8 +1728,8 @@ def learn_approve(dashboard_uid: str, backend: str, tenant: str | None):
     _header("Approve Learned Dashboard")
     _load_env()
 
-    from tacit.api.security import KnowledgeAction
     from tacit.dashboard_ingest import approve_ingested_dashboard_record
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
     runtime_settings = _cli_store_settings(stores)
@@ -1764,8 +1764,8 @@ def learn_reject(dashboard_uid: str, backend: str, tenant: str | None):
     _header("Reject Learned Dashboard")
     _load_env()
 
-    from tacit.api.security import KnowledgeAction
     from tacit.dashboard_ingest import reject_ingested_dashboard_record
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
     runtime_settings = _cli_store_settings(stores)
@@ -1802,7 +1802,7 @@ def learn_ignore(dashboard_uid: str, backend: str, tenant: str | None):
     _header("Ignore Learned Dashboard")
     _load_env()
 
-    from tacit.api.security import KnowledgeAction
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
     runtime_settings = _cli_store_settings(stores)
@@ -1965,8 +1965,8 @@ def export_report(anonymous: bool, output: Path | None, validate_bundle: bool, t
     _header("Export Assessment Report")
     _load_env()
 
-    from tacit.api.security import KnowledgeAction
     from tacit.export_report import export_assessment_report
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
     _require_cli_knowledge_action(KnowledgeAction.EXPORT, stores.settings)
@@ -2020,7 +2020,7 @@ def _knowledge_tenant(tenant: str | None, *, runtime_settings: Any | None = None
 
 def _cli_knowledge_read_context(tenant: str | None) -> tuple[Any, str]:
     """Resolve one authorized, settings-backed store graph for a CLI read."""
-    from tacit.api.security import KnowledgeAction
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
     _require_cli_knowledge_action(KnowledgeAction.READ, stores.settings)
@@ -2145,7 +2145,7 @@ def knowledge_review(
 ):
     """Review a candidate and evaluate it for promotion."""
     _load_env()
-    from tacit.api.security import KnowledgeAction
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
     runtime_settings = _cli_store_settings(stores)
@@ -2461,8 +2461,8 @@ def history_compare(investigation_id: str, left: int, right: int, tenant: str | 
 def history_export(investigation_id: str, revision: int | None, output: Path | None, tenant: str | None):
     """Export one investigation as a portable Assessment Bundle."""
     _load_env()
-    from tacit.api.security import KnowledgeAction
     from tacit.investigation_bundle import export_investigation_bundle
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
     selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)

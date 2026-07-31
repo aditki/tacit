@@ -197,7 +197,7 @@ def persist_inferred_signal_review(
     governed_pairs: set[tuple[str, str]] | None = None,
 ) -> bool:
     """Persist one inferred signal using the same gate for all approval paths."""
-    from tacit.api.security import KnowledgeAction, enforce_knowledge_action
+    from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 
     active_settings = runtime_settings or settings
     enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
@@ -528,7 +528,7 @@ def approve_ingested_dashboard_record(
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Approve a pending ingested dashboard and activate learned artifacts."""
-    from tacit.api.security import KnowledgeAction, enforce_knowledge_action
+    from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 
     active_settings = runtime_settings or settings
     enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
@@ -648,7 +648,7 @@ def reject_ingested_dashboard_record(
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Reject a pending ingested dashboard and persist heuristic negatives."""
-    from tacit.api.security import KnowledgeAction, enforce_knowledge_action
+    from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 
     active_settings = runtime_settings or settings
     enforce_knowledge_action(active_settings, KnowledgeAction.REJECT)
@@ -718,7 +718,7 @@ async def ingest_dashboard_features(
     """Infer, persist, and optionally approve already-extracted dashboard features."""
     active_settings = runtime_settings or settings
     if auto_approve:
-        from tacit.api.security import KnowledgeAction, enforce_knowledge_action
+        from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 
         enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)

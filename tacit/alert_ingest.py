@@ -177,7 +177,7 @@ async def ingest_alert_features(
     """Infer, persist, and optionally approve already-extracted alert features."""
     active_settings = runtime_settings or settings
     if auto_approve and not dry_run:
-        from tacit.api.security import KnowledgeAction, enforce_knowledge_action
+        from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 
         enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)

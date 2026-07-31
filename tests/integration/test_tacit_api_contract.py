@@ -19,18 +19,35 @@ if sys.version_info < (3, 12):  # pragma: no cover - env guard  # noqa: UP036
 
 from fastapi.testclient import TestClient
 
+import tacit.config as config_mod
 import tacit.dashboard_ingest as di
 from tacit.api.app import create_app
 from tacit.config import Settings
 
 
 @pytest.fixture
-def runtime_app(tmp_path):
+def runtime_app(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_mod, "_load_yaml_config", lambda: {})
     return create_app(
         runtime_settings=Settings(
+            _env_file=None,
+            _env_prefix="__TACIT_HERMETIC__",
             signals_db_path=str(tmp_path / "api_signals.db"),
             history_db_path=str(tmp_path / "api_history.db"),
             feedback_db_path=str(tmp_path / "api_feedback.db"),
+            api_auth_enabled=False,
+            api_auth_key="",
+            knowledge_tenant_id="default",
+            knowledge_tenant_api_keys={},
+            knowledge_permissions=(
+                "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,"
+                "knowledge.correct,knowledge.apply,knowledge.export,knowledge.override"
+            ),
+            learned_archetypes_generation_enabled=False,
+            learned_archetypes_automatic_registration_enabled=False,
+            learned_archetypes_normal_retrieval_enabled=False,
+            learning_auto_register_archetype=False,
+            learned_archetypes_quarantine_path=str(tmp_path / "generated_archetypes"),
         )
     )
 

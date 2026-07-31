@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from typing import Any
 
 from tacit.knowledge.enums import (
@@ -144,6 +146,35 @@ def _artifact_lineage(
     return group, LineageKind.UNKNOWN
 
 
+def _mapping_scope_values(value: Any) -> list[str]:
+    """Deserialize legacy resolver scope values without iterating JSON strings."""
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = [value]
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        value = [value]
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _mapping_scope_datetime(value: Any) -> datetime | None:
+    """Convert persisted resolver epochs or ISO timestamps into UTC datetimes."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), UTC)
+    normalized = str(value).strip()
+    try:
+        return datetime.fromtimestamp(float(normalized), UTC)
+    except ValueError:
+        return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+
+
 def migrate_signal_mapping(
     row: dict[str, Any],
     *,
@@ -174,16 +205,24 @@ def migrate_signal_mapping(
     ]
     scope = KnowledgeScope(
         tenant_id=tenant_id,
-        service_refs=[normalize_service_ref(str(value)) for value in (row.get("context_services") or [])],
-        environment_refs=[str(value) for value in (row.get("context_environments") or [])],
-        archetype_refs=[str(value) for value in (row.get("context_archetypes") or [])],
+        service_refs=[normalize_service_ref(value) for value in _mapping_scope_values(row.get("context_services"))],
+        environment_refs=_mapping_scope_values(row.get("context_environments")),
+        region_refs=_mapping_scope_values(row.get("context_regions")),
+        cluster_refs=_mapping_scope_values(row.get("context_clusters")),
+        namespace_refs=_mapping_scope_values(row.get("context_namespaces")),
+        archetype_refs=_mapping_scope_values(row.get("context_archetypes")),
+        version_constraints=_mapping_scope_values(row.get("context_versions")),
+        valid_from=_mapping_scope_datetime(row.get("valid_from")),
+        valid_until=_mapping_scope_datetime(row.get("valid_until")),
     )
     candidate_digest = stable_fingerprint(
         {
             "tenant_id": tenant_id,
             "record_ref": record_ref,
             "scope": canonical_scope_payload(scope),
-            "context_datasource_types": sorted({str(value) for value in (row.get("context_datasource_types") or [])}),
+            "valid_from": scope.valid_from.isoformat() if scope.valid_from else "",
+            "valid_until": scope.valid_until.isoformat() if scope.valid_until else "",
+            "context_datasource_types": sorted(set(_mapping_scope_values(row.get("context_datasource_types")))),
         }
     ).split(":", 1)[1][:20]
     candidate_id = f"kc_signal_{candidate_digest}"
@@ -236,9 +275,14 @@ def _apply_imported_review_state(
         or candidate.state.review_state != ReviewState.CANDIDATE
     ):
         return candidate
+    review_state = ReviewState(raw_review_state)
+    service._enforce_candidate_review_action(
+        approved=review_state != ReviewState.REJECTED,
+        trust=review_state == ReviewState.TRUSTED,
+    )
     updated = candidate.model_copy(
         update={
-            "state": candidate.state.model_copy(update={"review_state": ReviewState(raw_review_state)}),
+            "state": candidate.state.model_copy(update={"review_state": review_state}),
             "updated_at": utc_now(),
         }
     )

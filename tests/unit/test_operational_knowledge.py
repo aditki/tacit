@@ -3086,6 +3086,282 @@ def test_knowledge_service_enforces_its_runtime_tenant_boundary(tmp_path: Path):
         )
 
 
+@pytest.mark.parametrize(
+    ("approved", "trust", "can_trust", "permissions", "missing_permission"),
+    [
+        (True, False, False, "knowledge.read,knowledge.reject", "knowledge.review"),
+        (False, False, False, "knowledge.read,knowledge.review", "knowledge.reject"),
+        (True, True, True, "knowledge.read,knowledge.review", "knowledge.trust"),
+    ],
+)
+def test_candidate_review_transition_enforces_runtime_permissions(
+    tmp_path: Path,
+    approved: bool,
+    trust: bool,
+    can_trust: bool,
+    permissions: str,
+    missing_permission: str,
+):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref=f"permission:{missing_permission}",
+        family=SourceFamily.RUNBOOK,
+        lineage_group=f"permission:{missing_permission}",
+    )
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions=permissions,
+    )
+
+    with pytest.raises(PermissionError, match=f"Missing permission: {missing_permission}"):
+        service.review_candidate(
+            candidate.id,
+            approved=approved,
+            reviewer="embedding",
+            trust=trust,
+            can_trust=can_trust,
+        )
+
+    persisted = service.repository.get_candidate(candidate.id)
+    assert persisted is not None
+    assert persisted.state.review_state == ReviewState.CANDIDATE
+
+
+def test_unauthorized_direct_rejection_cannot_withdraw_active_knowledge(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate, revision = _promoted_dependency(service)
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read,knowledge.review,knowledge.trust",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.reject"):
+        service.review_candidate(
+            candidate.id,
+            approved=False,
+            reviewer="embedding",
+        )
+
+    persisted_candidate = service.repository.get_candidate(candidate.id)
+    persisted_revision = service.repository.get_revision(revision.knowledge_id)
+    assert persisted_candidate is not None
+    assert persisted_candidate.state.review_state == ReviewState.APPROVED
+    assert persisted_revision is not None
+    assert persisted_revision.state.lifecycle_status == LifecycleStatus.ACTIVE
+
+
+def test_imported_review_state_enforces_runtime_permissions(tmp_path: Path):
+    service = _service(tmp_path)
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.review"):
+        migrate_signal_mapping(
+            {
+                "id": "unauthorized-imported-trust",
+                "signal_type": "request_latency",
+                "metric_pattern": "unauthorized_latency_seconds",
+                "source_type": "dashboard_ingest",
+                "source_refs": ["dashboard:unauthorized-import"],
+                "review_state": "trusted",
+            },
+            service=service,
+        )
+
+    candidates = service.repository.list_candidates()
+    assert len(candidates) == 1
+    assert candidates[0].state.review_state == ReviewState.CANDIDATE
+    assert service.repository.list_current_revisions() == []
+
+
+def test_knowledge_usage_batch_rolls_back_usage_and_events_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    _, dependency_revision = _promoted_dependency(service)
+    mapping_candidate = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="signal:usage-batch",
+        typed_payload={"metric_pattern": "checkout_latency_seconds"},
+        proposition={
+            "subject_ref": "concept:request_latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:checkout_latency_seconds",
+            "concept_ref": "signal:request_latency",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["operator:usage-batch"],
+    )
+    service.review_candidate(mapping_candidate.id, approved=True, reviewer="operator")
+    _, mapping_revision = service.evaluate_candidate(mapping_candidate.id, live_verified=True)
+    assert mapping_revision is not None
+    usage = [
+        KnowledgeUsage(
+            knowledge_ref=dependency_revision.knowledge_id,
+            knowledge_revision=dependency_revision.revision,
+            disposition=KnowledgeUsageDisposition.APPLIED,
+            used_for=["ranking"],
+        ),
+        KnowledgeUsage(
+            knowledge_ref=mapping_revision.knowledge_id,
+            knowledge_revision=mapping_revision.revision,
+            disposition=KnowledgeUsageDisposition.APPLIED,
+            used_for=["query_compilation"],
+        ),
+    ]
+    save_usage = service.repository.save_usage
+    calls = 0
+
+    def fail_second_save(item: KnowledgeUsage):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("usage write interrupted")
+        return save_usage(item)
+
+    monkeypatch.setattr(service.repository, "save_usage", fail_second_save)
+    with pytest.raises(RuntimeError, match="usage write interrupted"):
+        service.persist_usage(
+            usage,
+            investigation_id="inv-usage-batch",
+            investigation_revision=3,
+        )
+
+    assert service.repository.list_usage(investigation_id="inv-usage-batch") == []
+    assert [
+        event
+        for event in service.repository.list_events()
+        if event["payload"].get("investigation_id") == "inv-usage-batch"
+    ] == []
+
+    monkeypatch.setattr(service.repository, "save_usage", save_usage)
+    persisted = service.persist_usage(
+        usage,
+        investigation_id="inv-usage-batch",
+        investigation_revision=3,
+    )
+    events = [
+        event
+        for event in service.repository.list_events()
+        if event["payload"].get("investigation_id") == "inv-usage-batch"
+    ]
+    assert len(persisted) == 2
+    assert len(service.repository.list_usage(investigation_id="inv-usage-batch")) == 2
+    assert len(events) == 2
+
+
+def test_migrated_signal_mapping_preserves_complete_scope_and_validity(tmp_path: Path):
+    service = _service(tmp_path)
+    now = datetime.now(UTC)
+    valid_from = now - timedelta(minutes=5)
+    valid_until = now + timedelta(minutes=5)
+    candidate_id = migrate_signal_mapping(
+        {
+            "id": "fully-scoped-migrated-latency",
+            "signal_type": "request_latency",
+            "metric_pattern": "migrated_latency_seconds",
+            "confidence": 0.91,
+            "source_type": "dashboard_ingest",
+            "source_refs": ["dashboard:fully-scoped"],
+            "context_services": ["checkout"],
+            "context_datasource_types": ["prometheus"],
+            "context_environments": ["production"],
+            "context_regions": ["us-east-1"],
+            "context_clusters": ["prod-a"],
+            "context_namespaces": ["checkout"],
+            "context_archetypes": ["resource-saturation"],
+            "context_versions": [">=2"],
+            "valid_from": valid_from.timestamp(),
+            "valid_until": valid_until.isoformat(),
+        },
+        service=service,
+    )
+    candidate = service.repository.get_candidate(candidate_id)
+    assert candidate is not None
+    assert candidate.scope.service_refs == ["entity:service:checkout"]
+    assert candidate.scope.environment_refs == ["environment:production"]
+    assert candidate.scope.region_refs == ["region:us-east-1"]
+    assert candidate.scope.cluster_refs == ["cluster:prod-a"]
+    assert candidate.scope.namespace_refs == ["namespace:checkout"]
+    assert candidate.scope.archetype_refs == ["archetype:resource-saturation"]
+    assert candidate.scope.version_constraints == ["version:>=2"]
+    assert candidate.scope.valid_from == valid_from
+    assert candidate.scope.valid_until == valid_until
+
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, live_verified=True)
+    assert revision is not None
+
+    from tacit.signals.store import SignalStore
+
+    store = SignalStore(service.repository._db_path)
+    matching_scope = candidate.scope.model_copy(
+        update={"version_constraints": ["version:v2.4.1"]},
+    )
+    matches = store.get_mappings_for_signal(
+        "request_latency",
+        context_service="checkout",
+        context_datasource_type="prometheus",
+        context_archetype="resource-saturation",
+        context_environment="production",
+        knowledge_scope=matching_scope,
+    )
+    wrong_region = matching_scope.model_copy(update={"region_refs": ["region:us-west-2"]})
+    misses = store.get_mappings_for_signal(
+        "request_latency",
+        context_service="checkout",
+        context_datasource_type="prometheus",
+        context_archetype="resource-saturation",
+        context_environment="production",
+        knowledge_scope=wrong_region,
+    )
+
+    assert [mapping["governance_ref"] for mapping in matches] == [revision.knowledge_id]
+    assert misses == []
+    assert matches[0]["context_regions"] == ["us-east-1"]
+    assert matches[0]["context_clusters"] == ["prod-a"]
+    assert matches[0]["context_namespaces"] == ["checkout"]
+    assert matches[0]["context_versions"] == [">=2"]
+    assert matches[0]["valid_from"] == pytest.approx(valid_from.timestamp())
+    assert matches[0]["valid_until"] == pytest.approx(valid_until.timestamp())
+
+
+def test_migrated_signal_mapping_validity_changes_have_distinct_candidate_identity(
+    tmp_path: Path,
+):
+    service = _service(tmp_path)
+    now = datetime.now(UTC)
+    row = {
+        "id": "mapping-validity-identity",
+        "signal_type": "request_latency",
+        "metric_pattern": "validity_scoped_latency_seconds",
+        "source_type": "dashboard_ingest",
+        "source_refs": ["dashboard:validity-identity"],
+        "valid_from": now.timestamp(),
+        "valid_until": (now + timedelta(hours=1)).timestamp(),
+    }
+
+    first_id = migrate_signal_mapping(row, service=service)
+    second_id = migrate_signal_mapping(
+        {
+            **row,
+            "valid_until": (now + timedelta(hours=2)).timestamp(),
+        },
+        service=service,
+    )
+
+    assert second_id != first_id
+    first = service.repository.get_candidate(first_id)
+    second = service.repository.get_candidate(second_id)
+    assert first is not None
+    assert second is not None
+    assert first.scope.valid_until != second.scope.valid_until
+
+
 def test_promoted_signal_mapping_preserves_exact_backend_metric_pattern(tmp_path: Path):
     service = _service(tmp_path)
     exact_pattern = "AWS/ApplicationELB/TargetResponseTime"

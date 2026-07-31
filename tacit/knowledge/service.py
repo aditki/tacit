@@ -9,6 +9,7 @@ from typing import Any
 import structlog
 
 from tacit.config import settings
+from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 from tacit.knowledge.corroboration import ConflictDetectionService, CorroborationService
 from tacit.knowledge.entities import EntityResolutionService
 from tacit.knowledge.enums import (
@@ -340,6 +341,10 @@ class KnowledgeService:
         )
         return candidate
 
+    def _enforce_candidate_review_action(self, *, approved: bool, trust: bool = False) -> None:
+        action = KnowledgeAction.TRUST if trust else KnowledgeAction.APPROVE if approved else KnowledgeAction.REJECT
+        enforce_knowledge_action(self._runtime_settings, action)
+
     def review_candidate(
         self,
         candidate_id: str,
@@ -351,6 +356,7 @@ class KnowledgeService:
         can_trust: bool = False,
         _correction_id: str | None = None,
     ) -> KnowledgeCandidate:
+        self._enforce_candidate_review_action(approved=approved, trust=trust)
         tenant_id = self._resolve_tenant(tenant_id)
         candidate = self._require_candidate(candidate_id, tenant_id)
         self._require_candidate_workflow(candidate_id, tenant_id, _correction_id)
@@ -1035,40 +1041,40 @@ class KnowledgeService:
         investigation_id: str,
         investigation_revision: int,
     ) -> list[KnowledgeUsage]:
-        usage = self._validated_usage(usage)
         persisted = []
-        for item in usage:
-            updated = item.model_copy(
-                update={
-                    "investigation_id": investigation_id,
-                    "investigation_revision": investigation_revision,
-                }
-            )
-            persisted.append(self.repository.save_usage(updated))
-            event = (
-                "knowledge_applied"
-                if updated.disposition == KnowledgeUsageDisposition.APPLIED
-                else (
-                    "knowledge_rejected_by_scope"
-                    if updated.disposition == KnowledgeUsageDisposition.REJECTED_BY_SCOPE
+        with self.repository.transaction():
+            for item in self._validated_usage(usage):
+                updated = item.model_copy(
+                    update={
+                        "investigation_id": investigation_id,
+                        "investigation_revision": investigation_revision,
+                    }
+                )
+                persisted.append(self.repository.save_usage(updated))
+                event = (
+                    "knowledge_applied"
+                    if updated.disposition == KnowledgeUsageDisposition.APPLIED
                     else (
-                        "knowledge_contradicted_live"
-                        if updated.disposition == KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION
-                        else "knowledge_considered"
+                        "knowledge_rejected_by_scope"
+                        if updated.disposition == KnowledgeUsageDisposition.REJECTED_BY_SCOPE
+                        else (
+                            "knowledge_contradicted_live"
+                            if updated.disposition == KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION
+                            else "knowledge_considered"
+                        )
                     )
                 )
-            )
-            self.repository.append_event(
-                event,
-                tenant_id=updated.tenant_id,
-                subject_ref=updated.knowledge_ref,
-                dimensions={"reason_code": updated.disposition.value},
-                payload={
-                    "investigation_id": investigation_id,
-                    "investigation_revision": investigation_revision,
-                    "knowledge_revision": updated.knowledge_revision,
-                },
-            )
+                self.repository.append_event(
+                    event,
+                    tenant_id=updated.tenant_id,
+                    subject_ref=updated.knowledge_ref,
+                    dimensions={"reason_code": updated.disposition.value},
+                    payload={
+                        "investigation_id": investigation_id,
+                        "investigation_revision": investigation_revision,
+                        "knowledge_revision": updated.knowledge_revision,
+                    },
+                )
         return persisted
 
     def create_correction(
