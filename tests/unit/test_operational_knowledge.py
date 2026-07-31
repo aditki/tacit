@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from click import ClickException
@@ -1184,6 +1185,28 @@ def test_entity_registration_normalizes_ids_before_exact_resolution(tmp_path: Pa
     assert resolution.selected_entity_ref == "entity:service:payment-api"
 
 
+def test_entity_api_returns_client_error_for_conflicting_identity_kind(tmp_path: Path):
+    app = create_app(
+        runtime_settings=Settings(
+            signals_db_path=str(tmp_path / "entity-validation.db"),
+            knowledge_permissions="knowledge.read,knowledge.review",
+        )
+    )
+
+    response = TestClient(app).post(
+        "/api/v1/knowledge/entities",
+        json={
+            "id": "entity:team:payments",
+            "kind": "service",
+            "canonical_name": "Payments",
+            "provenance_refs": ["operator:entity"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "entity id kind 'team' does not match declared kind 'service'" in response.json()["detail"]
+
+
 @pytest.mark.parametrize(
     ("subject_ref", "object_ref"),
     [
@@ -1263,6 +1286,25 @@ def test_alias_scope_defaults_to_alias_tenant(tmp_path: Path):
 
     assert alias.scope.tenant_id == "tenant-a"
     assert candidate.entity_resolution.status.value == "resolved"
+
+
+def test_alias_registration_derives_normalized_value_from_raw_value(tmp_path: Path):
+    service = _service(tmp_path)
+    alias = service.register_alias(
+        EntityAlias(
+            id="alias-checkout-api-normalized",
+            raw_value="Checkout API",
+            normalized_value="wrong-value",
+            entity_ref="entity:service:checkout",
+            method=EntityBindingMethod.HUMAN_CORRECTION,
+            review_state=ReviewState.APPROVED,
+            provenance_refs=["operator:alias"],
+        )
+    )
+
+    assert alias.normalized_value == "checkout-api"
+    assert [item.id for item in service.repository.find_aliases("default", "checkout-api")] == [alias.id]
+    assert service.repository.find_aliases("default", "wrong-value") == []
 
 
 def test_exact_alias_resolution_enforces_alias_scope(tmp_path: Path):
@@ -3151,6 +3193,59 @@ def test_unauthorized_direct_rejection_cannot_withdraw_active_knowledge(tmp_path
     assert persisted_revision.state.lifecycle_status == LifecycleStatus.ACTIVE
 
 
+@pytest.mark.parametrize(
+    ("permissions", "authoritative", "missing_permission"),
+    [
+        ("knowledge.read,knowledge.review", False, "knowledge.apply"),
+        (
+            "knowledge.read,knowledge.review,knowledge.apply",
+            True,
+            "knowledge.override",
+        ),
+    ],
+)
+def test_direct_correction_approval_enforces_apply_and_override_permissions(
+    tmp_path: Path,
+    permissions: str,
+    authoritative: bool,
+    missing_permission: str,
+):
+    service = _service(tmp_path)
+    correction, candidate = service.create_correction(
+        investigation_id="inv-direct-correction-permission",
+        investigation_revision=1,
+        correction_type=CorrectionType.DEPENDENCY,
+        proposed={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "depends_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        explanation="Review this correction.",
+        created_by="embedding",
+    )
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions=permissions,
+    )
+
+    with pytest.raises(PermissionError, match=f"Missing permission: {missing_permission}"):
+        service.review_correction(
+            correction.id,
+            approved=True,
+            reviewer="embedding",
+            authoritative=authoritative,
+        )
+
+    persisted_candidate = service.repository.get_candidate(candidate.id)
+    persisted_correction = service.repository.get_correction(correction.id)
+    assert persisted_candidate is not None
+    assert persisted_candidate.state.review_state == ReviewState.CANDIDATE
+    assert persisted_correction is not None
+    assert persisted_correction.review_state == ReviewState.CANDIDATE
+    assert service.repository.list_current_revisions() == []
+
+
 def test_imported_review_state_enforces_runtime_permissions(tmp_path: Path):
     service = _service(tmp_path)
     service._runtime_settings = Settings(
@@ -4378,7 +4473,7 @@ def test_investigation_scope_extracts_supported_prompt_dimensions():
     scope = investigation_knowledge_scope(
         tenant_id="tenant-a",
         prompt=(
-            "Investigate checkout in production us-east-1, cluster: prod-east, namespace payments on release v2.4.1"
+            "Investigate checkout in production us-east-1, cluster: prod-east, namespace: payments on release v2.4.1"
         ),
         services=["Checkout API"],
         archetype_ids=["latency_investigation"],
@@ -4391,6 +4486,103 @@ def test_investigation_scope_extracts_supported_prompt_dimensions():
     assert "entity:service:checkout-api" in scope.service_refs
     assert "archetype:latency_investigation" in scope.archetype_refs
     assert "version:v2.4.1" in scope.version_constraints
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "The checkout cluster is down.",
+        "The checkout namespace is unhealthy.",
+        "The checkout cluster remains down.",
+        "The checkout namespace looks unhealthy.",
+        "The checkout cluster health is degraded.",
+        "The checkout namespace errors are elevated.",
+        "The checkout cluster is currently down.",
+        "The checkout namespace is still unhealthy.",
+        "The checkout cluster and namespace are unhealthy.",
+        "The checkout cluster health degraded.",
+        "The checkout namespace errors elevated.",
+        "The checkout cluster status shows degraded.",
+        "The checkout cluster experienced an outage.",
+        "The checkout namespace reports errors.",
+        "The checkout cluster went offline.",
+        "The checkout namespace started failing.",
+        "The checkout cluster production is down and namespace payments is unhealthy.",
+        "The checkout cluster prod-east and namespace payments.",
+        "The checkout cluster: prod/east.",
+        "The checkout namespace called pay@ments.",
+        "The checkout cluster prod-east/west.",
+        "The checkout cluster: arn:aws:eks:us-east-1:123456789012:cluster/prod.",
+    ],
+)
+def test_investigation_scope_does_not_treat_status_prose_as_identifiers(prompt: str):
+    scope = investigation_knowledge_scope(
+        tenant_id="tenant-a",
+        prompt=prompt,
+        services=["checkout"],
+        archetype_ids=[],
+    )
+
+    assert scope.cluster_refs == []
+    assert scope.namespace_refs == []
+
+
+def test_investigation_scope_preserves_identifiers_before_status_prose():
+    scope = investigation_knowledge_scope(
+        tenant_id="tenant-a",
+        prompt="Cluster: prod-east is down and namespace: payments is unhealthy.",
+        services=["checkout"],
+        archetype_ids=[],
+    )
+
+    assert scope.cluster_refs == ["cluster:prod-east"]
+    assert scope.namespace_refs == ["namespace:payments"]
+
+
+@pytest.mark.parametrize(
+    ("prompt", "cluster_ref", "namespace_ref"),
+    [
+        ("Cluster: down and namespace=slow.", "cluster:down", "namespace:slow"),
+        ("Cluster: health and namespace=errors.", "cluster:health", "namespace:errors"),
+    ],
+)
+def test_investigation_scope_preserves_explicit_status_named_identifiers(
+    prompt: str,
+    cluster_ref: str,
+    namespace_ref: str,
+):
+    scope = investigation_knowledge_scope(
+        tenant_id="tenant-a",
+        prompt=prompt,
+        services=["checkout"],
+        archetype_ids=[],
+    )
+
+    assert scope.cluster_refs == [cluster_ref]
+    assert scope.namespace_refs == [namespace_ref]
+
+
+@pytest.mark.parametrize(
+    ("prompt", "cluster_ref", "namespace_ref"),
+    [
+        ("Cluster named prod and namespace called payments.", "cluster:prod", "namespace:payments"),
+        ('Cluster "prod" and namespace "payments".', "cluster:prod", "namespace:payments"),
+    ],
+)
+def test_investigation_scope_accepts_named_or_quoted_word_identifiers(
+    prompt: str,
+    cluster_ref: str,
+    namespace_ref: str,
+):
+    scope = investigation_knowledge_scope(
+        tenant_id="tenant-a",
+        prompt=prompt,
+        services=["checkout"],
+        archetype_ids=[],
+    )
+
+    assert scope.cluster_refs == [cluster_ref]
+    assert scope.namespace_refs == [namespace_ref]
 
 
 def test_correction_without_target_keeps_conflict_unresolved(tmp_path: Path):
@@ -5266,6 +5458,68 @@ def test_api_review_returns_post_evaluation_candidate_state(tmp_path: Path, monk
     assert body["candidate"]["policy"]["promotion_policy_ref"] == "dependency-promotion-v1"
 
 
+def test_cli_review_returns_post_evaluation_candidate_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref="cli-evaluated-response",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="cli-evaluated-response",
+    )
+
+    class Stores:
+        settings = Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.read,knowledge.review,knowledge.override",
+        )
+
+        def knowledge(self):
+            return service
+
+    captured: dict[str, Any] = {}
+    evaluation_returned = False
+    original_evaluate = service.evaluate_candidate_result
+    original_get_candidate = service.repository.get_candidate
+
+    def evaluate_atomically(*args, **kwargs):
+        nonlocal evaluation_returned
+        result = original_evaluate(*args, **kwargs)
+        evaluation_returned = True
+        return result
+
+    def reject_post_evaluation_reload(*args, **kwargs):
+        if evaluation_returned:
+            raise AssertionError("CLI must use the candidate captured by the evaluation transaction")
+        return original_get_candidate(*args, **kwargs)
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", Stores)
+    monkeypatch.setattr("tacit.cli._knowledge_json", lambda payload: captured.update(payload))
+    monkeypatch.setattr(service, "evaluate_candidate_result", evaluate_atomically)
+    monkeypatch.setattr(service.repository, "get_candidate", reject_post_evaluation_reload)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "knowledge",
+            "review",
+            candidate.id,
+            "--approve",
+            "--reviewer",
+            "operator",
+            "--authoritative-source",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["promotion_decision"]["decision"] == "promote"
+    assert captured["knowledge_revision"] is not None
+    assert captured["candidate"]["state"]["eligibility"] == "contextual_only"
+    assert captured["candidate"]["policy"]["promotion_policy_ref"] == "dependency-promotion-v1"
+
+
 def test_approved_candidate_can_be_evaluated_on_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     service = _service(tmp_path, "tenant-a")
     candidate = _dependency(
@@ -5662,6 +5916,23 @@ def test_operational_learning_benchmark_is_packaged_and_safe():
     assert report["metrics"]["unresolved_item_contribution_rate"] == 0
     assert report["metrics"]["causal_claim_leakage_rate"] == 0
     assert report["metrics"]["prompt_injection_policy_override_count"] == 0
+
+
+def test_operational_learning_benchmark_isolated_from_runtime_governance(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("KNOWLEDGE_TENANT_ID", "*")
+    monkeypatch.setenv("KNOWLEDGE_PERMISSIONS", "knowledge.read")
+    monkeypatch.setattr("tacit.knowledge.service.settings.knowledge_tenant_id", "*")
+    monkeypatch.setattr(
+        "tacit.knowledge.service.settings.knowledge_permissions",
+        "knowledge.read",
+    )
+
+    report = run_operational_learning_benchmark()
+
+    assert report["passed"] is True
+    assert report["metrics"]["passed_cases"]["numerator"] == report["case_count"]
 
 
 def test_causal_benchmark_reviews_candidate_before_evaluation(monkeypatch: pytest.MonkeyPatch):

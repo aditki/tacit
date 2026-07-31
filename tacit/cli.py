@@ -2176,12 +2176,15 @@ def knowledge_review(
         )
         promotion = revision = None
         if decision != "reject":
-            promotion, revision = service.evaluate_candidate(
+            evaluation = service.evaluate_candidate_result(
                 candidate_id,
                 tenant_id=tenant_id,
                 authoritative_source=authoritative_source,
                 live_verified=live_verified,
             )
+            candidate = evaluation.candidate
+            promotion = evaluation.decision
+            revision = evaluation.revision
     except (ValueError, PermissionError) as exc:
         raise click.ClickException(str(exc)) from exc
     _knowledge_json(

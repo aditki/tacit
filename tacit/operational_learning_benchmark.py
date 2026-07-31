@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from tacit import __version__
+from tacit.config import Settings
+from tacit.knowledge.authorization import KNOWLEDGE_ACTION_PERMISSIONS
 from tacit.knowledge.enums import (
     EntityBindingMethod,
     EntityKind,
@@ -24,6 +26,16 @@ from tacit.knowledge.normalization import PropositionNormalizer
 from tacit.knowledge.repository import KnowledgeRepository
 from tacit.knowledge.service import KnowledgeService
 
+_BENCHMARK_PERMISSIONS = ",".join(
+    sorted(
+        {
+            permission
+            for required_permissions in KNOWLEDGE_ACTION_PERMISSIONS.values()
+            for permission in required_permissions
+        }
+    )
+)
+
 
 def load_operational_learning_corpus() -> dict[str, Any]:
     resource = files("tacit.data").joinpath("operational_learning_v1.json")
@@ -36,8 +48,15 @@ def run_operational_learning_benchmark() -> dict[str, Any]:
     dataset_hash = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
     results = []
     with tempfile.TemporaryDirectory(prefix="tacit-learning-benchmark-") as tmp:
+        benchmark_settings = Settings(
+            knowledge_tenant_id="default",
+            knowledge_permissions=_BENCHMARK_PERMISSIONS,
+        )
         for index, case in enumerate(corpus["cases"]):
-            service = KnowledgeService(KnowledgeRepository(Path(tmp) / f"case-{index}.db"))
+            service = KnowledgeService(
+                KnowledgeRepository(Path(tmp) / f"case-{index}.db"),
+                runtime_settings=benchmark_settings,
+            )
             _seed_entities(service)
             passed, reason = _run_case(service, case)
             results.append(

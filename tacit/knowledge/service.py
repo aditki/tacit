@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Collection
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -106,6 +107,13 @@ def _source_family(value: str) -> SourceFamily:
         return aliases.get(value, SourceFamily.UNKNOWN)
 
 
+@dataclass(frozen=True)
+class CandidateEvaluationResult:
+    candidate: KnowledgeCandidate
+    decision: PromotionDecision
+    revision: KnowledgeRevision | None
+
+
 class KnowledgeService:
     def __init__(
         self,
@@ -180,7 +188,13 @@ class KnowledgeService:
     def register_alias(self, alias: EntityAlias) -> EntityAlias:
         tenant_id = self._record_tenant(alias)
         scope = self._scope_for_tenant(alias.scope, tenant_id)
-        alias = alias.model_copy(update={"tenant_id": tenant_id, "scope": scope})
+        alias = alias.model_copy(
+            update={
+                "tenant_id": tenant_id,
+                "scope": scope,
+                "normalized_value": normalize_entity(alias.raw_value),
+            }
+        )
         entity = self.repository.get_entity(alias.entity_ref, alias.tenant_id)
         if entity is None:
             raise ValueError("alias target entity does not exist in the tenant")
@@ -431,6 +445,27 @@ class KnowledgeService:
         ignored_conflict_ids: set[str] | None = None,
         _correction_id: str | None = None,
     ) -> tuple[PromotionDecision, KnowledgeRevision | None]:
+        result = self.evaluate_candidate_result(
+            candidate_id,
+            tenant_id=tenant_id,
+            authoritative_source=authoritative_source,
+            live_verified=live_verified,
+            ignored_conflict_ids=ignored_conflict_ids,
+            _correction_id=_correction_id,
+        )
+        return result.decision, result.revision
+
+    def evaluate_candidate_result(
+        self,
+        candidate_id: str,
+        *,
+        tenant_id: str | None = None,
+        authoritative_source: bool = False,
+        live_verified: bool = False,
+        ignored_conflict_ids: set[str] | None = None,
+        _correction_id: str | None = None,
+    ) -> CandidateEvaluationResult:
+        """Return candidate, decision, and revision from one evaluation transaction."""
         tenant_id = self._resolve_tenant(tenant_id)
         observed = self._require_candidate(candidate_id, tenant_id)
         self._require_candidate_workflow(candidate_id, tenant_id, _correction_id)
@@ -457,7 +492,7 @@ class KnowledgeService:
         live_verified: bool,
         ignored_conflict_ids: set[str] | None,
         _correction_id: str | None,
-    ) -> tuple[PromotionDecision, KnowledgeRevision | None]:
+    ) -> CandidateEvaluationResult:
         """Evaluate and persist authority while one immediate write lock is held."""
         candidate = self._require_candidate(candidate_id, tenant_id)
         self._require_candidate_workflow(candidate_id, tenant_id, _correction_id)
@@ -521,7 +556,7 @@ class KnowledgeService:
             payload=decision.model_dump(mode="json"),
         )
         if decision.decision != PromotionDecisionType.PROMOTE:
-            return decision, None
+            return CandidateEvaluationResult(candidate=candidate, decision=decision, revision=None)
         contributors = self.corroboration.contributing_candidates(
             tenant_id,
             candidate.proposition.proposition_key,
@@ -571,7 +606,7 @@ class KnowledgeService:
                 current_revision,
                 expected_semantic_fingerprint=semantic,
             )
-            return decision, current_revision
+            return CandidateEvaluationResult(candidate=candidate, decision=decision, revision=current_revision)
         revision = KnowledgeRevision(
             knowledge_id=knowledge_id,
             tenant_id=tenant_id,
@@ -607,7 +642,7 @@ class KnowledgeService:
                 concurrent_revision,
                 expected_semantic_fingerprint=revision.semantic_fingerprint,
             )
-            return decision, concurrent_revision
+            return CandidateEvaluationResult(candidate=candidate, decision=decision, revision=concurrent_revision)
         self.repository.append_event(
             "knowledge_promoted" if revision_number == 1 else "knowledge_revised",
             tenant_id=tenant_id,
@@ -622,7 +657,7 @@ class KnowledgeService:
             },
             payload={"revision": revision_number, "candidate_id": candidate.id},
         )
-        return decision, revision
+        return CandidateEvaluationResult(candidate=candidate, decision=decision, revision=revision)
 
     def create_snapshot(
         self,
@@ -1228,6 +1263,11 @@ class KnowledgeService:
         authoritative: bool = False,
     ) -> tuple[KnowledgeCorrection, KnowledgeRevision | None]:
         """Review and apply a correction within one locked write transaction."""
+        self._enforce_candidate_review_action(approved=approved)
+        if approved:
+            enforce_knowledge_action(self._runtime_settings, KnowledgeAction.APPLY)
+        if authoritative:
+            enforce_knowledge_action(self._runtime_settings, KnowledgeAction.OVERRIDE)
         tenant_id = self._resolve_tenant(tenant_id)
         correction = self.repository.get_correction(correction_id, tenant_id)
         if correction is not None:

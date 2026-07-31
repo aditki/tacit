@@ -1189,7 +1189,7 @@ def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, m
                 update={
                     "prompt": (
                         "Why is checkout slow in production us-east-1, cluster: prod-east, "
-                        "namespace payments on release v2.4.1?"
+                        "namespace: payments on release v2.4.1?"
                     )
                 }
             ),

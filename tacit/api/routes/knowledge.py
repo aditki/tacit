@@ -187,15 +187,15 @@ async def review_candidate(candidate_id: str, payload: CandidateReviewRequest, r
         )
         decision = revision = None
         if payload.evaluate and payload.decision != "reject":
-            decision, revision = service.evaluate_candidate(
+            evaluation = service.evaluate_candidate_result(
                 candidate_id,
                 tenant_id=tenant_id,
                 authoritative_source=payload.authoritative_source,
                 live_verified=payload.live_verified,
             )
-            evaluated = service.repository.get_candidate(candidate_id, tenant_id)
-            if evaluated is not None:
-                candidate = evaluated
+            candidate = evaluation.candidate
+            decision = evaluation.decision
+            revision = evaluation.revision
         return {
             "candidate": _candidate_dump(candidate),
             "promotion_decision": decision.model_dump(mode="json") if decision else None,
@@ -236,7 +236,10 @@ async def create_entity(payload: EntityRequest, request: Request):
         scope=scope,
         provenance_refs=payload.provenance_refs,
     )
-    return get_knowledge_service(request).register_entity(entity).model_dump(mode="json")
+    try:
+        return get_knowledge_service(request).register_entity(entity).model_dump(mode="json")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post(
