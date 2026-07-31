@@ -30,6 +30,7 @@ from tacit.knowledge.enums import (
     KnowledgeUsageDisposition,
     LifecycleStatus,
     LineageKind,
+    Predicate,
     ReviewState,
     SourceFamily,
 )
@@ -588,6 +589,8 @@ def test_scope_matching_evaluates_version_ranges_against_concrete_releases(tmp_p
         ("<2", "v2.4.1", False),
         ("==2.*", "v2.4.1", True),
         ("!=2.*", "v2.4.1", False),
+        ("===vendor-build", "vendor-build", True),
+        ("===vendor-build", "other-build", False),
     ],
 )
 def test_scope_version_selector_semantics(selector: str, release: str, expected: bool):
@@ -626,6 +629,13 @@ def test_version_scope_overlap_detects_disjoint_ranges():
     )
     assert version_scopes_overlap(["version:~=1!2.0"], ["version:!=1!2.*"]) is False
     assert version_scopes_overlap(["version:>=1!2,<1!3"], ["version:!=2.*"]) is True
+    assert version_scopes_overlap(["version:===vendor-build"], ["version:vendor-build"]) is True
+    assert version_scopes_overlap(["version:===vendor-build"], ["version:other-build"]) is False
+    assert version_scopes_overlap(["version:===1.0"], ["version:1.0"]) is True
+    assert version_scopes_overlap(["version:===1.0"], ["version:1.0.0"]) is False
+    assert version_scopes_overlap(["version:===1.0"], ["version:>=1"]) is True
+    assert version_scopes_overlap(["version:===1.0"], ["version:<2"]) is True
+    assert version_scopes_overlap(["version:===1.0"], ["version:!=1.0"]) is False
 
 
 def test_proposition_keys_canonicalize_scope_list_order(tmp_path: Path):
@@ -2514,6 +2524,321 @@ def test_correction_creates_candidate_revision_and_impact(tmp_path: Path):
     assert [item["id"] for item in service.explain(replacement.knowledge_id)["corrections"]] == [correction.id]
 
 
+@pytest.mark.parametrize(
+    "correction_type",
+    [CorrectionType.SCOPE_CORRECTION, CorrectionType.TIME_WINDOW_CORRECTION],
+)
+def test_scope_and_time_window_corrections_supersede_the_pinned_target(
+    tmp_path: Path,
+    correction_type: CorrectionType,
+):
+    service = _service(tmp_path)
+    _, target = _promoted_dependency(service)
+    scope_update = (
+        {"region_refs": ["region:us-east-1"]}
+        if correction_type == CorrectionType.SCOPE_CORRECTION
+        else {
+            "valid_from": datetime.now(UTC) - timedelta(hours=1),
+            "valid_until": datetime.now(UTC) + timedelta(days=30),
+        }
+    )
+    corrected_scope = target.scope.model_copy(update=scope_update)
+    correction, candidate = service.create_correction(
+        investigation_id=f"inv-{correction_type.value}",
+        investigation_revision=1,
+        correction_type=correction_type,
+        target_ref=target.knowledge_id,
+        target_revision=target.revision,
+        proposed={"kind": KnowledgeKind.DEPENDENCY.value},
+        scope=corrected_scope,
+        explanation="Narrow the reviewed knowledge boundary.",
+        created_by="operator",
+    )
+
+    reviewed, replacement = service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="reviewer",
+        authoritative=True,
+    )
+
+    assert candidate.kind == target.proposition.kind
+    assert candidate.proposition.subject_ref == target.proposition.subject_ref
+    assert candidate.proposition.predicate == target.proposition.predicate
+    assert candidate.proposition.object_ref == target.proposition.object_ref
+    assert replacement is not None
+    assert replacement.knowledge_id != target.knowledge_id
+    assert replacement.scope == corrected_scope
+    assert replacement.state.lifecycle_status == LifecycleStatus.ACTIVE
+    current_target = service.repository.get_revision(target.knowledge_id)
+    assert current_target is not None
+    assert current_target.revision == target.revision + 1
+    assert current_target.state.lifecycle_status == LifecycleStatus.SUPERSEDED
+    assert service.repository.get_revision(target.knowledge_id, target.revision) == target
+    assert reviewed.applied_knowledge_ref == replacement.knowledge_id
+    assert reviewed.applied_knowledge_revision == replacement.revision
+    assert (
+        service.supersede(
+            target.knowledge_id,
+            candidate.id,
+            expected_revision=target.revision,
+        )
+        == current_target
+    )
+
+
+def test_scope_correction_preserves_signal_mapping_resolver_payload(tmp_path: Path):
+    service = _service(tmp_path)
+    scope = KnowledgeScope(
+        environment_refs=["environment:production"],
+        service_refs=["entity:service:checkout"],
+    )
+    candidates = []
+    for index, (pattern, confidence, family) in enumerate(
+        (
+            ("AWS/ApplicationELB/TargetResponseTime", 0.93, SourceFamily.DASHBOARD),
+            ("AWS/ApplicationELB/TargetResponseTime/p99", 0.88, SourceFamily.ALERT),
+        )
+    ):
+        candidate = service.create_candidate(
+            kind=KnowledgeKind.SIGNAL_MAPPING,
+            payload_ref=f"signal-scope-source-{index}",
+            typed_payload={
+                "metric_pattern": pattern,
+                "confidence": confidence,
+                "context_datasource_types": ["cloudwatch"],
+            },
+            proposition={
+                "subject_ref": "concept:request-latency",
+                "predicate": Predicate.REPRESENTED_BY,
+                "object_ref": "concept:application-load-balancer-latency",
+                "concept_ref": "signal:request_latency",
+            },
+            scope=scope,
+            evidence=[
+                KnowledgeEvidenceReference(
+                    evidence_ref=f"signal-scope-evidence-{index}",
+                    source_family=family,
+                    lineage_group=f"signal-scope-lineage-{index}",
+                    lineage_kind=LineageKind.INDEPENDENT,
+                    provenance_refs=[f"signal-scope-provenance-{index}"],
+                )
+            ],
+            provenance_refs=[f"signal-scope-provenance-{index}"],
+        )
+        service.review_candidate(candidate.id, approved=True, reviewer="reviewer")
+        candidates.append(candidate)
+    _, target = service.evaluate_candidate(candidates[0].id)
+    assert target is not None
+    assert len(target.resolver_payload["mappings"]) == 2
+    corrected_scope = scope.model_copy(update={"region_refs": ["region:us-east-1"]})
+    correction, _ = service.create_correction(
+        investigation_id="inv-signal-scope-correction",
+        investigation_revision=1,
+        correction_type=CorrectionType.SCOPE_CORRECTION,
+        target_ref=target.knowledge_id,
+        target_revision=target.revision,
+        proposed={"kind": KnowledgeKind.SIGNAL_MAPPING.value},
+        scope=corrected_scope,
+        explanation="Restrict the exact CloudWatch mappings to us-east-1.",
+        created_by="operator",
+    )
+
+    _, replacement = service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="reviewer",
+        authoritative=True,
+    )
+
+    assert replacement is not None
+    assert replacement.resolver_payload == target.resolver_payload
+    assert service.repository.get_revision(target.knowledge_id).state.lifecycle_status == LifecycleStatus.SUPERSEDED
+    from tacit.signals.store import SignalStore
+
+    store = SignalStore(service.repository._db_path)
+    with store._conn() as conn:
+        replacement_rows = conn.execute(
+            """SELECT metric_pattern, confidence, context_datasource_types, context_regions, review_state
+               FROM signal_metric_mappings
+               WHERE tenant_id='default' AND governance_ref=?
+               ORDER BY metric_pattern""",
+            (replacement.knowledge_id,),
+        ).fetchall()
+        active_target_rows = conn.execute(
+            """SELECT COUNT(*) FROM signal_metric_mappings
+               WHERE tenant_id='default' AND governance_ref=? AND review_state IN ('approved', 'trusted')""",
+            (target.knowledge_id,),
+        ).fetchone()[0]
+    assert [row["metric_pattern"] for row in replacement_rows] == [
+        "AWS/ApplicationELB/TargetResponseTime",
+        "AWS/ApplicationELB/TargetResponseTime/p99",
+    ]
+    assert [row["confidence"] for row in replacement_rows] == [0.93, 0.88]
+    assert {row["context_datasource_types"] for row in replacement_rows} == {'["cloudwatch"]'}
+    assert {row["context_regions"] for row in replacement_rows} == {'["us-east-1"]'}
+    assert {row["review_state"] for row in replacement_rows} == {ReviewState.APPROVED.value}
+    assert active_target_rows == 0
+
+
+def test_signal_candidates_cannot_override_their_governed_resolver_payload(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="signal-resolver-payload-injection",
+        typed_payload={
+            "metric_pattern": "reviewed_metric_seconds",
+            "confidence": 0.9,
+            "resolver_payload": {
+                "mappings": [
+                    {
+                        "metric_pattern": "hidden_extra_metric_seconds",
+                        "confidence": 1.0,
+                        "context_datasource_types": ["prometheus"],
+                    }
+                ]
+            },
+        },
+        proposition={
+            "subject_ref": "concept:request-latency",
+            "predicate": Predicate.REPRESENTED_BY,
+            "object_ref": "concept:reviewed_metric_seconds",
+            "concept_ref": "signal:request_latency",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["operator:reviewed-mapping"],
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="reviewer")
+
+    _, revision = service.evaluate_candidate(candidate.id, live_verified=True)
+
+    assert revision is not None
+    assert service._signal_metric_patterns(revision) == ["reviewed_metric_seconds"]
+    from tacit.signals.store import SignalStore
+
+    mappings = SignalStore(service.repository._db_path).get_mappings_for_signal(
+        "request_latency",
+        context_service="checkout",
+    )
+    governed_patterns = {
+        mapping["metric_pattern"] for mapping in mappings if mapping["governance_ref"] == revision.knowledge_id
+    }
+    assert governed_patterns == {"reviewed_metric_seconds"}
+
+
+def test_scope_correction_rolls_back_replacement_and_target_when_application_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    _, target = _promoted_dependency(service)
+    correction, candidate = service.create_correction(
+        investigation_id="inv-scope-correction-rollback",
+        investigation_revision=1,
+        correction_type=CorrectionType.SCOPE_CORRECTION,
+        target_ref=target.knowledge_id,
+        target_revision=target.revision,
+        proposed={"kind": KnowledgeKind.DEPENDENCY.value},
+        scope=target.scope.model_copy(update={"region_refs": ["region:us-east-1"]}),
+        explanation="Apply this narrowed scope atomically.",
+        created_by="operator",
+    )
+    save_correction = service.repository.save_correction
+
+    def fail_after_supersession(updated: KnowledgeCorrection):
+        if updated.applied_knowledge_ref:
+            raise RuntimeError("correction persistence failed")
+        return save_correction(updated)
+
+    monkeypatch.setattr(service.repository, "save_correction", fail_after_supersession)
+
+    with pytest.raises(RuntimeError, match="correction persistence failed"):
+        service.review_correction(
+            correction.id,
+            approved=True,
+            reviewer="reviewer",
+            authoritative=True,
+        )
+
+    current_target = service.repository.get_revision(target.knowledge_id)
+    stored_correction = service.repository.get_correction(correction.id)
+    stored_candidate = service.repository.get_candidate(candidate.id)
+    assert current_target == target
+    assert current_target.state.lifecycle_status == LifecycleStatus.ACTIVE
+    assert stored_correction is not None
+    assert stored_correction.review_state == ReviewState.CANDIDATE
+    assert stored_correction.applied_knowledge_ref == ""
+    assert stored_candidate is not None
+    assert stored_candidate.state.review_state == ReviewState.CANDIDATE
+    assert {revision.knowledge_id for revision in service.repository.list_current_revisions()} == {target.knowledge_id}
+
+
+def test_supersession_rejects_a_reviewed_but_unpromoted_replacement(tmp_path: Path):
+    service = _service(tmp_path)
+    _, target = _promoted_dependency(service)
+    correction, candidate = service.create_correction(
+        investigation_id="inv-unpromoted-supersession",
+        investigation_revision=1,
+        correction_type=CorrectionType.DEPENDENCY,
+        target_ref=target.knowledge_id,
+        target_revision=target.revision,
+        proposed={
+            "subject_ref": "entity:service:checkout",
+            "predicate": Predicate.DOES_NOT_DEPEND_ON,
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=target.scope,
+        explanation="This still requires promotion policy approval.",
+        created_by="operator",
+    )
+    reviewed, replacement = service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="reviewer",
+        authoritative=False,
+    )
+    assert reviewed.review_state == ReviewState.APPROVED
+    assert replacement is None
+
+    with pytest.raises(ValueError, match="must have an active promoted revision"):
+        service.supersede(
+            target.knowledge_id,
+            candidate.id,
+            expected_revision=target.revision,
+        )
+
+    assert service.repository.get_revision(target.knowledge_id) == target
+    persisted_correction = service.repository.get_correction(correction.id)
+    assert persisted_correction is not None
+    assert persisted_correction.applied_knowledge_ref == ""
+
+
+def test_scope_correction_cannot_change_the_target_proposition(tmp_path: Path):
+    service = _service(tmp_path)
+    _, target = _promoted_dependency(service)
+
+    with pytest.raises(ValueError, match="cannot change the target proposition"):
+        service.create_correction(
+            investigation_id="inv-invalid-scope-correction",
+            investigation_revision=1,
+            correction_type=CorrectionType.SCOPE_CORRECTION,
+            target_ref=target.knowledge_id,
+            target_revision=target.revision,
+            proposed={
+                "kind": KnowledgeKind.DEPENDENCY.value,
+                "subject_ref": target.proposition.subject_ref,
+                "predicate": Predicate.DOES_NOT_DEPEND_ON,
+                "object_ref": target.proposition.object_ref,
+            },
+            scope=target.scope.model_copy(update={"region_refs": ["region:us-east-1"]}),
+            explanation="This attempts to change two authority dimensions at once.",
+            created_by="operator",
+        )
+
+    with service.repository._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM knowledge_corrections").fetchone()[0] == 0
+
+
 def test_correction_candidate_cannot_use_the_generic_review_or_evaluation_workflow(tmp_path: Path):
     service = _service(tmp_path)
     correction, candidate = service.create_correction(
@@ -3153,6 +3478,162 @@ def test_knowledge_service_enforces_its_runtime_tenant_boundary(tmp_path: Path):
             investigation_id="mixed-tenant-investigation",
             investigation_revision=1,
         )
+
+
+def test_entity_registration_enforces_runtime_review_permission(tmp_path: Path):
+    service = _service(tmp_path)
+    original = service.repository.get_entity("entity:service:checkout")
+    assert original is not None
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.review"):
+        service.register_entity(
+            Entity(
+                id="entity:service:payments",
+                kind=EntityKind.SERVICE,
+                canonical_name="payments",
+                provenance_refs=["catalog:payments"],
+            )
+        )
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.review"):
+        service.register_entity(original.model_copy(update={"canonical_name": "storefront"}))
+
+    assert service.repository.get_entity("entity:service:payments") is None
+    assert service.repository.get_entity(original.id) == original
+
+
+def test_correction_creation_enforces_runtime_correct_permission(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate_ids = {candidate.id for candidate in service.repository.list_candidates()}
+    event_count = len(service.repository.list_events())
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read,knowledge.review",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.correct"):
+        service.create_correction(
+            investigation_id="inv-unauthorized-correction",
+            investigation_revision=1,
+            correction_type=CorrectionType.DEPENDENCY,
+            proposed={
+                "subject_ref": "entity:service:checkout",
+                "predicate": "depends_on",
+                "object_ref": "entity:datastore:redis-session",
+            },
+            scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+            explanation="This must not reach persistence.",
+            created_by="embedding",
+        )
+
+    assert {candidate.id for candidate in service.repository.list_candidates()} == candidate_ids
+    assert len(service.repository.list_events()) == event_count
+    with service.repository._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM knowledge_corrections").fetchone()[0] == 0
+
+
+def test_mutation_permissions_are_checked_before_wildcard_tenant_or_resource_lookups(tmp_path: Path):
+    service = KnowledgeService(
+        KnowledgeRepository(tmp_path / "permission-order.db"),
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_tenant_id="*",
+            knowledge_permissions="knowledge.read",
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.review"):
+        service.register_entity(
+            Entity(
+                id="entity:service:checkout",
+                kind=EntityKind.SERVICE,
+                canonical_name="checkout",
+                provenance_refs=["catalog:checkout"],
+            )
+        )
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.correct"):
+        service.create_correction(
+            investigation_id="inv-permission-order",
+            investigation_revision=1,
+            correction_type=CorrectionType.DEPENDENCY,
+            proposed={
+                "subject_ref": "entity:service:checkout",
+                "predicate": "depends_on",
+                "object_ref": "entity:datastore:redis-session",
+            },
+            scope=KnowledgeScope(),
+            explanation="Authorization must precede tenant resolution.",
+            created_by="embedding",
+        )
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        service.supersede("knowledge-missing", "candidate-missing")
+
+    with service.repository._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM knowledge_corrections").fetchone()[0] == 0
+
+
+def test_supersession_requires_apply_permission_and_a_reviewed_correction(tmp_path: Path):
+    service = _service(tmp_path)
+    _, original = _promoted_dependency(service)
+    correction, candidate = service.create_correction(
+        investigation_id="inv-supersede-boundary",
+        investigation_revision=1,
+        correction_type=CorrectionType.DEPENDENCY,
+        target_ref=original.knowledge_id,
+        target_revision=original.revision,
+        proposed={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "does_not_depend_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=original.scope,
+        explanation="Replace the dependency through review.",
+        created_by="embedding",
+    )
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read,knowledge.review,knowledge.correct",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        service.supersede(
+            original.knowledge_id,
+            candidate.id,
+            expected_revision=original.revision,
+        )
+
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read,knowledge.review,knowledge.correct,knowledge.apply",
+    )
+    with pytest.raises(ValueError, match="replacement candidate must be approved or trusted"):
+        service.supersede(
+            original.knowledge_id,
+            candidate.id,
+            expected_revision=original.revision,
+        )
+
+    service.review_candidate(
+        candidate.id,
+        approved=True,
+        reviewer="embedding",
+        _correction_id=correction.id,
+    )
+    with pytest.raises(ValueError, match="requires an approved correction"):
+        service.supersede(
+            original.knowledge_id,
+            candidate.id,
+            expected_revision=original.revision,
+        )
+
+    persisted = service.repository.get_revision(original.knowledge_id)
+    assert persisted is not None
+    assert persisted.revision == original.revision
+    assert persisted.state.lifecycle_status == LifecycleStatus.ACTIVE
 
 
 @pytest.mark.parametrize(
@@ -3799,7 +4280,12 @@ def test_stale_and_incorrect_corrections_retire_their_target(
 
 @pytest.mark.parametrize(
     "correction_type",
-    [CorrectionType.KNOWLEDGE_STALE, CorrectionType.KNOWLEDGE_INCORRECT],
+    [
+        CorrectionType.KNOWLEDGE_STALE,
+        CorrectionType.KNOWLEDGE_INCORRECT,
+        CorrectionType.SCOPE_CORRECTION,
+        CorrectionType.TIME_WINDOW_CORRECTION,
+    ],
 )
 def test_target_required_corrections_remain_pending_when_target_is_missing(
     tmp_path: Path,

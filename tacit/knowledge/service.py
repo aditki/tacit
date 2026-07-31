@@ -63,6 +63,7 @@ from tacit.knowledge.normalization import (
     canonical_scope_payload,
     normalize_entity,
     normalize_entity_id,
+    normalize_ref,
     normalize_service_ref,
     stable_fingerprint,
 )
@@ -86,6 +87,16 @@ PROMPT_INJECTION_RE = re.compile(
     re.I,
 )
 logger = structlog.get_logger()
+
+_TARGET_RETIREMENT_CORRECTIONS = {
+    CorrectionType.KNOWLEDGE_STALE,
+    CorrectionType.KNOWLEDGE_INCORRECT,
+}
+_TARGET_SUPERSESSION_CORRECTIONS = {
+    CorrectionType.SCOPE_CORRECTION,
+    CorrectionType.TIME_WINDOW_CORRECTION,
+}
+_TARGET_REQUIRED_CORRECTIONS = _TARGET_RETIREMENT_CORRECTIONS | _TARGET_SUPERSESSION_CORRECTIONS
 
 
 def _id(prefix: str, value: Any) -> str:
@@ -167,6 +178,7 @@ class KnowledgeService:
         return validated
 
     def register_entity(self, entity: Entity) -> Entity:
+        enforce_knowledge_action(self._runtime_settings, KnowledgeAction.APPROVE)
         tenant_id = self._record_tenant(entity)
         scope = self._scope_for_tenant(entity.scope, tenant_id)
         entity = entity.model_copy(update={"tenant_id": tenant_id, "scope": scope})
@@ -506,6 +518,7 @@ class KnowledgeService:
         live_verified: bool,
         ignored_conflict_ids: set[str] | None,
         _correction_id: str | None,
+        resolver_payload_override: dict[str, Any] | None = None,
     ) -> CandidateEvaluationResult:
         """Evaluate after the caller has authorized or loaded persisted overrides."""
         tenant_id = self._resolve_tenant(tenant_id)
@@ -523,6 +536,7 @@ class KnowledgeService:
                 live_verified=live_verified,
                 ignored_conflict_ids=ignored_conflict_ids,
                 _correction_id=_correction_id,
+                resolver_payload_override=resolver_payload_override,
             )
 
     def _evaluate_candidate_in_transaction(
@@ -534,6 +548,7 @@ class KnowledgeService:
         live_verified: bool,
         ignored_conflict_ids: set[str] | None,
         _correction_id: str | None,
+        resolver_payload_override: dict[str, Any] | None = None,
     ) -> CandidateEvaluationResult:
         """Evaluate and persist authority while one immediate write lock is held."""
         candidate = self._require_candidate(candidate_id, tenant_id)
@@ -619,10 +634,16 @@ class KnowledgeService:
         existing = self.repository.find_knowledge_by_proposition(tenant_id, candidate.proposition.proposition_key)
         knowledge_id = existing.id if existing else _id("knowledge", [tenant_id, candidate.proposition.proposition_key])
         revision_number = existing.current_revision + 1 if existing else 1
+        if resolver_payload_override is not None and candidate.kind != KnowledgeKind.SIGNAL_MAPPING:
+            raise ValueError("resolver payload overrides apply only to signal mappings")
         resolver_payload = (
-            self._build_signal_mapping_resolver_payload(candidate, contributors)
-            if candidate.kind == KnowledgeKind.SIGNAL_MAPPING
-            else {}
+            resolver_payload_override
+            if resolver_payload_override is not None
+            else (
+                self._build_signal_mapping_resolver_payload(candidate, contributors)
+                if candidate.kind == KnowledgeKind.SIGNAL_MAPPING
+                else {}
+            )
         )
         semantic = stable_fingerprint(
             {
@@ -1168,6 +1189,7 @@ class KnowledgeService:
         target_revision: int | None = None,
         tenant_id: str | None = None,
     ) -> tuple[KnowledgeCorrection, KnowledgeCandidate]:
+        enforce_knowledge_action(self._runtime_settings, KnowledgeAction.CORRECT)
         tenant_id = self._resolve_tenant(tenant_id)
         scope = self._scope_for_tenant(scope, tenant_id)
         with self.repository.transaction():
@@ -1239,8 +1261,14 @@ class KnowledgeService:
         original = {}
         if target is not None:
             original = target.proposition.model_dump(mode="json")
-        kind = self._kind_for_correction(correction_type, proposed)
+        kind = (
+            target.proposition.kind
+            if target is not None and correction_type in _TARGET_SUPERSESSION_CORRECTIONS
+            else self._kind_for_correction(correction_type, proposed)
+        )
         candidate_proposition = proposed
+        if target is not None and correction_type in _TARGET_SUPERSESSION_CORRECTIONS:
+            candidate_proposition = self._target_proposition_for_scope_correction(target, proposed)
         if correction_type == CorrectionType.ENTITY_MAPPING:
             raw_value, entity_ref = self._entity_mapping_values(proposed)
             entity = self.repository.get_entity(entity_ref, tenant_id)
@@ -1375,11 +1403,7 @@ class KnowledgeService:
             if applied is None:
                 raise ValueError("applied correction result is missing from immutable knowledge history")
             return correction, applied
-        if (
-            approved
-            and correction.correction_type in {CorrectionType.KNOWLEDGE_STALE, CorrectionType.KNOWLEDGE_INCORRECT}
-            and not correction.target_ref
-        ):
+        if approved and correction.correction_type in _TARGET_REQUIRED_CORRECTIONS and not correction.target_ref:
             raise ValueError(f"{correction.correction_type.value} correction requires target_ref")
         target = None
         if correction.target_ref:
@@ -1442,10 +1466,7 @@ class KnowledgeService:
             correction = correction.model_copy(update={"applied_alias_ref": alias.id})
             correction = self.repository.save_correction(correction)
             return correction, None
-        if correction.correction_type in {
-            CorrectionType.KNOWLEDGE_STALE,
-            CorrectionType.KNOWLEDGE_INCORRECT,
-        }:
+        if correction.correction_type in _TARGET_RETIREMENT_CORRECTIONS:
             assert target is not None
             lifecycle_status = (
                 LifecycleStatus.STALE
@@ -1478,15 +1499,39 @@ class KnowledgeService:
             and conflict.resolution_status == ConflictResolutionStatus.UNRESOLVED
             and target.proposition.proposition_key in {conflict.left_proposition_ref, conflict.right_proposition_ref}
         ]
-        _, revision = self.evaluate_candidate(
-            candidate.id,
-            tenant_id=tenant_id,
-            authoritative_source=authoritative,
-            ignored_conflict_ids={conflict.id for conflict in replaceable_conflicts},
-            _correction_id=correction.id,
+        resolver_payload_override = (
+            target.resolver_payload
+            if target is not None
+            and correction.correction_type in _TARGET_SUPERSESSION_CORRECTIONS
+            and target.proposition.kind == KnowledgeKind.SIGNAL_MAPPING
+            else None
         )
+        if resolver_payload_override is None:
+            _, revision = self.evaluate_candidate(
+                candidate.id,
+                tenant_id=tenant_id,
+                authoritative_source=authoritative,
+                ignored_conflict_ids={conflict.id for conflict in replaceable_conflicts},
+                _correction_id=correction.id,
+            )
+        else:
+            revision = self._evaluate_candidate_result_with_authorized_overrides(
+                candidate.id,
+                tenant_id=tenant_id,
+                authoritative_source=authoritative,
+                live_verified=False,
+                ignored_conflict_ids={conflict.id for conflict in replaceable_conflicts},
+                _correction_id=correction.id,
+                resolver_payload_override=resolver_payload_override,
+            ).revision
         superseded = False
-        if revision and target is not None and replaceable_conflicts and correction.target_ref != revision.knowledge_id:
+        supersession_required = correction.correction_type in _TARGET_SUPERSESSION_CORRECTIONS
+        if (
+            revision
+            and target is not None
+            and (replaceable_conflicts or supersession_required)
+            and correction.target_ref != revision.knowledge_id
+        ):
             self.supersede(
                 correction.target_ref,
                 candidate.id,
@@ -1533,15 +1578,85 @@ class KnowledgeService:
         tenant_id: str | None = None,
         expected_revision: int | None = None,
     ) -> KnowledgeRevision:
+        enforce_knowledge_action(self._runtime_settings, KnowledgeAction.APPLY)
         tenant_id = self._resolve_tenant(tenant_id)
-        current = self.repository.get_revision(
-            knowledge_id,
-            expected_revision,
-            tenant_id=tenant_id,
-        )
-        candidate = self._require_candidate(replacement_candidate_id, tenant_id)
+        observed = self.repository.get_revision(knowledge_id, tenant_id=tenant_id)
+        if observed is not None and observed.proposition.kind == KnowledgeKind.SIGNAL_MAPPING:
+            self._signal_store()
+        with self.repository.transaction():
+            return self._supersede_in_transaction(
+                knowledge_id,
+                replacement_candidate_id,
+                tenant_id=tenant_id,
+                expected_revision=expected_revision,
+            )
+
+    def _supersede_in_transaction(
+        self,
+        knowledge_id: str,
+        replacement_candidate_id: str,
+        *,
+        tenant_id: str,
+        expected_revision: int | None,
+    ) -> KnowledgeRevision:
+        current = self.repository.get_revision(knowledge_id, tenant_id=tenant_id)
         if current is None:
             raise ValueError("knowledge item not found")
+        candidate = self._require_candidate(replacement_candidate_id, tenant_id)
+        if candidate.state.review_state not in {ReviewState.APPROVED, ReviewState.TRUSTED}:
+            raise ValueError("replacement candidate must be approved or trusted")
+        if candidate.state.lifecycle_status != LifecycleStatus.ACTIVE:
+            raise ValueError("replacement candidate must be active")
+        correction = self.repository.get_correction_for_candidate(candidate.id, tenant_id)
+        if correction is None:
+            raise ValueError("knowledge supersession requires a reviewed correction candidate")
+        if correction.review_state != ReviewState.APPROVED:
+            raise ValueError("knowledge supersession requires an approved correction")
+        if correction.target_ref != knowledge_id:
+            raise ValueError("replacement correction does not target this knowledge item")
+        if correction.applied_knowledge_ref:
+            applied = self.repository.get_revision(
+                correction.applied_knowledge_ref,
+                correction.applied_knowledge_revision,
+                tenant_id=tenant_id,
+            )
+            if (
+                applied is not None
+                and candidate.id in applied.promoted_from_candidate_refs
+                and current.state.lifecycle_status == LifecycleStatus.SUPERSEDED
+                and current.parent_revision == correction.target_revision
+            ):
+                return current
+            raise KnowledgeRevisionConflictError("knowledge correction application state is inconsistent")
+        if expected_revision is not None and current.revision != expected_revision:
+            raise KnowledgeRevisionConflictError(
+                f"knowledge target advanced from revision {expected_revision} to {current.revision}; "
+                "rebase the correction"
+            )
+        if correction.target_revision != current.revision:
+            raise KnowledgeRevisionConflictError(
+                f"knowledge target advanced from revision {correction.target_revision} to {current.revision}; "
+                "rebase the correction"
+            )
+        if current.state.lifecycle_status != LifecycleStatus.ACTIVE:
+            raise ValueError("only active knowledge can be superseded")
+        replacement_item = self.repository.find_knowledge_by_proposition(
+            tenant_id,
+            candidate.proposition.proposition_key,
+        )
+        replacement = (
+            self.repository.get_revision(replacement_item.id, tenant_id=tenant_id)
+            if replacement_item is not None
+            else None
+        )
+        if (
+            candidate.state.eligibility == KnowledgeEligibility.INELIGIBLE
+            or replacement is None
+            or replacement.state.lifecycle_status != LifecycleStatus.ACTIVE
+            or replacement.state.eligibility == KnowledgeEligibility.INELIGIBLE
+            or candidate.id not in replacement.promoted_from_candidate_refs
+        ):
+            raise ValueError("replacement candidate must have an active promoted revision")
         decision = self._state_decision(candidate, PromotionDecisionType.SUPERSEDE, "superseded_by_correction")
         self.repository.save_promotion_decision(decision, tenant_id)
         state = transition_lifecycle_state(current.state, LifecycleStatus.SUPERSEDED)
@@ -1565,7 +1680,15 @@ class KnowledgeService:
             revision,
             candidate_id=candidate.id,
             decision_ref=decision.decision_id,
-            expected_parent_revision=expected_revision,
+            expected_parent_revision=current.revision,
+        )
+        self.repository.save_correction(
+            correction.model_copy(
+                update={
+                    "applied_knowledge_ref": replacement.knowledge_id,
+                    "applied_knowledge_revision": replacement.revision,
+                }
+            )
         )
         self.repository.append_event(
             "knowledge_superseded",
@@ -1951,27 +2074,17 @@ class KnowledgeService:
     ) -> dict[str, Any]:
         """Freeze exact resolver inputs so revisions never depend on mutable candidates."""
         mappings: dict[str, dict[str, Any]] = {}
-        for contributor in contributors or [candidate]:
-            pattern = (
-                str(
-                    contributor.typed_payload.get("metric_pattern")
-                    or contributor.typed_payload.get("candidate_metric")
-                    or contributor.typed_payload.get("metric")
-                    or contributor.typed_payload.get("object_ref")
-                    or contributor.proposition.object_ref
-                    or ""
-                )
-                .removeprefix("concept:")
-                .strip()
-            )
+
+        def merge_mapping(raw: dict[str, Any]) -> None:
+            pattern = str(raw.get("metric_pattern") or "").removeprefix("concept:").strip()
             if not pattern:
-                continue
+                return
             try:
-                confidence = float(contributor.typed_payload.get("confidence", 0.5))
+                confidence = float(raw.get("confidence", 0.5))
             except (TypeError, ValueError):
                 confidence = 0.5
             confidence = max(0.0, min(1.0, confidence))
-            datasource_types = contributor.typed_payload.get("context_datasource_types", [])
+            datasource_types = raw.get("context_datasource_types", [])
             if not isinstance(datasource_types, list):
                 datasource_types = []
             existing = mappings.setdefault(
@@ -1987,6 +2100,19 @@ class KnowledgeService:
                 {
                     *existing["context_datasource_types"],
                     *[str(value).strip() for value in datasource_types if str(value).strip()],
+                }
+            )
+
+        for contributor in contributors or [candidate]:
+            merge_mapping(
+                {
+                    "metric_pattern": contributor.typed_payload.get("metric_pattern")
+                    or contributor.typed_payload.get("candidate_metric")
+                    or contributor.typed_payload.get("metric")
+                    or contributor.typed_payload.get("object_ref")
+                    or contributor.proposition.object_ref,
+                    "confidence": contributor.typed_payload.get("confidence", 0.5),
+                    "context_datasource_types": contributor.typed_payload.get("context_datasource_types", []),
                 }
             )
         return {"mappings": [mappings[key] for key in sorted(mappings)]}
@@ -2177,6 +2303,34 @@ class KnowledgeService:
         if correction_type in {CorrectionType.MISSING_CHECK, CorrectionType.OBSERVATION_DISPUTE}:
             return KnowledgeKind.EVIDENCE_REQUIREMENT
         return KnowledgeKind(proposed.get("kind", KnowledgeKind.ARTIFACT_QUALITY.value))
+
+    def _target_proposition_for_scope_correction(
+        self,
+        target: KnowledgeRevision,
+        proposed: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Keep scope and validity corrections bound to the reviewed proposition."""
+        if "kind" in proposed and KnowledgeKind(proposed["kind"]) != target.proposition.kind:
+            raise ValueError("scope and time-window corrections cannot change the target proposition")
+        for field_name in ("subject_ref", "object_ref", "concept_ref"):
+            if field_name in proposed and normalize_ref(str(proposed[field_name])) != getattr(
+                target.proposition,
+                field_name,
+            ):
+                raise ValueError("scope and time-window corrections cannot change the target proposition")
+        if (
+            "predicate" in proposed
+            and self.normalizer.normalize_predicate(proposed["predicate"]) != target.proposition.predicate
+        ):
+            raise ValueError("scope and time-window corrections cannot change the target proposition")
+        return {
+            "subject_ref": target.proposition.subject_ref,
+            "predicate": target.proposition.predicate,
+            "object_ref": target.proposition.object_ref,
+            "concept_ref": target.proposition.concept_ref,
+            "source_wording": str(proposed.get("source_wording", target.proposition.source_wording)),
+            "uncertainty": str(proposed.get("uncertainty", target.proposition.uncertainty)),
+        }
 
     @staticmethod
     def _entity_mapping_values(proposed: dict[str, Any]) -> tuple[str, str]:

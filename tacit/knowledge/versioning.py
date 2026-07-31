@@ -40,6 +40,27 @@ def _contains(specifiers: SpecifierSet, version: Version) -> bool:
     return specifiers.contains(version, prereleases=True)
 
 
+def _arbitrary_equality_literal(value: str) -> str | None:
+    selector = _selector_value(value)
+    if not selector.startswith("==="):
+        return None
+    literal = selector[3:]
+    if not literal:
+        return None
+    try:
+        Version(literal)
+    except InvalidVersion:
+        return literal
+    return None
+
+
+def _plain_literal(value: str) -> str | None:
+    selector = _selector_value(value)
+    if not selector or selector.startswith(_SPECIFIER_OPERATORS):
+        return None
+    return selector
+
+
 @dataclass(frozen=True)
 class _Bound:
     version: Version
@@ -227,6 +248,15 @@ def _specifier_sets_overlap(left: SpecifierSet, right: SpecifierSet) -> bool:
 
 def version_selectors_overlap(left: str, right: str) -> bool:
     """Return whether two exact or PEP 440 version selectors can match."""
+    left_arbitrary = _arbitrary_equality_literal(left)
+    right_arbitrary = _arbitrary_equality_literal(right)
+    if left_arbitrary is not None or right_arbitrary is not None:
+        if left_arbitrary is not None and right_arbitrary is not None:
+            return left_arbitrary == right_arbitrary
+        arbitrary = left_arbitrary if left_arbitrary is not None else right_arbitrary
+        literal = _plain_literal(right if left_arbitrary is not None else left)
+        return literal is not None and arbitrary == literal
+
     left_specifiers = _specifier_set(left)
     right_specifiers = _specifier_set(right)
     left_version = _version(left)
