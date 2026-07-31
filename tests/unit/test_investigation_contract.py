@@ -3066,6 +3066,35 @@ def test_contract_api_rejects_unsupported_schema_in_history(tmp_path, monkeypatc
     assert response.status_code == 404
 
 
+def test_knowledge_bearing_history_disclosures_require_read_permission(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    app = create_app(runtime_settings=Settings(knowledge_permissions="knowledge.apply"))
+    app.dependency_overrides[get_history_store] = lambda: store
+    client = TestClient(app)
+
+    responses = [
+        client.get(f"/api/v1/investigations/{investigation_id}/events"),
+        client.get(f"/api/v1/investigations/{investigation_id}/contract"),
+        client.post(f"/api/v1/investigations/{investigation_id}/replay"),
+        client.post(
+            f"/api/v1/investigations/{investigation_id}/corrections",
+            json={"correction_text": "Do not disclose contract-derived provenance."},
+        ),
+        client.get(f"/api/v1/investigations/{investigation_id}/corrections"),
+        client.post(
+            f"/api/v1/investigations/{investigation_id}/corrections/missing/review",
+            json={"approved": True, "reviewed_by": "operator"},
+        ),
+        client.post(f"/api/v1/investigations/{investigation_id}/corrections/missing/apply"),
+        client.post(f"/api/v1/investigations/{investigation_id}/migrate"),
+    ]
+
+    assert {response.status_code for response in responses} == {403}
+    assert {response.json()["detail"] for response in responses} == {"Missing permission: knowledge.read"}
+
+
 def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch):
     store = InvestigationStore(
         db_path=tmp_path / "history.db",

@@ -1126,8 +1126,9 @@
     async function loadIngestedDashboards() {
       const el = document.getElementById('ingested-list');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      const tenant = selectedTenant();
       try {
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboards`, { headers: knowledgeHeaders() });
+        const resp = await fetch(`${BASE}/api/v1/learn/dashboards`, { headers: knowledgeHeaders({}, tenant) });
         const data = await resp.json();
         const dashboards = data.dashboards || [];
         if (!dashboards.length) {
@@ -1157,9 +1158,9 @@
             : '';
           const quality = renderSignalQuality(d.signal_quality, d.learning_impact);
           const reviewBtns = d.status === 'pending'
-            ? `<button class="btn-sm btn-success review-dashboard-btn" data-dashboard-action="approve" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Approve</button>
-               <button class="btn-sm review-dashboard-btn" data-dashboard-action="reject" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Reject</button>
-               <button class="btn-sm review-dashboard-btn" data-dashboard-action="ignore" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Ignore</button>`
+            ? `<button class="btn-sm btn-success review-dashboard-btn" data-dashboard-action="approve" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}" data-dashboard-tenant="${escAttr(tenant)}">Approve</button>
+               <button class="btn-sm review-dashboard-btn" data-dashboard-action="reject" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}" data-dashboard-tenant="${escAttr(tenant)}">Reject</button>
+               <button class="btn-sm review-dashboard-btn" data-dashboard-action="ignore" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}" data-dashboard-tenant="${escAttr(tenant)}">Ignore</button>`
             : '';
           html += `
             <div class="ingest-card">
@@ -1184,12 +1185,12 @@
       }
     }
 
-    async function reviewDashboard(uid, action, backend = '') {
+    async function reviewDashboard(uid, action, backend = '', tenant = selectedTenant()) {
       try {
         const backendQuery = backend ? `?backend=${encodeURIComponent(backend)}` : '';
         const resp = await fetch(`${BASE}/api/v1/learn/dashboards/${encodeURIComponent(uid)}/${encodeURIComponent(action)}${backendQuery}`, {
           method: 'POST',
-          headers: knowledgeHeaders(),
+          headers: knowledgeHeaders({}, tenant),
         });
         if (!resp.ok) throw new Error(`${action} failed`);
         loadIngestedDashboards();
@@ -1406,7 +1407,12 @@
     document.getElementById('ingested-list').addEventListener('click', (e) => {
       const btn = e.target.closest('.review-dashboard-btn');
       if (btn && btn.dataset.dashboardUid) {
-        reviewDashboard(btn.dataset.dashboardUid, btn.dataset.dashboardAction || 'approve', btn.dataset.dashboardBackend || '');
+        reviewDashboard(
+          btn.dataset.dashboardUid,
+          btn.dataset.dashboardAction || 'approve',
+          btn.dataset.dashboardBackend || '',
+          btn.dataset.dashboardTenant || '',
+        );
       }
     });
 

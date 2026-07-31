@@ -648,49 +648,54 @@ def reject_ingested_dashboard_record(
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Reject a pending ingested dashboard and persist heuristic negatives."""
+    from tacit.api.security import KnowledgeAction, enforce_knowledge_action
+
+    active_settings = runtime_settings or settings
+    enforce_knowledge_action(active_settings, KnowledgeAction.REJECT)
     store = store or get_signal_store()
-    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
-    ingested = store.get_ingested_dashboard(
-        dashboard_uid,
-        backend_name=backend_name,
-        tenant_id=effective_tenant,
-    )
-    if ingested is None:
-        raise LookupError("Ingested dashboard not found")
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
+    with store.transaction():
+        ingested = store.get_ingested_dashboard(
+            dashboard_uid,
+            backend_name=backend_name,
+            tenant_id=effective_tenant,
+        )
+        if ingested is None:
+            raise LookupError("Ingested dashboard not found")
 
-    if ingested["status"] != "pending":
-        return {
-            "dashboard_uid": dashboard_uid,
-            "backend_name": ingested.get("backend_name", ""),
-            "status": ingested["status"],
-            "rejected_candidates": 0,
-            "message": f"Dashboard already {ingested['status']}",
-        }
+        if ingested["status"] != "pending":
+            return {
+                "dashboard_uid": dashboard_uid,
+                "backend_name": ingested.get("backend_name", ""),
+                "status": ingested["status"],
+                "rejected_candidates": 0,
+                "message": f"Dashboard already {ingested['status']}",
+            }
 
-    rejected_candidates = 0
-    for sig in ingested.get("signals_inferred", []):
-        if isinstance(sig, dict) and sig.get("source") == "heuristic" and sig.get("metric"):
-            store.record_rejected_candidate(
-                metric=sig["metric"],
-                signal_family=sig.get("signal_family", ""),
-                signal_name=sig.get("signal_type", ""),
-                score=sig.get("score", 0.0),
-                margin=sig.get("margin", 0.0),
-                why_not="dashboard_rejected",
-                evidence=sig.get("evidence", []),
-                inference_version=sig.get("inference_version", ""),
-                dashboard_uid=dashboard_uid,
-                backend_name=ingested.get("backend_name", ""),
-                tenant_id=effective_tenant,
-            )
-            rejected_candidates += 1
+        if not store.reject_ingested_dashboard(
+            dashboard_uid,
+            backend_name=backend_name,
+            tenant_id=effective_tenant,
+        ):
+            raise RuntimeError("Dashboard is no longer pending")
 
-    if not store.reject_ingested_dashboard(
-        dashboard_uid,
-        backend_name=backend_name,
-        tenant_id=effective_tenant,
-    ):
-        raise RuntimeError("Dashboard is no longer pending")
+        rejected_candidates = 0
+        for sig in ingested.get("signals_inferred", []):
+            if isinstance(sig, dict) and sig.get("source") == "heuristic" and sig.get("metric"):
+                store.record_rejected_candidate(
+                    metric=sig["metric"],
+                    signal_family=sig.get("signal_family", ""),
+                    signal_name=sig.get("signal_type", ""),
+                    score=sig.get("score", 0.0),
+                    margin=sig.get("margin", 0.0),
+                    why_not="dashboard_rejected",
+                    evidence=sig.get("evidence", []),
+                    inference_version=sig.get("inference_version", ""),
+                    dashboard_uid=dashboard_uid,
+                    backend_name=ingested.get("backend_name", ""),
+                    tenant_id=effective_tenant,
+                )
+                rejected_candidates += 1
 
     return {
         "dashboard_uid": dashboard_uid,

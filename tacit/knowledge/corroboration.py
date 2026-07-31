@@ -203,8 +203,12 @@ class ConflictDetectionService:
             )
             reopened = bool(
                 existing
-                and existing.resolution_status == ConflictResolutionStatus.RESOLVED_BY_REVIEW
-                and (existing.resolution_reason == "counter_proposition_rejected" or reviewed_support_for_superseded)
+                and existing.resolution_status
+                in {ConflictResolutionStatus.RESOLVED_BY_REVIEW, ConflictResolutionStatus.RESOLVED_BY_TIME}
+                and (
+                    existing.resolution_reason in {"counter_proposition_rejected", "counter_proposition_stale"}
+                    or reviewed_support_for_superseded
+                )
                 and conflict.resolution_status == ConflictResolutionStatus.UNRESOLVED
             )
             if (
@@ -221,6 +225,8 @@ class ConflictDetectionService:
             self.repository.save_conflict(conflict)
             if reopened and reviewed_support_for_superseded:
                 event_reason = "new_support_for_superseded_proposition"
+            elif reopened and existing and existing.resolution_reason == "counter_proposition_stale":
+                event_reason = "source_reactivated"
             elif reopened:
                 event_reason = "new_candidate_after_rejection"
             else:

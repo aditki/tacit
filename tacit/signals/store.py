@@ -24,6 +24,7 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -145,10 +146,18 @@ class SignalStore:
         configured_tenant = str(self._settings.knowledge_tenant_id or "default")
         self._legacy_tenant = configured_tenant if configured_tenant != "*" else None
         self._db_path = db_path or _db_path(self._settings)
+        self._transaction_connection: ContextVar[sqlite3.Connection | None] = ContextVar(
+            f"signal_transaction_{id(self)}",
+            default=None,
+        )
         self._ensure_schema()
 
     @contextmanager
     def _conn(self):
+        active = self._transaction_connection.get()
+        if active is not None:
+            yield active
+            return
         conn = sqlite3.connect(str(self._db_path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
@@ -170,6 +179,21 @@ class SignalStore:
             raise
         finally:
             conn.close()
+
+    @contextmanager
+    def transaction(self):
+        """Run signal-store writes in one immediate, nestable transaction."""
+        active = self._transaction_connection.get()
+        if active is not None:
+            yield active
+            return
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            token = self._transaction_connection.set(conn)
+            try:
+                yield conn
+            finally:
+                self._transaction_connection.reset(token)
 
     def _ensure_schema(self):
         bootstrap_signal_definitions: dict[str, dict[str, Any]] | None = None

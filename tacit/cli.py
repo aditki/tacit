@@ -517,16 +517,6 @@ def _cli_runtime_stores():
     return RuntimeStores(create_settings())
 
 
-def _cli_knowledge_repository():
-    """Resolve Operational Knowledge from the CLI runtime's signal database."""
-    return _cli_runtime_stores().knowledge_repository()
-
-
-def _cli_knowledge_service():
-    """Resolve Operational Knowledge orchestration for the active CLI command."""
-    return _cli_runtime_stores().knowledge()
-
-
 def _cli_store_settings(stores: Any) -> Any:
     from tacit.config import settings
 
@@ -904,13 +894,13 @@ def investigate(prompt: str | None, json_output: bool, open_browser: bool, tenan
     _load_env()
     if prompt is None:
         prompt = "High latency on the checkout service in the last hour"
-    tenant_id = _knowledge_tenant(tenant)
+    stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
 
     import asyncio
 
     from tacit.dependencies import build_pipeline_dependencies
 
-    stores = _cli_runtime_stores()
     deps = build_pipeline_dependencies(stores.settings, stores=stores)
 
     async def _run():
@@ -967,7 +957,8 @@ def test_run(prompt: str | None, open_browser: bool, tenant: str | None):
 
     if prompt is None:
         prompt = "High latency on the checkout service in the last hour"
-    tenant_id = _knowledge_tenant(tenant)
+    stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
     _info(f'Prompt: "{prompt}"')
     console.print()
 
@@ -975,7 +966,6 @@ def test_run(prompt: str | None, open_browser: bool, tenant: str | None):
 
     from tacit.dependencies import build_pipeline_dependencies
 
-    stores = _cli_runtime_stores()
     deps = build_pipeline_dependencies(stores.settings, stores=stores)
 
     async def _run():
@@ -1445,8 +1435,8 @@ def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool,
         _fail("Pass exactly one of --file or --dir.")
         return
     stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
     signal_store = None if dry_run else stores.signals()
-    tenant_id = _knowledge_tenant(tenant)
     try:
         if file_path:
             from tacit.artifact_learning import learn_runbook_file
@@ -1490,8 +1480,8 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
         _fail("Pass exactly one of --file or --dir.")
         return
     stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
     signal_store = None if dry_run else stores.signals()
-    tenant_id = _knowledge_tenant(tenant)
     try:
         if file_path:
             from tacit.artifact_learning import learn_incident_file
@@ -1550,11 +1540,10 @@ def learn_pagerduty(
     """Learn incident metadata from PagerDuty (read-only)."""
     _header("Learn PagerDuty Incidents")
     _load_env()
-    tenant_id = _knowledge_tenant(tenant)
+    stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
 
     import asyncio
-
-    stores = _cli_runtime_stores()
 
     async def _run():
         from tacit.integrations.pagerduty import PagerDutyClient, learn_pagerduty_incidents
@@ -2156,11 +2145,11 @@ def knowledge_review(
 ):
     """Review a candidate and evaluate it for promotion."""
     _load_env()
-    from tacit.api.security import KNOWLEDGE_ACTION_PERMISSIONS, KnowledgeAction
-    from tacit.config import settings
+    from tacit.api.security import KnowledgeAction
 
-    tenant_id = _knowledge_tenant(tenant)
-    service = _cli_knowledge_service()
+    stores = _cli_runtime_stores()
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
     selected = [value for value, enabled in (("approve", approve), ("reject", reject), ("trust", trust)) if enabled]
     if decision:
         selected.append(decision)
@@ -2172,12 +2161,10 @@ def knowledge_review(
         "reject": KnowledgeAction.REJECT,
         "trust": KnowledgeAction.TRUST,
     }[decision]
-    permissions = {value.strip() for value in settings.knowledge_permissions.split(",") if value.strip()}
-    for permission in KNOWLEDGE_ACTION_PERMISSIONS[action]:
-        if permission not in permissions:
-            raise click.ClickException(f"missing permission: {permission}")
-    if (authoritative_source or live_verified) and "knowledge.override" not in permissions:
-        raise click.ClickException("missing permission: knowledge.override")
+    _require_cli_knowledge_action(action, runtime_settings)
+    if authoritative_source or live_verified:
+        _require_cli_knowledge_action(KnowledgeAction.OVERRIDE, runtime_settings)
+    service = stores.knowledge()
     try:
         candidate = service.review_candidate(
             candidate_id,

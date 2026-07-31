@@ -169,6 +169,7 @@ async def list_investigation_events(
     run_id: str | None = None,
     store: Any = Depends(get_history_store),
 ):
+    assert_knowledge_action(request, KnowledgeAction.READ)
     selected_tenant = knowledge_tenant(request)
     _authorize_investigation(request, store, investigation_id)
     events = store.list_events(investigation_id, run_id, tenant_id=selected_tenant)
@@ -189,6 +190,7 @@ async def get_investigation_contract(
     revision: int | None = None,
     store: Any = Depends(get_history_store),
 ):
+    assert_knowledge_action(request, KnowledgeAction.READ)
     contract = _authorized_contract(request, store, investigation_id, revision)
     return contract.model_dump(mode="json", by_alias=True)
 
@@ -233,6 +235,7 @@ async def replay_investigation(
     store: Any = Depends(get_history_store),
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
+    assert_knowledge_action(http_request, KnowledgeAction.READ)
     replay_request = request or ReplayRequest()
     selected_tenant = knowledge_tenant(http_request)
     source_contract = store.get_contract(investigation_id, revision, tenant_id=selected_tenant)
@@ -272,6 +275,7 @@ async def create_correction_candidate(
     request: Request,
     store: Any = Depends(get_history_store),
 ):
+    assert_knowledge_action(request, KnowledgeAction.READ)
     assert_knowledge_action(request, KnowledgeAction.CORRECT)
     selected_tenant = knowledge_tenant(request)
     _authorized_contract(request, store, investigation_id, payload.revision)
@@ -294,6 +298,7 @@ async def create_correction_candidate(
     summary="List correction candidates",
 )
 async def list_correction_candidates(investigation_id: str, request: Request, store: Any = Depends(get_history_store)):
+    assert_knowledge_action(request, KnowledgeAction.READ)
     selected_tenant = knowledge_tenant(request)
     _authorize_investigation(request, store, investigation_id)
     candidates = store.list_knowledge_candidates(investigation_id, tenant_id=selected_tenant)
@@ -314,6 +319,7 @@ async def review_correction_candidate(
     request: Request,
     store: Any = Depends(get_history_store),
 ):
+    assert_knowledge_action(request, KnowledgeAction.READ)
     assert_knowledge_action(
         request,
         KnowledgeAction.APPROVE if payload.approved else KnowledgeAction.REJECT,
@@ -343,6 +349,7 @@ async def apply_correction_candidate(
     request: Request,
     store: Any = Depends(get_history_store),
 ):
+    assert_knowledge_action(request, KnowledgeAction.READ)
     assert_knowledge_action(request, KnowledgeAction.APPLY)
     selected_tenant = knowledge_tenant(request)
     _authorize_investigation(request, store, investigation_id)
@@ -402,6 +409,7 @@ async def refresh_investigation(
     summary="Migrate a legacy history record to Investigation Contract v1",
 )
 async def migrate_investigation(investigation_id: str, request: Request, store: Any = Depends(get_history_store)):
+    assert_knowledge_action(request, KnowledgeAction.READ)
     selected_tenant = knowledge_tenant(request)
     _authorize_investigation(request, store, investigation_id)
     contract = store.migrate_legacy_investigation(investigation_id, tenant_id=selected_tenant)

@@ -302,6 +302,8 @@ CREATE TABLE IF NOT EXISTS knowledge_corrections (
     investigation_revision INTEGER NOT NULL,
     correction_type TEXT NOT NULL,
     target_ref TEXT NOT NULL,
+    applied_knowledge_ref TEXT NOT NULL DEFAULT '',
+    applied_knowledge_revision INTEGER,
     review_state TEXT NOT NULL,
     candidate_ref TEXT NOT NULL,
     correction_json TEXT NOT NULL,
@@ -393,6 +395,48 @@ class KnowledgeRepository:
     def _ensure_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(SCHEMA_SQL)
+            correction_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(knowledge_corrections)").fetchall()
+            }
+            missing_applied_ref = "applied_knowledge_ref" not in correction_columns
+            missing_applied_revision = "applied_knowledge_revision" not in correction_columns
+            backfill_applied_refs = missing_applied_ref or missing_applied_revision
+            if missing_applied_ref:
+                conn.execute(
+                    "ALTER TABLE knowledge_corrections ADD COLUMN applied_knowledge_ref TEXT NOT NULL DEFAULT ''"
+                )
+            if missing_applied_revision:
+                conn.execute("ALTER TABLE knowledge_corrections ADD COLUMN applied_knowledge_revision INTEGER")
+            legacy_rows = (
+                conn.execute("SELECT correction_id, correction_json FROM knowledge_corrections").fetchall()
+                if backfill_applied_refs
+                else []
+            )
+            for row in legacy_rows:
+                try:
+                    correction = KnowledgeCorrection.model_validate_json(row["correction_json"])
+                except ValueError:
+                    logger.warning(
+                        "knowledge_correction_backfill_skipped",
+                        correction_id=row["correction_id"],
+                        reason="invalid_correction_json",
+                    )
+                    continue
+                if correction.applied_knowledge_ref:
+                    conn.execute(
+                        """UPDATE knowledge_corrections
+                           SET applied_knowledge_ref=?, applied_knowledge_revision=?
+                           WHERE correction_id=?""",
+                        (
+                            correction.applied_knowledge_ref,
+                            correction.applied_knowledge_revision,
+                            correction.id,
+                        ),
+                    )
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_knowledge_corrections_target
+                   ON knowledge_corrections(tenant_id, target_ref)""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_knowledge_corrections_applied
+                   ON knowledge_corrections(tenant_id, applied_knowledge_ref)""")
         logger.info("knowledge_repository_init", db_path=str(self._db_path))
 
     def append_event(
@@ -1377,8 +1421,9 @@ class KnowledgeRepository:
             conn.execute(
                 """INSERT INTO knowledge_corrections (
                    correction_id, tenant_id, investigation_id, investigation_revision, correction_type,
-                   target_ref, review_state, candidate_ref, correction_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   target_ref, applied_knowledge_ref, applied_knowledge_revision, review_state,
+                   candidate_ref, correction_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(correction_id) DO UPDATE SET
                    review_state=CASE
                      WHEN excluded.review_state='candidate' AND knowledge_corrections.review_state!='candidate'
@@ -1386,6 +1431,13 @@ class KnowledgeRepository:
                    candidate_ref=CASE
                      WHEN excluded.review_state='candidate' AND knowledge_corrections.review_state!='candidate'
                      THEN knowledge_corrections.candidate_ref ELSE excluded.candidate_ref END,
+                   applied_knowledge_ref=CASE
+                     WHEN excluded.review_state='candidate' AND knowledge_corrections.review_state!='candidate'
+                     THEN knowledge_corrections.applied_knowledge_ref ELSE excluded.applied_knowledge_ref END,
+                   applied_knowledge_revision=CASE
+                     WHEN excluded.review_state='candidate' AND knowledge_corrections.review_state!='candidate'
+                     THEN knowledge_corrections.applied_knowledge_revision
+                     ELSE excluded.applied_knowledge_revision END,
                    correction_json=CASE
                      WHEN excluded.review_state='candidate' AND knowledge_corrections.review_state!='candidate'
                      THEN knowledge_corrections.correction_json ELSE excluded.correction_json END,
@@ -1397,6 +1449,8 @@ class KnowledgeRepository:
                     correction.investigation_revision,
                     correction.correction_type.value,
                     correction.target_ref,
+                    correction.applied_knowledge_ref,
+                    correction.applied_knowledge_revision,
                     correction.review_state.value,
                     correction.knowledge_candidate_ref,
                     correction.model_dump_json(),
@@ -1431,6 +1485,32 @@ class KnowledgeRepository:
                 (candidate_id, tenant_id),
             ).fetchone()
         return KnowledgeCorrection.model_validate_json(row["correction_json"]) if row else None
+
+    def list_corrections_for_knowledge(
+        self,
+        knowledge_id: str,
+        tenant_id: str = "default",
+    ) -> list[KnowledgeCorrection]:
+        """Return corrections that targeted or produced one knowledge item."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT correction_json FROM knowledge_corrections
+                   WHERE tenant_id=? AND (target_ref=? OR applied_knowledge_ref=?)
+                   ORDER BY created_at""",
+                (tenant_id, knowledge_id, knowledge_id),
+            ).fetchall()
+        corrections = []
+        for row in rows:
+            try:
+                corrections.append(KnowledgeCorrection.model_validate_json(row["correction_json"]))
+            except ValueError:
+                logger.warning(
+                    "knowledge_correction_lookup_skipped",
+                    tenant_id=tenant_id,
+                    knowledge_id=knowledge_id,
+                    reason="invalid_correction_json",
+                )
+        return corrections
 
     def stats(self, tenant_id: str = "default") -> dict[str, Any]:
         with self._conn() as conn:

@@ -2889,6 +2889,76 @@ class TestIngestedDashboards:
         assert rejected[0]["why_not"] == "dashboard_rejected"
         assert rejected[0]["dashboard_uid"] == "checkout-reject"
 
+    def test_reject_record_enforces_permission_before_mutating(self, signal_store):
+        signal_store.record_ingested_dashboard(
+            "checkout-reject-denied",
+            backend_name="grafana_json",
+            metrics_found=["checkout_5xx_count"],
+            signals_inferred=[
+                {
+                    "signal_type": "error_rate",
+                    "metric": "checkout_5xx_count",
+                    "source": "heuristic",
+                    "signal_family": "errors",
+                }
+            ],
+            status="pending",
+        )
+
+        with pytest.raises(PermissionError, match="knowledge.reject"):
+            reject_ingested_dashboard_record(
+                dashboard_uid="checkout-reject-denied",
+                backend_name="grafana_json",
+                store=signal_store,
+                runtime_settings=Settings(_env_file=None, knowledge_permissions="knowledge.read"),
+            )
+
+        persisted = signal_store.get_ingested_dashboard(
+            "checkout-reject-denied",
+            backend_name="grafana_json",
+        )
+        assert persisted is not None
+        assert persisted["status"] == "pending"
+        assert signal_store.list_rejected_candidates() == []
+
+    def test_reject_record_rolls_back_status_and_negatives_together(self, signal_store, monkeypatch):
+        signal_store.record_ingested_dashboard(
+            "checkout-reject-rollback",
+            backend_name="grafana_json",
+            metrics_found=["checkout_5xx_count"],
+            signals_inferred=[
+                {
+                    "signal_type": "error_rate",
+                    "metric": "checkout_5xx_count",
+                    "source": "heuristic",
+                    "signal_family": "errors",
+                }
+            ],
+            status="pending",
+        )
+        persist_negative = signal_store.record_rejected_candidate
+
+        def fail_after_insert(*args, **kwargs):
+            persist_negative(*args, **kwargs)
+            raise RuntimeError("simulated negative-training write failure")
+
+        monkeypatch.setattr(signal_store, "record_rejected_candidate", fail_after_insert)
+
+        with pytest.raises(RuntimeError, match="simulated negative-training write failure"):
+            reject_ingested_dashboard_record(
+                dashboard_uid="checkout-reject-rollback",
+                backend_name="grafana_json",
+                store=signal_store,
+            )
+
+        persisted = signal_store.get_ingested_dashboard(
+            "checkout-reject-rollback",
+            backend_name="grafana_json",
+        )
+        assert persisted is not None
+        assert persisted["status"] == "pending"
+        assert signal_store.list_rejected_candidates() == []
+
     @pytest.mark.asyncio
     async def test_auto_approve_honors_heuristic_auto_teach_gate(self, signal_store, monkeypatch):
         from tacit import dashboard_ingest as di
@@ -4649,4 +4719,7 @@ class TestLearningTabRendering:
         assert 'onclick="approveDashboard' not in load_section
         assert "data-dashboard-uid" in load_section
         assert "data-dashboard-backend" in load_section
+        assert "data-dashboard-tenant" in load_section
+        assert "knowledgeHeaders({}, tenant)" in load_section
+        assert "btn.dataset.dashboardTenant" in html
         assert "encodeURIComponent(uid)" in html

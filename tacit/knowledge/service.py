@@ -381,7 +381,12 @@ class KnowledgeService:
                 if review_state == ReviewState.REJECTED:
                     decision = self._state_decision(updated, PromotionDecisionType.REJECT, "rejected_by_review")
                     self.repository.save_promotion_decision(decision, tenant_id)
-                    self._resolve_conflicts_for_rejected_proposition(updated, reviewer)
+                    self._resolve_conflicts_for_ineligible_proposition(
+                        updated,
+                        reviewer,
+                        reason_code="counter_proposition_rejected",
+                        resolution_status=ConflictResolutionStatus.RESOLVED_BY_REVIEW,
+                    )
                     self._reconcile_removed_candidates(
                         [updated],
                         lifecycle_status=LifecycleStatus.WITHDRAWN,
@@ -1303,7 +1308,7 @@ class KnowledgeService:
             if current_target is None:
                 raise ValueError("correction target knowledge item not found")
             if current_target.revision != correction.target_revision:
-                raise ValueError(
+                raise KnowledgeRevisionConflictError(
                     f"correction target advanced from revision {correction.target_revision} "
                     f"to {current_target.revision}; rebase the correction"
                 )
@@ -1549,6 +1554,13 @@ class KnowledgeService:
                         continue
                     retired_candidates.append(updated)
 
+                for retired in retired_candidates:
+                    self._resolve_conflicts_for_ineligible_proposition(
+                        retired,
+                        "source_lifecycle",
+                        reason_code="counter_proposition_stale",
+                        resolution_status=ConflictResolutionStatus.RESOLVED_BY_TIME,
+                    )
                 return self._reconcile_removed_candidates(
                     retired_candidates,
                     lifecycle_status=LifecycleStatus.STALE,
@@ -1942,7 +1954,10 @@ class KnowledgeService:
                 )
             ],
             "live_corroboration": revision.state.eligibility == KnowledgeEligibility.LIVE_VERIFIED,
-            "corrections": [],
+            "corrections": [
+                correction.model_dump(mode="json")
+                for correction in self.repository.list_corrections_for_knowledge(knowledge_id, tenant_id)
+            ],
             "revision_history": [
                 item.model_dump(mode="json") for item in self.repository.list_revisions(knowledge_id, tenant_id)
             ],
@@ -1980,17 +1995,16 @@ class KnowledgeService:
             and existing.proposition.concept_ref == candidate.proposition.concept_ref
         )
 
-    def _resolve_conflicts_for_rejected_proposition(
+    def _resolve_conflicts_for_ineligible_proposition(
         self,
         candidate: KnowledgeCandidate,
-        reviewer: str,
+        resolved_by: str,
+        *,
+        reason_code: str,
+        resolution_status: ConflictResolutionStatus,
     ) -> None:
         proposition_key = candidate.proposition.proposition_key
-        viable_candidates = [
-            item
-            for item in self.repository.candidates_for_proposition(candidate.tenant_id, proposition_key)
-            if item.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
-        ]
+        viable_candidates = self.corroboration.reviewed_candidates(candidate.tenant_id, proposition_key)
         if viable_candidates:
             return
         for conflict in self.repository.list_conflicts(
@@ -2000,9 +2014,9 @@ class KnowledgeService:
         ):
             resolved = conflict.model_copy(
                 update={
-                    "resolution_status": ConflictResolutionStatus.RESOLVED_BY_REVIEW,
-                    "resolution_reason": "counter_proposition_rejected",
-                    "resolved_by": reviewer,
+                    "resolution_status": resolution_status,
+                    "resolution_reason": reason_code,
+                    "resolved_by": resolved_by,
                     "resolved_at": utc_now(),
                 }
             )
@@ -2013,7 +2027,7 @@ class KnowledgeService:
                 subject_ref=resolved.id,
                 dimensions={
                     "knowledge_kind": candidate.kind.value,
-                    "reason_code": "counter_proposition_rejected",
+                    "reason_code": reason_code,
                 },
                 payload={"candidate_id": candidate.id},
             )

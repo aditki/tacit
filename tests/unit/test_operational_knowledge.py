@@ -43,6 +43,7 @@ from tacit.knowledge.models import (
     Entity,
     EntityAlias,
     KnowledgeCandidate,
+    KnowledgeCorrection,
     KnowledgeEvidenceReference,
     KnowledgeRevision,
     KnowledgeScope,
@@ -113,6 +114,7 @@ def _dependency(
     object_ref: str = "entity:datastore:redis-session",
     subject_ref: str = "entity:service:checkout",
     version_constraints: list[str] | None = None,
+    reactivate_stale: bool = False,
 ):
     scope = KnowledgeScope(
         tenant_id=tenant_id,
@@ -142,6 +144,7 @@ def _dependency(
         ],
         provenance_refs=[f"provenance:{payload_ref}"],
         tenant_id=tenant_id,
+        reactivate_stale=reactivate_stale,
     )
 
 
@@ -801,6 +804,51 @@ def test_new_candidate_reopens_conflict_resolved_by_rejection(tmp_path: Path):
     assert conflicts[0].resolution_reason == ""
     assert service.repository.list_conflicts("default", unresolved_only=True) == conflicts
     assert any(event["event_type"] == "conflict_reopened" for event in service.repository.list_events("default"))
+
+
+def test_stale_last_source_resolves_conflict_and_reactivation_reopens_it(tmp_path: Path):
+    service = _service(tmp_path)
+    positive = _dependency(
+        service,
+        payload_ref="active-positive",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="positive",
+    )
+    negative = _dependency(
+        service,
+        payload_ref="stale-negative",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="negative",
+        predicate="does_not_depend_on",
+    )
+    service.review_candidate(positive.id, approved=True, reviewer="operator")
+    service.review_candidate(negative.id, approved=True, reviewer="operator")
+    assert service.conflicts.analyze("default", positive.proposition.proposition_key)[0].resolution_status == (
+        ConflictResolutionStatus.UNRESOLVED
+    )
+
+    service.reconcile_source_lifecycle(
+        provenance_ref="provenance:stale-negative",
+        source_stale=True,
+    )
+
+    resolved = service.repository.list_conflicts("default")
+    assert resolved[0].resolution_status == ConflictResolutionStatus.RESOLVED_BY_TIME
+    assert resolved[0].resolution_reason == "counter_proposition_stale"
+    reactivated = _dependency(
+        service,
+        payload_ref="stale-negative",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="negative",
+        predicate="does_not_depend_on",
+        reactivate_stale=True,
+    )
+    reopened = service.conflicts.analyze("default", reactivated.proposition.proposition_key)
+    assert reopened[0].resolution_status == ConflictResolutionStatus.UNRESOLVED
+    assert any(
+        event["event_type"] == "conflict_reopened" and event["reason_code"] == "source_reactivated"
+        for event in service.repository.list_events("default")
+    )
 
 
 def test_reviewed_support_reopens_conflict_resolved_by_correction(tmp_path: Path):
@@ -2260,6 +2308,82 @@ def test_migrated_ownership_scope_uses_owned_service(tmp_path: Path):
     assert revision is not None
 
 
+@pytest.mark.parametrize(
+    "preexisting_lookup_column",
+    [
+        "",
+        "applied_knowledge_ref TEXT NOT NULL DEFAULT '',",
+        "applied_knowledge_revision INTEGER,",
+    ],
+)
+def test_correction_lookup_columns_backfill_legacy_and_partial_schemas(
+    tmp_path: Path,
+    preexisting_lookup_column: str,
+):
+    db_path = tmp_path / "legacy-corrections.db"
+    correction = KnowledgeCorrection(
+        id="correction_legacy",
+        investigation_id="inv_legacy",
+        investigation_revision=1,
+        correction_type=CorrectionType.DEPENDENCY,
+        target_ref="knowledge_original",
+        target_revision=1,
+        proposed={"predicate": "does_not_depend_on"},
+        scope=KnowledgeScope(),
+        explanation="Legacy applied correction.",
+        review_state=ReviewState.APPROVED,
+        created_by="operator",
+        knowledge_candidate_ref="candidate_legacy",
+        applied_knowledge_ref="knowledge_replacement",
+        applied_knowledge_revision=2,
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(f"""CREATE TABLE knowledge_corrections (
+                correction_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                investigation_id TEXT NOT NULL,
+                investigation_revision INTEGER NOT NULL,
+                correction_type TEXT NOT NULL,
+                target_ref TEXT NOT NULL,
+                {preexisting_lookup_column}
+                review_state TEXT NOT NULL,
+                candidate_ref TEXT NOT NULL,
+                correction_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );""")
+        conn.execute(
+            """INSERT INTO knowledge_corrections (
+               correction_id, tenant_id, investigation_id, investigation_revision,
+               correction_type, target_ref, review_state, candidate_ref,
+               correction_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                correction.id,
+                correction.tenant_id,
+                correction.investigation_id,
+                correction.investigation_revision,
+                correction.correction_type.value,
+                correction.target_ref,
+                correction.review_state.value,
+                correction.knowledge_candidate_ref,
+                correction.model_dump_json(),
+                correction.created_at.timestamp(),
+                correction.created_at.timestamp(),
+            ),
+        )
+
+    repository = KnowledgeRepository(db_path)
+
+    assert repository.list_corrections_for_knowledge("knowledge_original") == [correction]
+    assert repository.list_corrections_for_knowledge("knowledge_replacement") == [correction]
+    with repository._conn() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(knowledge_corrections)").fetchall()}
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(knowledge_corrections)").fetchall()}
+    assert {"applied_knowledge_ref", "applied_knowledge_revision"}.issubset(columns)
+    assert {"idx_knowledge_corrections_target", "idx_knowledge_corrections_applied"}.issubset(indexes)
+
+
 def test_correction_creates_candidate_revision_and_impact(tmp_path: Path):
     service = _service(tmp_path)
     _, original = _promoted_dependency(service)
@@ -2293,6 +2417,32 @@ def test_correction_creates_candidate_revision_and_impact(tmp_path: Path):
     assert service.repository.get_revision(original.knowledge_id).state.lifecycle_status == LifecycleStatus.SUPERSEDED
     assert service.repository.get_revision(original.knowledge_id, 1) == original
     assert service.impact(original.knowledge_id).recommended_action == "replay_current"
+    now = datetime.now(UTC).timestamp()
+    with service.repository._conn() as conn:
+        conn.execute(
+            """INSERT INTO knowledge_corrections (
+               correction_id, tenant_id, investigation_id, investigation_revision, correction_type,
+               target_ref, applied_knowledge_ref, applied_knowledge_revision, review_state,
+               candidate_ref, correction_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "correction_malformed",
+                "default",
+                "inv_malformed",
+                1,
+                CorrectionType.ARTIFACT_QUALITY.value,
+                original.knowledge_id,
+                "",
+                None,
+                ReviewState.APPROVED.value,
+                "candidate_malformed",
+                "{invalid-json",
+                now,
+                now,
+            ),
+        )
+    assert [item["id"] for item in service.explain(original.knowledge_id)["corrections"]] == [correction.id]
+    assert [item["id"] for item in service.explain(replacement.knowledge_id)["corrections"]] == [correction.id]
 
 
 def test_correction_candidate_cannot_use_the_generic_review_or_evaluation_workflow(tmp_path: Path):
@@ -2384,7 +2534,7 @@ def test_correction_rejects_target_that_advanced_after_creation(tmp_path: Path):
     assert advanced is not None
     assert advanced.revision > original.revision
 
-    with pytest.raises(ValueError, match="advanced from revision 1 to 2"):
+    with pytest.raises(KnowledgeRevisionConflictError, match="advanced from revision 1 to 2"):
         service.review_correction(
             correction.id,
             approved=True,
@@ -4642,14 +4792,23 @@ def test_api_reports_concurrent_candidate_review_as_conflict(monkeypatch: pytest
     assert response.json()["detail"] == "candidate review state changed; reload before reviewing"
 
 
-def test_api_reports_stale_correction_supersession_as_conflict(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    "error",
+    [
+        CandidateReviewConflictError("candidate review state changed; reload before reviewing"),
+        CandidateEvaluationConflictError("candidate inputs changed; reload before evaluating"),
+        KnowledgeRevisionConflictError("knowledge target advanced from revision 1 to 2; rebase the correction"),
+    ],
+)
+def test_api_reports_concurrent_correction_review_as_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+    error: ValueError,
+):
     import tacit.api.routes.knowledge as routes
 
     class ConflictingService:
         def review_correction(self, *args, **kwargs):
-            raise KnowledgeRevisionConflictError(
-                "knowledge target advanced from revision 1 to 2; rebase the correction"
-            )
+            raise error
 
     monkeypatch.setattr(routes, "get_knowledge_service", lambda request: ConflictingService())
     client = TestClient(
@@ -4666,7 +4825,65 @@ def test_api_reports_stale_correction_supersession_as_conflict(monkeypatch: pyte
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "knowledge target advanced from revision 1 to 2; rebase the correction"
+    assert response.json()["detail"] == str(error)
+
+
+def test_api_reports_real_stale_correction_target_as_conflict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path, "tenant-a")
+    _, original = _promoted_dependency(service, "tenant-a")
+    correction, candidate = service.create_correction(
+        investigation_id="inv-api-stale-correction",
+        investigation_revision=1,
+        correction_type=CorrectionType.DEPENDENCY,
+        target_ref=original.knowledge_id,
+        target_revision=original.revision,
+        proposed={
+            "subject_ref": "entity:service:checkout",
+            "predicate": "does_not_depend_on",
+            "object_ref": "entity:datastore:redis-session",
+        },
+        scope=KnowledgeScope(
+            tenant_id="tenant-a",
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        ),
+        explanation="The dependency changed.",
+        created_by="operator",
+        tenant_id="tenant-a",
+    )
+    additional = _dependency(
+        service,
+        payload_ref="api-stale-correction-support",
+        family=SourceFamily.INCIDENT,
+        lineage_group="api-stale-correction-support",
+        tenant_id="tenant-a",
+    )
+    service.review_candidate(additional.id, approved=True, reviewer="operator", tenant_id="tenant-a")
+    _, advanced = service.evaluate_candidate(additional.id, tenant_id="tenant-a")
+    assert advanced is not None
+
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
+    client = TestClient(
+        create_app(
+            runtime_settings=Settings(
+                knowledge_tenant_id="tenant-a",
+                knowledge_permissions="knowledge.read,knowledge.review,knowledge.apply,knowledge.override",
+            )
+        )
+    )
+
+    response = client.post(
+        f"/api/v1/knowledge/corrections/{correction.id}/review",
+        json={"decision": "approve", "reviewer": "operator", "authoritative": True},
+    )
+
+    assert response.status_code == 409
+    assert "advanced from revision 1 to 2" in response.json()["detail"]
+    persisted = service.repository.get_candidate(candidate.id, "tenant-a")
+    assert persisted is not None
+    assert persisted.state.review_state == ReviewState.CANDIDATE
 
 
 def test_alias_upsert_updates_lookup_columns(tmp_path: Path):
@@ -4900,8 +5117,14 @@ def test_cli_policy_overrides_require_privileged_permission(tmp_path: Path, monk
         family=SourceFamily.RUNBOOK,
         lineage_group="cli-override",
     )
-    monkeypatch.setattr("tacit.knowledge.service.get_knowledge_service", lambda: service)
-    monkeypatch.setattr("tacit.config.settings.knowledge_permissions", "knowledge.read,knowledge.review")
+
+    class Stores:
+        settings = Settings(_env_file=None, knowledge_permissions="knowledge.read,knowledge.review")
+
+        def knowledge(self):
+            raise AssertionError("unauthorized override initialized the knowledge store")
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", Stores)
 
     result = CliRunner().invoke(
         cli,
@@ -4922,12 +5145,13 @@ def test_cli_policy_overrides_require_privileged_permission(tmp_path: Path, monk
 
 
 def test_cli_trust_requires_review_and_trust_permissions(monkeypatch: pytest.MonkeyPatch):
-    class UnexpectedService:
-        def review_candidate(self, *args, **kwargs):
-            raise AssertionError("unauthorized trust reached the knowledge service")
+    class Stores:
+        settings = Settings(_env_file=None, knowledge_permissions="knowledge.trust")
 
-    monkeypatch.setattr("tacit.cli._cli_knowledge_service", lambda: UnexpectedService())
-    monkeypatch.setattr("tacit.config.settings.knowledge_permissions", "knowledge.trust")
+        def knowledge(self):
+            raise AssertionError("unauthorized trust initialized the knowledge store")
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", Stores)
 
     result = CliRunner().invoke(
         cli,
@@ -4999,7 +5223,14 @@ def test_artifact_learning_cli_missing_tenant_exits_nonzero(tmp_path: Path, monk
     incident = tmp_path / "incident.md"
     runbook.write_text("Checkout depends on Redis.")
     incident.write_text("Checkout latency increased during the incident.")
-    monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
+
+    class WildcardStores:
+        settings = Settings(_env_file=None, knowledge_tenant_id="*")
+
+        def signals(self):
+            raise AssertionError("tenant validation must precede persistence")
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", WildcardStores)
     runner = CliRunner()
 
     runbook_result = runner.invoke(cli, ["learn", "runbooks", "--file", str(runbook)])
@@ -5110,19 +5341,39 @@ def test_knowledge_ui_sends_selected_tenant_header():
     assert "fetch(`${BASE}/api/v1/investigations${qs}`, { headers: knowledgeHeaders() })" in html
     assert "fetch(`${BASE}/api/v1/investigations/${id}`, { headers: knowledgeHeaders() })" in html
     assert "fetch(`${BASE}/api/v1/investigations/stats`, { headers: knowledgeHeaders() })" in html
+    assert 'data-dashboard-tenant="${escAttr(tenant)}"' in html
+    assert "headers: knowledgeHeaders({}, tenant)" in html
+    assert "btn.dataset.dashboardTenant" in html
 
 
-def test_wildcard_cli_pipeline_commands_require_tenant(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
+def test_cli_resolves_tenants_from_active_runtime_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runbook = tmp_path / "runbook.md"
+    incident = tmp_path / "incident.md"
+    runbook.write_text("Checkout depends on Redis.")
+    incident.write_text("Checkout latency increased.")
+
+    class WildcardStores:
+        settings = Settings(_env_file=None, knowledge_tenant_id="*")
+
+        def __getattr__(self, name):
+            raise AssertionError(f"tenant validation must precede store access: {name}")
+
+    monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "default")
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", WildcardStores)
     runner = CliRunner()
+    commands = [
+        ["investigate", "checkout latency"],
+        ["test", "--no-open-browser"],
+        ["learn", "runbooks", "--file", str(runbook)],
+        ["learn", "incidents", "--file", str(incident)],
+        ["learn", "pagerduty", "--since", "2026-01-01T00:00:00Z"],
+        ["knowledge", "review", "candidate", "--approve", "--reviewer", "operator"],
+    ]
 
-    investigate_result = runner.invoke(cli, ["investigate", "checkout latency"])
-    test_result = runner.invoke(cli, ["test", "--no-open-browser"])
-
-    assert investigate_result.exit_code != 0
-    assert "--tenant is required" in investigate_result.output
-    assert test_result.exit_code != 0
-    assert "--tenant is required" in test_result.output
+    for command in commands:
+        result = runner.invoke(cli, command)
+        assert result.exit_code != 0
+        assert "--tenant is required" in result.output
 
 
 def test_operational_learning_benchmark_is_packaged_and_safe():
