@@ -66,6 +66,10 @@ class CandidateMergeConflictError(ValueError):
     """Raised when re-ingestion loses to a concurrent candidate transition."""
 
 
+class AliasRegistrationConflictError(ValueError):
+    """Raised when an alias changes during a registration transition."""
+
+
 class KnowledgeRevisionConflictError(ValueError):
     """Raised when another writer advances an immutable knowledge item first."""
 

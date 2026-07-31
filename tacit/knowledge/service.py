@@ -68,6 +68,7 @@ from tacit.knowledge.normalization import (
 )
 from tacit.knowledge.policies import default_policies
 from tacit.knowledge.repository import (
+    AliasRegistrationConflictError,
     CandidateEvaluationConflictError,
     CandidateLifecycleConflictError,
     CandidateMergeConflictError,
@@ -186,6 +187,14 @@ class KnowledgeService:
         return saved
 
     def register_alias(self, alias: EntityAlias) -> EntityAlias:
+        if alias.review_state not in {ReviewState.APPROVED, ReviewState.TRUSTED}:
+            raise ValueError("alias registration accepts only approved or trusted aliases")
+        if alias.lifecycle_status != LifecycleStatus.ACTIVE:
+            raise ValueError("alias lifecycle transitions must use the correction workflow")
+        enforce_knowledge_action(
+            self._runtime_settings,
+            KnowledgeAction.TRUST if alias.review_state == ReviewState.TRUSTED else KnowledgeAction.APPROVE,
+        )
         tenant_id = self._record_tenant(alias)
         scope = self._scope_for_tenant(alias.scope, tenant_id)
         alias = alias.model_copy(
@@ -200,18 +209,29 @@ class KnowledgeService:
             raise ValueError("alias target entity does not exist in the tenant")
         if entity.status != EntityStatus.ACTIVE:
             raise ValueError("alias target entity is not active")
-        saved = self.repository.save_alias(alias)
-        self.repository.append_event(
-            "entity_alias_registered",
-            tenant_id=alias.tenant_id,
-            subject_ref=alias.entity_ref,
-            dimensions={
-                "review_state": alias.review_state.value,
-                "lifecycle_status": alias.lifecycle_status.value,
-                "reason_code": alias.method.value,
-            },
-            payload={"alias_id": alias.id, "normalized_value": alias.normalized_value},
-        )
+        observed = self.repository.get_alias(alias.id, alias.tenant_id)
+        if observed is not None:
+            if observed.lifecycle_status != LifecycleStatus.ACTIVE:
+                raise ValueError("terminal aliases cannot be reactivated through registration")
+            if observed.review_state == ReviewState.REJECTED:
+                raise ValueError("rejected aliases cannot be reactivated through registration")
+            if observed.review_state == ReviewState.TRUSTED and alias.review_state != ReviewState.TRUSTED:
+                raise ValueError("trusted aliases cannot be downgraded through registration")
+        with self.repository.transaction():
+            if self.repository.get_alias(alias.id, alias.tenant_id) != observed:
+                raise AliasRegistrationConflictError("alias changed during registration; reload before updating")
+            saved = self.repository.save_alias(alias)
+            self.repository.append_event(
+                "entity_alias_registered",
+                tenant_id=alias.tenant_id,
+                subject_ref=alias.entity_ref,
+                dimensions={
+                    "review_state": alias.review_state.value,
+                    "lifecycle_status": alias.lifecycle_status.value,
+                    "reason_code": alias.method.value,
+                },
+                payload={"alias_id": alias.id, "normalized_value": alias.normalized_value},
+            )
         return saved
 
     def create_candidate(
@@ -466,6 +486,28 @@ class KnowledgeService:
         _correction_id: str | None = None,
     ) -> CandidateEvaluationResult:
         """Return candidate, decision, and revision from one evaluation transaction."""
+        if authoritative_source or live_verified:
+            enforce_knowledge_action(self._runtime_settings, KnowledgeAction.OVERRIDE)
+        return self._evaluate_candidate_result_with_authorized_overrides(
+            candidate_id,
+            tenant_id=tenant_id,
+            authoritative_source=authoritative_source,
+            live_verified=live_verified,
+            ignored_conflict_ids=ignored_conflict_ids,
+            _correction_id=_correction_id,
+        )
+
+    def _evaluate_candidate_result_with_authorized_overrides(
+        self,
+        candidate_id: str,
+        *,
+        tenant_id: str | None,
+        authoritative_source: bool,
+        live_verified: bool,
+        ignored_conflict_ids: set[str] | None,
+        _correction_id: str | None,
+    ) -> CandidateEvaluationResult:
+        """Evaluate after the caller has authorized or loaded persisted overrides."""
         tenant_id = self._resolve_tenant(tenant_id)
         observed = self._require_candidate(candidate_id, tenant_id)
         self._require_candidate_workflow(candidate_id, tenant_id, _correction_id)
@@ -1649,13 +1691,15 @@ class KnowledgeService:
                 supported_revision = None
                 for survivor in surviving_candidates:
                     correction = self.repository.get_correction_for_candidate(survivor.id, tenant_id)
-                    _, supported_revision = self.evaluate_candidate(
+                    evaluation = self._evaluate_candidate_result_with_authorized_overrides(
                         survivor.id,
                         tenant_id=tenant_id,
                         authoritative_source=survivor.policy.authoritative_source,
                         live_verified=survivor.policy.live_verified,
                         _correction_id=correction.id if correction is not None else None,
+                        ignored_conflict_ids=None,
                     )
+                    supported_revision = evaluation.revision
                     if supported_revision is not None:
                         lifecycle_revisions.append(supported_revision)
                         break

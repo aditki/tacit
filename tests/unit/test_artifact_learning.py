@@ -831,6 +831,93 @@ def test_learned_artifacts_and_extractions_are_tenant_scoped(tmp_path):
     assert [row["tenant_id"] for row in store.list_learned_artifacts(tenant_id="tenant-a")] == ["tenant-a"]
 
 
+def test_artifact_governance_uses_explicit_runtime_settings(tmp_path):
+    from tacit.knowledge.repository import KnowledgeRepository
+
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*")
+    backing_store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=runtime_settings,
+    )
+
+    class InjectedStore:
+        _db_path = backing_store._db_path
+
+        def __getattr__(self, name):
+            if name == "_settings":
+                raise AttributeError(name)
+            return getattr(backing_store, name)
+
+    result = learn_artifact(
+        _artifact("## Checks\n- check redis_cache_misses_total"),
+        RunbookExtractor(),
+        runtime_settings=runtime_settings,
+        store=InjectedStore(),
+        tenant_id="tenant-a",
+    )
+
+    candidate_ids = result["knowledge_candidate_ids"]
+    assert isinstance(candidate_ids, list)
+    assert candidate_ids
+    repository = KnowledgeRepository(backing_store._db_path)
+    assert all(repository.get_candidate(candidate_id, "tenant-a") is not None for candidate_id in candidate_ids)
+
+
+def test_artifact_governance_derives_settings_from_injected_store(tmp_path):
+    from tacit.knowledge.repository import KnowledgeRepository
+
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*")
+    store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=runtime_settings,
+    )
+
+    result = learn_artifact(
+        _artifact("## Checks\n- check redis_cache_misses_total"),
+        RunbookExtractor(),
+        store=store,
+        tenant_id="tenant-a",
+    )
+
+    candidate_ids = result["knowledge_candidate_ids"]
+    assert isinstance(candidate_ids, list)
+    assert candidate_ids
+    repository = KnowledgeRepository(store._db_path)
+    assert all(repository.get_candidate(candidate_id, "tenant-a") is not None for candidate_id in candidate_ids)
+
+
+def test_artifact_governance_constructs_store_from_explicit_settings(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from tacit.knowledge.repository import KnowledgeRepository
+
+    db_path = tmp_path / "scoped" / "signals.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="*",
+        signals_db_path=str(db_path),
+    )
+
+    def unexpected_global_store():
+        raise AssertionError("explicit settings consulted the process-global signal store")
+
+    monkeypatch.setattr("tacit.artifact_learning.get_signal_store", unexpected_global_store)
+    result = learn_artifact(
+        _artifact("## Checks\n- check redis_cache_misses_total"),
+        RunbookExtractor(),
+        runtime_settings=runtime_settings,
+        tenant_id="tenant-a",
+    )
+
+    candidate_ids = result["knowledge_candidate_ids"]
+    assert isinstance(candidate_ids, list)
+    assert candidate_ids
+    assert db_path.exists()
+    repository = KnowledgeRepository(db_path)
+    assert all(repository.get_candidate(candidate_id, "tenant-a") is not None for candidate_id in candidate_ids)
+
+
 @pytest.mark.parametrize(
     ("configured_tenant", "expected_tenant"),
     [("default", "default"), ("tenant-a", "tenant-a")],

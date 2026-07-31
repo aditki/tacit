@@ -739,11 +739,44 @@ def _resolve_tenant_id(
     return resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
 
 
-def _reconcile_stale_artifact_knowledge(*, store, tenant_id: str, artifact_type: str) -> None:
+def _active_runtime_settings(
+    runtime_settings: Settings | None,
+    store: Any | None,
+) -> Settings | None:
+    return runtime_settings or getattr(store, "_settings", None)
+
+
+def _resolve_artifact_store(
+    *,
+    dry_run: bool,
+    store: Any | None,
+    runtime_settings: Settings | None,
+) -> Any | None:
+    if dry_run or store is not None:
+        return store
+    if runtime_settings is not None:
+        from tacit.runtime_stores import RuntimeStores
+
+        return RuntimeStores(runtime_settings).signals()
+    return get_signal_store()
+
+
+def _reconcile_stale_artifact_knowledge(
+    *,
+    store,
+    tenant_id: str,
+    artifact_type: str,
+    runtime_settings: Settings | None = None,
+) -> None:
     from tacit.knowledge.repository import KnowledgeRepository
     from tacit.knowledge.service import KnowledgeService
 
-    service = KnowledgeService(KnowledgeRepository(store._db_path), signal_store=store)
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    service = KnowledgeService(
+        KnowledgeRepository(store._db_path),
+        signal_store=store,
+        runtime_settings=active_settings,
+    )
     offset = 0
     page_size = 1_000
     pages = 0
@@ -799,7 +832,13 @@ def learn_artifact(
     store: Any | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
-    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=runtime_settings)
+    store = _resolve_artifact_store(
+        dry_run=dry_run,
+        store=store,
+        runtime_settings=runtime_settings,
+    )
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=active_settings)
     result = extractor.extract(artifact)
     evidence_rows = _as_store_rows(result.evidence_requirements)
     ownership_rows = _as_store_rows(result.ownership_hints)
@@ -810,7 +849,7 @@ def learn_artifact(
     mappings_created = 0
     governed_candidate_ids: list[str] = []
     if not dry_run:
-        store = store or get_signal_store()
+        assert store is not None
         change_state = store.record_learned_artifact(
             tenant_id=tenant_id,
             artifact_id=artifact.id,
@@ -904,7 +943,11 @@ def learn_artifact(
         from tacit.knowledge.repository import KnowledgeRepository
         from tacit.knowledge.service import KnowledgeService
 
-        service = KnowledgeService(KnowledgeRepository(store._db_path), signal_store=store)
+        service = KnowledgeService(
+            KnowledgeRepository(store._db_path),
+            signal_store=store,
+            runtime_settings=active_settings,
+        )
         governed_candidate_ids = migrate_artifact_extractions(
             artifact_id=artifact.id,
             artifact_type=artifact.artifact_type,
@@ -1017,13 +1060,19 @@ def learn_incident_dir(
     store: Any | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
-    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=runtime_settings)
+    store = _resolve_artifact_store(
+        dry_run=dry_run,
+        store=store,
+        runtime_settings=runtime_settings,
+    )
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=active_settings)
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
     learned = [
         learn_incident_file(
             file,
             dry_run=dry_run,
-            runtime_settings=runtime_settings,
+            runtime_settings=active_settings,
             store=store,
             tenant_id=tenant_id,
         )
@@ -1040,7 +1089,7 @@ def learn_incident_dir(
 
     stale_marked = 0
     if not dry_run:
-        store = store or get_signal_store()
+        assert store is not None
         seen = {str(item["artifact_id"]) for item in learned}
         stale_marked = store.mark_missing_artifacts_stale(
             tenant_id=tenant_id,
@@ -1054,6 +1103,7 @@ def learn_incident_dir(
                 store=store,
                 tenant_id=tenant_id,
                 artifact_type="incident",
+                runtime_settings=active_settings,
             )
     return {
         "artifact_type": "incident",
@@ -1082,13 +1132,19 @@ def learn_runbook_dir(
     store: Any | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
-    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=runtime_settings)
+    store = _resolve_artifact_store(
+        dry_run=dry_run,
+        store=store,
+        runtime_settings=runtime_settings,
+    )
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=active_settings)
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
     learned = [
         learn_runbook_file(
             file,
             dry_run=dry_run,
-            runtime_settings=runtime_settings,
+            runtime_settings=active_settings,
             store=store,
             tenant_id=tenant_id,
         )
@@ -1105,7 +1161,7 @@ def learn_runbook_dir(
 
     stale_marked = 0
     if not dry_run:
-        store = store or get_signal_store()
+        assert store is not None
         seen = {str(item["artifact_id"]) for item in learned}
         stale_marked = store.mark_missing_artifacts_stale(
             tenant_id=tenant_id,
@@ -1119,6 +1175,7 @@ def learn_runbook_dir(
                 store=store,
                 tenant_id=tenant_id,
                 artifact_type="runbook",
+                runtime_settings=active_settings,
             )
     return {
         "artifact_type": "runbook",

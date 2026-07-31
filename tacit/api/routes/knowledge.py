@@ -20,6 +20,7 @@ from tacit.knowledge.entities import normalize_entity
 from tacit.knowledge.enums import CorrectionType, EntityBindingMethod, EntityKind, ReviewState
 from tacit.knowledge.models import Entity, EntityAlias, KnowledgeScope
 from tacit.knowledge.repository import (
+    AliasRegistrationConflictError,
     CandidateEvaluationConflictError,
     CandidateReviewConflictError,
     KnowledgeRevisionConflictError,
@@ -264,6 +265,8 @@ async def create_alias(payload: AliasRequest, request: Request):
     )
     try:
         return get_knowledge_service(request).register_alias(alias).model_dump(mode="json")
+    except AliasRegistrationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

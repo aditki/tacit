@@ -205,6 +205,15 @@ class Settings(BaseSettings):
         merged = {**yaml_values, **{k: v for k, v in values.items() if v is not None}}
         return merged
 
+    @model_validator(mode="after")
+    def _validate_tenant_api_keys(self) -> Settings:
+        if self.knowledge_tenant_id != "*":
+            return self
+        non_empty_keys = [value for value in self.knowledge_tenant_api_keys.values() if value]
+        if len(non_empty_keys) != len(set(non_empty_keys)):
+            raise ValueError("knowledge_tenant_api_keys must use a unique non-empty key per tenant")
+        return self
+
 
 def create_settings() -> Settings:
     """Load settings with YAML + env layering."""

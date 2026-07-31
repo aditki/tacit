@@ -46,6 +46,76 @@ class _Bound:
     inclusive: bool
 
 
+@dataclass(frozen=True)
+class _WildcardPrefix:
+    epoch: int
+    release: tuple[int, ...]
+
+
+def _wildcard_prefix(value: str) -> _WildcardPrefix | None:
+    if not value.endswith(".*"):
+        return None
+    try:
+        version = Version(value[:-2])
+    except InvalidVersion:
+        return None
+    return _WildcardPrefix(version.epoch, version.release)
+
+
+def _prefix_contains(container: _WildcardPrefix, candidate: _WildcardPrefix) -> bool:
+    return (
+        container.epoch == candidate.epoch
+        and len(container.release) <= len(candidate.release)
+        and candidate.release[: len(container.release)] == container.release
+    )
+
+
+def _wildcard_constraints_are_disjoint(specifiers: list[Specifier]) -> bool:
+    narrowest: _WildcardPrefix | None = None
+    for item in specifiers:
+        if item.operator != "==" or (prefix := _wildcard_prefix(item.version)) is None:
+            continue
+        if narrowest is None or _prefix_contains(narrowest, prefix):
+            narrowest = prefix
+        elif not _prefix_contains(prefix, narrowest):
+            return True
+    if narrowest is None:
+        return False
+    exclusions = [
+        prefix
+        for item in specifiers
+        if item.operator == "!=" and (prefix := _wildcard_prefix(item.version)) is not None
+    ]
+    return any(_prefix_contains(exclusion, narrowest) for exclusion in exclusions)
+
+
+def _wildcard_exclusions_cover_bounds(
+    specifiers: list[Specifier],
+    lower: _Bound | None,
+    upper: _Bound | None,
+) -> bool:
+    if lower is None or upper is None:
+        return False
+    exclusions = sorted(
+        (
+            bounds
+            for item in specifiers
+            if item.operator == "!=" and (bounds := _wildcard_bounds(item.version)) is not None
+        ),
+        key=lambda bounds: bounds[0].version,
+    )
+    cursor = lower.version
+    for exclusion_lower, exclusion_upper in exclusions:
+        if exclusion_upper.version <= cursor:
+            continue
+        if exclusion_lower.version > cursor:
+            return False
+        cursor = max(cursor, exclusion_upper.version)
+        if cursor > upper.version or (cursor == upper.version and not upper.inclusive):
+            return True
+    return False
+
+
 def _stronger_lower(current: _Bound | None, candidate: _Bound) -> _Bound:
     if current is None or candidate.version > current.version:
         return candidate
@@ -62,29 +132,35 @@ def _stronger_upper(current: _Bound | None, candidate: _Bound) -> _Bound:
     return current
 
 
+def _release_version(epoch: int, release: list[int]) -> Version:
+    value = ".".join(str(part) for part in release)
+    return Version(f"{epoch}!{value}" if epoch else value)
+
+
 def _compatible_upper(version: Version) -> Version | None:
     release = list(version.release)
     if len(release) < 2:
         return None
     prefix = release[:-1]
     prefix[-1] += 1
-    return Version(".".join(str(part) for part in prefix))
+    return _release_version(version.epoch, prefix)
 
 
 def _wildcard_bounds(value: str) -> tuple[_Bound, _Bound] | None:
     if not value.endswith(".*"):
         return None
     try:
-        release = list(Version(value[:-2]).release)
+        version = Version(value[:-2])
     except InvalidVersion:
         return None
+    release = list(version.release)
     if not release:
         return None
     upper = list(release)
     upper[-1] += 1
     return (
-        _Bound(Version(".".join(str(part) for part in release)), True),
-        _Bound(Version(".".join(str(part) for part in upper)), False),
+        _Bound(_release_version(version.epoch, release), True),
+        _Bound(_release_version(version.epoch, upper), False),
     )
 
 
@@ -129,6 +205,8 @@ def _exact_versions(specifiers: list[Specifier]) -> set[Version]:
 
 def _specifier_sets_overlap(left: SpecifierSet, right: SpecifierSet) -> bool:
     combined = [*left, *right]
+    if _wildcard_constraints_are_disjoint(combined):
+        return False
     exact_versions = _exact_versions(combined)
     if exact_versions:
         return any(_contains(left, version) and _contains(right, version) for version in exact_versions)
@@ -142,9 +220,8 @@ def _specifier_sets_overlap(left: SpecifierSet, right: SpecifierSet) -> bool:
         return (
             lower.inclusive and upper.inclusive and _contains(left, lower.version) and _contains(right, lower.version)
         )
-    # A non-empty open interval has representable PEP 440 versions. Exclusion
-    # specifiers may remove points, but cannot exhaust an interval unless an
-    # explicit exact/prefix constraint above narrows it first.
+    if _wildcard_exclusions_cover_bounds(combined, lower, upper):
+        return False
     return True
 
 

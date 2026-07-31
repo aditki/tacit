@@ -252,6 +252,33 @@ def test_wildcard_api_keys_are_bound_to_the_selected_tenant(monkeypatch):
     assert allowed.json()["summary"] == "tenant-b"
 
 
+def test_wildcard_settings_reject_duplicate_tenant_api_keys_without_disclosure():
+    duplicate_secret = "same-secret-for-two-tenants"
+
+    with pytest.raises(ValueError) as exc_info:
+        Settings(
+            _env_file=None,
+            knowledge_tenant_id="*",
+            knowledge_tenant_api_keys={
+                "tenant-a": duplicate_secret,
+                "tenant-b": duplicate_secret,
+            },
+        )
+
+    assert "unique non-empty key per tenant" in str(exc_info.value)
+    assert duplicate_secret not in str(exc_info.value)
+
+
+def test_wildcard_settings_allow_multiple_unconfigured_tenant_keys():
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="*",
+        knowledge_tenant_api_keys={"tenant-a": "", "tenant-b": ""},
+    )
+
+    assert runtime_settings.knowledge_tenant_api_keys == {"tenant-a": "", "tenant-b": ""}
+
+
 def test_learning_dashboard_route_uses_app_scoped_backend_settings(monkeypatch, tmp_path):
     runtime_settings = Settings(
         grafana_url="http://runtime-grafana",

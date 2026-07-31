@@ -53,6 +53,7 @@ from tacit.knowledge.models import (
 )
 from tacit.knowledge.normalization import canonical_scope_payload, normalize_service_ref
 from tacit.knowledge.repository import (
+    AliasRegistrationConflictError,
     CandidateEvaluationConflictError,
     CandidateReviewConflictError,
     KnowledgeRepository,
@@ -599,6 +600,32 @@ def test_scope_version_selector_semantics(selector: str, release: str, expected:
 def test_version_scope_overlap_detects_disjoint_ranges():
     assert version_scopes_overlap(["version:>=2"], ["version:<2"]) is False
     assert version_scopes_overlap(["version:>=1.2,<3"], ["version:==2.*"]) is True
+    assert version_scopes_overlap(["version:==2.*"], ["version:!=2.*"]) is False
+    assert version_scopes_overlap(["version:!=2.*"], ["version:==2.*"]) is False
+    assert version_scopes_overlap(["version:==2.1.*"], ["version:!=2.*"]) is False
+    assert version_scopes_overlap(["version:==2.*"], ["version:!=2.1.*"]) is True
+    assert version_scopes_overlap(["version:==2.*"], ["version:==3.*"]) is False
+    assert version_scopes_overlap(["version:==2.*"], ["version:==2.1.*"]) is True
+    assert version_scopes_overlap(["version:>=2,<3"], ["version:!=2.*"]) is False
+    assert version_scopes_overlap(["version:~=2.0"], ["version:!=2.*"]) is False
+    assert version_scopes_overlap(["version:>=2.1,<2.2"], ["version:!=2.1.*"]) is False
+    assert (
+        version_scopes_overlap(
+            ["version:>=2,<4"],
+            ["version:!=2.*,!=3.*"],
+        )
+        is False
+    )
+    assert version_scopes_overlap(["version:>=2,<4"], ["version:!=2.*"]) is True
+    assert (
+        version_scopes_overlap(
+            ["version:>=1!2,<1!4"],
+            ["version:!=1!2.*,!=1!3.*"],
+        )
+        is False
+    )
+    assert version_scopes_overlap(["version:~=1!2.0"], ["version:!=1!2.*"]) is False
+    assert version_scopes_overlap(["version:>=1!2,<1!3"], ["version:!=2.*"]) is True
 
 
 def test_proposition_keys_canonicalize_scope_list_order(tmp_path: Path):
@@ -3193,6 +3220,158 @@ def test_unauthorized_direct_rejection_cannot_withdraw_active_knowledge(tmp_path
     assert persisted_revision.state.lifecycle_status == LifecycleStatus.ACTIVE
 
 
+@pytest.mark.parametrize("override_field", ["authoritative_source", "live_verified"])
+def test_candidate_evaluation_enforces_override_permission(
+    tmp_path: Path,
+    override_field: str,
+):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref=f"evaluation-override:{override_field}",
+        family=SourceFamily.RUNBOOK,
+        lineage_group=f"evaluation-override:{override_field}",
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="embedding")
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read,knowledge.review",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.override"):
+        service.evaluate_candidate_result(candidate.id, **{override_field: True})
+
+    persisted = service.repository.get_candidate(candidate.id)
+    assert persisted is not None
+    assert persisted.policy.last_evaluated_at is None
+    assert service.repository.list_current_revisions() == []
+
+
+@pytest.mark.parametrize(
+    ("review_state", "permissions", "missing_permission"),
+    [
+        (ReviewState.APPROVED, "knowledge.read", "knowledge.review"),
+        (ReviewState.TRUSTED, "knowledge.read,knowledge.review", "knowledge.trust"),
+        (ReviewState.TRUSTED, "knowledge.read,knowledge.trust", "knowledge.review"),
+    ],
+)
+def test_alias_registration_enforces_runtime_permissions(
+    tmp_path: Path,
+    review_state: ReviewState,
+    permissions: str,
+    missing_permission: str,
+):
+    service = _service(tmp_path)
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions=permissions,
+    )
+    alias = EntityAlias(
+        id=f"alias-permission-{missing_permission.replace('.', '-')}",
+        raw_value="Storefront",
+        normalized_value="storefront",
+        entity_ref="entity:service:checkout",
+        method=EntityBindingMethod.HUMAN_CORRECTION,
+        review_state=review_state,
+        provenance_refs=["operator:alias"],
+    )
+
+    with pytest.raises(PermissionError, match=f"Missing permission: {missing_permission}"):
+        service.register_alias(alias)
+
+    assert service.repository.get_alias(alias.id) is None
+
+
+def test_alias_registration_rejects_terminal_state_mutations(tmp_path: Path):
+    service = _service(tmp_path)
+    approved = service.register_alias(
+        EntityAlias(
+            id="alias-terminal-state",
+            raw_value="Storefront",
+            normalized_value="storefront",
+            entity_ref="entity:service:checkout",
+            method=EntityBindingMethod.HUMAN_CORRECTION,
+            review_state=ReviewState.APPROVED,
+            provenance_refs=["operator:alias"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="only approved or trusted"):
+        service.register_alias(approved.model_copy(update={"review_state": ReviewState.REJECTED}))
+    with pytest.raises(ValueError, match="lifecycle transitions must use"):
+        service.register_alias(approved.model_copy(update={"lifecycle_status": LifecycleStatus.WITHDRAWN}))
+
+    assert service.repository.get_alias(approved.id) == approved
+
+
+def test_alias_registration_prevents_trust_downgrades(tmp_path: Path):
+    service = _service(tmp_path)
+    trusted = service.register_alias(
+        EntityAlias(
+            id="alias-trusted-terminal",
+            raw_value="Storefront",
+            normalized_value="storefront",
+            entity_ref="entity:service:checkout",
+            method=EntityBindingMethod.HUMAN_CORRECTION,
+            review_state=ReviewState.TRUSTED,
+            provenance_refs=["operator:alias"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="cannot be downgraded"):
+        service.register_alias(trusted.model_copy(update={"review_state": ReviewState.APPROVED}))
+
+    assert service.repository.get_alias(trusted.id) == trusted
+
+
+def test_alias_registration_detects_concurrent_updates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path)
+    alias = service.register_alias(
+        EntityAlias(
+            id="alias-concurrent-update",
+            raw_value="Storefront",
+            normalized_value="storefront",
+            entity_ref="entity:service:checkout",
+            method=EntityBindingMethod.HUMAN_CORRECTION,
+            review_state=ReviewState.APPROVED,
+            provenance_refs=["operator:initial"],
+        )
+    )
+    competing_service = KnowledgeService(
+        KnowledgeRepository(service.repository._db_path),
+        runtime_settings=Settings(_env_file=None),
+    )
+    observed = threading.Event()
+    release = threading.Event()
+    original_get_alias = service.repository.get_alias
+    first_read = True
+
+    def pause_after_observation(alias_id: str, tenant_id: str = "default"):
+        nonlocal first_read
+        current = original_get_alias(alias_id, tenant_id)
+        if first_read:
+            first_read = False
+            observed.set()
+            assert release.wait(timeout=5)
+        return current
+
+    monkeypatch.setattr(service.repository, "get_alias", pause_after_observation)
+    attempted = alias.model_copy(update={"raw_value": "Storefront API", "provenance_refs": ["operator:attempted"]})
+    competing = alias.model_copy(update={"raw_value": "Storefront Service", "provenance_refs": ["operator:competing"]})
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(service.register_alias, attempted)
+        assert observed.wait(timeout=5)
+        competing_service.register_alias(competing)
+        release.set()
+        with pytest.raises(AliasRegistrationConflictError, match="changed during registration"):
+            future.result(timeout=5)
+
+    persisted = competing_service.repository.get_alias(alias.id)
+    assert persisted is not None
+    assert persisted.raw_value == "Storefront Service"
+
+
 @pytest.mark.parametrize(
     ("permissions", "authoritative", "missing_permission"),
     [
@@ -3866,6 +4045,10 @@ def test_removed_source_reuses_authoritative_override_from_surviving_candidate(t
     persisted_survivor = service.repository.get_candidate(candidates[1].id)
     assert persisted_survivor is not None
     assert persisted_survivor.policy.authoritative_source is True
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read,knowledge.review",
+    )
 
     service.reconcile_source_lifecycle(
         provenance_ref="provenance:catalog-a",
@@ -3916,6 +4099,10 @@ def test_removed_source_reuses_live_verified_override_from_surviving_candidate(t
     persisted_survivor = service.repository.get_candidate(candidates[1].id)
     assert persisted_survivor is not None
     assert persisted_survivor.policy.live_verified is True
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read,knowledge.review",
+    )
 
     service.reconcile_source_lifecycle(
         provenance_ref="provenance:dashboard-a",
