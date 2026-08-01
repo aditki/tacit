@@ -459,7 +459,17 @@ def test_chart_route_requires_header_tenant_for_wildcard_configuration(monkeypat
     import tacit.api.routes.dashboard as dashboard_routes
 
     monkeypatch.setattr(dashboard_routes, "run_pipeline", fake_run_pipeline)
-    app = create_app(runtime_settings=SimpleNamespace(api_auth_enabled=False, knowledge_tenant_id="*"))
+    app = create_app(
+        runtime_settings=SimpleNamespace(
+            api_auth_enabled=True,
+            api_auth_key="",
+            knowledge_tenant_id="*",
+            knowledge_tenant_api_keys={
+                "tenant-a": "tenant-a-secret",
+                "tenant-b": "tenant-b-secret",
+            },
+        )
+    )
     app.dependency_overrides[get_pipeline_dependencies] = lambda: SimpleNamespace(
         settings=SimpleNamespace(knowledge_tenant_id="*")
     )
@@ -471,12 +481,12 @@ def test_chart_route_requires_header_tenant_for_wildcard_configuration(monkeypat
     )
     response = client.post(
         "/api/v1/chart",
-        headers={"X-Tacit-Tenant": "tenant-b"},
+        headers={"X-Tacit-Tenant": "tenant-b", "X-API-Key": "tenant-b-secret"},
         json={"prompt": "Investigate checkout latency", "tenant_id": "tenant-b"},
     )
     mismatch = client.post(
         "/api/v1/chart",
-        headers={"X-Tacit-Tenant": "tenant-a"},
+        headers={"X-Tacit-Tenant": "tenant-a", "X-API-Key": "tenant-a-secret"},
         json={"prompt": "Investigate checkout latency", "tenant_id": "tenant-b"},
     )
 
@@ -513,6 +523,78 @@ async def test_direct_pipeline_rejects_configured_tenant_mismatch(monkeypatch):
         await run_pipeline(DashRequest(prompt="Investigate checkout", tenant_id="tenant-b"), deps)
 
     assert "request" not in captured
+
+
+async def test_direct_pipeline_resolves_pinned_tenant_before_inner_pipeline(monkeypatch):
+    from tacit.pipeline import run_pipeline
+
+    captured: dict[str, DashRequest] = {}
+
+    async def fake_inner(request, deps, **kwargs):
+        captured["request"] = request
+        return DashResponse(dashboard_url="", dashboard_uid="", panel_count=0, summary="ok")
+
+    monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", fake_inner)
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_tenant_id="tenant-a",
+        ),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    await run_pipeline(DashRequest(prompt="Investigate checkout"), deps)
+
+    assert captured["request"].tenant_id == "tenant-a"
+
+
+@pytest.mark.parametrize(
+    ("configured_tenant", "request_tenant"),
+    [
+        ("tenant-a", ""),
+        ("*", "tenant-a"),
+        ("*", "default"),
+    ],
+)
+async def test_non_default_pipeline_rejects_tenant_blind_history_store(
+    configured_tenant,
+    request_tenant,
+):
+    from tacit.pipeline import run_pipeline
+
+    class TenantBlindHistory:
+        started = False
+
+        def start(self, prompt, user_id, channel_id):
+            self.started = True
+            return "unsafe-history-id"
+
+    history = TenantBlindHistory()
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_tenant_id=configured_tenant,
+        ),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: history,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    with pytest.raises(ValueError, match="non-default tenant pipelines require a tenant-aware history store"):
+        await run_pipeline(
+            DashRequest(prompt="Investigate checkout", tenant_id=request_tenant),
+            deps,
+        )
+
+    assert history.started is False
 
 
 async def test_direct_pipeline_requires_tenant_for_wildcard_configuration(monkeypatch):
@@ -3188,7 +3270,12 @@ def test_refresh_rejects_investigation_outside_configured_tenant(tmp_path, monke
 
 
 def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, monkeypatch):
-    settings = Settings(_env_file=None, knowledge_tenant_id="*")
+    settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="*",
+        api_auth_enabled=True,
+        knowledge_tenant_api_keys={"tenant-a": "tenant-a-secret", "tenant-b": "tenant-b-secret"},
+    )
     store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=settings)
     investigation_id = store.start("Why did checkout latency increase?", user_id="api", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
@@ -3217,11 +3304,11 @@ def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, mo
 
     replay = client.post(
         f"/api/v1/investigations/{investigation_id}/replay",
-        headers={"X-Tacit-Tenant": "tenant-b"},
+        headers={"X-Tacit-Tenant": "tenant-b", "X-API-Key": "tenant-b-secret"},
     )
     refresh = client.post(
         f"/api/v1/investigations/{investigation_id}/refresh",
-        headers={"X-Tacit-Tenant": "tenant-b"},
+        headers={"X-Tacit-Tenant": "tenant-b", "X-API-Key": "tenant-b-secret"},
     )
 
     assert replay.status_code == 404
@@ -3230,7 +3317,11 @@ def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, mo
 
 
 def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
-    runtime_settings = Settings(knowledge_tenant_id="*")
+    runtime_settings = Settings(
+        knowledge_tenant_id="*",
+        api_auth_enabled=True,
+        knowledge_tenant_api_keys={"tenant-a": "tenant-a-secret", "tenant-b": "tenant-b-secret"},
+    )
     store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=runtime_settings)
     investigation_ids = {}
     for tenant_id in ("tenant-a", "tenant-b"):
@@ -3249,7 +3340,7 @@ def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
     app = create_app(runtime_settings=runtime_settings)
     app.dependency_overrides[get_history_store] = lambda: store
     client = TestClient(app)
-    headers = {"X-Tacit-Tenant": "tenant-a"}
+    headers = {"X-Tacit-Tenant": "tenant-a", "X-API-Key": "tenant-a-secret"}
     own_id = investigation_ids["tenant-a"]
     other_id = investigation_ids["tenant-b"]
 

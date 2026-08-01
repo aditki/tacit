@@ -88,6 +88,9 @@ Useful settings include:
 - `KNOWLEDGE_TENANT_ID`
 - `KNOWLEDGE_TENANT_API_KEYS`
 
+Wildcard tenancy requires API authentication with a distinct key per tenant.
+`HISTORY_DB_PATH` and `SIGNALS_DB_PATH` must reference different SQLite files.
+
 ## More Documentation
 
 The full repository README covers architecture, development workflows, Docker compose stacks, evaluation notes, and project roadmap:

@@ -19,11 +19,13 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 async def verify_api_key(request: Request, api_key: str | None = Security(api_key_header)) -> None:
-    """Verify API key if auth is enabled. No-op when disabled."""
+    """Verify API keys and fail closed for unauthenticated wildcard tenancy."""
     runtime_settings = getattr(request.app.state, "settings", settings)
+    configured_tenant = str(runtime_settings.knowledge_tenant_id or "default")
+    if configured_tenant == "*" and not runtime_settings.api_auth_enabled:
+        raise HTTPException(status_code=503, detail="Wildcard knowledge tenancy requires API authentication")
     if not runtime_settings.api_auth_enabled:
         return
-    configured_tenant = str(runtime_settings.knowledge_tenant_id or "default")
     expected_key = runtime_settings.api_auth_key
     if configured_tenant == "*":
         selected_tenant = resolve_knowledge_tenant(

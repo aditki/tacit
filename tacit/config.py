@@ -17,6 +17,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tacit.archetypes.generated.schema import ArchetypeRetrievalMode
 
+DEFAULT_HISTORY_DB_PATH = Path("data/tacit_history.db")
+DEFAULT_FEEDBACK_DB_PATH = Path("data/tacit_feedback.db")
+DEFAULT_SIGNALS_DB_PATH = Path("data/tacit_signals.db")
+
 # ── Config file discovery ──────────────────────────────────────────────────
 # Priority: TACIT_CONFIG env var → ./tacit.yaml → ./tacit.yml → None
 
@@ -212,6 +216,14 @@ class Settings(BaseSettings):
         non_empty_keys = [value for value in self.knowledge_tenant_api_keys.values() if value]
         if len(non_empty_keys) != len(set(non_empty_keys)):
             raise ValueError("knowledge_tenant_api_keys must use a unique non-empty key per tenant")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_sqlite_store_paths(self) -> Settings:
+        history_path = Path(self.history_db_path or DEFAULT_HISTORY_DB_PATH).expanduser().resolve()
+        signals_path = Path(self.signals_db_path or DEFAULT_SIGNALS_DB_PATH).expanduser().resolve()
+        if history_path == signals_path:
+            raise ValueError("history_db_path and signals_db_path must use distinct SQLite files")
         return self
 
 

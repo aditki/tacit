@@ -42,6 +42,7 @@ from tacit.knowledge.models import (
     EntityAlias,
     EntityResolutionResult,
     KnowledgeCandidate,
+    KnowledgeConflict,
     KnowledgeCorrection,
     KnowledgeEvidence,
     KnowledgeEvidenceReference,
@@ -347,14 +348,19 @@ class KnowledgeService:
                     }
                 )
             try:
-                self.repository.save_candidate_with_proposition(
-                    candidate,
-                    lineage_group=(first_evidence.lineage_group if first_evidence else payload_ref),
-                    independence_class=(
-                        first_evidence.lineage_kind.value if first_evidence else LineageKind.UNKNOWN.value
-                    ),
-                    expected=existing,
-                )
+                with self.repository.transaction():
+                    self.repository.save_candidate_with_proposition(
+                        candidate,
+                        lineage_group=(first_evidence.lineage_group if first_evidence else payload_ref),
+                        independence_class=(
+                            first_evidence.lineage_kind.value if first_evidence else LineageKind.UNKNOWN.value
+                        ),
+                        expected=existing,
+                    )
+                    self._resolve_conflicts_without_independent_support(
+                        candidate,
+                        resolved_by="system:lineage-transition",
+                    )
                 break
             except CandidateMergeConflictError:
                 continue
@@ -443,6 +449,11 @@ class KnowledgeService:
                         [updated],
                         lifecycle_status=LifecycleStatus.WITHDRAWN,
                         reason="candidate_rejected",
+                    )
+                else:
+                    self._resolve_conflicts_without_independent_support(
+                        updated,
+                        resolved_by=reviewer,
                     )
                 self.repository.append_event(
                     (
@@ -730,8 +741,27 @@ class KnowledgeService:
         scope = self._scope_for_tenant(scope, self._resolve_tenant(requested_tenant))
         selected: list[KnowledgeSnapshotItem] = []
         usage: list[KnowledgeUsage] = []
-        for revision in self.repository.list_current_revisions(scope.tenant_id):
-            disposition, reasons = self._disposition(revision, scope)
+        revisions = self.repository.list_current_revisions(scope.tenant_id)
+        active_propositions = {
+            row["proposition_key"] for row in self.repository.list_propositions(scope.tenant_id)
+        }
+        conflicts_by_proposition: dict[str, list[KnowledgeConflict]] = {}
+        for conflict in self.repository.list_conflicts(scope.tenant_id, unresolved_only=True):
+            if (
+                conflict.left_proposition_ref not in active_propositions
+                or conflict.right_proposition_ref not in active_propositions
+            ):
+                continue
+            for proposition_ref in {conflict.left_proposition_ref, conflict.right_proposition_ref}:
+                conflicts_by_proposition.setdefault(proposition_ref, []).append(conflict)
+        service_refs = {normalize_service_ref(value) for value in scope.service_refs}
+        for revision in revisions:
+            disposition, reasons = self._disposition(
+                revision,
+                scope,
+                conflicts=conflicts_by_proposition.get(revision.proposition.proposition_key, ()),
+                service_refs=service_refs,
+            )
             if disposition == KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED:
                 selected.append(KnowledgeSnapshotItem(knowledge_ref=revision.knowledge_id, revision=revision.revision))
             usage.append(
@@ -1282,7 +1312,7 @@ class KnowledgeService:
             }
         evidence = KnowledgeEvidenceReference(
             evidence_ref=correction_id,
-            evidence_role=EvidenceRole.CONTRADICTING if target_ref else EvidenceRole.SUPPORTING,
+            evidence_role=EvidenceRole.SUPPORTING,
             source_family=SourceFamily.HUMAN_CORRECTION,
             lineage_group=correction_id,
             lineage_kind=LineageKind.INDEPENDENT,
@@ -2248,6 +2278,47 @@ class KnowledgeService:
                 payload={"candidate_id": candidate.id},
             )
 
+    def _resolve_conflicts_without_independent_support(
+        self,
+        candidate: KnowledgeCandidate,
+        *,
+        resolved_by: str,
+    ) -> None:
+        if (
+            candidate.state.review_state not in {ReviewState.APPROVED, ReviewState.TRUSTED}
+            or candidate.state.lifecycle_status != LifecycleStatus.ACTIVE
+            or candidate.entity_resolution.status != EntityResolutionStatus.RESOLVED
+        ):
+            return
+        proposition_key = candidate.proposition.proposition_key
+        if self.corroboration.contributing_candidates(candidate.tenant_id, proposition_key):
+            return
+        for conflict in self.repository.list_conflicts(
+            candidate.tenant_id,
+            proposition_key=proposition_key,
+            unresolved_only=True,
+        ):
+            resolved = conflict.model_copy(
+                update={
+                    "resolution_status": ConflictResolutionStatus.RESOLVED_BY_REVIEW,
+                    "resolution_reason": "counter_proposition_lacks_independent_support",
+                    "resolved_by": resolved_by,
+                    "resolved_at": utc_now(),
+                    "severity": "low",
+                }
+            )
+            self.repository.save_conflict(resolved)
+            self.repository.append_event(
+                "conflict_resolved",
+                tenant_id=candidate.tenant_id,
+                subject_ref=resolved.id,
+                dimensions={
+                    "knowledge_kind": candidate.kind.value,
+                    "reason_code": resolved.resolution_reason,
+                },
+                payload={"candidate_id": candidate.id},
+            )
+
     @staticmethod
     def _combined_resolution(subject: EntityResolutionResult, object_: EntityResolutionResult | None):
         results = [item for item in (subject, object_) if item is not None]
@@ -2376,7 +2447,14 @@ class KnowledgeService:
     def _candidate_ref(entity_ref: str) -> str:
         return candidate_ref_from_entity_ref(entity_ref)
 
-    def _disposition(self, revision: KnowledgeRevision, scope: KnowledgeScope):
+    def _disposition(
+        self,
+        revision: KnowledgeRevision,
+        scope: KnowledgeScope,
+        *,
+        conflicts: Collection[KnowledgeConflict],
+        service_refs: Collection[str],
+    ):
         state = revision.state
         if state.review_state == ReviewState.REJECTED:
             return KnowledgeUsageDisposition.REJECTED_BY_REVIEW_STATE, ["review_state_rejected"]
@@ -2390,21 +2468,12 @@ class KnowledgeService:
             return KnowledgeUsageDisposition.REJECTED_BY_SCOPE, ["scope_mismatch"]
         if revision.proposition.kind == KnowledgeKind.DEPENDENCY:
             subject_ref = normalize_service_ref(revision.proposition.subject_ref)
-            service_refs = {normalize_service_ref(value) for value in scope.service_refs}
             if subject_ref not in service_refs:
                 return KnowledgeUsageDisposition.REJECTED_BY_SCOPE, ["dependency_subject_mismatch"]
-        conflicts = self.repository.list_conflicts(
-            revision.tenant_id,
-            proposition_key=revision.proposition.proposition_key,
-            unresolved_only=True,
-        )
-        active_propositions = {row["proposition_key"] for row in self.repository.list_propositions(revision.tenant_id)}
         conflicts = [
             conflict
             for conflict in conflicts
-            if conflict.left_proposition_ref in active_propositions
-            and conflict.right_proposition_ref in active_propositions
-            and (
+            if (
                 conflict.conflict_kind == ConflictKind.DIRECT_NEGATION
                 or (
                     revision.proposition.kind == KnowledgeKind.OWNERSHIP

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from tacit.config import DEFAULT_SIGNALS_DB_PATH
 
-DEFAULT_DB_PATH = Path("data/tacit_signals.db")
+DEFAULT_DB_PATH = DEFAULT_SIGNALS_DB_PATH
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 # Invalid as an API tenant id, so global defaults cannot be selected or mutated
 # through tenant-scoped product paths.

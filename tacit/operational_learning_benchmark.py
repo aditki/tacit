@@ -281,6 +281,15 @@ def _run_case(service: KnowledgeService, case: dict[str, Any]) -> tuple[bool, st
                     "object_ref": "entity:datastore:redis-session",
                 },
                 scope=KnowledgeScope(environment_refs=[f"environment:{environment}"]),
+                evidence=[
+                    KnowledgeEvidenceReference(
+                        evidence_ref=f"scope:{environment}:evidence",
+                        evidence_role=EvidenceRole.SUPPORTING,
+                        source_family=SourceFamily.SERVICE_CATALOG,
+                        lineage_group=f"scope:{environment}",
+                        lineage_kind=LineageKind.INDEPENDENT,
+                    )
+                ],
                 provenance_refs=[f"catalog:{environment}"],
             )
             propositions.append(candidate.proposition.proposition_key)

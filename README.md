@@ -281,6 +281,7 @@ For a wildcard multi-tenant runtime, bind each API key to one tenant and send
 that tenant in `X-Tacit-Tenant`:
 
 ```bash
+API_AUTH_ENABLED=true
 KNOWLEDGE_TENANT_ID=*
 KNOWLEDGE_TENANT_API_KEYS='{"tenant-a":"strong-key-a","tenant-b":"strong-key-b"}'
 ```

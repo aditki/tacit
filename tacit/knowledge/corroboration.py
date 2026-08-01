@@ -121,24 +121,41 @@ class ConflictDetectionService:
         *,
         candidate_id: str = "",
     ) -> list[KnowledgeConflict]:
-        rows = self.repository.list_propositions(tenant_id)
-        existing_conflicts = {item.id: item for item in self.repository.list_conflicts(tenant_id)}
-        current = next((row for row in rows if row["proposition_key"] == proposition_key), None)
-        if current is None:
+        current_rows = self.repository.list_propositions(
+            tenant_id,
+            proposition_key=proposition_key,
+        )
+        if not current_rows:
             return []
+        current = current_rows[0]
+        if current["kind"] == KnowledgeKind.SIGNAL_MAPPING.value:
+            return []
+        if current["kind"] == KnowledgeKind.DEPENDENCY.value:
+            if current["predicate"] not in {"depends_on", "does_not_depend_on"}:
+                return []
+            predicates = {"depends_on", "does_not_depend_on"}
+        elif current["kind"] == KnowledgeKind.OWNERSHIP.value:
+            predicates = {current["predicate"]}
+        else:
+            return []
+        rows = self.repository.list_propositions(
+            tenant_id,
+            kind=current["kind"],
+            subject_ref=current["subject_ref"],
+            predicates=predicates,
+        )
+        existing_conflicts = {
+            item.id: item
+            for item in self.repository.list_conflicts(
+                tenant_id,
+                proposition_key=proposition_key,
+            )
+        }
         conflicts = []
         for other in rows:
             if other["proposition_key"] == proposition_key:
                 continue
             if current["kind"] != other["kind"]:
-                continue
-            signal_mapping = current["kind"] == KnowledgeKind.SIGNAL_MAPPING.value
-            if signal_mapping:
-                # Signal resolution is many-to-many in both directions. A
-                # conflict requires an explicit exclusivity rule, which v1
-                # propositions do not currently represent.
-                continue
-            elif current["subject_ref"] != other["subject_ref"]:
                 continue
             predicates = {current["predicate"], other["predicate"]}
             directly_negated = predicates == {"depends_on", "does_not_depend_on"}
@@ -157,7 +174,6 @@ class ConflictDetectionService:
                 continue
             if (
                 not directly_negated
-                and not signal_mapping
                 and current["object_ref"] == other["object_ref"]
                 and current["concept_ref"] == other["concept_ref"]
             ):
@@ -206,7 +222,12 @@ class ConflictDetectionService:
                 and existing.resolution_status
                 in {ConflictResolutionStatus.RESOLVED_BY_REVIEW, ConflictResolutionStatus.RESOLVED_BY_TIME}
                 and (
-                    existing.resolution_reason in {"counter_proposition_rejected", "counter_proposition_stale"}
+                    existing.resolution_reason
+                    in {
+                        "counter_proposition_rejected",
+                        "counter_proposition_stale",
+                        "counter_proposition_lacks_independent_support",
+                    }
                     or reviewed_support_for_superseded
                 )
                 and conflict.resolution_status == ConflictResolutionStatus.UNRESOLVED
@@ -227,6 +248,10 @@ class ConflictDetectionService:
                 event_reason = "new_support_for_superseded_proposition"
             elif reopened and existing and existing.resolution_reason == "counter_proposition_stale":
                 event_reason = "source_reactivated"
+            elif (
+                reopened and existing and existing.resolution_reason == "counter_proposition_lacks_independent_support"
+            ):
+                event_reason = "new_independent_support"
             elif reopened:
                 event_reason = "new_candidate_after_rejection"
             else:

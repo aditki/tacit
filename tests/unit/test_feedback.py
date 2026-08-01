@@ -326,6 +326,11 @@ def test_feedback_api_requires_and_applies_the_selected_wildcard_tenant(tmp_path
     runtime_settings = Settings(
         _env_file=None,
         knowledge_tenant_id="*",
+        api_auth_enabled=True,
+        knowledge_tenant_api_keys={
+            "tenant-a": "tenant-a-secret",
+            "tenant-b": "tenant-b-secret",
+        },
         feedback_db_path=str(tmp_path / "feedback.db"),
     )
     app = create_app(runtime_settings=runtime_settings)
@@ -337,16 +342,16 @@ def test_feedback_api_requires_and_applies_the_selected_wildcard_tenant(tmp_path
     assert client.get("/api/v1/feedback/shared-dashboard").status_code == 400
     tenant_a = client.get(
         "/api/v1/feedback/shared-dashboard",
-        headers={"X-Tacit-Tenant": "tenant-a"},
+        headers={"X-Tacit-Tenant": "tenant-a", "X-API-Key": "tenant-a-secret"},
     )
     submitted = client.post(
         "/api/v1/feedback",
-        headers={"X-Tacit-Tenant": "tenant-a"},
+        headers={"X-Tacit-Tenant": "tenant-a", "X-API-Key": "tenant-a-secret"},
         json={"dashboard_uid": "shared-dashboard", "overall_useful": True},
     )
     tenant_b_stats = client.get(
         "/api/v1/feedback/stats",
-        headers={"X-Tacit-Tenant": "tenant-b"},
+        headers={"X-Tacit-Tenant": "tenant-b", "X-API-Key": "tenant-b-secret"},
     )
 
     assert tenant_a.status_code == 200

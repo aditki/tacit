@@ -267,9 +267,12 @@ async def _run_pipeline_inner(
             request.prompt,
             request.user_id or "",
             request.channel_id or "",
-            tenant_id=request.tenant_id or "default",
+            tenant_id=request.tenant_id,
         )
     else:
+        configured_tenant = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
+        if configured_tenant != "default":
+            raise ValueError("non-default tenant pipelines require a tenant-aware history store")
         inv_id = history.start(request.prompt, request.user_id or "", request.channel_id or "")
     if base_revision is None and current_contract is not None:
         base_revision = current_contract.investigation.revision
@@ -469,7 +472,7 @@ async def _run_pipeline_inner(
                 recorder=runtime.recorder,
                 timings=runtime.timings,
                 started_at=runtime.started_at,
-                tenant_id=request.tenant_id or "default",
+                tenant_id=request.tenant_id,
             )
             runtime.add_tokens(freeform.token_usage)
             if freeform.failure is not None:
@@ -552,7 +555,7 @@ async def _run_pipeline_inner(
             if signal_store is SIGNAL_STORE_UNAVAILABLE:
                 raise RuntimeError("Operational Knowledge store is unavailable")
 
-            tenant_id = request.tenant_id or getattr(runtime_settings, "knowledge_tenant_id", "default")
+            tenant_id = request.tenant_id
             knowledge_service = resolve_knowledge_service(deps, signal_store=signal_store)
             knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(knowledge_scope)
             knowledge_usage = knowledge_service.apply_stage_usage(

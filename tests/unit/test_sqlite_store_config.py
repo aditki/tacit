@@ -112,6 +112,33 @@ signals:
     assert runtime_settings.signals_db_path == "state/yaml-signals.db"
 
 
+def test_history_and_signal_stores_reject_the_same_sqlite_path(tmp_path):
+    shared_path = tmp_path / "shared.db"
+
+    with pytest.raises(ValueError, match="history_db_path and signals_db_path must use distinct SQLite files"):
+        Settings(
+            _env_file=None,
+            history_db_path=str(shared_path),
+            signals_db_path=str(tmp_path / "state" / ".." / "shared.db"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("history_path", "signals_path"),
+    [
+        ("", "data/tacit_history.db"),
+        ("data/tacit_signals.db", ""),
+    ],
+)
+def test_sqlite_store_paths_include_defaults_when_detecting_collisions(history_path, signals_path):
+    with pytest.raises(ValueError, match="history_db_path and signals_db_path must use distinct SQLite files"):
+        Settings(
+            _env_file=None,
+            history_db_path=history_path,
+            signals_db_path=signals_path,
+        )
+
+
 def test_signal_store_sets_busy_timeout(tmp_path):
     store = SignalStore(db_path=tmp_path / "signals.db")
 

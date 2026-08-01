@@ -74,12 +74,19 @@ DESCRIPTION = (
     "generated output remains quarantined\n\n"
     "### Authentication\n"
     "When `API_AUTH_ENABLED=true`, pass your key via the `X-API-Key` header. "
-    "When disabled (default for development), all endpoints are open.\n\n"
+    "When disabled (default for development), all endpoints are open. Wildcard multi-tenant "
+    "operation requires API authentication and tenant-specific keys.\n\n"
     "### Interactive docs\n"
     "- **Swagger UI** — you are here (`/docs`)\n"
     "- **ReDoc** — alternative view at [`/redoc`](/redoc)\n"
     "- **Web UI** — interactive investigation workspace at [`/`](/)\n"
 )
+
+
+def _validate_api_runtime_settings(runtime_settings: Any) -> None:
+    configured_tenant = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
+    if configured_tenant == "*" and not bool(getattr(runtime_settings, "api_auth_enabled", False)):
+        raise ValueError("Wildcard knowledge tenancy requires API authentication")
 
 
 def create_app(
@@ -94,6 +101,7 @@ def create_app(
     construction here separates app metadata/middleware from route business
     logic and gives tests a small factory to exercise.
     """
+    _validate_api_runtime_settings(runtime_settings)
     app = FastAPI(
         title="Tacit",
         description=DESCRIPTION,

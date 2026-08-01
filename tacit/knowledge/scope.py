@@ -23,7 +23,12 @@ _REGION_PATTERN = re.compile(
     r"\b(?:us|eu|ap|sa|ca|me|af|il)-(?:north|south|east|west|central|northeast|northwest|southeast|southwest)-\d\b",
     re.IGNORECASE,
 )
-_VERSION_PATTERN = re.compile(r"\bv?\d+\.\d+(?:\.\d+)?(?:[-+][a-z0-9_.-]+)?\b", re.IGNORECASE)
+_VERSION_VALUE = r"v?\d+\.\d+(?:\.\d+)?(?:[-+][a-z0-9_.-]+)?"
+_PREFIXED_VERSION_PATTERN = re.compile(r"\bv\d+\.\d+(?:\.\d+)?(?:[-+][a-z0-9_.-]+)?\b", re.IGNORECASE)
+_LABELED_VERSION_PATTERN = re.compile(
+    rf"\b(?:version|release)\b\s*(?:(?:is|=|:)\s*)?(?P<version>{_VERSION_VALUE})\b",
+    re.IGNORECASE,
+)
 _SCOPE_IDENTIFIER_TOKEN = r"[a-z0-9][a-z0-9_.-]*"
 _QUOTED_SCOPE_IDENTIFIER = r"[a-z0-9](?:[a-z0-9_. -]*[a-z0-9])?"
 _UNQUOTED_SCOPE_CANDIDATE = r"[^\s,;!?()[\]{}]+"
@@ -47,7 +52,7 @@ def investigation_knowledge_scope(
     regions = set(_REGION_PATTERN.findall(prompt))
     clusters = _labeled_values(prompt, "cluster")
     namespaces = _labeled_values(prompt, "namespace")
-    versions = set(_VERSION_PATTERN.findall(prompt))
+    versions = _version_values(prompt)
     return KnowledgeScope(
         tenant_id=tenant_id,
         environment_refs=_dimension_refs("environment", environments),
@@ -91,6 +96,12 @@ def _labeled_values(prompt: str, label: str) -> set[str]:
                 values.add(value)
     for pattern in quoted_patterns:
         values.update(match.group("value").strip() for match in pattern.finditer(prompt))
+    return values
+
+
+def _version_values(prompt: str) -> set[str]:
+    values = set(_PREFIXED_VERSION_PATTERN.findall(prompt))
+    values.update(match.group("version") for match in _LABELED_VERSION_PATTERN.finditer(prompt))
     return values
 
 

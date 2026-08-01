@@ -23,7 +23,7 @@ from typing import Any
 
 import structlog
 
-from tacit.config import Settings, settings
+from tacit.config import DEFAULT_HISTORY_DB_PATH, Settings, settings
 from tacit.investigation_contract import (
     CorrectionReference,
     DecisionLogEntry,
@@ -51,7 +51,7 @@ from tacit.tenancy import resolve_tenant_boundary
 
 logger = structlog.get_logger()
 
-_DEFAULT_DB_PATH = Path("data/tacit_history.db")
+_DEFAULT_DB_PATH = DEFAULT_HISTORY_DB_PATH
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _CURRENT_ENGINE_REBUILT_STAGES = frozenset(
     {"candidate_exclusion", "candidate_generation", "ranking", "ranking_context"}

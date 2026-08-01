@@ -59,6 +59,7 @@ from tacit.knowledge.repository import (
     CandidateReviewConflictError,
     KnowledgeRepository,
     KnowledgeRevisionConflictError,
+    _conflict_lookup_sql,
 )
 from tacit.knowledge.scope import investigation_knowledge_scope
 from tacit.knowledge.service import KnowledgeService
@@ -149,6 +150,23 @@ def _dependency(
         tenant_id=tenant_id,
         reactivate_stale=reactivate_stale,
     )
+
+
+def _independent_support(
+    evidence_ref: str,
+    *,
+    family: SourceFamily = SourceFamily.SERVICE_CATALOG,
+) -> list[KnowledgeEvidenceReference]:
+    return [
+        KnowledgeEvidenceReference(
+            evidence_ref=evidence_ref,
+            evidence_role=EvidenceRole.SUPPORTING,
+            source_family=family,
+            lineage_group=evidence_ref,
+            lineage_kind=LineageKind.INDEPENDENT,
+            provenance_refs=[f"provenance:{evidence_ref}"],
+        )
+    ]
 
 
 def _promoted_dependency(
@@ -341,6 +359,63 @@ def test_resolution_normalization_corroboration_and_promotion(tmp_path: Path):
     reconciled_snapshot = service.snapshot_from_usage("default", contradicted)
     assert reconciled_snapshot.items == []
     assert reconciled_snapshot.id != snapshot_a.id
+
+
+def test_snapshot_preloads_active_propositions_and_conflicts_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    _promoted_dependency(service)
+    postgres_scope = KnowledgeScope(tenant_id="default")
+    service.register_entity(
+        Entity(
+            id="entity:datastore:postgres",
+            kind=EntityKind.DATASTORE,
+            canonical_name="postgres",
+            scope=postgres_scope,
+            provenance_refs=["catalog:postgres"],
+        )
+    )
+    candidates = [
+        _dependency(
+            service,
+            payload_ref=f"postgres-{family.value}",
+            family=family,
+            lineage_group=f"postgres-{family.value}",
+            object_ref="entity:datastore:postgres",
+        )
+        for family in (SourceFamily.RUNBOOK, SourceFamily.DASHBOARD)
+    ]
+    for candidate in candidates:
+        service.review_candidate(candidate.id, approved=True, reviewer="reviewer")
+    _, second_revision = service.evaluate_candidate(candidates[0].id)
+    assert second_revision is not None
+
+    calls = {"propositions": 0, "conflicts": 0}
+    list_propositions = service.repository.list_propositions
+    list_conflicts = service.repository.list_conflicts
+
+    def recording_list_propositions(*args, **kwargs):
+        calls["propositions"] += 1
+        return list_propositions(*args, **kwargs)
+
+    def recording_list_conflicts(*args, **kwargs):
+        calls["conflicts"] += 1
+        return list_conflicts(*args, **kwargs)
+
+    monkeypatch.setattr(service.repository, "list_propositions", recording_list_propositions)
+    monkeypatch.setattr(service.repository, "list_conflicts", recording_list_conflicts)
+
+    _, usage = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        )
+    )
+
+    assert len(usage) == 2
+    assert calls == {"propositions": 1, "conflicts": 1}
 
 
 def test_revision_invariants_reject_cross_tenant_and_broken_parentage(tmp_path: Path):
@@ -777,6 +852,188 @@ def test_rejected_propositions_do_not_create_conflicts(tmp_path: Path):
     assert service.conflicts.analyze("default", positive.proposition.proposition_key) == []
 
 
+def test_copied_only_propositions_do_not_create_active_conflicts(tmp_path: Path):
+    service = _service(tmp_path)
+    positive = _dependency(
+        service,
+        payload_ref="independent-positive",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="positive",
+    )
+    copied_negative = _dependency(
+        service,
+        payload_ref="copied-negative",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="copied-source",
+        lineage_kind=LineageKind.COPIED_FROM,
+        predicate="does_not_depend_on",
+    )
+    service.review_candidate(positive.id, approved=True, reviewer="reviewer")
+    service.review_candidate(copied_negative.id, approved=True, reviewer="reviewer")
+
+    active_keys = {row["proposition_key"] for row in service.repository.list_propositions("default")}
+
+    assert positive.proposition.proposition_key in active_keys
+    assert copied_negative.proposition.proposition_key not in active_keys
+    assert service.conflicts.analyze("default", positive.proposition.proposition_key) == []
+
+
+def test_legacy_conflict_without_independent_support_is_resolved_and_can_reopen(tmp_path: Path):
+    repository_path = tmp_path / "knowledge.db"
+    service = _service(tmp_path)
+    positive = _dependency(
+        service,
+        payload_ref="legacy-positive",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="positive",
+    )
+    negative = _dependency(
+        service,
+        payload_ref="legacy-negative",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="negative",
+        predicate="does_not_depend_on",
+    )
+    positive = service.review_candidate(positive.id, approved=True, reviewer="reviewer")
+    negative = service.review_candidate(negative.id, approved=True, reviewer="reviewer")
+    initial = service.conflicts.analyze("default", positive.proposition.proposition_key)
+    assert initial[0].resolution_status == ConflictResolutionStatus.UNRESOLVED
+
+    copied_evidence = negative.evidence.items[0].model_copy(update={"lineage_kind": LineageKind.COPIED_FROM})
+    copied_negative = negative.model_copy(
+        update={"evidence": negative.evidence.model_copy(update={"items": [copied_evidence]})}
+    )
+    service.repository.save_candidate(copied_negative, expected=negative)
+    with service.repository._conn() as conn:
+        conn.execute(
+            "DELETE FROM knowledge_migrations WHERE migration_name=?",
+            ("resolve_conflicts_without_independent_support_v1",),
+        )
+
+    reconciled_repository = KnowledgeRepository(repository_path)
+    resolved = reconciled_repository.list_conflicts("default")
+    assert resolved[0].resolution_status == ConflictResolutionStatus.RESOLVED_BY_REVIEW
+    assert resolved[0].resolution_reason == "counter_proposition_lacks_independent_support"
+
+    reconciled_service = KnowledgeService(
+        reconciled_repository,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="default"),
+    )
+    new_support = _dependency(
+        reconciled_service,
+        payload_ref="new-independent-negative",
+        family=SourceFamily.INCIDENT,
+        lineage_group="new-independent-negative",
+        predicate="does_not_depend_on",
+    )
+    new_support = reconciled_service.review_candidate(new_support.id, approved=True, reviewer="reviewer")
+    reopened = reconciled_service.conflicts.analyze(
+        "default",
+        positive.proposition.proposition_key,
+        candidate_id=new_support.id,
+    )
+
+    assert reopened[0].resolution_status == ConflictResolutionStatus.UNRESOLVED
+    reopen_events = [
+        event for event in reconciled_repository.list_events("default") if event["event_type"] == "conflict_reopened"
+    ]
+    assert reopen_events[0]["reason_code"] == "new_independent_support"
+
+
+def test_reingestion_lineage_downgrade_resolves_existing_conflict(tmp_path: Path):
+    service = _service(tmp_path)
+    positive = _dependency(
+        service,
+        payload_ref="reingested-positive",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="positive",
+    )
+    negative = _dependency(
+        service,
+        payload_ref="reingested-negative",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="negative",
+        predicate="does_not_depend_on",
+    )
+    service.review_candidate(positive.id, approved=True, reviewer="reviewer")
+    service.review_candidate(negative.id, approved=True, reviewer="reviewer")
+    initial = service.conflicts.analyze("default", positive.proposition.proposition_key)
+    assert initial[0].resolution_status == ConflictResolutionStatus.UNRESOLVED
+
+    _dependency(
+        service,
+        payload_ref="reingested-negative",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="copied-negative",
+        lineage_kind=LineageKind.COPIED_FROM,
+        predicate="does_not_depend_on",
+    )
+
+    resolved = service.repository.list_conflicts("default")
+    assert resolved[0].resolution_status == ConflictResolutionStatus.RESOLVED_BY_REVIEW
+    assert resolved[0].resolution_reason == "counter_proposition_lacks_independent_support"
+
+
+def test_conflict_analysis_filters_repository_lookup_to_plausible_competitors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    positive = _dependency(
+        service,
+        payload_ref="filtered-positive",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="positive",
+    )
+    negative = _dependency(
+        service,
+        payload_ref="filtered-negative",
+        family=SourceFamily.DASHBOARD,
+        lineage_group="negative",
+        predicate="does_not_depend_on",
+    )
+    service.review_candidate(positive.id, approved=True, reviewer="reviewer")
+    service.review_candidate(negative.id, approved=True, reviewer="reviewer")
+    with service.repository._conn() as conn:
+        conflict_indexes = {
+            row["name"] for row in conn.execute("PRAGMA index_list(knowledge_conflicts)").fetchall()
+        }
+    assert "idx_conflicts_tenant_left_status" in conflict_indexes
+    assert "idx_conflicts_tenant_right_status" in conflict_indexes
+    calls: list[dict[str, Any]] = []
+    list_propositions = service.repository.list_propositions
+
+    def recording_list_propositions(tenant_id="default", **filters):
+        calls.append(filters)
+        return list_propositions(tenant_id, **filters)
+
+    monkeypatch.setattr(service.repository, "list_propositions", recording_list_propositions)
+
+    service.conflicts.analyze("default", positive.proposition.proposition_key)
+
+    assert calls == [
+        {"proposition_key": positive.proposition.proposition_key},
+        {
+            "kind": KnowledgeKind.DEPENDENCY.value,
+            "subject_ref": "entity:service:checkout",
+            "predicates": {"depends_on", "does_not_depend_on"},
+        },
+    ]
+
+
+def test_conflict_lookup_uses_each_indexed_side(tmp_path: Path):
+    repository = KnowledgeRepository(tmp_path / "knowledge.db")
+    with repository._conn() as conn:
+        plan = conn.execute(
+            f"EXPLAIN QUERY PLAN {_conflict_lookup_sql(unresolved_only=True)}",
+            ("default", "proposition-a", "default", "proposition-a"),
+        ).fetchall()
+
+    details = "\n".join(str(row["detail"]) for row in plan)
+    assert "idx_conflicts_tenant_left_status" in details
+    assert "idx_conflicts_tenant_right_status" in details
+
+
 def test_rejecting_last_candidate_resolves_existing_conflicts(tmp_path: Path):
     service = _service(tmp_path)
     positive = _dependency(
@@ -1030,6 +1287,7 @@ def test_conflict_scope_analysis_includes_services(tmp_path: Path):
             "object_ref": "entity:team:payments",
         },
         scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        evidence=_independent_support("checkout-owner"),
         provenance_refs=["catalog:checkout"],
     )
     second = service.create_candidate(
@@ -1042,6 +1300,7 @@ def test_conflict_scope_analysis_includes_services(tmp_path: Path):
             "object_ref": "entity:team:platform",
         },
         scope=KnowledgeScope(service_refs=["entity:service:payment"]),
+        evidence=_independent_support("payment-owner"),
         provenance_refs=["catalog:payment"],
     )
     service.review_candidate(first.id, approved=True, reviewer="operator")
@@ -1079,6 +1338,7 @@ def test_conflict_scope_analysis_includes_archetypes(tmp_path: Path):
             service_refs=["entity:service:checkout"],
             archetype_refs=["archetype:http-service"],
         ),
+        evidence=_independent_support("http-owner"),
         provenance_refs=["catalog:http"],
     )
     second = service.create_candidate(
@@ -1094,6 +1354,7 @@ def test_conflict_scope_analysis_includes_archetypes(tmp_path: Path):
             service_refs=["entity:service:checkout"],
             archetype_refs=["archetype:queue-worker"],
         ),
+        evidence=_independent_support("queue-owner"),
         provenance_refs=["catalog:queue"],
     )
     service.review_candidate(first.id, approved=True, reviewer="operator")
@@ -1132,6 +1393,7 @@ def test_conflict_temporal_analysis_reports_disjoint_validity_windows(tmp_path: 
             service_refs=["entity:service:checkout"],
             valid_until=boundary,
         ),
+        evidence=_independent_support("historical-owner"),
         provenance_refs=["catalog:historical"],
     )
     second = service.create_candidate(
@@ -1147,6 +1409,7 @@ def test_conflict_temporal_analysis_reports_disjoint_validity_windows(tmp_path: 
             service_refs=["entity:service:checkout"],
             valid_from=boundary,
         ),
+        evidence=_independent_support("current-owner"),
         provenance_refs=["catalog:current"],
     )
     service.review_candidate(first.id, approved=True, reviewer="operator")
@@ -1937,24 +2200,26 @@ def test_candidate_reingestion_preserves_a_concurrent_terminal_review(tmp_path: 
         family=SourceFamily.RUNBOOK,
         lineage_group="runbook:concurrent-review",
     )
-    save_candidate = service.repository.save_candidate_with_proposition
+    get_candidate = service.repository.get_candidate
     review_won = False
 
-    def save_after_concurrent_review(candidate, **kwargs):
+    def get_candidate_after_concurrent_review(candidate_id, tenant_id="default"):
         nonlocal review_won
+        candidate = get_candidate(candidate_id, tenant_id)
         if not review_won:
             review_won = True
             service.review_candidate(
-                candidate.id,
+                candidate_id,
                 approved=False,
                 reviewer="concurrent-reviewer",
+                tenant_id=tenant_id,
             )
-        return save_candidate(candidate, **kwargs)
+        return candidate
 
     monkeypatch.setattr(
         service.repository,
-        "save_candidate_with_proposition",
-        save_after_concurrent_review,
+        "get_candidate",
+        get_candidate_after_concurrent_review,
     )
     reingested = _dependency(
         service,
@@ -5164,6 +5429,43 @@ def test_investigation_scope_extracts_supported_prompt_dimensions():
 @pytest.mark.parametrize(
     "prompt",
     [
+        "Checkout latency rose from 1.2 to 2.4 seconds.",
+        "Checkout p95 is 2.4 seconds and error rate is 1.2 percent.",
+    ],
+)
+def test_investigation_scope_ignores_unlabelled_decimal_measurements(prompt: str):
+    scope = investigation_knowledge_scope(
+        tenant_id="tenant-a",
+        prompt=prompt,
+        services=["checkout"],
+        archetype_ids=["latency_investigation"],
+    )
+
+    assert scope.version_constraints == []
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ("Investigate checkout release 2.4.1", "version:2.4.1"),
+        ("Investigate checkout running v2.4.1", "version:v2.4.1"),
+        ("Investigate checkout version: 2.4", "version:2.4"),
+    ],
+)
+def test_investigation_scope_accepts_explicit_version_syntax(prompt: str, expected: str):
+    scope = investigation_knowledge_scope(
+        tenant_id="tenant-a",
+        prompt=prompt,
+        services=["checkout"],
+        archetype_ids=["latency_investigation"],
+    )
+
+    assert expected in scope.version_constraints
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
         "The checkout cluster is down.",
         "The checkout namespace is unhealthy.",
         "The checkout cluster remains down.",
@@ -5881,6 +6183,8 @@ def test_api_correction_lookup_is_scoped_before_authorization():
     app = create_app(
         runtime_settings=Settings(
             knowledge_tenant_id="*",
+            api_auth_enabled=True,
+            knowledge_tenant_api_keys={"tenant-a": "tenant-a-secret"},
             knowledge_permissions="knowledge.read,knowledge.correct",
         )
     )
@@ -5889,7 +6193,7 @@ def test_api_correction_lookup_is_scoped_before_authorization():
 
     response = client.post(
         "/api/v1/knowledge/corrections",
-        headers={"X-Tacit-Tenant": "tenant-a"},
+        headers={"X-Tacit-Tenant": "tenant-a", "X-API-Key": "tenant-a-secret"},
         json={
             "investigation_id": "inv-other-tenant",
             "investigation_revision": 1,

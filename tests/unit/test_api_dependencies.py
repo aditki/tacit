@@ -14,6 +14,7 @@ from tacit.api.security import (
     assert_knowledge_action,
     assert_tenant_access,
     resolve_knowledge_tenant,
+    verify_api_key,
 )
 from tacit.backends.base import DashboardFeatures
 from tacit.config import Settings
@@ -107,6 +108,24 @@ def test_knowledge_tenant_resolution_matrix(configured, requested, expected, sta
     with pytest.raises(HTTPException) as exc_info:
         resolve_knowledge_tenant(configured, requested)
     assert exc_info.value.status_code == status_code
+
+
+def test_api_app_rejects_unauthenticated_wildcard_tenancy():
+    with pytest.raises(ValueError, match="Wildcard knowledge tenancy requires API authentication"):
+        create_app(runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"))
+
+
+async def test_api_key_dependency_fails_closed_for_unauthenticated_wildcard_tenancy():
+    request = _security_request(
+        Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=False),
+        "tenant-a",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await verify_api_key(request, None)
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "Wildcard knowledge tenancy requires API authentication"
 
 
 @pytest.mark.parametrize(
@@ -329,6 +348,8 @@ def test_pending_learning_requires_and_threads_wildcard_tenant(monkeypatch, tmp_
     app = create_app(
         runtime_settings=Settings(
             knowledge_tenant_id="*",
+            api_auth_enabled=True,
+            knowledge_tenant_api_keys={"tenant-a": "tenant-a-secret"},
             signals_db_path=str(tmp_path / "signals.db"),
         )
     )
@@ -349,11 +370,12 @@ def test_pending_learning_requires_and_threads_wildcard_tenant(monkeypatch, tmp_
 
     missing = client.post(
         "/api/v1/learn/dashboard",
+        headers={"X-API-Key": "tenant-a-secret"},
         json={"dashboard_uid": "tenant-dash", "auto_approve": False},
     )
     accepted = client.post(
         "/api/v1/learn/dashboard",
-        headers={"X-Tacit-Tenant": "tenant-a"},
+        headers={"X-Tacit-Tenant": "tenant-a", "X-API-Key": "tenant-a-secret"},
         json={"dashboard_uid": "tenant-dash", "auto_approve": False},
     )
 
@@ -499,12 +521,21 @@ def test_artifact_lists_use_the_requested_tenant(monkeypatch, tmp_path):
             artifact_type="runbook",
             title=f"{tenant_id} runbook",
         )
-    app = create_app(runtime_settings=Settings(knowledge_tenant_id="*"))
+    app = create_app(
+        runtime_settings=Settings(
+            knowledge_tenant_id="*",
+            api_auth_enabled=True,
+            knowledge_tenant_api_keys={"tenant-a": "tenant-a-secret"},
+        )
+    )
     app.dependency_overrides[get_signal_store] = lambda: store
     client = TestClient(app)
 
-    missing = client.get("/api/v1/learn/runbooks")
-    tenant_a = client.get("/api/v1/learn/runbooks", headers={"X-Tacit-Tenant": "tenant-a"})
+    missing = client.get("/api/v1/learn/runbooks", headers={"X-API-Key": "tenant-a-secret"})
+    tenant_a = client.get(
+        "/api/v1/learn/runbooks",
+        headers={"X-Tacit-Tenant": "tenant-a", "X-API-Key": "tenant-a-secret"},
+    )
 
     assert missing.status_code == 400
     assert tenant_a.status_code == 200
@@ -713,10 +744,16 @@ def test_alert_dry_runs_preserve_selected_wildcard_tenant(monkeypatch):
 
     monkeypatch.setattr("tacit.alert_ingest.ingest_alert", ingest_alert)
     monkeypatch.setattr("tacit.alert_ingest.learn_backend_alerts", learn_alerts)
-    app = create_app(runtime_settings=Settings(knowledge_tenant_id="*"))
+    app = create_app(
+        runtime_settings=Settings(
+            knowledge_tenant_id="*",
+            api_auth_enabled=True,
+            knowledge_tenant_api_keys={"tenant-a": "tenant-a-secret"},
+        )
+    )
     app.dependency_overrides[get_signal_store] = lambda: object()
     client = TestClient(app)
-    headers = {"X-Tacit-Tenant": "tenant-a"}
+    headers = {"X-Tacit-Tenant": "tenant-a", "X-API-Key": "tenant-a-secret"}
 
     single = client.post(
         "/api/v1/learn/alerts",

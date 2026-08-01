@@ -19,7 +19,7 @@ from typing import Any
 
 import structlog
 
-from tacit.config import Settings, settings
+from tacit.config import DEFAULT_FEEDBACK_DB_PATH, Settings, settings
 from tacit.tenancy import resolve_tenant_boundary
 
 _UID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")
@@ -34,7 +34,7 @@ def _sanitize_uid(uid: str) -> str:
 
 logger = structlog.get_logger()
 
-_DEFAULT_DB_PATH = Path("data/tacit_feedback.db")
+_DEFAULT_DB_PATH = DEFAULT_FEEDBACK_DB_PATH
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _DEFAULT_OWNER_MARKER = "default_owner_v1"
 

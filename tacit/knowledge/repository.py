@@ -16,6 +16,7 @@ import structlog
 
 from tacit.config import settings
 from tacit.knowledge.enums import (
+    ConflictResolutionStatus,
     EntityResolutionStatus,
     LifecycleStatus,
     PromotionDecisionType,
@@ -34,6 +35,7 @@ from tacit.knowledge.models import (
     KnowledgeUsage,
     OperationalKnowledgeItem,
     PromotionDecision,
+    utc_now,
 )
 from tacit.knowledge.normalization import normalize_entity
 from tacit.signals.schema import SQLITE_BUSY_TIMEOUT_MS
@@ -188,6 +190,8 @@ CREATE TABLE IF NOT EXISTS knowledge_propositions (
     created_at REAL NOT NULL,
     PRIMARY KEY(tenant_id, proposition_key)
 );
+CREATE INDEX IF NOT EXISTS idx_propositions_conflict_lookup
+    ON knowledge_propositions(tenant_id, kind, subject_ref, predicate);
 
 CREATE TABLE IF NOT EXISTS proposition_candidates (
     proposition_key TEXT NOT NULL,
@@ -213,6 +217,15 @@ CREATE TABLE IF NOT EXISTS knowledge_conflicts (
     resolved_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_conflicts_tenant_status ON knowledge_conflicts(tenant_id, resolution_status);
+CREATE INDEX IF NOT EXISTS idx_conflicts_tenant_left_status
+    ON knowledge_conflicts(tenant_id, left_proposition_key, resolution_status);
+CREATE INDEX IF NOT EXISTS idx_conflicts_tenant_right_status
+    ON knowledge_conflicts(tenant_id, right_proposition_key, resolution_status);
+
+CREATE TABLE IF NOT EXISTS knowledge_migrations (
+    migration_name TEXT PRIMARY KEY,
+    completed_at REAL NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS corroboration_snapshots (
     snapshot_id TEXT PRIMARY KEY,
@@ -352,6 +365,16 @@ def _ts(value) -> float:
     return value.timestamp()
 
 
+def _conflict_lookup_sql(*, unresolved_only: bool) -> str:
+    status_clause = " AND resolution_status='unresolved'" if unresolved_only else ""
+    return f"""SELECT conflict_json, created_at FROM knowledge_conflicts
+               WHERE tenant_id=? AND left_proposition_key=?{status_clause}
+               UNION ALL
+               SELECT conflict_json, created_at FROM knowledge_conflicts
+               WHERE tenant_id=? AND right_proposition_key=?{status_clause}
+               ORDER BY created_at DESC"""
+
+
 class KnowledgeRepository:
     def __init__(self, db_path: Path | None = None):
         self._db_path = db_path or _db_path()
@@ -360,6 +383,7 @@ class KnowledgeRepository:
             default=None,
         )
         self._ensure_schema()
+        self._run_conflict_lineage_migration()
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -442,6 +466,111 @@ class KnowledgeRepository:
             conn.execute("""CREATE INDEX IF NOT EXISTS idx_knowledge_corrections_applied
                    ON knowledge_corrections(tenant_id, applied_knowledge_ref)""")
         logger.info("knowledge_repository_init", db_path=str(self._db_path))
+
+    def _run_conflict_lineage_migration(self) -> None:
+        """Resolve legacy conflicts whose reviewed side has no independent support."""
+        migration_name = "resolve_conflicts_without_independent_support_v1"
+        with self._conn() as conn:
+            already_applied = conn.execute(
+                "SELECT 1 FROM knowledge_migrations WHERE migration_name=?",
+                (migration_name,),
+            ).fetchone()
+        if already_applied is not None:
+            return
+        dependent_lineages = (
+            "copied_from",
+            "generated_from",
+            "same_vendor_export",
+            "same_source_revision",
+        )
+        placeholders = ", ".join("?" for _ in dependent_lineages)
+        resolved_count = 0
+        with self.transaction() as conn:
+            if conn.execute(
+                "SELECT 1 FROM knowledge_migrations WHERE migration_name=?",
+                (migration_name,),
+            ).fetchone():
+                return
+            rows = conn.execute(
+                f"""WITH unsupported_propositions AS (
+                       SELECT p.tenant_id, p.proposition_key
+                       FROM knowledge_propositions p
+                       WHERE EXISTS (
+                         SELECT 1 FROM proposition_candidates pc
+                         JOIN knowledge_candidates c
+                           ON c.id=pc.candidate_id AND c.tenant_id=pc.tenant_id
+                          AND c.proposition_key=p.proposition_key
+                         WHERE pc.tenant_id=p.tenant_id AND pc.proposition_key=p.proposition_key
+                           AND c.review_state IN ('approved', 'trusted')
+                           AND c.lifecycle_status='active'
+                           AND c.entity_resolution_status='resolved'
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1 FROM proposition_candidates pc
+                         JOIN knowledge_candidates c
+                           ON c.id=pc.candidate_id AND c.tenant_id=pc.tenant_id
+                          AND c.proposition_key=p.proposition_key
+                         JOIN knowledge_candidate_evidence e
+                           ON e.candidate_id=c.id AND e.tenant_id=c.tenant_id
+                         WHERE pc.tenant_id=p.tenant_id AND pc.proposition_key=p.proposition_key
+                           AND c.review_state IN ('approved', 'trusted')
+                           AND c.lifecycle_status='active'
+                           AND c.entity_resolution_status='resolved'
+                           AND e.evidence_role='supporting'
+                           AND e.lineage_kind NOT IN ({placeholders})
+                       )
+                     )
+                     SELECT conflict_json FROM knowledge_conflicts conflict
+                     WHERE conflict.resolution_status='unresolved'
+                       AND EXISTS (
+                         SELECT 1 FROM unsupported_propositions unsupported
+                         WHERE unsupported.tenant_id=conflict.tenant_id
+                           AND unsupported.proposition_key IN (
+                             conflict.left_proposition_key, conflict.right_proposition_key
+                           )
+                       )""",
+                dependent_lineages,
+            ).fetchall()
+            for row in rows:
+                conflict = KnowledgeConflict.model_validate_json(row["conflict_json"])
+                resolved = conflict.model_copy(
+                    update={
+                        "resolution_status": ConflictResolutionStatus.RESOLVED_BY_REVIEW,
+                        "resolution_reason": "counter_proposition_lacks_independent_support",
+                        "resolved_by": "system:lineage-policy",
+                        "resolved_at": utc_now(),
+                        "severity": "low",
+                    }
+                )
+                conn.execute(
+                    """UPDATE knowledge_conflicts
+                       SET resolution_status=?, severity=?, conflict_json=?, resolved_at=?
+                       WHERE conflict_id=? AND resolution_status='unresolved'""",
+                    (
+                        resolved.resolution_status.value,
+                        resolved.severity,
+                        resolved.model_dump_json(),
+                        _ts(resolved.resolved_at),
+                        resolved.id,
+                    ),
+                )
+                self.append_event(
+                    "conflict_resolved",
+                    tenant_id=resolved.tenant_id,
+                    subject_ref=resolved.id,
+                    dimensions={"reason_code": resolved.resolution_reason},
+                    payload={"resolved_by": resolved.resolved_by},
+                )
+                resolved_count += 1
+            conn.execute(
+                "INSERT INTO knowledge_migrations (migration_name, completed_at) VALUES (?, ?)",
+                (migration_name, time.time()),
+            )
+        if resolved_count:
+            logger.info(
+                "dependent_lineage_conflicts_reconciled",
+                count=resolved_count,
+            )
 
     def append_event(
         self,
@@ -979,19 +1108,50 @@ class KnowledgeRepository:
             ).fetchall()
         return [KnowledgeCandidate.model_validate_json(row["candidate_json"]) for row in rows]
 
-    def list_propositions(self, tenant_id: str = "default") -> list[dict[str, Any]]:
+    def list_propositions(
+        self,
+        tenant_id: str = "default",
+        *,
+        proposition_key: str | None = None,
+        kind: str | None = None,
+        subject_ref: str | None = None,
+        predicates: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["p.tenant_id=?"]
+        params: list[Any] = [tenant_id]
+        for column, value in (
+            ("p.proposition_key", proposition_key),
+            ("p.kind", kind),
+            ("p.subject_ref", subject_ref),
+        ):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        if predicates:
+            clauses.append(f"p.predicate IN ({', '.join('?' for _ in predicates)})")
+            params.extend(sorted(predicates))
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT p.* FROM knowledge_propositions p
-                   WHERE p.tenant_id=? AND EXISTS (
+                f"""SELECT p.* FROM knowledge_propositions p
+                   WHERE {" AND ".join(clauses)} AND EXISTS (
                      SELECT 1 FROM proposition_candidates pc
-                     JOIN knowledge_candidates c ON c.id=pc.candidate_id AND c.tenant_id=pc.tenant_id
+                     JOIN knowledge_candidates c
+                       ON c.id=pc.candidate_id AND c.tenant_id=pc.tenant_id
+                      AND c.proposition_key=p.proposition_key
                      WHERE pc.tenant_id=p.tenant_id AND pc.proposition_key=p.proposition_key
                        AND c.review_state IN ('approved', 'trusted')
                        AND c.lifecycle_status = 'active'
                        AND c.entity_resolution_status = 'resolved'
+                       AND EXISTS (
+                         SELECT 1 FROM knowledge_candidate_evidence e
+                         WHERE e.tenant_id=c.tenant_id AND e.candidate_id=c.id
+                           AND e.evidence_role='supporting'
+                           AND e.lineage_kind NOT IN (
+                             'copied_from', 'generated_from', 'same_vendor_export', 'same_source_revision'
+                           )
+                       )
                    ) ORDER BY p.created_at""",
-                (tenant_id,),
+                params,
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1049,18 +1209,20 @@ class KnowledgeRepository:
         proposition_key: str | None = None,
         unresolved_only: bool = False,
     ) -> list[KnowledgeConflict]:
-        clauses = ["tenant_id=?"]
-        params: list[Any] = [tenant_id]
         if proposition_key:
-            clauses.append("(left_proposition_key=? OR right_proposition_key=?)")
-            params.extend([proposition_key, proposition_key])
-        if unresolved_only:
-            clauses.append("resolution_status='unresolved'")
+            query = _conflict_lookup_sql(unresolved_only=unresolved_only)
+            params = [tenant_id, proposition_key, tenant_id, proposition_key]
+        else:
+            clauses = ["tenant_id=?"]
+            params = [tenant_id]
+            if unresolved_only:
+                clauses.append("resolution_status='unresolved'")
+            query = (
+                f"SELECT conflict_json FROM knowledge_conflicts "
+                f"WHERE {' AND '.join(clauses)} ORDER BY created_at DESC"
+            )
         with self._conn() as conn:
-            rows = conn.execute(
-                f"SELECT conflict_json FROM knowledge_conflicts WHERE {' AND '.join(clauses)} ORDER BY created_at DESC",
-                params,
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [KnowledgeConflict.model_validate_json(row["conflict_json"]) for row in rows]
 
     def save_promotion_decision(self, decision: PromotionDecision, tenant_id: str) -> PromotionDecision:
