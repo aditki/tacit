@@ -948,9 +948,7 @@ def test_snapshot_limit_is_applied_after_complete_version_scope_filtering(tmp_pa
             expected_parent_revision=revision.revision,
         )
         advanced.append(updated)
-    service._runtime_settings = service._runtime_settings.model_copy(
-        update={"knowledge_snapshot_candidate_limit": 1}
-    )
+    service._runtime_settings = service._runtime_settings.model_copy(update={"knowledge_snapshot_candidate_limit": 1})
 
     _, usage = service.create_snapshot(
         KnowledgeScope(
@@ -970,9 +968,7 @@ def test_snapshot_scan_budget_fails_closed_before_unbounded_scope_filtering(
 ):
     service = _service(tmp_path)
     _, revision = _promoted_dependency(service)
-    service._runtime_settings = service._runtime_settings.model_copy(
-        update={"knowledge_snapshot_scan_limit": 100}
-    )
+    service._runtime_settings = service._runtime_settings.model_copy(update={"knowledge_snapshot_scan_limit": 100})
     monkeypatch.setattr(
         service.repository,
         "list_current_revisions_for_scope",
@@ -1007,9 +1003,7 @@ def test_repository_bulk_authority_lookups_chunk_sqlite_bindings(
     )
 
     assert set(by_ref) == {(revision.knowledge_id, revision.revision)}
-    assert [(item.knowledge_id, item.revision) for item in by_candidate] == [
-        (revision.knowledge_id, revision.revision)
-    ]
+    assert [(item.knowledge_id, item.revision) for item in by_candidate] == [(revision.knowledge_id, revision.revision)]
     assert active == {candidate.proposition.proposition_key}
 
 
@@ -1061,9 +1055,7 @@ def test_multi_page_snapshot_uses_one_database_read_view(
         retire_second_revision_between_pages,
     )
 
-    snapshot, _usage = service.create_snapshot(
-        KnowledgeScope(service_refs=["entity:service:checkout"])
-    )
+    snapshot, _usage = service.create_snapshot(KnowledgeScope(service_refs=["entity:service:checkout"]))
 
     assert calls == 3
     assert [(item.knowledge_ref, item.revision) for item in snapshot.items] == [
@@ -2792,9 +2784,7 @@ def test_signal_store_upgrade_rebuilds_projection_from_immutable_authority(
                 (revision.tenant_id, revision.knowledge_id),
             )
         # Simulate a database certified by the previous one-way v1 audit.
-        conn.execute(
-            "DELETE FROM signal_tenant_migration_metadata WHERE key='governed_projection_audit_v2'"
-        )
+        conn.execute("DELETE FROM signal_tenant_migration_metadata WHERE key='governed_projection_audit_v2'")
         conn.execute(
             """INSERT OR REPLACE INTO signal_tenant_migration_metadata (key, value, updated_at)
                VALUES ('governed_projection_audit_v1', 'clean', ?)""",
@@ -4767,9 +4757,7 @@ def test_usage_id_cannot_replace_another_tenants_audit_row(tmp_path: Path):
     assert repository.save_usage(tenant_a_usage) == tenant_a_usage
 
     with pytest.raises(ValueError, match="usage id already exists with different audit data"):
-        repository.save_usage(
-            tenant_a_usage.model_copy(update={"investigation_id": "inv-tenant-a-mutated"})
-        )
+        repository.save_usage(tenant_a_usage.model_copy(update={"investigation_id": "inv-tenant-a-mutated"}))
 
     with pytest.raises(ValueError, match="usage id already belongs to another tenant"):
         repository.save_usage(
@@ -4866,10 +4854,13 @@ def test_candidate_evaluation_enforces_runtime_review_permission(tmp_path: Path)
     with pytest.raises(PermissionError, match="Missing permission: knowledge.review"):
         service.evaluate_candidate(candidate.id)
 
-    assert service.repository.find_knowledge_by_proposition(
-        "default",
-        candidate.proposition.proposition_key,
-    ) is None
+    assert (
+        service.repository.find_knowledge_by_proposition(
+            "default",
+            candidate.proposition.proposition_key,
+        )
+        is None
+    )
 
 
 def test_correction_creation_enforces_runtime_correct_permission(tmp_path: Path):
@@ -7481,9 +7472,7 @@ def test_review_priority_migration_processes_multiple_bounded_batches(tmp_path: 
         )
         conn.execute("DROP INDEX IF EXISTS idx_kc_review_queue")
         conn.execute("ALTER TABLE knowledge_candidates DROP COLUMN review_priority")
-        conn.execute(
-            "DELETE FROM knowledge_migrations WHERE migration_name='candidate_review_priority_v2'"
-        )
+        conn.execute("DELETE FROM knowledge_migrations WHERE migration_name='candidate_review_priority_v2'")
 
     with capture_logs() as logs:
         migrated = KnowledgeRepository(service.repository._db_path)
@@ -7510,9 +7499,7 @@ def test_review_priority_backfill_resumes_when_interrupted(
     with service.repository._conn() as conn:
         conn.execute("DROP INDEX IF EXISTS idx_kc_review_queue")
         conn.execute("ALTER TABLE knowledge_candidates DROP COLUMN review_priority")
-        conn.execute(
-            "DELETE FROM knowledge_migrations WHERE migration_name='candidate_review_priority_v2'"
-        )
+        conn.execute("DELETE FROM knowledge_migrations WHERE migration_name='candidate_review_priority_v2'")
 
     import tacit.knowledge.repository as repository_module
 
@@ -7574,16 +7561,22 @@ def test_derived_knowledge_indexes_rebuild_in_resumable_batches(
     assert backfills["knowledge_contributor_projection_backfilled"]["batch_count"] == 1
     with rebuilt._conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM knowledge_candidate_provenance").fetchone()[0] == 2
-        assert conn.execute(
-            """SELECT COUNT(*) FROM knowledge_current_scope_refs
+        assert (
+            conn.execute(
+                """SELECT COUNT(*) FROM knowledge_current_scope_refs
                WHERE tenant_id=? AND knowledge_id=? AND revision=?""",
-            (revision.tenant_id, revision.knowledge_id, revision.revision),
-        ).fetchone()[0] == 2
-        assert conn.execute(
-            """SELECT COUNT(*) FROM knowledge_current_contributors
+                (revision.tenant_id, revision.knowledge_id, revision.revision),
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            conn.execute(
+                """SELECT COUNT(*) FROM knowledge_current_contributors
                WHERE tenant_id=? AND knowledge_id=? AND revision=?""",
-            (revision.tenant_id, revision.knowledge_id, revision.revision),
-        ).fetchone()[0] == 2
+                (revision.tenant_id, revision.knowledge_id, revision.revision),
+            ).fetchone()[0]
+            == 2
+        )
 
 
 def test_api_aliases_use_resolver_normalization(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -8342,9 +8335,7 @@ def test_pending_cli_learning_preserves_wildcard_tenant(monkeypatch: pytest.Monk
     class FakeStores:
         settings = SimpleNamespace(
             knowledge_tenant_id="*",
-            knowledge_permissions=(
-                "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.apply"
-            ),
+            knowledge_permissions=("knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.apply"),
         )
 
         def signals(self):

@@ -93,17 +93,13 @@ def test_metric_quality_invalidation_suppresses_an_inflight_stale_cache_write(tm
                 started.set()
                 assert release.wait(timeout=5)
             return {
-                "metric_quality": [
-                    {"metric": metric, "quality_score": score} for metric, score in captured.items()
-                ]
+                "metric_quality": [{"metric": metric, "quality_score": score} for metric, score in captured.items()]
             }
 
     store = BlockingStore(tmp_path / "blocking.db", {"checkout_latency": 0.1})
     first_result: list[dict[str, float]] = []
     thread = threading.Thread(
-        target=lambda: first_result.append(
-            ranking._load_metric_quality(feedback_store=store, tenant_id="tenant-a")
-        )
+        target=lambda: first_result.append(ranking._load_metric_quality(feedback_store=store, tenant_id="tenant-a"))
     )
     thread.start()
     assert started.wait(timeout=5)
@@ -114,9 +110,7 @@ def test_metric_quality_invalidation_suppresses_an_inflight_stale_cache_write(tm
 
     assert not thread.is_alive()
     assert first_result == [{"checkout_latency": 0.1}]
-    assert ranking._load_metric_quality(feedback_store=store, tenant_id="tenant-a") == {
-        "checkout_latency": 0.9
-    }
+    assert ranking._load_metric_quality(feedback_store=store, tenant_id="tenant-a") == {"checkout_latency": 0.9}
     assert store.analyze_calls == 2
 
 
@@ -415,13 +409,9 @@ def test_feedback_owner_migration_resumes_bounded_batches_for_the_same_owner(tmp
         progress = conn.execute(
             "SELECT value FROM feedback_tenant_migration_metadata WHERE key='default_owner_in_progress_v1'"
         ).fetchone()
-        cursor = conn.execute(
-            """SELECT value FROM feedback_tenant_migration_metadata
-               WHERE key='default_owner_cursor_v1:dashboard_provenance'"""
-        ).fetchone()
-        assert conn.execute(
-            "SELECT COUNT(*) FROM dashboard_provenance WHERE tenant_id='tenant-a'"
-        ).fetchone()[0] == 2
+        cursor = conn.execute("""SELECT value FROM feedback_tenant_migration_metadata
+               WHERE key='default_owner_cursor_v1:dashboard_provenance'""").fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM dashboard_provenance WHERE tenant_id='tenant-a'").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM feedback WHERE tenant_id='tenant-a'").fetchone()[0] == 0
     assert progress == ("tenant-a",)
     assert cursor is not None
@@ -439,17 +429,16 @@ def test_feedback_owner_migration_resumes_bounded_batches_for_the_same_owner(tmp
         runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
     )
     with resumed._conn() as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM dashboard_provenance WHERE tenant_id='tenant-a'"
-        ).fetchone()[0] == 5
+        assert conn.execute("SELECT COUNT(*) FROM dashboard_provenance WHERE tenant_id='tenant-a'").fetchone()[0] == 5
         assert conn.execute("SELECT COUNT(*) FROM feedback WHERE tenant_id='tenant-a'").fetchone()[0] == 5
-        assert conn.execute(
-            "SELECT 1 FROM feedback_tenant_migration_metadata WHERE key='default_owner_in_progress_v1'"
-        ).fetchone() is None
-        assert conn.execute(
-            """SELECT 1 FROM feedback_tenant_migration_metadata
-               WHERE key LIKE 'default_owner_cursor_v1:%'"""
-        ).fetchone() is None
+        assert (
+            conn.execute(
+                "SELECT 1 FROM feedback_tenant_migration_metadata WHERE key='default_owner_in_progress_v1'"
+            ).fetchone()
+            is None
+        )
+        assert conn.execute("""SELECT 1 FROM feedback_tenant_migration_metadata
+               WHERE key LIKE 'default_owner_cursor_v1:%'""").fetchone() is None
 
 
 def test_feedback_store_rejects_a_configured_owner_change(tmp_path):

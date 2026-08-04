@@ -699,8 +699,7 @@ class KnowledgeService:
         if decision.decision != PromotionDecisionType.PROMOTE:
             if (
                 persist_failed_revalidation
-                and
-                current_revision is not None
+                and current_revision is not None
                 and current_revision.state.lifecycle_status == LifecycleStatus.ACTIVE
                 and current_revision.state.eligibility != KnowledgeEligibility.INELIGIBLE
                 and candidate.id in current_revision.promoted_from_candidate_refs
@@ -920,9 +919,7 @@ class KnowledgeService:
                         applicable_revision_count=len(revisions),
                         page_count=page_count,
                     )
-                    raise RuntimeError(
-                        f"Operational Knowledge scope scan exceeded {scan_limit} candidate revisions"
-                    )
+                    raise RuntimeError(f"Operational Knowledge scope scan exceeded {scan_limit} candidate revisions")
                 for revision in page:
                     if not self._revision_applies_to_scope(
                         revision,
@@ -1159,9 +1156,7 @@ class KnowledgeService:
             and (not item.used_for or not set(item.used_for).issubset(rebuildable_stages))
         }
         historical = (
-            self.repository.get_snapshot(historical_snapshot_ref, tenant_id)
-            if historical_snapshot_ref
-            else None
+            self.repository.get_snapshot(historical_snapshot_ref, tenant_id) if historical_snapshot_ref else None
         )
         if historical_snapshot_ref and historical is None:
             return ["historical_knowledge_snapshot_unavailable"]
@@ -1372,9 +1367,7 @@ class KnowledgeService:
             KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
         }
         revision_refs = {
-            (item.knowledge_ref, item.knowledge_revision)
-            for item in usage
-            if item.disposition in selectable
+            (item.knowledge_ref, item.knowledge_revision) for item in usage if item.disposition in selectable
         }
         tenant_id = usage[0].tenant_id
         revisions = self.repository.get_revisions_by_refs(tenant_id, revision_refs)
@@ -1608,11 +1601,7 @@ class KnowledgeService:
                         "investigation_revision": investigation_revision,
                     }
                 )
-                existing = (
-                    self.repository.get_usage_by_id(updated.usage_id)
-                    if updated.usage_id
-                    else None
-                )
+                existing = self.repository.get_usage_by_id(updated.usage_id) if updated.usage_id else None
                 persisted_item = self.repository.save_usage(updated)
                 persisted.append(persisted_item)
                 if existing is not None:
@@ -1646,10 +1635,7 @@ class KnowledgeService:
     @staticmethod
     def _usage_contract_fingerprints(usage: Collection[KnowledgeUsage]) -> list[str]:
         excluded = {"usage_id", "investigation_id", "investigation_revision", "created_at"}
-        return sorted(
-            stable_fingerprint(item.model_dump(mode="json", exclude=excluded))
-            for item in usage
-        )
+        return sorted(stable_fingerprint(item.model_dump(mode="json", exclude=excluded)) for item in usage)
 
     def create_correction(
         self,
@@ -2214,9 +2200,7 @@ class KnowledgeService:
                 matching_candidates = [
                     candidate
                     for candidate in self.repository.list_candidates_for_provenance(tenant_id, provenance_ref)
-                    if source_stale
-                    or active_candidate_ids is None
-                    or candidate.id not in active_candidate_ids
+                    if source_stale or active_candidate_ids is None or candidate.id not in active_candidate_ids
                 ]
                 retired_candidates: list[KnowledgeCandidate] = []
                 for observed in matching_candidates:
@@ -2299,10 +2283,7 @@ class KnowledgeService:
             and current.corroboration == preflight.corroboration
             and current.policy == preflight.policy
         )
-        return source_material_changed or (
-            current.updated_at != preflight.updated_at
-            and workflow_unchanged
-        )
+        return source_material_changed or (current.updated_at != preflight.updated_at and workflow_unchanged)
 
     def _reconcile_removed_candidates(
         self,
@@ -2678,22 +2659,14 @@ class KnowledgeService:
             "status": revision.state.model_dump(mode="json"),
             "scope": revision.scope.model_dump(mode="json"),
             "supporting_sources": revision.provenance_refs,
-            "contradictions": [
-                conflict.model_dump(mode="json") for conflict in conflicts[:history_limit]
-            ],
+            "contradictions": [conflict.model_dump(mode="json") for conflict in conflicts[:history_limit]],
             "freshness": revision.state.lifecycle_status.value,
             "promotion_policy": {"id": revision.policy_id, "version": revision.policy_version},
             "promotion_reasons": revision.revision_reason,
-            "investigation_usage": [
-                item.model_dump(mode="json") for item in usage[:history_limit]
-            ],
+            "investigation_usage": [item.model_dump(mode="json") for item in usage[:history_limit]],
             "live_corroboration": revision.state.eligibility == KnowledgeEligibility.LIVE_VERIFIED,
-            "corrections": [
-                correction.model_dump(mode="json") for correction in corrections[:history_limit]
-            ],
-            "revision_history": [
-                item.model_dump(mode="json") for item in revisions[:history_limit]
-            ],
+            "corrections": [correction.model_dump(mode="json") for correction in corrections[:history_limit]],
+            "revision_history": [item.model_dump(mode="json") for item in revisions[:history_limit]],
             "history_page": {
                 "limit": history_limit,
                 "offset": history_offset,

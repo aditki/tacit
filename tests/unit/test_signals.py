@@ -665,10 +665,8 @@ def test_signal_mapping_activates_after_governed_corroboration(signal_store, mon
                 ORDER BY governance_ref""",
             ("tenant-a", "checkout_latency", "checkout_latency_seconds"),
         ).fetchall()
-        audit = conn.execute(
-            """SELECT value FROM signal_tenant_migration_metadata
-               WHERE key='governed_projection_audit_v2'"""
-        ).fetchone()
+        audit = conn.execute("""SELECT value FROM signal_tenant_migration_metadata
+               WHERE key='governed_projection_audit_v2'""").fetchone()
     ungoverned = next(row for row in rows if not row["governance_ref"])
     governed = next(row for row in rows if row["governance_ref"])
     assert ungoverned["review_state"] == "candidate"
@@ -1045,17 +1043,18 @@ def test_default_owner_migration_resumes_after_a_committed_batch(tmp_path, monke
         SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="tenant-a"))
 
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute(
-            "SELECT 1 FROM signal_tenant_migration_metadata WHERE key=?",
-            (_DEFAULT_OWNER_MARKER,),
-        ).fetchone() is None
+        assert (
+            conn.execute(
+                "SELECT 1 FROM signal_tenant_migration_metadata WHERE key=?",
+                (_DEFAULT_OWNER_MARKER,),
+            ).fetchone()
+            is None
+        )
         progress = conn.execute(
             "SELECT value FROM signal_tenant_migration_metadata WHERE key='default_owner_in_progress_v1'"
         ).fetchone()
-        cursor = conn.execute(
-            """SELECT value FROM signal_tenant_migration_metadata
-               WHERE key='default_owner_cursor_v1:learned_artifacts'"""
-        ).fetchone()
+        cursor = conn.execute("""SELECT value FROM signal_tenant_migration_metadata
+               WHERE key='default_owner_cursor_v1:learned_artifacts'""").fetchone()
         assert conn.execute("SELECT COUNT(*) FROM learned_artifacts WHERE tenant_id='tenant-a'").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM learned_artifacts WHERE tenant_id='default'").fetchone()[0] == 3
     assert progress == ("tenant-a",)
@@ -1078,10 +1077,8 @@ def test_default_owner_migration_resumes_after_a_committed_batch(tmp_path, monke
         progress = conn.execute(
             "SELECT 1 FROM signal_tenant_migration_metadata WHERE key='default_owner_in_progress_v1'"
         ).fetchone()
-        cursor = conn.execute(
-            """SELECT 1 FROM signal_tenant_migration_metadata
-               WHERE key LIKE 'default_owner_cursor_v1:%'"""
-        ).fetchone()
+        cursor = conn.execute("""SELECT 1 FROM signal_tenant_migration_metadata
+               WHERE key LIKE 'default_owner_cursor_v1:%'""").fetchone()
     assert marker is not None
     assert marker["value"] == "tenant-a"
     assert progress is None
@@ -1115,12 +1112,8 @@ def test_default_owner_migration_pages_unindexed_learning_context_by_rowid(tmp_p
     migrated = SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="tenant-a"))
 
     with migrated._conn() as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM learning_context_fts WHERE tenant_id='tenant-a'"
-        ).fetchone()[0] == 5
-        assert conn.execute(
-            "SELECT 1 FROM learning_context_fts WHERE tenant_id='default'"
-        ).fetchone() is None
+        assert conn.execute("SELECT COUNT(*) FROM learning_context_fts WHERE tenant_id='tenant-a'").fetchone()[0] == 5
+        assert conn.execute("SELECT 1 FROM learning_context_fts WHERE tenant_id='default'").fetchone() is None
 
 
 def test_knowledge_service_rejects_a_resolver_from_another_database(tmp_path):
@@ -1300,10 +1293,8 @@ def test_startup_rejects_unprojectable_authority_without_certifying_it_clean(tmp
                WHERE tenant_id='default' AND governance_ref=?""",
             (revision.knowledge_id,),
         ).fetchone()
-        audit = conn.execute(
-            """SELECT value FROM signal_tenant_migration_metadata
-               WHERE key='governed_projection_audit_v2'"""
-        ).fetchone()
+        audit = conn.execute("""SELECT value FROM signal_tenant_migration_metadata
+               WHERE key='governed_projection_audit_v2'""").fetchone()
 
     assert authority["content_json"] == legacy_content
     assert authority["semantic_fingerprint"] == legacy_fingerprint
@@ -1350,10 +1341,8 @@ def test_dirty_projection_audit_repairs_authority_in_bounded_batches(
         revisions.append(revision)
 
     with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """UPDATE signal_metric_mappings SET review_state='candidate'
-               WHERE governance_ref!=''"""
-        )
+        conn.execute("""UPDATE signal_metric_mappings SET review_state='candidate'
+               WHERE governance_ref!=''""")
         if force_schema_migration:
             conn.execute(
                 "DELETE FROM signal_tenant_migration_metadata WHERE key=?",
@@ -1364,21 +1353,15 @@ def test_dirty_projection_audit_repairs_authority_in_bounded_batches(
     with capture_logs() as logs:
         repaired = SignalStore(db_path=db_path)
 
-    batches = [
-        entry for entry in logs if entry["event"] == "governed_signal_projection_repair_batch"
-    ]
+    batches = [entry for entry in logs if entry["event"] == "governed_signal_projection_repair_batch"]
     assert len(batches) == 2
     assert all(entry["batch_size"] == 1 for entry in batches)
     with repaired._conn() as conn:
-        rows = conn.execute(
-            """SELECT governance_ref, governance_revision, review_state
+        rows = conn.execute("""SELECT governance_ref, governance_revision, review_state
                FROM signal_metric_mappings WHERE governance_ref!=''
-               ORDER BY governance_ref"""
-        ).fetchall()
-        audit = conn.execute(
-            """SELECT value FROM signal_tenant_migration_metadata
-               WHERE key='governed_projection_audit_v2'"""
-        ).fetchone()
+               ORDER BY governance_ref""").fetchall()
+        audit = conn.execute("""SELECT value FROM signal_tenant_migration_metadata
+               WHERE key='governed_projection_audit_v2'""").fetchone()
     assert [(row["governance_ref"], row["governance_revision"]) for row in rows] == sorted(
         (revision.knowledge_id, revision.revision) for revision in revisions
     )
@@ -1415,10 +1398,8 @@ def test_projection_audit_validation_pages_without_per_mapping_authority_queries
         assert revision is not None
 
     with store._conn() as conn:
-        conn.execute(
-            """UPDATE signal_tenant_migration_metadata SET value='dirty:test'
-               WHERE key='governed_projection_audit_v2'"""
-        )
+        conn.execute("""UPDATE signal_tenant_migration_metadata SET value='dirty:test'
+               WHERE key='governed_projection_audit_v2'""")
 
     statements: list[str] = []
     original_conn = store._conn
@@ -3855,10 +3836,7 @@ class TestIngestedDashboards:
             assert backend_name == "grafana"
             cursors.append(after_id)
             if after_id == 0:
-                return [
-                    {"id": index + 1, "dashboard_uid": f"stale-{index}"}
-                    for index in range(500)
-                ]
+                return [{"id": index + 1, "dashboard_uid": f"stale-{index}"} for index in range(500)]
             if after_id == 500:
                 return [{"id": 501, "dashboard_uid": "stale-final"}]
             return []
@@ -3946,10 +3924,13 @@ class TestIngestedDashboards:
         second = await di.learn_backend_dashboards("grafana", store=signal_store)
         assert second["stale_marked"] == 0
         assert second["stale_reconciliation_failures"] == 0
-        assert signal_store.list_unreconciled_stale_dashboards(
-            tenant_id="default",
-            backend_name="grafana",
-        ) == []
+        assert (
+            signal_store.list_unreconciled_stale_dashboards(
+                tenant_id="default",
+                backend_name="grafana",
+            )
+            == []
+        )
 
         third = await di.learn_backend_dashboards("grafana", store=signal_store)
         assert third["stale_marked"] == 0
@@ -4150,14 +4131,12 @@ signals:
 
     def test_unchanged_bootstrap_catalog_skips_repeated_upserts(self, tmp_path, monkeypatch):
         yaml_path = tmp_path / "signals.yaml"
-        yaml_path.write_text(
-            """signals:
+        yaml_path.write_text("""signals:
   request_latency:
     metric_patterns:
       - pattern: request_seconds
         confidence: 0.9
-"""
-        )
+""")
         store = SignalStore(db_path=tmp_path / "signals.db")
 
         assert store.load_from_yaml(yaml_path, only_if_changed=True) == 1

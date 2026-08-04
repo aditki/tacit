@@ -122,9 +122,7 @@ def test_pinned_history_migration_processes_multiple_bounded_batches(tmp_path):
     )
 
     with migrated._conn() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM investigations WHERE tenant_id='tenant-a'").fetchone()[0] == len(
-            rows
-        )
+        assert conn.execute("SELECT COUNT(*) FROM investigations WHERE tenant_id='tenant-a'").fetchone()[0] == len(rows)
         assert conn.execute("SELECT COUNT(*) FROM investigation_tenant_assignments").fetchone()[0] == len(rows)
 
 
@@ -273,12 +271,8 @@ def test_history_schema_migration_resumes_after_a_committed_batch(tmp_path):
 
     with sqlite3.connect(db_path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
-        assigned = conn.execute(
-            "SELECT COUNT(*) FROM investigation_tenant_assignments"
-        ).fetchone()
-        progress = conn.execute(
-            "SELECT 1 FROM history_migration_progress"
-        ).fetchone()
+        assigned = conn.execute("SELECT COUNT(*) FROM investigation_tenant_assignments").fetchone()
+        progress = conn.execute("SELECT 1 FROM history_migration_progress").fetchone()
     assert "tenant_id" in columns
     assert assigned == (500,)
     assert progress is not None

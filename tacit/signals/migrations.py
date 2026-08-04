@@ -170,10 +170,7 @@ def signal_schema_is_current(conn: sqlite3.Connection) -> bool:
         "learning_context_fts",
     }
     existing_tables = {
-        str(row[0])
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
-        ).fetchall()
+        str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')").fetchall()
     }
     if not required_tables.issubset(existing_tables):
         return False
@@ -184,8 +181,7 @@ def signal_schema_is_current(conn: sqlite3.Connection) -> bool:
         "idx_learned_artifact_reconciliation",
     }
     existing_indexes = {
-        str(row[0])
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
+        str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
     }
     if not required_indexes.issubset(existing_indexes):
         return False
@@ -195,8 +191,7 @@ def signal_schema_is_current(conn: sqlite3.Connection) -> bool:
         "trg_governed_mapping_delete_audit_dirty",
     }
     existing_triggers = {
-        str(row[0])
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()
+        str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()
     }
     return required_triggers.issubset(existing_triggers)
 
@@ -244,8 +239,7 @@ def ensure_governed_projection_audit_triggers(conn: sqlite3.Connection) -> None:
         "trg_governed_mapping_delete_audit_dirty",
     ):
         conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
-    conn.execute(
-        f"""CREATE TRIGGER trg_governed_mapping_insert_audit_dirty
+    conn.execute(f"""CREATE TRIGGER trg_governed_mapping_insert_audit_dirty
            AFTER INSERT ON signal_metric_mappings
            WHEN NEW.governance_ref != ''
              OR (NEW.source_type != 'bootstrap' AND NEW.review_state IN ('approved', 'trusted'))
@@ -254,10 +248,8 @@ def ensure_governed_projection_audit_triggers(conn: sqlite3.Connection) -> None:
              VALUES ('{GOVERNED_PROJECTION_AUDIT_MARKER}',
                      'dirty:' || lower(hex(randomblob(8))), CAST(strftime('%s', 'now') AS REAL))
              ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
-           END"""
-    )
-    conn.execute(
-        f"""CREATE TRIGGER trg_governed_mapping_update_audit_dirty
+           END""")
+    conn.execute(f"""CREATE TRIGGER trg_governed_mapping_update_audit_dirty
            AFTER UPDATE ON signal_metric_mappings
            WHEN OLD.governance_ref != '' OR NEW.governance_ref != ''
              OR (OLD.source_type != 'bootstrap' AND OLD.review_state IN ('approved', 'trusted'))
@@ -267,10 +259,8 @@ def ensure_governed_projection_audit_triggers(conn: sqlite3.Connection) -> None:
              VALUES ('{GOVERNED_PROJECTION_AUDIT_MARKER}',
                      'dirty:' || lower(hex(randomblob(8))), CAST(strftime('%s', 'now') AS REAL))
              ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
-           END"""
-    )
-    conn.execute(
-        f"""CREATE TRIGGER trg_governed_mapping_delete_audit_dirty
+           END""")
+    conn.execute(f"""CREATE TRIGGER trg_governed_mapping_delete_audit_dirty
            AFTER DELETE ON signal_metric_mappings
            WHEN OLD.governance_ref != ''
              OR (OLD.source_type != 'bootstrap' AND OLD.review_state IN ('approved', 'trusted'))
@@ -279,8 +269,7 @@ def ensure_governed_projection_audit_triggers(conn: sqlite3.Connection) -> None:
              VALUES ('{GOVERNED_PROJECTION_AUDIT_MARKER}',
                      'dirty:' || lower(hex(randomblob(8))), CAST(strftime('%s', 'now') AS REAL))
              ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
-           END"""
-    )
+           END""")
 
 
 def _migration_marker_exists(conn: sqlite3.Connection, key: str) -> bool:
@@ -406,9 +395,7 @@ def _archive_and_delete_migration_batch(
         payload = json.dumps(payload_row, sort_keys=True, separators=(",", ":"), default=str)
         row_key = hashlib.sha256(f"{table}\0{payload}".encode()).hexdigest()
         original_tenant = str(payload_row.get("tenant_id") or "default")
-        archive_rows.append(
-            (table, row_key, original_tenant, target_tenant, reason, payload, quarantined_at)
-        )
+        archive_rows.append((table, row_key, original_tenant, target_tenant, reason, payload, quarantined_at))
     conn.executemany(
         """INSERT OR IGNORE INTO signal_migration_quarantine
            (source_table, source_row_key, original_tenant_id, target_tenant_id,
@@ -475,21 +462,17 @@ def reconcile_default_tenant_owner_batch(
     if _tenant_column_exists(conn, "signal_metric_mappings"):
         projection_conditions = ["(tenant_id='default' AND governance_ref!='')"]
         if _tenant_column_exists(conn, "operational_knowledge"):
-            projection_conditions.append(
-                """EXISTS (
+            projection_conditions.append("""EXISTS (
                      SELECT 1 FROM operational_knowledge authority
                      WHERE authority.tenant_id='default'
                        AND authority.knowledge_id=signal_metric_mappings.governance_ref
-                   )"""
-            )
+                   )""")
         if _tenant_column_exists(conn, "operational_knowledge_revisions"):
-            projection_conditions.append(
-                """EXISTS (
+            projection_conditions.append("""EXISTS (
                      SELECT 1 FROM operational_knowledge_revisions authority
                      WHERE authority.tenant_id='default'
                        AND authority.knowledge_id=signal_metric_mappings.governance_ref
-                   )"""
-            )
+                   )""")
         count = _archive_and_delete_migration_batch(
             conn,
             table="signal_metric_mappings",
@@ -579,9 +562,7 @@ def reconcile_default_tenant_owner_batch(
     for table in _RETARGETABLE_TENANT_TABLES:
         if not _tenant_column_exists(conn, table):
             continue
-        remaining = conn.execute(
-            f"SELECT MIN(rowid) AS first_rowid FROM {table} WHERE tenant_id='default'"
-        ).fetchone()
+        remaining = conn.execute(f"SELECT MIN(rowid) AS first_rowid FROM {table} WHERE tenant_id='default'").fetchone()
         if remaining is not None and remaining["first_rowid"] is not None:
             _record_migration_marker(
                 conn,
@@ -593,10 +574,8 @@ def reconcile_default_tenant_owner_batch(
     if _tenant_column_exists(conn, "signal_metric_mappings"):
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
         source_filter = " AND source_type!='bootstrap'" if "source_type" in columns else ""
-        remaining = conn.execute(
-            f"""SELECT MIN(rowid) AS first_rowid FROM signal_metric_mappings
-                WHERE tenant_id='default'{source_filter}"""
-        ).fetchone()
+        remaining = conn.execute(f"""SELECT MIN(rowid) AS first_rowid FROM signal_metric_mappings
+                WHERE tenant_id='default'{source_filter}""").fetchone()
         if remaining is not None and remaining["first_rowid"] is not None:
             _record_migration_marker(
                 conn,
@@ -1063,10 +1042,8 @@ def ensure_ingested_dashboard_columns(conn: sqlite3.Connection) -> None:
     if "knowledge_reconciled_at" not in columns:
         conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN knowledge_reconciled_at REAL")
     if "tenant_id" in columns:
-        conn.execute(
-            """CREATE INDEX IF NOT EXISTS idx_ingested_dashboard_reconciliation
-               ON ingested_dashboards(tenant_id, backend_name, stale, knowledge_reconciled_at, id)"""
-        )
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_dashboard_reconciliation
+               ON ingested_dashboards(tenant_id, backend_name, stale, knowledge_reconciled_at, id)""")
 
 
 def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
@@ -1093,10 +1070,8 @@ def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
         if name not in columns:
             conn.execute(f"ALTER TABLE ingested_alerts ADD COLUMN {name} {ddl}")
     if "tenant_id" in columns:
-        conn.execute(
-            """CREATE INDEX IF NOT EXISTS idx_ingested_alert_reconciliation
-               ON ingested_alerts(tenant_id, backend_name, stale, knowledge_reconciled_at, id)"""
-        )
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_alert_reconciliation
+               ON ingested_alerts(tenant_id, backend_name, stale, knowledge_reconciled_at, id)""")
 
 
 def ensure_ingested_alert_tenant_scope(
@@ -1133,10 +1108,8 @@ def ensure_artifact_learning_columns(conn: sqlite3.Connection) -> None:
             if name not in artifact_columns:
                 conn.execute(f"ALTER TABLE learned_artifacts ADD COLUMN {name} {ddl}")
         if "tenant_id" in artifact_columns:
-            conn.execute(
-                """CREATE INDEX IF NOT EXISTS idx_learned_artifact_reconciliation
-                   ON learned_artifacts(tenant_id, artifact_type, stale, knowledge_reconciled_at, id)"""
-            )
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_learned_artifact_reconciliation
+                   ON learned_artifacts(tenant_id, artifact_type, stale, knowledge_reconciled_at, id)""")
 
     for table in ("evidence_requirements", "ownership_hints", "dependency_hints", "signal_mapping_candidates"):
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}

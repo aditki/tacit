@@ -426,12 +426,16 @@ async def knowledge_impact(
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
-    return get_knowledge_service(request).impact(
-        knowledge_id,
-        _tenant(request),
-        limit=limit,
-        offset=offset,
-    ).model_dump(mode="json")
+    return (
+        get_knowledge_service(request)
+        .impact(
+            knowledge_id,
+            _tenant(request),
+            limit=limit,
+            offset=offset,
+        )
+        .model_dump(mode="json")
+    )
 
 
 @router.get("/api/v1/knowledge/{knowledge_id}/explain", tags=["Operational Knowledge"])

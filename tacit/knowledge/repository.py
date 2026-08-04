@@ -538,18 +538,12 @@ class KnowledgeRepository:
                 row["name"] for row in conn.execute("PRAGMA table_info(knowledge_candidates)").fetchall()
             }
             if "review_priority" not in candidate_columns:
-                conn.execute(
-                    "ALTER TABLE knowledge_candidates ADD COLUMN review_priority INTEGER NOT NULL DEFAULT 0"
-                )
+                conn.execute("ALTER TABLE knowledge_candidates ADD COLUMN review_priority INTEGER NOT NULL DEFAULT 0")
             if "has_unresolved_conflict" not in candidate_columns:
-                conn.execute(
-                    """ALTER TABLE knowledge_candidates
-                       ADD COLUMN has_unresolved_conflict INTEGER NOT NULL DEFAULT 0"""
-                )
-            conn.execute(
-                """CREATE INDEX IF NOT EXISTS idx_kc_review_queue
-                   ON knowledge_candidates(tenant_id, review_state, review_priority DESC, id)"""
-            )
+                conn.execute("""ALTER TABLE knowledge_candidates
+                       ADD COLUMN has_unresolved_conflict INTEGER NOT NULL DEFAULT 0""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_kc_review_queue
+                   ON knowledge_candidates(tenant_id, review_state, review_priority DESC, id)""")
             correction_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(knowledge_corrections)").fetchall()
             }
@@ -2238,16 +2232,14 @@ class KnowledgeRepository:
                 dimension_clauses.append(unscoped)
                 continue
             placeholders = ", ".join("?" for _ in requested_refs)
-            dimension_clauses.append(
-                f"""({unscoped} OR EXISTS (
+            dimension_clauses.append(f"""({unscoped} OR EXISTS (
                     SELECT 1 FROM knowledge_current_scope_refs scoped
                     WHERE scoped.tenant_id=current.tenant_id
                       AND scoped.knowledge_id=current.knowledge_id
                       AND scoped.revision=current.current_revision
                       AND scoped.dimension=?
                       AND scoped.scope_ref IN ({placeholders})
-                ))"""
-            )
+                ))""")
             params.extend([field_name, *requested_refs])
         limit_clause = ""
         if limit is not None:

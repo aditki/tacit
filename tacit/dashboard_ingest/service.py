@@ -351,6 +351,7 @@ def _govern_signal_mapping(
     active_settings = _active_runtime_settings(runtime_settings, store)
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     from tacit.knowledge.migration import migrate_signal_mapping
+
     knowledge_service = knowledge_service or _knowledge_service_for_store(
         store,
         runtime_settings=active_settings,

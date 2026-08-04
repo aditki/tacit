@@ -102,11 +102,7 @@ class EntityResolutionService:
             expected_kind_filter,
             limit=_EXACT_NAME_CANDIDATE_LIMIT,
         )
-        named = [
-            entity
-            for entity in named_entities
-            if entity.scope.applies_to(scope)
-        ]
+        named = [entity for entity in named_entities if entity.scope.applies_to(scope)]
         alias_entities, aliases_truncated = self.repository.find_alias_entities(
             tenant_id,
             normalized,
@@ -167,10 +163,7 @@ class EntityResolutionService:
             limit=_FUZZY_ENTITY_CANDIDATE_LIMIT,
         )
         for entity in fuzzy_entities:
-            if (
-                not self._kind_matches(entity.kind, expected_kind)
-                or not entity.scope.applies_to(scope)
-            ):
+            if not self._kind_matches(entity.kind, expected_kind) or not entity.scope.applies_to(scope):
                 continue
             score = SequenceMatcher(None, normalized, normalize_entity(entity.canonical_name)).ratio()
             if score >= 0.78:

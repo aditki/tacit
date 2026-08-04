@@ -313,11 +313,15 @@ def _evaluate_imported_approval(
         or previous_candidate.provenance_refs != candidate.provenance_refs
         or previous_candidate.scope != candidate.scope
     )
-    should_evaluate = authority_inputs_changed or current is None or (
-        current.state.lifecycle_status == LifecycleStatus.STALE
+    should_evaluate = (
+        authority_inputs_changed
+        or current is None
         or (
-            current.state.lifecycle_status == LifecycleStatus.ACTIVE
-            and current.state.eligibility == KnowledgeEligibility.INELIGIBLE
+            current.state.lifecycle_status == LifecycleStatus.STALE
+            or (
+                current.state.lifecycle_status == LifecycleStatus.ACTIVE
+                and current.state.eligibility == KnowledgeEligibility.INELIGIBLE
+            )
         )
     )
     if should_evaluate:

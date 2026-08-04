@@ -445,22 +445,14 @@ class InvestigationStore:
                 conn.execute("ALTER TABLE investigations ADD COLUMN current_revision INTEGER NOT NULL DEFAULT 0")
             if "tenant_id" not in columns:
                 conn.execute("ALTER TABLE investigations ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
-            conn.execute(
-                """CREATE INDEX IF NOT EXISTS idx_inv_tenant_started
-                   ON investigations(tenant_id, started_at DESC, id DESC)"""
-            )
-            conn.execute(
-                """CREATE INDEX IF NOT EXISTS idx_inv_tenant_status_started
-                   ON investigations(tenant_id, status, started_at DESC, id DESC)"""
-            )
-            conn.execute(
-                """CREATE INDEX IF NOT EXISTS idx_inv_tenant_user_started
-                   ON investigations(tenant_id, user_id, started_at DESC, id DESC)"""
-            )
-            conn.execute(
-                """CREATE INDEX IF NOT EXISTS idx_inv_tenant_dashboard
-                   ON investigations(tenant_id, dashboard_uid)"""
-            )
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_inv_tenant_started
+                   ON investigations(tenant_id, started_at DESC, id DESC)""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_inv_tenant_status_started
+                   ON investigations(tenant_id, status, started_at DESC, id DESC)""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_inv_tenant_user_started
+                   ON investigations(tenant_id, user_id, started_at DESC, id DESC)""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_inv_tenant_dashboard
+                   ON investigations(tenant_id, dashboard_uid)""")
             if tenant_migration_required:
                 if pending_details is None and not tenant_column_existed:
                     conn.execute("DELETE FROM investigation_tenant_assignments")
@@ -508,12 +500,8 @@ class InvestigationStore:
             return False
         if self._pending_history_tenant_migration(conn) is not None:
             return False
-        investigation_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(investigations)")
-        }
-        candidate_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(knowledge_candidates)")
-        }
+        investigation_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(investigations)")}
+        candidate_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(knowledge_candidates)")}
         return (
             {"tenant_id", "stage_outcomes", "current_revision"}.issubset(investigation_columns)
             and {"reviewed_by", "reviewed_at", "applied_revision"}.issubset(candidate_columns)
@@ -604,9 +592,7 @@ class InvestigationStore:
                 return None
             try:
                 payload = json.loads(row["contract_json"])
-                return self._concrete_legacy_tenant(
-                    payload.get("request", {}).get("scope", {}).get("tenant_id")
-                )
+                return self._concrete_legacy_tenant(payload.get("request", {}).get("scope", {}).get("tenant_id"))
             except (AttributeError, TypeError, ValueError):
                 return None
         return self._legacy_contract_tenant(conn, str(row["id"]))
@@ -694,22 +680,15 @@ class InvestigationStore:
         if not self._table_exists(conn, "investigation_tenant_assignments"):
             ownerless_ids = [
                 str(row["id"])
-                for row in conn.execute(
-                    "SELECT id FROM investigations WHERE tenant_id='default' LIMIT 5"
-                ).fetchall()
+                for row in conn.execute("SELECT id FROM investigations WHERE tenant_id='default' LIMIT 5").fetchall()
             ]
         else:
-            ownerless_ids = [
-                str(row["id"])
-                for row in conn.execute(
-                    """SELECT i.id
+            ownerless_ids = [str(row["id"]) for row in conn.execute("""SELECT i.id
                        FROM investigations i
                        LEFT JOIN investigation_tenant_assignments a
                          ON a.investigation_id=i.id AND a.tenant_id='default'
                        WHERE i.tenant_id='default' AND a.investigation_id IS NULL
-                       LIMIT 5"""
-                ).fetchall()
-            ]
+                       LIMIT 5""").fetchall()]
         if ownerless_ids:
             logger.error(
                 "legacy_history_default_owner_unconfirmed",
@@ -759,9 +738,7 @@ class InvestigationStore:
                 tenant_column_existed = bool(details["tenant_column_existed"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError("History tenant migration progress is invalid") from exc
-            configured_tenant = str(
-                details.get("configured_tenant") or self._settings.knowledge_tenant_id or "default"
-            )
+            configured_tenant = str(details.get("configured_tenant") or self._settings.knowledge_tenant_id or "default")
             fallback_tenant = configured_tenant if configured_tenant != "*" else None
             revisions_exist = self._table_exists(conn, "investigation_revisions")
             revision_join = ""

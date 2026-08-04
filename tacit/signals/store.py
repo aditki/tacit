@@ -106,6 +106,8 @@ _PROJECTION_AUDIT_MAX_RETRIES = 3
 
 class _ProjectionAuditChanged(RuntimeError):
     pass
+
+
 _LEARNING_LIST_MAX_LIMIT = 10_000
 
 __all__ = [
@@ -154,11 +156,7 @@ def _escape_like_prefix(value: str) -> str:
 
 def _projection_scope_values(refs: list[str], prefix: str) -> list[str]:
     return sorted(
-        {
-            value.removeprefix(prefix)
-            for value in refs
-            if value and (value.startswith(prefix) or ":" not in value)
-        }
+        {value.removeprefix(prefix) for value in refs if value and (value.startswith(prefix) or ":" not in value)}
     )
 
 
@@ -209,9 +207,7 @@ class SignalStore:
             if not mapping.get("governance_ref") or int(mapping.get("governance_revision") or 0) < 1:
                 raise ValueError("pinned governed mappings require an exact knowledge revision")
             pinned.append(dict(mapping))
-        return self._pinned_governed_mappings.set(
-            _PinnedGovernedMappings(tenant_id=tenant_id, mappings=tuple(pinned))
-        )
+        return self._pinned_governed_mappings.set(_PinnedGovernedMappings(tenant_id=tenant_id, mappings=tuple(pinned)))
 
     def reset_pinned_governed_mappings(self, token: Token[_PinnedGovernedMappings | None]) -> None:
         """Restore the previous resolver pin for the current execution context."""
@@ -374,14 +370,9 @@ class SignalStore:
         after_id = ""
         while True:
             with self.transaction() as conn:
-                authority_tables = {
-                    str(row[0])
-                    for row in conn.execute(
-                        """SELECT name FROM sqlite_master
+                authority_tables = {str(row[0]) for row in conn.execute("""SELECT name FROM sqlite_master
                            WHERE type='table'
-                             AND name IN ('operational_knowledge', 'operational_knowledge_revisions')"""
-                    )
-                }
+                             AND name IN ('operational_knowledge', 'operational_knowledge_revisions')""")}
                 if authority_tables != {"operational_knowledge", "operational_knowledge_revisions"}:
                     return repaired
                 rows = conn.execute(
@@ -443,14 +434,9 @@ class SignalStore:
         after_rowid = 0
         while True:
             with self.transaction() as conn:
-                authority_tables = {
-                    str(row[0])
-                    for row in conn.execute(
-                        """SELECT name FROM sqlite_master
+                authority_tables = {str(row[0]) for row in conn.execute("""SELECT name FROM sqlite_master
                            WHERE type='table'
-                             AND name IN ('operational_knowledge', 'operational_knowledge_revisions')"""
-                    )
-                }
+                             AND name IN ('operational_knowledge', 'operational_knowledge_revisions')""")}
                 if authority_tables == {"operational_knowledge", "operational_knowledge_revisions"}:
                     rows = conn.execute(
                         """SELECT mapping.rowid AS mapping_rowid, mapping.*,
@@ -549,14 +535,9 @@ class SignalStore:
                 return None
             if not token:
                 raise RuntimeError("governed signal projection audit was not dirty during repair")
-            authority_tables = {
-                str(row[0])
-                for row in conn.execute(
-                    """SELECT name FROM sqlite_master
+            authority_tables = {str(row[0]) for row in conn.execute("""SELECT name FROM sqlite_master
                        WHERE type='table'
-                         AND name IN ('operational_knowledge', 'operational_knowledge_revisions')"""
-                )
-            }
+                         AND name IN ('operational_knowledge', 'operational_knowledge_revisions')""")}
 
         def require_same_token(connection: sqlite3.Connection) -> bool:
             current = self._projection_audit_marker_value(connection)
@@ -609,9 +590,9 @@ class SignalStore:
                         )
                         try:
                             content = json.loads(str(authority["content_json"]))
-                            signal_type = str(
-                                content.get("proposition", {}).get("concept_ref") or ""
-                            ).removeprefix("signal:")
+                            signal_type = str(content.get("proposition", {}).get("concept_ref") or "").removeprefix(
+                                "signal:"
+                            )
                             resolver_mappings = content.get("resolver_payload", {}).get("mappings", [])
                             expected = {
                                 (signal_type, str(mapping.get("metric_pattern") or "").strip())
@@ -620,13 +601,11 @@ class SignalStore:
                             }
                         except (AttributeError, TypeError, json.JSONDecodeError) as exc:
                             raise RuntimeError(
-                                "active governed signal authority has invalid resolver payload: "
-                                f"{key[1]}@{key[2]}"
+                                "active governed signal authority has invalid resolver payload: " f"{key[1]}@{key[2]}"
                             ) from exc
                         if not signal_type or not expected:
                             raise RuntimeError(
-                                "active governed signal authority has no exact resolver payload: "
-                                f"{key[1]}@{key[2]}"
+                                "active governed signal authority has no exact resolver payload: " f"{key[1]}@{key[2]}"
                             )
                         expected_by_authority[key] = expected
 
@@ -634,8 +613,7 @@ class SignalStore:
                         key: set() for key in expected_by_authority
                     }
                     key_clause = " OR ".join(
-                        "(tenant_id=? AND governance_ref=? AND governance_revision=?)"
-                        for _ in expected_by_authority
+                        "(tenant_id=? AND governance_ref=? AND governance_revision=?)" for _ in expected_by_authority
                     )
                     key_parameters = [value for key in expected_by_authority for value in key]
                     after_mapping_rowid = 0
@@ -730,8 +708,7 @@ class SignalStore:
                     valid, reason = projection_matches_authority(mapping, authority)
                     if not valid:
                         raise RuntimeError(
-                            f"governed signal projection remains invalid after repair: "
-                            f"{mapping['id']} ({reason})"
+                            f"governed signal projection remains invalid after repair: " f"{mapping['id']} ({reason})"
                         )
                 after_rowid = int(mappings[-1]["mapping_rowid"])
         return token
@@ -792,8 +769,7 @@ class SignalStore:
     def reconcile_governed_projection_audit(self, _connection: sqlite3.Connection) -> None:
         """Reject the removed single-transaction projection repair path."""
         raise RuntimeError(
-            "single-transaction projection repair is unsupported; "
-            "call ensure_governed_projection_audit_current()"
+            "single-transaction projection repair is unsupported; " "call ensure_governed_projection_audit_current()"
         )
 
     def _ensure_learning_index(self, conn: sqlite3.Connection) -> None:
@@ -1289,19 +1265,14 @@ class SignalStore:
         if revision.proposition.kind.value != "signal_mapping":
             return {"active": False, "deactivated": 0, "projected": 0}
         if not allow_dirty and not self.governed_projection_audit_is_current(connection):
-            raise RuntimeError(
-                "governed signal projection audit is dirty; reopen the signal store to reconcile it"
-            )
+            raise RuntimeError("governed signal projection audit is dirty; reopen the signal store to reconcile it")
 
         deactivated = self.deactivate_governed_mappings(
             tenant_id=revision.tenant_id,
             governance_ref=revision.knowledge_id,
             connection=connection,
         )
-        active = (
-            revision.state.lifecycle_status.value == "active"
-            and revision.state.eligibility.value != "ineligible"
-        )
+        active = revision.state.lifecycle_status.value == "active" and revision.state.eligibility.value != "ineligible"
         if not active:
             return {"active": False, "deactivated": deactivated, "projected": 0}
 
@@ -1426,9 +1397,7 @@ class SignalStore:
         stored_mappings = [_deserialize_mapping(row) for row in rows]
         if pinned is not None:
             pinned_for_signal = [
-                dict(mapping)
-                for mapping in pinned.mappings
-                if str(mapping.get("signal_type") or "") == signal_type
+                dict(mapping) for mapping in pinned.mappings if str(mapping.get("signal_type") or "") == signal_type
             ]
             pinned_for_signal.sort(key=lambda mapping: float(mapping.get("confidence") or 0.0), reverse=True)
             stored_mappings = [*pinned_for_signal, *stored_mappings]
@@ -1440,9 +1409,7 @@ class SignalStore:
                 mapping_count=len(stored_mappings),
                 mapping_limit=resolution_limit,
             )
-            raise RuntimeError(
-                f"Signal '{signal_type}' has more than {resolution_limit} active mapping candidates"
-            )
+            raise RuntimeError(f"Signal '{signal_type}' has more than {resolution_limit} active mapping candidates")
         for m in stored_mappings:
             if excluded_knowledge_refs:
                 governance_ref = str(m.get("governance_ref") or "")
@@ -1593,9 +1560,7 @@ class SignalStore:
                 catalog_count=len(eligible_catalog),
                 catalog_limit=catalog_limit,
             )
-            raise RuntimeError(
-                f"Signal resolution catalog has more than {catalog_limit} eligible metrics"
-            )
+            raise RuntimeError(f"Signal resolution catalog has more than {catalog_limit} eligible metrics")
         matched: list[ResolvedSignal] = []
         seen_metrics: set[tuple[str, str]] = set()
 

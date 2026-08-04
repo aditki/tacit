@@ -1243,9 +1243,7 @@ def test_current_engine_replay_requires_refresh_when_runtime_versions_changed(tm
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?")
     draft = _draft_contract(investigation_id)
-    draft = draft.model_copy(
-        update={"runtime": draft.runtime.model_copy(update={"engine_version": "0.0.0-old"})}
-    )
+    draft = draft.model_copy(update={"runtime": draft.runtime.model_copy(update={"engine_version": "0.0.0-old"})})
     store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
 
     with pytest.raises(ReplayInputsUnavailableError, match="refresh the investigation"):

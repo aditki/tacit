@@ -264,9 +264,7 @@ async def complete_pipeline(
         # current_revision pointer.
         persist_record=run_type != InvestigationRunType.REFRESH,
         run_warning_code=(
-            "contract_persistence_failed"
-            if contract_persist_error and not refresh_persist_failed
-            else ""
+            "contract_persistence_failed" if contract_persist_error and not refresh_persist_failed else ""
         ),
         run_warning_detail=(contract_persist_error if not refresh_persist_failed else ""),
     )
