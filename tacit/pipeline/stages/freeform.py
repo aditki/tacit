@@ -9,7 +9,8 @@ from typing import Any
 
 import structlog
 
-from tacit.agents.metrics_discovery import discover_metrics
+from tacit import __version__
+from tacit.agents.metrics_discovery import SYSTEM_PROMPT, discover_metrics
 from tacit.agents.providers.base import TokenUsage
 from tacit.agents.query_builder import build_dashboard
 from tacit.dependencies import PipelineDependencies
@@ -36,10 +37,12 @@ def discovery_cache_parts(
     intent: Intent,
     ranked_catalog: list[MetricEntry],
     context_chunks: list[Any],
+    runtime_identity: str = "",
 ) -> tuple[str, ...]:
     """Return the complete tenant-scoped identity for metric discovery."""
     return (
         "discovery",
+        runtime_identity,
         tenant_id,
         intent.summary,
         ",".join(intent.keywords),
@@ -109,6 +112,15 @@ async def build_freeform_dashboard(
             intent=intent,
             ranked_catalog=ranked_catalog,
             context_chunks=context_chunks,
+            runtime_identity=deps.cache_key_factory(
+                __version__,
+                deps.settings.llm_provider,
+                deps.settings.llm_model,
+                deps.settings.llm_azure_deployment,
+                deps.settings.llm_bedrock_model_id,
+                deps.settings.llm_api_base,
+                SYSTEM_PROMPT,
+            ),
         )
     )
     provider = deps.llm_provider_factory() if deps.llm_provider_factory else None

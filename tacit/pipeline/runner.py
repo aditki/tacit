@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from tacit.agents.intent import classify_intent
+from tacit.archetypes.templates import get_archetype, get_archetypes_by_confidence
 from tacit.backends import get_active_backends
 from tacit.config import settings
 from tacit.context.enrichment import enrich_context
@@ -33,7 +34,7 @@ from tacit.pipeline.discovery import (
 )
 
 if TYPE_CHECKING:
-    from tacit.knowledge.models import KnowledgeUsage
+    from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
 from tacit.pipeline.failures import PipelineFailureFactory, handle_empty_catalog
 from tacit.pipeline.recording import (
     PipelineRecorder,
@@ -59,6 +60,25 @@ _discovery_keywords = discovery_keywords
 _history_archetypes = history_archetypes
 _history_signals = history_signals
 _semantic_mapping_diagnostics = semantic_mapping_diagnostics
+
+
+def _initial_knowledge_archetype_ids(intent: Any) -> set[str]:
+    """Resolve the bounded curated IDs implied by the classified intent."""
+    resolved = {
+        archetype.id
+        for archetype, _confidence in get_archetypes_by_confidence(
+            intent.archetypes,
+            min_confidence=0.3,
+        )
+    }
+    legacy = get_archetype(intent.problem_type)
+    if legacy is not None:
+        resolved.add(legacy.id)
+    return {
+        *resolved,
+        *[match.type for match in intent.archetypes],
+        intent.problem_type,
+    }
 
 
 # Concurrency gate — prevents thundering-herd on LLM + Grafana APIs
@@ -93,6 +113,11 @@ def _get_semaphore(max_concurrent: int) -> asyncio.Semaphore:
         _pipeline_semaphore = asyncio.Semaphore(max_concurrent)
         _pipeline_semaphore_limit = max_concurrent
     return _pipeline_semaphore
+
+
+def _applied_stage_knowledge_refs(usage: list[KnowledgeUsage]) -> set[str]:
+    """Return governed revisions that already changed an investigation stage."""
+    return {item.knowledge_ref for item in usage if item.disposition.value == "applied" and item.used_for}
 
 
 def _initialize_signal_store(
@@ -322,6 +347,11 @@ async def _run_pipeline_inner(
         started_at=t_start,
         timings=timings,
     )
+    signal_store: Any = SIGNAL_STORE_UNAVAILABLE
+    knowledge_service: Any | None = None
+    knowledge_snapshot: KnowledgeSnapshot | None = None
+    knowledge_usage: list[KnowledgeUsage] = []
+    knowledge_pin_token: Any | None = None
 
     try:
         signal_store = _initialize_signal_store(deps, runtime.recorder, runtime.timings)
@@ -349,8 +379,65 @@ async def _run_pipeline_inner(
             tenant_id=request.tenant_id,
             prompt=request.prompt,
             services=intent.services,
-            archetype_ids={*[match.type for match in intent.archetypes], intent.problem_type},
+            archetype_ids=_initial_knowledge_archetype_ids(intent),
         )
+        if signal_store is not SIGNAL_STORE_UNAVAILABLE:
+            pin_started_at = time.monotonic()
+            try:
+                knowledge_service = resolve_knowledge_service(deps, signal_store=signal_store)
+                pin_snapshot = getattr(knowledge_service, "pin_snapshot", knowledge_service.create_snapshot)
+                knowledge_snapshot, knowledge_usage = pin_snapshot(knowledge_scope)
+                mapping_loader = getattr(knowledge_service, "signal_mappings_for_snapshot", None)
+                pinned_mappings = mapping_loader(knowledge_snapshot) if mapping_loader is not None else []
+                activate_pin = getattr(signal_store, "activate_pinned_governed_mappings", None)
+                if activate_pin is not None:
+                    knowledge_pin_token = activate_pin(
+                        tenant_id=request.tenant_id,
+                        mappings=pinned_mappings,
+                    )
+                logger.info(
+                    "operational_knowledge_snapshot_pinned",
+                    tenant_id=request.tenant_id,
+                    snapshot_ref=knowledge_snapshot.id,
+                    revision_count=len(knowledge_snapshot.items),
+                    resolver_mapping_count=len(pinned_mappings),
+                )
+                runtime.timings["knowledge_snapshot_pin"] = time.monotonic() - pin_started_at
+                stage_log(
+                    "knowledge_snapshot_pin",
+                    runtime.timings["knowledge_snapshot_pin"] * 1000,
+                    tenant_id=request.tenant_id,
+                    revision_count=len(knowledge_snapshot.items),
+                    resolver_mapping_count=len(pinned_mappings),
+                )
+                runtime.recorder.stage(
+                    "knowledge_snapshot",
+                    "passed",
+                    "immutable_revisions_pinned",
+                    snapshot_ref=knowledge_snapshot.id,
+                    revision_count=len(knowledge_snapshot.items),
+                    resolver_mapping_count=len(pinned_mappings),
+                )
+            except Exception as exc:
+                logger.warning("operational_knowledge_pin_failed", exc_info=True)
+                runtime.timings["knowledge_snapshot_pin"] = time.monotonic() - pin_started_at
+                if knowledge_pin_token is not None:
+                    reset_pin = getattr(signal_store, "reset_pinned_governed_mappings", None)
+                    if reset_pin is not None:
+                        reset_pin(knowledge_pin_token)
+                    knowledge_pin_token = None
+                knowledge_service = None
+                knowledge_snapshot = None
+                knowledge_usage = []
+                activate_pin = getattr(signal_store, "activate_pinned_governed_mappings", None)
+                if activate_pin is not None:
+                    knowledge_pin_token = activate_pin(tenant_id=request.tenant_id, mappings=[])
+                runtime.recorder.stage(
+                    "knowledge_snapshot",
+                    "skipped",
+                    "knowledge_snapshot_unavailable",
+                    error_type=type(exc).__name__,
+                )
 
         # ── 3. Metric discovery — each backend contributes ───────────
         discovery_stage = await run_discovery_stage(
@@ -549,15 +636,14 @@ async def _run_pipeline_inner(
             evidence_observations=validation_result.evidence_observations,
         )
         baseline_culprit_ranking = culprit_ranking
-        knowledge_snapshot = None
-        knowledge_usage: list[KnowledgeUsage] = []
         try:
-            if signal_store is SIGNAL_STORE_UNAVAILABLE:
+            if signal_store is SIGNAL_STORE_UNAVAILABLE or knowledge_service is None or knowledge_snapshot is None:
                 raise RuntimeError("Operational Knowledge store is unavailable")
 
             tenant_id = request.tenant_id
-            knowledge_service = resolve_knowledge_service(deps, signal_store=signal_store)
-            knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(knowledge_scope)
+            reconcile_pin = getattr(knowledge_service, "reconcile_pinned_usage", None)
+            if reconcile_pin is not None:
+                knowledge_usage = reconcile_pin(knowledge_scope, knowledge_usage)
             knowledge_usage = knowledge_service.apply_stage_usage(
                 knowledge_usage,
                 selection.knowledge_stage_uses,
@@ -627,6 +713,7 @@ async def _run_pipeline_inner(
         except Exception as exc:
             logger.warning("operational_knowledge_selection_failed", exc_info=True)
             governed_stage_refs = set(validation_result.applied_knowledge_refs)
+            governed_stage_refs.update(_applied_stage_knowledge_refs(knowledge_usage))
             governed_stage_refs.update(use.knowledge_ref for use in selection.knowledge_stage_uses)
             for requirement_id, refs in evidence_stage.knowledge_refs_by_requirement.items():
                 if requirement_id in {
@@ -728,5 +815,12 @@ async def _run_pipeline_inner(
         )
         raise
     finally:
+        if knowledge_pin_token is not None and signal_store is not SIGNAL_STORE_UNAVAILABLE:
+            reset_pin = getattr(signal_store, "reset_pinned_governed_mappings", None)
+            if reset_pin is not None:
+                try:
+                    reset_pin(knowledge_pin_token)
+                except Exception:
+                    logger.warning("operational_knowledge_pin_reset_failed", exc_info=True)
         await safe_close_backends(backends)
         await deps.close_resources()

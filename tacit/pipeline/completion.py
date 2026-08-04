@@ -122,6 +122,7 @@ async def complete_pipeline(
     )
 
     persisted_contract = None
+    contract_persist_error = ""
     try:
         draft_contract = InvestigationContractAssembler().from_pipeline(
             investigation_id=recorder.investigation_id,
@@ -210,12 +211,30 @@ async def complete_pipeline(
             run_id=recorder.run_id,
             expected_parent_revision=(base_revision if run_type == InvestigationRunType.REFRESH else None),
         )
-    except Exception:
+    except Exception as exc:
+        contract_persist_error = f"{type(exc).__name__}: {exc}"
         logger.warning(
             "investigation_contract_persist_failed",
             investigation_id=recorder.investigation_id,
             dashboard_uid=effective_uid,
             exc_info=True,
+        )
+        recorder.stage(
+            "contract_persistence",
+            "failed",
+            "contract_revision_persist_failed",
+            error_type=type(exc).__name__,
+        )
+        recorder.event(
+            "contract_persistence_failed",
+            {"error_type": type(exc).__name__, "dashboard_uid": effective_uid},
+        )
+    else:
+        recorder.stage(
+            "contract_persistence",
+            "passed",
+            "contract_revision_persisted",
+            investigation_revision=persisted_contract.investigation.revision,
         )
     if persisted_contract and persisted_contract.knowledge_usage:
         try:
@@ -244,6 +263,12 @@ async def complete_pipeline(
         # with the refreshed dashboard; revision persistence updates only its
         # current_revision pointer.
         persist_record=run_type != InvestigationRunType.REFRESH,
+        run_warning_code=(
+            "contract_persistence_failed"
+            if contract_persist_error and not refresh_persist_failed
+            else ""
+        ),
+        run_warning_detail=(contract_persist_error if not refresh_persist_failed else ""),
     )
 
     return DashResponse(

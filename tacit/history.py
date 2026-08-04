@@ -15,7 +15,7 @@ import json
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +33,7 @@ from tacit.investigation_contract import (
     KnowledgeCandidate,
     KnowledgeCandidateStatus,
     ProvenanceRecord,
+    RuntimeManifest,
     fingerprint,
     normalized_output_payload,
     stamp_fingerprints,
@@ -45,6 +46,7 @@ from tacit.investigation_replay import (
     apply_counterfactual,
     rebuild_contract,
 )
+from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 from tacit.knowledge.enums import KnowledgeUsageDisposition
 from tacit.knowledge.models import KnowledgeUsage
 from tacit.tenancy import resolve_tenant_boundary
@@ -53,6 +55,9 @@ logger = structlog.get_logger()
 
 _DEFAULT_DB_PATH = DEFAULT_HISTORY_DB_PATH
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
+_HISTORY_SCHEMA_MARKER = "history_tenant_assignments_v2"
+_HISTORY_TENANT_MIGRATION = "history_tenant_assignment_backfill_v2"
+_HISTORY_MIGRATION_BATCH_SIZE = 500
 _CURRENT_ENGINE_REBUILT_STAGES = frozenset(
     {"candidate_exclusion", "candidate_generation", "ranking", "ranking_context"}
 )
@@ -245,13 +250,24 @@ CREATE INDEX IF NOT EXISTS idx_inv_status ON investigations(status);
 CREATE INDEX IF NOT EXISTS idx_inv_user ON investigations(user_id);
 CREATE INDEX IF NOT EXISTS idx_inv_started ON investigations(started_at);
 CREATE INDEX IF NOT EXISTS idx_inv_dashboard ON investigations(dashboard_uid);
-
 CREATE TABLE IF NOT EXISTS investigation_tenant_assignments (
     investigation_id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
     assignment_source TEXT NOT NULL,
     assigned_at REAL NOT NULL,
     FOREIGN KEY (investigation_id) REFERENCES investigations(id)
+);
+
+CREATE TABLE IF NOT EXISTS history_schema_metadata (
+    migration_name TEXT PRIMARY KEY,
+    completed_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS history_migration_progress (
+    migration_name TEXT PRIMARY KEY,
+    cursor TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    updated_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS investigation_revisions (
@@ -313,6 +329,8 @@ CREATE TABLE IF NOT EXISTS investigation_events (
 
 CREATE INDEX IF NOT EXISTS idx_inv_events_run
     ON investigation_events(run_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_inv_events_investigation_order
+    ON investigation_events(investigation_id, created_at, sequence);
 
 CREATE TABLE IF NOT EXISTS knowledge_candidates (
     id               TEXT PRIMARY KEY,
@@ -375,26 +393,50 @@ class InvestigationStore:
 
     def _ensure_schema(self):
         with self._conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
             investigations_existed = self._table_exists(conn, "investigations")
+            if investigations_existed and self._history_schema_is_current(conn):
+                self._require_confirmed_default_tenant_owner(conn)
+                logger.info("investigation_store_init", db_path=str(self._db_path))
+                return
+
+            preflight_columns = (
+                {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
+                if investigations_existed
+                else set()
+            )
+            preflight_tenant_column = "tenant_id" in preflight_columns
+            assignments_existed = self._table_exists(conn, "investigation_tenant_assignments")
+            pending_details = self._pending_history_tenant_migration(conn)
+            original_tenant_column = (
+                bool(pending_details["tenant_column_existed"])
+                if pending_details is not None
+                else preflight_tenant_column
+            )
+            preflight_tenant_migration = investigations_existed and (
+                pending_details is not None or not preflight_tenant_column or not assignments_existed
+            )
+            if preflight_tenant_migration:
+                # Owner discovery can parse substantial legacy history. Do it
+                # before taking the write lock; each bounded migration batch still
+                # rejects ownerless rows before persisting assignments.
+                self._require_legacy_tenant_owner(
+                    conn,
+                    tenant_column_existed=original_tenant_column,
+                )
+            elif investigations_existed and preflight_tenant_column:
+                self._require_confirmed_default_tenant_owner(conn)
+
+            conn.execute("BEGIN IMMEDIATE")
             existing_columns = (
                 {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
                 if investigations_existed
                 else set()
             )
             tenant_column_existed = "tenant_id" in existing_columns
-            tenant_index_existed = self._index_exists(conn, "idx_inv_tenant_started")
+            assignments_existed = self._table_exists(conn, "investigation_tenant_assignments")
             tenant_migration_required = investigations_existed and (
-                not tenant_column_existed or not tenant_index_existed
+                pending_details is not None or not tenant_column_existed or not assignments_existed
             )
-            if investigations_existed and tenant_column_existed:
-                self._require_confirmed_default_tenant_owner(conn)
-            if tenant_migration_required:
-                self._require_legacy_tenant_owner(
-                    conn,
-                    tenant_column_existed=tenant_column_existed,
-                )
-
             _execute_schema_statements(conn, _SCHEMA_SQL)
             columns = {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
             if "stage_outcomes" not in columns:
@@ -403,13 +445,40 @@ class InvestigationStore:
                 conn.execute("ALTER TABLE investigations ADD COLUMN current_revision INTEGER NOT NULL DEFAULT 0")
             if "tenant_id" not in columns:
                 conn.execute("ALTER TABLE investigations ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_inv_tenant_started
+                   ON investigations(tenant_id, started_at DESC, id DESC)"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_inv_tenant_status_started
+                   ON investigations(tenant_id, status, started_at DESC, id DESC)"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_inv_tenant_user_started
+                   ON investigations(tenant_id, user_id, started_at DESC, id DESC)"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_inv_tenant_dashboard
+                   ON investigations(tenant_id, dashboard_uid)"""
+            )
             if tenant_migration_required:
-                self._backfill_legacy_tenants(
-                    conn,
-                    tenant_column_existed=tenant_column_existed,
+                if pending_details is None and not tenant_column_existed:
+                    conn.execute("DELETE FROM investigation_tenant_assignments")
+                conn.execute(
+                    "DELETE FROM history_schema_metadata WHERE migration_name=?",
+                    (_HISTORY_SCHEMA_MARKER,),
                 )
-            self._reconcile_tenant_assignments(conn)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_inv_tenant_started ON investigations(tenant_id, started_at)")
+                details = pending_details or {
+                    "tenant_column_existed": tenant_column_existed,
+                    "configured_tenant": str(self._settings.knowledge_tenant_id or "default"),
+                }
+                conn.execute(
+                    """INSERT INTO history_migration_progress (
+                           migration_name, cursor, details_json, updated_at
+                       ) VALUES (?, '', ?, ?)
+                       ON CONFLICT(migration_name) DO NOTHING""",
+                    (_HISTORY_TENANT_MIGRATION, json.dumps(details, sort_keys=True), time.time()),
+                )
             candidate_columns = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_candidates)")}
             if "reviewed_by" not in candidate_columns:
                 conn.execute("ALTER TABLE knowledge_candidates ADD COLUMN reviewed_by TEXT NOT NULL DEFAULT ''")
@@ -417,7 +486,61 @@ class InvestigationStore:
                 conn.execute("ALTER TABLE knowledge_candidates ADD COLUMN reviewed_at REAL")
             if "applied_revision" not in candidate_columns:
                 conn.execute("ALTER TABLE knowledge_candidates ADD COLUMN applied_revision INTEGER")
+            if not tenant_migration_required:
+                conn.execute(
+                    """INSERT OR REPLACE INTO history_schema_metadata (migration_name, completed_at)
+                       VALUES (?, ?)""",
+                    (_HISTORY_SCHEMA_MARKER, time.time()),
+                )
+        if tenant_migration_required:
+            self._run_history_tenant_migration()
         logger.info("investigation_store_init", db_path=str(self._db_path))
+
+    def _history_schema_is_current(self, conn: sqlite3.Connection) -> bool:
+        """Verify the marker still describes the physical schema."""
+        if not self._table_exists(conn, "history_schema_metadata"):
+            return False
+        marker = conn.execute(
+            "SELECT 1 FROM history_schema_metadata WHERE migration_name=?",
+            (_HISTORY_SCHEMA_MARKER,),
+        ).fetchone()
+        if marker is None:
+            return False
+        if self._pending_history_tenant_migration(conn) is not None:
+            return False
+        investigation_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(investigations)")
+        }
+        candidate_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(knowledge_candidates)")
+        }
+        return (
+            {"tenant_id", "stage_outcomes", "current_revision"}.issubset(investigation_columns)
+            and {"reviewed_by", "reviewed_at", "applied_revision"}.issubset(candidate_columns)
+            and self._table_exists(conn, "investigation_tenant_assignments")
+            and self._table_exists(conn, "history_migration_progress")
+            and self._index_exists(conn, "idx_inv_tenant_started")
+            and self._index_exists(conn, "idx_inv_tenant_status_started")
+            and self._index_exists(conn, "idx_inv_tenant_user_started")
+            and self._index_exists(conn, "idx_inv_events_investigation_order")
+        )
+
+    def _pending_history_tenant_migration(self, conn: sqlite3.Connection) -> dict[str, Any] | None:
+        if not self._table_exists(conn, "history_migration_progress"):
+            return None
+        row = conn.execute(
+            "SELECT details_json FROM history_migration_progress WHERE migration_name=?",
+            (_HISTORY_TENANT_MIGRATION,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            details = json.loads(str(row["details_json"]))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("History tenant migration progress is invalid") from exc
+        if not isinstance(details, dict) or "tenant_column_existed" not in details:
+            raise RuntimeError("History tenant migration progress is incomplete")
+        return details
 
     @staticmethod
     def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
@@ -476,16 +599,53 @@ class InvestigationStore:
             row_tenant = self._concrete_legacy_tenant(row["tenant_id"])
             if row_tenant is not None:
                 return row_tenant
+        if "contract_json" in row.keys():
+            if not row["contract_json"]:
+                return None
+            try:
+                payload = json.loads(row["contract_json"])
+                return self._concrete_legacy_tenant(
+                    payload.get("request", {}).get("scope", {}).get("tenant_id")
+                )
+            except (AttributeError, TypeError, ValueError):
+                return None
         return self._legacy_contract_tenant(conn, str(row["id"]))
 
-    def _legacy_investigation_rows(
+    def _legacy_investigation_batches(
         self,
         conn: sqlite3.Connection,
         *,
         tenant_column_existed: bool,
-    ) -> list[sqlite3.Row]:
-        selected = "id, tenant_id" if tenant_column_existed else "id"
-        return conn.execute(f"SELECT {selected} FROM investigations").fetchall()
+        batch_size: int = 500,
+    ) -> Iterator[list[sqlite3.Row]]:
+        selected = "i.id, i.tenant_id" if tenant_column_existed else "i.id"
+        revisions_exist = self._table_exists(conn, "investigation_revisions")
+        after_id = ""
+        while True:
+            if not revisions_exist:
+                rows = conn.execute(
+                    f"""SELECT {selected}, NULL AS contract_json FROM investigations i
+                        WHERE i.id>? ORDER BY i.id LIMIT ?""",
+                    (after_id, batch_size),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"""SELECT {selected}, revision.contract_json
+                        FROM investigations i
+                        LEFT JOIN investigation_revisions revision
+                          ON revision.investigation_id=i.id
+                         AND revision.revision=(
+                           SELECT MAX(candidate.revision)
+                           FROM investigation_revisions candidate
+                           WHERE candidate.investigation_id=i.id
+                         )
+                        WHERE i.id>? ORDER BY i.id LIMIT ?""",
+                    (after_id, batch_size),
+                ).fetchall()
+            if not rows:
+                break
+            yield rows
+            after_id = str(rows[-1]["id"])
 
     def _require_legacy_tenant_owner(
         self,
@@ -497,25 +657,29 @@ class InvestigationStore:
         configured_tenant = str(self._settings.knowledge_tenant_id or "default")
         if configured_tenant != "*":
             return
+        ownerless_count = 0
         ownerless_ids: list[str] = []
-        for row in self._legacy_investigation_rows(
+        for batch in self._legacy_investigation_batches(
             conn,
             tenant_column_existed=tenant_column_existed,
         ):
-            if (
-                self._legacy_row_tenant(
-                    conn,
-                    row,
-                    tenant_column_existed=tenant_column_existed,
-                )
-                is None
-            ):
-                ownerless_ids.append(str(row["id"]))
-        if ownerless_ids:
+            for row in batch:
+                if (
+                    self._legacy_row_tenant(
+                        conn,
+                        row,
+                        tenant_column_existed=tenant_column_existed,
+                    )
+                    is None
+                ):
+                    ownerless_count += 1
+                    if len(ownerless_ids) < 5:
+                        ownerless_ids.append(str(row["id"]))
+        if ownerless_count:
             logger.error(
                 "legacy_history_owner_required",
-                ownerless_count=len(ownerless_ids),
-                sample_investigation_ids=ownerless_ids[:5],
+                ownerless_count=ownerless_count,
+                sample_investigation_ids=ownerless_ids,
             )
             raise RuntimeError(
                 "Legacy investigation history has no tenant owner. Start once with knowledge_tenant_id pinned "
@@ -527,20 +691,25 @@ class InvestigationStore:
         configured_tenant = str(self._settings.knowledge_tenant_id or "default")
         if configured_tenant != "*":
             return
-        has_assignments = self._table_exists(conn, "investigation_tenant_assignments")
-        ownerless_ids = []
-        for row in conn.execute("SELECT id FROM investigations WHERE tenant_id='default'").fetchall():
-            assignment = (
-                conn.execute(
-                    """SELECT 1 FROM investigation_tenant_assignments
-                       WHERE investigation_id=? AND tenant_id='default'""",
-                    (row["id"],),
-                ).fetchone()
-                if has_assignments
-                else None
-            )
-            if assignment is None:
-                ownerless_ids.append(str(row["id"]))
+        if not self._table_exists(conn, "investigation_tenant_assignments"):
+            ownerless_ids = [
+                str(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM investigations WHERE tenant_id='default' LIMIT 5"
+                ).fetchall()
+            ]
+        else:
+            ownerless_ids = [
+                str(row["id"])
+                for row in conn.execute(
+                    """SELECT i.id
+                       FROM investigations i
+                       LEFT JOIN investigation_tenant_assignments a
+                         ON a.investigation_id=i.id AND a.tenant_id='default'
+                       WHERE i.tenant_id='default' AND a.investigation_id IS NULL
+                       LIMIT 5"""
+                ).fetchall()
+            ]
         if ownerless_ids:
             logger.error(
                 "legacy_history_default_owner_unconfirmed",
@@ -552,78 +721,113 @@ class InvestigationStore:
                 "Start once with knowledge_tenant_id pinned to its owner before enabling wildcard tenancy."
             )
 
-    def _reconcile_tenant_assignments(self, conn: sqlite3.Connection) -> None:
-        configured_tenant = str(self._settings.knowledge_tenant_id or "default")
-        for row in conn.execute("SELECT id, tenant_id FROM investigations").fetchall():
-            assignment = conn.execute(
-                """SELECT tenant_id FROM investigation_tenant_assignments
-                   WHERE investigation_id=?""",
-                (row["id"],),
-            ).fetchone()
-            if assignment is not None:
-                assigned_tenant = str(assignment["tenant_id"])
-            elif row["tenant_id"] != "default":
-                assigned_tenant = str(row["tenant_id"])
-            elif configured_tenant != "*":
-                assigned_tenant = configured_tenant
-            else:
-                raise RuntimeError("default-tenant investigation ownership has not been confirmed")
-            conn.execute(
-                "UPDATE investigations SET tenant_id=? WHERE id=?",
-                (assigned_tenant, row["id"]),
-            )
-            conn.execute(
-                """INSERT INTO investigation_tenant_assignments (
-                       investigation_id, tenant_id, assignment_source, assigned_at
-                   ) VALUES (?, ?, 'configured_or_recorded_owner', ?)
-                   ON CONFLICT(investigation_id) DO UPDATE SET
-                       tenant_id=excluded.tenant_id,
-                       assignment_source=excluded.assignment_source,
-                       assigned_at=excluded.assigned_at""",
-                (row["id"], assigned_tenant, time.time()),
-            )
-
-    def _backfill_legacy_tenants(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        tenant_column_existed: bool,
-    ) -> None:
-        configured_tenant = str(self._settings.knowledge_tenant_id or "default")
-        fallback_tenant = configured_tenant if configured_tenant != "*" else None
+    def _run_history_tenant_migration(self) -> None:
         migrated = 0
-        for row in self._legacy_investigation_rows(conn, tenant_column_existed=True):
-            tenant_id = self._legacy_row_tenant(
-                conn,
-                row,
-                tenant_column_existed=tenant_column_existed,
+        batch_count = 0
+        while True:
+            batch_size, completed = self._migrate_history_tenant_batch()
+            if completed:
+                break
+            migrated += batch_size
+            batch_count += 1
+            logger.info(
+                "legacy_history_tenant_backfill_batch",
+                batch_size=batch_size,
+                batch_count=batch_count,
             )
-            if tenant_id is None:
-                tenant_id = fallback_tenant
-            if tenant_id is None:
-                raise RuntimeError(
-                    "Legacy investigation history has no tenant owner. Start once with knowledge_tenant_id pinned "
-                    "to its owner before enabling wildcard tenancy."
-                )
-            conn.execute("UPDATE investigations SET tenant_id=? WHERE id=?", (tenant_id, row["id"]))
-            conn.execute(
-                """INSERT INTO investigation_tenant_assignments (
-                       investigation_id, tenant_id, assignment_source, assigned_at
-                   ) VALUES (?, ?, 'legacy_migration', ?)
-                   ON CONFLICT(investigation_id) DO UPDATE SET
-                       tenant_id=excluded.tenant_id,
-                       assignment_source=excluded.assignment_source,
-                       assigned_at=excluded.assigned_at""",
-                (row["id"], tenant_id, time.time()),
-            )
-            migrated += 1
         if migrated:
             logger.info(
                 "legacy_history_tenants_backfilled",
                 investigation_count=migrated,
-                configured_tenant=configured_tenant,
-                partial_migration=tenant_column_existed,
+                batch_count=batch_count,
+                batch_size=_HISTORY_MIGRATION_BATCH_SIZE,
             )
+
+    def _migrate_history_tenant_batch(self) -> tuple[int, bool]:
+        """Commit at most one bounded page of legacy tenant assignments."""
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            progress = conn.execute(
+                """SELECT details_json FROM history_migration_progress
+                   WHERE migration_name=?""",
+                (_HISTORY_TENANT_MIGRATION,),
+            ).fetchone()
+            if progress is None:
+                return 0, True
+            try:
+                details = json.loads(str(progress["details_json"]))
+                tenant_column_existed = bool(details["tenant_column_existed"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("History tenant migration progress is invalid") from exc
+            configured_tenant = str(
+                details.get("configured_tenant") or self._settings.knowledge_tenant_id or "default"
+            )
+            fallback_tenant = configured_tenant if configured_tenant != "*" else None
+            revisions_exist = self._table_exists(conn, "investigation_revisions")
+            revision_join = ""
+            revision_column = "NULL AS contract_json"
+            if revisions_exist:
+                revision_join = """LEFT JOIN investigation_revisions revision
+                          ON revision.investigation_id=i.id
+                         AND revision.revision=(
+                           SELECT MAX(candidate.revision)
+                           FROM investigation_revisions candidate
+                           WHERE candidate.investigation_id=i.id
+                         )"""
+                revision_column = "revision.contract_json"
+            rows = conn.execute(
+                f"""SELECT i.id, i.tenant_id, {revision_column}
+                    FROM investigations i
+                    LEFT JOIN investigation_tenant_assignments assignment
+                      ON assignment.investigation_id=i.id
+                    {revision_join}
+                    WHERE assignment.investigation_id IS NULL
+                    ORDER BY i.id LIMIT ?""",
+                (_HISTORY_MIGRATION_BATCH_SIZE,),
+            ).fetchall()
+            if not rows:
+                conn.execute(
+                    """INSERT OR REPLACE INTO history_schema_metadata (migration_name, completed_at)
+                       VALUES (?, ?)""",
+                    (_HISTORY_SCHEMA_MARKER, time.time()),
+                )
+                conn.execute(
+                    "DELETE FROM history_migration_progress WHERE migration_name=?",
+                    (_HISTORY_TENANT_MIGRATION,),
+                )
+                return 0, True
+
+            assigned_at = time.time()
+            updates: list[tuple[str, str]] = []
+            assignments: list[tuple[str, str, float]] = []
+            for row in rows:
+                tenant_id = self._legacy_row_tenant(
+                    conn,
+                    row,
+                    tenant_column_existed=tenant_column_existed,
+                )
+                if tenant_id is None:
+                    tenant_id = fallback_tenant
+                if tenant_id is None:
+                    raise RuntimeError(
+                        "Legacy investigation history has no tenant owner. Start once with knowledge_tenant_id pinned "
+                        "to its owner before enabling wildcard tenancy."
+                    )
+                updates.append((tenant_id, str(row["id"])))
+                assignments.append((str(row["id"]), tenant_id, assigned_at))
+            conn.executemany("UPDATE investigations SET tenant_id=? WHERE id=?", updates)
+            conn.executemany(
+                """INSERT INTO investigation_tenant_assignments (
+                       investigation_id, tenant_id, assignment_source, assigned_at
+                   ) VALUES (?, ?, 'legacy_migration', ?)""",
+                assignments,
+            )
+            conn.execute(
+                """UPDATE history_migration_progress
+                   SET cursor=?, updated_at=? WHERE migration_name=?""",
+                (str(rows[-1]["id"]), assigned_at, _HISTORY_TENANT_MIGRATION),
+            )
+            return len(rows), False
 
     # ── Write operations ──────────────────────────────────────────────────
 
@@ -1180,15 +1384,25 @@ class InvestigationStore:
         investigation_id: str,
         *,
         tenant_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         selected_tenant = self._resolve_tenant(tenant_id)
+        pagination = ""
+        params: list[Any] = [investigation_id, selected_tenant]
+        if limit is not None:
+            pagination = " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        elif offset:
+            pagination = " LIMIT -1 OFFSET ?"
+            params.append(offset)
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT r.* FROM investigation_runs r
+                f"""SELECT r.* FROM investigation_runs r
                    JOIN investigations i ON i.id=r.investigation_id
                    WHERE r.investigation_id=? AND i.tenant_id=?
-                   ORDER BY r.started_at ASC""",
-                (investigation_id, selected_tenant),
+                   ORDER BY r.started_at ASC{pagination}""",
+                params,
             ).fetchall()
         runs: list[dict[str, Any]] = []
         for row in rows:
@@ -1203,24 +1417,41 @@ class InvestigationStore:
         run_id: str | None = None,
         *,
         tenant_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         selected_tenant = self._resolve_tenant(tenant_id)
+        pagination = ""
+        if limit is not None:
+            pagination = " LIMIT ? OFFSET ?"
+        elif offset:
+            pagination = " LIMIT -1 OFFSET ?"
         with self._conn() as conn:
             if run_id is None:
+                params: list[Any] = [investigation_id, selected_tenant]
+                if limit is not None:
+                    params.extend([limit, offset])
+                elif offset:
+                    params.append(offset)
                 rows = conn.execute(
-                    """SELECT e.* FROM investigation_events e
+                    f"""SELECT e.* FROM investigation_events e
                        JOIN investigations i ON i.id=e.investigation_id
                        WHERE e.investigation_id=? AND i.tenant_id=?
-                       ORDER BY e.created_at ASC, e.sequence ASC""",
-                    (investigation_id, selected_tenant),
+                       ORDER BY e.created_at ASC, e.sequence ASC{pagination}""",
+                    params,
                 ).fetchall()
             else:
+                params = [investigation_id, run_id, selected_tenant]
+                if limit is not None:
+                    params.extend([limit, offset])
+                elif offset:
+                    params.append(offset)
                 rows = conn.execute(
-                    """SELECT e.* FROM investigation_events e
+                    f"""SELECT e.* FROM investigation_events e
                        JOIN investigations i ON i.id=e.investigation_id
                        WHERE e.investigation_id=? AND e.run_id=? AND i.tenant_id=?
-                       ORDER BY e.sequence ASC""",
-                    (investigation_id, run_id, selected_tenant),
+                       ORDER BY e.sequence ASC{pagination}""",
+                    params,
                 ).fetchall()
         events: list[dict[str, Any]] = []
         for row in rows:
@@ -1229,18 +1460,33 @@ class InvestigationStore:
             events.append(item)
         return events
 
-    def list_revisions(self, investigation_id: str, *, tenant_id: str | None = None) -> list[dict[str, Any]]:
+    def list_revisions(
+        self,
+        investigation_id: str,
+        *,
+        tenant_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         """List immutable contract revisions for one investigation."""
         tenant_id = self._resolve_tenant(tenant_id)
+        pagination = ""
+        params: list[Any] = [investigation_id, tenant_id]
+        if limit is not None:
+            pagination = " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        elif offset:
+            pagination = " LIMIT -1 OFFSET ?"
+            params.append(offset)
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT r.investigation_id, r.revision, r.parent_revision, r.schema_version,
+                f"""SELECT r.investigation_id, r.revision, r.parent_revision, r.schema_version,
                            r.input_fingerprint, r.output_fingerprint, r.engine_version, r.created_at, r.reason
                     FROM investigation_revisions r
                     JOIN investigations i ON i.id=r.investigation_id
                     WHERE r.investigation_id=? AND i.tenant_id=?
-                    ORDER BY r.revision ASC""",
-                (investigation_id, tenant_id),
+                    ORDER BY r.revision ASC{pagination}""",
+                params,
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -1343,6 +1589,20 @@ class InvestigationStore:
             run_type=InvestigationRunType.REPLAY,
             base_revision=contract.investigation.revision,
         )
+        if mode != ReplayMode.EXACT:
+            latest = self.get_contract(investigation_id, tenant_id=selected_tenant)
+            if latest is not None and latest.investigation.revision != contract.investigation.revision:
+                detail = (
+                    f"expected parent revision {contract.investigation.revision}, "
+                    f"current revision is {latest.investigation.revision}"
+                )
+                self.complete_run(
+                    run_id,
+                    status="failed",
+                    error_code="stale_base_revision",
+                    error_detail=detail,
+                )
+                raise StaleRevisionError(detail)
         if snapshot is None:
             if mode != ReplayMode.EXACT:
                 detail = (
@@ -1389,6 +1649,23 @@ class InvestigationStore:
             if mode == ReplayMode.CURRENT_ENGINE:
                 from tacit.knowledge.scope import investigation_knowledge_scope
 
+                current_runtime = RuntimeManifest()
+                changed_runtime_components = [
+                    field_name
+                    for field_name in (
+                        "engine_version",
+                        "policy_version",
+                        "ranking_version",
+                        "vocabulary_version",
+                    )
+                    if getattr(replay_snapshot.runtime, field_name) != getattr(current_runtime, field_name)
+                ]
+                if changed_runtime_components:
+                    raise ReplayInputsUnavailableError(
+                        "Captured replay inputs cannot execute changed pipeline stages for current-engine replay "
+                        f"({', '.join(changed_runtime_components)} changed); refresh the investigation instead"
+                    )
+
                 if knowledge_service_factory is not None:
                     knowledge_service = knowledge_service_factory()
                 else:
@@ -1404,7 +1681,7 @@ class InvestigationStore:
                         if panel.source_archetype
                     ],
                 }
-                _, knowledge_usage = knowledge_service.create_snapshot(
+                _selected_knowledge_snapshot, knowledge_usage = knowledge_service.create_snapshot(
                     investigation_knowledge_scope(
                         tenant_id=selected_tenant,
                         prompt=replay_snapshot.request.prompt,
@@ -1416,6 +1693,26 @@ class InvestigationStore:
                     knowledge_usage,
                     replay_snapshot.evidence_observations,
                 )
+                current_knowledge_snapshot = knowledge_service.snapshot_from_usage(
+                    selected_tenant,
+                    knowledge_usage,
+                )
+                blocker_check = getattr(knowledge_service, "captured_stage_replay_blockers", None)
+                if not callable(blocker_check):
+                    raise ReplayInputsUnavailableError(
+                        "Current-engine replay requires an exact captured-stage knowledge verifier"
+                    )
+                replay_blockers = blocker_check(
+                    tenant_id=selected_tenant,
+                    historical_snapshot_ref=replay_snapshot.knowledge_snapshot_ref,
+                    current_snapshot=current_knowledge_snapshot,
+                    historical_usage=replay_snapshot.knowledge_usage,
+                )
+                if replay_blockers:
+                    raise ReplayInputsUnavailableError(
+                        "Current knowledge changed stages whose captured discovery and compilation inputs are "
+                        f"unavailable for offline replay: {', '.join(replay_blockers)}"
+                    )
                 baseline_ranking = replay_snapshot.baseline_culprit_ranking or replay_snapshot.culprit_ranking
                 replay_ranking, knowledge_usage = knowledge_service.apply_to_ranking(
                     baseline_ranking,
@@ -1559,6 +1856,7 @@ class InvestigationStore:
         tenant_id: str | None = None,
     ) -> KnowledgeCandidate | None:
         """Store a human correction as a reviewable knowledge candidate."""
+        enforce_knowledge_action(self._settings, KnowledgeAction.CORRECT)
         selected_tenant = self._resolve_tenant(tenant_id)
         contract = self.get_contract(investigation_id, revision, tenant_id=selected_tenant)
         if contract is None:
@@ -1613,15 +1911,25 @@ class InvestigationStore:
         investigation_id: str,
         *,
         tenant_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[KnowledgeCandidate]:
         selected_tenant = self._resolve_tenant(tenant_id)
+        pagination = ""
+        params: list[Any] = [investigation_id, selected_tenant]
+        if limit is not None:
+            pagination = " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        elif offset:
+            pagination = " LIMIT -1 OFFSET ?"
+            params.append(offset)
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT c.* FROM knowledge_candidates c
+                f"""SELECT c.* FROM knowledge_candidates c
                    JOIN investigations i ON i.id=c.investigation_id
                    WHERE c.investigation_id=? AND i.tenant_id=?
-                   ORDER BY c.created_at ASC""",
-                (investigation_id, selected_tenant),
+                   ORDER BY c.created_at ASC{pagination}""",
+                params,
             ).fetchall()
         return [self._candidate_from_row(row) for row in rows]
 
@@ -1634,6 +1942,10 @@ class InvestigationStore:
         reviewed_by: str,
         tenant_id: str | None = None,
     ) -> KnowledgeCandidate | None:
+        enforce_knowledge_action(
+            self._settings,
+            KnowledgeAction.APPROVE if approved else KnowledgeAction.REJECT,
+        )
         selected_tenant = self._resolve_tenant(tenant_id)
         now = utc_now()
         with self._conn() as conn:
@@ -1694,6 +2006,7 @@ class InvestigationStore:
         *,
         tenant_id: str | None = None,
     ) -> InvestigationContract | None:
+        enforce_knowledge_action(self._settings, KnowledgeAction.APPLY)
         selected_tenant = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             row = conn.execute(
@@ -1888,8 +2201,18 @@ class InvestigationStore:
         status: str | None = None,
         user_id: str | None = None,
         tenant_id: str | None = None,
+        before_started_at: float | None = None,
+        before_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """List recent investigations, newest first."""
+        if limit < 1 or limit > 500:
+            raise ValueError("limit must be between 1 and 500")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
+        if (before_started_at is None) != (before_id is None):
+            raise ValueError("before_started_at and before_id must be supplied together")
+        if before_started_at is not None and offset:
+            raise ValueError("offset cannot be combined with a history cursor")
         tenant_id = self._resolve_tenant(tenant_id)
         query = "SELECT * FROM investigations"
         params: list[Any] = []
@@ -1902,10 +2225,13 @@ class InvestigationStore:
         if user_id:
             conditions.append("user_id=?")
             params.append(user_id)
+        if before_started_at is not None and before_id is not None:
+            conditions.append("(started_at < ? OR (started_at = ? AND id < ?))")
+            params.extend([before_started_at, before_started_at, before_id])
 
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY started_at DESC LIMIT ? OFFSET ?"
+        query += " ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
         with self._conn() as conn:

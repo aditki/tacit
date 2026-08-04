@@ -111,7 +111,7 @@ def migrate_artifact_extractions(
                 legacy_review,
                 was_existing=existing is not None,
             )
-            _evaluate_imported_approval(service, candidate)
+            _evaluate_imported_approval(service, candidate, previous_candidate=existing)
             created.append(candidate.id)
     return created
 
@@ -252,7 +252,7 @@ def migrate_signal_mapping(
         review,
         was_existing=existing is not None,
     )
-    _evaluate_imported_approval(service, candidate)
+    _evaluate_imported_approval(service, candidate, previous_candidate=existing)
     return candidate.id
 
 
@@ -295,7 +295,12 @@ def _apply_imported_review_state(
         return current
 
 
-def _evaluate_imported_approval(service: KnowledgeService, candidate: KnowledgeCandidate) -> None:
+def _evaluate_imported_approval(
+    service: KnowledgeService,
+    candidate: KnowledgeCandidate,
+    *,
+    previous_candidate: KnowledgeCandidate | None = None,
+) -> None:
     if candidate.state.review_state not in {ReviewState.APPROVED, ReviewState.TRUSTED}:
         return
     item = service.repository.find_knowledge_by_proposition(
@@ -303,7 +308,12 @@ def _evaluate_imported_approval(service: KnowledgeService, candidate: KnowledgeC
         candidate.proposition.proposition_key,
     )
     current = service.repository.get_revision(item.id, tenant_id=candidate.tenant_id) if item is not None else None
-    should_evaluate = current is None or (
+    authority_inputs_changed = previous_candidate is not None and (
+        previous_candidate.evidence != candidate.evidence
+        or previous_candidate.provenance_refs != candidate.provenance_refs
+        or previous_candidate.scope != candidate.scope
+    )
+    should_evaluate = authority_inputs_changed or current is None or (
         current.state.lifecycle_status == LifecycleStatus.STALE
         or (
             current.state.lifecycle_status == LifecycleStatus.ACTIVE
@@ -311,7 +321,12 @@ def _evaluate_imported_approval(service: KnowledgeService, candidate: KnowledgeC
         )
     )
     if should_evaluate:
-        service.evaluate_candidate(candidate.id, tenant_id=candidate.tenant_id)
+        service.evaluate_candidate(
+            candidate.id,
+            tenant_id=candidate.tenant_id,
+            authoritative_source=candidate.policy.authoritative_source,
+            live_verified=candidate.policy.live_verified,
+        )
 
 
 def _proposition(kind: KnowledgeKind, row: dict[str, Any]) -> dict[str, Any]:

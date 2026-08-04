@@ -9,6 +9,10 @@ from tacit.knowledge.models import EntityBinding, EntityResolutionResult, Knowle
 from tacit.knowledge.normalization import normalize_entity
 from tacit.knowledge.repository import KnowledgeRepository
 
+_FUZZY_ENTITY_CANDIDATE_LIMIT = 100
+_EXACT_ALIAS_CANDIDATE_LIMIT = 100
+_EXACT_NAME_CANDIDATE_LIMIT = 100
+
 
 class EntityResolutionService:
     def __init__(self, repository: KnowledgeRepository):
@@ -92,26 +96,50 @@ class EntityResolutionService:
         expected_kind_filter = (
             expected_kind.value if expected_kind is not None and expected_kind != EntityKind.UNKNOWN else None
         )
+        named_entities, names_truncated = self.repository.find_entities(
+            tenant_id,
+            normalized,
+            expected_kind_filter,
+            limit=_EXACT_NAME_CANDIDATE_LIMIT,
+        )
         named = [
             entity
-            for entity in self.repository.find_entities(
-                tenant_id,
-                normalized,
-                expected_kind_filter,
-            )
+            for entity in named_entities
             if entity.scope.applies_to(scope)
         ]
+        alias_entities, aliases_truncated = self.repository.find_alias_entities(
+            tenant_id,
+            normalized,
+            expected_kind_filter,
+            limit=_EXACT_ALIAS_CANDIDATE_LIMIT,
+        )
         aliases = [
             alias
-            for alias in self.repository.find_aliases(tenant_id, normalized)
-            if alias.scope.applies_to(scope)
-            and (entity := self.repository.get_entity(alias.entity_ref, tenant_id)) is not None
-            and entity.status == EntityStatus.ACTIVE
-            and self._kind_matches(entity.kind, expected_kind)
-            and entity.scope.applies_to(scope)
+            for alias, entity in alias_entities
+            if alias.scope.applies_to(scope) and entity.scope.applies_to(scope)
         ]
         refs = {entity.id: EntityBindingMethod.EXACT_NAME for entity in named}
         refs.update({alias.entity_ref: EntityBindingMethod.EXACT_ALIAS for alias in aliases})
+        if names_truncated or aliases_truncated:
+            reason_codes = []
+            if names_truncated:
+                reason_codes.append("canonical_name_candidate_search_truncated")
+            if aliases_truncated:
+                reason_codes.append("alias_candidate_search_truncated")
+            return self._record(
+                EntityResolutionResult(
+                    status=EntityResolutionStatus.AMBIGUOUS,
+                    raw_value=raw_value,
+                    candidate_bindings=[
+                        EntityBinding(entity_ref=ref, method=method, provenance_refs=provenance_refs)
+                        for ref, method in sorted(refs.items())
+                    ],
+                    reason_codes=reason_codes,
+                ),
+                scope,
+                expected_kind,
+                candidate_id,
+            )
         if len(refs) == 1:
             entity_ref, method = next(iter(refs.items()))
             return self._resolved(raw_value, entity_ref, method, provenance_refs, scope, expected_kind, candidate_id)
@@ -132,10 +160,15 @@ class EntityResolutionService:
             )
 
         fuzzy = []
-        for entity in self.repository.list_entities(tenant_id):
+        fuzzy_entities, fuzzy_truncated = self.repository.find_fuzzy_entity_candidates(
+            tenant_id,
+            normalized,
+            expected_kind_filter,
+            limit=_FUZZY_ENTITY_CANDIDATE_LIMIT,
+        )
+        for entity in fuzzy_entities:
             if (
-                entity.status != EntityStatus.ACTIVE
-                or not self._kind_matches(entity.kind, expected_kind)
+                not self._kind_matches(entity.kind, expected_kind)
                 or not entity.scope.applies_to(scope)
             ):
                 continue
@@ -149,12 +182,15 @@ class EntityResolutionService:
                         provenance_refs=provenance_refs,
                     )
                 )
+        reason_codes = ["fuzzy_candidates_require_confirmation"] if fuzzy else ["entity_not_found"]
+        if fuzzy_truncated:
+            reason_codes.append("fuzzy_candidate_search_truncated")
         return self._record(
             EntityResolutionResult(
                 status=EntityResolutionStatus.AMBIGUOUS if len(fuzzy) > 1 else EntityResolutionStatus.UNRESOLVED,
                 raw_value=raw_value,
                 candidate_bindings=fuzzy,
-                reason_codes=["fuzzy_candidates_require_confirmation"] if fuzzy else ["entity_not_found"],
+                reason_codes=reason_codes,
             ),
             scope,
             expected_kind,

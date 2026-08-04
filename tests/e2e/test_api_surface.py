@@ -5,7 +5,6 @@ from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
 from tacit.agents.providers.base import TokenUsage
-from tacit.config import settings
 from tacit.main import app
 from tacit.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
 from tests.e2e.framework import CapturingBackend, build_grafana_dashboard, load_scenario
@@ -67,8 +66,8 @@ def test_system_archetype_signal_and_auth_endpoints(isolated_learning_runtime, m
     )
     assert invalid_teach.status_code == 422
 
-    monkeypatch.setattr(settings, "api_auth_enabled", True)
-    monkeypatch.setattr(settings, "api_auth_key", "secret-e2e")
+    monkeypatch.setattr(app.state.settings, "api_auth_enabled", True)
+    monkeypatch.setattr(app.state.settings, "api_auth_key", "secret-e2e")
     assert client.get("/api/v1/signals").status_code == 401
     assert client.get("/api/v1/signals", headers={"X-API-Key": "wrong"}).status_code == 401
     assert client.get("/api/v1/signals", headers={"X-API-Key": "secret-e2e"}).status_code == 200

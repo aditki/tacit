@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from tacit.agents.providers.base import LLMProvider, LLMResult, TokenUsage
-from tacit.archetypes.engine import KnowledgeQueryUse, _query_references_metric
+from tacit.archetypes.engine import (
+    KnowledgeQueryUse,
+    _query_changes_under_metric_substitution,
+    _query_references_metric,
+)
 from tacit.config import Settings
 from tacit.context.base import ContextProvider
 from tacit.context.enrichment import enrich_context
@@ -18,7 +22,7 @@ from tacit.models.schemas import (
     SignalType,
 )
 from tacit.pipeline.failures import PipelineFailureFactory
-from tacit.pipeline.runner import _get_semaphore, _initialize_signal_store
+from tacit.pipeline.runner import _get_semaphore, _initial_knowledge_archetype_ids, _initialize_signal_store
 from tacit.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history, safe_record_provenance
 from tacit.pipeline.stages.archetypes import ArchetypeCompilation
 from tacit.pipeline.stages.freeform import build_freeform_dashboard, discovery_cache_parts
@@ -134,6 +138,22 @@ def _request() -> DashRequest:
     return DashRequest(prompt="checkout latency", user_id="u1", channel_id="c1")
 
 
+def test_initial_knowledge_scope_includes_concrete_curated_archetype_ids():
+    intent = _intent().model_copy(
+        update={
+            "problem_type": "api_latency_spike",
+            "archetypes": [ArchetypeMatch(type="api_latency_spike", confidence=0.9)],
+        }
+    )
+
+    archetype_ids = _initial_knowledge_archetype_ids(intent)
+
+    assert "api_latency_spike" in archetype_ids
+    assert "api_response_time_spike" in archetype_ids
+    assert "error_spike" not in archetype_ids
+    assert len(archetype_ids) == 2
+
+
 def _dashboard() -> DashboardSpec:
     return DashboardSpec(
         title="Test",
@@ -194,6 +214,21 @@ def test_compilation_provenance_matches_complete_metric_tokens():
     assert not _query_references_metric(
         "sum(rate(checkout_latency_seconds_total[5m]))",
         "checkout_latency_seconds",
+    )
+
+
+def test_compilation_provenance_uses_suffix_aware_substitution_semantics():
+    query = "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))"
+
+    assert _query_changes_under_metric_substitution(
+        query,
+        "http_request_duration_seconds",
+        "acme_checkout_latency_seconds_bucket",
+    )
+    assert not _query_changes_under_metric_substitution(
+        query,
+        "unrelated_request_duration_seconds",
+        "acme_checkout_latency_seconds_bucket",
     )
 
 
@@ -336,6 +371,20 @@ def test_discovery_cache_identity_includes_tenant_and_complete_ranked_catalog():
 
     assert tenant_a != tenant_b
     assert tenant_a != changed_tail
+
+
+def test_discovery_cache_identity_includes_runtime_provider_and_model():
+    common = {
+        "tenant_id": "tenant-a",
+        "intent": _intent(),
+        "ranked_catalog": [],
+        "context_chunks": [],
+    }
+
+    assert discovery_cache_parts(**common, runtime_identity="openai:model-a") != discovery_cache_parts(
+        **common,
+        runtime_identity="openai:model-b",
+    )
 
 
 async def test_intent_stage_defers_provider_construction_for_legacy_hooks():

@@ -17,7 +17,8 @@ from typing import Any, Protocol
 
 import structlog
 
-from tacit.config import Settings
+from tacit.config import Settings, settings
+from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 from tacit.signals import get_signal_store as _default_get_signal_store
 
 MAX_ARTIFACT_BODY_LENGTH = 200_000
@@ -742,8 +743,8 @@ def _resolve_tenant_id(
 def _active_runtime_settings(
     runtime_settings: Settings | None,
     store: Any | None,
-) -> Settings | None:
-    return runtime_settings or getattr(store, "_settings", None)
+) -> Settings:
+    return runtime_settings or getattr(store, "_settings", None) or settings
 
 
 def _resolve_artifact_store(
@@ -767,39 +768,51 @@ def _reconcile_stale_artifact_knowledge(
     tenant_id: str,
     artifact_type: str,
     runtime_settings: Settings | None = None,
+    knowledge_service: Any | None = None,
 ) -> None:
-    from tacit.knowledge.repository import KnowledgeRepository
-    from tacit.knowledge.service import KnowledgeService
+    from tacit.dashboard_ingest.service import _knowledge_service_for_store
 
     active_settings = _active_runtime_settings(runtime_settings, store)
-    service = KnowledgeService(
-        KnowledgeRepository(store._db_path),
-        signal_store=store,
+    enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
+    knowledge_service = knowledge_service or _knowledge_service_for_store(
+        store,
         runtime_settings=active_settings,
     )
-    offset = 0
+    after_id = 0
     page_size = 1_000
     pages = 0
     reconciled = 0
     while True:
-        artifacts = store.list_learned_artifacts(
+        artifacts = store.list_unreconciled_stale_artifacts(
             tenant_id=tenant_id,
             artifact_type=artifact_type,
-            stale=True,
             limit=page_size,
-            offset=offset,
+            after_id=after_id,
         )
         if not artifacts:
             break
         pages += 1
         for artifact in artifacts:
-            service.reconcile_source_lifecycle(
-                provenance_ref=f"prov_artifact:{artifact['artifact_id']}",
-                tenant_id=tenant_id,
-                source_stale=True,
-            )
-            reconciled += 1
-        offset += len(artifacts)
+            after_id = max(after_id, int(artifact["id"]))
+            try:
+                knowledge_service.reconcile_source_lifecycle(
+                    provenance_ref=f"prov_artifact:{artifact['artifact_id']}",
+                    tenant_id=tenant_id,
+                    source_stale=True,
+                )
+                store.mark_artifact_knowledge_reconciled(
+                    tenant_id=tenant_id,
+                    artifact_id=str(artifact["artifact_id"]),
+                )
+                reconciled += 1
+            except Exception:
+                logger.warning(
+                    "stale_artifact_knowledge_reconcile_failed",
+                    tenant_id=tenant_id,
+                    artifact_type=artifact_type,
+                    artifact_id=artifact["artifact_id"],
+                    exc_info=True,
+                )
         if len(artifacts) < page_size:
             break
     logger.info(
@@ -831,7 +844,11 @@ def learn_artifact(
     runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
 ) -> dict[str, object]:
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    if not dry_run:
+        enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
     store = _resolve_artifact_store(
         dry_run=dry_run,
         store=store,
@@ -939,13 +956,11 @@ def learn_artifact(
                 dependency_hints=index_dependency_rows,
                 signal_mapping_candidates=index_signal_rows,
             )
+        from tacit.dashboard_ingest.service import _knowledge_service_for_store
         from tacit.knowledge.migration import migrate_artifact_extractions
-        from tacit.knowledge.repository import KnowledgeRepository
-        from tacit.knowledge.service import KnowledgeService
 
-        service = KnowledgeService(
-            KnowledgeRepository(store._db_path),
-            signal_store=store,
+        knowledge_service = knowledge_service or _knowledge_service_for_store(
+            store,
             runtime_settings=active_settings,
         )
         governed_candidate_ids = migrate_artifact_extractions(
@@ -962,10 +977,10 @@ def learn_artifact(
                 "dependency_hints": dependency_rows,
                 "signal_mapping_candidates": signal_rows,
             },
-            service=service,
+            service=knowledge_service,
             tenant_id=tenant_id,
         )
-        service.reconcile_source_lifecycle(
+        knowledge_service.reconcile_source_lifecycle(
             provenance_ref=f"prov_artifact:{artifact.id}",
             tenant_id=tenant_id,
             active_candidate_ids=set(governed_candidate_ids),
@@ -1009,6 +1024,7 @@ def learn_runbook_file(
     runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
 ) -> dict[str, object]:
     return learn_artifact(
         runbook_from_file(path),
@@ -1017,6 +1033,7 @@ def learn_runbook_file(
         runtime_settings=runtime_settings,
         store=store,
         tenant_id=tenant_id,
+        knowledge_service=knowledge_service,
     )
 
 
@@ -1041,6 +1058,7 @@ def learn_incident_file(
     runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
 ) -> dict[str, object]:
     return learn_artifact(
         incident_from_file(path),
@@ -1049,6 +1067,7 @@ def learn_incident_file(
         runtime_settings=runtime_settings,
         store=store,
         tenant_id=tenant_id,
+        knowledge_service=knowledge_service,
     )
 
 
@@ -1060,6 +1079,9 @@ def learn_incident_dir(
     store: Any | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    if not dry_run:
+        enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
     store = _resolve_artifact_store(
         dry_run=dry_run,
         store=store,
@@ -1067,6 +1089,12 @@ def learn_incident_dir(
     )
     active_settings = _active_runtime_settings(runtime_settings, store)
     tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=active_settings)
+    knowledge_service = None
+    if not dry_run:
+        assert store is not None
+        from tacit.dashboard_ingest.service import _knowledge_service_for_store
+
+        knowledge_service = _knowledge_service_for_store(store, runtime_settings=active_settings)
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
     learned = [
         learn_incident_file(
@@ -1075,6 +1103,7 @@ def learn_incident_dir(
             runtime_settings=active_settings,
             store=store,
             tenant_id=tenant_id,
+            knowledge_service=knowledge_service,
         )
         for file in files
     ]
@@ -1098,13 +1127,13 @@ def learn_incident_dir(
             source_vendor="file",
             external_id_prefix=f"{path.resolve()}/",
         )
-        if stale_marked:
-            _reconcile_stale_artifact_knowledge(
-                store=store,
-                tenant_id=tenant_id,
-                artifact_type="incident",
-                runtime_settings=active_settings,
-            )
+        _reconcile_stale_artifact_knowledge(
+            store=store,
+            tenant_id=tenant_id,
+            artifact_type="incident",
+            runtime_settings=active_settings,
+            knowledge_service=knowledge_service,
+        )
     return {
         "artifact_type": "incident",
         "dry_run": dry_run,
@@ -1132,6 +1161,9 @@ def learn_runbook_dir(
     store: Any | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, object]:
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    if not dry_run:
+        enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
     store = _resolve_artifact_store(
         dry_run=dry_run,
         store=store,
@@ -1139,6 +1171,12 @@ def learn_runbook_dir(
     )
     active_settings = _active_runtime_settings(runtime_settings, store)
     tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=active_settings)
+    knowledge_service = None
+    if not dry_run:
+        assert store is not None
+        from tacit.dashboard_ingest.service import _knowledge_service_for_store
+
+        knowledge_service = _knowledge_service_for_store(store, runtime_settings=active_settings)
     files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
     learned = [
         learn_runbook_file(
@@ -1147,6 +1185,7 @@ def learn_runbook_dir(
             runtime_settings=active_settings,
             store=store,
             tenant_id=tenant_id,
+            knowledge_service=knowledge_service,
         )
         for file in files
     ]
@@ -1170,13 +1209,13 @@ def learn_runbook_dir(
             source_vendor="file",
             external_id_prefix=f"{path.resolve()}/",
         )
-        if stale_marked:
-            _reconcile_stale_artifact_knowledge(
-                store=store,
-                tenant_id=tenant_id,
-                artifact_type="runbook",
-                runtime_settings=active_settings,
-            )
+        _reconcile_stale_artifact_knowledge(
+            store=store,
+            tenant_id=tenant_id,
+            artifact_type="runbook",
+            runtime_settings=active_settings,
+            knowledge_service=knowledge_service,
+        )
     return {
         "artifact_type": "runbook",
         "dry_run": dry_run,

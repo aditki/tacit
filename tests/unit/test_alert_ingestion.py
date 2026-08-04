@@ -4,7 +4,9 @@ from tacit.alert_ingest import ingest_alert, ingest_alert_features, learn_backen
 from tacit.backends.base import AlertFeatures
 from tacit.backends.grafana import GrafanaBackend, _parse_grafana_alert_rule
 from tacit.backends.signalfx import SignalFxBackend, _parse_signalfx_detector
+from tacit.config import Settings
 from tacit.knowledge.repository import KnowledgeRepository
+from tacit.signals import SignalStore
 
 
 def test_grafana_alert_rule_parses_to_common_alert_features():
@@ -217,6 +219,82 @@ async def test_direct_alert_auto_approval_requires_teach_permissions():
 
 
 @pytest.mark.asyncio
+async def test_alert_ingestion_requires_apply_before_persistence(tmp_path):
+    store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.read,knowledge.review",
+        ),
+    )
+    features = AlertFeatures(
+        alert_uid="protected-pending-alert",
+        alert_title="Protected pending alert",
+        backend_name="grafana",
+        query_language="promql",
+        condition="A > 1",
+        metrics_found=["protected_metric"],
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        await ingest_alert_features(
+            features,
+            auto_approve=False,
+            store=store,
+        )
+
+    assert store.list_ingested_alerts(tenant_id="default") == []
+
+
+@pytest.mark.asyncio
+async def test_direct_alert_ingestion_authorizes_before_backend_access(tmp_path):
+    store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.read,knowledge.review",
+        ),
+    )
+
+    class Backend:
+        accessed = False
+
+        async def ingest_alert(self, _alert_uid):
+            self.accessed = True
+            raise AssertionError("unauthorized ingestion accessed the backend")
+
+    backend = Backend()
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        await ingest_alert("protected-alert", backend=backend, store=store)
+
+    assert backend.accessed is False
+
+
+@pytest.mark.asyncio
+async def test_bulk_alert_learning_authorizes_before_backend_access(tmp_path, monkeypatch):
+    store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.read,knowledge.review",
+        ),
+    )
+    backend_accessed = False
+
+    def get_backends(*_args):
+        nonlocal backend_accessed
+        backend_accessed = True
+        return []
+
+    monkeypatch.setattr("tacit.backends.get_active_backends", get_backends)
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        await learn_backend_alerts("grafana", store=store)
+
+    assert backend_accessed is False
+
+
+@pytest.mark.asyncio
 async def test_grafana_backend_resolves_datasource_uid_for_managed_alerts():
     class FakeGrafanaClient:
         base_url = "http://grafana.example"
@@ -376,6 +454,7 @@ async def test_pending_alert_refresh_retires_removed_support_without_promoting_r
 
 @pytest.mark.asyncio
 async def test_limited_alert_crawl_does_not_mark_unseen_alerts_stale(tmp_path, monkeypatch):
+    import tacit.alert_ingest as alert_ingest_module
     from tacit.signals import SignalStore
 
     store = SignalStore(db_path=tmp_path / "signals.db")
@@ -411,6 +490,15 @@ async def test_limited_alert_crawl_does_not_mark_unseen_alerts_stale(tmp_path, m
             return None
 
     monkeypatch.setattr("tacit.backends.get_active_backends", lambda *_args, **_kwargs: [FakeBackend()])
+    service_creations = 0
+    original_factory = alert_ingest_module._knowledge_service_for_store
+
+    def counted_factory(*args, **kwargs):
+        nonlocal service_creations
+        service_creations += 1
+        return original_factory(*args, **kwargs)
+
+    monkeypatch.setattr(alert_ingest_module, "_knowledge_service_for_store", counted_factory)
 
     result = await learn_backend_alerts("grafana", limit=1)
     stale_row = store.get_ingested_alert("outside-current-page", "grafana")
@@ -420,6 +508,7 @@ async def test_limited_alert_crawl_does_not_mark_unseen_alerts_stale(tmp_path, m
     assert result["summary"]["warnings"] == ["stale_reconciliation_skipped_partial_crawl"]
     assert stale_row is not None
     assert stale_row["stale"] is False
+    assert service_creations == 1
 
 
 @pytest.mark.asyncio
@@ -434,19 +523,18 @@ async def test_complete_alert_crawl_paginates_all_stale_sources_for_its_backend(
         fingerprint="abc",
         metrics_found=["checkout_request_duration_seconds"],
     )
-    offsets: list[int] = []
+    cursors: list[int] = []
     reconciled: list[str] = []
 
-    def list_stale_alerts(*, status, limit, tenant_id, backend_name, offset):
-        assert status == "stale"
+    def list_stale_alerts(*, limit, tenant_id, backend_name, after_id):
         assert limit == 500
         assert tenant_id == "default"
         assert backend_name == "grafana"
-        offsets.append(offset)
-        if offset == 0:
-            return [{"alert_uid": f"stale-{index}"} for index in range(500)]
-        if offset == 500:
-            return [{"alert_uid": "stale-final"}]
+        cursors.append(after_id)
+        if after_id == 0:
+            return [{"id": index + 1, "alert_uid": f"stale-{index}"} for index in range(500)]
+        if after_id == 500:
+            return [{"id": 501, "alert_uid": "stale-final"}]
         return []
 
     def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale):
@@ -454,7 +542,7 @@ async def test_complete_alert_crawl_paginates_all_stale_sources_for_its_backend(
         assert source_stale is True
         reconciled.append(provenance_ref)
 
-    monkeypatch.setattr(store, "list_ingested_alerts", list_stale_alerts)
+    monkeypatch.setattr(store, "list_unreconciled_stale_alerts", list_stale_alerts)
     monkeypatch.setattr("tacit.knowledge.service.KnowledgeService.reconcile_source_lifecycle", reconcile_source)
 
     class CompleteBackend:
@@ -472,7 +560,7 @@ async def test_complete_alert_crawl_paginates_all_stale_sources_for_its_backend(
     result = await learn_backend_alerts("grafana", store=store)
 
     assert result["stale_marked"] == 1
-    assert offsets == [0, 500]
+    assert cursors == [0, 500]
     assert len(reconciled) == 501
     assert reconciled[0] == "grafana:alert:stale-0"
     assert reconciled[-1] == "grafana:alert:stale-final"

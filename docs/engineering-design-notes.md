@@ -88,7 +88,10 @@ selection.
   transition out of stale or ineligible state.
 - Authority revisions and resolver projections that share a database commit in
   one unit of work. A retry may repair or verify an idempotent projection, but
-  it must not report an active revision whose projection failed to commit.
+  it must not report an active revision whose projection failed to commit. A
+  service receiving explicit authority and resolver stores verifies their
+  canonical database paths at construction; two individually valid stores do
+  not form a valid dependency graph when they point at different files.
 - External dashboard or alert IDs establish provenance, not independence.
   Corroboration groups copied sources by stable operational-content lineage.
 
@@ -137,6 +140,10 @@ of adding more per-stage reference sets. A likely record contains:
   fingerprinting.
 - Current-engine and counterfactual replay require captured inputs; they do not
   silently fall back to an exact load.
+- Offline current-engine replay must fail when the recorded engine, contract
+  policy, ranking, or vocabulary version changed and the capture cannot rerun
+  discovery, compilation, and validation. A refresh is the authoritative path
+  for those changes; replay must not relabel captured stage output as current.
 - Refresh, replay, and correction writes are pinned to the revision that supplied
   their inputs and use an expected-parent check.
 - Assessment bundles for an old revision contain no future revisions.
@@ -263,6 +270,71 @@ The likely first step is a shared unit-of-work and typed repository API, not a
 wholesale ORM rewrite. Keep domain state transitions in services; keep storage
 mechanics, tenant predicates, and transaction ownership in repositories.
 
+## Recovery, replay, and selection invariants
+
+- A source-refresh checkpoint is committed only after candidate lifecycle and
+  authority transitions succeed against state re-read under the write lock.
+  Compare-and-swap loss is a failed reconciliation, not a successful skip.
+- Resolver projections are disposable views of immutable knowledge revisions.
+  Startup repair is bidirectional: quarantine unauthorized rows and recreate
+  missing or deactivated rows from current eligible authority. Version the audit
+  marker whenever the repair contract changes. If active immutable authority
+  lacks enough exact resolver data to rebuild safely, leave the audit dirty and
+  fail that knowledge store closed instead of certifying a partial graph. The
+  pipeline may continue only through its explicit knowledge-unavailable path.
+- Current-engine replay fails closed when historical knowledge changed a stage
+  that captured inputs cannot rebuild. Applied non-ranking usage must be pinned
+  to an exact historical snapshot before replay can compare current authority.
+- Snapshot result caps are applied after every scope dimension, version range,
+  validity window, and dependency-subject predicate. Page authority rows with a
+  stable keyset so an early non-applicable row cannot hide a later match. Read
+  every page plus conflict and active-support eligibility in one SQLite snapshot,
+  then persist the deduplicated snapshot after releasing that read view. Initial
+  archetype scope contains only concrete templates resolved from classifier
+  matches plus their legacy labels. Catalog-driven widening requires an explicit
+  staged pin; never approximate it by selecting the entire curated universe.
+- Schema alterations and their required backfills share an explicit rollback
+  boundary. Derived-index migrations may commit bounded, idempotent batches and
+  set their completion marker only after the final page so interruption is
+  resumable without one long write lock. Tenant-owner migration treats the
+  remaining legacy rows as durable progress: governed rows are archived and
+  removed in the same batch transaction, retargetable rows move in bounded
+  batches, the intended owner is pinned in a progress marker across restarts,
+  and the owner marker is terminal rather than aspirational.
+- In-memory caches have capacity bounds as well as TTLs; ordinary writes prune
+  expired keys. Metric caches also carry a total item-weight budget and refuse
+  to retain one oversized catalog; a key-count limit alone does not bound
+  memory. Datasource cache identities include endpoint, organization, and a
+  non-secret credential fingerprint so app-scoped runtimes cannot share catalog
+  values accidentally. LLM caches belong to one runtime dependency graph and
+  include provider, model, endpoint, engine version, and prompt identity. Exact
+  aliases and non-authoritative fuzzy entity suggestions both use bounded
+  indexed candidate buckets; truncation is ambiguous and fails closed.
+- Immutable knowledge usage is an authority projection, not a free-form audit
+  API. Persisting it requires apply permission and an exact semantic match to
+  the usage stored in the tenant-scoped investigation contract.
+- Dirty resolver projection repair commits bounded batches while the audit stays
+  dirty. A read-only validation captures a generation token, and only an
+  unchanged token may be marked clean. This avoids a database-wide write lock
+  without certifying a concurrent or partial repair. Another initializer may
+  complete the same repair concurrently; observing a clean marker is success,
+  while a missing marker remains an invalid state. Validation pages immutable
+  authorities and resolver rows, joins mappings to authority in each page, and
+  restarts if the generation changes; never validate a large graph with one
+  long read snapshot or one authority query per mapping.
+- History, signal, and feedback ownership backfills use the same restartability
+  rule: pin the intended owner before the first data batch, release the SQLite
+  writer lock between batches, persist a per-table keyset cursor, and publish
+  the terminal owner marker only after an under-lock sweep finds no legacy rows.
+  A batch limit without a cursor is still quadratic on unindexed FTS state.
+- Bulk learning creates one tenant-scoped service/repository graph per crawl and
+  reuses it across records and stale-source reconciliation. If more ingestion
+  paths need this behavior, replace the private store-to-service helper with a
+  public dependency factory rather than adding new process-global fallbacks.
+- Candidate review priority is persisted as a base priority plus an indexed
+  unresolved-conflict bit. Conflict writes adjust that bit set-wise instead of
+  deserializing and rewriting every candidate while holding the writer lock.
+
 ## Observability expectations
 
 Best-effort behavior must be visible. Silent fallback is not resilience.
@@ -279,6 +351,11 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   persistence failure in run status and metrics.
 - Benchmark reports identify clean versus long-lived state and include latency
   percentiles, recall, signal-to-noise, and zero-match cases.
+- Failed chart runs should expose a run identifier and terminal status even when
+  validation drops every panel and no investigation revision is produced. The
+  audit record should retain per-datasource catalog counts and truncation,
+  intended versus compiled archetypes, signal-binding disposition, and rejected
+  query reasons so a safe abstention remains externally explainable.
 - When debugging exposes missing telemetry, call it out and add focused
   instrumentation when it is in scope.
 

@@ -22,7 +22,7 @@ from tacit.knowledge.models import (
     KnowledgeScope,
 )
 from tacit.knowledge.normalization import stable_fingerprint
-from tacit.knowledge.repository import KnowledgeRepository
+from tacit.knowledge.repository import CandidateEvaluationConflictError, KnowledgeRepository
 from tacit.knowledge.versioning import version_scopes_overlap
 
 
@@ -111,8 +111,11 @@ class CorroborationService:
 
 
 class ConflictDetectionService:
-    def __init__(self, repository: KnowledgeRepository):
+    def __init__(self, repository: KnowledgeRepository, *, comparison_limit: int = 1_000):
+        if comparison_limit < 1:
+            raise ValueError("comparison_limit must be positive")
         self.repository = repository
+        self.comparison_limit = comparison_limit
 
     def analyze(
         self,
@@ -124,6 +127,7 @@ class ConflictDetectionService:
         current_rows = self.repository.list_propositions(
             tenant_id,
             proposition_key=proposition_key,
+            limit=1,
         )
         if not current_rows:
             return []
@@ -143,14 +147,26 @@ class ConflictDetectionService:
             kind=current["kind"],
             subject_ref=current["subject_ref"],
             predicates=predicates,
+            limit=self.comparison_limit + 1,
         )
+        if len(rows) > self.comparison_limit:
+            raise CandidateEvaluationConflictError(
+                "conflict comparison limit exceeded; narrow the proposition scope before evaluation"
+            )
         existing_conflicts = {
             item.id: item
             for item in self.repository.list_conflicts(
                 tenant_id,
                 proposition_key=proposition_key,
+                limit=self.comparison_limit + 1,
             )
         }
+        if len(existing_conflicts) > self.comparison_limit:
+            raise CandidateEvaluationConflictError(
+                "existing conflict limit exceeded; resolve conflicts before evaluating this proposition"
+            )
+        current_item = self.repository.find_knowledge_by_proposition(tenant_id, proposition_key)
+        evaluated_candidate = self.repository.get_candidate(candidate_id, tenant_id) if candidate_id else None
         conflicts = []
         for other in rows:
             if other["proposition_key"] == proposition_key:
@@ -207,8 +223,6 @@ class ConflictDetectionService:
                 resolution_reason="" if scope_compatible else scope_reason,
             )
             existing = existing_conflicts.get(conflict.id)
-            current_item = self.repository.find_knowledge_by_proposition(tenant_id, proposition_key)
-            evaluated_candidate = self.repository.get_candidate(candidate_id, tenant_id) if candidate_id else None
             reviewed_support_for_superseded = bool(
                 existing
                 and existing.resolution_reason == "approved_human_correction"

@@ -5,19 +5,45 @@ from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
 import tacit.backends as backends_mod
+import tacit.cli as cli_mod
 import tacit.signals as signals_mod
 from tacit.backends.base import AlertFeatures, DashboardFeatures
 from tacit.cli import cli
+from tacit.config import Settings, settings
 from tacit.main import app
+from tacit.runtime_stores import RuntimeStores
 
 
 @pytest.fixture
 def isolated_learning_store(tmp_path, monkeypatch):
-    monkeypatch.setattr(signals_mod, "_DEFAULT_DB_PATH", tmp_path / "learning_e2e.db")
-    signals_mod._store = None
-    store = signals_mod.get_signal_store()
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="default",
+        knowledge_permissions=(
+            "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.correct,"
+            "knowledge.apply,knowledge.export,knowledge.override"
+        ),
+        api_auth_enabled=False,
+        signals_db_path=str(tmp_path / "learning_e2e.db"),
+        history_db_path=str(tmp_path / "history_e2e.db"),
+        feedback_db_path=str(tmp_path / "feedback_e2e.db"),
+    )
+    runtime_stores = RuntimeStores(runtime_settings)
+    store = runtime_stores.signals()
+    monkeypatch.setattr(signals_mod, "get_signal_store", lambda: store)
+    monkeypatch.setattr(cli_mod, "_cli_runtime_stores", lambda: runtime_stores)
+    for field in (
+        "knowledge_tenant_id",
+        "knowledge_permissions",
+        "api_auth_enabled",
+        "signals_db_path",
+        "history_db_path",
+        "feedback_db_path",
+    ):
+        monkeypatch.setattr(settings, field, getattr(runtime_settings, field))
+    monkeypatch.setattr(app.state, "settings", runtime_settings)
+    monkeypatch.setattr(app.state, "runtime_stores", runtime_stores)
     yield store
-    signals_mod._store = None
 
 
 @pytest.fixture

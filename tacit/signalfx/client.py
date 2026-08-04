@@ -13,6 +13,7 @@ from typing import Any, cast
 import httpx
 import structlog
 
+from tacit.cache import make_cache_key
 from tacit.config import Settings, settings
 
 logger = structlog.get_logger()
@@ -31,6 +32,7 @@ class SignalFxClient:
         self.api_token = api_token if api_token is not None else config.signalfx_api_token
         self.realm = realm or config.signalfx_realm
         base_url = f"https://api.{self.realm}.signalfx.com"
+        self.cache_namespace = make_cache_key("signalfx", base_url, self.api_token)
 
         self._client = httpx.AsyncClient(
             base_url=base_url,

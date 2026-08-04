@@ -41,6 +41,11 @@ def _authorize_signal_approval(request: Request, enabled: bool) -> None:
     assert_knowledge_action(request, KnowledgeAction.TEACH_SIGNALS)
 
 
+def _authorize_learning_mutation(request: Request, enabled: bool = True) -> None:
+    if enabled:
+        assert_knowledge_action(request, KnowledgeAction.APPLY)
+
+
 def _artifact_external_id(payload: _ArtifactPayload, artifact_type: str) -> str:
     if payload.external_id:
         return payload.external_id
@@ -95,6 +100,7 @@ async def learn_from_dashboard(
     from tacit.dashboard_ingest import ingest_dashboard
 
     _authorize_signal_approval(request, payload.auto_approve)
+    _authorize_learning_mutation(request)
     tenant_id = knowledge_tenant(request)
     try:
         return await _call_ingest_dashboard(
@@ -133,6 +139,7 @@ async def learn_from_alert(
     from tacit.config import settings
 
     _authorize_signal_approval(request, payload.auto_approve and not payload.dry_run)
+    _authorize_learning_mutation(request, not payload.dry_run)
     tenant_id = knowledge_tenant(request)
     try:
         return await _call_ingest_alert(
@@ -170,6 +177,7 @@ async def learn_from_runbook(
     """Learn operational candidates from a markdown/plain-text runbook."""
     from tacit.artifact_learning import RunbookExtractor, artifact_from_text, learn_artifact
 
+    _authorize_learning_mutation(request, not payload.dry_run)
     try:
         store = None if payload.dry_run else stores.signals()
         artifact = artifact_from_text(
@@ -210,6 +218,7 @@ async def learn_from_incident(
     """Learn operational candidates from an incident-history record."""
     from tacit.artifact_learning import IncidentExtractor, artifact_from_text, learn_artifact
 
+    _authorize_learning_mutation(request, not payload.dry_run)
     try:
         store = None if payload.dry_run else stores.signals()
         artifact = artifact_from_text(
@@ -252,6 +261,7 @@ async def learn_from_dashboard_json(
     from tacit.dashboard_uploads import parse_uploaded_dashboard
 
     _authorize_signal_approval(request, payload.auto_approve)
+    _authorize_learning_mutation(request)
     tenant_id = knowledge_tenant(request)
     try:
         features = parse_uploaded_dashboard(
@@ -300,6 +310,7 @@ async def learn_backend(
     from tacit.dashboard_ingest import learn_backend_dashboards
 
     _authorize_signal_approval(request, auto_approve)
+    _authorize_learning_mutation(request)
     tenant_id = knowledge_tenant(request)
     try:
         return await _call_learn_backend_dashboards(
@@ -344,6 +355,7 @@ async def learn_backend_alert_rules(
     from tacit.config import settings
 
     _authorize_signal_approval(request, auto_approve and not dry_run)
+    _authorize_learning_mutation(request, not dry_run)
     tenant_id = knowledge_tenant(request)
     try:
         return await _call_learn_backend_alerts(
@@ -375,18 +387,25 @@ async def learn_backend_alert_rules(
 async def list_ingested_dashboards(
     request: Request,
     status: str | None = None,
-    limit: int = 50,
+    limit: int = Query(default=50, ge=1, le=500),
+    before_created_at: float | None = Query(default=None, gt=0),
+    before_id: int | None = Query(default=None, ge=1),
     store: Any = Depends(get_signal_store),
 ):
     """List dashboards that have been ingested for learning."""
     from tacit.dashboard_ingest import build_learning_impact_report, build_signal_quality_report
 
     assert_knowledge_action(request, KnowledgeAction.READ)
-    dashboards = store.list_ingested_dashboards(
-        status=status,
-        limit=limit,
-        tenant_id=knowledge_tenant(request),
-    )
+    try:
+        dashboards = store.list_ingested_dashboards(
+            status=status,
+            limit=limit,
+            tenant_id=knowledge_tenant(request),
+            before_created_at=before_created_at,
+            before_id=before_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     for dashboard in dashboards:
         metrics = dashboard.get("metrics_found", [])
         signals = dashboard.get("signals_inferred", [])
@@ -397,7 +416,13 @@ async def list_ingested_dashboards(
                 signals=signals,
                 approved=dashboard.get("status") == "approved",
             )
-    return {"count": len(dashboards), "dashboards": dashboards}
+    next_cursor = None
+    if len(dashboards) == limit:
+        next_cursor = {
+            "before_created_at": dashboards[-1]["created_at"],
+            "before_id": dashboards[-1]["id"],
+        }
+    return {"count": len(dashboards), "dashboards": dashboards, "next_cursor": next_cursor}
 
 
 @router.get(
@@ -409,18 +434,25 @@ async def list_ingested_dashboards(
 async def list_ingested_alerts(
     request: Request,
     status: str | None = None,
-    limit: int = 50,
+    limit: int = Query(default=50, ge=1, le=500),
+    before_created_at: float | None = Query(default=None, gt=0),
+    before_id: int | None = Query(default=None, ge=1),
     store: Any = Depends(get_signal_store),
 ):
     """List alerts that have been ingested for learning."""
     from tacit.dashboard_ingest import build_learning_impact_report, build_signal_quality_report
 
     assert_knowledge_action(request, KnowledgeAction.READ)
-    alerts = store.list_ingested_alerts(
-        status=status,
-        limit=limit,
-        tenant_id=knowledge_tenant(request),
-    )
+    try:
+        alerts = store.list_ingested_alerts(
+            status=status,
+            limit=limit,
+            tenant_id=knowledge_tenant(request),
+            before_created_at=before_created_at,
+            before_id=before_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     for alert in alerts:
         metrics = alert.get("metrics_found", [])
         signals = alert.get("signals_inferred", [])
@@ -431,7 +463,13 @@ async def list_ingested_alerts(
                 signals=signals,
                 approved=alert.get("status") == "approved",
             )
-    return {"count": len(alerts), "alerts": alerts}
+    next_cursor = None
+    if len(alerts) == limit:
+        next_cursor = {
+            "before_created_at": alerts[-1]["created_at"],
+            "before_id": alerts[-1]["id"],
+        }
+    return {"count": len(alerts), "alerts": alerts, "next_cursor": next_cursor}
 
 
 @router.get(
@@ -552,6 +590,7 @@ async def approve_ingested_dashboard(
     from tacit.dashboard_ingest import approve_ingested_dashboard_record
 
     _authorize_signal_approval(request, True)
+    _authorize_learning_mutation(request)
     try:
         return approve_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,

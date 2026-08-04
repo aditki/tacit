@@ -12,8 +12,10 @@ metrics that correlate with poorly-rated dashboards get demoted.
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 import structlog
@@ -29,8 +31,14 @@ MAX_LLM_CANDIDATES = 60
 # Cached metric quality scores from the feedback store.
 # Refreshed at most every 10 minutes to avoid hitting SQLite on every request.
 
-_metric_quality_caches: dict[tuple[str, str, str], tuple[float, dict[str, float]]] = {}
+_metric_quality_caches: OrderedDict[
+    tuple[str, str, str],
+    tuple[float, dict[str, float]],
+] = OrderedDict()
 _QUALITY_CACHE_TTL = 600  # seconds
+_QUALITY_CACHE_MAX_ENTRIES = 256
+_metric_quality_cache_epoch = 0
+_metric_quality_cache_lock = RLock()
 
 
 def _feedback_store_cache_key(store: Any, tenant_id: str) -> tuple[str, str, str]:
@@ -42,16 +50,59 @@ def _feedback_store_cache_key(store: Any, tenant_id: str) -> tuple[str, str, str
 
 def invalidate_metric_quality_cache(store: Any | None = None, *, tenant_id: str | None = None) -> None:
     """Invalidate feedback-derived ranking scores globally or for one store."""
-    if store is None:
-        _metric_quality_caches.clear()
-        return
-    if tenant_id is not None:
-        _metric_quality_caches.pop(_feedback_store_cache_key(store, tenant_id), None)
-        return
-    store_key = _feedback_store_cache_key(store, "")[:2]
-    for cache_key in list(_metric_quality_caches):
-        if cache_key[:2] == store_key:
-            _metric_quality_caches.pop(cache_key, None)
+    global _metric_quality_cache_epoch
+    with _metric_quality_cache_lock:
+        _metric_quality_cache_epoch += 1
+        if store is None:
+            _metric_quality_caches.clear()
+            return
+        if tenant_id is not None:
+            _metric_quality_caches.pop(_feedback_store_cache_key(store, tenant_id), None)
+            return
+        store_key = _feedback_store_cache_key(store, "")[:2]
+        for cache_key in list(_metric_quality_caches):
+            if cache_key[:2] == store_key:
+                _metric_quality_caches.pop(cache_key, None)
+
+
+def _cached_metric_quality(
+    cache_key: tuple[str, str, str],
+    now: float,
+) -> tuple[dict[str, float] | None, int]:
+    with _metric_quality_cache_lock:
+        expired = [key for key, value in _metric_quality_caches.items() if now >= value[0]]
+        for key in expired:
+            _metric_quality_caches.pop(key, None)
+        cached = _metric_quality_caches.get(cache_key)
+        if cached is not None:
+            _metric_quality_caches.move_to_end(cache_key)
+            return cached[1], _metric_quality_cache_epoch
+        return None, _metric_quality_cache_epoch
+
+
+def _store_metric_quality(
+    cache_key: tuple[str, str, str],
+    *,
+    expires_at: float,
+    scores: dict[str, float],
+    load_epoch: int,
+) -> None:
+    with _metric_quality_cache_lock:
+        if load_epoch != _metric_quality_cache_epoch:
+            logger.debug("metric_quality_cache_write_suppressed", reason="invalidated_during_load")
+            return
+        _metric_quality_caches[cache_key] = (expires_at, scores)
+        _metric_quality_caches.move_to_end(cache_key)
+        evicted = 0
+        while len(_metric_quality_caches) > _QUALITY_CACHE_MAX_ENTRIES:
+            _metric_quality_caches.popitem(last=False)
+            evicted += 1
+        if evicted:
+            logger.debug(
+                "metric_quality_cache_capacity_eviction",
+                evicted=evicted,
+                max_entries=_QUALITY_CACHE_MAX_ENTRIES,
+            )
 
 
 def _load_metric_quality(
@@ -86,21 +137,31 @@ def _load_metric_quality(
 
     cache_key = _feedback_store_cache_key(feedback_store, tenant_id)
     now = time.monotonic()
-    cached = _metric_quality_caches.get(cache_key)
-    if cached is not None and now < cached[0]:
-        logger.debug("metric_quality_cache_hit", count=len(cached[1]), store_scope=cache_key[0])
-        return cached[1]
+    cached, load_epoch = _cached_metric_quality(cache_key, now)
+    if cached is not None:
+        logger.debug("metric_quality_cache_hit", count=len(cached), store_scope=cache_key[0])
+        return cached
 
     try:
         report = feedback_store.analyze(tenant_id=tenant_id)
         quality_list = report.get("metric_quality", [])
         scores = {m["metric"]: m["quality_score"] for m in quality_list}
-        _metric_quality_caches[cache_key] = (now + _QUALITY_CACHE_TTL, scores)
+        _store_metric_quality(
+            cache_key,
+            expires_at=now + _QUALITY_CACHE_TTL,
+            scores=scores,
+            load_epoch=load_epoch,
+        )
         if scores:
             logger.debug("metric_quality_loaded", count=len(scores), store_scope=cache_key[0])
     except Exception:
         scores = {}
-        _metric_quality_caches[cache_key] = (now + 60, scores)  # retry sooner on failure
+        _store_metric_quality(
+            cache_key,
+            expires_at=now + 60,
+            scores=scores,
+            load_epoch=load_epoch,
+        )
         logger.warning("metric_quality_load_failed", store_scope=cache_key[0], exc_info=True)
 
     return scores

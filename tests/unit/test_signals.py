@@ -41,7 +41,11 @@ from tacit.signals import (
     _effective_confidence,
     _metric_matches_pattern,
 )
-from tacit.signals.migrations import _DEFAULT_OWNER_MARKER, ensure_mapping_tenant_scope
+from tacit.signals.migrations import (
+    _DEFAULT_OWNER_MARKER,
+    CURRENT_SIGNAL_SCHEMA_MARKER,
+    ensure_mapping_tenant_scope,
+)
 from tacit.signals.schema import GLOBAL_BOOTSTRAP_TENANT_ID
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -73,8 +77,9 @@ def _wildcard_store(store: SignalStore) -> SignalStore:
 
 
 def _pinned_store(store: SignalStore, tenant_id: str) -> SignalStore:
+    db_path = store._db_path.with_name(f"{store._db_path.stem}-{tenant_id}.db")
     return SignalStore(
-        db_path=store._db_path,
+        db_path=db_path,
         runtime_settings=Settings(knowledge_tenant_id=tenant_id),
     )
 
@@ -130,10 +135,14 @@ def test_direct_signal_approval_requires_teach_permissions(signal_store):
         _env_file=None,
         knowledge_permissions="knowledge.read",
     )
+    restricted_store = SignalStore(
+        db_path=signal_store._db_path,
+        runtime_settings=runtime_settings,
+    )
 
     with pytest.raises(PermissionError, match="knowledge.review"):
         persist_inferred_signal_review(
-            store=signal_store,
+            store=restricted_store,
             sig={
                 "signal_type": "protected_signal",
                 "metric": "protected_metric",
@@ -143,10 +152,9 @@ def test_direct_signal_approval_requires_teach_permissions(signal_store):
             },
             source_ref="dashboard:protected",
             dashboard_uid="protected",
-            runtime_settings=runtime_settings,
         )
 
-    assert signal_store.get_signal_type("protected_signal") is None
+    assert restricted_store.get_signal_type("protected_signal") is None
 
 
 @pytest.mark.asyncio
@@ -162,6 +170,110 @@ async def test_direct_dashboard_auto_approval_requires_teach_permissions():
                 _env_file=None,
                 knowledge_permissions="knowledge.read",
             ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_dashboard_ingestion_requires_apply_before_persistence(tmp_path):
+    from tacit.dashboard_ingest.service import ingest_dashboard_features
+
+    restricted_store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.read,knowledge.review",
+        ),
+    )
+    features = DashboardFeatures(
+        dashboard_uid="protected-pending-dashboard",
+        dashboard_title="Protected pending dashboard",
+        backend_name="grafana",
+        query_language="promql",
+        metrics_found=["protected_metric"],
+        panel_count=1,
+        panels=[],
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        await ingest_dashboard_features(
+            features,
+            auto_approve=False,
+            store=restricted_store,
+        )
+
+    assert restricted_store.list_ingested_dashboards(tenant_id="default") == []
+
+
+@pytest.mark.asyncio
+async def test_bulk_dashboard_learning_authorizes_before_backend_access(tmp_path, monkeypatch):
+    from tacit.dashboard_ingest.service import learn_backend_dashboards
+
+    restricted_store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.read,knowledge.review",
+        ),
+    )
+    backend_accessed = False
+
+    def get_backends(*_args):
+        nonlocal backend_accessed
+        backend_accessed = True
+        return []
+
+    monkeypatch.setattr("tacit.backends.get_active_backends", get_backends)
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        await learn_backend_dashboards("grafana", store=restricted_store)
+
+    assert backend_accessed is False
+
+
+@pytest.mark.asyncio
+async def test_direct_dashboard_ingestion_authorizes_before_backend_access(tmp_path):
+    from tacit.dashboard_ingest.service import ingest_dashboard
+
+    restricted_store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.read,knowledge.review",
+        ),
+    )
+
+    class Backend:
+        accessed = False
+
+        async def ingest_dashboard(self, _dashboard_uid):
+            self.accessed = True
+            raise AssertionError("unauthorized ingestion accessed the backend")
+
+    backend = Backend()
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        await ingest_dashboard("protected-dashboard", backend=backend, store=restricted_store)
+
+    assert backend.accessed is False
+
+
+def test_dashboard_review_transitions_use_injected_store_permissions(tmp_path):
+    restricted_store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.read,knowledge.apply",
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.review"):
+        approve_ingested_dashboard_record(
+            dashboard_uid="protected-dashboard",
+            store=restricted_store,
+        )
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.reject"):
+        reject_ingested_dashboard_record(
+            dashboard_uid="protected-dashboard",
+            store=restricted_store,
         )
 
 
@@ -430,6 +542,42 @@ def test_ingested_source_lists_filter_by_backend_before_pagination(signal_store)
     assert [row["alert_uid"] for row in alert_page] == ["grafana-old"]
 
 
+def test_ingested_source_lists_use_stable_cursors_and_bounded_limits(signal_store):
+    for index in range(5):
+        uid = f"source-{index}"
+        signal_store.record_ingested_dashboard(uid, backend_name="grafana", status="pending")
+        signal_store.record_ingested_alert(uid, backend_name="grafana", status="pending")
+    with signal_store._conn() as conn:
+        conn.execute("UPDATE ingested_dashboards SET created_at=100.0")
+        conn.execute("UPDATE ingested_alerts SET created_at=100.0")
+
+    dashboard_first = signal_store.list_ingested_dashboards(limit=2)
+    dashboard_second = signal_store.list_ingested_dashboards(
+        limit=3,
+        before_created_at=dashboard_first[-1]["created_at"],
+        before_id=dashboard_first[-1]["id"],
+    )
+    alert_first = signal_store.list_ingested_alerts(limit=2)
+    alert_second = signal_store.list_ingested_alerts(
+        limit=3,
+        before_created_at=alert_first[-1]["created_at"],
+        before_id=alert_first[-1]["id"],
+    )
+
+    dashboard_ids = [row["id"] for row in [*dashboard_first, *dashboard_second]]
+    alert_ids = [row["id"] for row in [*alert_first, *alert_second]]
+    assert dashboard_ids == sorted(dashboard_ids, reverse=True)
+    assert alert_ids == sorted(alert_ids, reverse=True)
+    assert len(set(dashboard_ids)) == len(set(alert_ids)) == 5
+    for invalid_limit in (-1, 0, 10_001):
+        with pytest.raises(ValueError, match="limit"):
+            signal_store.list_ingested_dashboards(limit=invalid_limit)
+        with pytest.raises(ValueError, match="limit"):
+            signal_store.list_ingested_alerts(limit=invalid_limit)
+    with pytest.raises(ValueError, match="supplied together"):
+        signal_store.list_ingested_dashboards(before_created_at=100.0)
+
+
 def test_mapping_tenant_rebuild_rolls_back_on_copy_failure(tmp_path):
     db_path = tmp_path / "failed-mapping-migration.db"
     with sqlite3.connect(db_path) as conn:
@@ -517,10 +665,15 @@ def test_signal_mapping_activates_after_governed_corroboration(signal_store, mon
                 ORDER BY governance_ref""",
             ("tenant-a", "checkout_latency", "checkout_latency_seconds"),
         ).fetchall()
+        audit = conn.execute(
+            """SELECT value FROM signal_tenant_migration_metadata
+               WHERE key='governed_projection_audit_v2'"""
+        ).fetchone()
     ungoverned = next(row for row in rows if not row["governance_ref"])
     governed = next(row for row in rows if row["governance_ref"])
     assert ungoverned["review_state"] == "candidate"
     assert governed["review_state"] == "approved"
+    assert audit["value"] == "clean"
 
 
 def test_copied_dashboard_and_alert_sources_do_not_manufacture_corroboration(signal_store):
@@ -841,6 +994,145 @@ def test_concurrent_signal_store_startup_serializes_schema_and_markers(tmp_path)
     assert old_tables == []
 
 
+def test_current_signal_schema_reopens_without_running_migrations(tmp_path, monkeypatch):
+    db_path = tmp_path / "current-schema.db"
+    SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="tenant-a"))
+
+    def fail_migration(*_args, **_kwargs):
+        raise AssertionError("current signal schema should not run migrations or authority audit")
+
+    monkeypatch.setattr("tacit.signals.store.ensure_schema", fail_migration)
+
+    reopened = SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="tenant-a"))
+
+    assert reopened._db_path == db_path
+
+
+def test_default_owner_migration_resumes_after_a_committed_batch(tmp_path, monkeypatch):
+    from tacit.signals.migrations import reconcile_default_tenant_owner_batch
+
+    db_path = tmp_path / "resumable-default-owner.db"
+    original = SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="default"))
+    for index in range(5):
+        original.record_learned_artifact(
+            tenant_id="default",
+            artifact_id=f"runbook:{index}",
+            artifact_type="runbook",
+            title=f"Runbook {index}",
+        )
+    with original._conn() as conn:
+        conn.execute(
+            "DELETE FROM signal_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_MARKER,),
+        )
+
+    original_reconcile = SignalStore._reconcile_default_tenant_owner_batched
+
+    def migrate_one_batch_then_stop(store: SignalStore) -> None:
+        with store._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            complete, _operation, row_count = reconcile_default_tenant_owner_batch(
+                conn,
+                legacy_tenant="tenant-a",
+                batch_size=2,
+            )
+        assert complete is False
+        assert row_count == 2
+        raise RuntimeError("simulated process interruption")
+
+    monkeypatch.setattr(SignalStore, "_reconcile_default_tenant_owner_batched", migrate_one_batch_then_stop)
+    with pytest.raises(RuntimeError, match="simulated process interruption"):
+        SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="tenant-a"))
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM signal_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_MARKER,),
+        ).fetchone() is None
+        progress = conn.execute(
+            "SELECT value FROM signal_tenant_migration_metadata WHERE key='default_owner_in_progress_v1'"
+        ).fetchone()
+        cursor = conn.execute(
+            """SELECT value FROM signal_tenant_migration_metadata
+               WHERE key='default_owner_cursor_v1:learned_artifacts'"""
+        ).fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM learned_artifacts WHERE tenant_id='tenant-a'").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM learned_artifacts WHERE tenant_id='default'").fetchone()[0] == 3
+    assert progress == ("tenant-a",)
+    assert cursor is not None
+    assert int(cursor[0]) > 0
+
+    monkeypatch.setattr(SignalStore, "_reconcile_default_tenant_owner_batched", original_reconcile)
+    with pytest.raises(RuntimeError, match="already in progress for another tenant"):
+        SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="tenant-b"))
+
+    resumed = SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="tenant-a"))
+
+    with resumed._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM learned_artifacts WHERE tenant_id='tenant-a'").fetchone()[0] == 5
+        assert conn.execute("SELECT COUNT(*) FROM learned_artifacts WHERE tenant_id='default'").fetchone()[0] == 0
+        marker = conn.execute(
+            "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_MARKER,),
+        ).fetchone()
+        progress = conn.execute(
+            "SELECT 1 FROM signal_tenant_migration_metadata WHERE key='default_owner_in_progress_v1'"
+        ).fetchone()
+        cursor = conn.execute(
+            """SELECT 1 FROM signal_tenant_migration_metadata
+               WHERE key LIKE 'default_owner_cursor_v1:%'"""
+        ).fetchone()
+    assert marker is not None
+    assert marker["value"] == "tenant-a"
+    assert progress is None
+    assert cursor is None
+
+
+def test_signal_store_rejects_a_configured_owner_change(tmp_path):
+    db_path = tmp_path / "owner-change.db"
+    SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="tenant-a"))
+
+    with pytest.raises(RuntimeError, match="tenant owner does not match"):
+        SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="tenant-b"))
+
+
+def test_default_owner_migration_pages_unindexed_learning_context_by_rowid(tmp_path, monkeypatch):
+    db_path = tmp_path / "learning-context-owner.db"
+    original = SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="default"))
+    with original._conn() as conn:
+        conn.executemany(
+            """INSERT INTO learning_context_fts
+               (tenant_id, source_kind, source_id, dashboard_title, indexed_at)
+               VALUES ('default', 'dashboard', ?, ?, 1)""",
+            [(f"dashboard:{index}", f"Dashboard {index}") for index in range(5)],
+        )
+        conn.execute(
+            "DELETE FROM signal_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_MARKER,),
+        )
+
+    monkeypatch.setattr("tacit.signals.store._DEFAULT_OWNER_MIGRATION_BATCH_SIZE", 2)
+    migrated = SignalStore(db_path=db_path, runtime_settings=Settings(knowledge_tenant_id="tenant-a"))
+
+    with migrated._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM learning_context_fts WHERE tenant_id='tenant-a'"
+        ).fetchone()[0] == 5
+        assert conn.execute(
+            "SELECT 1 FROM learning_context_fts WHERE tenant_id='default'"
+        ).fetchone() is None
+
+
+def test_knowledge_service_rejects_a_resolver_from_another_database(tmp_path):
+    from tacit.knowledge.service import KnowledgeService
+
+    authority = KnowledgeRepository(tmp_path / "authority.db")
+    resolver = SignalStore(tmp_path / "resolver.db")
+
+    with pytest.raises(ValueError, match="must use the same database"):
+        KnowledgeService(authority, signal_store=resolver)
+
+
 def test_wildcard_rejects_unconfirmed_default_owner_and_pinned_reopen_retargets_current_schema(tmp_path):
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.models import KnowledgeScope
@@ -947,7 +1239,7 @@ def test_wildcard_rejects_unconfirmed_default_owner_and_pinned_reopen_retargets_
     assert wildcard.list_learned_artifacts(tenant_id="tenant-a")
 
 
-def test_startup_quarantines_unversioned_projection_without_mutating_immutable_revision(tmp_path):
+def test_startup_rejects_unprojectable_authority_without_certifying_it_clean(tmp_path):
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.models import KnowledgeScope
     from tacit.knowledge.service import KnowledgeService
@@ -993,8 +1285,11 @@ def test_startup_quarantines_unversioned_projection_without_mutating_immutable_r
             (revision.knowledge_id,),
         )
 
-    reopened = SignalStore(db_path=db_path)
-    with reopened._conn() as conn:
+    with pytest.raises(RuntimeError, match="active governed signal authority cannot be projected exactly"):
+        SignalStore(db_path=db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
         authority = conn.execute(
             """SELECT content_json, semantic_fingerprint FROM operational_knowledge_revisions
                WHERE tenant_id='default' AND knowledge_id=? AND revision=?""",
@@ -1005,18 +1300,212 @@ def test_startup_quarantines_unversioned_projection_without_mutating_immutable_r
                WHERE tenant_id='default' AND governance_ref=?""",
             (revision.knowledge_id,),
         ).fetchone()
+        audit = conn.execute(
+            """SELECT value FROM signal_tenant_migration_metadata
+               WHERE key='governed_projection_audit_v2'"""
+        ).fetchone()
 
     assert authority["content_json"] == legacy_content
     assert authority["semantic_fingerprint"] == legacy_fingerprint
-    assert dict(projection) == {"governance_revision": 0, "review_state": "candidate"}
-    assert (
-        reopened.resolve_signal(
-            "request_latency",
-            [_metric_entry("checkout_latency_seconds")],
-            context_service="checkout",
-        )
-        == []
+    assert dict(projection) == {"governance_revision": 0, "review_state": "approved"}
+    assert audit["value"].startswith("dirty")
+
+
+@pytest.mark.parametrize("force_schema_migration", [False, True])
+def test_dirty_projection_audit_repairs_authority_in_bounded_batches(
+    tmp_path,
+    monkeypatch,
+    force_schema_migration,
+):
+    from structlog.testing import capture_logs
+
+    from tacit.knowledge.enums import KnowledgeKind
+    from tacit.knowledge.models import KnowledgeScope
+    from tacit.knowledge.service import KnowledgeService
+
+    db_path = tmp_path / "bounded-projection-repair.db"
+    store = SignalStore(db_path=db_path)
+    service = KnowledgeService(
+        KnowledgeRepository(db_path),
+        signal_store=store,
     )
+    revisions = []
+    for index in range(2):
+        candidate = service.create_candidate(
+            kind=KnowledgeKind.SIGNAL_MAPPING,
+            payload_ref=f"dashboard:bounded-{index}",
+            typed_payload={"metric_pattern": f"bounded_metric_{index}", "confidence": 0.9},
+            proposition={
+                "subject_ref": f"concept:bounded-signal-{index}",
+                "predicate": "represented_by",
+                "object_ref": f"concept:bounded_metric_{index}",
+                "concept_ref": f"signal:bounded_signal_{index}",
+            },
+            scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+            provenance_refs=[f"dashboard:bounded-{index}"],
+        )
+        service.review_candidate(candidate.id, approved=True, reviewer="operator")
+        _, revision = service.evaluate_candidate(candidate.id, live_verified=True)
+        assert revision is not None
+        revisions.append(revision)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """UPDATE signal_metric_mappings SET review_state='candidate'
+               WHERE governance_ref!=''"""
+        )
+        if force_schema_migration:
+            conn.execute(
+                "DELETE FROM signal_tenant_migration_metadata WHERE key=?",
+                (CURRENT_SIGNAL_SCHEMA_MARKER,),
+            )
+
+    monkeypatch.setattr("tacit.signals.store._PROJECTION_AUDIT_BATCH_SIZE", 1)
+    with capture_logs() as logs:
+        repaired = SignalStore(db_path=db_path)
+
+    batches = [
+        entry for entry in logs if entry["event"] == "governed_signal_projection_repair_batch"
+    ]
+    assert len(batches) == 2
+    assert all(entry["batch_size"] == 1 for entry in batches)
+    with repaired._conn() as conn:
+        rows = conn.execute(
+            """SELECT governance_ref, governance_revision, review_state
+               FROM signal_metric_mappings WHERE governance_ref!=''
+               ORDER BY governance_ref"""
+        ).fetchall()
+        audit = conn.execute(
+            """SELECT value FROM signal_tenant_migration_metadata
+               WHERE key='governed_projection_audit_v2'"""
+        ).fetchone()
+    assert [(row["governance_ref"], row["governance_revision"]) for row in rows] == sorted(
+        (revision.knowledge_id, revision.revision) for revision in revisions
+    )
+    assert {row["review_state"] for row in rows} == {"approved"}
+    assert audit["value"] == "clean"
+
+
+def test_projection_audit_validation_pages_without_per_mapping_authority_queries(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from tacit.knowledge.enums import KnowledgeKind
+    from tacit.knowledge.models import KnowledgeScope
+    from tacit.knowledge.service import KnowledgeService
+
+    db_path = tmp_path / "paged-projection-validation.db"
+    store = SignalStore(db_path=db_path)
+    service = KnowledgeService(KnowledgeRepository(db_path), signal_store=store)
+    for index in range(2):
+        candidate = service.create_candidate(
+            kind=KnowledgeKind.SIGNAL_MAPPING,
+            payload_ref=f"dashboard:validation-{index}",
+            typed_payload={"metric_pattern": f"validation_metric_{index}", "confidence": 0.9},
+            proposition={
+                "subject_ref": f"concept:validation-{index}",
+                "predicate": "represented_by",
+                "object_ref": f"concept:validation-metric-{index}",
+                "concept_ref": f"signal:validation_signal_{index}",
+            },
+            scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+            provenance_refs=[f"dashboard:validation-{index}"],
+        )
+        service.review_candidate(candidate.id, approved=True, reviewer="operator")
+        _, revision = service.evaluate_candidate(candidate.id, live_verified=True)
+        assert revision is not None
+
+    with store._conn() as conn:
+        conn.execute(
+            """UPDATE signal_tenant_migration_metadata SET value='dirty:test'
+               WHERE key='governed_projection_audit_v2'"""
+        )
+
+    statements: list[str] = []
+    original_conn = store._conn
+
+    @contextmanager
+    def traced_conn():
+        with original_conn() as conn:
+            conn.set_trace_callback(statements.append)
+            try:
+                yield conn
+            finally:
+                conn.set_trace_callback(None)
+
+    monkeypatch.setattr(store, "_conn", traced_conn)
+    monkeypatch.setattr("tacit.signals.store._PROJECTION_AUTHORITY_VALIDATION_BATCH_SIZE", 1)
+    monkeypatch.setattr("tacit.signals.store._PROJECTION_AUDIT_BATCH_SIZE", 1)
+
+    assert store._validated_projection_audit_token() == "dirty:test"
+    assert not [statement for statement in statements if "FROM operational_knowledge item" in statement]
+    authority_pages = [
+        statement
+        for statement in statements
+        if "FROM operational_knowledge current" in statement and "LIMIT 1" in statement
+    ]
+    assert len(authority_pages) >= 2
+
+
+def test_projection_audit_rejects_a_partial_multi_pattern_projection(tmp_path):
+    from tacit.knowledge.enums import KnowledgeKind
+    from tacit.knowledge.models import KnowledgeScope
+    from tacit.knowledge.service import KnowledgeService
+
+    db_path = tmp_path / "partial-projection.db"
+    store = SignalStore(db_path=db_path)
+    service = KnowledgeService(KnowledgeRepository(db_path), signal_store=store)
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref="dashboard:multi-pattern",
+        typed_payload={"metric_pattern": "checkout_latency_seconds", "confidence": 0.9},
+        proposition={
+            "subject_ref": "concept:checkout-latency",
+            "predicate": "represented_by",
+            "object_ref": "concept:checkout-latency-seconds",
+            "concept_ref": "signal:checkout_latency",
+        },
+        scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+        provenance_refs=["dashboard:multi-pattern"],
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, live_verified=True)
+    assert revision is not None
+    expanded = revision.model_copy(
+        update={
+            "resolver_payload": {
+                "mappings": [
+                    {"metric_pattern": "checkout_latency_seconds", "confidence": 0.9},
+                    {"metric_pattern": "checkout_latency_milliseconds", "confidence": 0.8},
+                ]
+            }
+        }
+    )
+    with store.transaction() as conn:
+        conn.execute(
+            """UPDATE operational_knowledge_revisions SET content_json=?
+               WHERE tenant_id=? AND knowledge_id=? AND revision=?""",
+            (
+                expanded.model_dump_json(),
+                expanded.tenant_id,
+                expanded.knowledge_id,
+                expanded.revision,
+            ),
+        )
+        store.sync_governed_revision(expanded, connection=conn)
+        store.mark_governed_projection_audit_current(conn)
+    with store._conn() as conn:
+        conn.execute(
+            """DELETE FROM signal_metric_mappings
+               WHERE tenant_id=? AND governance_ref=? AND metric_pattern=?""",
+            (
+                expanded.tenant_id,
+                expanded.knowledge_id,
+                "checkout_latency_milliseconds",
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="incomplete resolver projection"):
+        store._validated_projection_audit_token()
 
 
 def test_learning_index_reraises_rebuild_failures(tmp_path, monkeypatch):
@@ -1764,6 +2253,33 @@ class TestMetricPatternMatching:
 
 
 class TestSignalResolution:
+    def test_resolution_fails_closed_when_mapping_budget_is_exceeded(self, tmp_path):
+        store = SignalStore(
+            db_path=tmp_path / "mapping-budget.db",
+            runtime_settings=Settings(_env_file=None, signal_resolution_mapping_limit=10),
+        )
+        for index in range(11):
+            store.add_mapping(
+                "bounded_signal",
+                f"bounded_metric_{index}",
+                0.9,
+                source_type="bootstrap",
+            )
+
+        with pytest.raises(RuntimeError, match="more than 10 active mapping candidates"):
+            store.resolve_signal("bounded_signal", [_metric_entry("bounded_metric_0")])
+
+    def test_resolution_fails_closed_when_catalog_budget_is_exceeded(self, tmp_path):
+        store = SignalStore(
+            db_path=tmp_path / "catalog-budget.db",
+            runtime_settings=Settings(_env_file=None, signal_resolution_catalog_limit=100),
+        )
+        store.add_mapping("bounded_catalog", "bounded_metric", 0.9, source_type="bootstrap")
+        catalog = [_metric_entry(f"metric_{index}") for index in range(101)]
+
+        with pytest.raises(RuntimeError, match="more than 100 eligible metrics"):
+            store.resolve_signal("bounded_catalog", catalog)
+
     def test_resolve_signal_exact_match(self, signal_store, sample_catalog):
         signal_store.add_mapping("request_rate", "http_requests_total", 0.95, source_type="bootstrap")
         resolved = signal_store.resolve_signal("request_rate", sample_catalog)
@@ -3215,6 +3731,7 @@ class TestIngestedDashboards:
     async def test_bulk_auto_approve_quarantines_archetypes(self, signal_store, monkeypatch, tmp_path):
         import tacit.backends as backends_mod
         from tacit import dashboard_ingest as di
+        from tacit.dashboard_ingest import service as dashboard_service
 
         class FakeBackend:
             name = "grafana"
@@ -3252,6 +3769,15 @@ class TestIngestedDashboards:
         monkeypatch.setattr(di.settings, "learned_archetypes_automatic_registration_enabled", True)
         monkeypatch.setattr(di.settings, "learned_archetypes_quarantine_path", str(tmp_path / "quarantine"))
         monkeypatch.setattr(backends_mod, "get_active_backends", lambda: [FakeBackend()])
+        service_creations = 0
+        original_factory = dashboard_service._knowledge_service_for_store
+
+        def counted_factory(*args, **kwargs):
+            nonlocal service_creations
+            service_creations += 1
+            return original_factory(*args, **kwargs)
+
+        monkeypatch.setattr(dashboard_service, "_knowledge_service_for_store", counted_factory)
 
         result = await di.learn_backend_dashboards("grafana", auto_approve=True)
 
@@ -3261,6 +3787,7 @@ class TestIngestedDashboards:
         assert len(list((tmp_path / "quarantine").rglob("*.yaml"))) == 2
         assert all(item["archetype_registered"] is False for item in result["learned"])
         assert all(item["archetype_quarantined"] is True for item in result["learned"])
+        assert service_creations == 1
 
     @pytest.mark.asyncio
     async def test_complete_dashboard_crawl_retires_missing_sources(self, signal_store, monkeypatch):
@@ -3319,19 +3846,21 @@ class TestIngestedDashboards:
             dashboard_title="Removed dashboard",
             status="approved",
         )
-        offsets: list[int] = []
+        cursors: list[int] = []
         reconciled: list[str] = []
 
-        def list_stale_dashboards(*, status, limit, tenant_id, backend_name, offset):
-            assert status == "stale"
+        def list_stale_dashboards(*, limit, tenant_id, backend_name, after_id):
             assert limit == 500
             assert tenant_id == "default"
             assert backend_name == "grafana"
-            offsets.append(offset)
-            if offset == 0:
-                return [{"dashboard_uid": f"stale-{index}"} for index in range(500)]
-            if offset == 500:
-                return [{"dashboard_uid": "stale-final"}]
+            cursors.append(after_id)
+            if after_id == 0:
+                return [
+                    {"id": index + 1, "dashboard_uid": f"stale-{index}"}
+                    for index in range(500)
+                ]
+            if after_id == 500:
+                return [{"id": 501, "dashboard_uid": "stale-final"}]
             return []
 
         def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale):
@@ -3339,7 +3868,7 @@ class TestIngestedDashboards:
             assert source_stale is True
             reconciled.append(provenance_ref)
 
-        monkeypatch.setattr(signal_store, "list_ingested_dashboards", list_stale_dashboards)
+        monkeypatch.setattr(signal_store, "list_unreconciled_stale_dashboards", list_stale_dashboards)
         monkeypatch.setattr(
             "tacit.knowledge.service.KnowledgeService.reconcile_source_lifecycle",
             reconcile_source,
@@ -3360,10 +3889,71 @@ class TestIngestedDashboards:
         result = await di.learn_backend_dashboards("grafana", store=signal_store)
 
         assert result["stale_marked"] == 1
-        assert offsets == [0, 500]
+        assert cursors == [0, 500]
         assert len(reconciled) == 501
         assert reconciled[0] == "grafana:stale-0"
         assert reconciled[-1] == "grafana:stale-final"
+
+    @pytest.mark.asyncio
+    async def test_failed_stale_dashboard_reconciliation_retries_without_a_new_stale_mark(
+        self,
+        signal_store,
+        monkeypatch,
+    ):
+        import tacit.backends as backends_mod
+        from tacit import dashboard_ingest as di
+
+        signal_store.record_ingested_dashboard(
+            "removed-dashboard",
+            backend_name="grafana",
+            dashboard_title="Removed dashboard",
+            status="approved",
+        )
+        attempts: list[str] = []
+
+        def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale):
+            assert tenant_id == "default"
+            assert source_stale is True
+            attempts.append(provenance_ref)
+            if len(attempts) == 1:
+                raise OSError("transient knowledge database failure")
+
+        monkeypatch.setattr(
+            "tacit.knowledge.service.KnowledgeService.reconcile_source_lifecycle",
+            reconcile_source,
+        )
+
+        class CompleteBackend:
+            name = "grafana"
+            last_dashboard_list_complete = True
+
+            async def list_dashboards(self, limit=500):
+                return []
+
+            async def close(self):
+                return None
+
+        monkeypatch.setattr(backends_mod, "get_active_backends", lambda: [CompleteBackend()])
+
+        first = await di.learn_backend_dashboards("grafana", store=signal_store)
+        assert first["stale_marked"] == 1
+        assert first["stale_reconciliation_failures"] == 1
+        assert signal_store.list_unreconciled_stale_dashboards(
+            tenant_id="default",
+            backend_name="grafana",
+        )
+
+        second = await di.learn_backend_dashboards("grafana", store=signal_store)
+        assert second["stale_marked"] == 0
+        assert second["stale_reconciliation_failures"] == 0
+        assert signal_store.list_unreconciled_stale_dashboards(
+            tenant_id="default",
+            backend_name="grafana",
+        ) == []
+
+        third = await di.learn_backend_dashboards("grafana", store=signal_store)
+        assert third["stale_marked"] == 0
+        assert attempts == ["grafana:removed-dashboard", "grafana:removed-dashboard"]
 
     def test_dashboard_uid_is_scoped_by_backend(self, signal_store):
         signal_store.record_ingested_dashboard(
@@ -3557,6 +4147,27 @@ signals:
             assert stats["metric_mappings"] > 20
         finally:
             db_path.unlink(missing_ok=True)
+
+    def test_unchanged_bootstrap_catalog_skips_repeated_upserts(self, tmp_path, monkeypatch):
+        yaml_path = tmp_path / "signals.yaml"
+        yaml_path.write_text(
+            """signals:
+  request_latency:
+    metric_patterns:
+      - pattern: request_seconds
+        confidence: 0.9
+"""
+        )
+        store = SignalStore(db_path=tmp_path / "signals.db")
+
+        assert store.load_from_yaml(yaml_path, only_if_changed=True) == 1
+
+        def unexpected_write(*_args, **_kwargs):
+            raise AssertionError("unchanged bootstrap catalogs must not be rewritten")
+
+        monkeypatch.setattr(store, "register_signal_type", unexpected_write)
+        monkeypatch.setattr(store, "add_mapping", unexpected_write)
+        assert store.load_from_yaml(yaml_path, only_if_changed=True) == 0
 
 
 # ── End-to-end: SSO custom metrics scenario ──────────────────────────────────

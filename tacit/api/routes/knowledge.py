@@ -7,7 +7,12 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from tacit.api.dependencies import get_history_store, get_knowledge_repository, get_knowledge_service
+from tacit.api.dependencies import (
+    get_correction_knowledge_service,
+    get_history_store,
+    get_knowledge_repository,
+    get_knowledge_service,
+)
 from tacit.api.security import (
     KnowledgeAction,
     assert_contract_tenant_access,
@@ -126,30 +131,45 @@ async def knowledge_status(request: Request):
 async def review_queue(request: Request, limit: int = Query(default=100, ge=1, le=500)):
     tenant_id = _tenant(request)
     repository = get_knowledge_repository(request)
-    candidates = repository.list_candidates(tenant_id, review_state=ReviewState.CANDIDATE.value, limit=None)
-    conflicts = repository.list_conflicts(tenant_id, unresolved_only=True)
-    unresolved_keys = {
-        proposition_ref
-        for conflict in conflicts
-        for proposition_ref in (conflict.left_proposition_ref, conflict.right_proposition_ref)
-    }
+    candidates = repository.list_review_candidates(tenant_id, limit=limit)
+    unresolved_keys = repository.unresolved_proposition_keys(
+        tenant_id,
+        {candidate.proposition.proposition_key for candidate in candidates},
+    )
+    conflicts = repository.list_conflicts(tenant_id, unresolved_only=True, limit=limit)
     attention_items = [
         revision.model_dump(mode="json")
-        for revision in repository.list_current_revisions(tenant_id)
+        for revision in repository.list_current_revisions(
+            tenant_id,
+            lifecycle_status="stale",
+            limit=limit,
+        )
         if revision.state.lifecycle_status.value == "stale"
         and revision.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
     ]
     return {
         "tenant_id": tenant_id,
-        "candidates": _prioritize_candidates(candidates, unresolved_keys)[:limit],
+        "candidates": _prioritize_candidates(candidates, unresolved_keys),
         "unresolved_conflicts": _dump(conflicts),
         "attention_items": attention_items,
     }
 
 
 @router.get("/api/v1/knowledge/conflicts", tags=["Operational Knowledge"])
-async def list_conflicts(request: Request, unresolved_only: bool = False):
-    return _dump(get_knowledge_repository(request).list_conflicts(_tenant(request), unresolved_only=unresolved_only))
+async def list_conflicts(
+    request: Request,
+    unresolved_only: bool = False,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    return _dump(
+        get_knowledge_repository(request).list_conflicts(
+            _tenant(request),
+            unresolved_only=unresolved_only,
+            limit=limit,
+            offset=offset,
+        )
+    )
 
 
 @router.get("/api/v1/knowledge/candidates", tags=["Operational Knowledge"])
@@ -280,6 +300,7 @@ async def create_correction(
     payload: CorrectionRequest,
     request: Request,
     history_store: Any = Depends(get_history_store),
+    knowledge_service: Any = Depends(get_correction_knowledge_service),
 ):
     selected_tenant = _tenant(request)
     contract = history_store.get_contract(
@@ -300,7 +321,7 @@ async def create_correction(
             detail="Correction target was not considered by the referenced investigation revision",
         )
     try:
-        correction, candidate = get_knowledge_service(request).create_correction(
+        correction, candidate = knowledge_service.create_correction(
             investigation_id=payload.investigation_id,
             investigation_revision=payload.investigation_revision,
             correction_type=payload.correction_type,
@@ -364,32 +385,69 @@ async def get_correction(correction_id: str, request: Request):
 
 
 @router.get("/api/v1/knowledge/{knowledge_id}/revisions", tags=["Operational Knowledge"])
-async def list_revisions(knowledge_id: str, request: Request):
-    revisions = get_knowledge_repository(request).list_revisions(knowledge_id, _tenant(request))
+async def list_revisions(
+    knowledge_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    revisions = get_knowledge_repository(request).list_revisions(
+        knowledge_id,
+        _tenant(request),
+        limit=limit,
+        offset=offset,
+    )
     if not revisions:
         raise HTTPException(status_code=404, detail="knowledge item not found")
     return _dump(revisions)
 
 
 @router.get("/api/v1/knowledge/{knowledge_id}/usage", tags=["Operational Knowledge"])
-async def list_usage(knowledge_id: str, request: Request):
+async def list_usage(
+    knowledge_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
     return _dump(
         get_knowledge_repository(request).list_usage(
             tenant_id=_tenant(request),
             knowledge_id=knowledge_id,
+            limit=limit,
+            offset=offset,
         )
     )
 
 
 @router.get("/api/v1/knowledge/{knowledge_id}/impact", tags=["Operational Knowledge"])
-async def knowledge_impact(knowledge_id: str, request: Request):
-    return get_knowledge_service(request).impact(knowledge_id, _tenant(request)).model_dump(mode="json")
+async def knowledge_impact(
+    knowledge_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    return get_knowledge_service(request).impact(
+        knowledge_id,
+        _tenant(request),
+        limit=limit,
+        offset=offset,
+    ).model_dump(mode="json")
 
 
 @router.get("/api/v1/knowledge/{knowledge_id}/explain", tags=["Operational Knowledge"])
-async def explain_knowledge(knowledge_id: str, request: Request):
+async def explain_knowledge(
+    knowledge_id: str,
+    request: Request,
+    history_limit: int = Query(default=200, ge=1, le=500),
+    history_offset: int = Query(default=0, ge=0),
+):
     try:
-        return get_knowledge_service(request).explain(knowledge_id, _tenant(request))
+        return get_knowledge_service(request).explain(
+            knowledge_id,
+            _tenant(request),
+            history_limit=history_limit,
+            history_offset=history_offset,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -411,10 +469,14 @@ async def list_knowledge(
     request: Request,
     kind: str | None = None,
     status: str | None = None,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ):
-    revisions = get_knowledge_repository(request).list_current_revisions(_tenant(request))
-    if kind:
-        revisions = [item for item in revisions if item.proposition.kind.value == kind]
-    if status:
-        revisions = [item for item in revisions if item.state.lifecycle_status.value == status]
+    revisions = get_knowledge_repository(request).list_current_revisions(
+        _tenant(request),
+        kind=kind,
+        lifecycle_status=status,
+        limit=limit,
+        offset=offset,
+    )
     return _dump(revisions)

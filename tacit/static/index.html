@@ -28,7 +28,7 @@
     .subtitle { color: #9ca3af; font-size: 0.9rem; margin-bottom: 1.5rem; }
 
     /* Tabs */
-    .tabs { display: flex; gap: 0.25rem; margin-bottom: 1.5rem; }
+    .tabs { display: flex; gap: 0.25rem; margin-bottom: 0.75rem; }
     .tab {
       padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem;
       cursor: pointer; color: #9ca3af; background: transparent; border: 1px solid transparent;
@@ -36,6 +36,15 @@
     }
     .tab:hover { color: #e4e6eb; }
     .tab.active { background: #1a1d27; border-color: #3b3f54; color: #c7d2fe; }
+    .runtime-context {
+      width: 100%; max-width: 640px; display: flex; justify-content: flex-end;
+      gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap;
+    }
+    .runtime-context input {
+      width: 10rem; max-width: 45vw; background: #0f1117; border: 1px solid #3b3f54;
+      border-radius: 6px; color: #e4e6eb; padding: 0.45rem 0.6rem; font-size: 0.8rem;
+    }
+    .runtime-context input:focus { outline: none; border-color: #6366f1; }
     .tab-content { display: none; width: 100%; max-width: 640px; }
     .tab-content.active { display: block; }
 
@@ -270,6 +279,10 @@
     <div class="tab" onclick="switchTab('archetypes')">Archetypes</div>
     <div class="tab" onclick="switchTab('history')">History</div>
   </div>
+  <div class="runtime-context">
+    <input id="knowledge-tenant" type="text" placeholder="Tenant" aria-label="Knowledge tenant">
+    <input id="api-key" type="password" placeholder="API key" aria-label="API key" autocomplete="off">
+  </div>
 
   <!-- Generate tab -->
   <div class="tab-content active" id="tab-generate">
@@ -342,10 +355,7 @@
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem">
         <div class="result-label" style="margin:0">Knowledge Review Queue</div>
-        <div style="display:flex;align-items:center;gap:0.5rem">
-          <input id="knowledge-tenant" type="text" placeholder="Tenant" style="width:10rem;max-width:45vw" aria-label="Knowledge tenant">
-          <button class="btn-secondary btn-sm" onclick="loadKnowledgeQueue()" title="Refresh review queue">&#8635;</button>
-        </div>
+        <button class="btn-secondary btn-sm" onclick="loadKnowledgeQueue()" title="Refresh review queue">&#8635;</button>
       </div>
       <div id="knowledge-status" style="font-size:0.75rem;color:#6b7280;margin-bottom:0.75rem"></div>
       <div id="knowledge-queue"><div class="status">Loading...</div></div>
@@ -430,6 +440,7 @@
     const LOCAL_API_BASE = 'http://127.0.0.1:8000';
     const BASE = window.location.protocol === 'file:' ? LOCAL_API_BASE : window.location.origin;
     const KNOWLEDGE_TENANT_KEY = 'tacit.knowledgeTenant';
+    const API_KEY_SESSION_KEY = 'tacit.apiKey';
     let lastDashboardUid = null;
 
     function selectedTenant() {
@@ -439,7 +450,11 @@
     }
 
     function knowledgeHeaders(extra = {}, tenant = selectedTenant()) {
-      return tenant ? { ...extra, 'X-Tacit-Tenant': tenant } : extra;
+      const headers = { ...extra };
+      if (tenant) headers['X-Tacit-Tenant'] = tenant;
+      const apiKey = document.getElementById('api-key')?.value || sessionStorage.getItem(API_KEY_SESSION_KEY) || '';
+      if (apiKey) headers['X-API-Key'] = apiKey;
+      return headers;
     }
 
     const TAB_ORDER = ['generate','learning','knowledge','signals','insights','archetypes','history'];
@@ -771,7 +786,7 @@
       const el = document.getElementById('archetypes-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       try {
-        const resp = await fetch(`${BASE}/api/v1/archetypes`);
+        const resp = await fetch(`${BASE}/api/v1/archetypes`, { headers: knowledgeHeaders() });
         const data = await resp.json();
         let html = '';
         for (const a of data.archetypes) {
@@ -791,7 +806,7 @@
 
     async function reloadArchetypes() {
       try {
-        await fetch(`${BASE}/api/v1/archetypes/reload`, { method: 'POST' });
+        await fetch(`${BASE}/api/v1/archetypes/reload`, { method: 'POST', headers: knowledgeHeaders() });
         loadArchetypes();
       } catch(e) { alert('Reload failed: ' + e.message); }
     }
@@ -1430,7 +1445,21 @@
 
     const knowledgeTenantInput = document.getElementById('knowledge-tenant');
     knowledgeTenantInput.value = localStorage.getItem(KNOWLEDGE_TENANT_KEY) || '';
-    knowledgeTenantInput.addEventListener('change', () => loadKnowledgeQueue());
+    knowledgeTenantInput.addEventListener('change', () => {
+      selectedTenant();
+      const activeTab = document.querySelector('.tab.active')?.textContent?.trim().toLowerCase();
+      if (activeTab === 'knowledge') loadKnowledgeQueue();
+      if (activeTab === 'learning') loadIngestedDashboards();
+      if (activeTab === 'signals') loadSignals();
+      if (activeTab === 'history') loadHistory();
+    });
+    const apiKeyInput = document.getElementById('api-key');
+    apiKeyInput.value = sessionStorage.getItem(API_KEY_SESSION_KEY) || '';
+    apiKeyInput.addEventListener('change', () => {
+      const value = apiKeyInput.value;
+      if (value) sessionStorage.setItem(API_KEY_SESSION_KEY, value);
+      else sessionStorage.removeItem(API_KEY_SESSION_KEY);
+    });
 
     // Submit on Ctrl+Enter
     document.getElementById('prompt').addEventListener('keydown', (e) => {

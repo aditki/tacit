@@ -55,6 +55,7 @@ class RuntimeStores:
         self._signal_store: Any | None = None
         self._knowledge_repository: Any | None = None
         self._knowledge_service: Any | None = None
+        self._llm_cache: Any | None = None
         self._lock = threading.RLock()
 
     @staticmethod
@@ -108,7 +109,7 @@ class RuntimeStores:
                         self._configured_path(self.settings.signals_db_path) if self.settings.signals_db_path else None
                     )
                     store = SignalStore(path, runtime_settings=self.settings)
-                    store.load_from_yaml()
+                    store.load_from_yaml(only_if_changed=True)
                     self._signal_store = store
         return self._signal_store
 
@@ -136,6 +137,17 @@ class RuntimeStores:
                     self._knowledge_service = KnowledgeService(
                         repository,
                         signal_store=self.signals(),
+                        history_store_factory=self.history,
                         runtime_settings=self.settings,
                     )
         return self._knowledge_service
+
+    def llm_cache(self) -> Any:
+        """Return the bounded LLM cache owned by this runtime graph."""
+        if self._llm_cache is None:
+            with self._lock:
+                if self._llm_cache is None:
+                    from tacit.cache import TTLCache
+
+                    self._llm_cache = TTLCache(default_ttl=600)
+        return self._llm_cache

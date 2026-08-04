@@ -422,6 +422,10 @@ class KnowledgeCorrection(BaseModel):
 class KnowledgeImpact(BaseModel):
     knowledge_ref: str
     affected_investigations: list[dict[str, Any]] = Field(default_factory=list)
+    total_affected: int = 0
+    limit: int = 200
+    offset: int = 0
+    has_more: bool = False
     recommended_action: str = "replay_current"
 
 

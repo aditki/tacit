@@ -56,7 +56,14 @@ def _seed_legacy_history(
                 (investigation_id,),
             )
     with store._conn() as conn:
-        conn.execute("DROP INDEX IF EXISTS idx_inv_tenant_started")
+        for index_name in (
+            "idx_inv_tenant_started",
+            "idx_inv_tenant_status_started",
+            "idx_inv_tenant_user_started",
+            "idx_inv_tenant_dashboard",
+        ):
+            conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+        conn.execute("DROP TABLE investigation_tenant_assignments")
         if not retain_tenant_column:
             conn.execute("ALTER TABLE investigations DROP COLUMN tenant_id")
     return investigation_ids
@@ -89,6 +96,36 @@ def test_pinned_migration_assigns_ownerless_contracts_and_preserves_explicit_own
             (investigation_ids["explicit"],),
         ).fetchone()["tenant_id"]
     assert explicit_owner == "tenant-b"
+
+
+def test_pinned_history_migration_processes_multiple_bounded_batches(tmp_path):
+    db_path = tmp_path / "large-legacy-history.db"
+    store = InvestigationStore(db_path=db_path, runtime_settings=Settings(_env_file=None))
+    rows = [(f"legacy-{index:04d}", f"Legacy prompt {index}", time.time()) for index in range(1_205)]
+    with store._conn() as conn:
+        conn.executemany(
+            "INSERT INTO investigations (id, prompt, started_at) VALUES (?, ?, ?)",
+            rows,
+        )
+        for index_name in (
+            "idx_inv_tenant_started",
+            "idx_inv_tenant_status_started",
+            "idx_inv_tenant_user_started",
+            "idx_inv_tenant_dashboard",
+        ):
+            conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+        conn.execute("ALTER TABLE investigations DROP COLUMN tenant_id")
+
+    migrated = InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+
+    with migrated._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM investigations WHERE tenant_id='tenant-a'").fetchone()[0] == len(
+            rows
+        )
+        assert conn.execute("SELECT COUNT(*) FROM investigation_tenant_assignments").fetchone()[0] == len(rows)
 
 
 def test_wildcard_migration_rejects_ownerless_contracts_before_schema_mutation(tmp_path):
@@ -185,7 +222,7 @@ def test_complete_schema_default_history_requires_and_records_a_migration_owner(
     with original._conn() as conn:
         conn.execute("DROP TABLE investigation_tenant_assignments")
 
-    with pytest.raises(RuntimeError, match="unconfirmed default-tenant ownership"):
+    with pytest.raises(RuntimeError, match="tenant owner"):
         InvestigationStore(
             db_path=db_path,
             runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
@@ -205,21 +242,27 @@ def test_complete_schema_default_history_requires_and_records_a_migration_owner(
     assert wildcard.get(investigation_id, tenant_id="default") is None
 
 
-def test_history_schema_migration_rolls_back_tenant_changes_on_failure(tmp_path):
+def test_history_schema_migration_resumes_after_a_committed_batch(tmp_path):
     db_path = tmp_path / "rollback-history.db"
-    _seed_legacy_history(db_path, {"ownerless": None})
+    store = InvestigationStore(db_path=db_path, runtime_settings=Settings(_env_file=None))
+    rows = [(f"legacy-{index:04d}", f"Legacy prompt {index}", time.time()) for index in range(505)]
+    with store._conn() as conn:
+        conn.executemany(
+            "INSERT INTO investigations (id, prompt, started_at) VALUES (?, ?, ?)",
+            rows,
+        )
+        for index_name in (
+            "idx_inv_tenant_started",
+            "idx_inv_tenant_status_started",
+            "idx_inv_tenant_user_started",
+            "idx_inv_tenant_dashboard",
+        ):
+            conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+        conn.execute("ALTER TABLE investigations DROP COLUMN tenant_id")
 
     class FailingHistoryStore(InvestigationStore):
-        def _backfill_legacy_tenants(
-            self,
-            conn: sqlite3.Connection,
-            *,
-            tenant_column_existed: bool,
-        ) -> None:
-            super()._backfill_legacy_tenants(
-                conn,
-                tenant_column_existed=tenant_column_existed,
-            )
+        def _migrate_history_tenant_batch(self) -> tuple[int, bool]:
+            super()._migrate_history_tenant_batch()
             raise RuntimeError("forced migration failure")
 
     with pytest.raises(RuntimeError, match="forced migration failure"):
@@ -230,11 +273,121 @@ def test_history_schema_migration_rolls_back_tenant_changes_on_failure(tmp_path)
 
     with sqlite3.connect(db_path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
-        tenant_index = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_inv_tenant_started'"
+        assigned = conn.execute(
+            "SELECT COUNT(*) FROM investigation_tenant_assignments"
         ).fetchone()
-    assert "tenant_id" not in columns
-    assert tenant_index is None
+        progress = conn.execute(
+            "SELECT 1 FROM history_migration_progress"
+        ).fetchone()
+    assert "tenant_id" in columns
+    assert assigned == (500,)
+    assert progress is not None
+
+    reopened = InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+    with reopened._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM investigation_tenant_assignments").fetchone()[0] == 505
+        assert conn.execute("SELECT COUNT(*) FROM history_migration_progress").fetchone()[0] == 0
+
+
+def test_history_upgrade_adds_investigation_event_lookup_index(tmp_path, monkeypatch):
+    db_path = tmp_path / "history-event-index.db"
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="tenant-a")
+    store = InvestigationStore(db_path=db_path, runtime_settings=runtime_settings)
+    investigation_id = store.start("Index event history", tenant_id="tenant-a")
+    with store._conn() as conn:
+        conn.execute("DROP INDEX idx_inv_events_investigation_order")
+
+    def unexpected_reconciliation(self):
+        raise AssertionError("event-index upgrade must not rescan tenant assignments")
+
+    monkeypatch.setattr(InvestigationStore, "_migrate_history_tenant_batch", unexpected_reconciliation)
+    reopened = InvestigationStore(db_path=db_path, runtime_settings=runtime_settings)
+
+    with reopened._conn() as conn:
+        plan = conn.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT e.* FROM investigation_events e
+               JOIN investigations i ON i.id=e.investigation_id
+               WHERE e.investigation_id=? AND i.tenant_id=?
+               ORDER BY e.created_at ASC, e.sequence ASC""",
+            (investigation_id, "tenant-a"),
+        ).fetchall()
+    assert any("idx_inv_events_investigation_order" in str(row["detail"]) for row in plan)
+
+
+def test_current_history_schema_reopens_without_reconciling_every_tenant_row(tmp_path, monkeypatch):
+    db_path = tmp_path / "current-history.db"
+    initial = InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+    initial.start("Already migrated", tenant_id="tenant-a")
+
+    def unexpected_reconciliation(self):
+        raise AssertionError("current-schema startup must not rewrite tenant assignments")
+
+    monkeypatch.setattr(InvestigationStore, "_migrate_history_tenant_batch", unexpected_reconciliation)
+
+    reopened = InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+
+    assert reopened.stats(tenant_id="tenant-a")["total"] == 1
+
+
+def test_history_cursor_pagination_is_stable_for_equal_timestamps(tmp_path):
+    store = InvestigationStore(
+        db_path=tmp_path / "cursor-history.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+    investigation_ids = [store.start(f"Investigation {index}", tenant_id="tenant-a") for index in range(5)]
+    with store._conn() as conn:
+        conn.execute("UPDATE investigations SET started_at=100.0 WHERE tenant_id='tenant-a'")
+
+    first = store.list_recent(limit=2, tenant_id="tenant-a")
+    second = store.list_recent(
+        limit=2,
+        tenant_id="tenant-a",
+        before_started_at=first[-1]["started_at"],
+        before_id=first[-1]["id"],
+    )
+    third = store.list_recent(
+        limit=2,
+        tenant_id="tenant-a",
+        before_started_at=second[-1]["started_at"],
+        before_id=second[-1]["id"],
+    )
+
+    observed = [item["id"] for page in (first, second, third) for item in page]
+    assert observed == sorted(investigation_ids, reverse=True)
+    assert len(observed) == len(set(observed))
+
+
+def test_history_filtered_pages_use_tenant_composite_indexes(tmp_path):
+    store = InvestigationStore(
+        db_path=tmp_path / "indexed-history.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+    with store._conn() as conn:
+        status_plan = conn.execute(
+            """EXPLAIN QUERY PLAN SELECT * FROM investigations
+               WHERE tenant_id=? AND status=?
+               ORDER BY started_at DESC, id DESC LIMIT ?""",
+            ("tenant-a", "success", 20),
+        ).fetchall()
+        user_plan = conn.execute(
+            """EXPLAIN QUERY PLAN SELECT * FROM investigations
+               WHERE tenant_id=? AND user_id=?
+               ORDER BY started_at DESC, id DESC LIMIT ?""",
+            ("tenant-a", "operator", 20),
+        ).fetchall()
+
+    assert any("idx_inv_tenant_status_started" in str(row["detail"]) for row in status_plan)
+    assert any("idx_inv_tenant_user_started" in str(row["detail"]) for row in user_plan)
 
 
 def test_compare_revisions_scopes_both_contract_lookups(monkeypatch):
@@ -536,6 +689,50 @@ def test_history_export_requires_export_permission(tmp_path, monkeypatch):
     assert result.exit_code != 0
     assert "knowledge.export" in result.output
     assert called is False
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["history", "contract", "inv-a"],
+        ["history", "replay", "inv-a"],
+    ],
+)
+def test_history_contract_cli_requires_read_permission(monkeypatch, arguments):
+    stores = _FakeStores(
+        Settings(
+            _env_file=None,
+            knowledge_tenant_id="tenant-a",
+            knowledge_permissions="knowledge.apply",
+        )
+    )
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: stores)
+
+    result = CliRunner().invoke(cli, arguments)
+
+    assert result.exit_code != 0
+    assert "knowledge.read" in result.output
+    assert stores.history_store.calls == []
+
+
+def test_history_current_replay_cli_requires_apply_permission(monkeypatch):
+    stores = _FakeStores(
+        Settings(
+            _env_file=None,
+            knowledge_tenant_id="tenant-a",
+            knowledge_permissions="knowledge.read",
+        )
+    )
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: stores)
+
+    result = CliRunner().invoke(
+        cli,
+        ["history", "replay", "inv-a", "--mode", "current_engine"],
+    )
+
+    assert result.exit_code != 0
+    assert "knowledge.apply" in result.output
+    assert stores.history_store.calls == []
 
 
 def test_assessment_export_requires_export_permission(tmp_path, monkeypatch):

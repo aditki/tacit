@@ -193,6 +193,8 @@ class PipelineRecorder:
             )
 
     def finish(self, *, persist_record: bool | None = None, **kwargs: Any) -> None:
+        run_warning_code = str(kwargs.pop("run_warning_code", ""))
+        run_warning_detail = str(kwargs.pop("run_warning_detail", ""))
         should_persist_record = self.record_investigation_updates if persist_record is None else persist_record
         if should_persist_record:
             try:
@@ -209,7 +211,7 @@ class PipelineRecorder:
                 succeeded = pipeline_status == "success"
                 cancelled = pipeline_status == "cancelled"
                 if succeeded:
-                    run_status, error_code = "completed", ""
+                    run_status, error_code = "completed", run_warning_code
                 elif cancelled:
                     run_status, error_code = "cancelled", "pipeline_cancelled"
                 elif pipeline_status == "timeout":
@@ -220,7 +222,7 @@ class PipelineRecorder:
                     self.run_id,
                     status=run_status,
                     error_code=error_code,
-                    error_detail=str(kwargs.get("error", "")),
+                    error_detail=run_warning_detail or str(kwargs.get("error", "")),
                 )
             except Exception:
                 logger.warning("history_complete_run_failed", exc_info=True)

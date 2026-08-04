@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS ingested_dashboards (
     archetype_generated TEXT NOT NULL DEFAULT '',
     stale               INTEGER NOT NULL DEFAULT 0,
     missing_since       REAL,
+    knowledge_reconciled_at REAL,
 
     created_at          REAL NOT NULL,
     reviewed_at         REAL,
@@ -150,6 +151,7 @@ CREATE TABLE IF NOT EXISTS ingested_alerts (
     confidence          REAL NOT NULL DEFAULT 0.0,
     stale               INTEGER NOT NULL DEFAULT 0,
     missing_since       REAL,
+    knowledge_reconciled_at REAL,
 
     -- Status
     status              TEXT NOT NULL DEFAULT 'pending',
@@ -177,6 +179,7 @@ CREATE TABLE IF NOT EXISTS learned_artifacts (
     fingerprint         TEXT NOT NULL DEFAULT '',
     stale               INTEGER NOT NULL DEFAULT 0,
     missing_since       REAL,
+    knowledge_reconciled_at REAL,
     first_seen_at       REAL NOT NULL,
     last_seen_at        REAL NOT NULL,
     updated_at          REAL NOT NULL,
@@ -277,6 +280,7 @@ CREATE TABLE IF NOT EXISTS signal_migration_quarantine (
     quarantined_at     REAL NOT NULL,
     PRIMARY KEY (source_table, source_row_key, reason)
 );
+
 """
 
 FTS_SCHEMA_SQL = """

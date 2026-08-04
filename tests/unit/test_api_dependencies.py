@@ -456,6 +456,33 @@ def test_learning_auto_approval_requires_knowledge_permissions(monkeypatch, perm
     assert called is False
 
 
+def test_pending_learning_requires_apply_permission(monkeypatch):
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.read,knowledge.review,knowledge.trust",
+        )
+    )
+    app.dependency_overrides[get_signal_store] = lambda: object()
+    called = False
+
+    async def fake_ingest_dashboard(**_kwargs):
+        nonlocal called
+        called = True
+        return {"dashboard_uid": "restricted-pending"}
+
+    monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard", fake_ingest_dashboard)
+
+    response = TestClient(app).post(
+        "/api/v1/learn/dashboard",
+        json={"dashboard_uid": "restricted-pending", "auto_approve": False},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.apply"
+    assert called is False
+
+
 @pytest.mark.parametrize(
     ("permissions", "missing_permission"),
     [

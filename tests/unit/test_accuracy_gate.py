@@ -280,6 +280,35 @@ async def test_prometheus_metadata_is_loaded_from_datasource_api():
     assert metadata == {"request_duration_seconds": ("seconds", "histogram")}
 
 
+@pytest.mark.asyncio
+async def test_prometheus_metric_cache_isolated_by_backend_identity():
+    metric_cache.invalidate()
+    datasource = DatasourceInfo(uid="shared-uid", name="Shared", type="prometheus")
+    first = AsyncMock()
+    first.cache_namespace = "runtime-a"
+    first.datasource_proxy_get.return_value = {
+        "status": "success",
+        "data": {"tenant_a_metric": [{"unit": "seconds", "type": "gauge"}]},
+    }
+    second = AsyncMock()
+    second.cache_namespace = "runtime-b"
+    second.datasource_proxy_get.return_value = {
+        "status": "success",
+        "data": {"tenant_b_metric": [{"unit": "bytes", "type": "gauge"}]},
+    }
+
+    try:
+        first_metadata = await PrometheusAdapter()._get_metric_metadata(first, datasource)
+        second_metadata = await PrometheusAdapter()._get_metric_metadata(second, datasource)
+    finally:
+        metric_cache.invalidate()
+
+    assert first_metadata == {"tenant_a_metric": ("seconds", "gauge")}
+    assert second_metadata == {"tenant_b_metric": ("bytes", "gauge")}
+    first.datasource_proxy_get.assert_awaited_once()
+    second.datasource_proxy_get.assert_awaited_once()
+
+
 def test_unit_compatibility_rewards_matches_and_penalizes_conflicts():
     assert _unit_compatibility("seconds", "ms") > 1.0
     assert _unit_compatibility("seconds", "bytes") < 1.0

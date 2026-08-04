@@ -120,6 +120,11 @@ def _query_references_metric(query_expr: str, metric: str) -> bool:
     )
 
 
+def _query_changes_under_metric_substitution(query_expr: str, old_metric: str, new_metric: str) -> bool:
+    """Use the compiler's substitution semantics to attribute a query change."""
+    return _suffix_aware_replace(query_expr, old_metric, new_metric) != query_expr
+
+
 def _re2_escape(s: str) -> str:
     """Escape a string for safe use in PromQL regex matchers."""
     return "".join(f"\\{c}" if c in _RE2_SPECIAL else c for c in s)
@@ -950,8 +955,12 @@ def _resolve_archetype_signals(
                     for query_index, query in enumerate(panel.queries):
                         refs = {
                             revision_ref
-                            for default_metric in substitutions
-                            if _query_references_metric(query.expr, default_metric)
+                            for default_metric, resolved_metric in substitutions.items()
+                            if _query_changes_under_metric_substitution(
+                                query.expr,
+                                default_metric,
+                                resolved_metric,
+                            )
                             for revision_ref in refs_by_default_metric.get(default_metric, set())
                         }
                         if refs:

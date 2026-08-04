@@ -20,7 +20,11 @@ from pydantic import ValidationError
 from tacit import __version__
 from tacit.agents.providers.base import TokenUsage
 from tacit.api.app import create_app
-from tacit.api.dependencies import get_history_store, get_pipeline_dependencies
+from tacit.api.dependencies import (
+    get_correction_knowledge_service,
+    get_history_store,
+    get_pipeline_dependencies,
+)
 from tacit.backends.base import PublishResult
 from tacit.config import Settings
 from tacit.dependencies import PipelineDependencies
@@ -77,6 +81,7 @@ from tacit.models.schemas import (
 )
 from tacit.pipeline.completion import complete_pipeline
 from tacit.pipeline.recording import PipelineRecorder
+from tacit.pipeline.runner import _applied_stage_knowledge_refs
 
 
 def _draft_contract(
@@ -1234,6 +1239,86 @@ def test_non_exact_replay_rejects_a_stale_base_revision(tmp_path):
     assert store.list_runs(investigation_id)[-1]["status"] == "failed"
 
 
+def test_current_engine_replay_requires_refresh_when_runtime_versions_changed(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    draft = _draft_contract(investigation_id)
+    draft = draft.model_copy(
+        update={"runtime": draft.runtime.model_copy(update={"engine_version": "0.0.0-old"})}
+    )
+    store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+
+    with pytest.raises(ReplayInputsUnavailableError, match="refresh the investigation"):
+        store.replay_contract(investigation_id, mode=ReplayMode.CURRENT_ENGINE)
+
+    assert len(store.list_revisions(investigation_id)) == 1
+    assert store.list_runs(investigation_id)[-1]["status"] == "failed"
+
+
+def test_current_engine_reconciles_live_contradictions_before_stage_blockers(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    draft = _draft_contract(investigation_id)
+    store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
+    blocker_checked = False
+
+    class ContradictedKnowledgeService:
+        def create_snapshot(self, scope):
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_before_live_reconciliation",
+                tenant_id=scope.tenant_id,
+                items=[],
+                fingerprint="sha256:before-live-reconciliation",
+            ), [
+                KnowledgeUsage(
+                    tenant_id=scope.tenant_id,
+                    knowledge_ref="knowledge_live_contradicted",
+                    knowledge_revision=2,
+                    disposition=KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+                )
+            ]
+
+        def reconcile_live_observations(self, usage, observations):
+            return [
+                usage[0].model_copy(
+                    update={
+                        "disposition": KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION,
+                    }
+                )
+            ]
+
+        def snapshot_from_usage(self, tenant_id, usage):
+            assert usage[0].disposition == KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION
+            return KnowledgeSnapshot(
+                id="knowledge_snapshot_after_live_reconciliation",
+                tenant_id=tenant_id,
+                items=[],
+                fingerprint="sha256:after-live-reconciliation",
+            )
+
+        def captured_stage_replay_blockers(self, *, current_snapshot, **_kwargs):
+            nonlocal blocker_checked
+            blocker_checked = True
+            assert current_snapshot.items == []
+            return []
+
+        def apply_to_ranking(self, ranking, usage):
+            return ranking, usage
+
+        def persist_usage(self, usage, **_kwargs):
+            return usage
+
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.CURRENT_ENGINE,
+        knowledge_service_factory=ContradictedKnowledgeService,
+    )
+
+    assert replayed is not None
+    assert blocker_checked is True
+    assert replayed.knowledge_usage[0].disposition == KnowledgeUsageDisposition.CONTRADICTED_BY_OBSERVATION
+
+
 def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, monkeypatch):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?")
@@ -1316,6 +1401,9 @@ def test_current_engine_replay_applies_knowledge_to_baseline_ranking(tmp_path, m
                 items=[],
                 fingerprint="sha256:reconciled",
             )
+
+        def captured_stage_replay_blockers(self, **_kwargs):
+            return []
 
         def apply_to_ranking(self, ranking, usage):
             self.seen_score = ranking.candidates[0].score
@@ -1401,6 +1489,9 @@ def test_current_engine_replay_snapshots_reconciled_knowledge_usage(tmp_path, mo
                 fingerprint="sha256:after",
             )
 
+        def captured_stage_replay_blockers(self, **_kwargs):
+            return []
+
         def apply_to_ranking(self, ranking, usage):
             return ranking, usage
 
@@ -1422,7 +1513,7 @@ def test_current_engine_replay_snapshots_reconciled_knowledge_usage(tmp_path, mo
     assert fake.persisted is True
 
 
-def test_current_engine_replay_preserves_exact_usage_for_captured_stages(tmp_path):
+def test_current_engine_replay_fails_when_current_knowledge_changes_captured_stages(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?")
     historical_usage = KnowledgeUsage(
@@ -1455,6 +1546,9 @@ def test_current_engine_replay_preserves_exact_usage_for_captured_stages(tmp_pat
                 fingerprint="sha256:current",
             ), [current]
 
+        def captured_stage_replay_blockers(self, **_kwargs):
+            return ["knowledge_latency_mapping@2"]
+
         def reconcile_live_observations(self, usage, observations):
             return usage
 
@@ -1473,20 +1567,56 @@ def test_current_engine_replay_preserves_exact_usage_for_captured_stages(tmp_pat
         def persist_usage(self, usage, *, investigation_id, investigation_revision):
             return usage
 
-    replayed = store.replay_contract(
-        investigation_id,
-        mode=ReplayMode.CURRENT_ENGINE,
-        knowledge_service_factory=CurrentKnowledgeService,
+    with pytest.raises(ReplayInputsUnavailableError, match="captured discovery and compilation inputs"):
+        store.replay_contract(
+            investigation_id,
+            mode=ReplayMode.CURRENT_ENGINE,
+            knowledge_service_factory=CurrentKnowledgeService,
+        )
+
+    assert [(item.knowledge_ref, item.knowledge_revision) for item in captured_usage] == [
+        ("knowledge_latency_mapping", 2)
+    ]
+    assert len(store.list_revisions(investigation_id)) == 1
+    assert store.list_runs(investigation_id)[-1]["status"] == "failed"
+
+
+def test_current_engine_replay_rejects_unpinned_historical_stage_usage(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?")
+    historical_usage = KnowledgeUsage(
+        tenant_id="",
+        knowledge_ref="knowledge_unpinned_mapping",
+        knowledge_revision=1,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        used_for=["query_compilation"],
+    )
+    draft = _draft_contract(investigation_id).model_copy(update={"knowledge_usage": [historical_usage]})
+    snapshot = _snapshot_for(draft).model_copy(
+        update={
+            "knowledge_snapshot_ref": "",
+            "knowledge_usage": [historical_usage],
+        }
+    )
+    store.persist_contract_revision(draft, snapshot=snapshot)
+    runtime_settings = Settings(
+        _env_file=None,
+        signals_db_path=str(tmp_path / "knowledge.db"),
+    )
+    knowledge_service = KnowledgeService(
+        KnowledgeRepository(tmp_path / "knowledge.db"),
+        runtime_settings=runtime_settings,
     )
 
-    assert replayed is not None
-    assert replayed.queries[0].expression == draft.queries[0].expression
-    usage_by_revision = {item.knowledge_revision: item for item in captured_usage}
-    assert usage_by_revision[2].disposition == KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED
-    assert usage_by_revision[2].used_for == []
-    assert usage_by_revision[1].disposition == KnowledgeUsageDisposition.APPLIED
-    assert usage_by_revision[1].used_for == ["query_compilation"]
-    assert "current_engine_reused_captured_stage_output" in usage_by_revision[1].reason_codes
+    with pytest.raises(ReplayInputsUnavailableError, match="historical_knowledge_snapshot_unavailable"):
+        store.replay_contract(
+            investigation_id,
+            mode=ReplayMode.CURRENT_ENGINE,
+            knowledge_service_factory=lambda: knowledge_service,
+        )
+
+    assert len(store.list_revisions(investigation_id)) == 1
+    assert store.list_runs(investigation_id)[-1]["status"] == "failed"
 
 
 def test_current_engine_replay_builds_default_knowledge_service_from_store_settings(tmp_path, monkeypatch):
@@ -1536,6 +1666,9 @@ def test_current_engine_replay_builds_default_knowledge_service_from_store_setti
                 items=[],
                 fingerprint="sha256:scoped",
             )
+
+        def captured_stage_replay_blockers(self, **_kwargs):
+            return []
 
     class CapturingRuntimeStores:
         def __init__(self, supplied_settings):
@@ -1592,18 +1725,20 @@ def test_current_engine_replay_succeeds_when_usage_persistence_fails(tmp_path, m
                 fingerprint="sha256:reconciled",
             )
 
+        def captured_stage_replay_blockers(self, **_kwargs):
+            return []
+
         def apply_to_ranking(self, ranking, usage):
             return ranking, usage
 
         def persist_usage(self, usage, *, investigation_id, investigation_revision):
             raise OSError("knowledge database unavailable")
 
-    monkeypatch.setattr(
-        "tacit.knowledge.service.get_knowledge_service",
-        lambda: FailingUsageService(),
+    replayed = store.replay_contract(
+        investigation_id,
+        mode=ReplayMode.CURRENT_ENGINE,
+        knowledge_service_factory=FailingUsageService,
     )
-
-    replayed = store.replay_contract(investigation_id, mode=ReplayMode.CURRENT_ENGINE)
 
     assert replayed.investigation.revision == 2
     assert store.get_contract(investigation_id).investigation.revision == 2
@@ -2085,6 +2220,24 @@ def test_run_completed_event_follows_revision_events(tmp_path):
     assert after_completion.index("revision_persisted") < after_completion.index("run_completed")
     runtime_manifest = store.list_runs(investigation_id)[0]["runtime_manifest"]
     assert runtime_manifest["engine_version"] == __version__
+
+
+def test_failed_knowledge_audit_guard_includes_applied_ranking_usage():
+    usage = [
+        KnowledgeUsage(
+            knowledge_ref="knowledge-ranking",
+            knowledge_revision=1,
+            disposition=KnowledgeUsageDisposition.APPLIED,
+            used_for=["candidate_generation", "ranking"],
+        ),
+        KnowledgeUsage(
+            knowledge_ref="knowledge-considered",
+            knowledge_revision=1,
+            disposition=KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+        ),
+    ]
+
+    assert _applied_stage_knowledge_refs(usage) == {"knowledge-ranking"}
 
 
 async def test_failed_refresh_does_not_overwrite_current_investigation_row(tmp_path):
@@ -2897,11 +3050,19 @@ async def test_published_dashboard_succeeds_when_contract_persistence_fails():
     class FailingContractHistory:
         def __init__(self):
             self.finished: list[dict] = []
+            self.stages: list[dict] = []
+            self.completed_runs: list[dict] = []
 
         def finish(self, investigation_id, **kwargs):
             self.finished.append({"investigation_id": investigation_id, **kwargs})
 
-        def persist_contract_revision(self, contract, *, reason):
+        def record_stage(self, investigation_id, stage, **kwargs):
+            self.stages.append({"investigation_id": investigation_id, "stage": stage, **kwargs})
+
+        def complete_run(self, run_id, **kwargs):
+            self.completed_runs.append({"run_id": run_id, **kwargs})
+
+        def persist_contract_revision(self, contract, **kwargs):
             raise RuntimeError("database is locked")
 
     class FeedbackStore:
@@ -2909,7 +3070,7 @@ async def test_published_dashboard_succeeds_when_contract_persistence_fails():
             return None
 
     history = FailingContractHistory()
-    recorder = PipelineRecorder(history, "inv-published")
+    recorder = PipelineRecorder(history, "inv-published", "run-published")
     dashboard = DashboardSpec(
         title="Published dashboard",
         panels=[PanelSpec(title="Traffic", queries=[PanelQuery(expr="up", datasource_uid="prom")])],
@@ -2954,6 +3115,16 @@ async def test_published_dashboard_succeeds_when_contract_persistence_fails():
     assert response.investigation_id == "inv-published"
     assert response.investigation_revision is None
     assert history.finished[0]["status"] == "success"
+    assert history.stages[-1]["stage"] == "contract_persistence"
+    assert history.stages[-1]["status"] == "failed"
+    assert history.completed_runs == [
+        {
+            "run_id": "run-published",
+            "status": "completed",
+            "error_code": "contract_persistence_failed",
+            "error_detail": "RuntimeError: database is locked",
+        }
+    ]
 
 
 def test_packaged_schema_matches_contract_model():
@@ -3103,6 +3274,77 @@ def test_legacy_correction_mutations_require_action_permissions(tmp_path, monkey
     assert apply_response.status_code == 403
     assert apply_response.json()["detail"] == "Missing permission: knowledge.apply"
     assert len(store.list_revisions(investigation_id)) == 1
+
+
+def test_legacy_correction_store_enforces_permissions_for_direct_callers(tmp_path):
+    db_path = tmp_path / "history.db"
+    full_store = InvestigationStore(db_path=db_path)
+    investigation_id = full_store.start("Why did checkout latency increase?", user_id="embedding")
+    persisted = full_store.persist_contract_revision(_draft_contract(investigation_id))
+    approved_candidate = full_store.create_knowledge_candidate(
+        investigation_id,
+        revision=persisted.investigation.revision,
+        correction_text="The cache was saturated.",
+        created_by="reviewer",
+    )
+    rejected_candidate = full_store.create_knowledge_candidate(
+        investigation_id,
+        revision=persisted.investigation.revision,
+        correction_text="This should be rejected.",
+        created_by="reviewer",
+    )
+    assert approved_candidate is not None and rejected_candidate is not None
+
+    no_mutations = InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_permissions="knowledge.read"),
+    )
+    with pytest.raises(PermissionError, match="knowledge.correct"):
+        no_mutations.create_knowledge_candidate(
+            investigation_id,
+            revision=1,
+            correction_text="Unauthorized correction.",
+        )
+    with pytest.raises(PermissionError, match="knowledge.review"):
+        no_mutations.review_knowledge_candidate(
+            investigation_id,
+            approved_candidate.id,
+            approved=True,
+            reviewed_by="unauthorized",
+        )
+    with pytest.raises(PermissionError, match="knowledge.reject"):
+        no_mutations.review_knowledge_candidate(
+            investigation_id,
+            rejected_candidate.id,
+            approved=False,
+            reviewed_by="unauthorized",
+        )
+
+    full_store.review_knowledge_candidate(
+        investigation_id,
+        approved_candidate.id,
+        approved=True,
+        reviewed_by="authorized",
+    )
+    with pytest.raises(PermissionError, match="knowledge.apply"):
+        no_mutations.apply_knowledge_candidate(investigation_id, approved_candidate.id)
+    assert len(full_store.list_revisions(investigation_id)) == 1
+
+
+def test_non_exact_replay_requires_apply_permission(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    app = create_app(runtime_settings=Settings(knowledge_permissions="knowledge.read"))
+    app.dependency_overrides[get_history_store] = lambda: store
+
+    response = TestClient(app).post(
+        f"/api/v1/investigations/{investigation_id}/replay",
+        json={"mode": "current_engine"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.apply"
 
 
 def test_assessment_bundle_export_requires_export_permission(tmp_path, monkeypatch):
@@ -3435,7 +3677,7 @@ def test_investigation_tenant_is_immutable_across_revisions(tmp_path):
         store.persist_contract_revision(draft.model_copy(update={"request": tenant_b_request}))
 
 
-def test_knowledge_correction_uses_target_revision_from_contract_usage(tmp_path, monkeypatch):
+def test_knowledge_correction_uses_target_revision_from_contract_usage(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Revision-pinned correction")
     draft = _draft_contract(investigation_id)
@@ -3453,12 +3695,9 @@ def test_knowledge_correction_uses_target_revision_from_contract_usage(tmp_path,
             captured.update(kwargs)
             raise ValueError("captured correction request")
 
-    monkeypatch.setattr(
-        "tacit.api.routes.knowledge.get_knowledge_service",
-        lambda request: CapturingKnowledgeService(),
-    )
     app = create_app(runtime_settings=Settings(knowledge_tenant_id="default"))
     app.dependency_overrides[get_history_store] = lambda: store
+    app.dependency_overrides[get_correction_knowledge_service] = lambda: CapturingKnowledgeService()
 
     response = TestClient(app).post(
         "/api/v1/knowledge/corrections",
@@ -3482,6 +3721,40 @@ def test_knowledge_correction_uses_target_revision_from_contract_usage(tmp_path,
     assert captured["target_revision"] == usage.knowledge_revision
 
 
+def test_knowledge_correction_validates_with_the_request_scoped_history_store(tmp_path):
+    request_history = InvestigationStore(db_path=tmp_path / "request-history.db")
+    investigation_id = request_history.start("Request-scoped correction provenance")
+    request_history.persist_contract_revision(_draft_contract(investigation_id))
+    unrelated_history_path = tmp_path / "app-history.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        history_db_path=str(unrelated_history_path),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    app = create_app(runtime_settings=runtime_settings)
+    app.dependency_overrides[get_history_store] = lambda: request_history
+
+    response = TestClient(app).post(
+        "/api/v1/knowledge/corrections",
+        json={
+            "investigation_id": investigation_id,
+            "investigation_revision": 1,
+            "correction_type": "artifact_quality",
+            "proposed": {
+                "subject_ref": "concept:artifact-quality",
+                "predicate": "useful_for_investigation",
+                "concept_ref": "concept:request-scoped-history",
+            },
+            "explanation": "Use the same history store that authorized this request.",
+            "created_by": "operator",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["correction"]["investigation_id"] == investigation_id
+    assert not unrelated_history_path.exists()
+
+
 def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeypatch):
     db_path = tmp_path / "legacy-history.db"
     store = InvestigationStore(db_path=db_path)
@@ -3495,7 +3768,14 @@ def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeyp
                WHERE investigation_id=? AND revision=?""",
             (json.dumps(payload), investigation_id, persisted.investigation.revision),
         )
-        conn.execute("DROP INDEX IF EXISTS idx_inv_tenant_started")
+        for index_name in (
+            "idx_inv_tenant_started",
+            "idx_inv_tenant_status_started",
+            "idx_inv_tenant_user_started",
+            "idx_inv_tenant_dashboard",
+        ):
+            conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+        conn.execute("DROP TABLE investigation_tenant_assignments")
         conn.execute("ALTER TABLE investigations DROP COLUMN tenant_id")
 
     migrated = InvestigationStore(
@@ -3527,15 +3807,13 @@ def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeyp
     monkeypatch.setattr("tacit.api.routes.history.run_pipeline", fake_refresh)
     knowledge_service = KnowledgeService(
         KnowledgeRepository(tmp_path / "knowledge.db"),
+        history_store=migrated,
         runtime_settings=runtime_settings,
-    )
-    monkeypatch.setattr(
-        "tacit.api.routes.knowledge.get_knowledge_service",
-        lambda request: knowledge_service,
     )
     app = create_app(runtime_settings=runtime_settings)
     app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
     app.dependency_overrides[get_history_store] = lambda: migrated
+    app.dependency_overrides[get_correction_knowledge_service] = lambda: knowledge_service
     client = TestClient(app)
 
     assert migrated.get(investigation_id)["tenant_id"] == "tenant-a"

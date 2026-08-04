@@ -53,7 +53,11 @@ _GOVERNED_TENANT_TABLES = (
 _TENANT_OWNED_TABLES = (*_RETARGETABLE_TENANT_TABLES, *_GOVERNED_TENANT_TABLES)
 
 _DEFAULT_OWNER_MARKER = "default_owner_v1"
+_DEFAULT_OWNER_PROGRESS_MARKER = "default_owner_in_progress_v1"
+_DEFAULT_OWNER_CURSOR_PREFIX = "default_owner_cursor_v1:"
 _SIGNAL_DEFINITION_SCOPE_MARKER = "signal_definition_scope_v1"
+CURRENT_SIGNAL_SCHEMA_MARKER = "signal_schema_operational_knowledge_v2"
+GOVERNED_PROJECTION_AUDIT_MARKER = "governed_projection_audit_v2"
 
 
 @contextmanager
@@ -125,11 +129,158 @@ def ensure_schema(
     ensure_artifact_tenant_scope(conn, legacy_tenant=migration_tenant)
     ensure_mapping_columns(conn)
     ensure_mapping_tenant_scope(conn, legacy_tenant=migration_tenant)
-    reconcile_default_tenant_owner(conn, legacy_tenant=legacy_tenant)
+    ensure_governed_projection_audit_triggers(conn)
     ensure_global_bootstrap_mapping_scope(conn)
-    quarantine_governed_mappings_without_revisions(conn)
-    quarantine_legacy_ungoverned_mappings(conn)
     ensure_rejected_candidate_tenant_scope(conn, legacy_tenant=migration_tenant)
+    mark_governed_projection_audit_dirty(conn, reason="schema_migration")
+    _record_migration_marker(conn, CURRENT_SIGNAL_SCHEMA_MARKER, migration_tenant)
+
+
+def signal_schema_is_current(conn: sqlite3.Connection) -> bool:
+    """Verify the current-schema marker against the small physical schema surface."""
+    if not _migration_marker_exists(conn, CURRENT_SIGNAL_SCHEMA_MARKER):
+        return False
+    required_columns = {
+        "signal_metric_mappings": {
+            "tenant_id",
+            "governance_ref",
+            "governance_revision",
+            "context_regions",
+            "context_clusters",
+            "context_namespaces",
+            "context_versions",
+            "valid_from",
+            "valid_until",
+        },
+        "ingested_dashboards": {"tenant_id", "backend_name", "knowledge_reconciled_at"},
+        "ingested_alerts": {"tenant_id", "backend_name", "knowledge_reconciled_at"},
+        "learned_artifacts": {"tenant_id", "knowledge_reconciled_at"},
+        "rejected_signal_candidates": {"tenant_id"},
+    }
+    for table, expected in required_columns.items():
+        if not _table_exists(conn, table):
+            return False
+        columns = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not expected.issubset(columns):
+            return False
+    required_tables = {
+        "signal_types",
+        "tenant_signal_types",
+        "signal_tenant_migration_metadata",
+        "learning_context_fts",
+    }
+    existing_tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        ).fetchall()
+    }
+    if not required_tables.issubset(existing_tables):
+        return False
+    required_indexes = {
+        "idx_smm_governance",
+        "idx_ingested_dashboard_reconciliation",
+        "idx_ingested_alert_reconciliation",
+        "idx_learned_artifact_reconciliation",
+    }
+    existing_indexes = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
+    }
+    if not required_indexes.issubset(existing_indexes):
+        return False
+    required_triggers = {
+        "trg_governed_mapping_insert_audit_dirty",
+        "trg_governed_mapping_update_audit_dirty",
+        "trg_governed_mapping_delete_audit_dirty",
+    }
+    existing_triggers = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()
+    }
+    return required_triggers.issubset(existing_triggers)
+
+
+def governed_projection_audit_is_current(conn: sqlite3.Connection) -> bool:
+    if not _table_exists(conn, "signal_tenant_migration_metadata"):
+        return False
+    row = conn.execute(
+        "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+        (GOVERNED_PROJECTION_AUDIT_MARKER,),
+    ).fetchone()
+    return row is not None and str(row["value"]) == "clean"
+
+
+def signal_tenant_owner_is_current(
+    conn: sqlite3.Connection,
+    *,
+    legacy_tenant: str | None,
+) -> bool:
+    if not _table_exists(conn, "signal_tenant_migration_metadata"):
+        return False
+    row = conn.execute(
+        "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+        (_DEFAULT_OWNER_MARKER,),
+    ).fetchone()
+    if row is None:
+        return False
+    return legacy_tenant is None or str(row["value"]) == legacy_tenant
+
+
+def mark_governed_projection_audit_current(conn: sqlite3.Connection) -> None:
+    _record_migration_marker(conn, GOVERNED_PROJECTION_AUDIT_MARKER, "clean")
+
+
+def mark_governed_projection_audit_dirty(conn: sqlite3.Connection, *, reason: str) -> None:
+    token = hashlib.sha256(f"{reason}:{time.time_ns()}".encode()).hexdigest()[:16]
+    _record_migration_marker(conn, GOVERNED_PROJECTION_AUDIT_MARKER, f"dirty:{token}")
+
+
+def ensure_governed_projection_audit_triggers(conn: sqlite3.Connection) -> None:
+    """Install mutation guards only after legacy mapping columns are current."""
+    for trigger_name in (
+        "trg_governed_mapping_insert_audit_dirty",
+        "trg_governed_mapping_update_audit_dirty",
+        "trg_governed_mapping_delete_audit_dirty",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+    conn.execute(
+        f"""CREATE TRIGGER trg_governed_mapping_insert_audit_dirty
+           AFTER INSERT ON signal_metric_mappings
+           WHEN NEW.governance_ref != ''
+             OR (NEW.source_type != 'bootstrap' AND NEW.review_state IN ('approved', 'trusted'))
+           BEGIN
+             INSERT INTO signal_tenant_migration_metadata (key, value, updated_at)
+             VALUES ('{GOVERNED_PROJECTION_AUDIT_MARKER}',
+                     'dirty:' || lower(hex(randomblob(8))), CAST(strftime('%s', 'now') AS REAL))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
+           END"""
+    )
+    conn.execute(
+        f"""CREATE TRIGGER trg_governed_mapping_update_audit_dirty
+           AFTER UPDATE ON signal_metric_mappings
+           WHEN OLD.governance_ref != '' OR NEW.governance_ref != ''
+             OR (OLD.source_type != 'bootstrap' AND OLD.review_state IN ('approved', 'trusted'))
+             OR (NEW.source_type != 'bootstrap' AND NEW.review_state IN ('approved', 'trusted'))
+           BEGIN
+             INSERT INTO signal_tenant_migration_metadata (key, value, updated_at)
+             VALUES ('{GOVERNED_PROJECTION_AUDIT_MARKER}',
+                     'dirty:' || lower(hex(randomblob(8))), CAST(strftime('%s', 'now') AS REAL))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
+           END"""
+    )
+    conn.execute(
+        f"""CREATE TRIGGER trg_governed_mapping_delete_audit_dirty
+           AFTER DELETE ON signal_metric_mappings
+           WHEN OLD.governance_ref != ''
+             OR (OLD.source_type != 'bootstrap' AND OLD.review_state IN ('approved', 'trusted'))
+           BEGIN
+             INSERT INTO signal_tenant_migration_metadata (key, value, updated_at)
+             VALUES ('{GOVERNED_PROJECTION_AUDIT_MARKER}',
+                     'dirty:' || lower(hex(randomblob(8))), CAST(strftime('%s', 'now') AS REAL))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
+           END"""
+    )
 
 
 def _migration_marker_exists(conn: sqlite3.Connection, key: str) -> bool:
@@ -228,7 +379,7 @@ def _tenant_column_exists(conn: sqlite3.Connection, table: str) -> bool:
     return "tenant_id" in columns
 
 
-def _archive_rows_for_migration(
+def _archive_and_delete_migration_batch(
     conn: sqlite3.Connection,
     *,
     table: str,
@@ -236,111 +387,234 @@ def _archive_rows_for_migration(
     parameters: tuple[Any, ...],
     target_tenant: str,
     reason: str,
+    batch_size: int,
 ) -> int:
-    rows = conn.execute(f"SELECT * FROM {table} WHERE {where}", parameters).fetchall()
+    """Archive and remove one bounded rowid batch in the active transaction."""
+    rows = conn.execute(
+        f"SELECT rowid AS _migration_rowid, * FROM {table} WHERE {where} LIMIT ?",
+        (*parameters, batch_size),
+    ).fetchall()
+    if not rows:
+        return 0
+
+    quarantined_at = time.time()
+    archive_rows: list[tuple[Any, ...]] = []
+    rowids: list[int] = []
     for row in rows:
-        payload = json.dumps(dict(row), sort_keys=True, separators=(",", ":"), default=str)
+        payload_row = dict(row)
+        rowids.append(int(payload_row.pop("_migration_rowid")))
+        payload = json.dumps(payload_row, sort_keys=True, separators=(",", ":"), default=str)
         row_key = hashlib.sha256(f"{table}\0{payload}".encode()).hexdigest()
-        original_tenant = str(row["tenant_id"]) if "tenant_id" in row.keys() else "default"
-        conn.execute(
-            """INSERT OR IGNORE INTO signal_migration_quarantine
-               (source_table, source_row_key, original_tenant_id, target_tenant_id,
-                reason, payload_json, quarantined_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (table, row_key, original_tenant, target_tenant, reason, payload, time.time()),
+        original_tenant = str(payload_row.get("tenant_id") or "default")
+        archive_rows.append(
+            (table, row_key, original_tenant, target_tenant, reason, payload, quarantined_at)
         )
-    return len(rows)
+    conn.executemany(
+        """INSERT OR IGNORE INTO signal_migration_quarantine
+           (source_table, source_row_key, original_tenant_id, target_tenant_id,
+            reason, payload_json, quarantined_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        archive_rows,
+    )
+    placeholders = ",".join("?" for _ in rowids)
+    conn.execute(f"DELETE FROM {table} WHERE rowid IN ({placeholders})", rowids)
+    return len(rowids)
 
 
-def _quarantine_default_governed_state(conn: sqlite3.Connection, target_tenant: str) -> dict[str, int]:
-    """Preserve legacy governed rows without rewriting tenant-derived identities."""
-    counts: dict[str, int] = {}
-    default_knowledge_ids: set[str] = set()
-    for table in ("operational_knowledge", "operational_knowledge_revisions"):
-        if not _tenant_column_exists(conn, table):
-            continue
-        default_knowledge_ids.update(
-            str(row["knowledge_id"])
-            for row in conn.execute(f"SELECT DISTINCT knowledge_id FROM {table} WHERE tenant_id='default'").fetchall()
-        )
-    for table in _GOVERNED_TENANT_TABLES:
-        if not _tenant_column_exists(conn, table):
-            continue
-        count = _archive_rows_for_migration(
-            conn,
-            table=table,
-            where="tenant_id='default'",
-            parameters=(),
-            target_tenant=target_tenant,
-            reason="tenant_identity_requires_remigration",
-        )
-        if count:
-            counts[table] = count
-
-    if _tenant_column_exists(conn, "signal_metric_mappings"):
-        projection_where = "tenant_id='default' AND governance_ref!=''"
-        projection_parameters: tuple[Any, ...] = ()
-        if default_knowledge_ids:
-            placeholders = ", ".join("?" for _ in default_knowledge_ids)
-            projection_where = f"({projection_where}) OR governance_ref IN ({placeholders})"
-            projection_parameters = tuple(sorted(default_knowledge_ids))
-        count = _archive_rows_for_migration(
-            conn,
-            table="signal_metric_mappings",
-            where=projection_where,
-            parameters=projection_parameters,
-            target_tenant=target_tenant,
-            reason="governed_projection_requires_rebuild",
-        )
-        if count:
-            counts["signal_metric_mappings"] = count
-
-    for table in reversed(_GOVERNED_TENANT_TABLES):
-        if _tenant_column_exists(conn, table):
-            conn.execute(f"DELETE FROM {table} WHERE tenant_id='default'")
-    if _tenant_column_exists(conn, "signal_metric_mappings"):
-        conn.execute(
-            f"DELETE FROM signal_metric_mappings WHERE {projection_where}",
-            projection_parameters,
-        )
-    return counts
-
-
-def reconcile_default_tenant_owner(
+def reconcile_default_tenant_owner_batch(
     conn: sqlite3.Connection,
     *,
     legacy_tenant: str | None,
-) -> None:
-    """Record explicit ownership without rewriting immutable governed identities."""
+    batch_size: int = 500,
+) -> tuple[bool, str, int]:
+    """Reconcile one restartable owner-migration batch.
+
+    The caller commits each invocation independently. The remaining default
+    rows are the durable progress record; the owner marker is written only
+    after every table is complete.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
     marker = conn.execute(
         "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
         (_DEFAULT_OWNER_MARKER,),
     ).fetchone()
     if marker is not None:
-        return
+        recorded_owner = str(marker["value"])
+        if legacy_tenant is not None and recorded_owner != legacy_tenant:
+            raise RuntimeError(
+                "Signal database tenant owner does not match the configured pinned tenant: "
+                f"recorded={recorded_owner}, configured={legacy_tenant}"
+            )
+        return True, "already_complete", 0
+
     owner = legacy_tenant or "*"
-    if owner not in {"*", "default"}:
-        with atomic_rebuild(conn, "retarget_default_signal_owner"):
-            quarantined = _quarantine_default_governed_state(conn, owner)
-            for table in _RETARGETABLE_TENANT_TABLES:
-                if _table_has_default_rows(conn, table):
-                    conn.execute(f"UPDATE {table} SET tenant_id=? WHERE tenant_id='default'", (owner,))
-            if _table_exists(conn, "signal_metric_mappings"):
-                columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
-                if "tenant_id" in columns:
-                    source_filter = " AND source_type!='bootstrap'" if "source_type" in columns else ""
-                    conn.execute(
-                        f"UPDATE signal_metric_mappings SET tenant_id=? " f"WHERE tenant_id='default'{source_filter}",
-                        (owner,),
-                    )
-            if quarantined:
-                logger.warning(
-                    "legacy_governed_state_quarantined",
-                    target_tenant=owner,
-                    rows=sum(quarantined.values()),
-                    tables=quarantined,
+    progress = conn.execute(
+        "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+        (_DEFAULT_OWNER_PROGRESS_MARKER,),
+    ).fetchone()
+    if progress is not None and str(progress["value"]) != owner:
+        raise RuntimeError(
+            "Signal database tenant owner migration is already in progress for another tenant: "
+            f"recorded={progress['value']}, configured={owner}"
+        )
+    if owner in {"*", "default"}:
+        _record_migration_marker(conn, _DEFAULT_OWNER_MARKER, owner)
+        conn.execute(
+            "DELETE FROM signal_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_PROGRESS_MARKER,),
+        )
+        conn.execute(
+            "DELETE FROM signal_tenant_migration_metadata WHERE key LIKE ?",
+            (f"{_DEFAULT_OWNER_CURSOR_PREFIX}%",),
+        )
+        return True, "marker", 0
+    if progress is None:
+        _record_migration_marker(conn, _DEFAULT_OWNER_PROGRESS_MARKER, owner)
+
+    if _tenant_column_exists(conn, "signal_metric_mappings"):
+        projection_conditions = ["(tenant_id='default' AND governance_ref!='')"]
+        if _tenant_column_exists(conn, "operational_knowledge"):
+            projection_conditions.append(
+                """EXISTS (
+                     SELECT 1 FROM operational_knowledge authority
+                     WHERE authority.tenant_id='default'
+                       AND authority.knowledge_id=signal_metric_mappings.governance_ref
+                   )"""
+            )
+        if _tenant_column_exists(conn, "operational_knowledge_revisions"):
+            projection_conditions.append(
+                """EXISTS (
+                     SELECT 1 FROM operational_knowledge_revisions authority
+                     WHERE authority.tenant_id='default'
+                       AND authority.knowledge_id=signal_metric_mappings.governance_ref
+                   )"""
+            )
+        count = _archive_and_delete_migration_batch(
+            conn,
+            table="signal_metric_mappings",
+            where=" OR ".join(projection_conditions),
+            parameters=(),
+            target_tenant=owner,
+            reason="governed_projection_requires_rebuild",
+            batch_size=batch_size,
+        )
+        if count:
+            return False, "signal_metric_mappings:quarantine", count
+
+    for table in reversed(_GOVERNED_TENANT_TABLES):
+        if not _tenant_column_exists(conn, table):
+            continue
+        count = _archive_and_delete_migration_batch(
+            conn,
+            table=table,
+            where="tenant_id='default'",
+            parameters=(),
+            target_tenant=owner,
+            reason="tenant_identity_requires_remigration",
+            batch_size=batch_size,
+        )
+        if count:
+            return False, f"{table}:quarantine", count
+
+    for table in _RETARGETABLE_TENANT_TABLES:
+        if not _tenant_column_exists(conn, table):
+            continue
+        cursor_key = f"{_DEFAULT_OWNER_CURSOR_PREFIX}{table}"
+        cursor_row = conn.execute(
+            "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+            (cursor_key,),
+        ).fetchone()
+        if cursor_row is not None and str(cursor_row["value"]) == "complete":
+            continue
+        after_rowid = int(cursor_row["value"]) if cursor_row is not None else 0
+        rows = conn.execute(
+            f"""SELECT rowid AS migration_rowid FROM {table}
+                WHERE rowid>? AND tenant_id='default'
+                ORDER BY rowid LIMIT ?""",
+            (after_rowid, batch_size),
+        ).fetchall()
+        if not rows:
+            _record_migration_marker(conn, cursor_key, "complete")
+            continue
+        last_rowid = int(rows[-1]["migration_rowid"])
+        cursor = conn.execute(
+            f"""UPDATE {table} SET tenant_id=?
+                WHERE rowid>? AND rowid<=? AND tenant_id='default'""",
+            (owner, after_rowid, last_rowid),
+        )
+        _record_migration_marker(conn, cursor_key, str(last_rowid))
+        if cursor.rowcount:
+            return False, f"{table}:retarget", int(cursor.rowcount)
+
+    if _tenant_column_exists(conn, "signal_metric_mappings"):
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
+        source_filter = " AND source_type!='bootstrap'" if "source_type" in columns else ""
+        cursor_key = f"{_DEFAULT_OWNER_CURSOR_PREFIX}signal_metric_mappings"
+        cursor_row = conn.execute(
+            "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+            (cursor_key,),
+        ).fetchone()
+        if cursor_row is None or str(cursor_row["value"]) != "complete":
+            after_rowid = int(cursor_row["value"]) if cursor_row is not None else 0
+            rows = conn.execute(
+                f"""SELECT rowid AS migration_rowid FROM signal_metric_mappings
+                    WHERE rowid>? AND tenant_id='default'{source_filter}
+                    ORDER BY rowid LIMIT ?""",
+                (after_rowid, batch_size),
+            ).fetchall()
+            if rows:
+                last_rowid = int(rows[-1]["migration_rowid"])
+                cursor = conn.execute(
+                    f"""UPDATE signal_metric_mappings SET tenant_id=?
+                        WHERE rowid>? AND rowid<=? AND tenant_id='default'{source_filter}""",
+                    (owner, after_rowid, last_rowid),
                 )
+                _record_migration_marker(conn, cursor_key, str(last_rowid))
+                if cursor.rowcount:
+                    return False, "signal_metric_mappings:retarget", int(cursor.rowcount)
+            else:
+                _record_migration_marker(conn, cursor_key, "complete")
+
+    for table in _RETARGETABLE_TENANT_TABLES:
+        if not _tenant_column_exists(conn, table):
+            continue
+        remaining = conn.execute(
+            f"SELECT MIN(rowid) AS first_rowid FROM {table} WHERE tenant_id='default'"
+        ).fetchone()
+        if remaining is not None and remaining["first_rowid"] is not None:
+            _record_migration_marker(
+                conn,
+                f"{_DEFAULT_OWNER_CURSOR_PREFIX}{table}",
+                str(max(0, int(remaining["first_rowid"]) - 1)),
+            )
+            return False, f"{table}:rescan", 0
+
+    if _tenant_column_exists(conn, "signal_metric_mappings"):
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(signal_metric_mappings)").fetchall()}
+        source_filter = " AND source_type!='bootstrap'" if "source_type" in columns else ""
+        remaining = conn.execute(
+            f"""SELECT MIN(rowid) AS first_rowid FROM signal_metric_mappings
+                WHERE tenant_id='default'{source_filter}"""
+        ).fetchone()
+        if remaining is not None and remaining["first_rowid"] is not None:
+            _record_migration_marker(
+                conn,
+                f"{_DEFAULT_OWNER_CURSOR_PREFIX}signal_metric_mappings",
+                str(max(0, int(remaining["first_rowid"]) - 1)),
+            )
+            return False, "signal_metric_mappings:rescan", 0
+
     _record_migration_marker(conn, _DEFAULT_OWNER_MARKER, owner)
+    conn.execute(
+        "DELETE FROM signal_tenant_migration_metadata WHERE key=?",
+        (_DEFAULT_OWNER_PROGRESS_MARKER,),
+    )
+    conn.execute(
+        "DELETE FROM signal_tenant_migration_metadata WHERE key LIKE ?",
+        (f"{_DEFAULT_OWNER_CURSOR_PREFIX}%",),
+    )
+    return True, "marker", 0
 
 
 def require_legacy_tenant_owner(
@@ -629,16 +903,6 @@ def ensure_global_bootstrap_mapping_scope(conn: sqlite3.Connection) -> None:
         )
 
 
-def quarantine_legacy_ungoverned_mappings(conn: sqlite3.Connection) -> None:
-    """Prevent trusted organizational mappings from bypassing governance after upgrade."""
-    quarantined = conn.execute("""UPDATE signal_metric_mappings
-              SET review_state='candidate'
-            WHERE source_type!='bootstrap' AND governance_ref=''
-              AND review_state IN ('approved', 'trusted')""").rowcount
-    if quarantined:
-        logger.warning("legacy_ungoverned_signal_mappings_quarantined", count=quarantined)
-
-
 def _json_values(value: Any) -> list[str]:
     if isinstance(value, str):
         try:
@@ -671,24 +935,11 @@ def _same_optional_float(left: Any, right: Any) -> bool:
     return abs(float(left) - float(right)) <= 1e-9
 
 
-def _projection_matches_immutable_authority(conn: sqlite3.Connection, mapping: sqlite3.Row) -> tuple[bool, str]:
+def projection_matches_authority(mapping: Any, authority: Any | None) -> tuple[bool, str]:
+    """Validate one resolver projection against an already-loaded authority row."""
     governance_revision = int(mapping["governance_revision"] or 0)
     if governance_revision < 1:
         return False, "unversioned_projection"
-    if not _table_exists(conn, "operational_knowledge") or not _table_exists(conn, "operational_knowledge_revisions"):
-        return False, "authority_table_missing"
-    authority = conn.execute(
-        """SELECT revision.content_json, revision.review_state,
-                  revision.lifecycle_status, revision.eligibility
-           FROM operational_knowledge item
-           JOIN operational_knowledge_revisions revision
-             ON revision.tenant_id=item.tenant_id
-            AND revision.knowledge_id=item.knowledge_id
-            AND revision.revision=item.current_revision
-           WHERE revision.tenant_id=? AND revision.knowledge_id=? AND revision.revision=?
-             AND item.status='active'""",
-        (mapping["tenant_id"], mapping["governance_ref"], governance_revision),
-    ).fetchone()
     if authority is None:
         return False, "authority_revision_missing"
     if (
@@ -782,32 +1033,6 @@ def _projection_matches_immutable_authority(conn: sqlite3.Connection, mapping: s
     return True, "validated"
 
 
-def quarantine_governed_mappings_without_revisions(conn: sqlite3.Connection) -> None:
-    """Quarantine projections that immutable authority cannot validate exactly."""
-    rows = conn.execute("SELECT * FROM signal_metric_mappings WHERE governance_ref!=''").fetchall()
-    invalid: list[tuple[sqlite3.Row, str]] = []
-    for row in rows:
-        matches, reason = _projection_matches_immutable_authority(conn, row)
-        if not matches:
-            invalid.append((row, reason))
-    if not invalid:
-        return
-    conn.executemany(
-        "UPDATE signal_metric_mappings SET review_state='candidate' WHERE id=?",
-        [(row["id"],) for row, _ in invalid],
-    )
-    reason_counts: dict[str, int] = {}
-    for _, reason in invalid:
-        reason_counts[reason] = reason_counts.get(reason, 0) + 1
-    logger.warning(
-        "governed_signal_mapping_revision_unknown",
-        mappings=len(invalid),
-        quarantined=sum(str(row["review_state"]) != "candidate" for row, _ in invalid),
-        reasons=reason_counts,
-        sample_patterns=sorted({str(row["metric_pattern"]) for row, _ in invalid})[:5],
-    )
-
-
 def ensure_ingested_dashboard_backend_scope(
     conn: sqlite3.Connection,
     *,
@@ -835,6 +1060,13 @@ def ensure_ingested_dashboard_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN stale INTEGER NOT NULL DEFAULT 0")
     if "missing_since" not in columns:
         conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN missing_since REAL")
+    if "knowledge_reconciled_at" not in columns:
+        conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN knowledge_reconciled_at REAL")
+    if "tenant_id" in columns:
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_ingested_dashboard_reconciliation
+               ON ingested_dashboards(tenant_id, backend_name, stale, knowledge_reconciled_at, id)"""
+        )
 
 
 def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
@@ -852,6 +1084,7 @@ def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
         "confidence": "REAL NOT NULL DEFAULT 0.0",
         "stale": "INTEGER NOT NULL DEFAULT 0",
         "missing_since": "REAL",
+        "knowledge_reconciled_at": "REAL",
         "first_seen_at": "REAL NOT NULL DEFAULT 0",
         "last_seen_at": "REAL NOT NULL DEFAULT 0",
         "updated_at": "REAL NOT NULL DEFAULT 0",
@@ -859,6 +1092,11 @@ def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
     for name, ddl in additions.items():
         if name not in columns:
             conn.execute(f"ALTER TABLE ingested_alerts ADD COLUMN {name} {ddl}")
+    if "tenant_id" in columns:
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_ingested_alert_reconciliation
+               ON ingested_alerts(tenant_id, backend_name, stale, knowledge_reconciled_at, id)"""
+        )
 
 
 def ensure_ingested_alert_tenant_scope(
@@ -886,6 +1124,7 @@ def ensure_artifact_learning_columns(conn: sqlite3.Connection) -> None:
             "provenance_url": "TEXT NOT NULL DEFAULT ''",
             "stale": "INTEGER NOT NULL DEFAULT 0",
             "missing_since": "REAL",
+            "knowledge_reconciled_at": "REAL",
             "first_seen_at": "REAL NOT NULL DEFAULT 0",
             "last_seen_at": "REAL NOT NULL DEFAULT 0",
             "updated_at": "REAL NOT NULL DEFAULT 0",
@@ -893,6 +1132,11 @@ def ensure_artifact_learning_columns(conn: sqlite3.Connection) -> None:
         for name, ddl in additions.items():
             if name not in artifact_columns:
                 conn.execute(f"ALTER TABLE learned_artifacts ADD COLUMN {name} {ddl}")
+        if "tenant_id" in artifact_columns:
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_learned_artifact_reconciliation
+                   ON learned_artifacts(tenant_id, artifact_type, stale, knowledge_reconciled_at, id)"""
+            )
 
     for table in ("evidence_requirements", "ownership_hints", "dependency_hints", "signal_mapping_candidates"):
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -933,6 +1177,8 @@ def ensure_artifact_tenant_indexes(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_learned_artifacts_type
             ON learned_artifacts(tenant_id, artifact_type);
+        CREATE INDEX IF NOT EXISTS idx_learned_artifact_reconciliation
+            ON learned_artifacts(tenant_id, artifact_type, stale, knowledge_reconciled_at, id);
         CREATE INDEX IF NOT EXISTS idx_evidence_requirements_artifact
             ON evidence_requirements(tenant_id, artifact_id);
         CREATE INDEX IF NOT EXISTS idx_ownership_hints_artifact
@@ -985,6 +1231,7 @@ def _rebuild_artifact_learning_tables(
             title TEXT NOT NULL DEFAULT '', body_text TEXT NOT NULL DEFAULT '',
             provenance_url TEXT NOT NULL DEFAULT '', fingerprint TEXT NOT NULL DEFAULT '',
             stale INTEGER NOT NULL DEFAULT 0, missing_since REAL,
+            knowledge_reconciled_at REAL,
             first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL,
             updated_at REAL NOT NULL, created_at REAL NOT NULL,
             UNIQUE(tenant_id, artifact_id)
@@ -1029,7 +1276,7 @@ def _rebuild_artifact_learning_tables(
     conn.execute(f"""INSERT INTO learned_artifacts
         SELECT id, {tenant_select["learned_artifacts"]}, artifact_id, artifact_type, source_vendor,
                source_instance, external_id, title, body_text, provenance_url, fingerprint, stale,
-               missing_since, first_seen_at, last_seen_at, updated_at, created_at
+               missing_since, knowledge_reconciled_at, first_seen_at, last_seen_at, updated_at, created_at
         FROM learned_artifacts_old""")
     conn.execute(f"""INSERT INTO evidence_requirements
         SELECT {tenant_select["evidence_requirements"]}, id, artifact_id, subject, evidence_kind,
@@ -1088,6 +1335,7 @@ def _rebuild_ingested_dashboards_table(conn: sqlite3.Connection, tenant_select: 
             archetype_generated TEXT NOT NULL DEFAULT '',
             stale               INTEGER NOT NULL DEFAULT 0,
             missing_since       REAL,
+            knowledge_reconciled_at REAL,
             created_at          REAL NOT NULL,
             reviewed_at         REAL,
             UNIQUE(tenant_id, dashboard_uid, backend_name)
@@ -1099,18 +1347,20 @@ def _rebuild_ingested_dashboards_table(conn: sqlite3.Connection, tenant_select: 
             metrics_found, panel_count, row_groups, metric_cooccurrence,
             aggregation_patterns, query_transformations, panel_titles,
             alert_links, drilldown_links, status, signals_inferred,
-            archetype_generated, stale, missing_since, created_at, reviewed_at)
+            archetype_generated, stale, missing_since, knowledge_reconciled_at, created_at, reviewed_at)
            SELECT id, {tenant_select}, dashboard_uid, COALESCE(backend_name, ''), dashboard_title, dashboard_tags,
                   metrics_found, panel_count, row_groups, metric_cooccurrence,
                   aggregation_patterns, query_transformations, panel_titles,
                   alert_links, drilldown_links, status, signals_inferred,
-                  archetype_generated, stale, missing_since, created_at, reviewed_at
+                  archetype_generated, stale, missing_since, knowledge_reconciled_at, created_at, reviewed_at
            FROM ingested_dashboards_old""")
     conn.execute("DROP TABLE ingested_dashboards_old")
     conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_tenant_uid_backend
            ON ingested_dashboards(tenant_id, dashboard_uid, backend_name)""")
     conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_tenant_uid_backend
            ON ingested_dashboards(tenant_id, dashboard_uid, backend_name)""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_dashboard_reconciliation
+           ON ingested_dashboards(tenant_id, backend_name, stale, knowledge_reconciled_at, id)""")
 
 
 def rebuild_ingested_alerts_table(conn: sqlite3.Connection, *, legacy_tenant: str = "default") -> None:
@@ -1141,6 +1391,7 @@ def _rebuild_ingested_alerts_table(conn: sqlite3.Connection, tenant_select: str)
             panel_title TEXT NOT NULL DEFAULT '', source_url TEXT NOT NULL DEFAULT '',
             provenance_url TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 0.0,
             stale INTEGER NOT NULL DEFAULT 0, missing_since REAL,
+            knowledge_reconciled_at REAL,
             status TEXT NOT NULL DEFAULT 'pending', signals_inferred TEXT NOT NULL DEFAULT '[]',
             first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL,
             updated_at REAL NOT NULL, created_at REAL NOT NULL, reviewed_at REAL,
@@ -1152,14 +1403,18 @@ def _rebuild_ingested_alerts_table(conn: sqlite3.Connection, tenant_select: str)
            (id, tenant_id, alert_uid, backend_name, source_vendor, source_instance, external_id,
             fingerprint, alert_title, alert_tags, condition, severity, enabled, labels, annotations,
             metrics_found, query_transformations, service_hints, dashboard_uid, panel_title,
-            source_url, provenance_url, confidence, stale, missing_since, status, signals_inferred,
+            source_url, provenance_url, confidence, stale, missing_since, knowledge_reconciled_at,
+            status, signals_inferred,
             first_seen_at, last_seen_at, updated_at, created_at, reviewed_at)
            SELECT id, {tenant_select}, alert_uid, backend_name, source_vendor, source_instance, external_id,
                   fingerprint, alert_title, alert_tags, condition, severity, enabled, labels, annotations,
                   metrics_found, query_transformations, service_hints, dashboard_uid, panel_title,
-                  source_url, provenance_url, confidence, stale, missing_since, status, signals_inferred,
+                  source_url, provenance_url, confidence, stale, missing_since, knowledge_reconciled_at,
+                  status, signals_inferred,
                   first_seen_at, last_seen_at, updated_at, created_at, reviewed_at
            FROM ingested_alerts_old""")
     conn.execute("DROP TABLE ingested_alerts_old")
     conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_alert_tenant_uid_backend
            ON ingested_alerts(tenant_id, alert_uid, backend_name)""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_alert_reconciliation
+           ON ingested_alerts(tenant_id, backend_name, stale, knowledge_reconciled_at, id)""")

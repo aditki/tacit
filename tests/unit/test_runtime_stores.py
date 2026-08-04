@@ -8,6 +8,7 @@ from tacit.cli import cli
 from tacit.config import Settings
 from tacit.dependencies import build_pipeline_dependencies
 from tacit.history import InvestigationStore
+from tacit.knowledge.models import KnowledgeScope
 from tacit.runtime_stores import RuntimeStores
 from tacit.signals.store import SignalStore
 
@@ -70,7 +71,13 @@ def test_configured_runtime_passes_settings_into_legacy_history_migration(tmp_pa
     legacy_store = InvestigationStore(db_path)
     investigation_id = legacy_store.start("Legacy tenant")
     with legacy_store._conn() as conn:
-        conn.execute("DROP INDEX IF EXISTS idx_inv_tenant_started")
+        for index_name in (
+            "idx_inv_tenant_started",
+            "idx_inv_tenant_status_started",
+            "idx_inv_tenant_user_started",
+            "idx_inv_tenant_dashboard",
+        ):
+            conn.execute(f"DROP INDEX IF EXISTS {index_name}")
         conn.execute("ALTER TABLE investigations DROP COLUMN tenant_id")
 
     runtime_settings = Settings(
@@ -111,6 +118,81 @@ def test_injected_signal_store_also_scopes_operational_knowledge(tmp_path):
     assert service.repository._db_path == injected._db_path
     assert service._signal_store() is injected
     assert dependencies.knowledge_service_factory() is service
+
+
+def test_pipeline_llm_cache_is_shared_only_within_one_runtime_graph():
+    settings_a = Settings(_env_file=None, llm_provider="openai", llm_model="model-a")
+    settings_b = Settings(_env_file=None, llm_provider="openai", llm_model="model-b")
+    stores_a = RuntimeStores(settings_a)
+    first = build_pipeline_dependencies(settings_a, stores=stores_a)
+    second = build_pipeline_dependencies(settings_a, stores=stores_a)
+    other = build_pipeline_dependencies(settings_b, stores=RuntimeStores(settings_b))
+
+    assert first.llm_cache is second.llm_cache
+    assert first.llm_cache is not other.llm_cache
+
+
+def test_custom_history_factory_is_lazy_and_used_for_correction_validation(tmp_path):
+    history_calls: list[tuple[str, int, str | None]] = []
+
+    class ScopedHistory:
+        def get_contract(self, investigation_id, revision, *, tenant_id=None):
+            history_calls.append((investigation_id, revision, tenant_id))
+            return SimpleNamespace(
+                investigation=SimpleNamespace(id=investigation_id, revision=revision),
+                request=SimpleNamespace(scope=SimpleNamespace(tenant_id=tenant_id)),
+                knowledge_usage=[],
+            )
+
+    injected_history = ScopedHistory()
+    runtime_settings = Settings(
+        _env_file=None,
+        history_db_path=str(tmp_path / "unused-runtime-history.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    dependencies = build_pipeline_dependencies(
+        runtime_settings,
+        history_store_factory=lambda: injected_history,
+    )
+    assert dependencies.knowledge_service_factory is not None
+
+    service = dependencies.knowledge_service_factory()
+    assert history_calls == []
+    assert not (tmp_path / "unused-runtime-history.db").exists()
+
+    correction, _candidate = service.create_correction(
+        investigation_id="inv-scoped-history",
+        investigation_revision=3,
+        correction_type="artifact_quality",
+        proposed={
+            "subject_ref": "concept:artifact-quality",
+            "predicate": "useful_for_investigation",
+            "concept_ref": "concept:scoped-history",
+        },
+        scope=KnowledgeScope(),
+        explanation="Validate against the injected history store.",
+        created_by="runtime-test",
+    )
+
+    assert correction.investigation_id == "inv-scoped-history"
+    assert history_calls == [("inv-scoped-history", 3, "default")]
+    assert not (tmp_path / "unused-runtime-history.db").exists()
+
+
+def test_runtime_knowledge_service_does_not_eagerly_initialize_history(tmp_path):
+    history_path = tmp_path / "state" / "history.db"
+    stores = RuntimeStores(
+        Settings(
+            _env_file=None,
+            history_db_path=str(history_path),
+            signals_db_path=str(tmp_path / "state" / "signals.db"),
+        )
+    )
+
+    service = stores.knowledge()
+
+    assert service.repository._db_path == tmp_path / "state" / "signals.db"
+    assert not history_path.exists()
 
 
 def test_cli_history_replay_requires_and_authorizes_wildcard_tenant(monkeypatch):

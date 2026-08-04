@@ -11,6 +11,7 @@ from tacit.artifact_learning import (
     _reconcile_stale_artifact_knowledge,
     artifact_from_text,
     learn_artifact,
+    learn_runbook_dir,
 )
 from tacit.config import Settings
 from tacit.signals import SignalStore
@@ -24,6 +25,24 @@ def _artifact(body: str):
         external_id="checkout-runbook",
         source_vendor="test",
     )
+
+
+def test_artifact_learning_requires_apply_before_persistence(tmp_path):
+    db_path = tmp_path / "signals.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        signals_db_path=str(db_path),
+        knowledge_permissions="knowledge.read,knowledge.review",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        learn_artifact(
+            _artifact("## Checks\n- check Redis misses"),
+            RunbookExtractor(),
+            runtime_settings=runtime_settings,
+        )
+
+    assert not db_path.exists()
 
 
 def test_runbook_extractor_emits_evidence_requirement_for_check():
@@ -1193,22 +1212,25 @@ def test_stale_runbook_reappears_as_restored_and_reindexed(tmp_path, monkeypatch
 
 def test_stale_artifact_knowledge_reconciliation_pages_past_ten_thousand(monkeypatch):
     total = 10_005
-    requested_offsets: list[int] = []
+    requested_cursors: list[int] = []
     reconciled: list[str] = []
 
     class FakeStore:
         _db_path = "/tmp/signals.db"
 
-        def list_learned_artifacts(self, *, tenant_id, artifact_type, stale, limit, offset):
+        def list_unreconciled_stale_artifacts(self, *, tenant_id, artifact_type, limit, after_id):
             assert tenant_id == "tenant-a"
             assert artifact_type == "runbook"
-            assert stale is True
-            requested_offsets.append(offset)
-            remaining = max(0, total - offset)
+            requested_cursors.append(after_id)
+            remaining = max(0, total - after_id)
             return [
-                {"artifact_id": f"artifact-{index}", "stale": True}
-                for index in range(offset, offset + min(limit, remaining))
+                {"id": row_id, "artifact_id": f"artifact-{row_id - 1}"}
+                for row_id in range(after_id + 1, after_id + 1 + min(limit, remaining))
             ]
+
+        def mark_artifact_knowledge_reconciled(self, *, tenant_id, artifact_id):
+            assert tenant_id == "tenant-a"
+            return True
 
     class FakeKnowledgeService:
         def reconcile_source_lifecycle(self, *, provenance_ref, tenant_id, source_stale):
@@ -1229,6 +1251,30 @@ def test_stale_artifact_knowledge_reconciliation_pages_past_ten_thousand(monkeyp
         artifact_type="runbook",
     )
 
-    assert requested_offsets == list(range(0, total, 1_000))
+    assert requested_cursors == list(range(0, total, 1_000))
     assert len(reconciled) == total
     assert reconciled[-1] == "prov_artifact:artifact-10004"
+
+
+def test_runbook_directory_reuses_one_scoped_knowledge_service(tmp_path, monkeypatch):
+    from tacit.dashboard_ingest import service as dashboard_service
+
+    runbooks = tmp_path / "runbooks"
+    runbooks.mkdir()
+    (runbooks / "checkout.md").write_text("## Checks\n- check checkout_latency_seconds")
+    (runbooks / "payments.md").write_text("## Checks\n- check payments_errors_total")
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    service_creations = 0
+    original_factory = dashboard_service._knowledge_service_for_store
+
+    def counted_factory(*args, **kwargs):
+        nonlocal service_creations
+        service_creations += 1
+        return original_factory(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_service, "_knowledge_service_for_store", counted_factory)
+
+    result = learn_runbook_dir(runbooks, store=store)
+
+    assert result["artifacts_learned"] == 2
+    assert service_creations == 1

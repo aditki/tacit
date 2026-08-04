@@ -7,7 +7,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from fastapi import Request
+from fastapi import Depends, Request
 
 import tacit.pipeline as pipeline_mod
 from tacit.config import Settings, settings
@@ -55,6 +55,22 @@ def get_knowledge_repository(request: Request) -> Any:
 def get_knowledge_service(request: Request) -> Any:
     """Return Operational Knowledge orchestration bound to this application."""
     return get_runtime_stores(request).knowledge()
+
+
+def get_correction_knowledge_service(
+    request: Request,
+    history_store: Any = Depends(get_history_store),
+) -> Any:
+    """Bind correction provenance checks to the authorized request history store."""
+    from tacit.knowledge.service import KnowledgeService
+
+    stores = get_runtime_stores(request)
+    return KnowledgeService(
+        stores.knowledge_repository(),
+        signal_store=stores.signals(),
+        history_store=history_store,
+        runtime_settings=stores.settings,
+    )
 
 
 def _backend_factory_for(runtime_settings: Settings) -> Callable[[], Any]:

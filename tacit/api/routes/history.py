@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 import tacit.history as history_mod
@@ -76,14 +76,6 @@ def _authorize_investigation(request: Request, store, investigation_id: str):
     if contract is not None:
         runtime_settings = getattr(request.app.state, "settings", settings)
         _require_contract_tenant(request, contract, runtime_settings, store)
-        for revision in store.list_revisions(investigation_id, tenant_id=selected_tenant):
-            revision_contract = store.get_contract(
-                investigation_id,
-                int(revision["revision"]),
-                tenant_id=selected_tenant,
-            )
-            if revision_contract is not None:
-                _require_contract_tenant(request, revision_contract, runtime_settings, store)
         return contract
     investigation = store.get(investigation_id, tenant_id=selected_tenant)
     if investigation is None:
@@ -99,21 +91,36 @@ def _authorize_investigation(request: Request, store, investigation_id: str):
 )
 async def list_investigations(
     request: Request,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     status: str | None = None,
     user_id: str | None = None,
+    before_started_at: float | None = None,
+    before_id: str | None = None,
     store: Any = Depends(get_history_store),
 ):
     """List recent investigation runs, newest first."""
-    investigations = store.list_recent(
-        limit=limit,
-        offset=offset,
-        status=status,
-        user_id=user_id,
-        tenant_id=knowledge_tenant(request),
-    )
-    return {"count": len(investigations), "investigations": investigations}
+    try:
+        investigations = store.list_recent(
+            limit=limit,
+            offset=offset,
+            status=status,
+            user_id=user_id,
+            tenant_id=knowledge_tenant(request),
+            before_started_at=before_started_at,
+            before_id=before_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    next_cursor = None
+    if investigations:
+        last = investigations[-1]
+        next_cursor = {"before_started_at": last["started_at"], "before_id": last["id"]}
+    return {
+        "count": len(investigations),
+        "investigations": investigations,
+        "next_cursor": next_cursor,
+    }
 
 
 @router.get(
@@ -134,11 +141,20 @@ async def investigation_stats(request: Request, store: Any = Depends(get_history
     response_description="Immutable investigation contract revision metadata",
 )
 async def list_investigation_revisions(
-    investigation_id: str, request: Request, store: Any = Depends(get_history_store)
+    investigation_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    store: Any = Depends(get_history_store),
 ):
     _authorize_investigation(request, store, investigation_id)
     selected_tenant = knowledge_tenant(request)
-    revisions = store.list_revisions(investigation_id, tenant_id=selected_tenant)
+    revisions = store.list_revisions(
+        investigation_id,
+        tenant_id=selected_tenant,
+        limit=limit,
+        offset=offset,
+    )
     if not revisions and store.get(investigation_id, tenant_id=selected_tenant) is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
     return {"count": len(revisions), "revisions": revisions}
@@ -149,10 +165,21 @@ async def list_investigation_revisions(
     tags=["History"],
     summary="List investigation runs and lifecycle status",
 )
-async def list_investigation_runs(investigation_id: str, request: Request, store: Any = Depends(get_history_store)):
+async def list_investigation_runs(
+    investigation_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    store: Any = Depends(get_history_store),
+):
     selected_tenant = knowledge_tenant(request)
     _authorize_investigation(request, store, investigation_id)
-    runs = store.list_runs(investigation_id, tenant_id=selected_tenant)
+    runs = store.list_runs(
+        investigation_id,
+        tenant_id=selected_tenant,
+        limit=limit,
+        offset=offset,
+    )
     if not runs and store.get(investigation_id, tenant_id=selected_tenant) is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
     return {"count": len(runs), "runs": runs}
@@ -167,12 +194,20 @@ async def list_investigation_events(
     investigation_id: str,
     request: Request,
     run_id: str | None = None,
+    limit: int = Query(default=500, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     store: Any = Depends(get_history_store),
 ):
     assert_knowledge_action(request, KnowledgeAction.READ)
     selected_tenant = knowledge_tenant(request)
     _authorize_investigation(request, store, investigation_id)
-    events = store.list_events(investigation_id, run_id, tenant_id=selected_tenant)
+    events = store.list_events(
+        investigation_id,
+        run_id,
+        tenant_id=selected_tenant,
+        limit=limit,
+        offset=offset,
+    )
     if not events and store.get(investigation_id, tenant_id=selected_tenant) is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
     return {"count": len(events), "events": events}
@@ -237,6 +272,8 @@ async def replay_investigation(
 ):
     assert_knowledge_action(http_request, KnowledgeAction.READ)
     replay_request = request or ReplayRequest()
+    if replay_request.mode != ReplayMode.EXACT:
+        assert_knowledge_action(http_request, KnowledgeAction.APPLY)
     selected_tenant = knowledge_tenant(http_request)
     source_contract = store.get_contract(investigation_id, revision, tenant_id=selected_tenant)
     if source_contract is None:
@@ -297,11 +334,22 @@ async def create_correction_candidate(
     tags=["History"],
     summary="List correction candidates",
 )
-async def list_correction_candidates(investigation_id: str, request: Request, store: Any = Depends(get_history_store)):
+async def list_correction_candidates(
+    investigation_id: str,
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    store: Any = Depends(get_history_store),
+):
     assert_knowledge_action(request, KnowledgeAction.READ)
     selected_tenant = knowledge_tenant(request)
     _authorize_investigation(request, store, investigation_id)
-    candidates = store.list_knowledge_candidates(investigation_id, tenant_id=selected_tenant)
+    candidates = store.list_knowledge_candidates(
+        investigation_id,
+        tenant_id=selected_tenant,
+        limit=limit,
+        offset=offset,
+    )
     if not candidates and store.get(investigation_id, tenant_id=selected_tenant) is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
     return {"count": len(candidates), "candidates": [item.model_dump(mode="json") for item in candidates]}

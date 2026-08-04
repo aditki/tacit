@@ -9,9 +9,13 @@ import tacit.archetypes.templates as templates
 import tacit.pipeline as pipeline_mod
 from tacit.agents.providers import registry as provider_registry
 from tacit.agents.providers.base import TokenUsage
+from tacit.config import settings
+from tacit.dependencies import build_pipeline_dependencies
 from tacit.errors import FatalPipelineError
+from tacit.knowledge.enums import KnowledgeUsageDisposition
+from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
 from tacit.main import app
-from tacit.models.schemas import ArchetypeMatch, DashRequest, Intent, MetricEntry, SignalType
+from tacit.models.schemas import ArchetypeMatch, CulpritCandidate, DashRequest, Intent, MetricEntry, SignalType
 from tests.e2e.framework import (
     CapturingBackend,
     IncidentFixtureProvider,
@@ -273,12 +277,12 @@ async def test_governed_compilation_fails_closed_when_usage_audit_is_unavailable
     _teach_taught_latency_mapping()
     backend = _configure_taught_latency_pipeline(monkeypatch)
 
-    def fail_snapshot(_self, _scope):
+    def fail_snapshot(_self, _scope, _usage):
         raise OSError("knowledge audit database unavailable")
 
-    monkeypatch.setattr("tacit.knowledge.service.KnowledgeService.create_snapshot", fail_snapshot)
+    monkeypatch.setattr("tacit.knowledge.service.KnowledgeService.reconcile_pinned_usage", fail_snapshot)
 
-    with pytest.raises(FatalPipelineError, match="Governed mappings changed compilation"):
+    with pytest.raises(FatalPipelineError, match="usage audit could not be persisted"):
         await pipeline_mod.run_pipeline(
             DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="audit-failure")
         )
@@ -286,7 +290,121 @@ async def test_governed_compilation_fails_closed_when_usage_audit_is_unavailable
     assert backend.published_specs == []
     investigation = history_store.list_recent(limit=1)[0]
     assert investigation["status"] == "failed"
-    assert "Governed mappings changed compilation" in investigation["error"]
+    assert "usage audit could not be persisted" in investigation["error"]
+
+
+@pytest.mark.e2e
+async def test_governed_ranking_fails_closed_when_final_snapshot_is_unavailable(
+    isolated_learning_runtime,
+    monkeypatch,
+):
+    signal_store, history_store, feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
+    _install_taught_latency_archetype(archetypes_path)
+    backend = CapturingBackend(
+        catalog=[
+            MetricEntry(
+                name="http_request_duration_seconds_bucket",
+                datasource_uid="prom-e2e",
+                datasource_name="Prometheus E2E",
+                datasource_type="prometheus",
+                query_language="promql",
+                dimensions=['service="checkout-api"', "le={0.1,0.5,1,5}"],
+            )
+        ]
+    )
+    monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
+
+    async def fake_classify_intent(prompt: str):
+        return (
+            Intent(
+                summary=prompt,
+                domain="application",
+                services=["checkout-api"],
+                signals=[SignalType.METRICS],
+                keywords=["checkout", "latency", "p95"],
+                timerange="1h",
+                problem_type="latency_investigation",
+                archetypes=[ArchetypeMatch(type="latency_investigation", confidence=0.97)],
+            ),
+            TokenUsage(),
+        )
+
+    monkeypatch.setattr(pipeline_mod, "classify_intent", fake_classify_intent)
+
+    class RankingKnowledgeService:
+        def create_snapshot(self, scope):
+            return (
+                KnowledgeSnapshot(
+                    id="knowledge_snapshot_before_ranking",
+                    tenant_id=scope.tenant_id,
+                    fingerprint="sha256:before-ranking",
+                ),
+                [
+                    KnowledgeUsage(
+                        tenant_id=scope.tenant_id,
+                        knowledge_ref="knowledge_ranked_dependency",
+                        knowledge_revision=1,
+                        disposition=KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+                    )
+                ],
+            )
+
+        def apply_stage_usage(self, usage, _stage_uses):
+            return usage
+
+        def apply_compilation_usage(self, usage, _revision_refs):
+            return usage
+
+        def apply_evidence_usage(self, usage, _revision_refs, _refs_by_requirement):
+            return usage
+
+        def reconcile_live_observations(self, usage, _observations):
+            return usage
+
+        def apply_to_ranking(self, ranking, usage):
+            candidate = CulpritCandidate(
+                rank=1,
+                suspect="redis-session",
+                suspect_type="datastore",
+                score=0.08,
+                contextual_reasons=["Governed dependency context"],
+            )
+            return (
+                ranking.model_copy(update={"candidates": [candidate, *ranking.candidates]}),
+                [
+                    usage[0].model_copy(
+                        update={
+                            "disposition": KnowledgeUsageDisposition.APPLIED,
+                            "used_for": ["candidate_generation", "ranking"],
+                            "score_delta": 0.08,
+                        }
+                    )
+                ],
+            )
+
+        def snapshot_from_usage(self, _tenant_id, _usage):
+            raise OSError("final knowledge snapshot unavailable")
+
+    knowledge_service = RankingKnowledgeService()
+    deps = build_pipeline_dependencies(
+        settings,
+        backend_factory=lambda: [backend],
+        history_store_factory=lambda: history_store,
+        feedback_store_factory=lambda: feedback_store,
+        signal_store_factory=lambda: signal_store,
+        knowledge_service_factory=lambda: knowledge_service,
+    )
+
+    with pytest.raises(FatalPipelineError, match="usage audit could not be persisted"):
+        await pipeline_mod.run_pipeline(
+            DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="ranking-audit"),
+            deps,
+        )
+
+    assert backend.published_specs == []
+    investigation = history_store.list_recent(limit=1)[0]
+    assert investigation["status"] == "failed"
+    assert "usage audit could not be persisted" in investigation["error"]
 
 
 @pytest.mark.e2e

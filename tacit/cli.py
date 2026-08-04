@@ -1257,6 +1257,7 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool, tenant
     tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
     if auto_approve:
         _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
 
     async def _run():
         from tacit.dashboard_ingest import ingest_dashboard
@@ -1436,6 +1437,10 @@ def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool,
         return
     stores = _cli_runtime_stores()
     tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    if not dry_run:
+        from tacit.knowledge.authorization import KnowledgeAction
+
+        _require_cli_knowledge_action(KnowledgeAction.APPLY, stores.settings)
     signal_store = None if dry_run else stores.signals()
     try:
         if file_path:
@@ -1481,6 +1486,10 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
         return
     stores = _cli_runtime_stores()
     tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    if not dry_run:
+        from tacit.knowledge.authorization import KnowledgeAction
+
+        _require_cli_knowledge_action(KnowledgeAction.APPLY, stores.settings)
     signal_store = None if dry_run else stores.signals()
     try:
         if file_path:
@@ -1542,6 +1551,10 @@ def learn_pagerduty(
     _load_env()
     stores = _cli_runtime_stores()
     tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    if not dry_run:
+        from tacit.knowledge.authorization import KnowledgeAction
+
+        _require_cli_knowledge_action(KnowledgeAction.APPLY, stores.settings)
 
     import asyncio
 
@@ -1594,6 +1607,8 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
     tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
     if auto_approve and not dry_run:
         _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
+    if not dry_run:
+        _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
 
     async def _run():
         if alert_uid:
@@ -1670,6 +1685,7 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int, ten
     tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
     if auto_approve:
         _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
 
     async def _run():
         from tacit.dashboard_ingest import learn_backend_dashboards
@@ -1735,6 +1751,7 @@ def learn_approve(dashboard_uid: str, backend: str, tenant: str | None):
     runtime_settings = _cli_store_settings(stores)
     tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
     _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
     try:
         result = approve_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
@@ -2382,6 +2399,9 @@ def history_contract(investigation_id: str, revision: int | None, tenant: str | 
     _load_env()
 
     stores = _cli_runtime_stores()
+    from tacit.knowledge.authorization import KnowledgeAction
+
+    _require_cli_knowledge_action(KnowledgeAction.READ, stores.settings)
     selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
     contract = stores.history().get_contract(
         investigation_id,
@@ -2405,6 +2425,11 @@ def history_replay(investigation_id: str, revision: int | None, mode: str, tenan
     from tacit.investigation_replay import ReplayMode
 
     stores = _cli_runtime_stores()
+    from tacit.knowledge.authorization import KnowledgeAction
+
+    _require_cli_knowledge_action(KnowledgeAction.READ, stores.settings)
+    if mode != "exact":
+        _require_cli_knowledge_action(KnowledgeAction.APPLY, stores.settings)
     selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
     history_store = stores.history()
     existing_contract = history_store.get_contract(

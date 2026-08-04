@@ -10,7 +10,7 @@ import structlog
 
 from tacit.agents.providers.base import LLMProvider
 from tacit.backends.base import DashboardBackend
-from tacit.cache import llm_cache, make_cache_key
+from tacit.cache import make_cache_key
 from tacit.config import Settings, settings
 from tacit.context.base import ContextProvider
 from tacit.runtime_stores import RuntimeStores
@@ -56,6 +56,7 @@ def build_pipeline_dependencies(
 
     runtime_stores = stores or RuntimeStores(runtime_settings)
     resolved_signal_store_factory = signal_store_factory or runtime_stores.signals
+    resolved_history_store_factory = history_store_factory or runtime_stores.history
     scoped_knowledge_service: Any | None = None
     scoped_knowledge_path: Any | None = None
 
@@ -63,7 +64,7 @@ def build_pipeline_dependencies(
         nonlocal scoped_knowledge_path, scoped_knowledge_service
         if knowledge_service_factory is not None:
             return knowledge_service_factory()
-        if signal_store_factory is None:
+        if signal_store_factory is None and history_store_factory is None:
             return runtime_stores.knowledge()
         signal_store = resolved_signal_store_factory()
         db_path = getattr(signal_store, "_db_path", None)
@@ -76,6 +77,7 @@ def build_pipeline_dependencies(
             scoped_knowledge_service = KnowledgeService(
                 KnowledgeRepository(db_path),
                 signal_store=signal_store,
+                history_store_factory=resolved_history_store_factory,
                 runtime_settings=runtime_settings,
             )
             scoped_knowledge_path = db_path
@@ -127,9 +129,9 @@ def build_pipeline_dependencies(
     return PipelineDependencies(
         settings=runtime_settings,
         backend_factory=backend_factory or runtime_backends,
-        history_store_factory=history_store_factory or runtime_stores.history,
+        history_store_factory=resolved_history_store_factory,
         feedback_store_factory=feedback_store_factory or runtime_stores.feedback,
-        llm_cache=llm_cache,
+        llm_cache=runtime_stores.llm_cache(),
         cache_key_factory=make_cache_key,
         signal_store_factory=resolved_signal_store_factory,
         knowledge_service_factory=runtime_knowledge_service,
@@ -163,6 +165,7 @@ def resolve_knowledge_service(
         return KnowledgeService(
             KnowledgeRepository(db_path),
             signal_store=active_signal_store,
+            history_store_factory=deps.history_store_factory,
             runtime_settings=deps.settings,
         )
     logger.error(

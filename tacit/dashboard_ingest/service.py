@@ -25,6 +25,7 @@ curated registry or normal retrieval.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import threading
 from pathlib import Path
@@ -39,6 +40,7 @@ from tacit.dashboard_ingest.features import (
     features_to_dict as _features_to_dict,
 )
 from tacit.dashboard_ingest.reports import build_learning_impact_report, build_signal_quality_report
+from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 from tacit.signals import get_signal_store as _default_get_signal_store
 
 logger = structlog.get_logger()
@@ -53,6 +55,20 @@ def get_signal_store():
     if package_getter is get_signal_store:
         return _default_get_signal_store()
     return package_getter()
+
+
+def _active_runtime_settings(runtime_settings: Settings | None, store: Any | None) -> Settings:
+    """Resolve policy and tenancy from the same runtime that owns persistence."""
+    return runtime_settings or getattr(store, "_settings", None) or settings
+
+
+def _build_active_backends(factory: Any, runtime_settings: Settings) -> list[Any]:
+    """Pass scoped settings while preserving established zero-argument patch points."""
+    try:
+        accepts_settings = bool(inspect.signature(factory).parameters)
+    except (TypeError, ValueError):
+        accepts_settings = True
+    return factory(runtime_settings) if accepts_settings else factory()
 
 
 # ── Signal inference ─────────────────────────────────────────────────────────
@@ -195,12 +211,14 @@ def persist_inferred_signal_review(
     runtime_settings: Settings | None = None,
     governed_candidate_ids: set[str] | None = None,
     governed_pairs: set[tuple[str, str]] | None = None,
+    knowledge_service: Any | None = None,
 ) -> bool:
     """Persist one inferred signal using the same gate for all approval paths."""
     from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 
-    active_settings = runtime_settings or settings
+    active_settings = _active_runtime_settings(runtime_settings, store)
     enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
+    enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
     signal_type = sig["signal_type"]
     metric = sig.get("metric", "")
     confidence = sig.get("confidence", 0.6)
@@ -210,6 +228,10 @@ def persist_inferred_signal_review(
     should_teach = _governable_signal(sig)
 
     if should_teach:
+        knowledge_service = knowledge_service or _knowledge_service_for_store(
+            store,
+            runtime_settings=active_settings,
+        )
         if governed_pairs is not None:
             governed_pairs.add((metric, signal_type))
         family = sig.get("signal_family", "")
@@ -233,6 +255,7 @@ def persist_inferred_signal_review(
             source_fingerprint=source_fingerprint,
             tenant_id=effective_tenant,
             runtime_settings=runtime_settings,
+            knowledge_service=knowledge_service,
         )
         if governed_candidate_ids is not None:
             governed_candidate_ids.add(governed_candidate_id)
@@ -240,15 +263,9 @@ def persist_inferred_signal_review(
             store=store,
             candidate_id=governed_candidate_id,
             tenant_id=effective_tenant,
+            repository=knowledge_service.repository,
         )
         if governed_knowledge_ref:
-            store.set_mapping_review_state(
-                signal_type,
-                metric,
-                "approved" if is_heuristic else "trusted",
-                tenant_id=effective_tenant,
-                governance_ref=governed_knowledge_ref,
-            )
             return True
         return False
 
@@ -289,16 +306,14 @@ def _existing_governed_candidate_ids(
     source_ref: str,
     active_pairs: set[tuple[str, str]],
     source_fingerprint: str = "",
+    repository: Any | None = None,
 ) -> set[str]:
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.repository import KnowledgeRepository
 
-    repository = KnowledgeRepository(store._db_path)
+    repository = repository or KnowledgeRepository(store._db_path)
     active: set[str] = set()
-    for candidate in repository.list_candidates(tenant_id, limit=None):
-        evidence_refs = {ref for evidence in candidate.evidence.items for ref in evidence.provenance_refs}
-        if source_ref not in set(candidate.provenance_refs).union(evidence_refs):
-            continue
+    for candidate in repository.list_candidates_for_provenance(tenant_id, source_ref):
         if candidate.kind != KnowledgeKind.SIGNAL_MAPPING:
             continue
         source_evidence = [item for item in candidate.evidence.items if source_ref in item.provenance_refs]
@@ -331,11 +346,15 @@ def _govern_signal_mapping(
     source_fingerprint: str = "",
     tenant_id: str | None,
     runtime_settings: Settings | None = None,
+    knowledge_service: Any | None = None,
 ) -> str:
-    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     from tacit.knowledge.migration import migrate_signal_mapping
-    from tacit.knowledge.repository import KnowledgeRepository
-    from tacit.knowledge.service import KnowledgeService
+    knowledge_service = knowledge_service or _knowledge_service_for_store(
+        store,
+        runtime_settings=active_settings,
+    )
 
     record_ref = f"{source_ref}:{sig['signal_type']}:{sig.get('metric', '')}"
     return migrate_signal_mapping(
@@ -351,12 +370,23 @@ def _govern_signal_mapping(
             "source_fingerprint": source_fingerprint,
             "review_state": "approved" if sig.get("source") == "heuristic" else "trusted",
         },
-        service=KnowledgeService(
-            KnowledgeRepository(store._db_path),
-            signal_store=store,
-            runtime_settings=runtime_settings,
-        ),
+        service=knowledge_service,
         tenant_id=effective_tenant,
+    )
+
+
+def _knowledge_service_for_store(
+    store: Any,
+    *,
+    runtime_settings: Settings,
+) -> Any:
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    return KnowledgeService(
+        KnowledgeRepository(store._db_path),
+        signal_store=store,
+        runtime_settings=runtime_settings,
     )
 
 
@@ -385,11 +415,12 @@ def _active_governed_signal_mapping_ref(
     store: Any,
     candidate_id: str,
     tenant_id: str,
+    repository: Any | None = None,
 ) -> str:
     from tacit.knowledge.enums import KnowledgeEligibility, LifecycleStatus
     from tacit.knowledge.repository import KnowledgeRepository
 
-    repository = KnowledgeRepository(store._db_path)
+    repository = repository or KnowledgeRepository(store._db_path)
     candidate = repository.get_candidate(candidate_id, tenant_id)
     if candidate is None:
         return ""
@@ -412,18 +443,25 @@ def reconcile_signal_source(
     source_ref: str,
     active_pairs: set[tuple[str, str]],
     active_candidate_ids: set[str],
+    runtime_settings: Settings | None = None,
+    knowledge_service: Any | None = None,
 ) -> None:
     """Reconcile refreshed legacy mappings and governed knowledge together."""
     from tacit.knowledge.repository import KnowledgeRepository
     from tacit.knowledge.service import KnowledgeService
 
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
     store.reconcile_mapping_source(
         tenant_id=tenant_id,
         source_type=source_type,
         source_ref=source_ref,
         active_pairs=active_pairs,
     )
-    KnowledgeService(KnowledgeRepository(store._db_path), signal_store=store).reconcile_source_lifecycle(
+    knowledge_service = knowledge_service or KnowledgeService(
+        KnowledgeRepository(store._db_path), signal_store=store, runtime_settings=active_settings
+    )
+    knowledge_service.reconcile_source_lifecycle(
         provenance_ref=source_ref,
         tenant_id=tenant_id,
         active_candidate_ids=active_candidate_ids,
@@ -526,11 +564,12 @@ def approve_ingested_dashboard_record(
     store: Any | None = None,
     runtime_settings: Settings | None = None,
     tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
 ) -> dict[str, Any]:
     """Approve a pending ingested dashboard and activate learned artifacts."""
     from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 
-    active_settings = runtime_settings or settings
+    active_settings = _active_runtime_settings(runtime_settings, store)
     enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
     store = store or get_signal_store()
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
@@ -557,6 +596,10 @@ def approve_ingested_dashboard_record(
     activated_pairs: set[tuple[str, str]] = set()
     governed_pairs: set[tuple[str, str]] = set()
     governed_candidate_ids: set[str] = set()
+    knowledge_service = knowledge_service or _knowledge_service_for_store(
+        store,
+        runtime_settings=active_settings,
+    )
     source_ref = f"{ingested['backend_name']}:{dashboard_uid}" if ingested.get("backend_name") else dashboard_uid
     source_fingerprint = _dashboard_content_fingerprint(ingested)
     for sig in ingested.get("signals_inferred", []):
@@ -572,6 +615,7 @@ def approve_ingested_dashboard_record(
                 source_fingerprint=source_fingerprint,
                 governed_candidate_ids=governed_candidate_ids,
                 governed_pairs=governed_pairs,
+                knowledge_service=knowledge_service,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
@@ -601,6 +645,7 @@ def approve_ingested_dashboard_record(
                             source_fingerprint=source_fingerprint,
                             governed_candidate_ids=governed_candidate_ids,
                             governed_pairs=governed_pairs,
+                            knowledge_service=knowledge_service,
                         ):
                             mappings_created += 1
                             activated_pairs.add((metric, sig))
@@ -613,6 +658,8 @@ def approve_ingested_dashboard_record(
         source_ref=source_ref,
         active_pairs=governed_pairs,
         active_candidate_ids=governed_candidate_ids,
+        runtime_settings=active_settings,
+        knowledge_service=knowledge_service,
     )
 
     store.approve_ingested_dashboard(
@@ -650,7 +697,7 @@ def reject_ingested_dashboard_record(
     """Reject a pending ingested dashboard and persist heuristic negatives."""
     from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 
-    active_settings = runtime_settings or settings
+    active_settings = _active_runtime_settings(runtime_settings, store)
     enforce_knowledge_action(active_settings, KnowledgeAction.REJECT)
     store = store or get_signal_store()
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
@@ -714,13 +761,13 @@ async def ingest_dashboard_features(
     runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted dashboard features."""
-    active_settings = runtime_settings or settings
+    active_settings = _active_runtime_settings(runtime_settings, store)
     if auto_approve:
-        from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
-
         enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
+    enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     extracted = _features_to_dict(features)
 
@@ -758,6 +805,10 @@ async def ingest_dashboard_features(
         )
 
     store = store or get_signal_store()
+    knowledge_service = knowledge_service or _knowledge_service_for_store(
+        store,
+        runtime_settings=active_settings,
+    )
     status = "approved" if auto_approve else "pending"
 
     store.record_ingested_dashboard(
@@ -805,6 +856,7 @@ async def ingest_dashboard_features(
                 source_fingerprint=source_fingerprint,
                 governed_candidate_ids=governed_candidate_ids,
                 governed_pairs=governed_pairs,
+                knowledge_service=knowledge_service,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
@@ -828,6 +880,7 @@ async def ingest_dashboard_features(
             source_ref=source_ref,
             active_pairs=governed_pairs,
             source_fingerprint=source_fingerprint,
+            repository=knowledge_service.repository,
         )
         logger.info(
             "dashboard_ingested_pending",
@@ -844,6 +897,8 @@ async def ingest_dashboard_features(
         source_ref=source_ref,
         active_pairs=governed_pairs,
         active_candidate_ids=governed_candidate_ids,
+        runtime_settings=active_settings,
+        knowledge_service=knowledge_service,
     )
 
     indexed_context_rows = store.index_dashboard_context(
@@ -897,6 +952,7 @@ async def ingest_dashboard(
     runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
 ) -> dict[str, Any]:
     """Full ingestion pipeline: fetch → extract → infer signals → store.
 
@@ -929,10 +985,15 @@ async def ingest_dashboard(
     from tacit.backends import get_active_backends
     from tacit.backends.base import DashboardFeatures
 
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    if auto_approve:
+        enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
+    enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     all_backends: list[Any] = []
     own_backends = False
     if backend is None:
-        all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
+        all_backends = _build_active_backends(get_active_backends, active_settings)
         own_backends = True
         if not all_backends:
             raise RuntimeError("No active backends configured for dashboard ingestion")
@@ -957,9 +1018,10 @@ async def ingest_dashboard(
             features,
             auto_approve=auto_approve,
             register_archetype=register_archetype,
-            runtime_settings=runtime_settings,
+            runtime_settings=active_settings,
             store=store,
-            tenant_id=tenant_id,
+            tenant_id=effective_tenant,
+            knowledge_service=knowledge_service,
         )
 
     finally:
@@ -982,9 +1044,14 @@ async def learn_backend_dashboards(
 
     from tacit.backends import get_active_backends
 
-    active_settings = runtime_settings or settings
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    if auto_approve:
+        enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
+    enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
-    all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
+    store = store or get_signal_store()
+    knowledge_service = _knowledge_service_for_store(store, runtime_settings=active_settings)
+    all_backends = _build_active_backends(get_active_backends, active_settings)
     if not all_backends:
         raise RuntimeError("No active backends configured for dashboard learning")
 
@@ -1024,6 +1091,7 @@ async def learn_backend_dashboards(
                         runtime_settings=active_settings,
                         store=store,
                         tenant_id=effective_tenant,
+                        knowledge_service=knowledge_service,
                     )
                 return (
                     {
@@ -1059,32 +1127,30 @@ async def learn_backend_dashboards(
 
         stale_reconciliation_complete = bool(getattr(backend, "last_dashboard_list_complete", False))
         if stale_reconciliation_complete:
-            store = store or get_signal_store()
             seen_dashboard_uids = {str(item.get("uid", "")) for item in dashboards if item.get("uid")}
             totals["stale_marked"] = store.mark_missing_dashboards_stale(
                 tenant_id=effective_tenant,
                 backend_name=backend_name,
                 seen_dashboard_uids=seen_dashboard_uids,
             )
-            if totals["stale_marked"]:
-                from tacit.knowledge.repository import KnowledgeRepository
-                from tacit.knowledge.service import KnowledgeService
-
-                knowledge_service = KnowledgeService(KnowledgeRepository(store._db_path), signal_store=store)
-                offset = 0
-                page_size = 500
-                reconciled_count = 0
-                page_count = 0
-                while True:
-                    stale_dashboards = store.list_ingested_dashboards(
-                        status="stale",
-                        limit=page_size,
-                        tenant_id=effective_tenant,
-                        backend_name=backend_name,
-                        offset=offset,
-                    )
-                    page_count += 1
-                    for dashboard in stale_dashboards:
+            after_id = 0
+            page_size = 500
+            reconciled_count = 0
+            reconciliation_failures = 0
+            page_count = 0
+            while True:
+                stale_dashboards = store.list_unreconciled_stale_dashboards(
+                    limit=page_size,
+                    tenant_id=effective_tenant,
+                    backend_name=backend_name,
+                    after_id=after_id,
+                )
+                if not stale_dashboards:
+                    break
+                page_count += 1
+                for dashboard in stale_dashboards:
+                    after_id = max(after_id, int(dashboard["id"]))
+                    try:
                         knowledge_service.reconcile_source_lifecycle(
                             provenance_ref=(
                                 f"{backend_name}:{dashboard['dashboard_uid']}"
@@ -1094,18 +1160,33 @@ async def learn_backend_dashboards(
                             tenant_id=effective_tenant,
                             source_stale=True,
                         )
+                        store.mark_dashboard_knowledge_reconciled(
+                            tenant_id=effective_tenant,
+                            backend_name=backend_name,
+                            dashboard_uid=str(dashboard["dashboard_uid"]),
+                        )
                         reconciled_count += 1
-                    if len(stale_dashboards) < page_size:
-                        break
-                    offset += len(stale_dashboards)
-                logger.info(
-                    "stale_dashboard_knowledge_reconciled",
-                    tenant_id=effective_tenant,
-                    backend_name=backend_name,
-                    stale_marked=totals["stale_marked"],
-                    records_reconciled=reconciled_count,
-                    pages_scanned=page_count,
-                )
+                    except Exception:
+                        reconciliation_failures += 1
+                        logger.warning(
+                            "stale_dashboard_knowledge_reconcile_failed",
+                            tenant_id=effective_tenant,
+                            backend_name=backend_name,
+                            dashboard_uid=dashboard["dashboard_uid"],
+                            exc_info=True,
+                        )
+                if len(stale_dashboards) < page_size:
+                    break
+            totals["stale_reconciliation_failures"] = reconciliation_failures
+            logger.info(
+                "stale_dashboard_knowledge_reconciled",
+                tenant_id=effective_tenant,
+                backend_name=backend_name,
+                stale_marked=totals["stale_marked"],
+                records_reconciled=reconciled_count,
+                reconciliation_failures=reconciliation_failures,
+                pages_scanned=page_count,
+            )
         else:
             totals["stale_reconciliation_skipped"] = True
 

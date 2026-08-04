@@ -194,6 +194,11 @@ class Settings(BaseSettings):
         "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.correct,knowledge.apply,knowledge.export,"
         "knowledge.override"
     )
+    knowledge_snapshot_candidate_limit: int = Field(default=1_000, ge=1, le=100_000)
+    knowledge_snapshot_scan_limit: int = Field(default=10_000, ge=100, le=1_000_000)
+    knowledge_conflict_comparison_limit: int = Field(default=1_000, ge=10, le=10_000)
+    signal_resolution_mapping_limit: int = Field(default=500, ge=10, le=5_000)
+    signal_resolution_catalog_limit: int = Field(default=5_000, ge=100, le=100_000)
 
     # App
     log_level: str = "INFO"

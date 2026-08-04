@@ -18,7 +18,7 @@ from urllib.parse import quote
 
 import structlog
 
-from tacit.cache import make_cache_key, metric_cache
+from tacit.cache import cache_owner_namespace, make_cache_key, metric_cache
 from tacit.grafana.adapters.base import DatasourceAdapter
 from tacit.grafana.client import GrafanaClient
 from tacit.models.schemas import DatasourceInfo, MetricEntry
@@ -152,7 +152,12 @@ class SignalFxAdapter(DatasourceAdapter):
         keywords: list[str],
     ) -> dict[str, list[str]]:
         """Return {metric_name: [dim_strings]} from cache or live fetch."""
-        cache_key = make_cache_key("sfx_catalog", datasource.uid, ",".join(sorted(keywords)))
+        cache_key = make_cache_key(
+            "sfx_catalog",
+            cache_owner_namespace(client),
+            datasource.uid,
+            ",".join(sorted(keywords)),
+        )
         cached = metric_cache.get(cache_key)
         if cached is not None:
             logger.info("signalfx_catalog_cache_hit", datasource=datasource.name, metrics=len(cached))

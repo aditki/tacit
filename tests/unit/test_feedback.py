@@ -1,9 +1,11 @@
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+import tacit.ranking as ranking
 from tacit.api.app import create_app
 from tacit.config import Settings
 from tacit.feedback import FeedbackStore
@@ -76,6 +78,60 @@ def test_preranking_uses_feedback_and_cache_from_the_supplied_store(tmp_path, mo
     assert [metric.name for metric in cached_first] == ["alpha_latency"]
     assert first_store.analyze_calls == 1
     assert second_store.analyze_calls == 1
+
+
+def test_metric_quality_invalidation_suppresses_an_inflight_stale_cache_write(tmp_path):
+    invalidate_metric_quality_cache()
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingStore(_MetricQualityStore):
+        def analyze(self, *, tenant_id: str = "default"):
+            self.analyze_calls += 1
+            captured = dict(self.scores)
+            if self.analyze_calls == 1:
+                started.set()
+                assert release.wait(timeout=5)
+            return {
+                "metric_quality": [
+                    {"metric": metric, "quality_score": score} for metric, score in captured.items()
+                ]
+            }
+
+    store = BlockingStore(tmp_path / "blocking.db", {"checkout_latency": 0.1})
+    first_result: list[dict[str, float]] = []
+    thread = threading.Thread(
+        target=lambda: first_result.append(
+            ranking._load_metric_quality(feedback_store=store, tenant_id="tenant-a")
+        )
+    )
+    thread.start()
+    assert started.wait(timeout=5)
+    store.scores = {"checkout_latency": 0.9}
+    invalidate_metric_quality_cache(store, tenant_id="tenant-a")
+    release.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert first_result == [{"checkout_latency": 0.1}]
+    assert ranking._load_metric_quality(feedback_store=store, tenant_id="tenant-a") == {
+        "checkout_latency": 0.9
+    }
+    assert store.analyze_calls == 2
+
+
+def test_metric_quality_cache_has_a_fixed_runtime_bound(tmp_path):
+    invalidate_metric_quality_cache()
+    stores = [
+        _MetricQualityStore(tmp_path / f"feedback-{index}.db", {f"metric-{index}": 0.5})
+        for index in range(ranking._QUALITY_CACHE_MAX_ENTRIES + 5)
+    ]
+
+    for store in stores:
+        ranking._load_metric_quality(feedback_store=store, tenant_id="tenant-a")
+
+    assert len(ranking._metric_quality_caches) == ranking._QUALITY_CACHE_MAX_ENTRIES
+    invalidate_metric_quality_cache()
 
 
 def test_preranking_does_not_open_feedback_store_for_small_catalogs():
@@ -320,6 +376,123 @@ def test_complete_schema_default_feedback_requires_and_records_a_migration_owner
     )
     assert wildcard.get_provenance("legacy-dashboard", tenant_id="tenant-a") is not None
     assert wildcard.get_provenance("legacy-dashboard", tenant_id="default") is None
+
+
+def test_feedback_owner_migration_resumes_bounded_batches_for_the_same_owner(tmp_path, monkeypatch):
+    db_path = tmp_path / "resumable-feedback-owner.db"
+    original = FeedbackStore(db_path, runtime_settings=Settings(_env_file=None))
+    for index in range(5):
+        dashboard_uid = f"dashboard-{index}"
+        original.record_provenance(dashboard_uid, f"Prompt {index}")
+        original.submit_feedback(dashboard_uid, reviewer="reviewer", overall_useful=True)
+    with original._conn() as conn:
+        conn.execute(
+            "DELETE FROM feedback_tenant_migration_metadata WHERE key=?",
+            ("default_owner_v1",),
+        )
+
+    original_reconcile = FeedbackStore._reconcile_default_tenant_owner_batched
+
+    def migrate_one_batch_then_stop(store: FeedbackStore) -> None:
+        with store._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            complete, _operation, row_count = store._reconcile_default_tenant_owner_batch(
+                conn,
+                batch_size=2,
+            )
+        assert complete is False
+        assert row_count == 2
+        raise RuntimeError("simulated process interruption")
+
+    monkeypatch.setattr(FeedbackStore, "_reconcile_default_tenant_owner_batched", migrate_one_batch_then_stop)
+    with pytest.raises(RuntimeError, match="simulated process interruption"):
+        FeedbackStore(
+            db_path,
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        progress = conn.execute(
+            "SELECT value FROM feedback_tenant_migration_metadata WHERE key='default_owner_in_progress_v1'"
+        ).fetchone()
+        cursor = conn.execute(
+            """SELECT value FROM feedback_tenant_migration_metadata
+               WHERE key='default_owner_cursor_v1:dashboard_provenance'"""
+        ).fetchone()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM dashboard_provenance WHERE tenant_id='tenant-a'"
+        ).fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM feedback WHERE tenant_id='tenant-a'").fetchone()[0] == 0
+    assert progress == ("tenant-a",)
+    assert cursor is not None
+    assert int(cursor[0]) > 0
+
+    monkeypatch.setattr(FeedbackStore, "_reconcile_default_tenant_owner_batched", original_reconcile)
+    with pytest.raises(RuntimeError, match="already in progress for another tenant"):
+        FeedbackStore(
+            db_path,
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-b"),
+        )
+
+    resumed = FeedbackStore(
+        db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+    with resumed._conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM dashboard_provenance WHERE tenant_id='tenant-a'"
+        ).fetchone()[0] == 5
+        assert conn.execute("SELECT COUNT(*) FROM feedback WHERE tenant_id='tenant-a'").fetchone()[0] == 5
+        assert conn.execute(
+            "SELECT 1 FROM feedback_tenant_migration_metadata WHERE key='default_owner_in_progress_v1'"
+        ).fetchone() is None
+        assert conn.execute(
+            """SELECT 1 FROM feedback_tenant_migration_metadata
+               WHERE key LIKE 'default_owner_cursor_v1:%'"""
+        ).fetchone() is None
+
+
+def test_feedback_store_rejects_a_configured_owner_change(tmp_path):
+    db_path = tmp_path / "feedback-owner-change.db"
+    FeedbackStore(
+        db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+
+    with pytest.raises(RuntimeError, match="tenant owner does not match"):
+        FeedbackStore(
+            db_path,
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-b"),
+        )
+
+
+def test_feedback_owner_migration_pages_use_tenant_id_indexes(tmp_path):
+    store = FeedbackStore(tmp_path / "feedback-owner-query-plan.db")
+
+    with store._conn() as conn:
+        provenance_plan = " ".join(
+            str(row["detail"])
+            for row in conn.execute(
+                """EXPLAIN QUERY PLAN
+                   SELECT id FROM dashboard_provenance
+                   WHERE tenant_id='default' AND id>? ORDER BY id LIMIT ?""",
+                (0, 500),
+            )
+        )
+        feedback_plan = " ".join(
+            str(row["detail"])
+            for row in conn.execute(
+                """EXPLAIN QUERY PLAN
+                   SELECT id FROM feedback
+                   WHERE tenant_id='default' AND id>? ORDER BY id LIMIT ?""",
+                (0, 500),
+            )
+        )
+
+    assert "idx_provenance_tenant_id" in provenance_plan
+    assert "idx_feedback_tenant_id" in feedback_plan
+    assert "TEMP B-TREE" not in provenance_plan
+    assert "TEMP B-TREE" not in feedback_plan
 
 
 def test_feedback_api_requires_and_applies_the_selected_wildcard_tenant(tmp_path):

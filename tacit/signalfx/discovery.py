@@ -7,7 +7,7 @@ from typing import Any
 
 import structlog
 
-from tacit.cache import make_cache_key, metric_cache
+from tacit.cache import cache_owner_namespace, make_cache_key, metric_cache
 from tacit.config import settings
 from tacit.grafana.adapters.signalfx import KEYWORD_METRIC_MAP
 from tacit.models.schemas import MetricEntry
@@ -81,7 +81,7 @@ async def discover_metrics(
     the Tacit pipeline.
     """
     norm_kw = _normalize_keywords(keywords)
-    cache_key = make_cache_key("sfx_direct", ",".join(norm_kw))
+    cache_key = make_cache_key("sfx_direct", cache_owner_namespace(client), ",".join(norm_kw))
     cached = metric_cache.get(cache_key)
     if cached is not None:
         logger.info("signalfx_direct_cache_hit", metrics=len(cached))

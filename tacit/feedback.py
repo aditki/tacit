@@ -37,6 +37,9 @@ logger = structlog.get_logger()
 _DEFAULT_DB_PATH = DEFAULT_FEEDBACK_DB_PATH
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _DEFAULT_OWNER_MARKER = "default_owner_v1"
+_DEFAULT_OWNER_PROGRESS_MARKER = "default_owner_in_progress_v1"
+_DEFAULT_OWNER_CURSOR_PREFIX = "default_owner_cursor_v1:"
+_OWNER_MIGRATION_BATCH_SIZE = 500
 
 
 def _db_path(runtime_settings: Settings | None = None) -> Path:
@@ -86,6 +89,10 @@ CREATE INDEX IF NOT EXISTS idx_provenance_tenant_uid
     ON dashboard_provenance(tenant_id, dashboard_uid);
 CREATE INDEX IF NOT EXISTS idx_feedback_tenant_uid
     ON feedback(tenant_id, dashboard_uid);
+CREATE INDEX IF NOT EXISTS idx_provenance_tenant_id
+    ON dashboard_provenance(tenant_id, id);
+CREATE INDEX IF NOT EXISTS idx_feedback_tenant_id
+    ON feedback(tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS feedback_tenant_migration_metadata (
     key TEXT PRIMARY KEY,
@@ -125,7 +132,7 @@ class FeedbackStore:
                 self._require_legacy_tenant_owner(conn)
                 self._migrate_tenant_scope(conn)
             conn.executescript(_SCHEMA_SQL)
-            self._reconcile_default_tenant_owner(conn)
+        self._reconcile_default_tenant_owner_batched()
         logger.info("feedback_store_init", db_path=str(self._db_path))
 
     @staticmethod
@@ -199,25 +206,159 @@ class FeedbackStore:
                 + ", ".join(ambiguous_tables)
             )
 
-    def _reconcile_default_tenant_owner(self, conn: sqlite3.Connection) -> None:
+    def _reconcile_default_tenant_owner_batch(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        batch_size: int,
+    ) -> tuple[bool, str, int]:
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
         marker = conn.execute(
             "SELECT value FROM feedback_tenant_migration_metadata WHERE key=?",
             (_DEFAULT_OWNER_MARKER,),
         ).fetchone()
         if marker is not None:
-            return
+            configured_tenant = str(self._settings.knowledge_tenant_id or "default")
+            recorded_owner = str(marker["value"])
+            if configured_tenant != "*" and recorded_owner != configured_tenant:
+                raise RuntimeError(
+                    "Feedback database tenant owner does not match the configured pinned tenant: "
+                    f"recorded={recorded_owner}, configured={configured_tenant}"
+                )
+            return True, "already_complete", 0
+
         configured_tenant = str(self._settings.knowledge_tenant_id or "default")
-        if configured_tenant not in {"*", "default"}:
-            conn.execute("UPDATE feedback SET tenant_id=? WHERE tenant_id='default'", (configured_tenant,))
-            conn.execute(
-                "UPDATE dashboard_provenance SET tenant_id=? WHERE tenant_id='default'",
-                (configured_tenant,),
+        progress = conn.execute(
+            "SELECT value FROM feedback_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_PROGRESS_MARKER,),
+        ).fetchone()
+        if progress is not None and str(progress["value"]) != configured_tenant:
+            raise RuntimeError(
+                "Feedback database tenant owner migration is already in progress for another tenant: "
+                f"recorded={progress['value']}, configured={configured_tenant}"
             )
+        if configured_tenant in {"*", "default"}:
+            conn.execute(
+                """INSERT INTO feedback_tenant_migration_metadata (key, value, updated_at)
+                   VALUES (?, ?, ?)""",
+                (_DEFAULT_OWNER_MARKER, configured_tenant, time.time()),
+            )
+            conn.execute(
+                "DELETE FROM feedback_tenant_migration_metadata WHERE key=?",
+                (_DEFAULT_OWNER_PROGRESS_MARKER,),
+            )
+            conn.execute(
+                "DELETE FROM feedback_tenant_migration_metadata WHERE key LIKE ?",
+                (f"{_DEFAULT_OWNER_CURSOR_PREFIX}%",),
+            )
+            return True, "marker", 0
+
+        if progress is None:
+            conn.execute(
+                """INSERT INTO feedback_tenant_migration_metadata (key, value, updated_at)
+                   VALUES (?, ?, ?)""",
+                (_DEFAULT_OWNER_PROGRESS_MARKER, configured_tenant, time.time()),
+            )
+
+        for table_name in ("dashboard_provenance", "feedback"):
+            cursor_key = f"{_DEFAULT_OWNER_CURSOR_PREFIX}{table_name}"
+            cursor_row = conn.execute(
+                "SELECT value FROM feedback_tenant_migration_metadata WHERE key=?",
+                (cursor_key,),
+            ).fetchone()
+            if cursor_row is not None and str(cursor_row["value"]) == "complete":
+                continue
+            after_id = int(cursor_row["value"]) if cursor_row is not None else 0
+            ids = conn.execute(
+                f"""SELECT id FROM {table_name}
+                    WHERE id>? AND tenant_id='default'
+                    ORDER BY id LIMIT ?""",
+                (after_id, batch_size),
+            ).fetchall()
+            if not ids:
+                conn.execute(
+                    """INSERT INTO feedback_tenant_migration_metadata (key, value, updated_at)
+                       VALUES (?, 'complete', ?)
+                       ON CONFLICT(key) DO UPDATE SET value='complete', updated_at=excluded.updated_at""",
+                    (cursor_key, time.time()),
+                )
+                continue
+            last_id = int(ids[-1]["id"])
+            cursor = conn.execute(
+                f"""UPDATE {table_name} SET tenant_id=?
+                    WHERE id>? AND id<=? AND tenant_id='default'""",
+                (configured_tenant, after_id, last_id),
+            )
+            conn.execute(
+                """INSERT INTO feedback_tenant_migration_metadata (key, value, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                (cursor_key, str(last_id), time.time()),
+            )
+            if cursor.rowcount:
+                return False, f"{table_name}:retarget", int(cursor.rowcount)
+
+        for table_name in ("dashboard_provenance", "feedback"):
+            remaining = conn.execute(
+                f"SELECT MIN(id) AS first_id FROM {table_name} WHERE tenant_id='default'"
+            ).fetchone()
+            if remaining is not None and remaining["first_id"] is not None:
+                conn.execute(
+                    """INSERT INTO feedback_tenant_migration_metadata (key, value, updated_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                    (
+                        f"{_DEFAULT_OWNER_CURSOR_PREFIX}{table_name}",
+                        str(max(0, int(remaining["first_id"]) - 1)),
+                        time.time(),
+                    ),
+                )
+                return False, f"{table_name}:rescan", 0
+
         conn.execute(
             """INSERT INTO feedback_tenant_migration_metadata (key, value, updated_at)
                VALUES (?, ?, ?)""",
             (_DEFAULT_OWNER_MARKER, configured_tenant, time.time()),
         )
+        conn.execute(
+            "DELETE FROM feedback_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_PROGRESS_MARKER,),
+        )
+        conn.execute(
+            "DELETE FROM feedback_tenant_migration_metadata WHERE key LIKE ?",
+            (f"{_DEFAULT_OWNER_CURSOR_PREFIX}%",),
+        )
+        return True, "marker", 0
+
+    def _reconcile_default_tenant_owner_batched(self) -> None:
+        migrated_rows = 0
+        batches = 0
+        while True:
+            with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                complete, operation, row_count = self._reconcile_default_tenant_owner_batch(
+                    conn,
+                    batch_size=_OWNER_MIGRATION_BATCH_SIZE,
+                )
+            migrated_rows += row_count
+            if row_count:
+                batches += 1
+                logger.info(
+                    "feedback_tenant_owner_migration_batch",
+                    operation=operation,
+                    rows=row_count,
+                    batch=batches,
+                )
+            if complete:
+                if migrated_rows:
+                    logger.warning(
+                        "feedback_tenant_owner_migration_complete",
+                        rows=migrated_rows,
+                        batches=batches,
+                        tenant_id=self._settings.knowledge_tenant_id,
+                    )
+                return
 
     def _migrate_tenant_scope(self, conn: sqlite3.Connection) -> None:
         """Atomically rebuild legacy feedback tables around tenant-scoped keys."""

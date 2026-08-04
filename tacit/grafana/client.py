@@ -5,6 +5,7 @@ from typing import cast
 import httpx
 import structlog
 
+from tacit.cache import make_cache_key
 from tacit.config import Settings, settings
 
 logger = structlog.get_logger()
@@ -24,6 +25,12 @@ class GrafanaClient:
         self.base_url = (base_url or config.grafana_url).rstrip("/")
         self.api_key = api_key if api_key is not None else config.grafana_api_key
         self.org_id = org_id if org_id is not None else config.grafana_org_id
+        self.cache_namespace = make_cache_key(
+            "grafana",
+            self.base_url,
+            str(self.org_id),
+            self.api_key,
+        )
         headers = {
             "Content-Type": "application/json",
             "X-Grafana-Org-Id": str(self.org_id),

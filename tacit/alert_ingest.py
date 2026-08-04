@@ -17,15 +17,19 @@ from urllib.parse import urlparse
 import structlog
 
 from tacit.backends.base import AlertFeatures
-from tacit.config import Settings, settings
+from tacit.config import Settings
 from tacit.dashboard_ingest import infer_signals_from_metrics, persist_inferred_signal_review
 from tacit.dashboard_ingest.reports import build_learning_impact_report, build_signal_quality_report
 from tacit.dashboard_ingest.service import (
+    _active_runtime_settings,
+    _build_active_backends,
     _existing_governed_candidate_ids,
     _governable_signal_pairs,
+    _knowledge_service_for_store,
     reconcile_signal_source,
     resolve_learning_tenant,
 )
+from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 from tacit.signals import get_signal_store as _default_get_signal_store
 from tacit.signals.learning_index import infer_services_for_learning
 
@@ -173,13 +177,14 @@ async def ingest_alert_features(
     runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted alert features."""
-    active_settings = runtime_settings or settings
+    active_settings = _active_runtime_settings(runtime_settings, store)
     if auto_approve and not dry_run:
-        from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
-
         enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
+    if not dry_run:
+        enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     store = store or get_signal_store()
     status = "approved" if auto_approve else "pending"
@@ -207,6 +212,12 @@ async def ingest_alert_features(
     activated_pairs: set[tuple[str, str]] = set()
     governed_pairs = _governable_signal_pairs(signals)
     governed_candidate_ids: set[str] = set()
+    if not dry_run:
+        knowledge_service = knowledge_service or _knowledge_service_for_store(
+            store,
+            runtime_settings=active_settings,
+        )
+        assert knowledge_service is not None
     if auto_approve and not dry_run:
         for sig in signals:
             if persist_inferred_signal_review(
@@ -221,6 +232,7 @@ async def ingest_alert_features(
                 runtime_settings=active_settings,
                 governed_candidate_ids=governed_candidate_ids,
                 governed_pairs=governed_pairs,
+                knowledge_service=knowledge_service,
             ):
                 mappings_created += 1
                 activated_pairs.add((sig.get("metric", ""), sig.get("signal_type", "")))
@@ -229,6 +241,7 @@ async def ingest_alert_features(
     effective_status = status
     if not dry_run:
         assert effective_tenant is not None
+        assert knowledge_service is not None
         change_state = store.record_ingested_alert(
             alert_uid=features.alert_uid,
             tenant_id=effective_tenant,
@@ -283,6 +296,7 @@ async def ingest_alert_features(
                 source_ref=source_ref,
                 active_pairs=governed_pairs,
                 source_fingerprint=mapping_fingerprint,
+                repository=knowledge_service.repository,
             )
         reconcile_signal_source(
             store=store,
@@ -291,6 +305,8 @@ async def ingest_alert_features(
             source_ref=source_ref,
             active_pairs=governed_pairs,
             active_candidate_ids=governed_candidate_ids,
+            runtime_settings=active_settings,
+            knowledge_service=knowledge_service,
         )
         if auto_approve:
             teachable_count = len(governed_pairs)
@@ -344,17 +360,22 @@ async def ingest_alert(
     runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
 ) -> dict[str, Any]:
     """Full alert ingestion pipeline: fetch -> extract -> infer -> persist."""
     from tacit.backends import get_active_backends
 
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    if auto_approve and not dry_run:
+        enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
+    if not dry_run:
+        enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
+    effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
     all_backends: list[Any] = []
     own_backends = False
     try:
         if backend is None:
-            all_backends = (
-                get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
-            )
+            all_backends = _build_active_backends(get_active_backends, active_settings)
             own_backends = True
             if not all_backends:
                 raise RuntimeError("No active backends configured for alert ingestion")
@@ -373,9 +394,10 @@ async def ingest_alert(
             features,
             auto_approve=auto_approve,
             dry_run=dry_run,
-            runtime_settings=runtime_settings,
+            runtime_settings=active_settings,
             store=store,
-            tenant_id=tenant_id,
+            tenant_id=effective_tenant,
+            knowledge_service=knowledge_service,
         )
     finally:
         if own_backends:
@@ -396,9 +418,17 @@ async def learn_backend_alerts(
     """Crawl a backend and learn from every discoverable alert rule."""
     from tacit.backends import get_active_backends
 
-    active_settings = runtime_settings or settings
+    active_settings = _active_runtime_settings(runtime_settings, store)
+    if auto_approve and not dry_run:
+        enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
+    if not dry_run:
+        enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
-    all_backends = get_active_backends(runtime_settings) if runtime_settings is not None else get_active_backends()
+    knowledge_service = None
+    if not dry_run:
+        store = store or get_signal_store()
+        knowledge_service = _knowledge_service_for_store(store, runtime_settings=active_settings)
+    all_backends = _build_active_backends(get_active_backends, active_settings)
     if not all_backends:
         raise RuntimeError("No active backends configured for alert ingestion")
 
@@ -438,6 +468,7 @@ async def learn_backend_alerts(
                         runtime_settings=active_settings,
                         store=store,
                         tenant_id=effective_tenant,
+                        knowledge_service=knowledge_service,
                     )
                 return (
                     {
@@ -476,32 +507,32 @@ async def learn_backend_alerts(
         stale_reconciliation_complete = bool(getattr(backend, "last_alert_list_complete", False))
         if not dry_run and stale_reconciliation_complete:
             assert effective_tenant is not None
-            store = store or get_signal_store()
+            assert store is not None
             seen_alert_uids = {str(item.get("uid", "")) for item in alerts if item.get("uid")}
             totals["stale_marked"] = store.mark_missing_alerts_stale(
                 tenant_id=effective_tenant,
                 backend_name=backend_name,
                 seen_alert_uids=seen_alert_uids,
             )
-            if totals["stale_marked"]:
-                from tacit.knowledge.repository import KnowledgeRepository
-                from tacit.knowledge.service import KnowledgeService
-
-                knowledge_service = KnowledgeService(KnowledgeRepository(store._db_path), signal_store=store)
-                offset = 0
-                page_size = 500
-                reconciled_count = 0
-                page_count = 0
-                while True:
-                    stale_alerts = store.list_ingested_alerts(
-                        status="stale",
-                        limit=page_size,
-                        tenant_id=effective_tenant,
-                        backend_name=backend_name,
-                        offset=offset,
-                    )
-                    page_count += 1
-                    for alert in stale_alerts:
+            assert knowledge_service is not None
+            after_id = 0
+            page_size = 500
+            reconciled_count = 0
+            reconciliation_failures = 0
+            page_count = 0
+            while True:
+                stale_alerts = store.list_unreconciled_stale_alerts(
+                    limit=page_size,
+                    tenant_id=effective_tenant,
+                    backend_name=backend_name,
+                    after_id=after_id,
+                )
+                if not stale_alerts:
+                    break
+                page_count += 1
+                for alert in stale_alerts:
+                    after_id = max(after_id, int(alert["id"]))
+                    try:
                         knowledge_service.reconcile_source_lifecycle(
                             provenance_ref=(
                                 f"{backend_name}:alert:{alert['alert_uid']}"
@@ -511,18 +542,33 @@ async def learn_backend_alerts(
                             tenant_id=effective_tenant,
                             source_stale=True,
                         )
+                        store.mark_alert_knowledge_reconciled(
+                            tenant_id=effective_tenant,
+                            backend_name=backend_name,
+                            alert_uid=str(alert["alert_uid"]),
+                        )
                         reconciled_count += 1
-                    if len(stale_alerts) < page_size:
-                        break
-                    offset += len(stale_alerts)
-                logger.info(
-                    "stale_alert_knowledge_reconciled",
-                    tenant_id=effective_tenant,
-                    backend_name=backend_name,
-                    stale_marked=totals["stale_marked"],
-                    records_reconciled=reconciled_count,
-                    pages_scanned=page_count,
-                )
+                    except Exception:
+                        reconciliation_failures += 1
+                        logger.warning(
+                            "stale_alert_knowledge_reconcile_failed",
+                            tenant_id=effective_tenant,
+                            backend_name=backend_name,
+                            alert_uid=alert["alert_uid"],
+                            exc_info=True,
+                        )
+                if len(stale_alerts) < page_size:
+                    break
+            totals["stale_reconciliation_failures"] = reconciliation_failures
+            logger.info(
+                "stale_alert_knowledge_reconciled",
+                tenant_id=effective_tenant,
+                backend_name=backend_name,
+                stale_marked=totals["stale_marked"],
+                records_reconciled=reconciled_count,
+                reconciliation_failures=reconciliation_failures,
+                pages_scanned=page_count,
+            )
         elif not dry_run:
             totals["stale_reconciliation_skipped"] = True
 

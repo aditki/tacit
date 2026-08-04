@@ -19,12 +19,13 @@ one signal can map to many metrics across environments.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 import time
 from contextlib import contextmanager, nullcontext
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -48,12 +49,22 @@ from tacit.signals.learning_index import (
     fts_query as _fts_query,
 )
 from tacit.signals.migrations import (
+    CURRENT_SIGNAL_SCHEMA_MARKER,
+    GOVERNED_PROJECTION_AUDIT_MARKER,
+    ensure_governed_projection_audit_triggers,
     ensure_ingested_alert_columns,
     ensure_ingested_dashboard_backend_scope,
     ensure_learning_index,
     ensure_mapping_columns,
     ensure_schema,
+    governed_projection_audit_is_current,
+    mark_governed_projection_audit_current,
+    projection_matches_authority,
     rebuild_ingested_dashboards_table,
+    reconcile_default_tenant_owner_batch,
+    require_confirmed_default_tenant_owner,
+    signal_schema_is_current,
+    signal_tenant_owner_is_current,
 )
 from tacit.signals.resolution import (
     context_matches as _context_matches,
@@ -87,6 +98,15 @@ from tacit.signals.schema import (
 from tacit.tenancy import resolve_tenant_boundary
 
 logger = structlog.get_logger()
+_DEFAULT_OWNER_MIGRATION_BATCH_SIZE = 500
+_PROJECTION_AUDIT_BATCH_SIZE = 500
+_PROJECTION_AUTHORITY_VALIDATION_BATCH_SIZE = 100
+_PROJECTION_AUDIT_MAX_RETRIES = 3
+
+
+class _ProjectionAuditChanged(RuntimeError):
+    pass
+_LEARNING_LIST_MAX_LIMIT = 10_000
 
 __all__ = [
     "LearningIndexUnavailable",
@@ -101,6 +121,7 @@ __all__ = [
 ]
 
 _DEFAULT_DB_PATH = DEFAULT_DB_PATH
+_BOOTSTRAP_FINGERPRINT_KEY = "bootstrap_signal_catalog_fingerprint"
 
 
 class LearningIndexUnavailable(RuntimeError):
@@ -121,8 +142,24 @@ class ResolvedSignal:
         return KnowledgeRevisionRef(self.governance_ref, self.governance_revision)
 
 
+@dataclass(frozen=True)
+class _PinnedGovernedMappings:
+    tenant_id: str
+    mappings: tuple[dict[str, Any], ...]
+
+
 def _escape_like_prefix(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _projection_scope_values(refs: list[str], prefix: str) -> list[str]:
+    return sorted(
+        {
+            value.removeprefix(prefix)
+            for value in refs
+            if value and (value.startswith(prefix) or ":" not in value)
+        }
+    )
 
 
 def _stronger_review_state(existing: str, incoming: str) -> str:
@@ -150,7 +187,35 @@ class SignalStore:
             f"signal_transaction_{id(self)}",
             default=None,
         )
+        self._pinned_governed_mappings: ContextVar[_PinnedGovernedMappings | None] = ContextVar(
+            f"signal_knowledge_pin_{id(self)}",
+            default=None,
+        )
         self._ensure_schema()
+
+    def activate_pinned_governed_mappings(
+        self,
+        *,
+        tenant_id: str,
+        mappings: list[dict[str, Any]],
+    ) -> Token[_PinnedGovernedMappings | None]:
+        """Use one immutable governed mapping set for the current execution context."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        pinned: list[dict[str, Any]] = []
+        for mapping in mappings:
+            mapping_tenant = str(mapping.get("tenant_id") or "")
+            if mapping_tenant != tenant_id:
+                raise ValueError("pinned governed mappings cannot cross tenants")
+            if not mapping.get("governance_ref") or int(mapping.get("governance_revision") or 0) < 1:
+                raise ValueError("pinned governed mappings require an exact knowledge revision")
+            pinned.append(dict(mapping))
+        return self._pinned_governed_mappings.set(
+            _PinnedGovernedMappings(tenant_id=tenant_id, mappings=tuple(pinned))
+        )
+
+    def reset_pinned_governed_mappings(self, token: Token[_PinnedGovernedMappings | None]) -> None:
+        """Restore the previous resolver pin for the current execution context."""
+        self._pinned_governed_mappings.reset(token)
 
     @contextmanager
     def _conn(self):
@@ -196,6 +261,32 @@ class SignalStore:
                 self._transaction_connection.reset(token)
 
     def _ensure_schema(self):
+        with self._conn() as conn:
+            schema_current = signal_schema_is_current(conn)
+            audit_current = governed_projection_audit_is_current(conn)
+            owner_current = signal_tenant_owner_is_current(conn, legacy_tenant=self._legacy_tenant)
+            if schema_current and audit_current and owner_current:
+                require_confirmed_default_tenant_owner(conn, legacy_tenant=self._legacy_tenant)
+                logger.info(
+                    "signal_store_init",
+                    db_path=str(self._db_path),
+                    schema_marker=CURRENT_SIGNAL_SCHEMA_MARKER,
+                    migration_required=False,
+                )
+                return
+            projection_repair_only = schema_current and owner_current
+
+        if projection_repair_only:
+            self._reconcile_governed_projection_audit_batched()
+            logger.info(
+                "signal_store_init",
+                db_path=str(self._db_path),
+                schema_marker=CURRENT_SIGNAL_SCHEMA_MARKER,
+                migration_required=True,
+                projection_repair_batched=True,
+            )
+            return
+
         bootstrap_signal_definitions: dict[str, dict[str, Any]] | None = None
         try:
             import yaml
@@ -208,15 +299,502 @@ class SignalStore:
         except Exception as exc:
             logger.warning("signals_bootstrap_taxonomy_unavailable", error=str(exc))
         with self._conn() as conn:
-            # Tenant ownership checks, schema rebuilds, classification markers,
-            # and projection quarantine are one serialized startup migration.
+            # Structural rebuilds remain atomic. Potentially large owner and
+            # projection reconciliation runs in restartable batches below.
             conn.execute("BEGIN IMMEDIATE")
+            if (
+                signal_schema_is_current(conn)
+                and governed_projection_audit_is_current(conn)
+                and signal_tenant_owner_is_current(conn, legacy_tenant=self._legacy_tenant)
+            ):
+                require_confirmed_default_tenant_owner(conn, legacy_tenant=self._legacy_tenant)
+                logger.info(
+                    "signal_store_init",
+                    db_path=str(self._db_path),
+                    schema_marker=CURRENT_SIGNAL_SCHEMA_MARKER,
+                    migration_required=False,
+                )
+                return
             ensure_schema(
                 conn,
                 legacy_tenant=self._legacy_tenant,
                 bootstrap_signal_definitions=bootstrap_signal_definitions,
             )
-        logger.info("signal_store_init", db_path=str(self._db_path))
+        self._reconcile_default_tenant_owner_batched()
+        self._reconcile_governed_projection_audit_batched()
+        logger.info(
+            "signal_store_init",
+            db_path=str(self._db_path),
+            schema_marker=CURRENT_SIGNAL_SCHEMA_MARKER,
+            migration_required=True,
+            projection_repair_batched=True,
+        )
+
+    def _reconcile_default_tenant_owner_batched(self) -> None:
+        migrated_rows = 0
+        batches = 0
+        while True:
+            with self._conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                complete, operation, row_count = reconcile_default_tenant_owner_batch(
+                    conn,
+                    legacy_tenant=self._legacy_tenant,
+                    batch_size=_DEFAULT_OWNER_MIGRATION_BATCH_SIZE,
+                )
+            migrated_rows += row_count
+            if row_count:
+                batches += 1
+                logger.info(
+                    "signal_tenant_owner_migration_batch",
+                    operation=operation,
+                    rows=row_count,
+                    batch=batches,
+                )
+            if complete:
+                if migrated_rows:
+                    logger.warning(
+                        "signal_tenant_owner_migration_complete",
+                        rows=migrated_rows,
+                        batches=batches,
+                        tenant_id=self._legacy_tenant,
+                    )
+                return
+
+    @staticmethod
+    def _projection_audit_marker_value(connection: sqlite3.Connection) -> str:
+        row = connection.execute(
+            "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+            (GOVERNED_PROJECTION_AUDIT_MARKER,),
+        ).fetchone()
+        return str(row["value"]) if row is not None else ""
+
+    def _repair_projection_authority_batches(self) -> int:
+        repaired = 0
+        after_tenant = ""
+        after_id = ""
+        while True:
+            with self.transaction() as conn:
+                authority_tables = {
+                    str(row[0])
+                    for row in conn.execute(
+                        """SELECT name FROM sqlite_master
+                           WHERE type='table'
+                             AND name IN ('operational_knowledge', 'operational_knowledge_revisions')"""
+                    )
+                }
+                if authority_tables != {"operational_knowledge", "operational_knowledge_revisions"}:
+                    return repaired
+                rows = conn.execute(
+                    """SELECT revision.tenant_id, revision.knowledge_id, revision.revision,
+                              revision.content_json
+                       FROM operational_knowledge current
+                       JOIN operational_knowledge_revisions revision
+                         ON revision.tenant_id=current.tenant_id
+                        AND revision.knowledge_id=current.knowledge_id
+                        AND revision.revision=current.current_revision
+                       WHERE current.kind='signal_mapping'
+                         AND current.status='active'
+                         AND revision.lifecycle_status='active'
+                         AND revision.eligibility!='ineligible'
+                         AND (current.tenant_id>?
+                              OR (current.tenant_id=? AND current.knowledge_id>?))
+                       ORDER BY current.tenant_id, current.knowledge_id LIMIT ?""",
+                    (after_tenant, after_tenant, after_id, _PROJECTION_AUDIT_BATCH_SIZE),
+                ).fetchall()
+                if not rows:
+                    return repaired
+                logger.info(
+                    "governed_signal_projection_repair_batch",
+                    batch_size=len(rows),
+                    after_tenant=after_tenant,
+                    after_knowledge_id=after_id,
+                )
+                from tacit.knowledge.models import KnowledgeRevision
+
+                for row in rows:
+                    try:
+                        revision = KnowledgeRevision.model_validate_json(row["content_json"])
+                        result = self.sync_governed_revision(
+                            revision,
+                            connection=conn,
+                            allow_dirty=True,
+                        )
+                        repaired += int(result["projected"])
+                    except ValueError as exc:
+                        logger.error(
+                            "governed_signal_projection_authority_unrepairable",
+                            tenant_id=row["tenant_id"],
+                            knowledge_id=row["knowledge_id"],
+                            knowledge_revision=row["revision"],
+                            error=str(exc),
+                        )
+                        raise RuntimeError(
+                            "active governed signal authority cannot be projected exactly: "
+                            f"{row['knowledge_id']}@{row['revision']}"
+                        ) from exc
+                after_tenant = str(rows[-1]["tenant_id"])
+                after_id = str(rows[-1]["knowledge_id"])
+
+    def _quarantine_projection_batches(self) -> tuple[int, int]:
+        quarantined = 0
+        legacy_quarantined = 0
+        quarantine_reasons: dict[str, int] = {}
+        quarantine_patterns: set[str] = set()
+        after_rowid = 0
+        while True:
+            with self.transaction() as conn:
+                authority_tables = {
+                    str(row[0])
+                    for row in conn.execute(
+                        """SELECT name FROM sqlite_master
+                           WHERE type='table'
+                             AND name IN ('operational_knowledge', 'operational_knowledge_revisions')"""
+                    )
+                }
+                if authority_tables == {"operational_knowledge", "operational_knowledge_revisions"}:
+                    rows = conn.execute(
+                        """SELECT mapping.rowid AS mapping_rowid, mapping.*,
+                                  revision.content_json AS authority_content_json,
+                                  revision.review_state AS authority_review_state,
+                                  revision.lifecycle_status AS authority_lifecycle_status,
+                                  revision.eligibility AS authority_eligibility
+                           FROM signal_metric_mappings mapping
+                           LEFT JOIN operational_knowledge item
+                             ON item.tenant_id=mapping.tenant_id
+                            AND item.knowledge_id=mapping.governance_ref
+                            AND item.current_revision=mapping.governance_revision
+                            AND item.status='active'
+                           LEFT JOIN operational_knowledge_revisions revision
+                             ON revision.tenant_id=item.tenant_id
+                            AND revision.knowledge_id=item.knowledge_id
+                            AND revision.revision=item.current_revision
+                           WHERE mapping.governance_ref!=''
+                             AND mapping.review_state IN ('approved', 'trusted')
+                             AND mapping.rowid>?
+                           ORDER BY mapping.rowid LIMIT ?""",
+                        (after_rowid, _PROJECTION_AUDIT_BATCH_SIZE),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """SELECT rowid AS mapping_rowid, *,
+                                  NULL AS authority_content_json,
+                                  NULL AS authority_review_state,
+                                  NULL AS authority_lifecycle_status,
+                                  NULL AS authority_eligibility
+                           FROM signal_metric_mappings
+                           WHERE governance_ref!='' AND review_state IN ('approved', 'trusted')
+                             AND rowid>?
+                           ORDER BY rowid LIMIT ?""",
+                        (after_rowid, _PROJECTION_AUDIT_BATCH_SIZE),
+                    ).fetchall()
+                if not rows:
+                    break
+                invalid_ids: list[str] = []
+                for row in rows:
+                    authority = None
+                    if row["authority_content_json"] is not None:
+                        authority = {
+                            "content_json": row["authority_content_json"],
+                            "review_state": row["authority_review_state"],
+                            "lifecycle_status": row["authority_lifecycle_status"],
+                            "eligibility": row["authority_eligibility"],
+                        }
+                    valid, reason = projection_matches_authority(row, authority)
+                    if valid:
+                        continue
+                    invalid_ids.append(str(row["id"]))
+                    quarantine_reasons[reason] = quarantine_reasons.get(reason, 0) + 1
+                    quarantine_patterns.add(str(row["metric_pattern"]))
+                if invalid_ids:
+                    conn.executemany(
+                        "UPDATE signal_metric_mappings SET review_state='candidate' WHERE id=?",
+                        [(mapping_id,) for mapping_id in invalid_ids],
+                    )
+                    quarantined += len(invalid_ids)
+                after_rowid = int(rows[-1]["mapping_rowid"])
+
+        after_rowid = 0
+        while True:
+            with self.transaction() as conn:
+                rows = conn.execute(
+                    """SELECT rowid AS mapping_rowid, id FROM signal_metric_mappings
+                       WHERE source_type!='bootstrap' AND governance_ref=''
+                         AND review_state IN ('approved', 'trusted') AND rowid>?
+                       ORDER BY rowid LIMIT ?""",
+                    (after_rowid, _PROJECTION_AUDIT_BATCH_SIZE),
+                ).fetchall()
+                if not rows:
+                    break
+                conn.executemany(
+                    "UPDATE signal_metric_mappings SET review_state='candidate' WHERE id=?",
+                    [(str(row["id"]),) for row in rows],
+                )
+                legacy_quarantined += len(rows)
+                after_rowid = int(rows[-1]["mapping_rowid"])
+        if quarantined:
+            logger.warning(
+                "governed_signal_mapping_revision_unknown",
+                mappings=quarantined,
+                quarantined=quarantined,
+                reasons=quarantine_reasons,
+                sample_patterns=sorted(quarantine_patterns)[:5],
+            )
+        return quarantined, legacy_quarantined
+
+    def _validated_projection_audit_token(self) -> str | None:
+        with self._conn() as conn:
+            conn.execute("BEGIN")
+            token = self._projection_audit_marker_value(conn)
+            if token == "clean":
+                return None
+            if not token:
+                raise RuntimeError("governed signal projection audit was not dirty during repair")
+            authority_tables = {
+                str(row[0])
+                for row in conn.execute(
+                    """SELECT name FROM sqlite_master
+                       WHERE type='table'
+                         AND name IN ('operational_knowledge', 'operational_knowledge_revisions')"""
+                )
+            }
+
+        def require_same_token(connection: sqlite3.Connection) -> bool:
+            current = self._projection_audit_marker_value(connection)
+            if current == "clean":
+                return False
+            if not current:
+                raise RuntimeError("governed signal projection audit marker disappeared during repair")
+            if current != token:
+                raise _ProjectionAuditChanged
+            return True
+
+        if authority_tables == {"operational_knowledge", "operational_knowledge_revisions"}:
+            after_tenant = ""
+            after_knowledge_id = ""
+            while True:
+                with self._conn() as conn:
+                    conn.execute("BEGIN")
+                    if not require_same_token(conn):
+                        return None
+                    authorities = conn.execute(
+                        """SELECT current.tenant_id, current.knowledge_id, current.current_revision,
+                                  revision.content_json
+                           FROM operational_knowledge current
+                           JOIN operational_knowledge_revisions revision
+                             ON revision.tenant_id=current.tenant_id
+                            AND revision.knowledge_id=current.knowledge_id
+                            AND revision.revision=current.current_revision
+                           WHERE current.kind='signal_mapping' AND current.status='active'
+                             AND revision.lifecycle_status='active'
+                             AND revision.eligibility!='ineligible'
+                             AND (current.tenant_id>?
+                                  OR (current.tenant_id=? AND current.knowledge_id>?))
+                           ORDER BY current.tenant_id, current.knowledge_id LIMIT ?""",
+                        (
+                            after_tenant,
+                            after_tenant,
+                            after_knowledge_id,
+                            _PROJECTION_AUTHORITY_VALIDATION_BATCH_SIZE,
+                        ),
+                    ).fetchall()
+                    if not authorities:
+                        break
+
+                    expected_by_authority: dict[tuple[str, str, int], set[tuple[str, str]]] = {}
+                    for authority in authorities:
+                        key = (
+                            str(authority["tenant_id"]),
+                            str(authority["knowledge_id"]),
+                            int(authority["current_revision"]),
+                        )
+                        try:
+                            content = json.loads(str(authority["content_json"]))
+                            signal_type = str(
+                                content.get("proposition", {}).get("concept_ref") or ""
+                            ).removeprefix("signal:")
+                            resolver_mappings = content.get("resolver_payload", {}).get("mappings", [])
+                            expected = {
+                                (signal_type, str(mapping.get("metric_pattern") or "").strip())
+                                for mapping in resolver_mappings
+                                if isinstance(mapping, dict) and str(mapping.get("metric_pattern") or "").strip()
+                            }
+                        except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+                            raise RuntimeError(
+                                "active governed signal authority has invalid resolver payload: "
+                                f"{key[1]}@{key[2]}"
+                            ) from exc
+                        if not signal_type or not expected:
+                            raise RuntimeError(
+                                "active governed signal authority has no exact resolver payload: "
+                                f"{key[1]}@{key[2]}"
+                            )
+                        expected_by_authority[key] = expected
+
+                    projected_by_authority: dict[tuple[str, str, int], set[tuple[str, str]]] = {
+                        key: set() for key in expected_by_authority
+                    }
+                    key_clause = " OR ".join(
+                        "(tenant_id=? AND governance_ref=? AND governance_revision=?)"
+                        for _ in expected_by_authority
+                    )
+                    key_parameters = [value for key in expected_by_authority for value in key]
+                    after_mapping_rowid = 0
+                    while True:
+                        projections = conn.execute(
+                            f"""SELECT rowid AS mapping_rowid, tenant_id, governance_ref,
+                                       governance_revision, signal_type, metric_pattern
+                                FROM signal_metric_mappings
+                                WHERE rowid>? AND review_state IN ('approved', 'trusted')
+                                  AND ({key_clause})
+                                ORDER BY rowid LIMIT ?""",
+                            (after_mapping_rowid, *key_parameters, _PROJECTION_AUDIT_BATCH_SIZE),
+                        ).fetchall()
+                        if not projections:
+                            break
+                        for projection in projections:
+                            key = (
+                                str(projection["tenant_id"]),
+                                str(projection["governance_ref"]),
+                                int(projection["governance_revision"]),
+                            )
+                            projected_by_authority[key].add(
+                                (str(projection["signal_type"]), str(projection["metric_pattern"]))
+                            )
+                        after_mapping_rowid = int(projections[-1]["mapping_rowid"])
+
+                    for key, expected in expected_by_authority.items():
+                        projected = projected_by_authority[key]
+                        if projected != expected:
+                            raise RuntimeError(
+                                "active governed signal authority has an incomplete resolver projection: "
+                                f"{key[1]}@{key[2]} "
+                                f"(expected={len(expected)}, projected={len(projected)})"
+                            )
+                    after_tenant = str(authorities[-1]["tenant_id"])
+                    after_knowledge_id = str(authorities[-1]["knowledge_id"])
+
+        after_rowid = 0
+        while True:
+            with self._conn() as conn:
+                conn.execute("BEGIN")
+                if not require_same_token(conn):
+                    return None
+                if authority_tables == {"operational_knowledge", "operational_knowledge_revisions"}:
+                    mappings = conn.execute(
+                        """SELECT mapping.rowid AS mapping_rowid, mapping.*,
+                                  revision.content_json AS authority_content_json,
+                                  revision.review_state AS authority_review_state,
+                                  revision.lifecycle_status AS authority_lifecycle_status,
+                                  revision.eligibility AS authority_eligibility
+                           FROM signal_metric_mappings mapping
+                           LEFT JOIN operational_knowledge item
+                             ON item.tenant_id=mapping.tenant_id
+                            AND item.knowledge_id=mapping.governance_ref
+                            AND item.current_revision=mapping.governance_revision
+                            AND item.status='active'
+                           LEFT JOIN operational_knowledge_revisions revision
+                             ON revision.tenant_id=item.tenant_id
+                            AND revision.knowledge_id=item.knowledge_id
+                            AND revision.revision=item.current_revision
+                           WHERE mapping.rowid>? AND mapping.review_state IN ('approved', 'trusted')
+                             AND (mapping.governance_ref!='' OR mapping.source_type!='bootstrap')
+                           ORDER BY mapping.rowid LIMIT ?""",
+                        (after_rowid, _PROJECTION_AUDIT_BATCH_SIZE),
+                    ).fetchall()
+                else:
+                    mappings = conn.execute(
+                        """SELECT rowid AS mapping_rowid, *,
+                                  NULL AS authority_content_json,
+                                  NULL AS authority_review_state,
+                                  NULL AS authority_lifecycle_status,
+                                  NULL AS authority_eligibility
+                           FROM signal_metric_mappings
+                           WHERE rowid>? AND review_state IN ('approved', 'trusted')
+                             AND (governance_ref!='' OR source_type!='bootstrap')
+                           ORDER BY rowid LIMIT ?""",
+                        (after_rowid, _PROJECTION_AUDIT_BATCH_SIZE),
+                    ).fetchall()
+                if not mappings:
+                    break
+                for mapping in mappings:
+                    if not mapping["governance_ref"]:
+                        raise RuntimeError("active ungoverned signal mapping remains after projection repair")
+                    authority = None
+                    if mapping["authority_content_json"] is not None:
+                        authority = {
+                            "content_json": mapping["authority_content_json"],
+                            "review_state": mapping["authority_review_state"],
+                            "lifecycle_status": mapping["authority_lifecycle_status"],
+                            "eligibility": mapping["authority_eligibility"],
+                        }
+                    valid, reason = projection_matches_authority(mapping, authority)
+                    if not valid:
+                        raise RuntimeError(
+                            f"governed signal projection remains invalid after repair: "
+                            f"{mapping['id']} ({reason})"
+                        )
+                after_rowid = int(mappings[-1]["mapping_rowid"])
+        return token
+
+    def _reconcile_governed_projection_audit_batched(self) -> None:
+        """Repair a dirty projection audit without one database-wide write lock."""
+        with self.transaction() as conn:
+            require_confirmed_default_tenant_owner(conn, legacy_tenant=self._legacy_tenant)
+            ensure_governed_projection_audit_triggers(conn)
+        for attempt in range(1, _PROJECTION_AUDIT_MAX_RETRIES + 1):
+            repaired = self._repair_projection_authority_batches()
+            quarantined, legacy_quarantined = self._quarantine_projection_batches()
+            try:
+                token = self._validated_projection_audit_token()
+            except _ProjectionAuditChanged:
+                logger.warning(
+                    "governed_signal_projection_audit_raced",
+                    attempt=attempt,
+                )
+                continue
+            if token is None:
+                return
+            with self.transaction() as conn:
+                if self._projection_audit_marker_value(conn) != token:
+                    logger.warning(
+                        "governed_signal_projection_audit_raced",
+                        attempt=attempt,
+                    )
+                    continue
+                mark_governed_projection_audit_current(conn)
+            if repaired or quarantined or legacy_quarantined:
+                logger.warning(
+                    "governed_signal_projection_authority_rebuilt",
+                    mappings=repaired,
+                    quarantined=quarantined,
+                    legacy_quarantined=legacy_quarantined,
+                )
+            return
+        raise RuntimeError("governed signal projection audit changed repeatedly during repair")
+
+    def ensure_governed_projection_audit_current(self) -> None:
+        """Repair a dirty authority projection in bounded transactions."""
+        with self._conn() as conn:
+            if governed_projection_audit_is_current(conn):
+                return
+        self._reconcile_governed_projection_audit_batched()
+
+    @staticmethod
+    def mark_governed_projection_audit_current(connection: sqlite3.Connection) -> None:
+        """Mark an authority/projection transaction internally consistent."""
+        mark_governed_projection_audit_current(connection)
+
+    @staticmethod
+    def governed_projection_audit_is_current(connection: sqlite3.Connection) -> bool:
+        """Return whether no unresolved projection mutation predates this transaction."""
+        return governed_projection_audit_is_current(connection)
+
+    def reconcile_governed_projection_audit(self, _connection: sqlite3.Connection) -> None:
+        """Reject the removed single-transaction projection repair path."""
+        raise RuntimeError(
+            "single-transaction projection repair is unsupported; "
+            "call ensure_governed_projection_audit_current()"
+        )
 
     def _ensure_learning_index(self, conn: sqlite3.Connection) -> None:
         """Create the FTS5 operational knowledge index when available."""
@@ -700,6 +1278,96 @@ class SignalStore:
             )
             return updated.rowcount
 
+    def sync_governed_revision(
+        self,
+        revision: Any,
+        *,
+        connection: sqlite3.Connection,
+        allow_dirty: bool = False,
+    ) -> dict[str, int | bool]:
+        """Project one immutable signal-mapping revision into the resolver index."""
+        if revision.proposition.kind.value != "signal_mapping":
+            return {"active": False, "deactivated": 0, "projected": 0}
+        if not allow_dirty and not self.governed_projection_audit_is_current(connection):
+            raise RuntimeError(
+                "governed signal projection audit is dirty; reopen the signal store to reconcile it"
+            )
+
+        deactivated = self.deactivate_governed_mappings(
+            tenant_id=revision.tenant_id,
+            governance_ref=revision.knowledge_id,
+            connection=connection,
+        )
+        active = (
+            revision.state.lifecycle_status.value == "active"
+            and revision.state.eligibility.value != "ineligible"
+        )
+        if not active:
+            return {"active": False, "deactivated": deactivated, "projected": 0}
+
+        signal_type = revision.proposition.concept_ref.removeprefix("signal:")
+        resolver_mappings = revision.resolver_payload.get("mappings", [])
+        metric_patterns = sorted(
+            {
+                str(mapping.get("metric_pattern") or "").strip()
+                for mapping in resolver_mappings
+                if isinstance(mapping, dict) and str(mapping.get("metric_pattern") or "").strip()
+            }
+        )
+        if not signal_type or not metric_patterns:
+            raise ValueError("active governed signal mapping requires a signal and exact metric pattern")
+
+        datasource_types = sorted(
+            {
+                str(value).strip()
+                for mapping in resolver_mappings
+                if isinstance(mapping, dict) and isinstance(mapping.get("context_datasource_types", []), list)
+                for value in mapping.get("context_datasource_types", [])
+                if str(value).strip()
+            }
+        )
+        review_state = (
+            revision.state.review_state.value
+            if revision.state.review_state.value in {"approved", "trusted"}
+            else "candidate"
+        )
+        for metric_pattern in metric_patterns:
+            confidences: list[float] = []
+            for mapping in resolver_mappings:
+                if not isinstance(mapping, dict) or str(mapping.get("metric_pattern") or "").strip() != metric_pattern:
+                    continue
+                try:
+                    confidence = float(mapping.get("confidence", 0.5))
+                except (TypeError, ValueError):
+                    confidence = 0.5
+                confidences.append(max(0.0, min(1.0, confidence)))
+            self.add_mapping(
+                signal_type,
+                metric_pattern,
+                confidence=max(confidences, default=0.5),
+                context_services=_projection_scope_values(revision.scope.service_refs, "entity:service:"),
+                context_environments=_projection_scope_values(revision.scope.environment_refs, "environment:"),
+                context_datasource_types=datasource_types,
+                context_archetypes=_projection_scope_values(revision.scope.archetype_refs, "archetype:"),
+                context_regions=_projection_scope_values(revision.scope.region_refs, "region:"),
+                context_clusters=_projection_scope_values(revision.scope.cluster_refs, "cluster:"),
+                context_namespaces=_projection_scope_values(revision.scope.namespace_refs, "namespace:"),
+                context_versions=_projection_scope_values(revision.scope.version_constraints, "version:"),
+                valid_from=revision.scope.valid_from.timestamp() if revision.scope.valid_from else None,
+                valid_until=revision.scope.valid_until.timestamp() if revision.scope.valid_until else None,
+                source_type="operational_knowledge",
+                source_refs=[f"{revision.knowledge_id}@{revision.revision}", *revision.provenance_refs],
+                governance_ref=revision.knowledge_id,
+                governance_revision=revision.revision,
+                inference_version=f"{revision.policy_id}:{revision.policy_version}",
+                review_state=review_state,
+                tenant_id=revision.tenant_id,
+                connection=connection,
+                replace_existing=True,
+                increment_use_count=False,
+            )
+        return {"active": True, "deactivated": deactivated, "projected": len(metric_patterns)}
+
     def get_mappings_for_signal(
         self,
         signal_type: str,
@@ -712,6 +1380,7 @@ class SignalStore:
         tenant_id: str | None = None,
         knowledge_scope: Any | None = None,
         excluded_knowledge_refs: set[KnowledgeRevisionRef] | None = None,
+        resolution_limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Get all metric mappings for a signal, optionally filtered by context.
 
@@ -719,21 +1388,62 @@ class SignalStore:
         and feedback).
         """
         tenant_id = self._resolve_tenant(tenant_id)
+        pinned = self._pinned_governed_mappings.get()
+        if pinned is not None and pinned.tenant_id != tenant_id:
+            raise ValueError("pinned governed mappings belong to another tenant")
         with self._conn() as conn:
-            rows = conn.execute(
-                """SELECT * FROM signal_metric_mappings
-                   WHERE signal_type = ?
-                     AND tenant_id IN (?, ?)
-                     AND review_state IN ('approved', 'trusted')
-                   ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END, confidence DESC""",
-                (signal_type, tenant_id, GLOBAL_BOOTSTRAP_TENANT_ID, tenant_id),
-            ).fetchall()
+            if pinned is None:
+                limit_clause = " LIMIT ?" if resolution_limit is not None else ""
+                parameters: list[Any] = [signal_type, tenant_id, GLOBAL_BOOTSTRAP_TENANT_ID, tenant_id]
+                if resolution_limit is not None:
+                    parameters.append(resolution_limit + 1)
+                rows = conn.execute(
+                    f"""SELECT * FROM signal_metric_mappings
+                       WHERE signal_type = ?
+                         AND tenant_id IN (?, ?)
+                         AND review_state IN ('approved', 'trusted')
+                       ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END, confidence DESC{limit_clause}""",
+                    parameters,
+                ).fetchall()
+            else:
+                limit_clause = " LIMIT ?" if resolution_limit is not None else ""
+                parameters = [signal_type, GLOBAL_BOOTSTRAP_TENANT_ID]
+                if resolution_limit is not None:
+                    parameters.append(resolution_limit + 1)
+                rows = conn.execute(
+                    f"""SELECT * FROM signal_metric_mappings
+                       WHERE signal_type = ?
+                         AND tenant_id = ?
+                         AND source_type = 'bootstrap'
+                         AND review_state IN ('approved', 'trusted')
+                       ORDER BY confidence DESC{limit_clause}""",
+                    parameters,
+                ).fetchall()
 
         now = time.time()
         results = []
         seen_patterns: set[str] = set()
-        for row in rows:
-            m = _deserialize_mapping(row)
+        stored_mappings = [_deserialize_mapping(row) for row in rows]
+        if pinned is not None:
+            pinned_for_signal = [
+                dict(mapping)
+                for mapping in pinned.mappings
+                if str(mapping.get("signal_type") or "") == signal_type
+            ]
+            pinned_for_signal.sort(key=lambda mapping: float(mapping.get("confidence") or 0.0), reverse=True)
+            stored_mappings = [*pinned_for_signal, *stored_mappings]
+        if resolution_limit is not None and len(stored_mappings) > resolution_limit:
+            logger.error(
+                "signal_resolution_mapping_limit_exceeded",
+                tenant_id=tenant_id,
+                signal_type=signal_type,
+                mapping_count=len(stored_mappings),
+                mapping_limit=resolution_limit,
+            )
+            raise RuntimeError(
+                f"Signal '{signal_type}' has more than {resolution_limit} active mapping candidates"
+            )
+        for m in stored_mappings:
             if excluded_knowledge_refs:
                 governance_ref = str(m.get("governance_ref") or "")
                 governance_revision = int(m.get("governance_revision") or 0)
@@ -860,6 +1570,7 @@ class SignalStore:
             tenant_id=tenant_id,
             knowledge_scope=knowledge_scope,
             excluded_knowledge_refs=excluded_knowledge_refs,
+            resolution_limit=int(self._settings.signal_resolution_mapping_limit),
         )
 
         if not mappings:
@@ -867,6 +1578,24 @@ class SignalStore:
 
         target_lang = target_query_language.lower()
         target_ds = context_datasource_type.lower()
+        eligible_catalog = [
+            entry
+            for entry in catalog
+            if (not target_lang or (entry.query_language or "").lower() == target_lang)
+            and (not target_ds or _datasource_type_matches(entry.datasource_type, target_ds))
+        ]
+        catalog_limit = int(self._settings.signal_resolution_catalog_limit)
+        if len(eligible_catalog) > catalog_limit:
+            logger.error(
+                "signal_resolution_catalog_limit_exceeded",
+                tenant_id=tenant_id,
+                signal_type=signal_type,
+                catalog_count=len(eligible_catalog),
+                catalog_limit=catalog_limit,
+            )
+            raise RuntimeError(
+                f"Signal resolution catalog has more than {catalog_limit} eligible metrics"
+            )
         matched: list[ResolvedSignal] = []
         seen_metrics: set[tuple[str, str]] = set()
 
@@ -876,15 +1605,9 @@ class SignalStore:
             pattern = mapping["metric_pattern"]
             eff_conf = mapping["effective_confidence"]
 
-            for entry in catalog:
+            for entry in eligible_catalog:
                 metric_key = (entry.datasource_uid, entry.name)
                 if metric_key in seen_metrics:
-                    continue
-                # Restrict to the target backend's query language so we never
-                # substitute a cross-backend metric into the wrong template.
-                if target_lang and (entry.query_language or "").lower() != target_lang:
-                    continue
-                if target_ds and not _datasource_type_matches(entry.datasource_type, target_ds):
                     continue
                 if _metric_matches_pattern(entry.name, pattern):
                     adjusted = eff_conf * _metric_metadata_compatibility(signal_type, sig_type or {}, entry)
@@ -1029,7 +1752,7 @@ class SignalStore:
                 return yaml.safe_load(f) or {}, "package:tacit.data/signals.yaml"
         return None, None
 
-    def load_from_yaml(self, path: Path | None = None) -> int:
+    def load_from_yaml(self, path: Path | None = None, *, only_if_changed: bool = False) -> int:
         """Load bootstrap signal definitions from signals.yaml.
 
         Returns the number of mappings loaded.
@@ -1039,25 +1762,44 @@ class SignalStore:
             logger.info("signals_yaml_not_found")
             return 0
 
+        fingerprint = hashlib.sha256(
+            json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         count = 0
-        for sig_type, sig_def in data.get("signals", {}).items():
-            self.register_signal_type(
-                signal_type=sig_type,
-                description=sig_def.get("description", ""),
-                category=sig_def.get("category", ""),
-                unit=sig_def.get("unit", ""),
-            )
-            for mp in sig_def.get("metric_patterns", []):
-                self.add_mapping(
-                    signal_type=sig_type,
-                    metric_pattern=mp["pattern"],
-                    confidence=mp.get("confidence", 0.5),
-                    context_datasource_types=mp["datasource_types"] if "datasource_types" in mp else None,
-                    source_type="bootstrap",
-                )
-                count += 1
+        with self.transaction() as conn:
+            if only_if_changed:
+                existing = conn.execute(
+                    "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+                    (_BOOTSTRAP_FINGERPRINT_KEY,),
+                ).fetchone()
+                if existing is not None and str(existing["value"]) == fingerprint:
+                    logger.info("signals_yaml_unchanged", path=source, fingerprint=fingerprint)
+                    return 0
 
-        logger.info("signals_loaded_from_yaml", path=source, mappings=count)
+            for sig_type, sig_def in data.get("signals", {}).items():
+                self.register_signal_type(
+                    signal_type=sig_type,
+                    description=sig_def.get("description", ""),
+                    category=sig_def.get("category", ""),
+                    unit=sig_def.get("unit", ""),
+                )
+                for mp in sig_def.get("metric_patterns", []):
+                    self.add_mapping(
+                        signal_type=sig_type,
+                        metric_pattern=mp["pattern"],
+                        confidence=mp.get("confidence", 0.5),
+                        context_datasource_types=mp["datasource_types"] if "datasource_types" in mp else None,
+                        source_type="bootstrap",
+                    )
+                    count += 1
+            conn.execute(
+                """INSERT INTO signal_tenant_migration_metadata (key, value, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                (_BOOTSTRAP_FINGERPRINT_KEY, fingerprint, time.time()),
+            )
+
+        logger.info("signals_loaded_from_yaml", path=source, mappings=count, fingerprint=fingerprint)
         return count
 
     # ── Ingested dashboard records ───────────────────────────────────────
@@ -1094,8 +1836,9 @@ class SignalStore:
                     metric_cooccurrence, aggregation_patterns,
                     query_transformations, panel_titles,
                     alert_links, drilldown_links,
-                    status, signals_inferred, archetype_generated, stale, missing_since, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)""",
+                    status, signals_inferred, archetype_generated, stale, missing_since,
+                    knowledge_reconciled_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?)""",
                 (
                     tenant_id,
                     dashboard_uid,
@@ -1227,9 +1970,10 @@ class SignalStore:
                     condition, severity, enabled, labels, annotations,
                     metrics_found, query_transformations, service_hints,
                     dashboard_uid, panel_title, source_url, provenance_url,
-                    confidence, stale, missing_since, status, signals_inferred, first_seen_at,
+                    confidence, stale, missing_since, knowledge_reconciled_at,
+                    status, signals_inferred, first_seen_at,
                     last_seen_at, updated_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(tenant_id, alert_uid, backend_name) DO UPDATE SET
                        source_vendor = excluded.source_vendor,
                        source_instance = excluded.source_instance,
@@ -1252,6 +1996,7 @@ class SignalStore:
                        confidence = excluded.confidence,
                        stale = 0,
                        missing_since = NULL,
+                       knowledge_reconciled_at = NULL,
                        status = CASE
                            WHEN ingested_alerts.fingerprint = excluded.fingerprint
                                 AND ingested_alerts.stale = 0
@@ -1290,6 +2035,7 @@ class SignalStore:
                     provenance_url or source_url,
                     confidence,
                     0,
+                    None,
                     None,
                     status,
                     json.dumps(signals_inferred or []),
@@ -1339,8 +2085,9 @@ class SignalStore:
                 """INSERT INTO learned_artifacts
                    (tenant_id, artifact_id, artifact_type, source_vendor, source_instance,
                     external_id, title, body_text, provenance_url, fingerprint,
-                    stale, missing_since, first_seen_at, last_seen_at, updated_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?)
+                    stale, missing_since, knowledge_reconciled_at,
+                    first_seen_at, last_seen_at, updated_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?)
                    ON CONFLICT(tenant_id, artifact_id) DO UPDATE SET
                        artifact_type = excluded.artifact_type,
                        source_vendor = excluded.source_vendor,
@@ -1352,6 +2099,7 @@ class SignalStore:
                        fingerprint = excluded.fingerprint,
                        stale = 0,
                        missing_since = NULL,
+                       knowledge_reconciled_at = NULL,
                        first_seen_at = learned_artifacts.first_seen_at,
                        last_seen_at = excluded.last_seen_at,
                        updated_at = CASE
@@ -1694,6 +2442,7 @@ class SignalStore:
                 f"""UPDATE learned_artifacts
                     SET stale = 1,
                         missing_since = COALESCE(missing_since, ?),
+                        knowledge_reconciled_at = NULL,
                         updated_at = ?
                     WHERE tenant_id = ? AND artifact_type = ? AND artifact_id IN ({placeholders})""",
                 (now, now, tenant_id, artifact_type, *missing),
@@ -1748,6 +2497,42 @@ class SignalStore:
                 params,
             ).fetchall()
         return [_deserialize_learned_artifact(row) for row in rows]
+
+    def list_unreconciled_stale_artifacts(
+        self,
+        *,
+        tenant_id: str | None = None,
+        artifact_type: str,
+        limit: int = 1_000,
+        after_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Return a keyset page of stale artifacts whose knowledge transition is pending."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT id, artifact_id FROM learned_artifacts
+                   WHERE tenant_id=? AND artifact_type=? AND stale=1
+                     AND knowledge_reconciled_at IS NULL AND id>?
+                   ORDER BY id LIMIT ?""",
+                (tenant_id, artifact_type, after_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_artifact_knowledge_reconciled(
+        self,
+        *,
+        tenant_id: str | None = None,
+        artifact_id: str,
+    ) -> bool:
+        tenant_id = self._resolve_tenant(tenant_id)
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """UPDATE learned_artifacts SET knowledge_reconciled_at=?
+                   WHERE tenant_id=? AND artifact_id=? AND stale=1
+                     AND knowledge_reconciled_at IS NULL""",
+                (time.time(), tenant_id, artifact_id),
+            )
+        return cursor.rowcount == 1
 
     def get_learned_artifact(
         self,
@@ -1880,6 +2665,7 @@ class SignalStore:
                 f"""UPDATE ingested_alerts
                     SET stale = 1,
                         missing_since = COALESCE(missing_since, ?),
+                        knowledge_reconciled_at = NULL,
                         status = 'stale',
                         updated_at = ?
                     WHERE tenant_id = ? AND backend_name = ? AND alert_uid IN ({placeholders})""",
@@ -1932,7 +2718,8 @@ class SignalStore:
             placeholders = ", ".join("?" for _ in missing)
             cursor = conn.execute(
                 f"""UPDATE ingested_dashboards
-                    SET stale=1, missing_since=COALESCE(missing_since, ?), status='stale'
+                    SET stale=1, missing_since=COALESCE(missing_since, ?),
+                        knowledge_reconciled_at=NULL, status='stale'
                     WHERE tenant_id=? AND backend_name=? AND dashboard_uid IN ({placeholders})""",
                 (now, tenant_id, backend_name, *missing),
             )
@@ -2307,8 +3094,18 @@ class SignalStore:
         tenant_id: str | None = None,
         backend_name: str | None = None,
         offset: int = 0,
+        before_created_at: float | None = None,
+        before_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """List ingested dashboards, optionally filtered by status."""
+        if not 1 <= limit <= _LEARNING_LIST_MAX_LIMIT:
+            raise ValueError(f"limit must be between 1 and {_LEARNING_LIST_MAX_LIMIT}")
+        if offset < 0:
+            raise ValueError("offset cannot be negative")
+        if (before_created_at is None) != (before_id is None):
+            raise ValueError("before_created_at and before_id must be supplied together")
+        if before_created_at is not None and offset:
+            raise ValueError("cursor and offset pagination cannot be combined")
         tenant_id = self._resolve_tenant(tenant_id)
         conditions = ["tenant_id = ?"]
         params: list[Any] = [tenant_id]
@@ -2318,6 +3115,9 @@ class SignalStore:
         if backend_name is not None:
             conditions.append("backend_name = ?")
             params.append(backend_name)
+        if before_created_at is not None and before_id is not None:
+            conditions.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            params.extend([before_created_at, before_created_at, before_id])
         params.extend([limit, offset])
         with self._conn() as conn:
             rows = conn.execute(
@@ -2328,6 +3128,42 @@ class SignalStore:
             ).fetchall()
         return [_deserialize_ingested(r) for r in rows]
 
+    def list_unreconciled_stale_dashboards(
+        self,
+        *,
+        tenant_id: str | None = None,
+        backend_name: str,
+        limit: int = 500,
+        after_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        tenant_id = self._resolve_tenant(tenant_id)
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT id, dashboard_uid FROM ingested_dashboards
+                   WHERE tenant_id=? AND backend_name=? AND stale=1
+                     AND knowledge_reconciled_at IS NULL AND id>?
+                   ORDER BY id LIMIT ?""",
+                (tenant_id, backend_name, after_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_dashboard_knowledge_reconciled(
+        self,
+        *,
+        tenant_id: str | None = None,
+        backend_name: str,
+        dashboard_uid: str,
+    ) -> bool:
+        tenant_id = self._resolve_tenant(tenant_id)
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """UPDATE ingested_dashboards SET knowledge_reconciled_at=?
+                   WHERE tenant_id=? AND backend_name=? AND dashboard_uid=? AND stale=1
+                     AND knowledge_reconciled_at IS NULL""",
+                (time.time(), tenant_id, backend_name, dashboard_uid),
+            )
+        return cursor.rowcount == 1
+
     def list_ingested_alerts(
         self,
         status: str | None = None,
@@ -2336,8 +3172,18 @@ class SignalStore:
         tenant_id: str | None = None,
         backend_name: str | None = None,
         offset: int = 0,
+        before_created_at: float | None = None,
+        before_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """List ingested alerts, optionally filtered by status."""
+        if not 1 <= limit <= _LEARNING_LIST_MAX_LIMIT:
+            raise ValueError(f"limit must be between 1 and {_LEARNING_LIST_MAX_LIMIT}")
+        if offset < 0:
+            raise ValueError("offset cannot be negative")
+        if (before_created_at is None) != (before_id is None):
+            raise ValueError("before_created_at and before_id must be supplied together")
+        if before_created_at is not None and offset:
+            raise ValueError("cursor and offset pagination cannot be combined")
         tenant_id = self._resolve_tenant(tenant_id)
         conditions = ["tenant_id = ?"]
         params: list[Any] = [tenant_id]
@@ -2347,6 +3193,9 @@ class SignalStore:
         if backend_name is not None:
             conditions.append("backend_name = ?")
             params.append(backend_name)
+        if before_created_at is not None and before_id is not None:
+            conditions.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            params.extend([before_created_at, before_created_at, before_id])
         params.extend([limit, offset])
         with self._conn() as conn:
             rows = conn.execute(
@@ -2356,6 +3205,42 @@ class SignalStore:
                 params,
             ).fetchall()
         return [_deserialize_ingested_alert(r) for r in rows]
+
+    def list_unreconciled_stale_alerts(
+        self,
+        *,
+        tenant_id: str | None = None,
+        backend_name: str,
+        limit: int = 500,
+        after_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        tenant_id = self._resolve_tenant(tenant_id)
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT id, alert_uid FROM ingested_alerts
+                   WHERE tenant_id=? AND backend_name=? AND stale=1
+                     AND knowledge_reconciled_at IS NULL AND id>?
+                   ORDER BY id LIMIT ?""",
+                (tenant_id, backend_name, after_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_alert_knowledge_reconciled(
+        self,
+        *,
+        tenant_id: str | None = None,
+        backend_name: str,
+        alert_uid: str,
+    ) -> bool:
+        tenant_id = self._resolve_tenant(tenant_id)
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """UPDATE ingested_alerts SET knowledge_reconciled_at=?
+                   WHERE tenant_id=? AND backend_name=? AND alert_uid=? AND stale=1
+                     AND knowledge_reconciled_at IS NULL""",
+                (time.time(), tenant_id, backend_name, alert_uid),
+            )
+        return cursor.rowcount == 1
 
     def get_ingested_alert(
         self,
@@ -2676,5 +3561,5 @@ def get_signal_store() -> SignalStore:
     if _store is None:
         _store = SignalStore()
         # Auto-load bootstrap signals on first access
-        _store.load_from_yaml()
+        _store.load_from_yaml(only_if_changed=True)
     return _store
