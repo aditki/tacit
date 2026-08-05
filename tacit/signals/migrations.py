@@ -56,7 +56,7 @@ _DEFAULT_OWNER_MARKER = "default_owner_v1"
 _DEFAULT_OWNER_PROGRESS_MARKER = "default_owner_in_progress_v1"
 _DEFAULT_OWNER_CURSOR_PREFIX = "default_owner_cursor_v1:"
 _SIGNAL_DEFINITION_SCOPE_MARKER = "signal_definition_scope_v1"
-CURRENT_SIGNAL_SCHEMA_MARKER = "signal_schema_operational_knowledge_v2"
+CURRENT_SIGNAL_SCHEMA_MARKER = "signal_schema_operational_knowledge_v3"
 GOVERNED_PROJECTION_AUDIT_MARKER = "governed_projection_audit_v2"
 
 
@@ -131,6 +131,7 @@ def ensure_schema(
     ensure_mapping_tenant_scope(conn, legacy_tenant=migration_tenant)
     ensure_governed_projection_audit_triggers(conn)
     ensure_global_bootstrap_mapping_scope(conn)
+    ensure_mapping_source_ref_index(conn)
     ensure_rejected_candidate_tenant_scope(conn, legacy_tenant=migration_tenant)
     mark_governed_projection_audit_dirty(conn, reason="schema_migration")
     _record_migration_marker(conn, CURRENT_SIGNAL_SCHEMA_MARKER, migration_tenant)
@@ -152,9 +153,23 @@ def signal_schema_is_current(conn: sqlite3.Connection) -> bool:
             "valid_from",
             "valid_until",
         },
-        "ingested_dashboards": {"tenant_id", "backend_name", "knowledge_reconciled_at"},
-        "ingested_alerts": {"tenant_id", "backend_name", "knowledge_reconciled_at"},
-        "learned_artifacts": {"tenant_id", "knowledge_reconciled_at"},
+        "ingested_dashboards": {
+            "tenant_id",
+            "backend_name",
+            "last_seen_at",
+            "knowledge_reconciled_at",
+        },
+        "ingested_alerts": {
+            "tenant_id",
+            "backend_name",
+            "generation_fingerprint",
+            "knowledge_reconciled_at",
+        },
+        "learned_artifacts": {
+            "tenant_id",
+            "knowledge_reconciled_at",
+            "extraction_generation",
+        },
         "rejected_signal_candidates": {"tenant_id"},
     }
     for table, expected in required_columns.items():
@@ -166,6 +181,7 @@ def signal_schema_is_current(conn: sqlite3.Connection) -> bool:
     required_tables = {
         "signal_types",
         "tenant_signal_types",
+        "signal_mapping_source_refs",
         "signal_tenant_migration_metadata",
         "learning_context_fts",
     }
@@ -176,9 +192,19 @@ def signal_schema_is_current(conn: sqlite3.Connection) -> bool:
         return False
     required_indexes = {
         "idx_smm_governance",
+        "idx_smm_tenant_signal_page",
+        "idx_signal_mapping_source_ref",
         "idx_ingested_dashboard_reconciliation",
+        "idx_ingested_dashboard_stale_scan",
         "idx_ingested_alert_reconciliation",
+        "idx_ingested_alert_stale_scan",
         "idx_learned_artifact_reconciliation",
+        "idx_learned_artifact_stale_scan",
+        "idx_learned_artifacts_page",
+        "idx_evidence_requirements_artifact_page",
+        "idx_ownership_hints_artifact_page",
+        "idx_dependency_hints_artifact_page",
+        "idx_signal_mapping_candidates_artifact_page",
     }
     existing_indexes = {
         str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
@@ -189,6 +215,9 @@ def signal_schema_is_current(conn: sqlite3.Connection) -> bool:
         "trg_governed_mapping_insert_audit_dirty",
         "trg_governed_mapping_update_audit_dirty",
         "trg_governed_mapping_delete_audit_dirty",
+        "trg_signal_mapping_source_ref_insert",
+        "trg_signal_mapping_source_ref_update",
+        "trg_signal_mapping_source_ref_delete",
     }
     existing_triggers = {
         str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()
@@ -798,6 +827,8 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str 
     ):
         conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_tenant_signal
                ON signal_metric_mappings(tenant_id, signal_type)""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_tenant_signal_page
+               ON signal_metric_mappings(tenant_id, signal_type, confidence DESC, id DESC)""")
         conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_governance
                ON signal_metric_mappings(tenant_id, governance_ref) WHERE governance_ref != ''""")
         return
@@ -858,8 +889,60 @@ def ensure_mapping_tenant_scope(conn: sqlite3.Connection, *, legacy_tenant: str 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_smm_metric ON signal_metric_mappings(metric_pattern)")
         conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_tenant_signal
                ON signal_metric_mappings(tenant_id, signal_type)""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_tenant_signal_page
+               ON signal_metric_mappings(tenant_id, signal_type, confidence DESC, id DESC)""")
         conn.execute("""CREATE INDEX IF NOT EXISTS idx_smm_governance
                ON signal_metric_mappings(tenant_id, governance_ref) WHERE governance_ref != ''""")
+
+
+def ensure_mapping_source_ref_index(conn: sqlite3.Connection) -> None:
+    """Build the indexed source-ref projection and its maintenance triggers."""
+    for trigger in (
+        "trg_signal_mapping_source_ref_insert",
+        "trg_signal_mapping_source_ref_update",
+        "trg_signal_mapping_source_ref_delete",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    conn.execute("""CREATE TABLE IF NOT EXISTS signal_mapping_source_refs (
+               mapping_id INTEGER NOT NULL,
+               tenant_id TEXT NOT NULL,
+               source_ref TEXT NOT NULL,
+               PRIMARY KEY (mapping_id, source_ref)
+           )""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_signal_mapping_source_ref
+           ON signal_mapping_source_refs(tenant_id, source_ref, mapping_id)""")
+    conn.execute("DELETE FROM signal_mapping_source_refs")
+    backfilled = conn.execute("""INSERT OR IGNORE INTO signal_mapping_source_refs (mapping_id, tenant_id, source_ref)
+           SELECT mapping.id, mapping.tenant_id, source.value
+           FROM signal_metric_mappings mapping
+           JOIN json_each(
+               CASE WHEN json_valid(mapping.source_refs) THEN mapping.source_refs ELSE '[]' END
+           ) source
+           WHERE source.type='text' AND source.value != ''""").rowcount
+    conn.execute("""CREATE TRIGGER trg_signal_mapping_source_ref_insert
+           AFTER INSERT ON signal_metric_mappings
+           BEGIN
+               INSERT OR IGNORE INTO signal_mapping_source_refs (mapping_id, tenant_id, source_ref)
+               SELECT NEW.id, NEW.tenant_id, value
+               FROM json_each(CASE WHEN json_valid(NEW.source_refs) THEN NEW.source_refs ELSE '[]' END)
+               WHERE type='text' AND value != '';
+           END""")
+    conn.execute("""CREATE TRIGGER trg_signal_mapping_source_ref_update
+           AFTER UPDATE OF tenant_id, source_refs ON signal_metric_mappings
+           BEGIN
+               DELETE FROM signal_mapping_source_refs WHERE mapping_id=OLD.id;
+               INSERT OR IGNORE INTO signal_mapping_source_refs (mapping_id, tenant_id, source_ref)
+               SELECT NEW.id, NEW.tenant_id, value
+               FROM json_each(CASE WHEN json_valid(NEW.source_refs) THEN NEW.source_refs ELSE '[]' END)
+               WHERE type='text' AND value != '';
+           END""")
+    conn.execute("""CREATE TRIGGER trg_signal_mapping_source_ref_delete
+           AFTER DELETE ON signal_metric_mappings
+           BEGIN
+               DELETE FROM signal_mapping_source_refs WHERE mapping_id=OLD.id;
+           END""")
+    if backfilled:
+        logger.info("signal_mapping_source_refs_indexed", source_ref_count=backfilled)
 
 
 def ensure_global_bootstrap_mapping_scope(conn: sqlite3.Connection) -> None:
@@ -1041,9 +1124,14 @@ def ensure_ingested_dashboard_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN missing_since REAL")
     if "knowledge_reconciled_at" not in columns:
         conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN knowledge_reconciled_at REAL")
+    if "last_seen_at" not in columns:
+        conn.execute("ALTER TABLE ingested_dashboards ADD COLUMN last_seen_at REAL NOT NULL DEFAULT 0")
+        conn.execute("UPDATE ingested_dashboards SET last_seen_at=created_at WHERE last_seen_at=0")
     if "tenant_id" in columns:
         conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_dashboard_reconciliation
                ON ingested_dashboards(tenant_id, backend_name, stale, knowledge_reconciled_at, id)""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_dashboard_stale_scan
+               ON ingested_dashboards(tenant_id, backend_name, stale, id, last_seen_at)""")
 
 
 def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
@@ -1057,6 +1145,7 @@ def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
         "source_instance": "TEXT NOT NULL DEFAULT ''",
         "external_id": "TEXT NOT NULL DEFAULT ''",
         "fingerprint": "TEXT NOT NULL DEFAULT ''",
+        "generation_fingerprint": "TEXT NOT NULL DEFAULT ''",
         "provenance_url": "TEXT NOT NULL DEFAULT ''",
         "confidence": "REAL NOT NULL DEFAULT 0.0",
         "stale": "INTEGER NOT NULL DEFAULT 0",
@@ -1072,6 +1161,8 @@ def ensure_ingested_alert_columns(conn: sqlite3.Connection) -> None:
     if "tenant_id" in columns:
         conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_alert_reconciliation
                ON ingested_alerts(tenant_id, backend_name, stale, knowledge_reconciled_at, id)""")
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_alert_stale_scan
+               ON ingested_alerts(tenant_id, backend_name, stale, id, last_seen_at)""")
 
 
 def ensure_ingested_alert_tenant_scope(
@@ -1100,6 +1191,7 @@ def ensure_artifact_learning_columns(conn: sqlite3.Connection) -> None:
             "stale": "INTEGER NOT NULL DEFAULT 0",
             "missing_since": "REAL",
             "knowledge_reconciled_at": "REAL",
+            "extraction_generation": "TEXT NOT NULL DEFAULT ''",
             "first_seen_at": "REAL NOT NULL DEFAULT 0",
             "last_seen_at": "REAL NOT NULL DEFAULT 0",
             "updated_at": "REAL NOT NULL DEFAULT 0",
@@ -1110,6 +1202,8 @@ def ensure_artifact_learning_columns(conn: sqlite3.Connection) -> None:
         if "tenant_id" in artifact_columns:
             conn.execute("""CREATE INDEX IF NOT EXISTS idx_learned_artifact_reconciliation
                    ON learned_artifacts(tenant_id, artifact_type, stale, knowledge_reconciled_at, id)""")
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_learned_artifact_stale_scan
+                   ON learned_artifacts(tenant_id, artifact_type, stale, id, last_seen_at)""")
 
     for table in ("evidence_requirements", "ownership_hints", "dependency_hints", "signal_mapping_candidates"):
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1150,16 +1244,28 @@ def ensure_artifact_tenant_indexes(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_learned_artifacts_type
             ON learned_artifacts(tenant_id, artifact_type);
+        CREATE INDEX IF NOT EXISTS idx_learned_artifacts_page
+            ON learned_artifacts(tenant_id, artifact_type, updated_at DESC, id DESC);
         CREATE INDEX IF NOT EXISTS idx_learned_artifact_reconciliation
             ON learned_artifacts(tenant_id, artifact_type, stale, knowledge_reconciled_at, id);
+        CREATE INDEX IF NOT EXISTS idx_learned_artifact_stale_scan
+            ON learned_artifacts(tenant_id, artifact_type, stale, id, last_seen_at);
         CREATE INDEX IF NOT EXISTS idx_evidence_requirements_artifact
             ON evidence_requirements(tenant_id, artifact_id);
+        CREATE INDEX IF NOT EXISTS idx_evidence_requirements_artifact_page
+            ON evidence_requirements(tenant_id, artifact_id, id);
         CREATE INDEX IF NOT EXISTS idx_ownership_hints_artifact
             ON ownership_hints(tenant_id, artifact_id);
+        CREATE INDEX IF NOT EXISTS idx_ownership_hints_artifact_page
+            ON ownership_hints(tenant_id, artifact_id, id);
         CREATE INDEX IF NOT EXISTS idx_dependency_hints_artifact
             ON dependency_hints(tenant_id, artifact_id);
+        CREATE INDEX IF NOT EXISTS idx_dependency_hints_artifact_page
+            ON dependency_hints(tenant_id, artifact_id, id);
         CREATE INDEX IF NOT EXISTS idx_signal_mapping_candidates_artifact
             ON signal_mapping_candidates(tenant_id, artifact_id);
+        CREATE INDEX IF NOT EXISTS idx_signal_mapping_candidates_artifact_page
+            ON signal_mapping_candidates(tenant_id, artifact_id, id);
     """,
     )
 
@@ -1203,6 +1309,7 @@ def _rebuild_artifact_learning_tables(
             source_instance TEXT NOT NULL DEFAULT '', external_id TEXT NOT NULL DEFAULT '',
             title TEXT NOT NULL DEFAULT '', body_text TEXT NOT NULL DEFAULT '',
             provenance_url TEXT NOT NULL DEFAULT '', fingerprint TEXT NOT NULL DEFAULT '',
+            extraction_generation TEXT NOT NULL DEFAULT '',
             stale INTEGER NOT NULL DEFAULT 0, missing_since REAL,
             knowledge_reconciled_at REAL,
             first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL,
@@ -1248,8 +1355,9 @@ def _rebuild_artifact_learning_tables(
     )
     conn.execute(f"""INSERT INTO learned_artifacts
         SELECT id, {tenant_select["learned_artifacts"]}, artifact_id, artifact_type, source_vendor,
-               source_instance, external_id, title, body_text, provenance_url, fingerprint, stale,
-               missing_since, knowledge_reconciled_at, first_seen_at, last_seen_at, updated_at, created_at
+               source_instance, external_id, title, body_text, provenance_url, fingerprint,
+               extraction_generation, stale, missing_since, knowledge_reconciled_at,
+               first_seen_at, last_seen_at, updated_at, created_at
         FROM learned_artifacts_old""")
     conn.execute(f"""INSERT INTO evidence_requirements
         SELECT {tenant_select["evidence_requirements"]}, id, artifact_id, subject, evidence_kind,
@@ -1309,6 +1417,7 @@ def _rebuild_ingested_dashboards_table(conn: sqlite3.Connection, tenant_select: 
             stale               INTEGER NOT NULL DEFAULT 0,
             missing_since       REAL,
             knowledge_reconciled_at REAL,
+            last_seen_at        REAL NOT NULL DEFAULT 0,
             created_at          REAL NOT NULL,
             reviewed_at         REAL,
             UNIQUE(tenant_id, dashboard_uid, backend_name)
@@ -1320,12 +1429,14 @@ def _rebuild_ingested_dashboards_table(conn: sqlite3.Connection, tenant_select: 
             metrics_found, panel_count, row_groups, metric_cooccurrence,
             aggregation_patterns, query_transformations, panel_titles,
             alert_links, drilldown_links, status, signals_inferred,
-            archetype_generated, stale, missing_since, knowledge_reconciled_at, created_at, reviewed_at)
+            archetype_generated, stale, missing_since, knowledge_reconciled_at,
+            last_seen_at, created_at, reviewed_at)
            SELECT id, {tenant_select}, dashboard_uid, COALESCE(backend_name, ''), dashboard_title, dashboard_tags,
                   metrics_found, panel_count, row_groups, metric_cooccurrence,
                   aggregation_patterns, query_transformations, panel_titles,
                   alert_links, drilldown_links, status, signals_inferred,
-                  archetype_generated, stale, missing_since, knowledge_reconciled_at, created_at, reviewed_at
+                  archetype_generated, stale, missing_since, knowledge_reconciled_at,
+                  last_seen_at, created_at, reviewed_at
            FROM ingested_dashboards_old""")
     conn.execute("DROP TABLE ingested_dashboards_old")
     conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_ingested_tenant_uid_backend
@@ -1334,6 +1445,8 @@ def _rebuild_ingested_dashboards_table(conn: sqlite3.Connection, tenant_select: 
            ON ingested_dashboards(tenant_id, dashboard_uid, backend_name)""")
     conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_dashboard_reconciliation
            ON ingested_dashboards(tenant_id, backend_name, stale, knowledge_reconciled_at, id)""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_dashboard_stale_scan
+           ON ingested_dashboards(tenant_id, backend_name, stale, id, last_seen_at)""")
 
 
 def rebuild_ingested_alerts_table(conn: sqlite3.Connection, *, legacy_tenant: str = "default") -> None:
@@ -1355,7 +1468,8 @@ def _rebuild_ingested_alerts_table(conn: sqlite3.Connection, tenant_select: str)
             tenant_id TEXT NOT NULL DEFAULT 'default', alert_uid TEXT NOT NULL,
             backend_name TEXT NOT NULL DEFAULT '', source_vendor TEXT NOT NULL DEFAULT '',
             source_instance TEXT NOT NULL DEFAULT '', external_id TEXT NOT NULL DEFAULT '',
-            fingerprint TEXT NOT NULL DEFAULT '', alert_title TEXT NOT NULL DEFAULT '',
+            fingerprint TEXT NOT NULL DEFAULT '', generation_fingerprint TEXT NOT NULL DEFAULT '',
+            alert_title TEXT NOT NULL DEFAULT '',
             alert_tags TEXT NOT NULL DEFAULT '[]', condition TEXT NOT NULL DEFAULT '',
             severity TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
             labels TEXT NOT NULL DEFAULT '{}', annotations TEXT NOT NULL DEFAULT '{}',
@@ -1374,13 +1488,15 @@ def _rebuild_ingested_alerts_table(conn: sqlite3.Connection, tenant_select: str)
     )
     conn.execute(f"""INSERT INTO ingested_alerts
            (id, tenant_id, alert_uid, backend_name, source_vendor, source_instance, external_id,
-            fingerprint, alert_title, alert_tags, condition, severity, enabled, labels, annotations,
+            fingerprint, generation_fingerprint, alert_title, alert_tags, condition, severity,
+            enabled, labels, annotations,
             metrics_found, query_transformations, service_hints, dashboard_uid, panel_title,
             source_url, provenance_url, confidence, stale, missing_since, knowledge_reconciled_at,
             status, signals_inferred,
             first_seen_at, last_seen_at, updated_at, created_at, reviewed_at)
            SELECT id, {tenant_select}, alert_uid, backend_name, source_vendor, source_instance, external_id,
-                  fingerprint, alert_title, alert_tags, condition, severity, enabled, labels, annotations,
+                  fingerprint, generation_fingerprint, alert_title, alert_tags, condition, severity,
+                  enabled, labels, annotations,
                   metrics_found, query_transformations, service_hints, dashboard_uid, panel_title,
                   source_url, provenance_url, confidence, stale, missing_since, knowledge_reconciled_at,
                   status, signals_inferred,
@@ -1391,3 +1507,5 @@ def _rebuild_ingested_alerts_table(conn: sqlite3.Connection, tenant_select: str)
            ON ingested_alerts(tenant_id, alert_uid, backend_name)""")
     conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_alert_reconciliation
            ON ingested_alerts(tenant_id, backend_name, stale, knowledge_reconciled_at, id)""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_ingested_alert_stale_scan
+           ON ingested_alerts(tenant_id, backend_name, stale, id, last_seen_at)""")

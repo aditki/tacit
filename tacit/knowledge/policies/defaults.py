@@ -46,8 +46,18 @@ class ConservativePromotionPolicy:
             if eligible and context.live_verified
             else KnowledgeEligibility.CONTEXTUAL_ONLY if eligible else KnowledgeEligibility.INELIGIBLE
         )
+        candidate_input = candidate.model_dump(
+            mode="json",
+            exclude={
+                "created_at": True,
+                "updated_at": True,
+                "corroboration": True,
+                "policy": True,
+                "state": {"eligibility"},
+            },
+        )
         input_payload = {
-            "candidate": candidate.model_dump(mode="json"),
+            "candidate": candidate_input,
             "context": context.model_dump(mode="json"),
             "policy": {"id": self.policy_id, "version": self.version},
         }

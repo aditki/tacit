@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,7 +61,9 @@ from tacit.knowledge.normalization import canonical_scope_payload, normalize_ser
 from tacit.knowledge.repository import (
     AliasRegistrationConflictError,
     CandidateEvaluationConflictError,
+    CandidateLifecycleConflictError,
     CandidateReviewConflictError,
+    EntityRegistrationConflictError,
     KnowledgeRepository,
     KnowledgeRevisionConflictError,
     _conflict_lookup_sql,
@@ -74,7 +77,13 @@ from tacit.knowledge.usage import (
     KnowledgeUsageStage,
 )
 from tacit.knowledge.versioning import version_scopes_overlap
-from tacit.models.schemas import CulpritCandidate, CulpritRanking, EvidenceObservation, EvidenceObservationOutcome
+from tacit.models.schemas import (
+    CulpritCandidate,
+    CulpritRanking,
+    CulpritRankingMode,
+    EvidenceObservation,
+    EvidenceObservationOutcome,
+)
 from tacit.operational_learning_benchmark import (
     load_operational_learning_corpus,
     run_operational_learning_benchmark,
@@ -331,6 +340,79 @@ def _dependency(
     )
 
 
+def test_candidate_creation_and_audit_events_commit_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    candidate_id = "kc_atomic_creation_failure"
+    append_event = service.repository.append_event
+
+    def fail_creation_event(event_type, **kwargs):
+        if event_type == "candidate_created":
+            raise RuntimeError("simulated candidate audit failure")
+        return append_event(event_type, **kwargs)
+
+    monkeypatch.setattr(service.repository, "append_event", fail_creation_event)
+
+    with pytest.raises(RuntimeError, match="simulated candidate audit failure"):
+        service.create_candidate(
+            kind=KnowledgeKind.DEPENDENCY,
+            payload_ref="atomic-candidate",
+            typed_payload={},
+            proposition={
+                "subject_ref": "entity:service:checkout",
+                "predicate": "depends_on",
+                "object_ref": "entity:datastore:redis-session",
+            },
+            scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+            provenance_refs=["runbook:atomic-candidate"],
+            candidate_id=candidate_id,
+        )
+
+    assert service.repository.get_candidate(candidate_id) is None
+    assert all(event["subject_ref"] != candidate_id for event in service.repository.list_events(limit=1_000))
+
+
+def test_duplicate_candidate_submission_does_not_repeat_creation_events(tmp_path: Path):
+    service = _service(tmp_path)
+    first = _dependency(
+        service,
+        payload_ref="idempotent-candidate",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="idempotent-candidate",
+    )
+    second = _dependency(
+        service,
+        payload_ref="idempotent-candidate",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="idempotent-candidate",
+    )
+
+    events = service.repository.list_events(limit=1_000)
+    assert first == second
+    assert (
+        len(
+            [
+                event
+                for event in events
+                if event["event_type"] == "candidate_created" and event["subject_ref"] == first.id
+            ]
+        )
+        == 1
+    )
+    assert (
+        len(
+            [
+                event
+                for event in events
+                if event["event_type"] == "proposition_normalized" and event["payload"].get("candidate_id") == first.id
+            ]
+        )
+        == 1
+    )
+
+
 def _independent_support(
     evidence_ref: str,
     *,
@@ -376,6 +458,35 @@ def _promoted_dependency(
     assert decision.decision.value == "promote"
     assert revision is not None
     return first, revision
+
+
+def _promoted_signal_mapping(
+    service: KnowledgeService,
+    *,
+    suffix: str,
+    metric_pattern: str,
+    archetype_refs: list[str] | None = None,
+):
+    candidate = service.create_candidate(
+        kind=KnowledgeKind.SIGNAL_MAPPING,
+        payload_ref=f"signal:{suffix}",
+        typed_payload={"metric_pattern": metric_pattern, "confidence": 0.9},
+        proposition={
+            "subject_ref": "concept:request_latency",
+            "predicate": "represented_by",
+            "object_ref": f"concept:{suffix}",
+            "concept_ref": "signal:request_latency",
+        },
+        scope=KnowledgeScope(
+            service_refs=["entity:service:checkout"],
+            archetype_refs=archetype_refs or [],
+        ),
+        provenance_refs=[f"dashboard:{suffix}"],
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, live_verified=True)
+    assert revision is not None
+    return candidate, revision
 
 
 def _assert_repository_invariants(repository: KnowledgeRepository, tenant_id: str = "default") -> None:
@@ -752,6 +863,55 @@ def test_knowledge_preserves_abstention_when_it_only_boosts_an_existing_candidat
     assert applied_usage[0].used_for == ["ranking"]
 
 
+def test_knowledge_resort_keeps_runtime_evidence_ahead_of_higher_context_score(tmp_path: Path):
+    service = _service(tmp_path)
+    _, revision = _promoted_signal_mapping(
+        service,
+        suffix="ranking-order",
+        metric_pattern="checkout_latency_seconds",
+        archetype_refs=["latency"],
+    )
+    _, usage = service.create_snapshot(
+        KnowledgeScope(
+            service_refs=["entity:service:checkout"],
+            archetype_refs=["latency"],
+        )
+    )
+    assert {item.knowledge_ref for item in usage} == {revision.knowledge_id}
+    baseline = CulpritRanking(
+        mode=CulpritRankingMode.TELEMETRY_EVIDENCED,
+        abstained=False,
+        candidates=[
+            CulpritCandidate(
+                rank=1,
+                suspect="checkout-runtime",
+                suspect_type="resource",
+                score=0.45,
+                runtime_evidence=["Observed CPU saturation"],
+            ),
+            CulpritCandidate(
+                rank=2,
+                suspect="checkout-context",
+                suspect_type="service",
+                score=0.95,
+                contextual_reasons=["Mentioned in the incident prompt"],
+            ),
+        ],
+        evidence_sources=["Operational context", "Validated runtime observations"],
+        telemetry_status="supported",
+    )
+
+    ranking, resulting_usage = service.apply_to_ranking(baseline, usage)
+
+    assert [candidate.suspect for candidate in ranking.candidates] == [
+        "checkout-runtime",
+        "checkout-context",
+    ]
+    assert ranking.mode == CulpritRankingMode.TELEMETRY_EVIDENCED
+    assert ranking.abstained is False
+    assert resulting_usage == usage
+
+
 def test_scope_references_are_canonical_before_proposition_hashing(tmp_path: Path):
     service = _service(tmp_path)
     raw_scope = KnowledgeScope(
@@ -859,6 +1019,50 @@ def test_rejected_and_pending_candidates_do_not_corroborate(tmp_path: Path):
     assert decision.decision.value == "retain_candidate"
     assert decision.resulting_eligibility == KnowledgeEligibility.INELIGIBLE
     assert decision.reason_codes == ["insufficient_independent_sources"]
+
+
+def test_corroboration_filters_terminal_candidates_before_the_scan_budget(tmp_path: Path):
+    service = _service(tmp_path)
+    approved = _dependency(
+        service,
+        payload_ref="bounded-approved",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="bounded-approved",
+    )
+    service.review_candidate(approved.id, approved=True, reviewer="reviewer")
+    for index in range(4):
+        candidate = _dependency(
+            service,
+            payload_ref=f"bounded-rejected-{index}",
+            family=SourceFamily.DASHBOARD,
+            lineage_group=f"bounded-rejected-{index}",
+        )
+        service.review_candidate(candidate.id, approved=False, reviewer="reviewer")
+    service.corroboration.candidate_limit = 1
+
+    summary, _ = service.corroboration.analyze("default", approved.proposition.proposition_key)
+
+    assert summary.raw_source_count == 1
+
+
+def test_corroboration_fails_closed_at_an_explicit_candidate_budget(tmp_path: Path):
+    service = _service(tmp_path)
+    candidates = [
+        _dependency(
+            service,
+            payload_ref=f"bounded-copied-{index}",
+            family=SourceFamily.RUNBOOK,
+            lineage_group=f"bounded-copied-{index}",
+            lineage_kind=LineageKind.COPIED_FROM,
+        )
+        for index in range(3)
+    ]
+    for candidate in candidates:
+        service.review_candidate(candidate.id, approved=True, reviewer="reviewer")
+    service.corroboration.candidate_limit = 2
+
+    with pytest.raises(CandidateEvaluationConflictError, match="corroboration candidate limit exceeded"):
+        service.corroboration.analyze("default", candidates[0].proposition.proposition_key)
 
 
 def test_scope_matching_requires_version_constraints(tmp_path: Path):
@@ -2061,6 +2265,42 @@ def test_entity_api_returns_client_error_for_conflicting_identity_kind(tmp_path:
     assert "entity id kind 'team' does not match declared kind 'service'" in response.json()["detail"]
 
 
+def test_entity_api_requires_apply_permission_for_authority_updates(tmp_path: Path):
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            signals_db_path=str(tmp_path / "entity-permissions.db"),
+            knowledge_permissions="knowledge.read,knowledge.review",
+        )
+    )
+    client = TestClient(app)
+    payload = {
+        "id": "entity:service:checkout",
+        "kind": "service",
+        "canonical_name": "checkout",
+        "provenance_refs": ["operator:entity"],
+    }
+
+    created = client.post("/api/v1/knowledge/entities", json=payload)
+    updated = client.post(
+        "/api/v1/knowledge/entities",
+        json={
+            **payload,
+            "scope": {"environment_refs": ["environment:production"]},
+        },
+    )
+
+    assert created.status_code == 200, created.text
+    assert updated.status_code == 403
+    assert "knowledge.apply" in updated.json()["detail"]
+    entity = app.state.runtime_stores.knowledge().repository.get_entity(
+        "entity:service:checkout",
+        "default",
+    )
+    assert entity is not None
+    assert entity.scope.environment_refs == []
+
+
 @pytest.mark.parametrize(
     ("subject_ref", "object_ref"),
     [
@@ -2106,6 +2346,183 @@ def test_exact_id_resolution_rejects_inactive_entities(tmp_path: Path):
     )
 
     assert candidate.entity_resolution.status.value == "unresolved"
+
+
+def test_candidate_evaluation_revalidates_entity_authority_under_write_lock(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref="entity-race",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="entity-race",
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="reviewer")
+    checkout = service.repository.get_entity("entity:service:checkout")
+    assert checkout is not None
+    # Simulate an authority update that wins after extraction but before policy evaluation.
+    service.repository.save_entity(checkout.model_copy(update={"status": EntityStatus.WITHDRAWN}))
+
+    decision, revision = service.evaluate_candidate(
+        candidate.id,
+        authoritative_source=True,
+    )
+
+    persisted = service.repository.get_candidate(candidate.id)
+    assert decision.decision.value == "retain_candidate"
+    assert "entity_subject_inactive" in decision.reason_codes
+    assert revision is None
+    assert persisted is not None
+    assert persisted.entity_resolution.status == EntityResolutionStatus.UNRESOLVED
+    assert persisted.state.eligibility == KnowledgeEligibility.INELIGIBLE
+
+
+def test_snapshot_revalidates_entities_without_per_revision_queries(tmp_path: Path):
+    service = _service(tmp_path)
+    _, revision = _promoted_dependency(service)
+    checkout = service.repository.get_entity("entity:service:checkout")
+    assert checkout is not None
+    # Bypass the service repair to exercise the independent runtime safety gate.
+    service.repository.save_entity(checkout.model_copy(update={"status": EntityStatus.WITHDRAWN}))
+
+    _, usage = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        )
+    )
+
+    selected = next(item for item in usage if item.knowledge_ref == revision.knowledge_id)
+    assert selected.disposition == KnowledgeUsageDisposition.UNRESOLVED_ENTITY
+    assert selected.reason_codes == ["entity_subject_inactive"]
+
+
+def test_entity_withdrawal_invalidates_candidates_and_retires_authority(tmp_path: Path):
+    service = _service(tmp_path)
+    first, revision = _promoted_dependency(service)
+    checkout = service.repository.get_entity("entity:service:checkout")
+    assert checkout is not None
+
+    service.register_entity(checkout.model_copy(update={"status": EntityStatus.WITHDRAWN}))
+
+    candidate = service.repository.get_candidate(first.id)
+    current = service.repository.get_revision(revision.knowledge_id)
+    assert candidate is not None
+    assert candidate.entity_resolution.status == EntityResolutionStatus.UNRESOLVED
+    assert candidate.state.eligibility == KnowledgeEligibility.INELIGIBLE
+    assert current is not None
+    assert current.state.lifecycle_status == LifecycleStatus.WITHDRAWN
+    assert current.revision_reason == "entity_binding_invalidated"
+
+
+def test_entity_scope_change_invalidates_out_of_scope_candidates(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref="entity-scope-change",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="entity-scope-change",
+    )
+    checkout = service.repository.get_entity("entity:service:checkout")
+    assert checkout is not None
+
+    service.register_entity(
+        checkout.model_copy(
+            update={
+                "scope": KnowledgeScope(
+                    environment_refs=["environment:staging"],
+                    service_refs=["entity:service:checkout"],
+                )
+            }
+        )
+    )
+
+    persisted = service.repository.get_candidate(candidate.id)
+    assert persisted is not None
+    assert persisted.entity_resolution.status == EntityResolutionStatus.UNRESOLVED
+    assert "entity_subject_scope_mismatch" in persisted.entity_resolution.reason_codes
+
+
+def test_entity_registration_cas_cannot_resurrect_withdrawn_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    stale_repository = KnowledgeRepository(service.repository._db_path)
+    stale_service = KnowledgeService(
+        stale_repository,
+        history_store=_TestHistoryStore(stale_repository),
+        runtime_settings=Settings(_env_file=None),
+    )
+    checkout = service.repository.get_entity("entity:service:checkout")
+    assert checkout is not None
+    stale_transaction_entered = threading.Event()
+    release_stale_transaction = threading.Event()
+    transaction = stale_repository.transaction
+
+    @contextmanager
+    def delayed_transaction():
+        stale_transaction_entered.set()
+        assert release_stale_transaction.wait(timeout=5)
+        with transaction() as connection:
+            yield connection
+
+    monkeypatch.setattr(stale_repository, "transaction", delayed_transaction)
+    stale_update = checkout.model_copy(update={"display_name": "Stale checkout name"})
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        stale_registration = executor.submit(stale_service.register_entity, stale_update)
+        assert stale_transaction_entered.wait(timeout=5)
+        service.register_entity(checkout.model_copy(update={"status": EntityStatus.WITHDRAWN}))
+        release_stale_transaction.set()
+        with pytest.raises(EntityRegistrationConflictError, match="entity changed during registration"):
+            stale_registration.result(timeout=5)
+
+    persisted = service.repository.get_entity(checkout.id)
+    assert persisted is not None
+    assert persisted.status == EntityStatus.WITHDRAWN
+
+
+def test_terminal_entity_requires_explicit_reactivation_transition(tmp_path: Path):
+    service = _service(tmp_path)
+    checkout = service.repository.get_entity("entity:service:checkout")
+    assert checkout is not None
+    service.register_entity(checkout.model_copy(update={"status": EntityStatus.WITHDRAWN}))
+
+    with pytest.raises(ValueError, match="explicit reactivation transition"):
+        service.register_entity(checkout)
+
+    persisted = service.repository.get_entity(checkout.id)
+    assert persisted is not None
+    assert persisted.status == EntityStatus.WITHDRAWN
+
+
+def test_entity_invalidation_pages_every_bound_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    candidates = [
+        _dependency(
+            service,
+            payload_ref=f"entity-page-{index}",
+            family=SourceFamily.RUNBOOK,
+            lineage_group=f"entity-page-{index}",
+        )
+        for index in range(3)
+    ]
+    monkeypatch.setattr("tacit.knowledge.service._SNAPSHOT_PAGE_SIZE", 1)
+    checkout = service.repository.get_entity("entity:service:checkout")
+    assert checkout is not None
+
+    service.register_entity(checkout.model_copy(update={"status": EntityStatus.WITHDRAWN}))
+
+    persisted = [service.repository.get_candidate(candidate.id) for candidate in candidates]
+    assert all(candidate is not None for candidate in persisted)
+    assert all(
+        candidate.entity_resolution.status == EntityResolutionStatus.UNRESOLVED
+        for candidate in persisted
+        if candidate is not None
+    )
 
 
 def test_alias_scope_defaults_to_alias_tenant(tmp_path: Path):
@@ -3329,6 +3746,175 @@ def test_pinned_snapshot_keeps_resolver_and_usage_on_the_exact_revision(tmp_path
     ]
 
 
+def test_scope_repin_preserves_consumed_revisions_and_adds_new_archetype_knowledge(tmp_path: Path):
+    service = _service(tmp_path)
+    initial_candidate, initial_revision = _promoted_signal_mapping(
+        service,
+        suffix="initial-scope",
+        metric_pattern="checkout_latency_v1_seconds",
+        archetype_refs=["latency"],
+    )
+    _, added_revision = _promoted_signal_mapping(
+        service,
+        suffix="catalog-scope",
+        metric_pattern="checkout_catalog_latency_seconds",
+        archetype_refs=["catalog-context"],
+    )
+    initial_scope = KnowledgeScope(
+        service_refs=["entity:service:checkout"],
+        archetype_refs=["latency"],
+    )
+    pinned_snapshot, pinned_usage = service.pin_snapshot(initial_scope)
+    from tacit.signals.store import SignalStore
+
+    resolver = SignalStore(service.repository._db_path)
+    pin_token = resolver.activate_pinned_governed_mappings(
+        tenant_id="default",
+        mappings=service.signal_mappings_for_snapshot(pinned_snapshot),
+    )
+    advanced = initial_revision.model_copy(
+        update={
+            "revision": initial_revision.revision + 1,
+            "parent_revision": initial_revision.revision,
+            "resolver_payload": {
+                "mappings": [
+                    {
+                        "metric_pattern": "checkout_latency_v2_seconds",
+                        "confidence": 0.95,
+                        "context_datasource_types": [],
+                    }
+                ]
+            },
+            "revision_reason": "concurrent_mapping_update",
+            "semantic_fingerprint": f"{initial_revision.semantic_fingerprint}:v2",
+            "created_at": datetime.now(UTC),
+        }
+    )
+    service._persist_revision_with_projection(
+        advanced,
+        candidate_id=initial_candidate.id,
+        decision_ref=advanced.decision_ref,
+        expected_parent_revision=initial_revision.revision,
+    )
+    _, late_initial_scope_revision = _promoted_signal_mapping(
+        service,
+        suffix="late-initial-scope",
+        metric_pattern="checkout_late_initial_latency_seconds",
+        archetype_refs=["latency"],
+    )
+
+    staged_snapshot, staged_usage = service.repin_snapshot(
+        KnowledgeScope(
+            service_refs=["entity:service:checkout"],
+            archetype_refs=["latency", "catalog-context"],
+        ),
+        pinned_usage,
+        previous_scope=initial_scope,
+    )
+    pin_token = resolver.replace_pinned_governed_mappings(
+        pin_token,
+        tenant_id="default",
+        mappings=service.signal_mappings_for_snapshot(staged_snapshot),
+    )
+    staged_latency_rows = [
+        row
+        for row in resolver.get_mappings_for_signal(
+            "request_latency",
+            context_service="checkout",
+            context_archetype="latency",
+            tenant_id="default",
+            knowledge_scope=KnowledgeScope(
+                service_refs=["entity:service:checkout"],
+                archetype_refs=["latency", "catalog-context"],
+            ),
+            include_decayed=True,
+        )
+        if row.get("governance_ref") == initial_revision.knowledge_id
+    ]
+    resolver.reset_pinned_governed_mappings(pin_token)
+    current_latency_rows = [
+        row
+        for row in resolver.get_mappings_for_signal(
+            "request_latency",
+            context_service="checkout",
+            context_archetype="latency",
+            tenant_id="default",
+            knowledge_scope=KnowledgeScope(
+                service_refs=["entity:service:checkout"],
+                archetype_refs=["latency", "catalog-context"],
+            ),
+            include_decayed=True,
+        )
+        if row.get("governance_ref") == initial_revision.knowledge_id
+    ]
+
+    expected_refs = {
+        (initial_revision.knowledge_id, initial_revision.revision),
+        (added_revision.knowledge_id, added_revision.revision),
+    }
+    snapshot_refs = {(item.knowledge_ref, item.revision) for item in staged_snapshot.items}
+    usage_refs = {(item.knowledge_ref, item.knowledge_revision) for item in staged_usage}
+    assert snapshot_refs == expected_refs
+    assert usage_refs == expected_refs
+    assert (initial_revision.knowledge_id, advanced.revision) not in snapshot_refs
+    assert (late_initial_scope_revision.knowledge_id, late_initial_scope_revision.revision) not in snapshot_refs
+    assert [(row["metric_pattern"], row["governance_revision"]) for row in staged_latency_rows] == [
+        ("checkout_latency_v1_seconds", initial_revision.revision)
+    ]
+    assert [(row["metric_pattern"], row["governance_revision"]) for row in current_latency_rows] == [
+        ("checkout_latency_v2_seconds", advanced.revision)
+    ]
+
+
+def test_scope_repin_preserves_prior_usage_dispositions(tmp_path: Path):
+    service = _service(tmp_path)
+    _, initial_revision = _promoted_signal_mapping(
+        service,
+        suffix="initial-rejected",
+        metric_pattern="checkout_initial_rejected_seconds",
+        archetype_refs=["latency"],
+    )
+    _, newly_scoped_revision = _promoted_signal_mapping(
+        service,
+        suffix="catalog-added",
+        metric_pattern="checkout_catalog_added_seconds",
+        archetype_refs=["catalog-context"],
+    )
+    initial_scope = KnowledgeScope(
+        service_refs=["entity:service:checkout"],
+        archetype_refs=["latency"],
+    )
+    _, pinned_usage = service.pin_snapshot(initial_scope)
+    pinned_usage = [
+        item.model_copy(
+            update={
+                "disposition": KnowledgeUsageDisposition.REJECTED_BY_CONFLICT,
+                "reason_codes": ["unresolved_conflict"],
+            }
+        )
+        for item in pinned_usage
+    ]
+
+    staged_snapshot, staged_usage = service.repin_snapshot(
+        KnowledgeScope(
+            service_refs=["entity:service:checkout"],
+            archetype_refs=["latency", "catalog-context"],
+        ),
+        pinned_usage,
+        previous_scope=initial_scope,
+    )
+
+    usage_by_ref = {item.knowledge_ref: item for item in staged_usage}
+    assert usage_by_ref[initial_revision.knowledge_id].disposition == KnowledgeUsageDisposition.REJECTED_BY_CONFLICT
+    assert usage_by_ref[initial_revision.knowledge_id].reason_codes == ["unresolved_conflict"]
+    assert usage_by_ref[newly_scoped_revision.knowledge_id].disposition == (
+        KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED
+    )
+    assert {(item.knowledge_ref, item.revision) for item in staged_snapshot.items} == {
+        (newly_scoped_revision.knowledge_id, newly_scoped_revision.revision)
+    }
+
+
 @pytest.mark.parametrize(
     ("proposition", "reason"),
     [
@@ -3420,6 +4006,59 @@ def test_negative_dependency_excludes_matching_ranked_candidate(tmp_path: Path):
     assert ranking.candidates == []
     assert ranking.abstained is True
     assert ranking.abstention_reason == "operational_knowledge_excluded_ranked_candidates"
+
+
+def test_negative_dependency_recomputes_abstention_after_excluding_supported_candidate(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref="negative-supported-dependency",
+        family=SourceFamily.HUMAN_CORRECTION,
+        lineage_group="negative-supported-dependency",
+        predicate="does_not_depend_on",
+    )
+    service.review_candidate(candidate.id, approved=True, reviewer="operator")
+    _, revision = service.evaluate_candidate(candidate.id, authoritative_source=True)
+    assert revision is not None
+    _, usage = service.create_snapshot(
+        KnowledgeScope(
+            environment_refs=["environment:production"],
+            service_refs=["entity:service:checkout"],
+        )
+    )
+    baseline = CulpritRanking(
+        mode=CulpritRankingMode.TELEMETRY_EVIDENCED,
+        abstained=False,
+        candidates=[
+            CulpritCandidate(
+                rank=1,
+                suspect="redis-session",
+                suspect_type="datastore",
+                score=0.72,
+                runtime_evidence=["Observed cache saturation"],
+            ),
+            CulpritCandidate(
+                rank=2,
+                suspect="checkout",
+                suspect_type="service",
+                score=0.4,
+                contextual_reasons=["Mentioned in the incident prompt"],
+            ),
+        ],
+        evidence_sources=["Operational context", "Validated runtime observations"],
+        telemetry_status="supported",
+    )
+
+    ranking, resulting_usage = service.apply_to_ranking(baseline, usage)
+
+    assert [item.suspect for item in ranking.candidates] == ["checkout"]
+    assert ranking.mode == CulpritRankingMode.CONTEXTUAL
+    assert ranking.telemetry_status == "not_evidenced"
+    assert ranking.abstained is True
+    assert ranking.abstention_reason == "operational_knowledge_excluded_supported_candidates"
+    assert ranking.evidence_sources == ["Operational context"]
+    assert resulting_usage[0].disposition == KnowledgeUsageDisposition.APPLIED
+    assert resulting_usage[0].used_for == ["candidate_exclusion"]
 
 
 def test_negative_dependency_without_matching_candidate_remains_considered(tmp_path: Path):
@@ -4691,7 +5330,7 @@ def _wildcard_dependency_revisions(db_path: Path) -> tuple[KnowledgeRepository, 
         runtime_settings=Settings(
             _env_file=None,
             knowledge_tenant_id="*",
-            knowledge_permissions="knowledge.read,knowledge.review,knowledge.override",
+            knowledge_permissions="knowledge.read,knowledge.review,knowledge.apply,knowledge.override",
         ),
     )
     revisions: dict[str, KnowledgeRevision] = {}
@@ -4835,6 +5474,33 @@ def test_entity_registration_enforces_runtime_review_permission(tmp_path: Path):
 
     assert service.repository.get_entity("entity:service:payments") is None
     assert service.repository.get_entity(original.id) == original
+
+
+def test_candidate_creation_enforces_runtime_review_permission(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate_count = len(service.repository.list_candidates())
+    event_count = len(service.repository.list_events())
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.review"):
+        service.create_candidate(
+            kind=KnowledgeKind.DEPENDENCY,
+            payload_ref="unauthorized-ingest",
+            typed_payload={},
+            proposition={
+                "subject_ref": "entity:service:checkout",
+                "predicate": "depends_on",
+                "object_ref": "entity:datastore:redis-session",
+            },
+            scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+            provenance_refs=["runbook:unauthorized"],
+        )
+
+    assert len(service.repository.list_candidates()) == candidate_count
+    assert len(service.repository.list_events()) == event_count
 
 
 def test_candidate_evaluation_enforces_runtime_review_permission(tmp_path: Path):
@@ -5049,6 +5715,38 @@ def test_snapshot_boundaries_enforce_runtime_read_permission(tmp_path: Path):
             investigation_id="inv-read-boundary",
             investigation_revision=1,
         )
+
+
+def test_runtime_knowledge_application_boundaries_require_apply_permission(tmp_path: Path):
+    service = _service(tmp_path)
+    _, revision = _promoted_signal_mapping(
+        service,
+        suffix="apply-boundary",
+        metric_pattern="checkout_apply_boundary_seconds",
+        archetype_refs=["latency"],
+    )
+    scope = KnowledgeScope(
+        service_refs=["entity:service:checkout"],
+        archetype_refs=["latency"],
+    )
+    snapshot, usage = service.create_snapshot(scope)
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read",
+    )
+
+    service.create_snapshot(scope)
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        service.pin_snapshot(scope)
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        service.signal_mappings_for_snapshot(snapshot)
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        service.apply_compilation_usage(
+            usage,
+            {KnowledgeRevisionRef(revision.knowledge_id, revision.revision)},
+        )
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        service.apply_to_ranking(CulpritRanking(), usage)
 
 
 def test_source_lifecycle_reconciliation_enforces_apply_permission(tmp_path: Path):
@@ -5465,9 +6163,154 @@ def test_imported_review_state_enforces_runtime_permissions(tmp_path: Path):
         )
 
     candidates = service.repository.list_candidates()
-    assert len(candidates) == 1
-    assert candidates[0].state.review_state == ReviewState.CANDIDATE
+    assert candidates == []
     assert service.repository.list_current_revisions() == []
+
+
+@pytest.mark.parametrize(
+    ("review_state", "missing_permission"),
+    [
+        ("trusted", "knowledge.trust"),
+        ("rejected", "knowledge.reject"),
+    ],
+)
+def test_imported_review_mode_is_preflighted_before_candidate_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    review_state: str,
+    missing_permission: str,
+):
+    service = _service(tmp_path)
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.review",
+    )
+    monkeypatch.setattr(
+        service,
+        "_signal_store",
+        lambda: pytest.fail("signal storage must not initialize before migration authorization"),
+    )
+    events_before = service.repository.list_events(limit=1_000)
+
+    with pytest.raises(PermissionError, match=f"Missing permission: {missing_permission}"):
+        migrate_signal_mapping(
+            {
+                "id": f"unauthorized-imported-{review_state}",
+                "signal_type": "request_latency",
+                "metric_pattern": f"{review_state}_latency_seconds",
+                "source_type": "dashboard_ingest",
+                "source_refs": [f"dashboard:{review_state}-import"],
+                "review_state": review_state,
+            },
+            service=service,
+        )
+
+    assert service.repository.list_candidates() == []
+    assert service.repository.list_events(limit=1_000) == events_before
+
+
+def test_reviewed_signal_import_requires_apply_before_store_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read,knowledge.review,knowledge.trust",
+    )
+    monkeypatch.setattr(
+        service,
+        "_signal_store",
+        lambda: pytest.fail("signal storage must not initialize before migration authorization"),
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        migrate_signal_mapping(
+            {
+                "id": "reviewed-import-missing-apply",
+                "signal_type": "request_latency",
+                "metric_pattern": "reviewed_latency_seconds",
+                "source_type": "dashboard_ingest",
+                "source_refs": ["dashboard:reviewed-import"],
+                "review_state": "trusted",
+            },
+            service=service,
+        )
+
+    assert service.repository.list_candidates() == []
+
+
+def test_artifact_migration_rejects_unbounded_candidate_fanout_before_persistence(tmp_path: Path):
+    service = _service(tmp_path)
+    rows = {
+        "dependency_hints": [
+            {
+                "id": f"dep-bounded-{index}",
+                "source_entity": "entity:service:checkout",
+                "target_entity": f"entity:service:dependency-{index}",
+                "direction": "depends_on",
+            }
+            for index in range(2)
+        ]
+    }
+
+    with pytest.raises(ValueError, match="exceeds atomic candidate limit 1"):
+        migrate_artifact_extractions(
+            artifact_id="artifact-bounded-import",
+            artifact_type="runbook",
+            rows=rows,
+            service=service,
+            max_candidate_count=1,
+        )
+
+    assert service.repository.list_candidates() == []
+
+
+def test_artifact_migration_rolls_back_the_complete_candidate_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    create_candidate = service.create_candidate
+    events_before = service.repository.list_events(limit=1_000)
+    calls = 0
+
+    def fail_second_candidate(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected second-row migration failure")
+        return create_candidate(**kwargs)
+
+    monkeypatch.setattr(service, "create_candidate", fail_second_candidate)
+    rows = {
+        "dependency_hints": [
+            {
+                "id": "dep-atomic-one",
+                "source_entity": "entity:service:checkout",
+                "target_entity": "entity:datastore:redis-session",
+                "direction": "depends_on",
+            },
+            {
+                "id": "dep-atomic-two",
+                "source_entity": "entity:service:checkout",
+                "target_entity": "entity:service:payments",
+                "direction": "depends_on",
+            },
+        ]
+    }
+
+    with pytest.raises(RuntimeError, match="injected second-row migration failure"):
+        migrate_artifact_extractions(
+            artifact_id="artifact-atomic-import",
+            artifact_type="runbook",
+            rows=rows,
+            service=service,
+        )
+
+    assert calls == 2
+    assert service.repository.list_candidates() == []
+    assert service.repository.list_events(limit=1_000) == events_before
 
 
 def test_knowledge_usage_batch_rolls_back_usage_and_events_together(
@@ -5578,6 +6421,50 @@ def test_knowledge_usage_retry_does_not_duplicate_audit_event(tmp_path: Path):
     ]
     assert second == first
     assert len(service.repository.list_usage(investigation_id="inv-idempotent-usage")) == 1
+    assert len(events) == 1
+
+
+def test_knowledge_usage_retry_uses_contract_identity_when_caller_id_is_blank(tmp_path: Path):
+    service = _service(tmp_path)
+    _, revision = _promoted_dependency(service)
+    caller_usage = KnowledgeUsage(
+        knowledge_ref=revision.knowledge_id,
+        knowledge_revision=revision.revision,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        used_for=["ranking"],
+    )
+    contract_usage = caller_usage.model_copy(
+        update={
+            "usage_id": "usage_inv-contract-identity_4_01",
+            "investigation_id": "inv-contract-identity",
+            "investigation_revision": 4,
+        }
+    )
+    service._history_store_instance.authorize_usage(
+        "inv-contract-identity",
+        4,
+        [contract_usage],
+    )
+
+    first = service.persist_usage(
+        [caller_usage],
+        investigation_id="inv-contract-identity",
+        investigation_revision=4,
+    )
+    second = service.persist_usage(
+        [caller_usage],
+        investigation_id="inv-contract-identity",
+        investigation_revision=4,
+    )
+
+    stored = service.repository.list_usage(investigation_id="inv-contract-identity")
+    events = [
+        event
+        for event in service.repository.list_events()
+        if event["payload"].get("investigation_id") == "inv-contract-identity"
+    ]
+    assert first == second == [contract_usage]
+    assert stored == [contract_usage]
     assert len(events) == 1
 
 
@@ -6002,6 +6889,77 @@ def test_removed_source_retires_promoted_knowledge(tmp_path: Path):
     assert service.repository.get_revision(active.knowledge_id).state.eligibility == KnowledgeEligibility.INELIGIBLE
 
 
+def test_atomic_source_reconciliation_limit_rolls_back_without_partial_retirement(tmp_path: Path):
+    service = _service(tmp_path)
+    candidates = [
+        service.create_candidate(
+            kind=KnowledgeKind.ARTIFACT_QUALITY,
+            payload_ref=f"shared-source:{suffix}",
+            typed_payload={},
+            proposition={
+                "subject_ref": "concept:artifact-quality",
+                "predicate": "useful_for_investigation",
+                "concept_ref": f"concept:{suffix}",
+            },
+            scope=KnowledgeScope(),
+            provenance_refs=["runbook:shared-source"],
+        )
+        for suffix in ("first", "second")
+    ]
+
+    with pytest.raises(CandidateLifecycleConflictError, match="atomic candidate limit"):
+        with service.repository.transaction():
+            service.reconcile_source_lifecycle(
+                provenance_ref="runbook:shared-source",
+                active_candidate_ids=set(),
+                max_candidate_count=1,
+            )
+
+    assert [service.repository.get_candidate(candidate.id).state.lifecycle_status for candidate in candidates] == [
+        LifecycleStatus.ACTIVE,
+        LifecycleStatus.ACTIVE,
+    ]
+
+
+def test_restored_source_generation_cannot_be_retired_by_a_stale_worker(tmp_path: Path):
+    from tacit.signals.store import SignalStore
+
+    service = _service(tmp_path)
+    candidate, active = _promoted_dependency(service)
+    store = SignalStore(db_path=tmp_path / "knowledge.db")
+    store.record_ingested_dashboard("source-dashboard", backend_name="grafana")
+    assert (
+        store.mark_missing_dashboards_stale(
+            backend_name="grafana",
+            seen_dashboard_uids=set(),
+            crawl_started_at=time.time() + 1,
+        )
+        == 1
+    )
+    stale_generation = store.list_unreconciled_stale_dashboards(backend_name="grafana")[0]
+    store.record_ingested_dashboard("source-dashboard", backend_name="grafana")
+
+    with pytest.raises(CandidateLifecycleConflictError, match="source generation changed"):
+        service.reconcile_source_lifecycle(
+            provenance_ref=candidate.provenance_refs[0],
+            source_stale=True,
+            source_generation_guard=lambda conn: store.dashboard_stale_generation_is_current(
+                conn,
+                tenant_id="default",
+                backend_name="grafana",
+                dashboard_uid="source-dashboard",
+                missing_since=stale_generation["missing_since"],
+            ),
+        )
+
+    persisted_candidate = service.repository.get_candidate(candidate.id)
+    persisted_revision = service.repository.get_revision(active.knowledge_id)
+    assert persisted_candidate is not None
+    assert persisted_candidate.state.lifecycle_status == LifecycleStatus.ACTIVE
+    assert persisted_revision is not None
+    assert persisted_revision.state.lifecycle_status == LifecycleStatus.ACTIVE
+
+
 def test_source_reconciliation_rereads_candidate_after_concurrent_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6013,21 +6971,20 @@ def test_source_reconciliation_rereads_candidate_after_concurrent_review(
         family=SourceFamily.RUNBOOK,
         lineage_group="concurrent-source-review",
     )
-    original_list = service.repository.list_candidates_for_provenance
-    calls = 0
+    has_candidate = service.repository.has_candidate_for_provenance
+    review_applied = False
 
-    def review_between_preflight_and_lock(tenant_id, provenance_ref):
-        nonlocal calls
-        observed = original_list(tenant_id, provenance_ref)
-        calls += 1
-        if calls == 1:
+    def review_after_reconciliation_cutoff(*args, **kwargs):
+        nonlocal review_applied
+        if not review_applied:
+            review_applied = True
             service.review_candidate(candidate.id, approved=True, reviewer="concurrent-reviewer")
-        return observed
+        return has_candidate(*args, **kwargs)
 
     monkeypatch.setattr(
         service.repository,
-        "list_candidates_for_provenance",
-        review_between_preflight_and_lock,
+        "has_candidate_for_provenance",
+        review_after_reconciliation_cutoff,
     )
 
     service.reconcile_source_lifecycle(
@@ -6036,10 +6993,95 @@ def test_source_reconciliation_rereads_candidate_after_concurrent_review(
     )
 
     persisted = service.repository.get_candidate(candidate.id)
-    assert calls == 2
+    assert review_applied is True
     assert persisted is not None
     assert persisted.state.review_state == ReviewState.APPROVED
     assert persisted.state.lifecycle_status == LifecycleStatus.STALE
+
+
+def test_source_reconciliation_uses_bounded_pages_and_completes_every_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    provenance_ref = "runbook:high-churn-source"
+    candidates = [
+        service.create_candidate(
+            kind=KnowledgeKind.DEPENDENCY,
+            payload_ref=f"high-churn-{index}",
+            typed_payload={"generation": index},
+            proposition={
+                "subject_ref": "entity:service:checkout",
+                "predicate": "depends_on",
+                "object_ref": "entity:datastore:redis-session",
+            },
+            scope=KnowledgeScope(service_refs=["entity:service:checkout"]),
+            evidence=[
+                KnowledgeEvidenceReference(
+                    evidence_ref=f"high-churn-evidence-{index}",
+                    source_family=SourceFamily.RUNBOOK,
+                    lineage_group=f"high-churn-{index}",
+                    lineage_kind=LineageKind.INDEPENDENT,
+                    provenance_refs=[provenance_ref],
+                )
+            ],
+            provenance_refs=[provenance_ref],
+        )
+        for index in range(4)
+    ]
+    monkeypatch.setattr("tacit.knowledge.service._SOURCE_RECONCILIATION_PAGE_SIZE", 1)
+    list_page = service.repository.list_candidates_for_provenance
+    observed_limits: list[int] = []
+
+    def capture_page_limit(*args, **kwargs):
+        observed_limits.append(kwargs["limit"])
+        return list_page(*args, **kwargs)
+
+    monkeypatch.setattr(service.repository, "list_candidates_for_provenance", capture_page_limit)
+
+    service.reconcile_source_lifecycle(
+        provenance_ref=provenance_ref,
+        source_stale=True,
+    )
+
+    assert len(observed_limits) == len(candidates) + 1
+    assert set(observed_limits) == {1}
+    assert all(
+        service.repository.get_candidate(candidate.id).state.lifecycle_status == LifecycleStatus.STALE
+        for candidate in candidates
+    )
+
+
+def test_source_reconciliation_rolls_back_when_conflict_budget_is_exceeded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref="conflict-budget-source",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="conflict-budget-source",
+    )
+    observed_limits: list[int | None] = []
+
+    def over_budget_conflicts(*_args, **kwargs):
+        observed_limits.append(kwargs.get("limit"))
+        return [object(), object()]
+
+    monkeypatch.setattr("tacit.knowledge.service._SOURCE_RECONCILIATION_CONFLICT_BUDGET", 1)
+    monkeypatch.setattr(service.repository, "list_conflicts", over_budget_conflicts)
+
+    with pytest.raises(CandidateLifecycleConflictError, match="conflict transition budget exceeded"):
+        service.reconcile_source_lifecycle(
+            provenance_ref=candidate.provenance_refs[0],
+            source_stale=True,
+        )
+
+    current = service.repository.get_candidate(candidate.id)
+    assert observed_limits == [2]
+    assert current is not None
+    assert current.state.lifecycle_status == LifecycleStatus.ACTIVE
 
 
 def test_source_retirement_rolls_back_candidate_revision_and_projection_together(
@@ -6308,7 +7350,7 @@ def test_reingested_stale_candidate_reactivates_and_is_reevaluated(tmp_path: Pat
     first, active = _promoted_dependency(service)
     service.reconcile_source_lifecycle(
         provenance_ref="provenance:runbook",
-        active_candidate_ids=set(),
+        source_stale=True,
     )
     stale = service.repository.get_candidate(first.id)
     assert stale is not None
@@ -6335,15 +7377,125 @@ def test_reingested_stale_candidate_reactivates_and_is_reevaluated(tmp_path: Pat
     assert current.state.eligibility == KnowledgeEligibility.CONTEXTUAL_ONLY
 
 
+@pytest.mark.parametrize(
+    ("reingested_review_state", "expected_lifecycle"),
+    [
+        (ReviewState.TRUSTED.value, LifecycleStatus.ACTIVE),
+        (ReviewState.CANDIDATE.value, LifecycleStatus.STALE),
+    ],
+)
+def test_source_changed_candidate_requires_reviewed_reingestion_to_reactivate(
+    tmp_path: Path,
+    reingested_review_state: str,
+    expected_lifecycle: LifecycleStatus,
+):
+    service = _service(tmp_path)
+    row = {
+        "id": "source-changed-signal",
+        "signal_type": "request_latency",
+        "metric_pattern": "checkout_latency_seconds",
+        "source_type": "dashboard_ingest",
+        "source_refs": ["grafana:source-changed"],
+        "review_state": ReviewState.TRUSTED.value,
+        "context_services": ["checkout"],
+    }
+    candidate_id = migrate_signal_mapping(row, service=service)
+    _, active = service.evaluate_candidate(candidate_id, live_verified=True)
+    assert active is not None
+
+    service.reconcile_source_lifecycle(
+        provenance_ref="grafana:source-changed",
+        active_candidate_ids=set(),
+    )
+    stale = service.repository.get_revision(active.knowledge_id)
+    assert stale is not None
+    assert stale.state.lifecycle_status == LifecycleStatus.STALE
+    assert stale.revision_reason == "source_changed"
+
+    migrate_signal_mapping(
+        {**row, "review_state": reingested_review_state},
+        service=service,
+    )
+
+    candidate = service.repository.get_candidate(candidate_id)
+    current = service.repository.get_revision(active.knowledge_id)
+    assert candidate is not None and current is not None
+    assert candidate.state.lifecycle_status == expected_lifecycle
+    assert current.state.lifecycle_status == expected_lifecycle
+
+
+def test_reingestion_does_not_reactivate_human_stale_knowledge(tmp_path: Path, monkeypatch):
+    from tacit.knowledge.migration import _evaluate_imported_approval
+
+    service = _service(tmp_path)
+    original_candidate, active = _promoted_dependency(service)
+    correction, _ = service.create_correction(
+        investigation_id="inv-human-stale-terminal",
+        investigation_revision=1,
+        correction_type=CorrectionType.KNOWLEDGE_STALE,
+        target_ref=active.knowledge_id,
+        target_revision=active.revision,
+        proposed={
+            "subject_ref": "concept:artifact-quality",
+            "predicate": "useful_for_investigation",
+            "concept_ref": "concept:human-stale-decision",
+        },
+        scope=active.scope,
+        explanation="An operator marked this knowledge stale.",
+        created_by="operator",
+    )
+    _, stale_revision = service.review_correction(
+        correction.id,
+        approved=True,
+        reviewer="operator",
+    )
+    assert stale_revision is not None
+    assert stale_revision.revision_reason == "knowledge_stale"
+
+    reingested = service.create_candidate(
+        kind=original_candidate.kind,
+        payload_ref=original_candidate.payload_ref,
+        typed_payload=original_candidate.typed_payload,
+        proposition=original_candidate.proposition,
+        scope=original_candidate.scope,
+        evidence=original_candidate.evidence.items,
+        provenance_refs=original_candidate.provenance_refs,
+        candidate_id=original_candidate.id,
+        reactivate_stale=True,
+    )
+    monkeypatch.setattr(
+        service,
+        "evaluate_candidate",
+        lambda *args, **kwargs: pytest.fail("human-stale authority requires an explicit reactivation"),
+    )
+
+    _evaluate_imported_approval(service, reingested, previous_candidate=original_candidate)
+
+    current = service.repository.get_revision(active.knowledge_id)
+    assert reingested.state.review_state == ReviewState.APPROVED
+    assert current == stale_revision
+
+
 def test_repeated_candidate_evaluation_reuses_unchanged_revision(tmp_path: Path):
     service = _service(tmp_path)
     candidate, original = _promoted_dependency(service)
+    candidate_before = service.repository.get_candidate(candidate.id)
+    events_before = service.repository.list_events(limit=1_000)
+    with service.repository._conn() as conn:
+        corroboration_before = conn.execute("SELECT COUNT(*) FROM corroboration_snapshots").fetchone()[0]
+        decisions_before = conn.execute("SELECT COUNT(*) FROM promotion_decisions").fetchone()[0]
 
     decision, repeated = service.evaluate_candidate(candidate.id)
 
     assert decision.decision.value == "promote"
     assert repeated == original
+    assert service.repository.get_candidate(candidate.id) == candidate_before
     assert len(service.repository.list_revisions(original.knowledge_id)) == 1
+    events_after = service.repository.list_events(limit=1_000)
+    assert len(events_after) == len(events_before)
+    with service.repository._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM corroboration_snapshots").fetchone()[0] == corroboration_before
+        assert conn.execute("SELECT COUNT(*) FROM promotion_decisions").fetchone()[0] == decisions_before
 
 
 def test_concurrent_candidate_evaluation_reuses_the_committed_revision(
@@ -6611,12 +7763,11 @@ def test_stale_worker_does_not_retire_a_newer_source_generation(
         family=SourceFamily.RUNBOOK,
         lineage_group="runbook:source-generation",
     )
-    list_candidates = service.repository.list_candidates_for_provenance
+    has_candidate = service.repository.has_candidate_for_provenance
     reingested = False
 
-    def list_then_reingest(*args, **kwargs):
+    def reingest_after_reconciliation_cutoff(*args, **kwargs):
         nonlocal reingested
-        observed = list_candidates(*args, **kwargs)
         if not reingested:
             reingested = True
             service.create_candidate(
@@ -6629,9 +7780,13 @@ def test_stale_worker_does_not_retire_a_newer_source_generation(
                 provenance_refs=original.provenance_refs,
                 candidate_id=original.id,
             )
-        return observed
+        return has_candidate(*args, **kwargs)
 
-    monkeypatch.setattr(service.repository, "list_candidates_for_provenance", list_then_reingest)
+    monkeypatch.setattr(
+        service.repository,
+        "has_candidate_for_provenance",
+        reingest_after_reconciliation_cutoff,
+    )
 
     revisions = service.reconcile_source_lifecycle(
         provenance_ref=original.provenance_refs[0],
@@ -6827,6 +7982,26 @@ def test_investigation_scope_ignores_unlabelled_decimal_measurements(prompt: str
     )
 
     assert scope.version_constraints == []
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Investigate checkout-prod latency.",
+        "Investigate prod-checkout latency.",
+        "Investigate checkout_prod latency.",
+        "Investigate prod.checkout latency.",
+    ],
+)
+def test_investigation_scope_does_not_extract_environment_from_service_identifiers(prompt: str):
+    scope = investigation_knowledge_scope(
+        tenant_id="tenant-a",
+        prompt=prompt,
+        services=[prompt.split()[1]],
+        archetype_ids=["latency_investigation"],
+    )
+
+    assert scope.environment_refs == []
 
 
 @pytest.mark.parametrize(
@@ -7378,6 +8553,141 @@ def test_api_queue_tenant_and_permissions(tmp_path: Path, monkeypatch: pytest.Mo
     )
 
 
+def test_candidate_audit_history_is_keyset_paginated_beyond_ten_thousand(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    template = _dependency(
+        service,
+        payload_ref="candidate-page-template",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="candidate-page-template",
+    )
+    base_time = datetime(2025, 1, 1, tzinfo=UTC)
+    template_payload = template.model_dump(mode="json")
+    rows = []
+    for index in range(10_004):
+        candidate_id = f"kc-page-{index:05d}"
+        created_at = base_time + timedelta(seconds=index)
+        candidate_payload = {
+            **template_payload,
+            "id": candidate_id,
+            "payload_ref": f"candidate-page-{index:05d}",
+            "created_at": created_at.isoformat(),
+            "updated_at": created_at.isoformat(),
+        }
+        rows.append(
+            (
+                candidate_id,
+                "default",
+                template.kind.value,
+                candidate_payload["payload_ref"],
+                template.proposition.proposition_key,
+                template.scope.model_dump_json(),
+                template.state.review_state.value,
+                template.state.lifecycle_status.value,
+                template.state.eligibility.value,
+                template.entity_resolution.status.value,
+                "",
+                "",
+                20,
+                0,
+                json.dumps(candidate_payload, sort_keys=True),
+                created_at.timestamp(),
+                created_at.timestamp(),
+                created_at.timestamp(),
+            )
+        )
+    with service.repository._conn() as conn:
+        conn.execute(
+            "UPDATE knowledge_candidates SET created_at=?, updated_at=? WHERE id=?",
+            ((base_time + timedelta(seconds=10_004)).timestamp(), base_time.timestamp(), template.id),
+        )
+        conn.executemany(
+            """INSERT INTO knowledge_candidates (
+                   id, tenant_id, kind, payload_ref, proposition_key, scope_json,
+                   review_state, lifecycle_status, eligibility, entity_resolution_status,
+                   promotion_policy_id, promotion_policy_version, review_priority,
+                   has_unresolved_conflict, candidate_json, source_updated_at,
+                   created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    app = create_app(runtime_settings=Settings(_env_file=None, knowledge_permissions="knowledge.read"))
+    client = TestClient(app)
+    cursor = None
+    candidate_ids: list[str] = []
+    page_count = 0
+    while True:
+        params = {"limit": 500}
+        if cursor:
+            params["cursor"] = cursor
+        response = client.get("/api/v1/knowledge/candidates", params=params)
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        candidate_ids.extend(candidate["id"] for candidate in payload["candidates"])
+        page_count += 1
+        if not payload["has_more"]:
+            assert payload["next_cursor"] is None
+            break
+        cursor = payload["next_cursor"]
+        assert cursor
+
+    assert page_count == 21
+    assert len(candidate_ids) == 10_005
+    assert len(set(candidate_ids)) == 10_005
+    assert candidate_ids[0] == template.id
+    assert candidate_ids[-1] == "kc-page-00000"
+    assert client.get("/api/v1/knowledge/candidates", params={"cursor": "not-a-cursor"}).status_code == 400
+
+    with service.repository._conn() as conn:
+        plan = conn.execute(
+            """EXPLAIN QUERY PLAN SELECT id, created_at, candidate_json
+               FROM knowledge_candidates
+               WHERE tenant_id=? AND (created_at < ? OR (created_at = ? AND id < ?))
+               ORDER BY created_at DESC, id DESC LIMIT ?""",
+            ("default", 10_000.0, 10_000.0, "kc-page-10000", 501),
+        ).fetchall()
+    assert any("idx_kc_tenant_created_page" in str(row["detail"]) for row in plan)
+
+
+def test_candidate_cli_returns_and_accepts_keyset_cursor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path)
+    for index in range(3):
+        _dependency(
+            service,
+            payload_ref=f"cli-page-{index}",
+            family=SourceFamily.RUNBOOK,
+            lineage_group=f"cli-page-{index}",
+        )
+
+    stores = SimpleNamespace(
+        settings=Settings(_env_file=None, knowledge_permissions="knowledge.read"),
+        knowledge_repository=lambda: service.repository,
+    )
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: stores)
+    runner = CliRunner()
+    first = runner.invoke(cli, ["knowledge", "candidates", "--limit", "2"])
+    assert first.exit_code == 0, first.output
+    first_payload = json.loads(first.output)
+    assert first_payload["has_more"] is True
+    assert first_payload["next_cursor"]
+
+    second = runner.invoke(
+        cli,
+        ["knowledge", "candidates", "--limit", "2", "--cursor", first_payload["next_cursor"]],
+    )
+    assert second.exit_code == 0, second.output
+    second_payload = json.loads(second.output)
+    assert len(second_payload["candidates"]) == 1
+    assert second_payload["has_more"] is False
+
+
 def test_review_queue_prioritizes_before_applying_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     service = _service(tmp_path)
     high_priority = _dependency(
@@ -7773,7 +9083,7 @@ def test_api_reports_concurrent_candidate_review_as_conflict(monkeypatch: pytest
     client = TestClient(
         create_app(
             runtime_settings=Settings(
-                knowledge_permissions="knowledge.read,knowledge.review",
+                knowledge_permissions="knowledge.read,knowledge.review,knowledge.apply",
             )
         )
     )
@@ -7964,7 +9274,7 @@ def test_api_review_returns_post_evaluation_candidate_state(tmp_path: Path, monk
         runtime_settings=Settings(
             api_auth_enabled=False,
             knowledge_tenant_id="tenant-a",
-            knowledge_permissions="knowledge.read,knowledge.review,knowledge.override",
+            knowledge_permissions="knowledge.read,knowledge.review,knowledge.apply,knowledge.override",
         )
     )
 
@@ -8000,7 +9310,7 @@ def test_cli_review_returns_post_evaluation_candidate_state(
     class Stores:
         settings = Settings(
             _env_file=None,
-            knowledge_permissions="knowledge.read,knowledge.review,knowledge.override",
+            knowledge_permissions="knowledge.read,knowledge.review,knowledge.apply,knowledge.override",
         )
 
         def knowledge(self):
@@ -8064,7 +9374,7 @@ def test_approved_candidate_can_be_evaluated_on_retry(tmp_path: Path, monkeypatc
         runtime_settings=Settings(
             api_auth_enabled=False,
             knowledge_tenant_id="tenant-a",
-            knowledge_permissions="knowledge.read,knowledge.review,knowledge.override",
+            knowledge_permissions="knowledge.read,knowledge.review,knowledge.apply,knowledge.override",
         )
     )
     client = TestClient(app)
@@ -8088,6 +9398,66 @@ def test_approved_candidate_can_be_evaluated_on_retry(tmp_path: Path, monkeypatc
     assert evaluated.status_code == 200
     assert evaluated.json()["promotion_decision"]["decision"] == "promote"
     assert evaluated.json()["knowledge_revision"] is not None
+
+
+def test_candidate_evaluation_requires_apply_at_service_api_and_cli_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path, "tenant-a")
+    candidate = _dependency(
+        service,
+        payload_ref="evaluation-apply-boundary",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="evaluation-apply-boundary",
+        tenant_id="tenant-a",
+    )
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-a",
+        knowledge_permissions="knowledge.read,knowledge.review",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        service.evaluate_candidate(candidate.id, tenant_id="tenant-a")
+
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
+    response = TestClient(create_app(runtime_settings=service._runtime_settings)).post(
+        f"/api/v1/knowledge/{candidate.id}/review",
+        json={"decision": "approve", "reviewer": "operator", "evaluate": True},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.apply"
+    assert service.repository.get_candidate(candidate.id, "tenant-a").state.review_state == ReviewState.CANDIDATE
+
+    class Stores:
+        settings = service._runtime_settings
+
+        def knowledge(self):
+            raise AssertionError("CLI initialized knowledge evaluation without apply permission")
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", Stores)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "knowledge",
+            "review",
+            candidate.id,
+            "--approve",
+            "--reviewer",
+            "operator",
+            "--tenant",
+            "tenant-a",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "missing permission: knowledge.apply" in result.output
+    assert service.repository.get_candidate(candidate.id, "tenant-a").state.review_state == ReviewState.CANDIDATE
 
 
 def test_api_correction_authority_requires_override_permission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -8361,29 +9731,32 @@ def test_pending_cli_learning_preserves_wildcard_tenant(monkeypatch: pytest.Monk
 def test_cli_reject_and_ignore_thread_wildcard_tenant(monkeypatch: pytest.MonkeyPatch):
     seen: list[tuple[str, str]] = []
 
-    class FakeSignalStore:
-        def ignore_ingested_dashboard(self, dashboard_uid, *, backend_name, tenant_id):
-            seen.append(("ignore", tenant_id))
-            return True
-
     class FakeStores:
         settings = SimpleNamespace(
             knowledge_tenant_id="*",
-            knowledge_permissions="knowledge.read,knowledge.review,knowledge.trust,knowledge.reject",
+            knowledge_permissions=("knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.apply"),
         )
 
         def signals(self):
-            return FakeSignalStore()
+            return object()
 
     def reject_dashboard_record(**kwargs):
         seen.append(("reject", kwargs["tenant_id"]))
         return {"status": "rejected", "rejected_candidates": 0}
+
+    def ignore_dashboard_record(**kwargs):
+        seen.append(("ignore", kwargs["tenant_id"]))
+        return {"status": "ignored", "message": "Dashboard ignored"}
 
     monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
     monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: FakeStores())
     monkeypatch.setattr(
         "tacit.dashboard_ingest.reject_ingested_dashboard_record",
         reject_dashboard_record,
+    )
+    monkeypatch.setattr(
+        "tacit.dashboard_ingest.ignore_ingested_dashboard_record",
+        ignore_dashboard_record,
     )
     runner = CliRunner()
 
@@ -8403,17 +9776,22 @@ def test_knowledge_ui_sends_selected_tenant_and_api_key_headers():
     assert "headers['X-Tacit-Tenant'] = tenant" in html
     assert "headers['X-API-Key'] = apiKey" in html
     assert "sessionStorage.setItem(API_KEY_SESSION_KEY, value)" in html
-    assert "knowledgeHeaders({ 'Content-Type': 'application/json' })" in html
+    assert "function captureTenantRequest(tenant = selectedTenant())" in html
+    assert "headers: knowledgeHeaders(options.headers || {}, request.tenant)" in html
+    assert "requireCurrentTenantRequest(request)" in html
+    assert "if (isStaleTenantResponse(error)) return" in html
     assert "if (tenant) payload.tenant_id = tenant" in html
-    assert "data = await streamChart(payload, onStage, tenant)" in html
-    assert html.count("headers: knowledgeHeaders({ 'Content-Type': 'application/json' }, tenant)") == 2
-    assert "headers: knowledgeHeaders()," in html
-    assert "fetch(`${BASE}/api/v1/investigations${qs}`, { headers: knowledgeHeaders() })" in html
-    assert "fetch(`${BASE}/api/v1/investigations/${id}`, { headers: knowledgeHeaders() })" in html
-    assert "fetch(`${BASE}/api/v1/investigations/stats`, { headers: knowledgeHeaders() })" in html
-    assert 'data-dashboard-tenant="${escAttr(tenant)}"' in html
-    assert "headers: knowledgeHeaders({}, tenant)" in html
+    assert "data = await streamChart(payload, onStage, request)" in html
+    assert "fetchTenantJson(`${BASE}/api/v1/investigations${qs}`, {}, request)" in html
+    assert "fetchTenantJson(`${BASE}/api/v1/investigations/${encodeURIComponent(id)}`, {}, request)" in html
+    assert "fetchTenantJson(`${BASE}/api/v1/investigations/stats`, {}, request)" in html
+    assert 'data-dashboard-tenant="${escAttr(request.tenant)}"' in html
     assert "btn.dataset.dashboardTenant" in html
+    assert "lastDashboardTenant = tenant" in html
+    assert "lastDashboardUid = null" in html
+    assert "tenantRequestGeneration += 1" in html
+    assert "invalidateTenantViews()" in html
+    assert "reloadActiveTenantView()" in html
 
 
 def test_cli_resolves_tenants_from_active_runtime_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

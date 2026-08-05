@@ -577,7 +577,9 @@ class TeachSignalRequest(BaseModel):
 
     signal_type: str = Field(description="Organization-specific signal name, e.g. 'queue_depth'")
     metric_patterns: list[MetricPattern] = Field(
-        default_factory=list, description="Metric patterns this signal maps to"
+        min_length=1,
+        max_length=100,
+        description="Metric patterns this signal maps to (1-100 per atomic request)",
     )
     description: str = Field(default="", description="Human-readable description of the signal")
     category: str = Field(default="", description="Signal category, e.g. 'saturation'")

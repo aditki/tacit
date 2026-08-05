@@ -704,7 +704,7 @@ def test_counterfactual_replay_resorts_candidates_after_score_changes(tmp_path):
     assert replayed.grounding.maximum_trustworthy_conclusion["text"].startswith("cache:shared-cache")
 
 
-def test_counterfactual_score_override_abstains_when_the_new_leader_has_no_runtime_support():
+def test_counterfactual_score_override_keeps_supported_candidate_ahead_of_contextual_candidate():
     ranking = CulpritRanking(
         abstained=False,
         telemetry_status="evidenced",
@@ -732,9 +732,10 @@ def test_counterfactual_score_override_abstains_when_the_new_leader_has_no_runti
         CounterfactualChanges(candidate_score_overrides={"cache:shared-cache": 0.95}),
     )
 
-    assert replayed.culprit_ranking.candidates[0].suspect == "shared-cache"
-    assert replayed.culprit_ranking.abstained is True
-    assert replayed.culprit_ranking.abstention_reason == "counterfactual_leading_candidate_unsupported"
+    assert replayed.culprit_ranking.candidates[0].suspect == "checkout"
+    assert replayed.culprit_ranking.candidates[1].suspect == "shared-cache"
+    assert replayed.culprit_ranking.abstained is False
+    assert replayed.culprit_ranking.abstention_reason == ""
     assert replayed.culprit_ranking.telemetry_status == "evidenced"
 
 
@@ -2220,6 +2221,147 @@ def test_run_completed_event_follows_revision_events(tmp_path):
     assert runtime_manifest["engine_version"] == __version__
 
 
+def test_history_audit_routes_keyset_page_newest_records_without_caps(tmp_path):
+    runtime_settings = Settings(_env_file=None)
+    store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=runtime_settings)
+    investigation_id = store.start("Long-lived investigation")
+    contract_json = _draft_contract(investigation_id).model_dump_json(by_alias=True)
+    revision_count = 550
+    run_count = 510
+    event_count = 1_105
+    with store._conn() as conn:
+        conn.executemany(
+            """INSERT INTO investigation_revisions(
+                   investigation_id, revision, parent_revision, schema_version,
+                   contract_json, input_fingerprint, output_fingerprint,
+                   engine_version, created_at, reason
+               ) VALUES (?, ?, ?, '1.0', ?, ?, ?, ?, ?, 'test')""",
+            [
+                (
+                    investigation_id,
+                    revision,
+                    revision - 1 if revision > 1 else None,
+                    contract_json,
+                    f"input-{revision}",
+                    f"output-{revision}",
+                    __version__,
+                    float(revision),
+                )
+                for revision in range(1, revision_count + 1)
+            ],
+        )
+        conn.execute(
+            "UPDATE investigations SET current_revision=? WHERE id=?",
+            (revision_count, investigation_id),
+        )
+        conn.executemany(
+            """INSERT INTO investigation_runs(
+                   run_id, investigation_id, base_revision, run_type, status,
+                   started_at, runtime_manifest_json
+               ) VALUES (?, ?, ?, 'refresh', 'completed', ?, '{}')""",
+            [(f"run-{index:04d}", investigation_id, index, float(index)) for index in range(1, run_count + 1)],
+        )
+        conn.executemany(
+            """INSERT INTO investigation_events(
+                   event_id, investigation_id, run_id, sequence, event_type,
+                   payload_json, created_at
+               ) VALUES (?, ?, 'run-0510', ?, 'stage_recorded', '{}', ?)""",
+            [(f"event-{index:05d}", investigation_id, index, float(index)) for index in range(1, event_count + 1)],
+        )
+
+        run_plan = " ".join(
+            str(value)
+            for row in conn.execute(
+                """EXPLAIN QUERY PLAN SELECT run_id FROM investigation_runs
+                    WHERE investigation_id=?
+                    ORDER BY started_at DESC, run_id DESC LIMIT 20""",
+                (investigation_id,),
+            )
+            for value in row
+        )
+        event_plan = " ".join(
+            str(value)
+            for row in conn.execute(
+                """EXPLAIN QUERY PLAN SELECT event_id FROM investigation_events
+                    WHERE investigation_id=?
+                    ORDER BY created_at DESC, sequence DESC, event_id DESC LIMIT 20""",
+                (investigation_id,),
+            )
+            for value in row
+        )
+    assert "idx_inv_runs_page" in run_plan
+    assert "idx_inv_events_page" in event_plan
+
+    app = create_app(runtime_settings=runtime_settings)
+    app.dependency_overrides[get_history_store] = lambda: store
+    client = TestClient(app)
+
+    def collect(
+        path: str,
+        key: str,
+        identity: str,
+        *,
+        limit: int,
+        extra_params: dict[str, str] | None = None,
+    ) -> list:
+        collected = []
+        cursor = None
+        while True:
+            params = {"limit": limit, **(extra_params or {})}
+            if cursor:
+                params["cursor"] = cursor
+            response = client.get(path, params=params)
+            assert response.status_code == 200
+            body = response.json()
+            collected.extend(item[identity] for item in body[key])
+            assert body["count"] == len(body[key])
+            if not body["has_more"]:
+                assert body["next_cursor"] is None
+                break
+            cursor = body["next_cursor"]
+            assert cursor
+        return collected
+
+    revisions = collect(
+        f"/api/v1/investigations/{investigation_id}/revisions",
+        "revisions",
+        "revision",
+        limit=137,
+    )
+    runs = collect(
+        f"/api/v1/investigations/{investigation_id}/runs",
+        "runs",
+        "run_id",
+        limit=113,
+    )
+    events = collect(
+        f"/api/v1/investigations/{investigation_id}/events",
+        "events",
+        "event_id",
+        limit=211,
+    )
+    run_events = collect(
+        f"/api/v1/investigations/{investigation_id}/events",
+        "events",
+        "event_id",
+        limit=197,
+        extra_params={"run_id": "run-0510"},
+    )
+
+    assert revisions == list(range(revision_count, 0, -1))
+    assert runs == [f"run-{index:04d}" for index in range(run_count, 0, -1)]
+    assert events == [f"event-{index:05d}" for index in range(event_count, 0, -1)]
+    assert run_events == events
+    assert len(set(revisions)) == revision_count
+    assert len(set(runs)) == run_count
+    assert len(set(events)) == event_count
+    malformed = client.get(
+        f"/api/v1/investigations/{investigation_id}/events",
+        params={"cursor": "not-a-valid-cursor"},
+    )
+    assert malformed.status_code == 400
+
+
 def test_failed_knowledge_audit_guard_includes_applied_ranking_usage():
     usage = [
         KnowledgeUsage(
@@ -2249,7 +2391,11 @@ async def test_failed_refresh_does_not_overwrite_current_investigation_row(tmp_p
         dashboard_url="http://grafana/current",
     )
     deps = PipelineDependencies(
-        settings=SimpleNamespace(pipeline_max_concurrent=1, pipeline_timeout_seconds=5),
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_permissions="knowledge.read,knowledge.apply",
+        ),
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -2298,6 +2444,7 @@ async def test_direct_refresh_rejects_a_cross_tenant_investigation_before_starti
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_tenant_id="*",
+            knowledge_permissions="knowledge.read,knowledge.apply",
         ),
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
@@ -2330,7 +2477,11 @@ async def test_pipeline_preserves_a_caller_supplied_base_revision(monkeypatch):
 
     monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", fake_inner)
     deps = PipelineDependencies(
-        settings=SimpleNamespace(pipeline_max_concurrent=1, pipeline_timeout_seconds=5),
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_permissions="knowledge.read,knowledge.apply",
+        ),
         backend_factory=lambda: [],
         history_store_factory=lambda: object(),
         feedback_store_factory=lambda: object(),
@@ -2349,6 +2500,53 @@ async def test_pipeline_preserves_a_caller_supplied_base_revision(monkeypatch):
     assert received["investigation_id"] == "inv-pinned"
     assert received["run_type"] == InvestigationRunType.REFRESH
     assert received["base_revision"] == 1
+
+
+@pytest.mark.parametrize(
+    ("permissions", "missing_permission"),
+    [
+        ("knowledge.apply", "knowledge.read"),
+        ("knowledge.read", "knowledge.apply"),
+    ],
+)
+async def test_direct_refresh_authorizes_before_history_or_backend_access(
+    permissions,
+    missing_permission,
+):
+    accessed: list[str] = []
+
+    def history_store_factory():
+        accessed.append("history")
+        raise AssertionError("history must not be opened before authorization")
+
+    def backend_factory():
+        accessed.append("backend")
+        raise AssertionError("backends must not be opened before authorization")
+
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_permissions=permissions,
+        ),
+        backend_factory=backend_factory,
+        history_store_factory=history_store_factory,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    with pytest.raises(PermissionError, match=f"Missing permission: {missing_permission}"):
+        await run_pipeline(
+            DashRequest(prompt="Refresh checkout"),
+            deps,
+            investigation_id="inv-existing",
+            run_type=InvestigationRunType.REFRESH,
+        )
+
+    assert accessed == []
 
 
 async def test_backend_factory_failure_completes_the_pipeline_run(tmp_path):
@@ -2498,6 +2696,7 @@ async def test_successful_refresh_only_advances_the_legacy_row_revision_pointer(
         store,
         investigation_id,
         run_id=run_id,
+        tenant_id="default",
         record_investigation_updates=False,
     )
     refreshed_dashboard = DashboardSpec(
@@ -2580,6 +2779,7 @@ async def test_refresh_persistence_rejects_a_base_that_advanced_during_the_run(t
         store,
         investigation_id,
         run_id=run_id,
+        tenant_id="default",
         record_investigation_updates=False,
     )
     dashboard = DashboardSpec(
@@ -3068,7 +3268,12 @@ async def test_published_dashboard_succeeds_when_contract_persistence_fails():
             return None
 
     history = FailingContractHistory()
-    recorder = PipelineRecorder(history, "inv-published", "run-published")
+    recorder = PipelineRecorder(
+        history,
+        "inv-published",
+        "run-published",
+        tenant_id="default",
+    )
     dashboard = DashboardSpec(
         title="Published dashboard",
         panels=[PanelSpec(title="Traffic", queries=[PanelQuery(expr="up", datasource_uid="prom")])],
@@ -3121,6 +3326,7 @@ async def test_published_dashboard_succeeds_when_contract_persistence_fails():
             "status": "completed",
             "error_code": "contract_persistence_failed",
             "error_detail": "RuntimeError: database is locked",
+            "tenant_id": "default",
         }
     ]
 
@@ -3410,11 +3616,68 @@ def test_knowledge_bearing_history_disclosures_require_read_permission(tmp_path)
             json={"approved": True, "reviewed_by": "operator"},
         ),
         client.post(f"/api/v1/investigations/{investigation_id}/corrections/missing/apply"),
+        client.post(f"/api/v1/investigations/{investigation_id}/refresh"),
         client.post(f"/api/v1/investigations/{investigation_id}/migrate"),
     ]
 
     assert {response.status_code for response in responses} == {403}
     assert {response.json()["detail"] for response in responses} == {"Missing permission: knowledge.read"}
+
+
+def test_refresh_requires_apply_permission_before_loading_or_publishing(tmp_path):
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read",
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=runtime_settings,
+    )
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    runs_before = store.list_runs(investigation_id)
+
+    response = TestClient(create_app(runtime_settings=runtime_settings)).post(
+        f"/api/v1/investigations/{investigation_id}/refresh"
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.apply"
+    assert store.list_runs(investigation_id) == runs_before
+
+
+def test_history_store_replay_and_migration_enforce_domain_permissions(tmp_path):
+    db_path = tmp_path / "history.db"
+    privileged = InvestigationStore(db_path=db_path)
+    replay_id = privileged.start("Replay this investigation", user_id="api")
+    privileged.persist_contract_revision(_draft_contract(replay_id))
+    migration_id = privileged.start("Migrate this investigation", user_id="api")
+    privileged.finish(migration_id, status="success")
+    replay_runs_before = privileged.list_runs(replay_id)
+
+    apply_only = InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_permissions="knowledge.apply"),
+    )
+    with pytest.raises(PermissionError, match="knowledge.read"):
+        apply_only.replay_contract(replay_id, mode=ReplayMode.EXACT)
+    with pytest.raises(PermissionError, match="knowledge.read"):
+        apply_only.migrate_legacy_investigation(migration_id)
+
+    read_only = InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_permissions="knowledge.read"),
+    )
+    with pytest.raises(PermissionError, match="knowledge.apply"):
+        read_only.replay_contract(replay_id, mode=ReplayMode.CURRENT_ENGINE)
+    with pytest.raises(PermissionError, match="knowledge.apply"):
+        read_only.migrate_legacy_investigation(migration_id)
+
+    assert privileged.get_contract(migration_id) is None
+    assert privileged.list_runs(replay_id) == replay_runs_before
 
 
 def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch):

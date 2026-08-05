@@ -21,6 +21,7 @@ from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies
 from tacit.errors import FatalPipelineError
 from tacit.history import get_investigation_store
 from tacit.investigation_contract import InvestigationRunType
+from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 from tacit.logging import bind_request_id, stage_log, unbind_request_id
 from tacit.models.schemas import (
     DashRequest,
@@ -200,6 +201,9 @@ async def run_pipeline(
     """End-to-end: natural language → Grafana dashboard URL."""
     deps = deps or _default_dependencies()
     runtime_settings = deps.settings
+    if investigation_id is not None or run_type == InvestigationRunType.REFRESH:
+        enforce_knowledge_action(runtime_settings, KnowledgeAction.READ)
+        enforce_knowledge_action(runtime_settings, KnowledgeAction.APPLY)
     from tacit.tenancy import resolve_tenant_boundary
 
     configured_tenant = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
@@ -304,13 +308,19 @@ async def _run_pipeline_inner(
     run_id = None
     if hasattr(history, "start_run"):
         try:
-            run_id = history.start_run(inv_id, run_type=run_type, base_revision=base_revision)
+            run_id = history.start_run(
+                inv_id,
+                run_type=run_type,
+                base_revision=base_revision,
+                tenant_id=request.tenant_id,
+            )
         except Exception:
             logger.warning("investigation_run_start_failed", investigation_id=inv_id, exc_info=True)
     recorder = PipelineRecorder(
         history,
         inv_id,
         run_id=run_id,
+        tenant_id=request.tenant_id,
         record_investigation_updates=investigation_id is None,
     )
     try:
@@ -384,6 +394,7 @@ async def _run_pipeline_inner(
         if signal_store is not SIGNAL_STORE_UNAVAILABLE:
             pin_started_at = time.monotonic()
             try:
+                enforce_knowledge_action(runtime.settings, KnowledgeAction.APPLY)
                 knowledge_service = resolve_knowledge_service(deps, signal_store=signal_store)
                 pin_snapshot = getattr(knowledge_service, "pin_snapshot", knowledge_service.create_snapshot)
                 knowledge_snapshot, knowledge_usage = pin_snapshot(knowledge_scope)
@@ -480,6 +491,7 @@ async def _run_pipeline_inner(
         # ── 4. Multi-label archetype matching ────────────────────
         target_language = primary.query_language
         t0 = time.monotonic()
+        selection_knowledge_scope = knowledge_scope
         selection = select_archetypes(
             intent=intent,
             metric_catalog=metric_catalog,
@@ -505,6 +517,87 @@ async def _run_pipeline_inner(
             },
         )
         runtime.timings["archetype_select"] = time.monotonic() - t0
+
+        added_archetype_refs = sorted(
+            set(knowledge_scope.archetype_refs).difference(selection_knowledge_scope.archetype_refs)
+        )
+        if added_archetype_refs and knowledge_service is not None and knowledge_snapshot is not None:
+            repin_started_at = time.monotonic()
+            previous_snapshot_items = {(item.knowledge_ref, item.revision) for item in knowledge_snapshot.items}
+            try:
+                repin_snapshot = getattr(knowledge_service, "repin_snapshot", None)
+                if repin_snapshot is None:
+                    raise RuntimeError("Operational Knowledge service does not support staged scope repinning")
+                staged_snapshot, staged_usage = repin_snapshot(
+                    knowledge_scope,
+                    knowledge_usage,
+                    previous_scope=selection_knowledge_scope,
+                )
+                mapping_loader = getattr(knowledge_service, "signal_mappings_for_snapshot", None)
+                staged_mappings = mapping_loader(staged_snapshot) if mapping_loader is not None else []
+                replace_pin = getattr(signal_store, "replace_pinned_governed_mappings", None)
+                if knowledge_pin_token is not None and replace_pin is not None:
+                    staged_pin_token = replace_pin(
+                        knowledge_pin_token,
+                        tenant_id=request.tenant_id,
+                        mappings=staged_mappings,
+                    )
+                else:
+                    reset_pin = getattr(signal_store, "reset_pinned_governed_mappings", None)
+                    if knowledge_pin_token is not None and reset_pin is not None:
+                        reset_pin(knowledge_pin_token)
+                    activate_pin = getattr(signal_store, "activate_pinned_governed_mappings", None)
+                    if activate_pin is None:
+                        raise RuntimeError("Signal store does not support staged scope repinning")
+                    staged_pin_token = activate_pin(
+                        tenant_id=request.tenant_id,
+                        mappings=staged_mappings,
+                    )
+                knowledge_snapshot = staged_snapshot
+                knowledge_usage = staged_usage
+                knowledge_pin_token = staged_pin_token
+                runtime.timings["knowledge_snapshot_repin"] = time.monotonic() - repin_started_at
+                staged_snapshot_items = {(item.knowledge_ref, item.revision) for item in knowledge_snapshot.items}
+                added_revision_count = len(staged_snapshot_items.difference(previous_snapshot_items))
+                logger.info(
+                    "operational_knowledge_snapshot_repinned",
+                    tenant_id=request.tenant_id,
+                    snapshot_ref=knowledge_snapshot.id,
+                    added_archetype_refs=added_archetype_refs,
+                    revision_count=len(knowledge_snapshot.items),
+                    added_revision_count=added_revision_count,
+                    resolver_mapping_count=len(staged_mappings),
+                )
+                stage_log(
+                    "knowledge_snapshot_repin",
+                    runtime.timings["knowledge_snapshot_repin"] * 1000,
+                    tenant_id=request.tenant_id,
+                    added_archetype_count=len(added_archetype_refs),
+                    added_revision_count=added_revision_count,
+                    resolver_mapping_count=len(staged_mappings),
+                )
+                runtime.recorder.stage(
+                    "knowledge_snapshot_repin",
+                    "passed",
+                    "catalog_archetype_scope_repinned",
+                    snapshot_ref=knowledge_snapshot.id,
+                    added_archetype_refs=added_archetype_refs,
+                    revision_count=len(knowledge_snapshot.items),
+                    added_revision_count=added_revision_count,
+                    resolver_mapping_count=len(staged_mappings),
+                )
+            except Exception as exc:
+                runtime.timings["knowledge_snapshot_repin"] = time.monotonic() - repin_started_at
+                runtime.recorder.stage(
+                    "knowledge_snapshot_repin",
+                    "failed",
+                    "catalog_archetype_scope_repin_failed",
+                    added_archetype_refs=added_archetype_refs,
+                    error_type=type(exc).__name__,
+                )
+                raise FatalPipelineError(
+                    "Operational Knowledge scope widened after archetype selection but could not be repinned"
+                ) from exc
 
         retrieval_details: dict[str, Any] = {
             "retrieval_mode": selection.retrieval_mode.value,

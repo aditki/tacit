@@ -21,8 +21,14 @@ from tacit.models.schemas import (
     PanelSpec,
     SignalType,
 )
+from tacit.pipeline.completion import _rounded_timings
 from tacit.pipeline.failures import PipelineFailureFactory
-from tacit.pipeline.runner import _get_semaphore, _initial_knowledge_archetype_ids, _initialize_signal_store
+from tacit.pipeline.runner import (
+    _get_semaphore,
+    _initial_knowledge_archetype_ids,
+    _initialize_signal_store,
+    run_pipeline,
+)
 from tacit.pipeline.side_effects import safe_close_backends, safe_finish_timeout_history, safe_record_provenance
 from tacit.pipeline.stages.archetypes import ArchetypeCompilation
 from tacit.pipeline.stages.freeform import build_freeform_dashboard, discovery_cache_parts
@@ -45,11 +51,13 @@ class FakeRecorder:
 class FakeHistoryStore:
     def __init__(self, fail: bool = False):
         self.fail = fail
+        self.started: list[tuple[str, str, str, str | None]] = []
         self.finished: list[tuple[str, dict]] = []
 
-    def start(self, prompt, user_id, channel_id):
+    def start(self, prompt, user_id, channel_id, tenant_id=None):
         if self.fail:
             raise RuntimeError("history unavailable")
+        self.started.append((prompt, user_id, channel_id, tenant_id))
         return "inv-1"
 
     def finish(self, inv_id, **kwargs):
@@ -596,16 +604,31 @@ def test_get_semaphore_recreates_when_limit_changes():
     assert second is third
 
 
+def test_pipeline_timing_diagnostics_preserve_sub_ten_millisecond_stages():
+    assert _rounded_timings({"knowledge_snapshot_repin": 0.00346}) == {"knowledge_snapshot_repin": 0.0035}
+
+
 def test_safe_finish_timeout_history_records_when_available():
     store = FakeHistoryStore()
+    request = _request().model_copy(update={"tenant_id": "tenant-a"})
 
     safe_finish_timeout_history(
         history_store_factory=lambda: store,
-        request=_request(),
+        request=request,
         timeout_seconds=9,
     )
 
-    assert store.finished == [("inv-1", {"status": "timeout", "error": "Timed out after 9s"})]
+    assert store.started == [("checkout latency", "u1", "c1", "tenant-a")]
+    assert store.finished == [
+        (
+            "inv-1",
+            {
+                "status": "timeout",
+                "error": "Timed out after 9s",
+                "tenant_id": "tenant-a",
+            },
+        )
+    ]
 
 
 def test_safe_finish_timeout_history_swallows_noncritical_errors():
@@ -614,6 +637,50 @@ def test_safe_finish_timeout_history_swallows_noncritical_errors():
         request=_request(),
         timeout_seconds=9,
     )
+
+
+async def test_pipeline_threads_resolved_tenant_through_run_and_recorder_history_writes():
+    class TrackingHistory:
+        def __init__(self):
+            self.calls: list[tuple[str, str | None]] = []
+
+        def start(self, _prompt, _user_id, _channel_id, *, tenant_id=None):
+            self.calls.append(("start", tenant_id))
+            return "inv-tenant-a"
+
+        def start_run(self, _investigation_id, *, run_type, base_revision=None, tenant_id=None):
+            assert run_type is not None
+            assert base_revision is None
+            self.calls.append(("start_run", tenant_id))
+            return "run-tenant-a"
+
+        def finish(self, _investigation_id, **kwargs):
+            self.calls.append(("finish", kwargs.get("tenant_id")))
+
+        def complete_run(self, _run_id, **kwargs):
+            self.calls.append(("complete_run", kwargs.get("tenant_id")))
+
+    history = TrackingHistory()
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*")
+    response = await run_pipeline(
+        DashRequest(prompt="checkout latency", tenant_id="tenant-a"),
+        PipelineDependencies(
+            settings=runtime_settings,
+            backend_factory=lambda: [],
+            history_store_factory=lambda: history,
+            feedback_store_factory=FakeFeedbackStore,
+            llm_cache={},
+            cache_key_factory=lambda *parts: ":".join(parts),
+        ),
+    )
+
+    assert response.investigation_id == "inv-tenant-a"
+    assert history.calls == [
+        ("start", "tenant-a"),
+        ("start_run", "tenant-a"),
+        ("finish", "tenant-a"),
+        ("complete_run", "tenant-a"),
+    ]
 
 
 def test_safe_record_provenance_records_when_available():

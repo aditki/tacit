@@ -35,6 +35,12 @@ from tacit.pipeline.side_effects import safe_record_provenance
 from tacit.pipeline.stages.publish import publish_dashboard
 
 logger = structlog.get_logger()
+_TIMING_DECIMAL_PLACES = 4
+
+
+def _rounded_timings(timings: dict[str, float]) -> dict[str, float]:
+    """Retain sub-10ms stage costs in persisted pipeline diagnostics."""
+    return {key: round(value, _TIMING_DECIMAL_PLACES) for key, value in timings.items()}
 
 
 async def complete_pipeline(
@@ -91,7 +97,7 @@ async def complete_pipeline(
 
     total_s = time.monotonic() - started_at
     timings["total"] = total_s
-    timings_rounded = {key: round(value, 2) for key, value in timings.items()}
+    timings_rounded = _rounded_timings(timings)
 
     recorder.validation(
         validation_warnings,

@@ -551,6 +551,12 @@ class FeedbackStore:
         tenant_id = self._resolve_tenant(tenant_id)
         dashboard_uid = _sanitize_uid(dashboard_uid)
         with self._conn() as conn:
+            provenance = conn.execute(
+                "SELECT 1 FROM dashboard_provenance WHERE tenant_id=? AND dashboard_uid=?",
+                (tenant_id, dashboard_uid),
+            ).fetchone()
+            if provenance is None:
+                raise ValueError("feedback requires dashboard provenance in the same tenant")
             cursor = conn.execute(
                 """INSERT INTO feedback
                    (tenant_id, dashboard_uid, reviewer, symptom_visibility, root_cause_support,

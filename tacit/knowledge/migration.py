@@ -6,6 +6,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 from tacit.knowledge.enums import (
     EvidenceRole,
     KnowledgeEligibility,
@@ -39,80 +40,101 @@ def migrate_artifact_extractions(
     rows: dict[str, list[dict[str, Any]]],
     service: KnowledgeService,
     tenant_id: str = "default",
+    max_candidate_count: int | None = None,
 ) -> list[str]:
     """Wrap existing typed rows without changing their payload semantics."""
-    created = []
-    for collection, kind in (
+    collections = (
         ("dependency_hints", KnowledgeKind.DEPENDENCY),
         ("ownership_hints", KnowledgeKind.OWNERSHIP),
         ("signal_mapping_candidates", KnowledgeKind.SIGNAL_MAPPING),
         ("evidence_requirements", KnowledgeKind.EVIDENCE_REQUIREMENT),
-    ):
-        for row in rows.get(collection, []):
-            legacy_id = str(row["id"])
-            proposition = _proposition(kind, row)
-            lineage_group, lineage_kind = _artifact_lineage(
-                row,
-                artifact_id=artifact_id,
-                artifact_fingerprint=artifact_fingerprint,
-                artifact_content_fingerprint=artifact_content_fingerprint,
-                source_vendor=source_vendor,
-                source_instance=source_instance,
-                external_id=external_id,
-            )
-            evidence = KnowledgeEvidenceReference(
-                evidence_ref=f"artifact:{artifact_id}:{row['id']}",
-                evidence_role=EvidenceRole.SUPPORTING,
-                source_family=_source_family(artifact_type),
-                lineage_group=lineage_group,
-                lineage_kind=lineage_kind,
-                provenance_refs=[f"prov_artifact:{artifact_id}"],
-            )
-            if kind == KnowledgeKind.DEPENDENCY:
-                scope_service = row.get("source_entity")
-            elif kind == KnowledgeKind.OWNERSHIP:
-                scope_service = row.get("entity")
-            else:
-                scope_service = row.get("target_entity")
-            scope = KnowledgeScope(
-                tenant_id=tenant_id,
-                service_refs=[_service_ref(str(scope_service))] if scope_service else [],
-            )
-            semantic_id = stable_fingerprint(
-                {
-                    "kind": kind.value,
-                    "subject_ref": proposition.get("subject_ref", ""),
-                    "predicate": str(proposition.get("predicate", "")),
-                    "object_ref": proposition.get("object_ref", ""),
-                    "concept_ref": proposition.get("concept_ref", ""),
-                    "scope": scope.model_dump(mode="json"),
-                }
-            ).split(":", 1)[1][:10]
-            tenant_prefix = "" if tenant_id == "default" else f"{tenant_id}_"
-            candidate_id = f"kc_{tenant_prefix}{legacy_id}_{semantic_id}"
-            existing = service.repository.get_candidate(candidate_id, tenant_id)
-            candidate = service.create_candidate(
-                kind=kind,
-                payload_ref=f"{collection}:{row['id']}",
-                typed_payload=row,
-                proposition=proposition,
-                scope=scope,
-                evidence=[evidence],
-                provenance_refs=[f"prov_artifact:{artifact_id}"],
-                tenant_id=tenant_id,
-                candidate_id=candidate_id,
-                migration_provenance=MigrationProvenance(original_record_ref=f"{collection}:{row['id']}"),
-                reactivate_stale=True,
-            )
-            legacy_review = str(row.get("review_state", ReviewState.CANDIDATE.value))
-            candidate = _apply_imported_review_state(
-                service,
-                candidate,
-                legacy_review,
-                was_existing=existing is not None,
-            )
-            _evaluate_imported_approval(service, candidate, previous_candidate=existing)
-            created.append(candidate.id)
+    )
+    review_states = [
+        str(row.get("review_state", ReviewState.CANDIDATE.value))
+        for collection, _kind in collections
+        for row in rows.get(collection, [])
+    ]
+    candidate_limit = (
+        int(service._runtime_settings.knowledge_source_atomic_candidate_limit)
+        if max_candidate_count is None
+        else int(max_candidate_count)
+    )
+    if len(review_states) > candidate_limit:
+        raise ValueError(
+            f"artifact extraction fan-out {len(review_states)} exceeds atomic candidate limit {candidate_limit}"
+        )
+    _preflight_imported_review_states(service, review_states)
+    if rows.get("signal_mapping_candidates"):
+        service._signal_store()
+
+    created = []
+    with service.repository.transaction():
+        for collection, kind in collections:
+            for row in rows.get(collection, []):
+                legacy_id = str(row["id"])
+                proposition = _proposition(kind, row)
+                lineage_group, lineage_kind = _artifact_lineage(
+                    row,
+                    artifact_id=artifact_id,
+                    artifact_fingerprint=artifact_fingerprint,
+                    artifact_content_fingerprint=artifact_content_fingerprint,
+                    source_vendor=source_vendor,
+                    source_instance=source_instance,
+                    external_id=external_id,
+                )
+                evidence = KnowledgeEvidenceReference(
+                    evidence_ref=f"artifact:{artifact_id}:{row['id']}",
+                    evidence_role=EvidenceRole.SUPPORTING,
+                    source_family=_source_family(artifact_type),
+                    lineage_group=lineage_group,
+                    lineage_kind=lineage_kind,
+                    provenance_refs=[f"prov_artifact:{artifact_id}"],
+                )
+                if kind == KnowledgeKind.DEPENDENCY:
+                    scope_service = row.get("source_entity")
+                elif kind == KnowledgeKind.OWNERSHIP:
+                    scope_service = row.get("entity")
+                else:
+                    scope_service = row.get("target_entity")
+                scope = KnowledgeScope(
+                    tenant_id=tenant_id,
+                    service_refs=[_service_ref(str(scope_service))] if scope_service else [],
+                )
+                semantic_id = stable_fingerprint(
+                    {
+                        "kind": kind.value,
+                        "subject_ref": proposition.get("subject_ref", ""),
+                        "predicate": str(proposition.get("predicate", "")),
+                        "object_ref": proposition.get("object_ref", ""),
+                        "concept_ref": proposition.get("concept_ref", ""),
+                        "scope": scope.model_dump(mode="json"),
+                    }
+                ).split(":", 1)[1][:10]
+                tenant_prefix = "" if tenant_id == "default" else f"{tenant_id}_"
+                candidate_id = f"kc_{tenant_prefix}{legacy_id}_{semantic_id}"
+                existing = service.repository.get_candidate(candidate_id, tenant_id)
+                candidate = service.create_candidate(
+                    kind=kind,
+                    payload_ref=f"{collection}:{row['id']}",
+                    typed_payload=row,
+                    proposition=proposition,
+                    scope=scope,
+                    evidence=[evidence],
+                    provenance_refs=[f"prov_artifact:{artifact_id}"],
+                    tenant_id=tenant_id,
+                    candidate_id=candidate_id,
+                    migration_provenance=MigrationProvenance(original_record_ref=f"{collection}:{row['id']}"),
+                    reactivate_stale=True,
+                )
+                legacy_review = str(row.get("review_state", ReviewState.CANDIDATE.value))
+                candidate = _apply_imported_review_state(
+                    service,
+                    candidate,
+                    legacy_review,
+                    was_existing=existing is not None,
+                )
+                _evaluate_imported_approval(service, candidate, previous_candidate=existing)
+                created.append(candidate.id)
     return created
 
 
@@ -226,34 +248,57 @@ def migrate_signal_mapping(
         }
     ).split(":", 1)[1][:20]
     candidate_id = f"kc_signal_{candidate_digest}"
-    existing = service.repository.get_candidate(candidate_id, tenant_id)
-    candidate = service.create_candidate(
-        kind=KnowledgeKind.SIGNAL_MAPPING,
-        payload_ref=f"signal_mapping:{record_ref}",
-        typed_payload=row,
-        proposition={
-            "subject_ref": f"concept:{signal}",
-            "predicate": Predicate.REPRESENTED_BY,
-            "concept_ref": f"signal:{signal}",
-            "object_ref": f"concept:{metric}",
-        },
-        scope=scope,
-        evidence=evidence,
-        provenance_refs=source_refs,
-        tenant_id=tenant_id,
-        candidate_id=candidate_id,
-        migration_provenance=MigrationProvenance(original_record_ref=f"signal_mapping:{record_ref}"),
-        reactivate_stale=True,
-    )
     review = str(row.get("review_state", ReviewState.CANDIDATE.value))
-    candidate = _apply_imported_review_state(
-        service,
-        candidate,
-        review,
-        was_existing=existing is not None,
-    )
-    _evaluate_imported_approval(service, candidate, previous_candidate=existing)
+    _preflight_imported_review_states(service, [review])
+    reviewed_source_change = review in {ReviewState.APPROVED.value, ReviewState.TRUSTED.value}
+    if reviewed_source_change:
+        enforce_knowledge_action(service._runtime_settings, KnowledgeAction.APPLY)
+    service._signal_store()
+    with service.repository.transaction():
+        existing = service.repository.get_candidate(candidate_id, tenant_id)
+        candidate = service.create_candidate(
+            kind=KnowledgeKind.SIGNAL_MAPPING,
+            payload_ref=f"signal_mapping:{record_ref}",
+            typed_payload=row,
+            proposition={
+                "subject_ref": f"concept:{signal}",
+                "predicate": Predicate.REPRESENTED_BY,
+                "concept_ref": f"signal:{signal}",
+                "object_ref": f"concept:{metric}",
+            },
+            scope=scope,
+            evidence=evidence,
+            provenance_refs=source_refs,
+            tenant_id=tenant_id,
+            candidate_id=candidate_id,
+            migration_provenance=MigrationProvenance(original_record_ref=f"signal_mapping:{record_ref}"),
+            reactivate_stale=True,
+            reactivate_source_change=reviewed_source_change,
+        )
+        candidate = _apply_imported_review_state(
+            service,
+            candidate,
+            review,
+            was_existing=existing is not None,
+        )
+        _evaluate_imported_approval(service, candidate, previous_candidate=existing)
     return candidate.id
+
+
+def _preflight_imported_review_states(service: KnowledgeService, raw_states: list[str]) -> None:
+    """Authorize a whole legacy batch before reading or persisting any row."""
+    if not raw_states:
+        return
+    service._enforce_candidate_review_action(approved=True)
+    valid_states = {state.value for state in ReviewState}
+    for raw_state in raw_states:
+        if raw_state not in valid_states or raw_state == ReviewState.CANDIDATE.value:
+            continue
+        review_state = ReviewState(raw_state)
+        service._enforce_candidate_review_action(
+            approved=review_state != ReviewState.REJECTED,
+            trust=review_state == ReviewState.TRUSTED,
+        )
 
 
 def _service_ref(value: str) -> str:
@@ -308,6 +353,11 @@ def _evaluate_imported_approval(
         candidate.proposition.proposition_key,
     )
     current = service.repository.get_revision(item.id, tenant_id=candidate.tenant_id) if item is not None else None
+    if current is not None and current.state.lifecycle_status == LifecycleStatus.STALE:
+        if current.revision_reason not in {"source_stale", "source_changed"}:
+            return
+        if candidate.state.lifecycle_status != LifecycleStatus.ACTIVE:
+            return
     authority_inputs_changed = previous_candidate is not None and (
         previous_candidate.evidence != candidate.evidence
         or previous_candidate.provenance_refs != candidate.provenance_refs

@@ -205,3 +205,16 @@ class TestTeachSignalRequest:
 
         with pytest.raises(ValidationError):
             TeachSignalRequest(signal_type="  ")
+
+    def test_pattern_batch_is_required_and_bounded(self):
+        from pydantic import ValidationError
+
+        from tacit.models.schemas import TeachSignalRequest
+
+        with pytest.raises(ValidationError):
+            TeachSignalRequest(signal_type="queue_depth", metric_patterns=[])
+        with pytest.raises(ValidationError):
+            TeachSignalRequest(
+                signal_type="queue_depth",
+                metric_patterns=[{"pattern": f"metric_{index}"} for index in range(101)],
+            )

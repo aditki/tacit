@@ -45,6 +45,24 @@ def test_artifact_learning_requires_apply_before_persistence(tmp_path):
     assert not db_path.exists()
 
 
+def test_artifact_learning_requires_review_before_creating_storage(tmp_path):
+    db_path = tmp_path / "signals.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        signals_db_path=str(db_path),
+        knowledge_permissions="knowledge.read,knowledge.apply",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.review"):
+        learn_artifact(
+            _artifact("## Checks\n- check Redis misses"),
+            RunbookExtractor(),
+            runtime_settings=runtime_settings,
+        )
+
+    assert not db_path.exists()
+
+
 def test_runbook_extractor_emits_evidence_requirement_for_check():
     result = RunbookExtractor().extract(_artifact("## Checks\n- check Redis misses"))
 
@@ -715,6 +733,124 @@ def test_skipped_reingest_rebuilds_missing_extractions(tmp_path, monkeypatch):
     assert len(rows["evidence_requirements"]) == 1
 
 
+def test_skipped_reingest_replaces_equal_count_extractions_from_an_old_generation(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    first_artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+    next_artifact = _artifact("## Checks\n- check checkout_latency_seconds")
+    learn_artifact(first_artifact, RunbookExtractor())
+    first_rows = store.list_artifact_extractions(first_artifact.id)
+    assert len(first_rows["evidence_requirements"]) == 1
+
+    # Simulate the pre-fix crash window: the source generation committed while
+    # the equal-sized extraction replacement did not.
+    with store._conn() as conn:
+        conn.execute(
+            """UPDATE learned_artifacts SET fingerprint=?, body_text=?
+               WHERE tenant_id='default' AND artifact_id=?""",
+            (next_artifact.fingerprint, next_artifact.body_text, next_artifact.id),
+        )
+
+    retried = learn_artifact(next_artifact, RunbookExtractor())
+    rows = store.list_artifact_extractions(next_artifact.id)
+
+    assert retried["change_state"] == "skipped"
+    assert [row["signal_hint"] for row in rows["evidence_requirements"]] == ["checkout_latency_seconds"]
+    assert rows["evidence_requirements"][0]["id"] != first_rows["evidence_requirements"][0]["id"]
+
+
+def test_artifact_source_and_extraction_generation_roll_back_together(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
+    first_artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+    next_artifact = _artifact("## Checks\n- check checkout_latency_seconds")
+    learn_artifact(first_artifact, RunbookExtractor())
+
+    def fail_replacement(**_kwargs):
+        raise RuntimeError("simulated extraction write failure")
+
+    monkeypatch.setattr(store, "replace_artifact_extractions", fail_replacement)
+    with pytest.raises(RuntimeError, match="simulated extraction write failure"):
+        learn_artifact(next_artifact, RunbookExtractor())
+
+    persisted = store.get_learned_artifact(first_artifact.id)
+    rows = store.list_artifact_extractions(first_artifact.id)
+    assert persisted is not None
+    assert persisted["fingerprint"] == first_artifact.fingerprint
+    assert [row["signal_hint"] for row in rows["evidence_requirements"]] == ["redis_cache_misses_total"]
+
+
+def test_artifact_generation_rolls_back_when_governed_lifecycle_fails(tmp_path, monkeypatch):
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    runtime_settings = Settings(_env_file=None)
+    store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=runtime_settings,
+    )
+    repository = KnowledgeRepository(store._db_path)
+    service = KnowledgeService(
+        repository,
+        signal_store=store,
+        runtime_settings=runtime_settings,
+    )
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+
+    def fail_lifecycle(**_kwargs):
+        raise RuntimeError("simulated governed lifecycle failure")
+
+    monkeypatch.setattr(service, "reconcile_source_lifecycle", fail_lifecycle)
+
+    with pytest.raises(RuntimeError, match="simulated governed lifecycle failure"):
+        learn_artifact(
+            artifact,
+            RunbookExtractor(),
+            store=store,
+            runtime_settings=runtime_settings,
+            knowledge_service=service,
+        )
+
+    assert store.get_learned_artifact(artifact.id) is None
+    assert store.list_artifact_extractions(artifact.id) == {
+        "evidence_requirements": [],
+        "ownership_hints": [],
+        "dependency_hints": [],
+        "signal_mapping_candidates": [],
+    }
+    assert repository.list_candidates(limit=None) == []
+    with store._conn() as conn:
+        indexed = conn.execute(
+            """SELECT COUNT(*) FROM learning_context_fts
+               WHERE tenant_id='default' AND source_kind='runbook' AND source_id=?""",
+            (artifact.id,),
+        ).fetchone()[0]
+    assert indexed == 0
+
+
+def test_artifact_fanout_limit_is_checked_before_source_persistence(tmp_path):
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_source_atomic_candidate_limit=1,
+    )
+    store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=runtime_settings,
+    )
+    artifact = _artifact("## Checks\n" "- check redis_cache_misses_total\n" "- check checkout_latency_seconds")
+
+    with pytest.raises(ValueError, match=r"artifact produced \d+ candidates"):
+        learn_artifact(
+            artifact,
+            RunbookExtractor(),
+            store=store,
+            runtime_settings=runtime_settings,
+        )
+
+    assert store.get_learned_artifact(artifact.id) is None
+    assert store.list_artifact_extractions(artifact.id)["evidence_requirements"] == []
+
+
 def test_skipped_reingest_preserves_reviewed_extraction_state(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
@@ -1224,16 +1360,28 @@ def test_stale_artifact_knowledge_reconciliation_pages_past_ten_thousand(monkeyp
             requested_cursors.append(after_id)
             remaining = max(0, total - after_id)
             return [
-                {"id": row_id, "artifact_id": f"artifact-{row_id - 1}"}
+                {
+                    "id": row_id,
+                    "artifact_id": f"artifact-{row_id - 1}",
+                    "missing_since": float(row_id),
+                }
                 for row_id in range(after_id + 1, after_id + 1 + min(limit, remaining))
             ]
 
-        def mark_artifact_knowledge_reconciled(self, *, tenant_id, artifact_id):
+        def mark_artifact_knowledge_reconciled(self, *, tenant_id, artifact_id, missing_since):
             assert tenant_id == "tenant-a"
+            assert missing_since > 0
             return True
 
     class FakeKnowledgeService:
-        def reconcile_source_lifecycle(self, *, provenance_ref, tenant_id, source_stale):
+        def reconcile_source_lifecycle(
+            self,
+            *,
+            provenance_ref,
+            tenant_id,
+            source_stale,
+            source_generation_guard,
+        ):
             assert tenant_id == "tenant-a"
             assert source_stale is True
             reconciled.append(provenance_ref)

@@ -60,6 +60,7 @@ def _authorized_contract(
     revision: int | None = None,
 ):
     """Load an immutable contract and enforce its recorded tenant boundary."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
     selected_tenant = knowledge_tenant(request)
     contract = store.get_contract(investigation_id, revision, tenant_id=selected_tenant)
     if contract is None:
@@ -100,6 +101,7 @@ async def list_investigations(
     store: Any = Depends(get_history_store),
 ):
     """List recent investigation runs, newest first."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
     try:
         investigations = store.list_recent(
             limit=limit,
@@ -131,6 +133,7 @@ async def list_investigations(
 )
 async def investigation_stats(request: Request, store: Any = Depends(get_history_store)):
     """Aggregate stats: success/failure rates, avg timings, path distribution."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
     return store.stats(tenant_id=knowledge_tenant(request))
 
 
@@ -144,20 +147,29 @@ async def list_investigation_revisions(
     investigation_id: str,
     request: Request,
     limit: int = Query(default=200, ge=1, le=500),
+    cursor: str | None = Query(default=None, max_length=1024),
     offset: int = Query(default=0, ge=0),
     store: Any = Depends(get_history_store),
 ):
+    assert_knowledge_action(request, KnowledgeAction.READ)
     _authorize_investigation(request, store, investigation_id)
     selected_tenant = knowledge_tenant(request)
-    revisions = store.list_revisions(
-        investigation_id,
-        tenant_id=selected_tenant,
-        limit=limit,
-        offset=offset,
-    )
-    if not revisions and store.get(investigation_id, tenant_id=selected_tenant) is None:
-        raise HTTPException(status_code=404, detail="Investigation not found")
-    return {"count": len(revisions), "revisions": revisions}
+    try:
+        page = store.list_revisions_page(
+            investigation_id,
+            tenant_id=selected_tenant,
+            limit=limit,
+            cursor=cursor,
+            offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "count": len(page.items),
+        "revisions": page.items,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+    }
 
 
 @router.get(
@@ -169,20 +181,29 @@ async def list_investigation_runs(
     investigation_id: str,
     request: Request,
     limit: int = Query(default=200, ge=1, le=500),
+    cursor: str | None = Query(default=None, max_length=1024),
     offset: int = Query(default=0, ge=0),
     store: Any = Depends(get_history_store),
 ):
+    assert_knowledge_action(request, KnowledgeAction.READ)
     selected_tenant = knowledge_tenant(request)
     _authorize_investigation(request, store, investigation_id)
-    runs = store.list_runs(
-        investigation_id,
-        tenant_id=selected_tenant,
-        limit=limit,
-        offset=offset,
-    )
-    if not runs and store.get(investigation_id, tenant_id=selected_tenant) is None:
-        raise HTTPException(status_code=404, detail="Investigation not found")
-    return {"count": len(runs), "runs": runs}
+    try:
+        page = store.list_runs_page(
+            investigation_id,
+            tenant_id=selected_tenant,
+            limit=limit,
+            cursor=cursor,
+            offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "count": len(page.items),
+        "runs": page.items,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+    }
 
 
 @router.get(
@@ -195,22 +216,30 @@ async def list_investigation_events(
     request: Request,
     run_id: str | None = None,
     limit: int = Query(default=500, ge=1, le=1000),
+    cursor: str | None = Query(default=None, max_length=1024),
     offset: int = Query(default=0, ge=0),
     store: Any = Depends(get_history_store),
 ):
     assert_knowledge_action(request, KnowledgeAction.READ)
     selected_tenant = knowledge_tenant(request)
     _authorize_investigation(request, store, investigation_id)
-    events = store.list_events(
-        investigation_id,
-        run_id,
-        tenant_id=selected_tenant,
-        limit=limit,
-        offset=offset,
-    )
-    if not events and store.get(investigation_id, tenant_id=selected_tenant) is None:
-        raise HTTPException(status_code=404, detail="Investigation not found")
-    return {"count": len(events), "events": events}
+    try:
+        page = store.list_events_page(
+            investigation_id,
+            run_id,
+            tenant_id=selected_tenant,
+            limit=limit,
+            cursor=cursor,
+            offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "count": len(page.items),
+        "events": page.items,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+    }
 
 
 @router.get(
@@ -421,6 +450,8 @@ async def refresh_investigation(
     request: Request,
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
+    assert_knowledge_action(request, KnowledgeAction.READ)
+    assert_knowledge_action(request, KnowledgeAction.APPLY)
     store = deps.history_store_factory()
     selected_tenant = knowledge_tenant(request)
     contract = store.get_contract(investigation_id, tenant_id=selected_tenant)
@@ -458,6 +489,7 @@ async def refresh_investigation(
 )
 async def migrate_investigation(investigation_id: str, request: Request, store: Any = Depends(get_history_store)):
     assert_knowledge_action(request, KnowledgeAction.READ)
+    assert_knowledge_action(request, KnowledgeAction.APPLY)
     selected_tenant = knowledge_tenant(request)
     _authorize_investigation(request, store, investigation_id)
     contract = store.migrate_legacy_investigation(investigation_id, tenant_id=selected_tenant)
@@ -506,6 +538,7 @@ async def export_investigation_assessment_bundle(
 )
 async def get_investigation(investigation_id: str, request: Request, store: Any = Depends(get_history_store)):
     """Get full details of a single investigation by ID."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
     _authorize_investigation(request, store, investigation_id)
     inv = store.get(investigation_id, tenant_id=knowledge_tenant(request))
     if inv is None:

@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -37,6 +39,7 @@ from tacit.config import Settings, settings
 from tacit.knowledge.usage import KnowledgeRevisionRef
 from tacit.knowledge.versioning import version_scope_applies
 from tacit.models.schemas import MetricEntry
+from tacit.pagination import KeysetPage, decode_cursor, encode_cursor
 from tacit.signals.confidence import TRUST_THRESHOLD, stronger_review_state
 from tacit.signals.learning_index import (
     build_alert_context_rows,
@@ -102,6 +105,62 @@ _DEFAULT_OWNER_MIGRATION_BATCH_SIZE = 500
 _PROJECTION_AUDIT_BATCH_SIZE = 500
 _PROJECTION_AUTHORITY_VALIDATION_BATCH_SIZE = 100
 _PROJECTION_AUDIT_MAX_RETRIES = 3
+_SIGNAL_RESOLUTION_PAGE_SIZE = 500
+_STALE_SOURCE_PAGE_SIZE = 500
+_SIGNAL_RESOLUTION_MIN_SCAN_LIMIT = 10_000
+_SIGNAL_RESOLUTION_MAX_SCAN_LIMIT = 100_000
+_SIGNAL_RESOLUTION_SCAN_MULTIPLIER = 100
+_ARTIFACT_COUNT_BATCH_SIZE = 200
+_ARTIFACT_EXTRACTION_TABLES = {
+    "evidence_requirements": "evidence_requirements",
+    "ownership_hints": "ownership_hints",
+    "dependency_hints": "dependency_hints",
+    "signal_mapping_candidates": "signal_mapping_candidates",
+}
+
+
+def _decode_artifact_cursor(cursor: str) -> tuple[float, int]:
+    try:
+        raw_updated_at, raw_id = decode_cursor(cursor, field_count=2)
+        if isinstance(raw_updated_at, bool) or not isinstance(raw_updated_at, (int, float)):
+            raise ValueError
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int) or raw_id < 1:
+            raise ValueError
+        updated_at = float(raw_updated_at)
+        if not math.isfinite(updated_at):
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid artifact cursor") from exc
+    return updated_at, raw_id
+
+
+def _decode_extraction_cursor(cursor: str) -> tuple[str, str]:
+    try:
+        raw_generation, raw_id = decode_cursor(cursor, field_count=2)
+        if not isinstance(raw_generation, str) or len(raw_generation) > 128:
+            raise ValueError
+        if not isinstance(raw_id, str) or not raw_id or len(raw_id) > 500:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid extraction cursor") from exc
+    return raw_generation, raw_id
+
+
+def _decode_signal_mapping_cursor(cursor: str) -> tuple[int, float, int]:
+    try:
+        raw_priority, raw_confidence, raw_id = decode_cursor(cursor, field_count=3)
+        if isinstance(raw_priority, bool) or not isinstance(raw_priority, int) or raw_priority not in {0, 1}:
+            raise ValueError
+        if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
+            raise ValueError
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int) or raw_id < 1:
+            raise ValueError
+        confidence = float(raw_confidence)
+        if not math.isfinite(confidence):
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid signal mapping cursor") from exc
+    return raw_priority, confidence, raw_id
 
 
 class _ProjectionAuditChanged(RuntimeError):
@@ -111,6 +170,7 @@ class _ProjectionAuditChanged(RuntimeError):
 _LEARNING_LIST_MAX_LIMIT = 10_000
 
 __all__ = [
+    "ArtifactGenerationConflictError",
     "LearningIndexUnavailable",
     "ResolvedSignal",
     "SignalStore",
@@ -124,10 +184,15 @@ __all__ = [
 
 _DEFAULT_DB_PATH = DEFAULT_DB_PATH
 _BOOTSTRAP_FINGERPRINT_KEY = "bootstrap_signal_catalog_fingerprint"
+_BOOTSTRAP_WRITE_TOKEN = object()
 
 
 class LearningIndexUnavailable(RuntimeError):
     """Raised when SQLite FTS5-backed learning retrieval is unavailable."""
+
+
+class ArtifactGenerationConflictError(ValueError):
+    """Raised when an extraction page cursor targets a replaced source generation."""
 
 
 @dataclass(frozen=True)
@@ -198,6 +263,27 @@ class SignalStore:
         mappings: list[dict[str, Any]],
     ) -> Token[_PinnedGovernedMappings | None]:
         """Use one immutable governed mapping set for the current execution context."""
+        pinned = self._validated_pinned_governed_mappings(tenant_id=tenant_id, mappings=mappings)
+        return self._pinned_governed_mappings.set(pinned)
+
+    def replace_pinned_governed_mappings(
+        self,
+        token: Token[_PinnedGovernedMappings | None],
+        *,
+        tenant_id: str,
+        mappings: list[dict[str, Any]],
+    ) -> Token[_PinnedGovernedMappings | None]:
+        """Replace a context pin after validating the complete staged mapping set."""
+        pinned = self._validated_pinned_governed_mappings(tenant_id=tenant_id, mappings=mappings)
+        self._pinned_governed_mappings.reset(token)
+        return self._pinned_governed_mappings.set(pinned)
+
+    def _validated_pinned_governed_mappings(
+        self,
+        *,
+        tenant_id: str,
+        mappings: list[dict[str, Any]],
+    ) -> _PinnedGovernedMappings:
         tenant_id = self._resolve_tenant(tenant_id)
         pinned: list[dict[str, Any]] = []
         for mapping in mappings:
@@ -207,7 +293,7 @@ class SignalStore:
             if not mapping.get("governance_ref") or int(mapping.get("governance_revision") or 0) < 1:
                 raise ValueError("pinned governed mappings require an exact knowledge revision")
             pinned.append(dict(mapping))
-        return self._pinned_governed_mappings.set(_PinnedGovernedMappings(tenant_id=tenant_id, mappings=tuple(pinned)))
+        return _PinnedGovernedMappings(tenant_id=tenant_id, mappings=tuple(pinned))
 
     def reset_pinned_governed_mappings(self, token: Token[_PinnedGovernedMappings | None]) -> None:
         """Restore the previous resolver pin for the current execution context."""
@@ -250,6 +336,21 @@ class SignalStore:
             return
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            token = self._transaction_connection.set(conn)
+            try:
+                yield conn
+            finally:
+                self._transaction_connection.reset(token)
+
+    @contextmanager
+    def read_transaction(self):
+        """Keep related reads on one SQLite snapshot without taking a writer lock."""
+        active = self._transaction_connection.get()
+        if active is not None:
+            yield active
+            return
+        with self._conn() as conn:
+            conn.execute("BEGIN")
             token = self._transaction_connection.set(conn)
             try:
                 yield conn
@@ -805,12 +906,15 @@ class SignalStore:
         unit: str = "",
         *,
         tenant_id: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> None:
         """Register a global taxonomy definition or a tenant-specific override."""
         if tenant_id is not None:
             tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
-        with self._conn() as conn:
+        connection_context = nullcontext(connection) if connection is not None else self._conn()
+        with connection_context as conn:
+            assert conn is not None
             if tenant_id is None:
                 conn.execute(
                     """INSERT INTO signal_types (signal_type, description, category, unit, created_at, updated_at)
@@ -901,6 +1005,98 @@ class SignalStore:
         result["mappings"] = [_deserialize_mapping(r) for r in mappings]
         return result
 
+    def get_signal_type_page(
+        self,
+        signal_type: str,
+        *,
+        tenant_id: str | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return signal metadata plus one tenant-prioritized mapping page."""
+        if limit < 1:
+            raise ValueError("signal mapping page limit must be positive")
+        tenant_id = self._resolve_tenant(tenant_id)
+        cursor_clause = ""
+        cursor_params: list[Any] = []
+        if cursor:
+            priority, confidence, mapping_id = _decode_signal_mapping_cursor(cursor)
+            cursor_clause = """WHERE (_tenant_priority > ?
+                OR (_tenant_priority = ? AND confidence < ?)
+                OR (_tenant_priority = ? AND confidence = ? AND id < ?))"""
+            cursor_params = [priority, priority, confidence, priority, confidence, mapping_id]
+        with self.read_transaction() as conn:
+            tenant_definition = conn.execute(
+                "SELECT * FROM tenant_signal_types WHERE tenant_id = ? AND signal_type = ?",
+                (tenant_id, signal_type),
+            ).fetchone()
+            global_definition = conn.execute(
+                "SELECT * FROM signal_types WHERE signal_type = ?",
+                (signal_type,),
+            ).fetchone()
+            definition = _merge_signal_definition(
+                dict(global_definition) if global_definition is not None else None,
+                dict(tenant_definition) if tenant_definition is not None else None,
+            )
+            if definition is None:
+                return None
+            mapping_count = int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM signal_metric_mappings
+                       WHERE signal_type=? AND tenant_id IN (?, ?)""",
+                    (signal_type, tenant_id, GLOBAL_BOOTSTRAP_TENANT_ID),
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                f"""WITH scoped AS (
+                        SELECT mapping.*, 0 AS _tenant_priority
+                        FROM signal_metric_mappings mapping
+                        WHERE mapping.tenant_id=? AND mapping.signal_type=?
+                        UNION ALL
+                        SELECT mapping.*, 1 AS _tenant_priority
+                        FROM signal_metric_mappings mapping
+                        WHERE mapping.tenant_id=? AND mapping.signal_type=?
+                    )
+                    SELECT * FROM scoped
+                    {cursor_clause}
+                    ORDER BY _tenant_priority ASC, confidence DESC, id DESC
+                    LIMIT ?""",
+                (
+                    tenant_id,
+                    signal_type,
+                    GLOBAL_BOOTSTRAP_TENANT_ID,
+                    signal_type,
+                    *cursor_params,
+                    limit + 1,
+                ),
+            ).fetchall()
+        has_more = len(rows) > limit
+        visible = rows[:limit]
+        mappings = []
+        for row in visible:
+            mapping = _deserialize_mapping(row)
+            mapping.pop("_tenant_priority", None)
+            mappings.append(mapping)
+        next_cursor = None
+        if has_more and visible:
+            last = visible[-1]
+            next_cursor = encode_cursor(
+                int(last["_tenant_priority"]),
+                float(last["confidence"]),
+                int(last["id"]),
+            )
+        result = dict(definition)
+        result.pop("tenant_id", None)
+        result.update(
+            {
+                "mapping_count": mapping_count,
+                "mappings": mappings,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            }
+        )
+        return result
+
     # ── Signal ↔ metric mappings ─────────────────────────────────────────
 
     def add_mapping(
@@ -929,6 +1125,7 @@ class SignalStore:
         connection: sqlite3.Connection | None = None,
         replace_existing: bool = False,
         increment_use_count: bool = True,
+        _bootstrap_write_token: object | None = None,
     ) -> int:
         """Add or update a signal-to-metric mapping. Returns mapping ID.
 
@@ -941,6 +1138,8 @@ class SignalStore:
         ('candidate' → 'approved' → 'trusted'); on conflict it is preserved
         (re-teaching never downgrades trust).
         """
+        if source_type == "bootstrap" and _bootstrap_write_token is not _BOOTSTRAP_WRITE_TOKEN:
+            raise PermissionError("global bootstrap mappings may only be written by the packaged catalog loader")
         if source_type != "bootstrap":
             tenant_id = self._resolve_tenant(tenant_id)
         else:
@@ -1124,6 +1323,24 @@ class SignalStore:
                 ),
             )
             return cursor.lastrowid or 0
+
+    def _add_bootstrap_mapping(
+        self,
+        signal_type: str,
+        metric_pattern: str,
+        confidence: float = 0.5,
+        **kwargs: Any,
+    ) -> int:
+        """Write one packaged bootstrap mapping through the reserved internal path."""
+        kwargs.pop("source_type", None)
+        return self.add_mapping(
+            signal_type,
+            metric_pattern,
+            confidence,
+            source_type="bootstrap",
+            _bootstrap_write_token=_BOOTSTRAP_WRITE_TOKEN,
+            **kwargs,
+        )
 
     def record_rejected_candidate(
         self,
@@ -1362,72 +1579,30 @@ class SignalStore:
         pinned = self._pinned_governed_mappings.get()
         if pinned is not None and pinned.tenant_id != tenant_id:
             raise ValueError("pinned governed mappings belong to another tenant")
-        with self._conn() as conn:
-            if pinned is None:
-                limit_clause = " LIMIT ?" if resolution_limit is not None else ""
-                parameters: list[Any] = [signal_type, tenant_id, GLOBAL_BOOTSTRAP_TENANT_ID, tenant_id]
-                if resolution_limit is not None:
-                    parameters.append(resolution_limit + 1)
-                rows = conn.execute(
-                    f"""SELECT * FROM signal_metric_mappings
-                       WHERE signal_type = ?
-                         AND tenant_id IN (?, ?)
-                         AND review_state IN ('approved', 'trusted')
-                       ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END, confidence DESC{limit_clause}""",
-                    parameters,
-                ).fetchall()
-            else:
-                limit_clause = " LIMIT ?" if resolution_limit is not None else ""
-                parameters = [signal_type, GLOBAL_BOOTSTRAP_TENANT_ID]
-                if resolution_limit is not None:
-                    parameters.append(resolution_limit + 1)
-                rows = conn.execute(
-                    f"""SELECT * FROM signal_metric_mappings
-                       WHERE signal_type = ?
-                         AND tenant_id = ?
-                         AND source_type = 'bootstrap'
-                         AND review_state IN ('approved', 'trusted')
-                       ORDER BY confidence DESC{limit_clause}""",
-                    parameters,
-                ).fetchall()
-
         now = time.time()
-        results = []
-        seen_patterns: set[str] = set()
-        stored_mappings = [_deserialize_mapping(row) for row in rows]
-        if pinned is not None:
-            pinned_for_signal = [
-                dict(mapping) for mapping in pinned.mappings if str(mapping.get("signal_type") or "") == signal_type
-            ]
-            pinned_for_signal.sort(key=lambda mapping: float(mapping.get("confidence") or 0.0), reverse=True)
-            stored_mappings = [*pinned_for_signal, *stored_mappings]
-        if resolution_limit is not None and len(stored_mappings) > resolution_limit:
-            logger.error(
-                "signal_resolution_mapping_limit_exceeded",
-                tenant_id=tenant_id,
-                signal_type=signal_type,
-                mapping_count=len(stored_mappings),
-                mapping_limit=resolution_limit,
-            )
-            raise RuntimeError(f"Signal '{signal_type}' has more than {resolution_limit} active mapping candidates")
-        for m in stored_mappings:
+        applicable: list[dict[str, Any]] = []
+
+        def consider(mapping: dict[str, Any], *, priority: int) -> None:
             if excluded_knowledge_refs:
-                governance_ref = str(m.get("governance_ref") or "")
-                governance_revision = int(m.get("governance_revision") or 0)
+                governance_ref = str(mapping.get("governance_ref") or "")
+                governance_revision = int(mapping.get("governance_revision") or 0)
                 if (
                     governance_ref
                     and governance_revision > 0
                     and KnowledgeRevisionRef(governance_ref, governance_revision) in excluded_knowledge_refs
                 ):
-                    continue
+                    return
 
-            # Context filtering
             if not _context_matches(
-                m, context_service, context_datasource_type, context_archetype, context_environment
+                mapping,
+                context_service,
+                context_datasource_type,
+                context_archetype,
+                context_environment,
             ):
-                continue
-            if m.get("governance_ref") and not _governed_scope_matches(
-                m,
+                return
+            if mapping.get("governance_ref") and not _governed_scope_matches(
+                mapping,
                 knowledge_scope=knowledge_scope,
                 context_service=context_service,
                 context_datasource_type=context_datasource_type,
@@ -1435,11 +1610,10 @@ class SignalStore:
                 context_environment=context_environment,
                 now=now,
             ):
-                continue
+                return
 
-            # Compute effective confidence with decay + feedback + context ranking
             effective = _effective_confidence(
-                m,
+                mapping,
                 now,
                 context_service=context_service,
                 context_datasource_type=context_datasource_type,
@@ -1447,7 +1621,7 @@ class SignalStore:
                 context_environment=context_environment,
             )
             trust_effective = _effective_confidence(
-                m,
+                mapping,
                 now,
                 context_service=context_service,
                 context_datasource_type=context_datasource_type,
@@ -1456,15 +1630,126 @@ class SignalStore:
                 apply_context_penalty=False,
             )
             if not include_decayed and trust_effective < TRUST_THRESHOLD:
-                continue
-            if m["metric_pattern"] in seen_patterns:
-                continue
-            seen_patterns.add(m["metric_pattern"])
+                return
 
-            m["effective_confidence"] = round(effective, 4)
-            results.append(m)
+            candidate = dict(mapping)
+            candidate["effective_confidence"] = round(effective, 4)
+            candidate["_resolution_priority"] = priority
+            applicable.append(candidate)
+            if resolution_limit is not None and len(applicable) > resolution_limit:
+                logger.error(
+                    "signal_resolution_mapping_limit_exceeded",
+                    tenant_id=tenant_id,
+                    signal_type=signal_type,
+                    mapping_count=len(applicable),
+                    mapping_limit=resolution_limit,
+                )
+                raise RuntimeError(f"Signal '{signal_type}' has more than {resolution_limit} active mapping candidates")
 
-        results.sort(key=lambda x: x["effective_confidence"], reverse=True)
+        if pinned is not None:
+            pinned_for_signal = [
+                dict(mapping) for mapping in pinned.mappings if str(mapping.get("signal_type") or "") == signal_type
+            ]
+            for mapping in pinned_for_signal:
+                consider(mapping, priority=0)
+
+        if resolution_limit is None:
+            scan_limit = None
+        else:
+            scan_limit = min(
+                _SIGNAL_RESOLUTION_MAX_SCAN_LIMIT,
+                max(_SIGNAL_RESOLUTION_MIN_SCAN_LIMIT, resolution_limit * _SIGNAL_RESOLUTION_SCAN_MULTIPLIER),
+            )
+        scanned = len(pinned_for_signal) if pinned is not None else 0
+        last_id = 0
+        exhausted = False
+        with self._conn() as conn:
+            while scan_limit is None or scanned < scan_limit:
+                page_limit = _SIGNAL_RESOLUTION_PAGE_SIZE
+                if scan_limit is not None:
+                    page_limit = min(page_limit, scan_limit - scanned)
+                if pinned is None:
+                    rows = conn.execute(
+                        """SELECT * FROM signal_metric_mappings
+                           WHERE signal_type = ?
+                             AND tenant_id IN (?, ?)
+                             AND review_state IN ('approved', 'trusted')
+                             AND id > ?
+                           ORDER BY id LIMIT ?""",
+                        (signal_type, tenant_id, GLOBAL_BOOTSTRAP_TENANT_ID, last_id, page_limit),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """SELECT * FROM signal_metric_mappings
+                           WHERE signal_type = ?
+                             AND tenant_id = ?
+                             AND source_type = 'bootstrap'
+                             AND review_state IN ('approved', 'trusted')
+                             AND id > ?
+                           ORDER BY id LIMIT ?""",
+                        (signal_type, GLOBAL_BOOTSTRAP_TENANT_ID, last_id, page_limit),
+                    ).fetchall()
+                if not rows:
+                    exhausted = True
+                    break
+                scanned += len(rows)
+                last_id = int(rows[-1]["id"])
+                for row in rows:
+                    mapping = _deserialize_mapping(row)
+                    priority = 0 if mapping["tenant_id"] == tenant_id else 1
+                    consider(mapping, priority=priority)
+                if len(rows) < page_limit:
+                    exhausted = True
+                    break
+
+            if not exhausted and scan_limit is not None:
+                if pinned is None:
+                    more = conn.execute(
+                        """SELECT 1 FROM signal_metric_mappings
+                           WHERE signal_type = ?
+                             AND tenant_id IN (?, ?)
+                             AND review_state IN ('approved', 'trusted')
+                             AND id > ? LIMIT 1""",
+                        (signal_type, tenant_id, GLOBAL_BOOTSTRAP_TENANT_ID, last_id),
+                    ).fetchone()
+                else:
+                    more = conn.execute(
+                        """SELECT 1 FROM signal_metric_mappings
+                           WHERE signal_type = ?
+                             AND tenant_id = ?
+                             AND source_type = 'bootstrap'
+                             AND review_state IN ('approved', 'trusted')
+                             AND id > ? LIMIT 1""",
+                        (signal_type, GLOBAL_BOOTSTRAP_TENANT_ID, last_id),
+                    ).fetchone()
+                if more is not None:
+                    logger.error(
+                        "signal_resolution_mapping_scan_limit_exceeded",
+                        tenant_id=tenant_id,
+                        signal_type=signal_type,
+                        mapping_scan_count=scanned,
+                        mapping_scan_limit=scan_limit,
+                    )
+                    raise RuntimeError(
+                        f"Signal '{signal_type}' mapping scan exceeded the {scan_limit}-row safety limit"
+                    )
+
+        applicable.sort(
+            key=lambda mapping: (
+                int(mapping.pop("_resolution_priority")),
+                -float(mapping["effective_confidence"]),
+                int(mapping.get("id") or 0),
+            )
+        )
+        results: list[dict[str, Any]] = []
+        seen_patterns: set[str] = set()
+        for mapping in applicable:
+            if mapping["metric_pattern"] in seen_patterns:
+                continue
+            seen_patterns.add(mapping["metric_pattern"])
+            results.append(mapping)
+
+        results.sort(key=lambda mapping: mapping["effective_confidence"], reverse=True)
         return results
 
     # ── Resolution engine ────────────────────────────────────────────────
@@ -1749,12 +2034,11 @@ class SignalStore:
                     unit=sig_def.get("unit", ""),
                 )
                 for mp in sig_def.get("metric_patterns", []):
-                    self.add_mapping(
+                    self._add_bootstrap_mapping(
                         signal_type=sig_type,
                         metric_pattern=mp["pattern"],
                         confidence=mp.get("confidence", 0.5),
                         context_datasource_types=mp["datasource_types"] if "datasource_types" in mp else None,
-                        source_type="bootstrap",
                     )
                     count += 1
             conn.execute(
@@ -1789,42 +2073,129 @@ class SignalStore:
         signals_inferred: list[str] | list[dict] | None = None,
         archetype_generated: str = "",
         status: str = "pending",
-    ) -> None:
-        """Record features extracted from an ingested dashboard."""
+    ) -> str:
+        """Record features while preserving terminal review for unchanged content."""
         tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
-        with self._conn() as conn:
+        values = {
+            "dashboard_title": dashboard_title,
+            "dashboard_tags": dashboard_tags or [],
+            "metrics_found": metrics_found or [],
+            "panel_count": panel_count,
+            "row_groups": row_groups or [],
+            "metric_cooccurrence": metric_cooccurrence or {},
+            "aggregation_patterns": aggregation_patterns or [],
+            "query_transformations": query_transformations or [],
+            "panel_titles": panel_titles or [],
+            "alert_links": alert_links or [],
+            "drilldown_links": drilldown_links or [],
+            "signals_inferred": signals_inferred or [],
+            "archetype_generated": archetype_generated,
+        }
+        source_content_fields = (
+            "dashboard_tags",
+            "metrics_found",
+            "panel_count",
+            "row_groups",
+            "metric_cooccurrence",
+            "aggregation_patterns",
+            "query_transformations",
+            "panel_titles",
+            "alert_links",
+            "drilldown_links",
+        )
+        generation_fields = ("dashboard_title", *source_content_fields, "signals_inferred", "archetype_generated")
+        with self.transaction() as conn:
+            existing_row = conn.execute(
+                """SELECT * FROM ingested_dashboards
+                   WHERE tenant_id = ? AND dashboard_uid = ? AND backend_name = ?""",
+                (tenant_id, dashboard_uid, backend_name),
+            ).fetchone()
+            if existing_row is None:
+                conn.execute(
+                    """INSERT INTO ingested_dashboards
+                       (tenant_id, dashboard_uid, backend_name, dashboard_title, dashboard_tags,
+                        metrics_found, panel_count, row_groups, metric_cooccurrence,
+                        aggregation_patterns, query_transformations, panel_titles,
+                        alert_links, drilldown_links, status, signals_inferred,
+                        archetype_generated, stale, missing_since, knowledge_reconciled_at,
+                        last_seen_at, created_at, reviewed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, NULL)""",
+                    (
+                        tenant_id,
+                        dashboard_uid,
+                        backend_name,
+                        dashboard_title,
+                        json.dumps(values["dashboard_tags"]),
+                        json.dumps(values["metrics_found"]),
+                        panel_count,
+                        json.dumps(values["row_groups"]),
+                        json.dumps(values["metric_cooccurrence"]),
+                        json.dumps(values["aggregation_patterns"]),
+                        json.dumps(values["query_transformations"]),
+                        json.dumps(values["panel_titles"]),
+                        json.dumps(values["alert_links"]),
+                        json.dumps(values["drilldown_links"]),
+                        status,
+                        json.dumps(values["signals_inferred"]),
+                        archetype_generated,
+                        now,
+                        now,
+                    ),
+                )
+                return "created"
+
+            existing = _deserialize_ingested(existing_row)
+            source_unchanged = not existing.get("stale") and all(
+                existing.get(field) == values[field] for field in source_content_fields
+            )
+            generation_unchanged = source_unchanged and all(
+                existing.get(field) == values[field] for field in generation_fields
+            )
+            existing_status = str(existing.get("status") or "pending")
+            if existing_status == "approving" and not generation_unchanged:
+                raise RuntimeError("dashboard approval is in progress; retry ingestion after it completes")
+            if generation_unchanged and existing_status in {"approved", "rejected", "ignored"}:
+                effective_status = existing_status
+            elif generation_unchanged and existing_status == "approving":
+                effective_status = existing_status
+            else:
+                effective_status = status
+            previous_generation = float(existing["created_at"])
+            generation = previous_generation if generation_unchanged else max(now, previous_generation + 0.000001)
+            reviewed_at = existing.get("reviewed_at") if effective_status == existing_status else None
             conn.execute(
-                """INSERT OR REPLACE INTO ingested_dashboards
-                   (tenant_id, dashboard_uid, backend_name, dashboard_title, dashboard_tags,
-                    metrics_found, panel_count, row_groups,
-                    metric_cooccurrence, aggregation_patterns,
-                    query_transformations, panel_titles,
-                    alert_links, drilldown_links,
-                    status, signals_inferred, archetype_generated, stale, missing_since,
-                    knowledge_reconciled_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?)""",
+                """UPDATE ingested_dashboards
+                   SET dashboard_title = ?, dashboard_tags = ?, metrics_found = ?,
+                       panel_count = ?, row_groups = ?, metric_cooccurrence = ?,
+                       aggregation_patterns = ?, query_transformations = ?, panel_titles = ?,
+                       alert_links = ?, drilldown_links = ?, status = ?, signals_inferred = ?,
+                       archetype_generated = ?, stale = 0, missing_since = NULL,
+                       knowledge_reconciled_at = NULL, last_seen_at = ?,
+                       created_at = ?, reviewed_at = ?
+                   WHERE id = ?""",
                 (
-                    tenant_id,
-                    dashboard_uid,
-                    backend_name,
                     dashboard_title,
-                    json.dumps(dashboard_tags or []),
-                    json.dumps(metrics_found or []),
+                    json.dumps(values["dashboard_tags"]),
+                    json.dumps(values["metrics_found"]),
                     panel_count,
-                    json.dumps(row_groups or []),
-                    json.dumps(metric_cooccurrence or {}),
-                    json.dumps(aggregation_patterns or []),
-                    json.dumps(query_transformations or []),
-                    json.dumps(panel_titles or []),
-                    json.dumps(alert_links or []),
-                    json.dumps(drilldown_links or []),
-                    status,
-                    json.dumps(signals_inferred or []),
+                    json.dumps(values["row_groups"]),
+                    json.dumps(values["metric_cooccurrence"]),
+                    json.dumps(values["aggregation_patterns"]),
+                    json.dumps(values["query_transformations"]),
+                    json.dumps(values["panel_titles"]),
+                    json.dumps(values["alert_links"]),
+                    json.dumps(values["drilldown_links"]),
+                    effective_status,
+                    json.dumps(values["signals_inferred"]),
                     archetype_generated,
                     now,
+                    generation,
+                    reviewed_at,
+                    existing["id"],
                 ),
             )
+        return "skipped" if generation_unchanged else "updated"
 
     def index_dashboard_context(
         self,
@@ -1918,32 +2289,48 @@ class SignalStore:
         """
         tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
-        with self._conn() as conn:
+        serialized_signals = json.dumps(signals_inferred or [], sort_keys=True)
+        generation_fingerprint = hashlib.sha256(
+            json.dumps(
+                {"source_fingerprint": fingerprint, "signals_inferred": json.loads(serialized_signals)},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        # The approval claim and source generation share this row. Acquire the
+        # writer lock before reading so a concurrent claim cannot be overwritten
+        # by a stale re-ingestion decision.
+        with self.transaction() as conn:
             existing = conn.execute(
-                """SELECT id, fingerprint, first_seen_at, status, stale FROM ingested_alerts
+                """SELECT id, fingerprint, generation_fingerprint, first_seen_at, status, stale
+                   FROM ingested_alerts
                    WHERE tenant_id = ? AND alert_uid = ? AND backend_name = ?""",
                 (tenant_id, alert_uid, backend_name),
             ).fetchone()
             first_seen = existing["first_seen_at"] if existing and existing["first_seen_at"] else now
             change_state = "created"
             if existing is not None:
-                change_state = "skipped" if fingerprint and existing["fingerprint"] == fingerprint else "updated"
+                change_state = "skipped" if existing["generation_fingerprint"] == generation_fingerprint else "updated"
+                if existing["status"] == "approving" and change_state != "skipped":
+                    raise RuntimeError("alert approval is in progress; retry ingestion after it completes")
             conn.execute(
                 """INSERT INTO ingested_alerts
                    (tenant_id, alert_uid, backend_name, source_vendor, source_instance,
-                    external_id, fingerprint, alert_title, alert_tags,
+                    external_id, fingerprint, generation_fingerprint, alert_title, alert_tags,
                     condition, severity, enabled, labels, annotations,
                     metrics_found, query_transformations, service_hints,
                     dashboard_uid, panel_title, source_url, provenance_url,
                     confidence, stale, missing_since, knowledge_reconciled_at,
                     status, signals_inferred, first_seen_at,
                     last_seen_at, updated_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(tenant_id, alert_uid, backend_name) DO UPDATE SET
                        source_vendor = excluded.source_vendor,
                        source_instance = excluded.source_instance,
                        external_id = excluded.external_id,
                        fingerprint = excluded.fingerprint,
+                       generation_fingerprint = excluded.generation_fingerprint,
                        alert_title = excluded.alert_title,
                        alert_tags = excluded.alert_tags,
                        condition = excluded.condition,
@@ -1963,7 +2350,7 @@ class SignalStore:
                        missing_since = NULL,
                        knowledge_reconciled_at = NULL,
                        status = CASE
-                           WHEN ingested_alerts.fingerprint = excluded.fingerprint
+                           WHEN ingested_alerts.generation_fingerprint = excluded.generation_fingerprint
                                 AND ingested_alerts.stale = 0
                                 AND excluded.status != 'approved' THEN ingested_alerts.status
                            ELSE excluded.status
@@ -1972,7 +2359,8 @@ class SignalStore:
                        first_seen_at = ingested_alerts.first_seen_at,
                        last_seen_at = excluded.last_seen_at,
                        updated_at = CASE
-                           WHEN ingested_alerts.fingerprint = excluded.fingerprint THEN ingested_alerts.updated_at
+                           WHEN ingested_alerts.generation_fingerprint = excluded.generation_fingerprint
+                               THEN ingested_alerts.updated_at
                            ELSE excluded.updated_at
                        END,
                        created_at = ingested_alerts.created_at""",
@@ -1984,6 +2372,7 @@ class SignalStore:
                     source_instance,
                     external_id or alert_uid,
                     fingerprint,
+                    generation_fingerprint,
                     alert_title,
                     json.dumps(alert_tags or []),
                     condition,
@@ -2003,7 +2392,7 @@ class SignalStore:
                     None,
                     None,
                     status,
-                    json.dumps(signals_inferred or []),
+                    serialized_signals,
                     first_seen,
                     now,
                     now,
@@ -2104,6 +2493,7 @@ class SignalStore:
         """Replace extracted IR rows for one artifact."""
         tenant_id = self._resolve_tenant(tenant_id)
         now = time.time()
+        extraction_generation = uuid.uuid4().hex
         with self._conn() as conn:
             conn.execute(
                 "DELETE FROM evidence_requirements WHERE tenant_id = ? AND artifact_id = ?",
@@ -2219,6 +2609,13 @@ class SignalStore:
                         now,
                     ),
                 )
+            generation_update = conn.execute(
+                """UPDATE learned_artifacts SET extraction_generation=?
+                   WHERE tenant_id=? AND artifact_id=?""",
+                (extraction_generation, tenant_id, artifact_id),
+            )
+            if generation_update.rowcount != 1:
+                raise ValueError("artifact extraction replacement requires a persisted source")
         return {
             "evidence_requirements": len(evidence_requirements or []),
             "ownership_hints": len(ownership_hints or []),
@@ -2378,57 +2775,77 @@ class SignalStore:
         source_vendor: str | None = None,
         source_instance: str | None = None,
         external_id_prefix: str | None = None,
+        crawl_started_at: float | None = None,
     ) -> int:
         """Mark previously learned artifacts stale when absent from a complete crawl."""
         tenant_id = self._resolve_tenant(tenant_id)
-        now = time.time()
-        with self._conn() as conn:
-            clauses = ["tenant_id = ?", "artifact_type = ?", "stale = 0"]
-            params: list[Any] = [tenant_id, artifact_type]
-            if source_vendor is not None:
-                clauses.append("source_vendor = ?")
-                params.append(source_vendor)
-            if source_instance is not None:
-                clauses.append("source_instance = ?")
-                params.append(source_instance)
-            if external_id_prefix is not None:
-                clauses.append("external_id LIKE ? ESCAPE '\\'")
-                params.append(f"{_escape_like_prefix(external_id_prefix)}%")
-            rows = conn.execute(
-                f"""SELECT artifact_id FROM learned_artifacts
-                    WHERE {" AND ".join(clauses)}""",
-                params,
-            ).fetchall()
-            missing = [row["artifact_id"] for row in rows if row["artifact_id"] not in seen_artifact_ids]
-            if not missing:
-                return 0
-            placeholders = ", ".join("?" for _ in missing)
-            cursor = conn.execute(
-                f"""UPDATE learned_artifacts
-                    SET stale = 1,
-                        missing_since = COALESCE(missing_since, ?),
-                        knowledge_reconciled_at = NULL,
-                        updated_at = ?
-                    WHERE tenant_id = ? AND artifact_type = ? AND artifact_id IN ({placeholders})""",
-                (now, now, tenant_id, artifact_type, *missing),
-            )
-            if self._learning_index_available():
-                try:
-                    conn.execute(
-                        f"""DELETE FROM learning_context_fts
-                            WHERE tenant_id = ? AND source_kind = ?
-                              AND source_id IN ({placeholders})""",
-                        (tenant_id, artifact_type, *missing),
+        crawl_started_at = crawl_started_at if crawl_started_at is not None else time.time()
+        marked_at = time.time()
+        after_id = 0
+        total = 0
+        while True:
+            with self.transaction() as conn:
+                clauses = [
+                    "tenant_id = ?",
+                    "artifact_type = ?",
+                    "stale = 0",
+                    "id > ?",
+                    "last_seen_at <= ?",
+                ]
+                params: list[Any] = [tenant_id, artifact_type, after_id, crawl_started_at]
+                if source_vendor is not None:
+                    clauses.append("source_vendor = ?")
+                    params.append(source_vendor)
+                if source_instance is not None:
+                    clauses.append("source_instance = ?")
+                    params.append(source_instance)
+                if external_id_prefix is not None:
+                    clauses.append("external_id LIKE ? ESCAPE '\\'")
+                    params.append(f"{_escape_like_prefix(external_id_prefix)}%")
+                rows = conn.execute(
+                    f"""SELECT id, artifact_id, last_seen_at FROM learned_artifacts
+                        WHERE {" AND ".join(clauses)}
+                        ORDER BY id LIMIT ?""",
+                    (*params, _STALE_SOURCE_PAGE_SIZE),
+                ).fetchall()
+                if not rows:
+                    break
+                after_id = int(rows[-1]["id"])
+                stale_refs: set[str] = set()
+                for row in rows:
+                    artifact_id = str(row["artifact_id"])
+                    if artifact_id in seen_artifact_ids:
+                        continue
+                    cursor = conn.execute(
+                        """UPDATE learned_artifacts
+                           SET stale=1, missing_since=COALESCE(missing_since, ?),
+                               knowledge_reconciled_at=NULL, updated_at=?
+                           WHERE tenant_id=? AND id=? AND stale=0 AND last_seen_at=?""",
+                        (marked_at, marked_at, tenant_id, row["id"], row["last_seen_at"]),
                     )
-                except sqlite3.OperationalError as exc:
-                    logger.warning("stale_artifact_context_update_failed", error=str(exc))
-            self._remove_mapping_source_refs(
-                conn,
-                tenant_id=tenant_id,
-                source_type=artifact_type,
-                stale_refs=set(missing),
-            )
-            return cursor.rowcount
+                    if cursor.rowcount == 1:
+                        stale_refs.add(artifact_id)
+                if not stale_refs:
+                    continue
+                total += len(stale_refs)
+                placeholders = ", ".join("?" for _ in stale_refs)
+                if self._learning_index_available():
+                    try:
+                        conn.execute(
+                            f"""DELETE FROM learning_context_fts
+                                WHERE tenant_id=? AND source_kind=?
+                                  AND source_id IN ({placeholders})""",
+                            (tenant_id, artifact_type, *sorted(stale_refs)),
+                        )
+                    except sqlite3.OperationalError as exc:
+                        logger.warning("stale_artifact_context_update_failed", error=str(exc))
+                self._remove_mapping_source_refs(
+                    conn,
+                    tenant_id=tenant_id,
+                    source_type=artifact_type,
+                    stale_refs=stale_refs,
+                )
+        return total
 
     def list_learned_artifacts(
         self,
@@ -2453,7 +2870,7 @@ class SignalStore:
         with self._conn() as conn:
             rows = conn.execute(
                 f"""SELECT id, tenant_id, artifact_id, artifact_type, source_vendor, source_instance,
-                           external_id, title, provenance_url, fingerprint,
+                           external_id, title, provenance_url, fingerprint, extraction_generation,
                            stale, missing_since, first_seen_at, last_seen_at,
                            updated_at, created_at
                     FROM learned_artifacts
@@ -2462,6 +2879,58 @@ class SignalStore:
                 params,
             ).fetchall()
         return [_deserialize_learned_artifact(row) for row in rows]
+
+    def list_learned_artifacts_page(
+        self,
+        *,
+        tenant_id: str | None = None,
+        artifact_type: str | None = None,
+        stale: bool | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        offset: int = 0,
+    ) -> KeysetPage[dict[str, Any]]:
+        """Return newest artifacts with stable pagination for long-lived stores."""
+        if limit < 1 or offset < 0:
+            raise ValueError("invalid artifact page bounds")
+        if cursor and offset:
+            raise ValueError("artifact cursor and offset cannot be combined")
+        tenant_id = self._resolve_tenant(tenant_id)
+        conditions = ["tenant_id = ?"]
+        params: list[Any] = [tenant_id]
+        if artifact_type:
+            conditions.append("artifact_type = ?")
+            params.append(artifact_type)
+        if stale is not None:
+            conditions.append("stale = ?")
+            params.append(int(stale))
+        if cursor:
+            updated_at, row_id = _decode_artifact_cursor(cursor)
+            conditions.append("(updated_at < ? OR (updated_at = ? AND id < ?))")
+            params.extend([updated_at, updated_at, row_id])
+        params.extend([limit + 1, offset])
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""SELECT id, tenant_id, artifact_id, artifact_type, source_vendor, source_instance,
+                           external_id, title, provenance_url, fingerprint, extraction_generation,
+                           stale, missing_since, first_seen_at, last_seen_at,
+                           updated_at, created_at
+                    FROM learned_artifacts
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?""",
+                params,
+            ).fetchall()
+        has_more = len(rows) > limit
+        visible = rows[:limit]
+        next_cursor = None
+        if has_more and visible:
+            last = visible[-1]
+            next_cursor = encode_cursor(float(last["updated_at"]), int(last["id"]))
+        return KeysetPage(
+            items=[_deserialize_learned_artifact(row) for row in visible],
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
 
     def list_unreconciled_stale_artifacts(
         self,
@@ -2475,7 +2944,7 @@ class SignalStore:
         tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT id, artifact_id FROM learned_artifacts
+                """SELECT id, artifact_id, missing_since FROM learned_artifacts
                    WHERE tenant_id=? AND artifact_type=? AND stale=1
                      AND knowledge_reconciled_at IS NULL AND id>?
                    ORDER BY id LIMIT ?""",
@@ -2483,19 +2952,40 @@ class SignalStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def artifact_stale_generation_is_current(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        tenant_id: str | None,
+        artifact_id: str,
+        missing_since: float | None,
+    ) -> bool:
+        """Check a stale artifact generation on the caller's write-locked connection."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        return (
+            conn.execute(
+                """SELECT 1 FROM learned_artifacts
+                   WHERE tenant_id=? AND artifact_id=? AND stale=1
+                     AND missing_since IS ? AND knowledge_reconciled_at IS NULL""",
+                (tenant_id, artifact_id, missing_since),
+            ).fetchone()
+            is not None
+        )
+
     def mark_artifact_knowledge_reconciled(
         self,
         *,
         tenant_id: str | None = None,
         artifact_id: str,
+        missing_since: float | None,
     ) -> bool:
         tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             cursor = conn.execute(
                 """UPDATE learned_artifacts SET knowledge_reconciled_at=?
                    WHERE tenant_id=? AND artifact_id=? AND stale=1
-                     AND knowledge_reconciled_at IS NULL""",
-                (time.time(), tenant_id, artifact_id),
+                     AND missing_since IS ? AND knowledge_reconciled_at IS NULL""",
+                (time.time(), tenant_id, artifact_id, missing_since),
             )
         return cursor.rowcount == 1
 
@@ -2548,6 +3038,85 @@ class SignalStore:
             "signal_mapping_candidates": [dict(row) for row in signal_candidates],
         }
 
+    def list_artifact_extraction_page(
+        self,
+        artifact_id: str,
+        *,
+        extraction_kind: str,
+        tenant_id: str | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> KeysetPage[dict[str, Any]]:
+        """Return one bounded extraction-kind page for an artifact."""
+        table = _ARTIFACT_EXTRACTION_TABLES.get(extraction_kind)
+        if table is None:
+            raise ValueError("unsupported artifact extraction kind")
+        if limit < 1:
+            raise ValueError("extraction page limit must be positive")
+        tenant_id = self._resolve_tenant(tenant_id)
+        conditions = ["tenant_id = ?", "artifact_id = ?"]
+        params: list[Any] = [tenant_id, artifact_id]
+        cursor_generation = None
+        if cursor:
+            cursor_generation, extraction_id = _decode_extraction_cursor(cursor)
+            conditions.append("id > ?")
+            params.append(extraction_id)
+        params.append(limit + 1)
+        with self.read_transaction() as conn:
+            artifact = conn.execute(
+                """SELECT extraction_generation FROM learned_artifacts
+                   WHERE tenant_id=? AND artifact_id=?""",
+                (tenant_id, artifact_id),
+            ).fetchone()
+            if artifact is None:
+                raise ValueError("learned artifact not found")
+            extraction_generation = str(artifact["extraction_generation"] or "")
+            if cursor_generation is not None and cursor_generation != extraction_generation:
+                raise ArtifactGenerationConflictError(
+                    "artifact extractions changed; restart pagination from the first page"
+                )
+            rows = conn.execute(
+                f"""SELECT * FROM {table}
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY id ASC LIMIT ?""",
+                params,
+            ).fetchall()
+        has_more = len(rows) > limit
+        visible = rows[:limit]
+        next_cursor = encode_cursor(extraction_generation, str(visible[-1]["id"])) if has_more and visible else None
+        return KeysetPage(
+            items=[dict(row) for row in visible],
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
+
+    def artifact_extraction_counts_batch(
+        self,
+        artifact_ids: list[str],
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Load extraction summaries in bounded set queries instead of per artifact."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        unique_ids = list(dict.fromkeys(str(value) for value in artifact_ids if str(value)))
+        counts = {artifact_id: {kind: 0 for kind in _ARTIFACT_EXTRACTION_TABLES} for artifact_id in unique_ids}
+        if not unique_ids:
+            return counts
+        with self._conn() as conn:
+            for start in range(0, len(unique_ids), _ARTIFACT_COUNT_BATCH_SIZE):
+                batch = unique_ids[start : start + _ARTIFACT_COUNT_BATCH_SIZE]
+                placeholders = ", ".join("?" for _ in batch)
+                for kind, table in _ARTIFACT_EXTRACTION_TABLES.items():
+                    rows = conn.execute(
+                        f"""SELECT artifact_id, COUNT(*) AS count FROM {table}
+                            WHERE tenant_id=? AND artifact_id IN ({placeholders})
+                            GROUP BY artifact_id""",
+                        (tenant_id, *batch),
+                    ).fetchall()
+                    for row in rows:
+                        counts[str(row["artifact_id"])][kind] = int(row["count"])
+        return counts
+
     def artifact_extraction_counts(
         self,
         artifact_id: str,
@@ -2555,32 +3124,10 @@ class SignalStore:
         tenant_id: str | None = None,
     ) -> dict[str, int]:
         """Return structured extraction row counts for one artifact."""
-        tenant_id = self._resolve_tenant(tenant_id)
-        with self._conn() as conn:
-            evidence = conn.execute(
-                """SELECT COUNT(*) AS count FROM evidence_requirements
-                   WHERE tenant_id = ? AND artifact_id = ?""",
-                (tenant_id, artifact_id),
-            ).fetchone()
-            ownership = conn.execute(
-                "SELECT COUNT(*) AS count FROM ownership_hints WHERE tenant_id = ? AND artifact_id = ?",
-                (tenant_id, artifact_id),
-            ).fetchone()
-            dependencies = conn.execute(
-                "SELECT COUNT(*) AS count FROM dependency_hints WHERE tenant_id = ? AND artifact_id = ?",
-                (tenant_id, artifact_id),
-            ).fetchone()
-            signal_candidates = conn.execute(
-                """SELECT COUNT(*) AS count FROM signal_mapping_candidates
-                   WHERE tenant_id = ? AND artifact_id = ?""",
-                (tenant_id, artifact_id),
-            ).fetchone()
-        return {
-            "evidence_requirements": int(evidence["count"] if evidence else 0),
-            "ownership_hints": int(ownership["count"] if ownership else 0),
-            "dependency_hints": int(dependencies["count"] if dependencies else 0),
-            "signal_mapping_candidates": int(signal_candidates["count"] if signal_candidates else 0),
-        }
+        return self.artifact_extraction_counts_batch(
+            [artifact_id],
+            tenant_id=tenant_id,
+        )[artifact_id]
 
     def artifact_context_indexed(
         self,
@@ -2612,54 +3159,90 @@ class SignalStore:
         tenant_id: str | None = None,
         backend_name: str,
         seen_alert_uids: set[str],
+        crawl_started_at: float | None = None,
     ) -> int:
         """Mark previously ingested backend alerts stale when absent from a crawl."""
         tenant_id = self._resolve_tenant(tenant_id)
-        now = time.time()
-        with self._conn() as conn:
-            rows = conn.execute(
-                """SELECT alert_uid FROM ingested_alerts
-                   WHERE tenant_id = ? AND backend_name = ? AND stale = 0""",
-                (tenant_id, backend_name),
-            ).fetchall()
-            missing = [row["alert_uid"] for row in rows if row["alert_uid"] not in seen_alert_uids]
-            if not missing:
-                return 0
-            placeholders = ", ".join("?" for _ in missing)
-            cursor = conn.execute(
-                f"""UPDATE ingested_alerts
-                    SET stale = 1,
-                        missing_since = COALESCE(missing_since, ?),
-                        knowledge_reconciled_at = NULL,
-                        status = 'stale',
-                        updated_at = ?
-                    WHERE tenant_id = ? AND backend_name = ? AND alert_uid IN ({placeholders})""",
-                (now, now, tenant_id, backend_name, *missing),
-            )
-            if self._learning_index_available():
-                try:
-                    alert_context_ids = [f"alert:{uid}" for uid in missing]
-                    fts_placeholders = ", ".join("?" for _ in alert_context_ids)
-                    conn.execute(
-                        f"""UPDATE learning_context_fts
-                            SET review_state = 'stale'
-                            WHERE tenant_id = ? AND source_kind = 'alert_rule'
-                              AND backend_name = ?
-                              AND dashboard_uid IN ({fts_placeholders})""",
-                        (tenant_id, backend_name, *alert_context_ids),
+        crawl_started_at = crawl_started_at if crawl_started_at is not None else time.time()
+        marked_at = time.time()
+        approval_claim_cutoff = marked_at - self._settings.learning_approval_claim_ttl_seconds
+        after_id = 0
+        total = 0
+        recovered_claims = 0
+        while True:
+            with self.transaction() as conn:
+                rows = conn.execute(
+                    """SELECT id, alert_uid, last_seen_at, status FROM ingested_alerts
+                       WHERE tenant_id=? AND backend_name=? AND stale=0
+                         AND (status!='approving' OR reviewed_at IS NULL OR reviewed_at<=?)
+                         AND id>? AND last_seen_at<=?
+                       ORDER BY id LIMIT ?""",
+                    (
+                        tenant_id,
+                        backend_name,
+                        approval_claim_cutoff,
+                        after_id,
+                        crawl_started_at,
+                        _STALE_SOURCE_PAGE_SIZE,
+                    ),
+                ).fetchall()
+                if not rows:
+                    break
+                after_id = int(rows[-1]["id"])
+                stale_uids: set[str] = set()
+                for row in rows:
+                    alert_uid = str(row["alert_uid"])
+                    if alert_uid in seen_alert_uids:
+                        continue
+                    cursor = conn.execute(
+                        """UPDATE ingested_alerts
+                           SET stale=1, missing_since=COALESCE(missing_since, ?),
+                               knowledge_reconciled_at=NULL, status='stale', updated_at=?
+                           WHERE tenant_id=? AND id=? AND stale=0
+                             AND (status!='approving' OR reviewed_at IS NULL OR reviewed_at<=?)
+                             AND last_seen_at=?""",
+                        (
+                            marked_at,
+                            marked_at,
+                            tenant_id,
+                            row["id"],
+                            approval_claim_cutoff,
+                            row["last_seen_at"],
+                        ),
                     )
-                except sqlite3.OperationalError as exc:
-                    logger.warning("stale_alert_context_update_failed", error=str(exc))
-            stale_source_refs = {
-                f"{backend_name}:alert:{alert_uid}" if backend_name else alert_uid for alert_uid in missing
-            }
-            self._remove_mapping_source_refs(
-                conn,
+                    if cursor.rowcount == 1:
+                        stale_uids.add(alert_uid)
+                        recovered_claims += int(row["status"] == "approving")
+                if not stale_uids:
+                    continue
+                total += len(stale_uids)
+                if self._learning_index_available():
+                    try:
+                        alert_context_ids = sorted(f"alert:{uid}" for uid in stale_uids)
+                        placeholders = ", ".join("?" for _ in alert_context_ids)
+                        conn.execute(
+                            f"""UPDATE learning_context_fts SET review_state='stale'
+                                WHERE tenant_id=? AND source_kind='alert_rule' AND backend_name=?
+                                  AND dashboard_uid IN ({placeholders})""",
+                            (tenant_id, backend_name, *alert_context_ids),
+                        )
+                    except sqlite3.OperationalError as exc:
+                        logger.warning("stale_alert_context_update_failed", error=str(exc))
+                stale_source_refs = {f"{backend_name}:alert:{uid}" if backend_name else uid for uid in stale_uids}
+                self._remove_mapping_source_refs(
+                    conn,
+                    tenant_id=tenant_id,
+                    source_type="alert_ingest",
+                    stale_refs=stale_source_refs,
+                )
+        if recovered_claims:
+            logger.warning(
+                "expired_alert_approval_claims_recovered",
                 tenant_id=tenant_id,
-                source_type="alert_ingest",
-                stale_refs=stale_source_refs,
+                backend_name=backend_name,
+                claim_count=recovered_claims,
             )
-            return cursor.rowcount
+        return total
 
     def mark_missing_dashboards_stale(
         self,
@@ -2667,45 +3250,88 @@ class SignalStore:
         tenant_id: str | None = None,
         backend_name: str,
         seen_dashboard_uids: set[str],
+        crawl_started_at: float | None = None,
     ) -> int:
         """Mark dashboards absent from a complete backend crawl as stale."""
         tenant_id = self._resolve_tenant(tenant_id)
-        now = time.time()
-        with self._conn() as conn:
-            rows = conn.execute(
-                """SELECT dashboard_uid FROM ingested_dashboards
-                   WHERE tenant_id=? AND backend_name=? AND stale=0""",
-                (tenant_id, backend_name),
-            ).fetchall()
-            missing = [row["dashboard_uid"] for row in rows if row["dashboard_uid"] not in seen_dashboard_uids]
-            if not missing:
-                return 0
-            placeholders = ", ".join("?" for _ in missing)
-            cursor = conn.execute(
-                f"""UPDATE ingested_dashboards
-                    SET stale=1, missing_since=COALESCE(missing_since, ?),
-                        knowledge_reconciled_at=NULL, status='stale'
-                    WHERE tenant_id=? AND backend_name=? AND dashboard_uid IN ({placeholders})""",
-                (now, tenant_id, backend_name, *missing),
-            )
-            if self._learning_index_available():
-                try:
-                    conn.execute(
-                        f"""UPDATE learning_context_fts SET review_state='stale'
-                            WHERE tenant_id=? AND source_kind='dashboard_panel' AND backend_name=?
-                              AND dashboard_uid IN ({placeholders})""",
-                        (tenant_id, backend_name, *missing),
+        crawl_started_at = crawl_started_at if crawl_started_at is not None else time.time()
+        marked_at = time.time()
+        approval_claim_cutoff = marked_at - self._settings.learning_approval_claim_ttl_seconds
+        after_id = 0
+        total = 0
+        recovered_claims = 0
+        while True:
+            with self.transaction() as conn:
+                rows = conn.execute(
+                    """SELECT id, dashboard_uid, last_seen_at, status FROM ingested_dashboards
+                       WHERE tenant_id=? AND backend_name=? AND stale=0
+                         AND (status!='approving' OR reviewed_at IS NULL OR reviewed_at<=?)
+                         AND id>? AND last_seen_at<=?
+                       ORDER BY id LIMIT ?""",
+                    (
+                        tenant_id,
+                        backend_name,
+                        approval_claim_cutoff,
+                        after_id,
+                        crawl_started_at,
+                        _STALE_SOURCE_PAGE_SIZE,
+                    ),
+                ).fetchall()
+                if not rows:
+                    break
+                after_id = int(rows[-1]["id"])
+                stale_uids: set[str] = set()
+                for row in rows:
+                    dashboard_uid = str(row["dashboard_uid"])
+                    if dashboard_uid in seen_dashboard_uids:
+                        continue
+                    cursor = conn.execute(
+                        """UPDATE ingested_dashboards
+                           SET stale=1, missing_since=COALESCE(missing_since, ?),
+                               knowledge_reconciled_at=NULL, status='stale'
+                           WHERE tenant_id=? AND id=? AND stale=0
+                             AND (status!='approving' OR reviewed_at IS NULL OR reviewed_at<=?)
+                             AND last_seen_at=?""",
+                        (
+                            marked_at,
+                            tenant_id,
+                            row["id"],
+                            approval_claim_cutoff,
+                            row["last_seen_at"],
+                        ),
                     )
-                except sqlite3.OperationalError as exc:
-                    logger.warning("stale_dashboard_context_update_failed", error=str(exc))
-            stale_refs = {f"{backend_name}:{uid}" if backend_name else uid for uid in missing}
-            self._remove_mapping_source_refs(
-                conn,
+                    if cursor.rowcount == 1:
+                        stale_uids.add(dashboard_uid)
+                        recovered_claims += int(row["status"] == "approving")
+                if not stale_uids:
+                    continue
+                total += len(stale_uids)
+                placeholders = ", ".join("?" for _ in stale_uids)
+                if self._learning_index_available():
+                    try:
+                        conn.execute(
+                            f"""UPDATE learning_context_fts SET review_state='stale'
+                                WHERE tenant_id=? AND source_kind='dashboard_panel' AND backend_name=?
+                                  AND dashboard_uid IN ({placeholders})""",
+                            (tenant_id, backend_name, *sorted(stale_uids)),
+                        )
+                    except sqlite3.OperationalError as exc:
+                        logger.warning("stale_dashboard_context_update_failed", error=str(exc))
+                stale_refs = {f"{backend_name}:{uid}" if backend_name else uid for uid in stale_uids}
+                self._remove_mapping_source_refs(
+                    conn,
+                    tenant_id=tenant_id,
+                    source_type="dashboard_ingest",
+                    stale_refs=stale_refs,
+                )
+        if recovered_claims:
+            logger.warning(
+                "expired_dashboard_approval_claims_recovered",
                 tenant_id=tenant_id,
-                source_type="dashboard_ingest",
-                stale_refs=stale_refs,
+                backend_name=backend_name,
+                claim_count=recovered_claims,
             )
-            return cursor.rowcount
+        return total
 
     @staticmethod
     def _remove_mapping_source_refs(
@@ -2716,10 +3342,17 @@ class SignalStore:
         stale_refs: set[str],
     ) -> None:
         """Remove stale provenance from active mappings, deleting unsupported rows."""
+        if not stale_refs:
+            return
+        ordered_refs = sorted(stale_refs)
+        placeholders = ", ".join("?" for _ in ordered_refs)
         mappings = conn.execute(
-            """SELECT id, source_refs FROM signal_metric_mappings
-               WHERE tenant_id = ? AND governance_ref = ''""",
-            (tenant_id,),
+            f"""SELECT DISTINCT mapping.id, mapping.source_refs
+                FROM signal_metric_mappings mapping
+                JOIN signal_mapping_source_refs source ON source.mapping_id=mapping.id
+                WHERE source.tenant_id=? AND mapping.governance_ref=''
+                  AND source.source_ref IN ({placeholders})""",
+            (tenant_id, *ordered_refs),
         ).fetchall()
         for mapping in mappings:
             refs = json.loads(mapping["source_refs"] or "[]")
@@ -2746,10 +3379,13 @@ class SignalStore:
         tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             mappings = conn.execute(
-                """SELECT id, signal_type, metric_pattern, source_refs
-                   FROM signal_metric_mappings
-                   WHERE tenant_id = ? AND governance_ref = ''""",
-                (tenant_id,),
+                """SELECT mapping.id, mapping.signal_type, mapping.metric_pattern,
+                          mapping.source_refs
+                   FROM signal_mapping_source_refs source
+                   JOIN signal_metric_mappings mapping ON mapping.id=source.mapping_id
+                   WHERE source.tenant_id=? AND source.source_ref=?
+                     AND mapping.governance_ref=''""",
+                (tenant_id, source_ref),
             ).fetchall()
             for mapping in mappings:
                 refs = json.loads(mapping["source_refs"] or "[]")
@@ -3104,7 +3740,7 @@ class SignalStore:
         tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT id, dashboard_uid FROM ingested_dashboards
+                """SELECT id, dashboard_uid, missing_since FROM ingested_dashboards
                    WHERE tenant_id=? AND backend_name=? AND stale=1
                      AND knowledge_reconciled_at IS NULL AND id>?
                    ORDER BY id LIMIT ?""",
@@ -3112,20 +3748,42 @@ class SignalStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def dashboard_stale_generation_is_current(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        tenant_id: str | None,
+        backend_name: str,
+        dashboard_uid: str,
+        missing_since: float | None,
+    ) -> bool:
+        """Check a stale dashboard generation on the caller's write-locked connection."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        return (
+            conn.execute(
+                """SELECT 1 FROM ingested_dashboards
+                   WHERE tenant_id=? AND backend_name=? AND dashboard_uid=? AND stale=1
+                     AND missing_since IS ? AND knowledge_reconciled_at IS NULL""",
+                (tenant_id, backend_name, dashboard_uid, missing_since),
+            ).fetchone()
+            is not None
+        )
+
     def mark_dashboard_knowledge_reconciled(
         self,
         *,
         tenant_id: str | None = None,
         backend_name: str,
         dashboard_uid: str,
+        missing_since: float | None,
     ) -> bool:
         tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             cursor = conn.execute(
                 """UPDATE ingested_dashboards SET knowledge_reconciled_at=?
                    WHERE tenant_id=? AND backend_name=? AND dashboard_uid=? AND stale=1
-                     AND knowledge_reconciled_at IS NULL""",
-                (time.time(), tenant_id, backend_name, dashboard_uid),
+                     AND missing_since IS ? AND knowledge_reconciled_at IS NULL""",
+                (time.time(), tenant_id, backend_name, dashboard_uid, missing_since),
             )
         return cursor.rowcount == 1
 
@@ -3182,7 +3840,7 @@ class SignalStore:
         tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT id, alert_uid FROM ingested_alerts
+                """SELECT id, alert_uid, missing_since FROM ingested_alerts
                    WHERE tenant_id=? AND backend_name=? AND stale=1
                      AND knowledge_reconciled_at IS NULL AND id>?
                    ORDER BY id LIMIT ?""",
@@ -3190,20 +3848,42 @@ class SignalStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def alert_stale_generation_is_current(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        tenant_id: str | None,
+        backend_name: str,
+        alert_uid: str,
+        missing_since: float | None,
+    ) -> bool:
+        """Check a stale alert generation on the caller's write-locked connection."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        return (
+            conn.execute(
+                """SELECT 1 FROM ingested_alerts
+                   WHERE tenant_id=? AND backend_name=? AND alert_uid=? AND stale=1
+                     AND missing_since IS ? AND knowledge_reconciled_at IS NULL""",
+                (tenant_id, backend_name, alert_uid, missing_since),
+            ).fetchone()
+            is not None
+        )
+
     def mark_alert_knowledge_reconciled(
         self,
         *,
         tenant_id: str | None = None,
         backend_name: str,
         alert_uid: str,
+        missing_since: float | None,
     ) -> bool:
         tenant_id = self._resolve_tenant(tenant_id)
         with self._conn() as conn:
             cursor = conn.execute(
                 """UPDATE ingested_alerts SET knowledge_reconciled_at=?
                    WHERE tenant_id=? AND backend_name=? AND alert_uid=? AND stale=1
-                     AND knowledge_reconciled_at IS NULL""",
-                (time.time(), tenant_id, backend_name, alert_uid),
+                     AND missing_since IS ? AND knowledge_reconciled_at IS NULL""",
+                (time.time(), tenant_id, backend_name, alert_uid, missing_since),
             )
         return cursor.rowcount == 1
 
@@ -3226,6 +3906,99 @@ class SignalStore:
             return None
         return _deserialize_ingested_alert(row)
 
+    def finalize_ingested_alert_approval(
+        self,
+        alert_uid: str,
+        backend_name: str,
+        *,
+        generation_fingerprint: str,
+        tenant_id: str | None = None,
+    ) -> bool:
+        """Finalize the exact claimed alert generation after promotion succeeds."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """UPDATE ingested_alerts SET status = 'approved', reviewed_at = ?
+                   WHERE tenant_id = ? AND alert_uid = ? AND backend_name = ?
+                     AND generation_fingerprint = ? AND stale = 0 AND status = 'approving'""",
+                (time.time(), tenant_id, alert_uid, backend_name, generation_fingerprint),
+            )
+        return cursor.rowcount == 1
+
+    def claim_ingested_alert_approval(
+        self,
+        alert_uid: str,
+        backend_name: str,
+        *,
+        generation_fingerprint: str,
+        tenant_id: str | None = None,
+    ) -> bool:
+        """Claim one pending alert generation before promoting its mappings."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """UPDATE ingested_alerts SET status='approving', reviewed_at=?
+                   WHERE tenant_id=? AND alert_uid=? AND backend_name=?
+                     AND generation_fingerprint=? AND stale=0 AND status='pending'""",
+                (time.time(), tenant_id, alert_uid, backend_name, generation_fingerprint),
+            )
+        return cursor.rowcount == 1
+
+    def claim_ingested_dashboard_approval(
+        self,
+        dashboard_uid: str,
+        backend_name: str | None = None,
+        *,
+        expected_generation: float,
+        tenant_id: str | None = None,
+    ) -> bool:
+        """Claim one pending dashboard generation before promoting its mappings."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        with self.transaction() as conn:
+            ingested = self.get_ingested_dashboard(dashboard_uid, backend_name, tenant_id=tenant_id)
+            if ingested is None:
+                return False
+            cursor = conn.execute(
+                """UPDATE ingested_dashboards SET status = 'approving', reviewed_at = ?
+                   WHERE id = ? AND created_at = ? AND stale = 0 AND status = 'pending'""",
+                (time.time(), ingested["id"], expected_generation),
+            )
+        return cursor.rowcount == 1
+
+    def finalize_ingested_dashboard_approval(
+        self,
+        dashboard_uid: str,
+        backend_name: str | None = None,
+        activated_pairs: set[tuple[str, str]] | None = None,
+        *,
+        expected_generation: float,
+        tenant_id: str | None = None,
+    ) -> bool:
+        """Finalize only the dashboard generation previously claimed for approval."""
+        tenant_id = self._resolve_tenant(tenant_id)
+        with self.transaction() as conn:
+            ingested = self.get_ingested_dashboard(dashboard_uid, backend_name, tenant_id=tenant_id)
+            if ingested is None:
+                return False
+            cursor = conn.execute(
+                """UPDATE ingested_dashboards SET status = 'approved', reviewed_at = ?
+                   WHERE id = ? AND created_at = ? AND stale = 0 AND status = 'approving'""",
+                (time.time(), ingested["id"], expected_generation),
+            )
+            changed = cursor.rowcount == 1
+        if changed:
+            pairs = activated_pairs
+            if pairs is None:
+                pairs = _eligible_pairs_from_ingested_signals(ingested.get("signals_inferred", []))
+            self.update_learning_context_review_state(
+                dashboard_uid,
+                "approved",
+                backend_name,
+                activated_pairs=pairs,
+                tenant_id=tenant_id,
+            )
+        return changed
+
     def update_ingested_dashboard_status(
         self,
         dashboard_uid: str,
@@ -3235,7 +4008,7 @@ class SignalStore:
         *,
         tenant_id: str | None = None,
     ) -> bool:
-        """Move a pending ingested dashboard to a reviewed status."""
+        """Move an eligible dashboard review state to a terminal decision."""
         tenant_id = self._resolve_tenant(tenant_id)
         if status not in {"approved", "rejected", "ignored"}:
             raise ValueError(f"unsupported ingested dashboard status: {status}")
@@ -3244,11 +4017,13 @@ class SignalStore:
         if ingested is None:
             return False
 
+        expected_statuses = ("pending",) if status == "approved" else ("pending", "approved")
+        placeholders = ", ".join("?" for _ in expected_statuses)
         with self._conn() as conn:
             cursor = conn.execute(
-                """UPDATE ingested_dashboards SET status = ?, reviewed_at = ?
-                   WHERE id = ? AND status = 'pending'""",
-                (status, time.time(), ingested["id"]),
+                f"""UPDATE ingested_dashboards SET status = ?, reviewed_at = ?
+                    WHERE id = ? AND status IN ({placeholders})""",
+                (status, time.time(), ingested["id"], *expected_statuses),
             )
             changed = cursor.rowcount > 0
         if changed:

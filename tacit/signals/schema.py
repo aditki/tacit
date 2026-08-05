@@ -74,6 +74,18 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     UNIQUE(tenant_id, signal_type, metric_pattern, governance_ref)
 );
 
+-- Indexed provenance relation for lifecycle reconciliation. source_refs remains
+-- the compatibility payload; triggers keep this lookup table authoritative.
+CREATE TABLE IF NOT EXISTS signal_mapping_source_refs (
+    mapping_id          INTEGER NOT NULL,
+    tenant_id           TEXT NOT NULL,
+    source_ref          TEXT NOT NULL,
+    PRIMARY KEY (mapping_id, source_ref)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_mapping_source_ref
+    ON signal_mapping_source_refs(tenant_id, source_ref, mapping_id);
+
 -- Inferred candidates that were NOT auto-taught (negative training data).
 CREATE TABLE IF NOT EXISTS rejected_signal_candidates (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,6 +130,7 @@ CREATE TABLE IF NOT EXISTS ingested_dashboards (
     missing_since       REAL,
     knowledge_reconciled_at REAL,
 
+    last_seen_at        REAL NOT NULL DEFAULT 0,
     created_at          REAL NOT NULL,
     reviewed_at         REAL,
     UNIQUE(tenant_id, dashboard_uid, backend_name)
@@ -132,6 +145,7 @@ CREATE TABLE IF NOT EXISTS ingested_alerts (
     source_instance     TEXT NOT NULL DEFAULT '',
     external_id         TEXT NOT NULL DEFAULT '',
     fingerprint         TEXT NOT NULL DEFAULT '',
+    generation_fingerprint TEXT NOT NULL DEFAULT '',
     alert_title         TEXT NOT NULL DEFAULT '',
     alert_tags          TEXT NOT NULL DEFAULT '[]',
     condition           TEXT NOT NULL DEFAULT '',
@@ -177,6 +191,7 @@ CREATE TABLE IF NOT EXISTS learned_artifacts (
     body_text           TEXT NOT NULL DEFAULT '',
     provenance_url      TEXT NOT NULL DEFAULT '',
     fingerprint         TEXT NOT NULL DEFAULT '',
+    extraction_generation TEXT NOT NULL DEFAULT '',
     stale               INTEGER NOT NULL DEFAULT 0,
     missing_since       REAL,
     knowledge_reconciled_at REAL,

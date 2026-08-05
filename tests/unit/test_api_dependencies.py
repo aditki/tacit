@@ -483,6 +483,24 @@ def test_pending_learning_requires_apply_permission(monkeypatch):
     assert called is False
 
 
+@pytest.mark.parametrize("endpoint", ["runbooks", "incidents"])
+def test_artifact_learning_requires_review_permission_before_persistence(endpoint):
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.apply",
+        )
+    )
+
+    response = TestClient(app).post(
+        f"/api/v1/learn/{endpoint}",
+        json={"title": "Restricted artifact", "body_text": "checkout depends on redis"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.review"
+
+
 @pytest.mark.parametrize(
     ("permissions", "missing_permission"),
     [
@@ -568,6 +586,156 @@ def test_artifact_lists_use_the_requested_tenant(monkeypatch, tmp_path):
     assert tenant_a.status_code == 200
     assert tenant_a.json()["count"] == 1
     assert tenant_a.json()["runbooks"][0]["title"] == "tenant-a runbook"
+
+
+def test_artifact_routes_page_all_rows_and_batch_extraction_summaries(monkeypatch, tmp_path):
+    runtime_settings = Settings(_env_file=None)
+    store = SignalStore(
+        db_path=tmp_path / "signals.db",
+        runtime_settings=runtime_settings,
+    )
+    artifact_count = 1_005
+    extraction_count = 605
+    with store._conn() as conn:
+        conn.executemany(
+            """INSERT INTO learned_artifacts(
+                   tenant_id, artifact_id, artifact_type, title,
+                   first_seen_at, last_seen_at, updated_at, created_at
+               ) VALUES ('default', ?, 'runbook', ?, ?, ?, ?, ?)""",
+            [
+                (
+                    f"artifact-{index:05d}",
+                    f"Runbook {index}",
+                    float(index),
+                    float(index),
+                    float(index),
+                    float(index),
+                )
+                for index in range(1, artifact_count + 1)
+            ],
+        )
+        conn.executemany(
+            """INSERT INTO evidence_requirements(
+                   tenant_id, id, artifact_id, subject, created_at
+               ) VALUES ('default', ?, ?, 'checkout', ?)""",
+            [
+                (
+                    f"er-{index:05d}",
+                    "artifact-01005",
+                    float(index),
+                )
+                for index in range(1, extraction_count + 1)
+            ],
+        )
+        artifact_plan = " ".join(
+            str(value) for row in conn.execute("""EXPLAIN QUERY PLAN SELECT id FROM learned_artifacts
+                    WHERE tenant_id='default' AND artifact_type='runbook'
+                    ORDER BY updated_at DESC, id DESC LIMIT 50""") for value in row
+        )
+    assert "idx_learned_artifacts_page" in artifact_plan
+
+    monkeypatch.setattr(
+        store,
+        "list_artifact_extractions",
+        lambda *args, **kwargs: pytest.fail("artifact list performed an N+1 detail load"),
+    )
+    batch_count_calls = 0
+    load_counts = store.artifact_extraction_counts_batch
+
+    def tracked_count_batch(*args, **kwargs):
+        nonlocal batch_count_calls
+        batch_count_calls += 1
+        return load_counts(*args, **kwargs)
+
+    monkeypatch.setattr(store, "artifact_extraction_counts_batch", tracked_count_batch)
+    app = create_app(runtime_settings=runtime_settings)
+    app.dependency_overrides[get_signal_store] = lambda: store
+    client = TestClient(app)
+
+    artifact_ids = []
+    cursor = None
+    page_count = 0
+    while True:
+        params = {"limit": 137}
+        if cursor:
+            params["cursor"] = cursor
+        response = client.get("/api/v1/learn/runbooks", params=params)
+        assert response.status_code == 200
+        body = response.json()
+        page_count += 1
+        artifact_ids.extend(item["artifact_id"] for item in body["runbooks"])
+        for item in body["runbooks"]:
+            expected = 605 if item["artifact_id"] == "artifact-01005" else 0
+            assert item["extraction_counts"]["evidence_requirements"] == expected
+            assert "extractions" not in item
+        if not body["has_more"]:
+            assert body["next_cursor"] is None
+            break
+        cursor = body["next_cursor"]
+        assert cursor
+
+    assert artifact_ids == [f"artifact-{index:05d}" for index in range(artifact_count, 0, -1)]
+    assert len(set(artifact_ids)) == artifact_count
+    assert batch_count_calls == page_count
+
+    extraction_ids = []
+    cursor = None
+    while True:
+        params = {"kind": "evidence_requirements", "limit": 127}
+        if cursor:
+            params["cursor"] = cursor
+        response = client.get(
+            "/api/v1/learn/runbooks/artifact-01005/extractions",
+            params=params,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        extraction_ids.extend(item["id"] for item in body["extractions"])
+        if not body["has_more"]:
+            assert body["next_cursor"] is None
+            break
+        cursor = body["next_cursor"]
+        assert cursor
+
+    assert extraction_ids == [f"er-{index:05d}" for index in range(1, extraction_count + 1)]
+    assert len(set(extraction_ids)) == extraction_count
+
+    first_generation = client.get(
+        "/api/v1/learn/runbooks/artifact-01005/extractions",
+        params={"kind": "evidence_requirements", "limit": 2},
+    )
+    assert first_generation.status_code == 200
+    stale_cursor = first_generation.json()["next_cursor"]
+    assert stale_cursor
+    store.replace_artifact_extractions(
+        artifact_id="artifact-01005",
+        evidence_requirements=[
+            {"id": "er-new-050", "subject": "checkout"},
+            {"id": "er-new-250", "subject": "checkout"},
+            {"id": "er-new-350", "subject": "checkout"},
+        ],
+    )
+
+    stale_continuation = client.get(
+        "/api/v1/learn/runbooks/artifact-01005/extractions",
+        params={
+            "kind": "evidence_requirements",
+            "limit": 2,
+            "cursor": stale_cursor,
+        },
+    )
+    restarted = client.get(
+        "/api/v1/learn/runbooks/artifact-01005/extractions",
+        params={"kind": "evidence_requirements", "limit": 3},
+    )
+
+    assert stale_continuation.status_code == 409
+    assert "restart pagination" in stale_continuation.json()["detail"]
+    assert [row["id"] for row in restarted.json()["extractions"]] == [
+        "er-new-050",
+        "er-new-250",
+        "er-new-350",
+    ]
 
 
 def test_learning_backend_route_uses_app_scoped_backend_settings(monkeypatch, tmp_path):
@@ -795,3 +963,12 @@ def test_alert_dry_runs_preserve_selected_wildcard_tenant(monkeypatch):
     assert single.status_code == 200, single.text
     assert bulk.status_code == 200, bulk.text
     assert seen == [("single", "tenant-a"), ("bulk", "tenant-a")]
+
+
+def test_openapi_feedback_description_preserves_governed_authority_boundary():
+    from tacit.api.app import OPENAPI_TAGS
+
+    feedback = next(tag for tag in OPENAPI_TAGS if tag["name"] == "Feedback")
+
+    assert "assessment and governed-candidate input" in feedback["description"]
+    assert "never changes runtime ranking directly" in feedback["description"]

@@ -72,7 +72,9 @@ Cold and learned recall are different experiments and must not share state. Befo
 - the curated archetype registry back to the packaged set;
 - the generated-archetype quarantine to an empty test directory, with generation and experimental retrieval disabled;
 - the LLM/discovery cache (`cache.py`) and metric catalog cache;
-- the investigation history and feedback/provenance stores (`history.py`, `feedback.py`), since ranking reads metric quality from feedback.
+- the investigation history and feedback/provenance stores (`history.py`, `feedback.py`), so evaluation state and
+  tenant-owned assessment data cannot leak between runs. Raw feedback is assessment-only until represented by an
+  eligible Operational Knowledge revision.
 
 During ClickStack testing, repeated runs contaminated the baseline precisely because these stores accumulate across runs. Learned runs then start from a defined teaching step (a specified set of approved dashboards) so the learned baseline is reproducible rather than path-dependent.
 Generated archetypes are not a learned-run input. They may be evaluated only as a

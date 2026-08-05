@@ -23,7 +23,7 @@ OPENAPI_TAGS = [
     {
         "name": "Feedback",
         "description": "Submit and retrieve human evaluation feedback for generated dashboards. "
-        "Feedback drives the closed-loop improvement system — rated metrics influence future ranking.",
+        "Raw feedback is assessment and governed-candidate input; it never changes runtime ranking directly.",
     },
     {
         "name": "Insights",
@@ -69,7 +69,7 @@ DESCRIPTION = (
     "deterministic query building.\n\n"
     "### Key capabilities\n"
     "- **Investigation generation** — describe the incident, get validated evidence artifacts\n"
-    "- **Feedback loop** — rate dashboards, and the system automatically improves metric selection\n"
+    "- **Feedback and assessment** — rate dashboards to measure usefulness and identify governed learning candidates\n"
     "- **Curated archetype management** — edit operator-authored templates via YAML and hot-reload without restart; "
     "generated output remains quarantined\n\n"
     "### Authentication\n"

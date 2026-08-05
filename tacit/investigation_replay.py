@@ -202,6 +202,7 @@ def apply_counterfactual(
         and observation.valid_query
         and observation.survived
     }
+    supported_requirements = set(supported_observations)
     effectively_removed_requirement_ids = removed_evidence_requirement_ids.difference(supported_observations)
     candidates = []
     for candidate in snapshot.culprit_ranking.candidates:
@@ -275,38 +276,56 @@ def apply_counterfactual(
             )
             candidate = candidate.model_copy(update={"score": override_score, "confidence": override_confidence})
         candidates.append(candidate)
-    candidates.sort(key=lambda candidate: (-candidate.score, candidate.rank, candidate.suspect_type, candidate.suspect))
-    candidates = [candidate.model_copy(update={"rank": rank}) for rank, candidate in enumerate(candidates, start=1)]
-    supported_requirements = {
-        observation.requirement_id
-        for observation in observations
-        if observation.outcome == EvidenceObservationOutcome.SUPPORTED_OBSERVATION
-        and observation.valid_query
-        and observation.survived
-    }
-    leading_candidate_supported = bool(
-        candidates and supported_requirements.intersection(candidates[0].supporting_requirement_ids)
+
+    def has_supported_runtime(candidate) -> bool:
+        linked_requirements = set(candidate.supporting_requirement_ids)
+        if linked_requirements:
+            return bool(linked_requirements.intersection(supported_requirements))
+        return bool(candidate.runtime_evidence) and not removed_evidence_requirement_ids
+
+    candidates.sort(
+        key=lambda candidate: (
+            has_supported_runtime(candidate),
+            candidate.score,
+            len(candidate.contextual_reasons),
+            candidate.suspect,
+        ),
+        reverse=True,
     )
-    abstained = snapshot.culprit_ranking.abstained or not leading_candidate_supported
+    candidates = [candidate.model_copy(update={"rank": rank}) for rank, candidate in enumerate(candidates, start=1)]
+    has_supported_candidate = any(has_supported_runtime(candidate) for candidate in candidates)
+    abstained = snapshot.culprit_ranking.abstained or not has_supported_candidate
     abstention_reason = snapshot.culprit_ranking.abstention_reason
     if abstained and not abstention_reason:
         abstention_reason = (
-            "counterfactual_leading_candidate_unsupported"
-            if supported_requirements
-            else "counterfactual_removed_runtime_support"
+            "counterfactual_removed_runtime_support"
+            if removed_evidence_requirement_ids
+            else "counterfactual_no_supported_candidate"
         )
-    has_supported_evidence = bool(supported_requirements)
+    if not abstained:
+        abstention_reason = ""
+    evidence_sources = [
+        source for source in snapshot.culprit_ranking.evidence_sources if source != "Validated runtime observations"
+    ]
+    if candidates and "Operational context" not in evidence_sources:
+        evidence_sources.insert(0, "Operational context")
+    if has_supported_candidate and "Validated runtime observations" not in evidence_sources:
+        evidence_sources.append("Validated runtime observations")
+    if not candidates:
+        evidence_sources = []
     culprit_ranking = snapshot.culprit_ranking.model_copy(
         update={
             "candidates": candidates,
             "abstained": abstained,
             "abstention_reason": abstention_reason,
-            "mode": (snapshot.culprit_ranking.mode if has_supported_evidence else CulpritRankingMode.CONTEXTUAL),
-            "evidence_sources": snapshot.culprit_ranking.evidence_sources if has_supported_evidence else [],
+            "mode": (
+                CulpritRankingMode.TELEMETRY_EVIDENCED if has_supported_candidate else CulpritRankingMode.CONTEXTUAL
+            ),
+            "evidence_sources": evidence_sources,
             "telemetry_status": (
                 snapshot.culprit_ranking.telemetry_status
-                if has_supported_evidence or not removed_evidence_requirement_ids
-                else "counterfactual_evidence_removed"
+                if has_supported_candidate
+                else ("counterfactual_evidence_removed" if removed_evidence_requirement_ids else "not_evidenced")
             ),
         }
     )

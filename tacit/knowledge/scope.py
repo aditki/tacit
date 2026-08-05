@@ -47,7 +47,7 @@ def investigation_knowledge_scope(
     environments = {
         canonical
         for alias, canonical in _ENVIRONMENT_ALIASES.items()
-        if re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", lowered)
+        if re.search(rf"(?<![a-z0-9_.-]){re.escape(alias)}(?![a-z0-9_.-])", lowered)
     }
     regions = set(_REGION_PATTERN.findall(prompt))
     clusters = _labeled_values(prompt, "cluster")

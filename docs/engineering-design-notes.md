@@ -2,7 +2,7 @@
 
 Status: living implementation guidance
 
-Last reviewed: 2026-07-29
+Last reviewed: 2026-08-04
 
 This document records recurring engineering lessons and refactor signals found
 while building Tacit's Investigation Contract, Operational Knowledge, learning,
@@ -94,6 +94,10 @@ selection.
   not form a valid dependency graph when they point at different files.
 - External dashboard or alert IDs establish provenance, not independence.
   Corroboration groups copied sources by stable operational-content lineage.
+- Human feedback is assessment input until it becomes a reviewed Operational
+  Knowledge candidate. Raw feedback scores must not directly boost or penalize
+  runtime metric ranking because that would bypass revisions, snapshots, and
+  usage attribution.
 
 ### Usage is confirmed by the consuming stage
 
@@ -167,6 +171,13 @@ of adding more per-stage reference sets. A likely record contains:
 
 - Authorization is semantic: read, review, reject, trust, correct, apply, and
   policy override are separate capabilities.
+- Enforce those capabilities at API, CLI, and public domain-service boundaries.
+  Repositories remain tenant-scoped persistence primitives; callers must not
+  mistake direct repository access for an authorized product operation.
+- Workflows that consume stored authority require read permission before their
+  first lookup. Workflows that publish or persist a new authoritative result,
+  including refresh and non-exact replay, also require apply permission before
+  starting a run or external side effect.
 - Policy override inputs require their own privileged permission in API and CLI.
 - Review transitions use compare-and-swap predicates on tenant, identity, and
   expected state.
@@ -188,6 +199,12 @@ of adding more per-stage reference sets. A likely record contains:
   terminal candidate transition in one transaction when they form one operation.
 - Candidate evaluation must not overwrite a concurrent rejection or lifecycle
   transition.
+- A source's terminal review state, mutable resolver retirement, governed
+  lifecycle transition, and audit writes commit together. Atomic source fan-out
+  is bounded; exceeding the bound leaves the source unchanged instead of holding
+  SQLite's single writer indefinitely. Larger fan-out requires a durable
+  revocation/outbox state machine whose pending state fails runtime selection
+  closed.
 - Correction application must verify and supersede the pinned target revision in
   the same atomic operation.
 - Table-rebuild migrations must not allow an implicit commit between rename,
@@ -209,6 +226,8 @@ layer is warranted.
   or dashboard state.
 - Terminal run events occur after all successful reconstruction and revision
   events.
+- A run row and its corresponding start or terminal lifecycle event are one
+  transaction. Neither side may become visible without the other.
 - Client cancellation is cancellation, not timeout.
 
 ### Entity and scope normalization is symmetric
@@ -275,6 +294,9 @@ mechanics, tenant predicates, and transaction ownership in repositories.
 - A source-refresh checkpoint is committed only after candidate lifecycle and
   authority transitions succeed against state re-read under the write lock.
   Compare-and-swap loss is a failed reconciliation, not a successful skip.
+  The checkpoint is bound to the source's `missing_since` generation; a worker
+  from an earlier stale interval cannot certify a source that disappeared
+  again after being restored.
 - Resolver projections are disposable views of immutable knowledge revisions.
   Startup repair is bidirectional: quarantine unauthorized rows and recreate
   missing or deactivated rows from current eligible authority. Version the audit
@@ -293,6 +315,11 @@ mechanics, tenant predicates, and transaction ownership in repositories.
   archetype scope contains only concrete templates resolved from classifier
   matches plus their legacy labels. Catalog-driven widening requires an explicit
   staged pin; never approximate it by selecting the entire curated universe.
+  A staged pin preserves exact revisions already exposed to earlier stages and
+  preserves their recorded usage dispositions; only revisions newly eligible
+  because of the wider scope are evaluated against current state. Resolver
+  projections are replaced from that complete staged snapshot before any
+  wider-scope stage executes.
 - Schema alterations and their required backfills share an explicit rollback
   boundary. Derived-index migrations may commit bounded, idempotent batches and
   set their completion marker only after the final page so interruption is
@@ -312,7 +339,14 @@ mechanics, tenant predicates, and transaction ownership in repositories.
   indexed candidate buckets; truncation is ambiguous and fails closed.
 - Immutable knowledge usage is an authority projection, not a free-form audit
   API. Persisting it requires apply permission and an exact semantic match to
-  the usage stored in the tenant-scoped investigation contract.
+  the usage stored in the tenant-scoped investigation contract. The immutable
+  contract also owns usage identity: retry callers may omit revision-assigned
+  IDs, but persistence must map them back to the contract IDs rather than minting
+  new audit records.
+- Runtime use is authorized before knowledge can affect resolver selection,
+  evidence, query compilation, or ranking. Read permission permits inspection;
+  it does not permit a pipeline to publish knowledge-modified output and defer
+  the apply check until best-effort usage persistence.
 - Dirty resolver projection repair commits bounded batches while the audit stays
   dirty. A read-only validation captures a generation token, and only an
   unchanged token may be marked clean. This avoids a database-wide write lock
@@ -334,6 +368,118 @@ mechanics, tenant predicates, and transaction ownership in repositories.
 - Candidate review priority is persisted as a base priority plus an indexed
   unresolved-conflict bit. Conflict writes adjust that bit set-wise instead of
   deserializing and rewriting every candidate while holding the writer lock.
+- Ranking post-processing preserves runtime-evidence-first ordering even when
+  contextual knowledge changes scores. After exclusions, mode, telemetry status,
+  confidence, and abstention are derived again from surviving runtime evidence;
+  inherited non-abstention must never elevate a contextual-only survivor. The
+  same ordering and state derivation apply to counterfactual replay.
+- Entity bindings are leases on current entity authority, not permanent facts.
+  Promotion revalidates referenced entities while holding the authority write
+  lock, and snapshot selection batch-loads every referenced entity before use.
+  Missing, withdrawn, kind-mismatched, or out-of-scope entities fail closed.
+  Entity status and scope updates use an indexed candidate-to-entity projection
+  for bounded keyset repair; the runtime checks remain the safety boundary if a
+  repair is interrupted. Do not replace that projection with a full JSON scan or
+  one entity query per candidate. Entity registration uses compare-and-swap;
+  withdrawn and superseded entities cannot return to active through the generic
+  registration path and require an explicit future reactivation transition.
+- Source approval claims an exact dashboard or alert generation before governed
+  promotion begins. Generation identity includes the inferred mappings and
+  generated artifact, not only the raw upstream payload: rerunning inference can
+  invalidate an approval even when the dashboard or alert fingerprint is stable.
+  While that generation is `approving`, re-ingestion, terminal review, and
+  complete-crawl staleness must not overwrite it. The claim is retryable after
+  interruption, so recovery completes the same generation rather than exposing
+  authority that lost its source-state compare-and-swap. Claims are leases, not
+  permanent locks: a complete crawl may recover an `approving` source only after
+  the configured claim TTL expires.
+- Candidate source generation and workflow state use separate persistence clocks.
+  `source_updated_at` changes only when extracted source material changes; review,
+  policy, and lifecycle transitions leave it untouched. Source reconciliation
+  captures a generation cutoff, scans provenance with bounded keyset pages, and
+  commits bounded checkpoints. A newer source generation is skipped, while a
+  concurrent review is preserved and still receives the source lifecycle result.
+  Complete-crawl retirement similarly compares the source's `last_seen_at` value
+  from before the crawl and uses a compare-and-swap update, so an unchanged source
+  refreshed during the crawl cannot be marked stale. The exact `missing_since`
+  generation is revalidated on the same write-locked connection before every
+  bounded authority checkpoint; a restored source therefore cannot be retired by
+  an older worker. Reviewed `source_changed`
+  candidates may reactivate explicitly; pending source changes and human terminal
+  decisions may not inherit old authority.
+- A learned artifact's source fingerprint and extracted IR rows are one atomic
+  generation. Retry validation compares deterministic extraction identities, not
+  row counts, because equal-sized old and new extractions are not equivalent.
+- Mapping provenance is projected into an indexed relational table maintained by
+  SQLite triggers. Source refresh and retirement must query this relation rather
+  than deserialize every tenant mapping. The JSON `source_refs` field remains a
+  compatibility payload, not a license to reintroduce history-wide scans.
+- Corroboration filters review, lifecycle, and entity eligibility in SQL and has
+  an explicit candidate scan budget. Exceeding that budget fails evaluation
+  closed instead of holding the SQLite writer lock for an unbounded history scan.
+  Conflict transitions have a separate per-checkpoint work budget; exhausting it
+  rolls back that lifecycle page and asks the caller to retry or consolidate.
+- Candidate admission, proposition membership, and initial audit events commit in
+  one transaction. Duplicate submissions do not emit duplicate creation events;
+  source merges and stale-source reactivation use distinct audit event types.
+  Corroboration snapshots and promotion decisions use deterministic semantic
+  identities that exclude evaluation output and timestamps. Retrying an unchanged
+  review/evaluation reuses the revision and emits no false audit history.
+- Explicit runtime settings own every store resolved below that boundary. Public
+  ingestion helpers may use legacy process-global factories only when neither a
+  store nor runtime settings were supplied. A scoped runtime must never fall back
+  to global persistence after initialization or lookup failure.
+- One user command that changes several authoritative records is one transaction.
+  Signal teaching therefore commits the tenant signal definition, every governed
+  candidate/revision, and every resolver projection together. Adding another
+  multi-record mutation requires a shared unit-of-work API, not compensating
+  writes after independently committed calls. Atomic batches must also be
+  schema-bounded so request size cannot hold SQLite's single writer indefinitely.
+- Source approval may persist an `approving` recovery claim separately, but no
+  authority is visible at that point. Candidate promotion, immutable revisions,
+  resolver projections, source reconciliation, and the final approved status
+  commit together; a failed finalization rolls all authority back while leaving
+  only the retryable claim.
+- Reviewing a candidate and publishing it are distinct capabilities. Review or
+  trust permission can change queue state; any evaluation that can create or
+  repair active authority additionally requires apply permission at the API,
+  CLI, and shared service boundary before the review transition is attempted.
+- Resource lookup and lifecycle transition are separate API outcomes. Missing
+  tenant-scoped resources return `404`; a present resource whose state no longer
+  permits the requested transition returns `409`. Broad `ValueError -> 404`
+  mappings hide races and are prohibited at mutation boundaries.
+- Browser tenant state is a request generation. Every tenant-scoped request and
+  rendered mutation action captures that generation and tenant, rejects stale
+  responses, and displays authorization or transport failures rather than
+  converting them into empty data. Tenant changes invalidate all scoped views.
+- Stored prompts, identifiers, provenance, and URLs are untrusted browser input.
+  Build dynamic rows with DOM text and attribute APIs instead of HTML string
+  interpolation, and allow only HTTP(S) schemes for external links. Security
+  regressions execute the page in a browser; source-string assertions are not an
+  XSS test, especially while the UI holds an operational API key.
+- Long-lived audit collections use stable keyset pagination backed by the same
+  sort index. A fixed limit without a cursor makes old governance history
+  unreachable; an unbounded list trades that bug for memory and latency risk.
+  Parent list responses expose bounded child summaries loaded in set queries;
+  child details use a separate cursor rather than an N+1 query loop or an
+  unbounded nested response.
+- Import and migration modes are authorized as a complete batch before the
+  first storage read or write. A caller must not leave admitted candidates
+  behind when a later requested trust/reject transition is unauthorized, and a
+  failed row rolls back the batch's candidates, authority, projections, and
+  audit events together.
+- A learned source, its extracted rows, retrieval index, governed candidates,
+  lifecycle reconciliation, and resolver projections form one authority
+  transaction when they share a database. Candidate fan-out is checked before
+  opening that write transaction so one source cannot monopolize SQLite's
+  writer indefinitely.
+- Replace-in-place child collections carry a source-generation identity in
+  their pagination cursor. If a refresh replaces the generation between pages,
+  continuation fails with a conflict and the caller restarts; silently mixing
+  two generations produces an audit view that never existed.
+- Automation success means the requested work ran and completed. CLI operational
+  failures return nonzero, and CI invokes suites excluded by default pytest
+  markers explicitly; a documented-but-deselected E2E suite is not coverage.
 
 ## Observability expectations
 
@@ -344,9 +490,18 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   projection mismatch, and resolver/snapshot usage mismatch.
 - Time intent classification, discovery, semantic resolution, archetype
   selection, compilation, validation, publication, and persistence separately.
+  Persist enough precision to distinguish sub-10ms stages; rounding seconds to
+  two decimal places erases the cost of snapshot pinning and repinning.
 - Record knowledge counts by disposition and reason, selected knowledge IDs and
   revisions, stage effects, lifecycle backlog, stale sources, conflicts, and
   projection health.
+- Record learned-source authority transaction duration, candidate fan-out,
+  configured fan-out limit, governed candidate count, index row count, and
+  rollback reason. These fields distinguish extraction growth from lock
+  contention and lifecycle/projection failures.
+- Track the count and age of `approving` source claims plus authority-transaction
+  rollback reasons. A growing claim backlog is an operator-visible recovery
+  problem even when active authority remains transactionally safe.
 - Separate timeout, cancellation, validation failure, backend failure, and audit
   persistence failure in run status and metrics.
 - Benchmark reports identify clean versus long-lived state and include latency

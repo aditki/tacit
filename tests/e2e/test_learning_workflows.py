@@ -91,6 +91,33 @@ def _checkout_dashboard_upload() -> dict:
     }
 
 
+def _corroborating_dashboard_upload(uid: str, panel_title: str, expression: str) -> dict:
+    return {
+        "vendor": "grafana",
+        "source_name": f"{uid}.json",
+        "auto_approve": True,
+        "dashboard": {
+            "dashboard": {
+                "uid": uid,
+                "title": panel_title,
+                "tags": ["service:checkout"],
+                "panels": [
+                    {
+                        "type": "timeseries",
+                        "title": panel_title,
+                        "targets": [
+                            {
+                                "expr": expression,
+                                "datasource": {"type": "prometheus", "uid": "prom"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
+    }
+
+
 def test_dashboard_upload_approval_search_and_service_question_e2e(client, isolated_learning_store):
     if not isolated_learning_store._learning_index_available():
         pytest.skip("SQLite FTS5 is not available")
@@ -157,6 +184,58 @@ def test_dashboard_upload_approval_search_and_service_question_e2e(client, isola
     )
     assert search_cli.exit_code == 0
     assert "checkout_custom_latency_ms" in search_cli.output
+
+
+@pytest.mark.parametrize(("action", "terminal_status"), [("reject", "rejected"), ("ignore", "ignored")])
+def test_dashboard_terminal_review_retires_governed_source_support_e2e(
+    client,
+    isolated_learning_store,
+    action,
+    terminal_status,
+):
+    first = client.post(
+        "/api/v1/learn/dashboard/json",
+        json=_corroborating_dashboard_upload(
+            "checkout-latency-source-a",
+            "Checkout latency p95",
+            "checkout_custom_latency_ms",
+        ),
+    )
+    second = client.post(
+        "/api/v1/learn/dashboard/json",
+        json=_corroborating_dashboard_upload(
+            "checkout-latency-source-b",
+            "Checkout latency p99",
+            "avg(checkout_custom_latency_ms)",
+        ),
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["status"] == second.json()["status"] == "approved"
+    active_patterns = {
+        mapping["metric_pattern"]
+        for mapping in isolated_learning_store.get_mappings_for_signal(
+            "request_latency",
+            include_decayed=True,
+        )
+    }
+    assert "checkout_custom_latency_ms" in active_patterns
+
+    reviewed = client.post(
+        f"/api/v1/learn/dashboards/checkout-latency-source-b/{action}",
+        params={"backend": "grafana_json"},
+    )
+
+    assert reviewed.status_code == 200
+    assert reviewed.json()["status"] == terminal_status
+    remaining_patterns = {
+        mapping["metric_pattern"]
+        for mapping in isolated_learning_store.get_mappings_for_signal(
+            "request_latency",
+            include_decayed=True,
+        )
+    }
+    assert "checkout_custom_latency_ms" not in remaining_patterns
 
 
 def test_runbook_artifact_learning_cli_and_api_e2e(client, isolated_learning_store, tmp_path):

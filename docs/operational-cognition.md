@@ -70,7 +70,8 @@ Tacit treats operational semantics as learned infrastructure:
 - bootstrap patterns provide common defaults
 - dashboard ingestion learns from existing Grafana and SignalFx dashboards
 - context-aware mappings preserve service, datasource, environment, and backend scope
-- feedback can raise or lower metric quality without retraining a model
+- feedback measures metric usefulness and can produce reviewable learning candidates; raw feedback does not bypass
+  governed knowledge to alter runtime ranking
 
 This is why Tacit has a signal store rather than only prompt templates. The system needs a memory of what metrics mean in this environment.
 

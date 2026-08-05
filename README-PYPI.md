@@ -87,6 +87,7 @@ Useful settings include:
 - `API_AUTH_KEY`
 - `KNOWLEDGE_TENANT_ID`
 - `KNOWLEDGE_TENANT_API_KEYS`
+- `LEARNING_APPROVAL_CLAIM_TTL_SECONDS`
 
 Wildcard tenancy requires API authentication with a distinct key per tenant.
 `HISTORY_DB_PATH` and `SIGNALS_DB_PATH` must reference different SQLite files.

@@ -8,11 +8,13 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from fastapi.testclient import TestClient
 
+from tacit.api.app import create_app
 from tacit.cli import cli
 from tacit.config import Settings
 from tacit.grounding_benchmark import _contract_for_case, load_grounding_corpus
-from tacit.history import InvestigationStore
+from tacit.history import InvestigationStore, StaleRevisionError
 from tacit.investigation_bundle import build_investigation_bundle, export_investigation_bundle
 from tacit.investigation_contract import InvestigationRunType
 
@@ -240,7 +242,7 @@ def test_complete_schema_default_history_requires_and_records_a_migration_owner(
     assert wildcard.get(investigation_id, tenant_id="default") is None
 
 
-def test_history_schema_migration_resumes_after_a_committed_batch(tmp_path):
+def test_history_schema_migration_resumes_for_the_same_owner_and_rejects_an_owner_change(tmp_path):
     db_path = tmp_path / "rollback-history.db"
     store = InvestigationStore(db_path=db_path, runtime_settings=Settings(_env_file=None))
     rows = [(f"legacy-{index:04d}", f"Legacy prompt {index}", time.time()) for index in range(505)]
@@ -277,13 +279,39 @@ def test_history_schema_migration_resumes_after_a_committed_batch(tmp_path):
     assert assigned == (500,)
     assert progress is not None
 
-    reopened = InvestigationStore(
+    with pytest.raises(RuntimeError, match="already in progress for another tenant"):
+        InvestigationStore(
+            db_path=db_path,
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-b"),
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM investigation_tenant_assignments").fetchone() == (500,)
+        assert conn.execute("SELECT COUNT(*) FROM investigations WHERE tenant_id='tenant-b'").fetchone() == (0,)
+        details = json.loads(
+            conn.execute(
+                "SELECT details_json FROM history_migration_progress WHERE migration_name=?",
+                ("history_tenant_assignment_backfill_v2",),
+            ).fetchone()[0]
+        )
+    assert details["configured_tenant"] == "tenant-a"
+
+    legacy_row_checks = 0
+
+    class CountingHistoryStore(InvestigationStore):
+        def _legacy_row_tenant(self, *args, **kwargs):
+            nonlocal legacy_row_checks
+            legacy_row_checks += 1
+            return super()._legacy_row_tenant(*args, **kwargs)
+
+    reopened = CountingHistoryStore(
         db_path=db_path,
         runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
     )
     with reopened._conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM investigation_tenant_assignments").fetchone()[0] == 505
         assert conn.execute("SELECT COUNT(*) FROM history_migration_progress").fetchone()[0] == 0
+    assert legacy_row_checks == 5
 
 
 def test_history_upgrade_adds_investigation_event_lookup_index(tmp_path, monkeypatch):
@@ -478,13 +506,203 @@ def test_history_stats_rejects_cross_tenant_requests_in_pinned_runtime(tmp_path)
         store.stats(tenant_id="tenant-b")
 
 
+def test_wildcard_history_id_mutations_require_an_explicit_tenant(tmp_path):
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
+    investigation_id = store.start("Tenant A investigation", tenant_id="tenant-a")
+    run_id = store.start_run(
+        investigation_id,
+        run_type=InvestigationRunType.INITIAL,
+        tenant_id="tenant-a",
+    )
+    calls = [
+        lambda: store.record_intent(investigation_id, summary="Blocked intent"),
+        lambda: store.record_discovery(investigation_id, datasources_found=3),
+        lambda: store.record_queries(investigation_id, panel_count=3),
+        lambda: store.record_validation(investigation_id, final_panel_count=3),
+        lambda: store.record_stage(
+            investigation_id,
+            "ranking",
+            status="passed",
+            reason_code="blocked_stage",
+        ),
+        lambda: store.finish(investigation_id, status="success"),
+        lambda: store.start_run(investigation_id, run_type=InvestigationRunType.REPLAY),
+        lambda: store.append_event(investigation_id, run_id, "blocked_event"),
+        lambda: store.complete_run(run_id, status="completed"),
+    ]
+
+    for call in calls:
+        with pytest.raises(ValueError, match="tenant"):
+            call()
+
+    record = store.get(investigation_id, tenant_id="tenant-a")
+    assert record is not None
+    assert record["intent_summary"] == ""
+    assert record["datasources_found"] == 0
+    assert record["panel_count"] == 0
+    assert record["status"] == "running"
+    assert [event["event_type"] for event in store.list_events(investigation_id, tenant_id="tenant-a")] == [
+        "run_started"
+    ]
+    assert store.list_runs(investigation_id, tenant_id="tenant-a")[0]["status"] == "running"
+
+
+def test_start_run_rolls_back_row_when_start_event_fails(tmp_path, monkeypatch):
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=Settings(_env_file=None),
+    )
+    investigation_id = store.start("Atomic start event")
+    append_event = store._append_event_in_transaction
+
+    def fail_after_event(*args, **kwargs):
+        append_event(*args, **kwargs)
+        raise RuntimeError("simulated run-start event failure")
+
+    monkeypatch.setattr(store, "_append_event_in_transaction", fail_after_event)
+
+    with pytest.raises(RuntimeError, match="simulated run-start event failure"):
+        store.start_run(investigation_id, run_type=InvestigationRunType.INITIAL)
+
+    assert store.list_runs(investigation_id) == []
+    assert store.list_events(investigation_id) == []
+
+
+def test_complete_run_rolls_back_state_when_terminal_event_fails(tmp_path, monkeypatch):
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=Settings(_env_file=None),
+    )
+    investigation_id = store.start("Atomic completion event")
+    run_id = store.start_run(investigation_id, run_type=InvestigationRunType.INITIAL)
+    append_event = store._append_event_in_transaction
+
+    def fail_after_event(*args, **kwargs):
+        append_event(*args, **kwargs)
+        raise RuntimeError("simulated run-terminal event failure")
+
+    monkeypatch.setattr(store, "_append_event_in_transaction", fail_after_event)
+
+    with pytest.raises(RuntimeError, match="simulated run-terminal event failure"):
+        store.complete_run(run_id, status="completed")
+
+    assert store.list_runs(investigation_id)[0]["status"] == "running"
+    assert [event["event_type"] for event in store.list_events(investigation_id)] == ["run_started"]
+
+
+def test_history_mutations_enforce_tenant_and_run_ownership(tmp_path):
+    store = InvestigationStore(
+        db_path=tmp_path / "history.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
+    investigation_id = store.start("Tenant A investigation", tenant_id="tenant-a")
+    other_investigation_id = store.start("Other tenant A investigation", tenant_id="tenant-a")
+    tenant_b_investigation_id = store.start("Tenant B investigation", tenant_id="tenant-b")
+    run_id = store.start_run(
+        investigation_id,
+        run_type=InvestigationRunType.INITIAL,
+        tenant_id="tenant-a",
+    )
+    other_run_id = store.start_run(
+        other_investigation_id,
+        run_type=InvestigationRunType.INITIAL,
+        tenant_id="tenant-a",
+    )
+    tenant_b_run_id = store.start_run(
+        tenant_b_investigation_id,
+        run_type=InvestigationRunType.INITIAL,
+        tenant_id="tenant-b",
+    )
+
+    store.record_intent(investigation_id, summary="Blocked intent", tenant_id="tenant-b")
+    store.record_discovery(investigation_id, datasources_found=3, tenant_id="tenant-b")
+    store.record_queries(investigation_id, panel_count=3, tenant_id="tenant-b")
+    store.record_validation(investigation_id, final_panel_count=3, tenant_id="tenant-b")
+    store.record_stage(
+        investigation_id,
+        "ranking",
+        status="passed",
+        reason_code="blocked_stage",
+        tenant_id="tenant-b",
+    )
+    store.finish(investigation_id, status="success", tenant_id="tenant-b")
+    with pytest.raises(ValueError, match="selected tenant"):
+        store.start_run(
+            investigation_id,
+            run_type=InvestigationRunType.REPLAY,
+            tenant_id="tenant-b",
+        )
+
+    store.append_event(
+        investigation_id,
+        other_run_id,
+        "wrong_investigation",
+        tenant_id="tenant-a",
+    )
+    store.append_event(
+        investigation_id,
+        tenant_b_run_id,
+        "wrong_tenant_and_investigation",
+        tenant_id="tenant-a",
+    )
+    store.append_event(
+        investigation_id,
+        run_id,
+        "wrong_tenant",
+        tenant_id="tenant-b",
+    )
+    store.complete_run(run_id, status="completed", tenant_id="tenant-b")
+
+    record = store.get(investigation_id, tenant_id="tenant-a")
+    assert record is not None
+    assert record["intent_summary"] == ""
+    assert record["datasources_found"] == 0
+    assert record["panel_count"] == 0
+    assert record["stage_outcomes"] == {}
+    assert record["status"] == "running"
+    assert [event["event_type"] for event in store.list_events(investigation_id, tenant_id="tenant-a")] == [
+        "run_started"
+    ]
+    assert store.list_runs(investigation_id, tenant_id="tenant-a")[0]["status"] == "running"
+
+    with pytest.raises(StaleRevisionError, match="run does not belong"):
+        store.persist_contract_revision(
+            _contract(investigation_id, tenant_id="tenant-a"),
+            run_id=other_run_id,
+        )
+    assert store.list_revisions(investigation_id, tenant_id="tenant-a") == []
+
+    store.persist_contract_revision(
+        _contract(investigation_id, tenant_id="tenant-a"),
+        run_id=run_id,
+    )
+    store.append_event(investigation_id, run_id, "owned_event", tenant_id="tenant-a")
+    store.complete_run(run_id, status="completed", tenant_id="tenant-a")
+
+    assert [event["event_type"] for event in store.list_events(investigation_id, tenant_id="tenant-a")] == [
+        "run_started",
+        "revision_persisted",
+        "owned_event",
+        "run_completed",
+    ]
+    assert store.list_runs(investigation_id, tenant_id="tenant-a")[0]["status"] == "completed"
+
+
 def test_history_child_records_require_and_enforce_the_selected_tenant(tmp_path):
     settings = Settings(_env_file=None, knowledge_tenant_id="*")
     store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=settings)
     investigation_id = store.start("Tenant A investigation", tenant_id="tenant-a")
     store.persist_contract_revision(_contract(investigation_id, tenant_id="tenant-a"))
-    run_id = store.start_run(investigation_id, run_type=InvestigationRunType.REPLAY, base_revision=1)
-    store.append_event(investigation_id, run_id, "tenant_a_event", {})
+    run_id = store.start_run(
+        investigation_id,
+        run_type=InvestigationRunType.REPLAY,
+        base_revision=1,
+        tenant_id="tenant-a",
+    )
+    store.append_event(investigation_id, run_id, "tenant_a_event", {}, tenant_id="tenant-a")
     candidate = store.create_knowledge_candidate(
         investigation_id,
         revision=1,
@@ -544,7 +762,7 @@ def test_legacy_migration_is_scoped_before_reading_or_persisting(tmp_path):
     settings = Settings(_env_file=None, knowledge_tenant_id="*")
     store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=settings)
     investigation_id = store.start("Tenant A legacy investigation", tenant_id="tenant-a")
-    store.finish(investigation_id, status="success")
+    store.finish(investigation_id, status="success", tenant_id="tenant-a")
 
     assert store.migrate_legacy_investigation(investigation_id, tenant_id="tenant-b") is None
     assert store.get_contract(investigation_id, tenant_id="tenant-a") is None
@@ -552,6 +770,30 @@ def test_legacy_migration_is_scoped_before_reading_or_persisting(tmp_path):
     migrated = store.migrate_legacy_investigation(investigation_id, tenant_id="tenant-a")
     assert migrated is not None
     assert migrated.request.scope.tenant_id == "tenant-a"
+
+
+def test_history_api_migration_requires_apply_permission_before_mutation(tmp_path):
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-a",
+        knowledge_permissions="knowledge.read",
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    store = InvestigationStore(
+        db_path=Path(runtime_settings.history_db_path),
+        runtime_settings=runtime_settings,
+    )
+    investigation_id = store.start("Legacy migration permission", tenant_id="tenant-a")
+    store.finish(investigation_id, status="success", tenant_id="tenant-a")
+    client = TestClient(create_app(runtime_settings=runtime_settings))
+
+    response = client.post(f"/api/v1/investigations/{investigation_id}/migrate")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.apply"
+    assert store.get_contract(investigation_id, tenant_id="tenant-a") is None
 
 
 class _FakeHistory:
@@ -688,11 +930,16 @@ def test_history_export_requires_export_permission(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "arguments",
     [
+        ["history", "list"],
+        ["history", "show", "inv-a"],
         ["history", "contract", "inv-a"],
+        ["history", "compare", "inv-a", "1", "2"],
         ["history", "replay", "inv-a"],
+        ["history", "stats"],
+        ["doctor"],
     ],
 )
-def test_history_contract_cli_requires_read_permission(monkeypatch, arguments):
+def test_history_cli_reads_require_read_permission(monkeypatch, arguments):
     stores = _FakeStores(
         Settings(
             _env_file=None,
@@ -707,6 +954,36 @@ def test_history_contract_cli_requires_read_permission(monkeypatch, arguments):
     assert result.exit_code != 0
     assert "knowledge.read" in result.output
     assert stores.history_store.calls == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/investigations",
+        "/api/v1/investigations/stats",
+        "/api/v1/investigations/inv-a/revisions",
+        "/api/v1/investigations/inv-a/runs",
+        "/api/v1/investigations/inv-a/compare?left=1&right=2",
+        "/api/v1/investigations/inv-a",
+        "/api/v1/feedback/stats",
+        "/api/v1/feedback/analysis",
+        "/api/v1/feedback/dashboard-a",
+    ],
+)
+def test_history_and_feedback_api_reads_require_knowledge_read(tmp_path, path):
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.apply",
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    client = TestClient(create_app(runtime_settings=runtime_settings))
+
+    response = client.get(path)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.read"
 
 
 def test_history_current_replay_cli_requires_apply_permission(monkeypatch):

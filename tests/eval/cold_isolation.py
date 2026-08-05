@@ -81,20 +81,12 @@ def _patch_all(targets: list[tuple[str, str]], value: Any) -> list[tuple[Any, st
 
 
 def _reset_caches() -> None:
-    """Clear the in-memory metric + LLM caches and the feedback quality cache."""
+    """Clear the in-memory metric and LLM caches."""
     try:
         from tacit.cache import llm_cache, metric_cache
 
         metric_cache.invalidate()
         llm_cache.invalidate()
-    except Exception:
-        pass
-    # Ranking memoizes feedback-derived metric quality; force a reload.
-    try:
-        import tacit.ranking as ranking
-
-        ranking._metric_quality_cache = {}
-        ranking._metric_quality_expires = 0.0
     except Exception:
         pass
 

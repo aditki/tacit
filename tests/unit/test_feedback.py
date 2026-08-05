@@ -1,16 +1,14 @@
 import sqlite3
-import threading
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-import tacit.ranking as ranking
 from tacit.api.app import create_app
 from tacit.config import Settings
 from tacit.feedback import FeedbackStore
 from tacit.models.schemas import Intent, MetricEntry
-from tacit.ranking import invalidate_metric_quality_cache, prerank_metrics
+from tacit.ranking import prerank_metrics
 
 
 def test_empty_feedback_stats_match_api_response_model(tmp_path):
@@ -48,8 +46,7 @@ def _metric(name: str) -> MetricEntry:
     )
 
 
-def test_preranking_uses_feedback_and_cache_from_the_supplied_store(tmp_path, monkeypatch):
-    invalidate_metric_quality_cache()
+def test_preranking_keeps_raw_feedback_assessment_only(tmp_path, monkeypatch):
     first_store = _MetricQualityStore(
         tmp_path / "first.db",
         {"alpha_latency": 0.9, "beta_latency": 0.1},
@@ -71,61 +68,10 @@ def test_preranking_uses_feedback_and_cache_from_the_supplied_store(tmp_path, mo
 
     first = prerank_metrics(intent, catalog, max_candidates=1, feedback_store=first_store)
     second = prerank_metrics(intent, catalog, max_candidates=1, feedback_store=second_store)
-    cached_first = prerank_metrics(intent, catalog, max_candidates=1, feedback_store=first_store)
-
     assert [metric.name for metric in first] == ["alpha_latency"]
-    assert [metric.name for metric in second] == ["beta_latency"]
-    assert [metric.name for metric in cached_first] == ["alpha_latency"]
-    assert first_store.analyze_calls == 1
-    assert second_store.analyze_calls == 1
-
-
-def test_metric_quality_invalidation_suppresses_an_inflight_stale_cache_write(tmp_path):
-    invalidate_metric_quality_cache()
-    started = threading.Event()
-    release = threading.Event()
-
-    class BlockingStore(_MetricQualityStore):
-        def analyze(self, *, tenant_id: str = "default"):
-            self.analyze_calls += 1
-            captured = dict(self.scores)
-            if self.analyze_calls == 1:
-                started.set()
-                assert release.wait(timeout=5)
-            return {
-                "metric_quality": [{"metric": metric, "quality_score": score} for metric, score in captured.items()]
-            }
-
-    store = BlockingStore(tmp_path / "blocking.db", {"checkout_latency": 0.1})
-    first_result: list[dict[str, float]] = []
-    thread = threading.Thread(
-        target=lambda: first_result.append(ranking._load_metric_quality(feedback_store=store, tenant_id="tenant-a"))
-    )
-    thread.start()
-    assert started.wait(timeout=5)
-    store.scores = {"checkout_latency": 0.9}
-    invalidate_metric_quality_cache(store, tenant_id="tenant-a")
-    release.set()
-    thread.join(timeout=5)
-
-    assert not thread.is_alive()
-    assert first_result == [{"checkout_latency": 0.1}]
-    assert ranking._load_metric_quality(feedback_store=store, tenant_id="tenant-a") == {"checkout_latency": 0.9}
-    assert store.analyze_calls == 2
-
-
-def test_metric_quality_cache_has_a_fixed_runtime_bound(tmp_path):
-    invalidate_metric_quality_cache()
-    stores = [
-        _MetricQualityStore(tmp_path / f"feedback-{index}.db", {f"metric-{index}": 0.5})
-        for index in range(ranking._QUALITY_CACHE_MAX_ENTRIES + 5)
-    ]
-
-    for store in stores:
-        ranking._load_metric_quality(feedback_store=store, tenant_id="tenant-a")
-
-    assert len(ranking._metric_quality_caches) == ranking._QUALITY_CACHE_MAX_ENTRIES
-    invalidate_metric_quality_cache()
+    assert [metric.name for metric in second] == ["alpha_latency"]
+    assert first_store.analyze_calls == 0
+    assert second_store.analyze_calls == 0
 
 
 def test_preranking_does_not_open_feedback_store_for_small_catalogs():
@@ -143,7 +89,7 @@ def test_preranking_does_not_open_feedback_store_for_small_catalogs():
     assert ranked == catalog
 
 
-def test_preranking_tolerates_feedback_store_initialization_failure():
+def test_preranking_does_not_initialize_unavailable_feedback_store():
     calls = 0
 
     def unavailable_store():
@@ -159,7 +105,7 @@ def test_preranking_tolerates_feedback_store_initialization_failure():
     )
 
     assert len(ranked) == 1
-    assert calls == 1
+    assert calls == 0
 
 
 def test_feedback_store_isolates_duplicate_dashboard_uids_by_tenant(tmp_path):
@@ -197,6 +143,20 @@ def test_feedback_store_isolates_duplicate_dashboard_uids_by_tenant(tmp_path):
     assert [row["reviewer"] for row in store.get_feedback("shared-dashboard", tenant_id="tenant-a")] == ["reviewer-a"]
     assert store.get_aggregate_stats(tenant_id="tenant-a")["useful_rate"] == 1.0
     assert store.get_aggregate_stats(tenant_id="tenant-b")["useful_rate"] == 0
+
+
+def test_feedback_requires_dashboard_provenance_in_the_same_tenant(tmp_path):
+    store = FeedbackStore(
+        tmp_path / "feedback.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+    )
+    store.record_provenance("shared-dashboard", "Tenant A prompt", tenant_id="tenant-a")
+
+    with pytest.raises(ValueError, match="same tenant"):
+        store.submit_feedback("shared-dashboard", overall_useful=True, tenant_id="tenant-b")
+
+    assert store.get_feedback("shared-dashboard", tenant_id="tenant-a") == []
+    assert store.get_feedback("shared-dashboard", tenant_id="tenant-b") == []
 
 
 def test_wildcard_feedback_store_requires_an_explicit_tenant(tmp_path):
@@ -523,8 +483,33 @@ def test_feedback_api_requires_and_applies_the_selected_wildcard_tenant(tmp_path
     assert tenant_b_stats.json()["total_feedback"] == 0
 
 
-def test_feedback_metric_quality_cache_is_tenant_scoped(tmp_path):
-    invalidate_metric_quality_cache()
+def test_feedback_api_rejects_unknown_dashboard_in_selected_tenant(tmp_path):
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="*",
+        api_auth_enabled=True,
+        knowledge_tenant_api_keys={
+            "tenant-a": "tenant-a-secret",
+            "tenant-b": "tenant-b-secret",
+        },
+        feedback_db_path=str(tmp_path / "feedback.db"),
+    )
+    app = create_app(runtime_settings=runtime_settings)
+    store = app.state.runtime_stores.feedback()
+    store.record_provenance("shared-dashboard", "Tenant A prompt", tenant_id="tenant-a")
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/feedback",
+        headers={"X-Tacit-Tenant": "tenant-b", "X-API-Key": "tenant-b-secret"},
+        json={"dashboard_uid": "shared-dashboard", "overall_useful": True},
+    )
+
+    assert response.status_code == 404
+    assert "same tenant" in response.json()["detail"]
+
+
+def test_tenant_feedback_does_not_bypass_governed_runtime_ranking(tmp_path):
     store = FeedbackStore(
         tmp_path / "feedback.db",
         runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
@@ -567,4 +552,4 @@ def test_feedback_metric_quality_cache_is_tenant_scoped(tmp_path):
     )
 
     assert [metric.name for metric in tenant_a] == ["alpha_latency"]
-    assert [metric.name for metric in tenant_b] == ["beta_latency"]
+    assert [metric.name for metric in tenant_b] == ["alpha_latency"]

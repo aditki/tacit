@@ -21,6 +21,7 @@ from tacit.models.schemas import (
     LearnRunbookRequest,
 )
 from tacit.runtime_stores import RuntimeStores
+from tacit.signals.store import ArtifactGenerationConflictError
 
 logger = structlog.get_logger()
 router = APIRouter(dependencies=[Depends(verify_api_key)])
@@ -178,6 +179,8 @@ async def learn_from_runbook(
     from tacit.artifact_learning import RunbookExtractor, artifact_from_text, learn_artifact
 
     _authorize_learning_mutation(request, not payload.dry_run)
+    if not payload.dry_run:
+        assert_knowledge_action(request, KnowledgeAction.APPROVE)
     try:
         store = None if payload.dry_run else stores.signals()
         artifact = artifact_from_text(
@@ -197,6 +200,8 @@ async def learn_from_runbook(
             store=store,
             tenant_id=knowledge_tenant(request),
         )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
@@ -219,6 +224,8 @@ async def learn_from_incident(
     from tacit.artifact_learning import IncidentExtractor, artifact_from_text, learn_artifact
 
     _authorize_learning_mutation(request, not payload.dry_run)
+    if not payload.dry_run:
+        assert_knowledge_action(request, KnowledgeAction.APPROVE)
     try:
         store = None if payload.dry_run else stores.signals()
         artifact = artifact_from_text(
@@ -238,6 +245,8 @@ async def learn_from_incident(
             store=store,
             tenant_id=knowledge_tenant(request),
         )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
@@ -481,18 +490,35 @@ async def list_ingested_alerts(
 async def list_learned_runbooks(
     request: Request,
     limit: int = Query(50, ge=1, le=500),
+    cursor: str | None = Query(default=None, max_length=1024),
+    offset: int = Query(default=0, ge=0),
     store: Any = Depends(get_signal_store),
 ):
-    """List runbooks learned by Tacit Artifact Learning v1."""
+    """List bounded runbook summaries learned by Tacit Artifact Learning v1."""
     assert_knowledge_action(request, KnowledgeAction.READ)
     tenant_id = knowledge_tenant(request)
-    runbooks = store.list_learned_artifacts(tenant_id=tenant_id, artifact_type="runbook", limit=limit)
-    for runbook in runbooks:
-        runbook["extractions"] = store.list_artifact_extractions(
-            runbook["artifact_id"],
+    try:
+        page = store.list_learned_artifacts_page(
             tenant_id=tenant_id,
+            artifact_type="runbook",
+            limit=limit,
+            cursor=cursor,
+            offset=offset,
         )
-    return {"count": len(runbooks), "runbooks": runbooks}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    counts = store.artifact_extraction_counts_batch(
+        [runbook["artifact_id"] for runbook in page.items],
+        tenant_id=tenant_id,
+    )
+    for runbook in page.items:
+        runbook["extraction_counts"] = counts[runbook["artifact_id"]]
+    return {
+        "count": len(page.items),
+        "runbooks": page.items,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+    }
 
 
 @router.get(
@@ -504,18 +530,120 @@ async def list_learned_runbooks(
 async def list_learned_incidents(
     request: Request,
     limit: int = Query(50, ge=1, le=500),
+    cursor: str | None = Query(default=None, max_length=1024),
+    offset: int = Query(default=0, ge=0),
     store: Any = Depends(get_signal_store),
 ):
-    """List incident history learned by Tacit Artifact Learning v1."""
+    """List bounded incident summaries learned by Tacit Artifact Learning v1."""
     assert_knowledge_action(request, KnowledgeAction.READ)
     tenant_id = knowledge_tenant(request)
-    incidents = store.list_learned_artifacts(tenant_id=tenant_id, artifact_type="incident", limit=limit)
-    for incident in incidents:
-        incident["extractions"] = store.list_artifact_extractions(
-            incident["artifact_id"],
+    try:
+        page = store.list_learned_artifacts_page(
             tenant_id=tenant_id,
+            artifact_type="incident",
+            limit=limit,
+            cursor=cursor,
+            offset=offset,
         )
-    return {"count": len(incidents), "incidents": incidents}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    counts = store.artifact_extraction_counts_batch(
+        [incident["artifact_id"] for incident in page.items],
+        tenant_id=tenant_id,
+    )
+    for incident in page.items:
+        incident["extraction_counts"] = counts[incident["artifact_id"]]
+    return {
+        "count": len(page.items),
+        "incidents": page.items,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+    }
+
+
+async def _list_artifact_extraction_page(
+    *,
+    request: Request,
+    artifact_id: str,
+    artifact_type: str,
+    kind: str,
+    limit: int,
+    cursor: str | None,
+    store: Any,
+) -> dict[str, Any]:
+    assert_knowledge_action(request, KnowledgeAction.READ)
+    tenant_id = knowledge_tenant(request)
+    artifact = store.get_learned_artifact(artifact_id, tenant_id=tenant_id)
+    if artifact is None or artifact.get("artifact_type") != artifact_type:
+        raise HTTPException(status_code=404, detail="Learned artifact not found")
+    try:
+        page = store.list_artifact_extraction_page(
+            artifact_id,
+            extraction_kind=kind,
+            tenant_id=tenant_id,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ArtifactGenerationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "artifact_id": artifact_id,
+        "kind": kind,
+        "count": len(page.items),
+        "extractions": page.items,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+    }
+
+
+@router.get(
+    "/api/v1/learn/runbooks/{artifact_id}/extractions",
+    tags=["Learning"],
+    summary="List one runbook extraction kind",
+)
+async def list_runbook_extractions(
+    artifact_id: str,
+    request: Request,
+    kind: str = Query(...),
+    limit: int = Query(200, ge=1, le=500),
+    cursor: str | None = Query(default=None, max_length=1024),
+    store: Any = Depends(get_signal_store),
+):
+    return await _list_artifact_extraction_page(
+        request=request,
+        artifact_id=artifact_id,
+        artifact_type="runbook",
+        kind=kind,
+        limit=limit,
+        cursor=cursor,
+        store=store,
+    )
+
+
+@router.get(
+    "/api/v1/learn/incidents/{artifact_id}/extractions",
+    tags=["Learning"],
+    summary="List one incident extraction kind",
+)
+async def list_incident_extractions(
+    artifact_id: str,
+    request: Request,
+    kind: str = Query(...),
+    limit: int = Query(200, ge=1, le=500),
+    cursor: str | None = Query(default=None, max_length=1024),
+    store: Any = Depends(get_signal_store),
+):
+    return await _list_artifact_extraction_page(
+        request=request,
+        artifact_id=artifact_id,
+        artifact_type="incident",
+        kind=kind,
+        limit=limit,
+        cursor=cursor,
+        store=store,
+    )
 
 
 @router.get(
@@ -587,7 +715,7 @@ async def approve_ingested_dashboard(
 ):
     """Approve a pending ingested dashboard, activating its signal mappings."""
     from tacit.config import settings
-    from tacit.dashboard_ingest import approve_ingested_dashboard_record
+    from tacit.dashboard_ingest import DashboardReviewConflictError, approve_ingested_dashboard_record
 
     _authorize_signal_approval(request, True)
     _authorize_learning_mutation(request)
@@ -601,6 +729,8 @@ async def approve_ingested_dashboard(
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")
+    except DashboardReviewConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.post(
@@ -617,9 +747,10 @@ async def reject_ingested_dashboard(
 ):
     """Reject a pending ingested dashboard."""
     from tacit.config import settings
-    from tacit.dashboard_ingest import reject_ingested_dashboard_record
+    from tacit.dashboard_ingest import DashboardReviewConflictError, reject_ingested_dashboard_record
 
     assert_knowledge_action(request, KnowledgeAction.REJECT)
+    _authorize_learning_mutation(request)
     try:
         return reject_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
@@ -630,8 +761,8 @@ async def reject_ingested_dashboard(
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")
-    except RuntimeError:
-        raise HTTPException(status_code=409, detail="Dashboard is no longer pending")
+    except DashboardReviewConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.post(
@@ -646,21 +777,21 @@ async def ignore_ingested_dashboard(
     backend: str | None = None,
     store: Any = Depends(get_signal_store),
 ):
-    """Ignore a pending ingested dashboard without creating mappings or negative examples."""
+    """Ignore a dashboard without creating mappings or negative examples."""
+    from tacit.config import settings
+    from tacit.dashboard_ingest import DashboardReviewConflictError, ignore_ingested_dashboard_record
+
     assert_knowledge_action(request, KnowledgeAction.REJECT)
-    tenant_id = knowledge_tenant(request)
-    ingested = store.get_ingested_dashboard(dashboard_uid, backend_name=backend, tenant_id=tenant_id)
-    if ingested is None:
+    _authorize_learning_mutation(request)
+    try:
+        return ignore_ingested_dashboard_record(
+            dashboard_uid=dashboard_uid,
+            backend_name=backend,
+            store=store,
+            runtime_settings=getattr(request.app.state, "settings", settings),
+            tenant_id=knowledge_tenant(request),
+        )
+    except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")
-    if ingested["status"] != "pending":
-        return {"message": f"Dashboard already {ingested['status']}"}
-
-    if not store.ignore_ingested_dashboard(dashboard_uid, backend_name=backend, tenant_id=tenant_id):
-        raise HTTPException(status_code=409, detail="Dashboard is no longer pending")
-
-    return {
-        "dashboard_uid": dashboard_uid,
-        "backend_name": ingested.get("backend_name", ""),
-        "status": "ignored",
-        "message": "Dashboard ignored; no mappings created",
-    }
+    except DashboardReviewConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))

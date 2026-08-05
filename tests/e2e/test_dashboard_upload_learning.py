@@ -14,6 +14,7 @@ from tacit.dependencies import build_pipeline_dependencies
 from tacit.errors import FatalPipelineError
 from tacit.knowledge.enums import KnowledgeUsageDisposition
 from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
+from tacit.knowledge.service import KnowledgeService
 from tacit.main import app
 from tacit.models.schemas import ArchetypeMatch, CulpritCandidate, DashRequest, Intent, MetricEntry, SignalType
 from tests.e2e.framework import (
@@ -53,6 +54,24 @@ archetypes:
                 sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le)
               )
             legend_format: p95
+"""
+
+CATALOG_SCOPE_ARCHETYPE = """
+archetypes:
+  - id: catalog_scope_latency
+    name: Catalog Scope Latency
+    description: Curated latency path discovered only from live catalog overlap
+    problem_types: [catalog_scope_only]
+    required_metrics: [catalog_scope_latency_seconds]
+    tags: [catalog-scope, latency]
+    default_timerange: 1h
+    panels:
+      - title: Catalog latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'catalog_scope_latency_seconds{{{service_filter}}}'
+            legend_format: latency
 """
 
 
@@ -172,7 +191,7 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
         params={"kind": "signal_mapping", "limit": 100},
     )
     assert candidates.status_code == 200, candidates.text
-    signal_candidates = candidates.json()
+    signal_candidates = candidates.json()["candidates"]
     assert len(signal_candidates) >= 5
     for candidate in signal_candidates:
         promoted = client.post(
@@ -265,6 +284,86 @@ async def test_manual_teach_signal_mapping_is_used_before_dashboard_creation(
     ]
     assert len(compilation_usage) == 1
     assert compilation_usage[0].score_delta == 0
+
+
+@pytest.mark.e2e
+async def test_read_only_pipeline_does_not_publish_applied_knowledge_usage(
+    isolated_learning_runtime,
+    monkeypatch,
+):
+    _signal_store, history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
+    _install_taught_latency_archetype(archetypes_path)
+    _teach_taught_latency_mapping()
+    _configure_taught_latency_pipeline(monkeypatch)
+    monkeypatch.setattr(settings, "knowledge_permissions", "knowledge.read")
+
+    response = await pipeline_mod.run_pipeline(
+        DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="read-only")
+    )
+
+    assert response.dashboard_uid
+    contract = history_store.get_contract(response.investigation_id)
+    assert contract is not None
+    assert contract.knowledge_snapshot_ref == ""
+    assert contract.knowledge_usage == []
+
+
+@pytest.mark.e2e
+async def test_pipeline_repins_knowledge_when_catalog_retrieval_widens_archetype_scope(
+    isolated_learning_runtime,
+    monkeypatch,
+):
+    _signal_store, _history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
+    archetypes_path.write_text(CATALOG_SCOPE_ARCHETYPE, encoding="utf-8")
+    templates.reload_archetypes()
+    backend = CapturingBackend(
+        catalog=[
+            MetricEntry(
+                name="catalog_scope_latency_seconds",
+                datasource_uid="prom-e2e",
+                datasource_name="Prometheus E2E",
+                datasource_type="prometheus",
+                query_language="promql",
+                dimensions=['service="checkout-api"'],
+            )
+        ]
+    )
+    monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
+    monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
+
+    async def fake_classify_intent(prompt: str):
+        return (
+            Intent(
+                summary=prompt,
+                domain="application",
+                services=["checkout-api"],
+                signals=[SignalType.METRICS],
+                keywords=["checkout", "health"],
+                timerange="1h",
+                problem_type="general",
+                archetypes=[ArchetypeMatch(type="general", confidence=0.9)],
+            ),
+            TokenUsage(),
+        )
+
+    monkeypatch.setattr(pipeline_mod, "classify_intent", fake_classify_intent)
+    repinned_scopes: list[list[str]] = []
+    original_repin = KnowledgeService.repin_snapshot
+
+    def record_repin(self, scope, usage, *, previous_scope):
+        repinned_scopes.append(list(scope.archetype_refs))
+        return original_repin(self, scope, usage, previous_scope=previous_scope)
+
+    monkeypatch.setattr(KnowledgeService, "repin_snapshot", record_repin)
+
+    response = await pipeline_mod.run_pipeline(
+        DashRequest(prompt="checkout-api general health", user_id="e2e", channel_id="scope-repin")
+    )
+
+    assert response.dashboard_uid
+    assert repinned_scopes
+    assert "archetype:catalog_scope_latency" in repinned_scopes[-1]
+    assert any(panel.source_archetype == "catalog_scope_latency" for panel in backend.published_specs[-1].panels)
 
 
 @pytest.mark.e2e

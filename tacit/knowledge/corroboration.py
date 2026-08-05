@@ -27,8 +27,11 @@ from tacit.knowledge.versioning import version_scopes_overlap
 
 
 class CorroborationService:
-    def __init__(self, repository: KnowledgeRepository):
+    def __init__(self, repository: KnowledgeRepository, *, candidate_limit: int = 1_000):
+        if candidate_limit < 1:
+            raise ValueError("candidate_limit must be positive")
         self.repository = repository
+        self.candidate_limit = candidate_limit
 
     def analyze(self, tenant_id: str, proposition_key: str) -> tuple[CorroborationSummary, str]:
         candidates = self.reviewed_candidates(tenant_id, proposition_key)
@@ -60,24 +63,31 @@ class CorroborationService:
             duplicate_source_count=max(0, len(evidence) - len(independent)),
             status=status,
         )
-        snapshot_id = self.repository.save_corroboration(summary, tenant_id)
-        self.repository.append_event(
-            "corroboration_updated",
-            tenant_id=tenant_id,
-            subject_ref=proposition_key,
-            dimensions={"knowledge_kind": candidates[0].kind.value if candidates else ""},
-            payload=summary.model_dump(mode="json"),
-        )
+        snapshot_id, created = self.repository.save_corroboration(summary, tenant_id)
+        if created:
+            self.repository.append_event(
+                "corroboration_updated",
+                tenant_id=tenant_id,
+                subject_ref=proposition_key,
+                dimensions={"knowledge_kind": candidates[0].kind.value if candidates else ""},
+                payload=summary.model_dump(mode="json"),
+            )
         return summary, snapshot_id
 
     def reviewed_candidates(self, tenant_id: str, proposition_key: str) -> list[KnowledgeCandidate]:
-        return [
-            candidate
-            for candidate in self.repository.candidates_for_proposition(tenant_id, proposition_key)
-            if candidate.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
-            and candidate.state.lifecycle_status == LifecycleStatus.ACTIVE
-            and candidate.entity_resolution.status == EntityResolutionStatus.RESOLVED
-        ]
+        candidates = self.repository.candidates_for_proposition(
+            tenant_id,
+            proposition_key,
+            review_states={ReviewState.APPROVED.value, ReviewState.TRUSTED.value},
+            lifecycle_status=LifecycleStatus.ACTIVE.value,
+            entity_resolution_status=EntityResolutionStatus.RESOLVED.value,
+            limit=self.candidate_limit + 1,
+        )
+        if len(candidates) > self.candidate_limit:
+            raise CandidateEvaluationConflictError(
+                "corroboration candidate limit exceeded; consolidate proposition support before evaluation"
+            )
+        return candidates
 
     def contributing_candidates(self, tenant_id: str, proposition_key: str) -> list[KnowledgeCandidate]:
         candidates = self.reviewed_candidates(tenant_id, proposition_key)
@@ -246,40 +256,34 @@ class ConflictDetectionService:
                 )
                 and conflict.resolution_status == ConflictResolutionStatus.UNRESOLVED
             )
-            if (
-                existing
-                and not reopened
-                and existing.resolution_status
-                in {
-                    ConflictResolutionStatus.RESOLVED_BY_AUTHORITY,
-                    ConflictResolutionStatus.RESOLVED_BY_REVIEW,
-                    ConflictResolutionStatus.SUPERSEDED,
-                }
-            ):
+            if existing and not reopened:
                 conflict = existing
-            self.repository.save_conflict(conflict)
-            if reopened and reviewed_support_for_superseded:
-                event_reason = "new_support_for_superseded_proposition"
-            elif reopened and existing and existing.resolution_reason == "counter_proposition_stale":
-                event_reason = "source_reactivated"
-            elif (
-                reopened and existing and existing.resolution_reason == "counter_proposition_lacks_independent_support"
-            ):
-                event_reason = "new_independent_support"
-            elif reopened:
-                event_reason = "new_candidate_after_rejection"
-            else:
-                event_reason = kind.value
-            self.repository.append_event(
-                "conflict_reopened" if reopened else "conflict_created",
-                tenant_id=tenant_id,
-                subject_ref=conflict.id,
-                dimensions={
-                    "knowledge_kind": current["kind"],
-                    "reason_code": event_reason,
-                },
-                payload=conflict.model_dump(mode="json"),
-            )
+            if existing is None or reopened:
+                self.repository.save_conflict(conflict)
+                if reopened and reviewed_support_for_superseded:
+                    event_reason = "new_support_for_superseded_proposition"
+                elif reopened and existing and existing.resolution_reason == "counter_proposition_stale":
+                    event_reason = "source_reactivated"
+                elif (
+                    reopened
+                    and existing
+                    and existing.resolution_reason == "counter_proposition_lacks_independent_support"
+                ):
+                    event_reason = "new_independent_support"
+                elif reopened:
+                    event_reason = "new_candidate_after_rejection"
+                else:
+                    event_reason = kind.value
+                self.repository.append_event(
+                    "conflict_reopened" if reopened else "conflict_created",
+                    tenant_id=tenant_id,
+                    subject_ref=conflict.id,
+                    dimensions={
+                        "knowledge_kind": current["kind"],
+                        "reason_code": event_reason,
+                    },
+                    payload=conflict.model_dump(mode="json"),
+                )
             conflicts.append(conflict)
         return conflicts
 

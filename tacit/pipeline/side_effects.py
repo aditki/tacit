@@ -23,13 +23,14 @@ def safe_finish_timeout_history(
     """Best-effort timeout history persistence."""
     try:
         store = history_store_factory()
+        tenant_id = request.tenant_id or "default"
         start_parameters = inspect.signature(store.start).parameters
         if "tenant_id" in start_parameters:
             inv_id = store.start(
                 request.prompt,
                 request.user_id,
                 request.channel_id,
-                tenant_id=request.tenant_id or "default",
+                tenant_id=tenant_id,
             )
         else:
             inv_id = store.start(request.prompt, request.user_id, request.channel_id)
@@ -37,6 +38,7 @@ def safe_finish_timeout_history(
             inv_id,
             status="timeout",
             error=f"Timed out after {timeout_seconds}s",
+            tenant_id=tenant_id,
         )
     except Exception:
         logger.warning("timeout_history_record_failed", exc_info=True)

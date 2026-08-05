@@ -5,7 +5,9 @@ from tacit.backends.base import AlertFeatures
 from tacit.backends.grafana import GrafanaBackend, _parse_grafana_alert_rule
 from tacit.backends.signalfx import SignalFxBackend, _parse_signalfx_detector
 from tacit.config import Settings
+from tacit.knowledge.migration import migrate_signal_mapping
 from tacit.knowledge.repository import KnowledgeRepository
+from tacit.knowledge.service import KnowledgeService
 from tacit.signals import SignalStore
 
 
@@ -219,6 +221,45 @@ async def test_direct_alert_auto_approval_requires_teach_permissions():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_alert_ingestion_uses_explicit_runtime_signal_store(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    dry_run: bool,
+):
+    db_path = tmp_path / f"scoped-alert-{dry_run}.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        signals_db_path=str(db_path),
+        knowledge_tenant_id="tenant-a",
+    )
+
+    def unexpected_global_store():
+        raise AssertionError("explicit alert runtime consulted the process-global signal store")
+
+    monkeypatch.setattr("tacit.alert_ingest.get_signal_store", unexpected_global_store)
+    features = AlertFeatures(
+        alert_uid="scoped-alert",
+        alert_title="Scoped alert",
+        backend_name="grafana",
+        query_language="promql",
+        condition="A > 1",
+        metrics_found=["checkout_errors_total"],
+    )
+
+    result = await ingest_alert_features(
+        features,
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+    )
+
+    assert result["dry_run"] is dry_run
+    scoped_store = SignalStore(db_path=db_path, runtime_settings=runtime_settings)
+    stored = scoped_store.get_ingested_alert("scoped-alert", "grafana", tenant_id="tenant-a")
+    assert (stored is None) is dry_run
+
+
+@pytest.mark.asyncio
 async def test_alert_ingestion_requires_apply_before_persistence(tmp_path):
     store = SignalStore(
         db_path=tmp_path / "signals.db",
@@ -244,6 +285,206 @@ async def test_alert_ingestion_requires_apply_before_persistence(tmp_path):
         )
 
     assert store.list_ingested_alerts(tenant_id="default") == []
+
+
+@pytest.mark.asyncio
+async def test_alert_auto_approval_claims_source_before_promotion(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    features = AlertFeatures(
+        alert_uid="promotion-crash-alert",
+        alert_title="Promotion crash alert",
+        backend_name="grafana",
+        query_language="promql",
+        condition="A > 1",
+        metrics_found=["checkout_latency_seconds"],
+    )
+    inferred = [
+        {
+            "signal_type": "request_latency",
+            "metric": "checkout_latency_seconds",
+            "source": "heuristic",
+            "confidence": 0.9,
+            "auto_teach_eligible": True,
+        }
+    ]
+    monkeypatch.setattr("tacit.alert_ingest.infer_signals_from_metrics", lambda *_args, **_kwargs: inferred)
+
+    def crash_during_promotion(**_kwargs):
+        source = store.get_ingested_alert("promotion-crash-alert", "grafana")
+        assert source is not None and source["status"] == "approving"
+        raise RuntimeError("simulated promotion crash")
+
+    monkeypatch.setattr("tacit.alert_ingest.persist_inferred_signal_review", crash_during_promotion)
+
+    with pytest.raises(RuntimeError, match="simulated promotion crash"):
+        await ingest_alert_features(features, auto_approve=True, store=store)
+
+    source = store.get_ingested_alert("promotion-crash-alert", "grafana")
+    assert source is not None
+    assert source["status"] == "approving"
+
+
+@pytest.mark.asyncio
+async def test_alert_auto_approval_retry_finalizes_claimed_generation(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    features = AlertFeatures(
+        alert_uid="promotion-retry-alert",
+        alert_title="Promotion retry alert",
+        backend_name="grafana",
+        query_language="promql",
+        condition="A > 1",
+        metrics_found=["checkout_latency_seconds"],
+    )
+    inferred = [
+        {
+            "signal_type": "request_latency",
+            "metric": "checkout_latency_seconds",
+            "source": "heuristic",
+            "confidence": 0.9,
+            "auto_teach_eligible": True,
+        }
+    ]
+    monkeypatch.setattr("tacit.alert_ingest.infer_signals_from_metrics", lambda *_args, **_kwargs: inferred)
+    promotion_calls = 0
+
+    def idempotent_promotion(**kwargs):
+        nonlocal promotion_calls
+        promotion_calls += 1
+        source = store.get_ingested_alert("promotion-retry-alert", "grafana")
+        assert source is not None and source["status"] == "approving"
+        kwargs["governed_pairs"].add(("checkout_latency_seconds", "request_latency"))
+        return True
+
+    monkeypatch.setattr("tacit.alert_ingest.persist_inferred_signal_review", idempotent_promotion)
+
+    knowledge_service = KnowledgeService(
+        KnowledgeRepository(store._db_path),
+        signal_store=store,
+    )
+
+    original_finalize = store.finalize_ingested_alert_approval
+    finalize_calls = 0
+
+    def crash_once(*args, **kwargs):
+        nonlocal finalize_calls
+        finalize_calls += 1
+        if finalize_calls == 1:
+            raise RuntimeError("simulated finalization crash")
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(store, "finalize_ingested_alert_approval", crash_once)
+
+    with pytest.raises(RuntimeError, match="simulated finalization crash"):
+        await ingest_alert_features(
+            features,
+            auto_approve=True,
+            store=store,
+            knowledge_service=knowledge_service,
+        )
+    assert store.get_ingested_alert("promotion-retry-alert", "grafana")["status"] == "approving"
+
+    recovered = await ingest_alert_features(
+        features,
+        auto_approve=True,
+        store=store,
+        knowledge_service=knowledge_service,
+    )
+
+    assert recovered["status"] == "approved"
+    assert promotion_calls == finalize_calls == 2
+    assert store.get_ingested_alert("promotion-retry-alert", "grafana")["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_alert_approval_rolls_back_governed_authority_before_final_status(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    knowledge_service = KnowledgeService(
+        KnowledgeRepository(store._db_path),
+        signal_store=store,
+    )
+    features = AlertFeatures(
+        alert_uid="governed-alert-rollback",
+        alert_title="Governed alert rollback",
+        backend_name="grafana",
+        query_language="promql",
+        condition="A > 1",
+        metrics_found=["checkout_latency_seconds"],
+    )
+    inferred = [
+        {
+            "signal_type": "request_latency",
+            "metric": "checkout_latency_seconds",
+            "source": "heuristic",
+            "confidence": 0.9,
+            "auto_teach_eligible": True,
+        }
+    ]
+    monkeypatch.setattr("tacit.alert_ingest.infer_signals_from_metrics", lambda *_args, **_kwargs: inferred)
+
+    def promote_governed_mapping(**kwargs):
+        candidate_id = migrate_signal_mapping(
+            {
+                "id": "governed-alert-rollback",
+                "signal_type": "request_latency",
+                "metric_pattern": "checkout_latency_seconds",
+                "source_type": "alert_ingest",
+                "source_refs": [kwargs["source_ref"]],
+            },
+            service=knowledge_service,
+        )
+        knowledge_service.review_candidate(
+            candidate_id,
+            approved=True,
+            reviewer="test",
+        )
+        _decision, revision = knowledge_service.evaluate_candidate(
+            candidate_id,
+            live_verified=True,
+        )
+        assert revision is not None
+        kwargs["governed_candidate_ids"].add(candidate_id)
+        kwargs["governed_pairs"].add(("checkout_latency_seconds", "request_latency"))
+        return True
+
+    monkeypatch.setattr("tacit.alert_ingest.persist_inferred_signal_review", promote_governed_mapping)
+    original_finalize = store.finalize_ingested_alert_approval
+    finalize_attempts = 0
+
+    def crash_once(*args, **kwargs):
+        nonlocal finalize_attempts
+        finalize_attempts += 1
+        if finalize_attempts == 1:
+            raise RuntimeError("simulated finalization crash")
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(store, "finalize_ingested_alert_approval", crash_once)
+
+    with pytest.raises(RuntimeError, match="simulated finalization crash"):
+        await ingest_alert_features(
+            features,
+            auto_approve=True,
+            store=store,
+            knowledge_service=knowledge_service,
+        )
+
+    assert store.get_ingested_alert("governed-alert-rollback", "grafana")["status"] == "approving"
+    assert knowledge_service.repository.list_candidates() == []
+    assert knowledge_service.repository.list_current_revisions() == []
+    assert store.get_mappings_for_signal("request_latency", include_decayed=True) == []
+
+    recovered = await ingest_alert_features(
+        features,
+        auto_approve=True,
+        store=store,
+        knowledge_service=knowledge_service,
+    )
+
+    assert recovered["status"] == "approved"
+    revisions = knowledge_service.repository.list_current_revisions()
+    assert len(revisions) == 1
+    mappings = store.get_mappings_for_signal("request_latency", include_decayed=True)
+    assert len(mappings) == 1
+    assert mappings[0]["governance_ref"] == revisions[0].knowledge_id
 
 
 @pytest.mark.asyncio
@@ -532,17 +773,28 @@ async def test_complete_alert_crawl_paginates_all_stale_sources_for_its_backend(
         assert backend_name == "grafana"
         cursors.append(after_id)
         if after_id == 0:
-            return [{"id": index + 1, "alert_uid": f"stale-{index}"} for index in range(500)]
+            return [
+                {"id": index + 1, "alert_uid": f"stale-{index}", "missing_since": float(index + 1)}
+                for index in range(500)
+            ]
         if after_id == 500:
-            return [{"id": 501, "alert_uid": "stale-final"}]
+            return [{"id": 501, "alert_uid": "stale-final", "missing_since": 501.0}]
         return []
 
-    def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale):
+    def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale, source_generation_guard):
         assert tenant_id == "default"
         assert source_stale is True
         reconciled.append(provenance_ref)
 
+    def mark_reconciled(*, tenant_id, backend_name, alert_uid, missing_since):
+        assert tenant_id == "default"
+        assert backend_name == "grafana"
+        assert alert_uid
+        assert missing_since > 0
+        return True
+
     monkeypatch.setattr(store, "list_unreconciled_stale_alerts", list_stale_alerts)
+    monkeypatch.setattr(store, "mark_alert_knowledge_reconciled", mark_reconciled)
     monkeypatch.setattr("tacit.knowledge.service.KnowledgeService.reconcile_source_lifecycle", reconcile_source)
 
     class CompleteBackend:

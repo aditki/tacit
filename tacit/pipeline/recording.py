@@ -23,17 +23,27 @@ class PipelineRecorder:
         investigation_id: str,
         run_id: str | None = None,
         *,
+        tenant_id: str,
         record_investigation_updates: bool = True,
     ):
         self.history = history
         self.investigation_id = investigation_id
         self.run_id = run_id
+        self.tenant_id = tenant_id
         self.record_investigation_updates = record_investigation_updates
 
     def stage(self, stage: str, status: str, reason_code: str, **details: Any) -> None:
         emit_progress(stage, status, reason_code, **details)
         if self.record_investigation_updates:
-            record_stage(self.history, self.investigation_id, stage, status, reason_code, **details)
+            record_stage(
+                self.history,
+                self.investigation_id,
+                stage,
+                status,
+                reason_code,
+                tenant_id=self.tenant_id,
+                **details,
+            )
         if self.run_id and hasattr(self.history, "append_event"):
             try:
                 self.history.append_event(
@@ -41,6 +51,7 @@ class PipelineRecorder:
                     self.run_id,
                     "stage_completed",
                     {"stage": stage, "status": status, "reason_code": reason_code, "details": details},
+                    tenant_id=self.tenant_id,
                 )
             except Exception:
                 logger.warning("history_append_event_failed", stage=stage, exc_info=True)
@@ -50,7 +61,13 @@ class PipelineRecorder:
         if not self.run_id or not hasattr(self.history, "append_event"):
             return
         try:
-            self.history.append_event(self.investigation_id, self.run_id, event_type, payload)
+            self.history.append_event(
+                self.investigation_id,
+                self.run_id,
+                event_type,
+                payload,
+                tenant_id=self.tenant_id,
+            )
         except Exception:
             logger.warning("history_append_event_failed", event_type=event_type, exc_info=True)
 
@@ -79,6 +96,7 @@ class PipelineRecorder:
                 problem_type=intent.problem_type,
                 archetypes=[{"type": a.type, "confidence": a.confidence} for a in intent.archetypes],
                 timerange=intent.timerange,
+                tenant_id=self.tenant_id,
             )
         except Exception:
             logger.warning(
@@ -103,6 +121,7 @@ class PipelineRecorder:
             ranked_archetypes,
             learned_archetypes,
             shadow_archetypes,
+            tenant_id=self.tenant_id,
         )
 
     def discovery(self, catalog_discovery: Any) -> None:
@@ -122,6 +141,7 @@ class PipelineRecorder:
                 datasources_found=len(catalog_discovery.datasource_types),
                 datasource_types=catalog_discovery.datasource_types,
                 metrics_catalog_size=len(catalog_discovery.metric_catalog),
+                tenant_id=self.tenant_id,
             )
         except Exception:
             logger.warning(
@@ -148,6 +168,7 @@ class PipelineRecorder:
                 generated_queries=queries_for_history,
                 panel_count=len(dashboard_spec.panels),
                 path_used=path_used,
+                tenant_id=self.tenant_id,
             )
         except Exception:
             logger.warning(
@@ -184,6 +205,7 @@ class PipelineRecorder:
                 warnings=warnings,
                 panels_dropped=panels_dropped,
                 final_panel_count=final_panel_count,
+                tenant_id=self.tenant_id,
             )
         except Exception:
             logger.warning(
@@ -198,7 +220,7 @@ class PipelineRecorder:
         should_persist_record = self.record_investigation_updates if persist_record is None else persist_record
         if should_persist_record:
             try:
-                self.history.finish(self.investigation_id, **kwargs)
+                self.history.finish(self.investigation_id, tenant_id=self.tenant_id, **kwargs)
             except Exception:
                 logger.warning(
                     "history_finish_failed",
@@ -223,12 +245,22 @@ class PipelineRecorder:
                     status=run_status,
                     error_code=error_code,
                     error_detail=run_warning_detail or str(kwargs.get("error", "")),
+                    tenant_id=self.tenant_id,
                 )
             except Exception:
                 logger.warning("history_complete_run_failed", exc_info=True)
 
 
-def record_stage(history: Any, inv_id: str, stage: str, status: str, reason_code: str, **details: Any) -> None:
+def record_stage(
+    history: Any,
+    inv_id: str,
+    stage: str,
+    status: str,
+    reason_code: str,
+    *,
+    tenant_id: str,
+    **details: Any,
+) -> None:
     """Best-effort persistence for diagnostic stage outcomes."""
     try:
         history.record_stage(
@@ -237,6 +269,7 @@ def record_stage(history: Any, inv_id: str, stage: str, status: str, reason_code
             status=status,
             reason_code=reason_code,
             details=details,
+            tenant_id=tenant_id,
         )
     except Exception:
         logger.warning(
@@ -446,6 +479,8 @@ def record_selected_intent(
     ranked_archetypes: list[tuple[Any, float]],
     learned_archetypes: list[tuple[Any, float]],
     shadow_archetypes: list[tuple[Any, float]] | None = None,
+    *,
+    tenant_id: str,
 ) -> None:
     """Persist selected archetype context without leaking persistence policy into the runner."""
     try:
@@ -464,6 +499,7 @@ def record_selected_intent(
                 shadow_archetypes,
             ),
             timerange=intent.timerange,
+            tenant_id=tenant_id,
         )
     except Exception:
         logger.warning("history_record_selected_archetypes_failed", exc_info=True)

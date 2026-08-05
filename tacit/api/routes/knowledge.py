@@ -28,6 +28,7 @@ from tacit.knowledge.repository import (
     AliasRegistrationConflictError,
     CandidateEvaluationConflictError,
     CandidateReviewConflictError,
+    EntityRegistrationConflictError,
     KnowledgeRevisionConflictError,
 )
 
@@ -178,11 +179,23 @@ async def list_candidates(
     kind: str | None = None,
     review_state: str | None = None,
     limit: int = Query(default=200, ge=1, le=500),
+    cursor: str | None = Query(default=None, max_length=512),
 ):
-    candidates = get_knowledge_repository(request).list_candidates(
-        _tenant(request), kind=kind, review_state=review_state, limit=limit
-    )
-    return [_candidate_dump(candidate) for candidate in candidates]
+    try:
+        page = get_knowledge_repository(request).list_candidates_page(
+            _tenant(request),
+            kind=kind,
+            review_state=review_state,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "candidates": [_candidate_dump(candidate) for candidate in page.candidates],
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+    }
 
 
 @router.post("/api/v1/knowledge/candidates/{candidate_id}/review", tags=["Operational Knowledge"])
@@ -195,6 +208,8 @@ async def review_candidate(candidate_id: str, payload: CandidateReviewRequest, r
     assert_knowledge_action(request, action)
     if payload.authoritative_source or payload.live_verified:
         assert_knowledge_action(request, KnowledgeAction.OVERRIDE)
+    if payload.evaluate and payload.decision != "reject":
+        assert_knowledge_action(request, KnowledgeAction.APPLY)
     tenant_id = _tenant(request)
     service = get_knowledge_service(request)
     try:
@@ -231,7 +246,8 @@ async def review_candidate(candidate_id: str, payload: CandidateReviewRequest, r
     ) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        status_code = 404 if service.repository.get_candidate(candidate_id, tenant_id) is None else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 @router.post("/api/v1/knowledge/{knowledge_id}/review", tags=["Operational Knowledge"])
@@ -259,6 +275,10 @@ async def create_entity(payload: EntityRequest, request: Request):
     )
     try:
         return get_knowledge_service(request).register_entity(entity).model_dump(mode="json")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except EntityRegistrationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -354,12 +374,14 @@ async def review_correction(correction_id: str, payload: CorrectionReviewRequest
         assert_knowledge_action(request, KnowledgeAction.APPLY)
     if payload.authoritative:
         assert_knowledge_action(request, KnowledgeAction.OVERRIDE)
+    tenant_id = _tenant(request)
+    service = get_knowledge_service(request)
     try:
-        correction, revision = get_knowledge_service(request).review_correction(
+        correction, revision = service.review_correction(
             correction_id,
             approved=payload.decision == "approve",
             reviewer=payload.reviewer,
-            tenant_id=_tenant(request),
+            tenant_id=tenant_id,
             authoritative=payload.authoritative,
         )
         return {
@@ -373,7 +395,8 @@ async def review_correction(correction_id: str, payload: CorrectionReviewRequest
     ) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        status_code = 404 if service.repository.get_correction(correction_id, tenant_id) is None else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 @router.get("/api/v1/knowledge/corrections/{correction_id}", tags=["Operational Knowledge"])

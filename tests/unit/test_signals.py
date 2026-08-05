@@ -10,8 +10,10 @@ import sqlite3
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from importlib.resources import files
 from pathlib import Path
+from threading import Event
 
 import pytest
 import yaml
@@ -27,13 +29,17 @@ from tacit.dashboard_ingest import (
     extract_aggregation_patterns,
     extract_metrics_from_promql,
     generate_archetype_yaml,
+    ignore_ingested_dashboard_record,
     infer_signals_from_metrics,
     parse_dashboard_json,
     reject_ingested_dashboard_record,
 )
 from tacit.dashboard_ingest.service import persist_inferred_signal_review
 from tacit.dashboard_uploads import parse_uploaded_dashboard
+from tacit.knowledge.migration import migrate_signal_mapping
+from tacit.knowledge.models import KnowledgeScope
 from tacit.knowledge.repository import KnowledgeRepository
+from tacit.knowledge.service import KnowledgeService
 from tacit.models.schemas import MetricEntry
 from tacit.signals import (
     SignalStore,
@@ -340,11 +346,10 @@ def test_signal_mapping_resolution_is_tenant_scoped(signal_store, monkeypatch):
 
 def test_bootstrap_signal_mappings_are_available_to_every_tenant(signal_store):
     signal_store = _wildcard_store(signal_store)
-    signal_store.add_mapping(
+    signal_store._add_bootstrap_mapping(
         "request_latency",
         "http_request_duration_seconds",
         confidence=0.9,
-        source_type="bootstrap",
     )
     catalog = [_metric_entry("http_request_duration_seconds")]
 
@@ -352,13 +357,27 @@ def test_bootstrap_signal_mappings_are_available_to_every_tenant(signal_store):
     assert signal_store.resolve_signal("request_latency", catalog, tenant_id="tenant-b")
 
 
+def test_public_mapping_write_cannot_create_global_bootstrap_authority(signal_store):
+    signal_store = _wildcard_store(signal_store)
+
+    with pytest.raises(PermissionError, match="packaged catalog loader"):
+        signal_store.add_mapping(
+            "request_latency",
+            "tenant_supplied_latency_seconds",
+            confidence=0.9,
+            source_type="bootstrap",
+            tenant_id="tenant-a",
+        )
+
+    assert signal_store.get_mappings_for_signal("request_latency", tenant_id="tenant-b") == []
+
+
 def test_default_tenant_mapping_cannot_mutate_global_bootstrap(signal_store):
     signal_store = _wildcard_store(signal_store)
-    signal_store.add_mapping(
+    signal_store._add_bootstrap_mapping(
         "request_latency",
         "http_request_duration_seconds",
         confidence=0.9,
-        source_type="bootstrap",
     )
     signal_store.add_mapping(
         "request_latency",
@@ -394,11 +413,10 @@ def test_default_tenant_mapping_cannot_mutate_global_bootstrap(signal_store):
 
 def test_context_rejected_tenant_override_does_not_hide_bootstrap_mapping(signal_store):
     signal_store = _wildcard_store(signal_store)
-    signal_store.add_mapping(
+    signal_store._add_bootstrap_mapping(
         "request_latency",
         "http_request_duration_seconds",
         confidence=0.9,
-        source_type="bootstrap",
     )
     signal_store.add_mapping(
         "request_latency",
@@ -499,6 +517,18 @@ def test_mapping_reconciliation_checks_all_provenance_refs(signal_store):
         tenant_id="tenant-a",
     )
     assert mappings[0]["source_refs"] == ["grafana:alert:checkout"]
+
+    with signal_store._conn() as conn:
+        plan = conn.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT mapping.id
+               FROM signal_mapping_source_refs source
+               JOIN signal_metric_mappings mapping ON mapping.id=source.mapping_id
+               WHERE source.tenant_id=? AND source.source_ref=?
+                 AND mapping.governance_ref=''""",
+            ("tenant-a", "grafana:alert:checkout"),
+        ).fetchall()
+    assert any("idx_signal_mapping_source_ref" in str(row[3]) for row in plan)
 
 
 def test_rejected_signal_candidates_are_tenant_scoped(signal_store):
@@ -1126,6 +1156,24 @@ def test_knowledge_service_rejects_a_resolver_from_another_database(tmp_path):
         KnowledgeService(authority, signal_store=resolver)
 
 
+def test_knowledge_service_rejects_a_resolver_with_another_tenant_boundary(tmp_path):
+    from tacit.knowledge.service import KnowledgeService
+
+    db_path = tmp_path / "knowledge.db"
+    authority = KnowledgeRepository(db_path)
+    resolver = SignalStore(
+        db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+
+    with pytest.raises(ValueError, match="must use the same tenant boundary"):
+        KnowledgeService(
+            authority,
+            signal_store=resolver,
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-b"),
+        )
+
+
 def test_wildcard_rejects_unconfirmed_default_owner_and_pinned_reopen_retargets_current_schema(tmp_path):
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.models import KnowledgeScope
@@ -1608,11 +1656,10 @@ def test_excluding_preferred_revision_reveals_same_pattern_fallback(signal_store
         review_state="approved",
         tenant_id="default",
     )
-    signal_store.add_mapping(
+    signal_store._add_bootstrap_mapping(
         "request_latency",
         "shared_latency_seconds",
         confidence=0.8,
-        source_type="bootstrap",
         review_state="trusted",
         tenant_id=GLOBAL_BOOTSTRAP_TENANT_ID,
     )
@@ -1835,7 +1882,10 @@ def test_legacy_alerts_migrate_to_pinned_tenant(tmp_path):
     alert = store.get_ingested_alert("legacy-alert", "grafana", tenant_id="tenant-a")
     assert alert is not None
     assert alert["tenant_id"] == "tenant-a"
+    assert "generation_fingerprint" in alert
     with store._conn() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(ingested_alerts)")}
+        assert "generation_fingerprint" in columns
         assert conn.execute("""SELECT 1 FROM ingested_alerts
                WHERE tenant_id='default' AND alert_uid='legacy-alert'""").fetchone() is None
 
@@ -1944,11 +1994,10 @@ class TestSignalStoreBasics:
 class TestSignalMappings:
     def test_add_and_retrieve_mapping(self, signal_store):
         signal_store.register_signal_type("request_latency")
-        signal_store.add_mapping(
+        signal_store._add_bootstrap_mapping(
             "request_latency",
             "http_request_duration_seconds",
             confidence=0.95,
-            source_type="bootstrap",
         )
 
         mappings = signal_store.get_mappings_for_signal("request_latency")
@@ -2240,57 +2289,130 @@ class TestSignalResolution:
             runtime_settings=Settings(_env_file=None, signal_resolution_mapping_limit=10),
         )
         for index in range(11):
-            store.add_mapping(
+            store._add_bootstrap_mapping(
                 "bounded_signal",
                 f"bounded_metric_{index}",
                 0.9,
-                source_type="bootstrap",
             )
 
         with pytest.raises(RuntimeError, match="more than 10 active mapping candidates"):
             store.resolve_signal("bounded_signal", [_metric_entry("bounded_metric_0")])
+
+    def test_resolution_applies_mapping_cap_after_service_and_environment_scope(self, tmp_path):
+        store = SignalStore(db_path=tmp_path / "mapping-scope-cap.db")
+        for index in range(501):
+            store.add_mapping(
+                "scoped_signal",
+                f"disjoint_metric_{index}",
+                0.99,
+                context_services=[f"service-{index}"],
+                context_environments=[f"environment-{index}"],
+                source_type="teach",
+            )
+        store.add_mapping(
+            "scoped_signal",
+            "checkout_metric",
+            0.8,
+            context_services=["checkout"],
+            context_environments=["production"],
+            source_type="teach",
+        )
+
+        resolved = store.resolve_signal(
+            "scoped_signal",
+            [_metric_entry("checkout_metric")],
+            context_service="checkout",
+            context_environment="production",
+        )
+
+        assert [entry.name for entry, _confidence in resolved] == ["checkout_metric"]
+
+    def test_resolution_applies_mapping_cap_after_full_governed_scope(self, tmp_path):
+        store = SignalStore(
+            db_path=tmp_path / "mapping-full-scope-cap.db",
+            runtime_settings=Settings(_env_file=None, signal_resolution_mapping_limit=10),
+        )
+        now = time.time()
+
+        def governed_mapping(index: int, region: str) -> dict:
+            return {
+                "signal_type": "regional_signal",
+                "metric_pattern": f"regional_metric_{index}",
+                "confidence": 0.9,
+                "source_type": "operational_knowledge",
+                "source_refs": [f"source-{index}"],
+                "review_state": "approved",
+                "tenant_id": "default",
+                "governance_ref": f"knowledge-{index}",
+                "governance_revision": 1,
+                "context_services": [],
+                "context_datasource_types": [],
+                "context_environments": [],
+                "context_archetypes": [],
+                "context_regions": [region],
+                "context_clusters": [],
+                "context_namespaces": [],
+                "context_versions": [],
+                "last_seen": now,
+                "positive_feedback": 0,
+                "negative_feedback": 0,
+            }
+
+        mappings = [governed_mapping(index, f"region-{index}") for index in range(11)]
+        mappings.append(governed_mapping(99, "us-central1"))
+        token = store.activate_pinned_governed_mappings(tenant_id="default", mappings=mappings)
+        try:
+            resolved = store.resolve_signal(
+                "regional_signal",
+                [_metric_entry("regional_metric_99")],
+                knowledge_scope=KnowledgeScope(tenant_id="default", region_refs=["us-central1"]),
+            )
+        finally:
+            store.reset_pinned_governed_mappings(token)
+
+        assert [entry.name for entry, _confidence in resolved] == ["regional_metric_99"]
 
     def test_resolution_fails_closed_when_catalog_budget_is_exceeded(self, tmp_path):
         store = SignalStore(
             db_path=tmp_path / "catalog-budget.db",
             runtime_settings=Settings(_env_file=None, signal_resolution_catalog_limit=100),
         )
-        store.add_mapping("bounded_catalog", "bounded_metric", 0.9, source_type="bootstrap")
+        store._add_bootstrap_mapping("bounded_catalog", "bounded_metric", 0.9)
         catalog = [_metric_entry(f"metric_{index}") for index in range(101)]
 
         with pytest.raises(RuntimeError, match="more than 100 eligible metrics"):
             store.resolve_signal("bounded_catalog", catalog)
 
     def test_resolve_signal_exact_match(self, signal_store, sample_catalog):
-        signal_store.add_mapping("request_rate", "http_requests_total", 0.95, source_type="bootstrap")
+        signal_store._add_bootstrap_mapping("request_rate", "http_requests_total", 0.95)
         resolved = signal_store.resolve_signal("request_rate", sample_catalog)
         assert len(resolved) == 1
         assert resolved[0][0].name == "http_requests_total"
         assert resolved[0][1] == 0.95
 
     def test_resolve_signal_pattern_match(self, signal_store, sample_catalog):
-        signal_store.add_mapping("auth_failure_count", "*auth*fail*", 0.85, source_type="bootstrap")
+        signal_store._add_bootstrap_mapping("auth_failure_count", "*auth*fail*", 0.85)
         resolved = signal_store.resolve_signal("auth_failure_count", sample_catalog)
         assert len(resolved) == 1
         assert resolved[0][0].name == "sso_auth_failures_total"
 
     def test_resolve_signal_multiple_matches(self, signal_store, sample_catalog):
-        signal_store.add_mapping("auth_request_rate", "*auth*requests*", 0.8, source_type="bootstrap")
+        signal_store._add_bootstrap_mapping("auth_request_rate", "*auth*requests*", 0.8)
         resolved = signal_store.resolve_signal("auth_request_rate", sample_catalog)
         assert len(resolved) >= 1
         names = {r[0].name for r in resolved}
         assert "sso_auth_requests_total" in names
 
     def test_resolve_signal_no_match(self, signal_store, sample_catalog):
-        signal_store.add_mapping("kafka_lag", "kafka_consumer_lag", 0.9, source_type="bootstrap")
+        signal_store._add_bootstrap_mapping("kafka_lag", "kafka_consumer_lag", 0.9)
         resolved = signal_store.resolve_signal("kafka_lag", sample_catalog)
         assert len(resolved) == 0
 
     def test_resolve_signals_for_archetype(self, signal_store, sample_catalog):
         """Core SSO use case: archetype says auth_requests_total but env has sso_auth_requests_total."""
-        signal_store.add_mapping("auth_request_rate", "*auth*requests*total", 0.85, source_type="bootstrap")
-        signal_store.add_mapping("auth_failure_count", "*auth*fail*total", 0.85, source_type="bootstrap")
-        signal_store.add_mapping("auth_latency", "*auth*latency*", 0.8, source_type="bootstrap")
+        signal_store._add_bootstrap_mapping("auth_request_rate", "*auth*requests*total", 0.85)
+        signal_store._add_bootstrap_mapping("auth_failure_count", "*auth*fail*total", 0.85)
+        signal_store._add_bootstrap_mapping("auth_latency", "*auth*latency*", 0.8)
 
         signal_bindings = {
             "auth_request_rate": "auth_requests_total",
@@ -2313,7 +2435,7 @@ class TestSignalResolution:
 
     def test_resolve_skips_existing_metrics(self, signal_store, sample_catalog):
         """If the default metric exists in catalog, no substitution needed."""
-        signal_store.add_mapping("request_rate", "*requests*total", 0.9, source_type="bootstrap")
+        signal_store._add_bootstrap_mapping("request_rate", "*requests*total", 0.9)
 
         subs = signal_store.resolve_signals_for_archetype(
             signal_bindings={"request_rate": "http_requests_total"},
@@ -3222,6 +3344,81 @@ class TestIngestedDashboards:
         assert len(quarantine_files) == 1
         assert "checkout_manual" in quarantine_files[0].read_text()
 
+    @pytest.mark.asyncio
+    async def test_unchanged_approved_dashboard_reingest_preserves_review_state(self, signal_store, monkeypatch):
+        from tacit.dashboard_ingest.service import ingest_dashboard_features
+
+        inferred = [
+            {
+                "signal_type": "request_latency",
+                "metric": "checkout_latency_seconds",
+                "source": "heuristic",
+                "signal_family": "latency",
+                "confidence": 0.9,
+                "auto_teach_eligible": True,
+            }
+        ]
+        monkeypatch.setattr(
+            "tacit.dashboard_ingest.service.infer_signals_from_metrics",
+            lambda *_args, **_kwargs: inferred,
+        )
+        features = DashboardFeatures(
+            dashboard_uid="unchanged-approved",
+            dashboard_title="Unchanged approved",
+            backend_name="grafana",
+            query_language="promql",
+            metrics_found=["checkout_latency_seconds"],
+            panel_count=1,
+            panel_titles=["Checkout latency"],
+            panels=[
+                {
+                    "title": "Checkout latency",
+                    "metrics": ["checkout_latency_seconds"],
+                    "queries": ["checkout_latency_seconds"],
+                }
+            ],
+        )
+
+        approved = await ingest_dashboard_features(features, auto_approve=True, store=signal_store)
+        before = signal_store.get_ingested_dashboard("unchanged-approved", backend_name="grafana")
+        refreshed = await ingest_dashboard_features(features, auto_approve=False, store=signal_store)
+        after = signal_store.get_ingested_dashboard("unchanged-approved", backend_name="grafana")
+
+        assert approved["status"] == refreshed["status"] == "approved"
+        assert before is not None and after is not None
+        assert after["status"] == "approved"
+        assert after["created_at"] == before["created_at"]
+
+    def test_changed_dashboard_inference_creates_a_pending_generation(self, signal_store):
+        source = {
+            "dashboard_title": "Checkout latency",
+            "metrics_found": ["checkout_latency_seconds"],
+            "query_transformations": ["checkout_latency_seconds"],
+        }
+        signal_store.record_ingested_dashboard(
+            "changed-inference",
+            backend_name="grafana",
+            signals_inferred=[{"signal_type": "request_latency", "metric": "checkout_latency_seconds"}],
+            status="approved",
+            **source,
+        )
+        before = signal_store.get_ingested_dashboard("changed-inference", backend_name="grafana")
+
+        result = signal_store.record_ingested_dashboard(
+            "changed-inference",
+            backend_name="grafana",
+            signals_inferred=[{"signal_type": "database_latency", "metric": "checkout_latency_seconds"}],
+            status="pending",
+            **source,
+        )
+        after = signal_store.get_ingested_dashboard("changed-inference", backend_name="grafana")
+
+        assert result == "updated"
+        assert before is not None and after is not None
+        assert after["status"] == "pending"
+        assert after["created_at"] > before["created_at"]
+        assert after["last_seen_at"] >= before["last_seen_at"]
+
     def test_manual_approval_keeps_held_candidates_out_of_approved_context(self, signal_store):
         if not signal_store._learning_index_available():
             pytest.skip("SQLite FTS5 is not available")
@@ -3455,6 +3652,665 @@ class TestIngestedDashboards:
         assert persisted is not None
         assert persisted["status"] == "pending"
         assert signal_store.list_rejected_candidates() == []
+
+    @pytest.mark.parametrize(
+        "decision",
+        [reject_ingested_dashboard_record, ignore_ingested_dashboard_record],
+    )
+    def test_terminal_dashboard_review_rolls_back_when_authority_reconciliation_fails(
+        self,
+        signal_store,
+        monkeypatch,
+        decision,
+    ):
+        signal_store.record_ingested_dashboard(
+            "authority-rollback",
+            backend_name="grafana",
+            metrics_found=["checkout_latency_seconds"],
+            signals_inferred=[],
+            status="approved",
+        )
+
+        def fail_reconciliation(**_kwargs):
+            raise RuntimeError("simulated authority reconciliation failure")
+
+        monkeypatch.setattr(
+            "tacit.dashboard_ingest.service._reconcile_dashboard_authority_for_state",
+            fail_reconciliation,
+        )
+
+        with pytest.raises(RuntimeError, match="simulated authority reconciliation failure"):
+            decision(
+                dashboard_uid="authority-rollback",
+                backend_name="grafana",
+                store=signal_store,
+            )
+
+        persisted = signal_store.get_ingested_dashboard("authority-rollback", backend_name="grafana")
+        assert persisted is not None
+        assert persisted["status"] == "approved"
+
+    def test_dashboard_rejection_rolls_back_mapping_and_revision_retirement_together(
+        self,
+        signal_store,
+        monkeypatch,
+    ):
+        source_ref = "grafana:governed-rollback"
+        signal_store.record_ingested_dashboard(
+            "governed-rollback",
+            backend_name="grafana",
+            metrics_found=["checkout_latency_seconds"],
+            signals_inferred=[],
+            status="approved",
+        )
+        service = KnowledgeService(
+            KnowledgeRepository(signal_store._db_path),
+            signal_store=signal_store,
+        )
+        candidate_id = migrate_signal_mapping(
+            {
+                "id": "governed-rollback-a",
+                "signal_type": "request_latency",
+                "metric_pattern": "checkout_latency_seconds",
+                "source_type": "dashboard_ingest",
+                "source_refs": [source_ref],
+                "source_fingerprint": "independent-a",
+                "review_state": "approved",
+            },
+            service=service,
+        )
+        migrate_signal_mapping(
+            {
+                "id": "governed-rollback-b",
+                "signal_type": "request_latency",
+                "metric_pattern": "checkout_latency_seconds",
+                "source_type": "alert_ingest",
+                "source_refs": ["grafana:alert:governed-rollback"],
+                "source_fingerprint": "independent-b",
+                "review_state": "approved",
+            },
+            service=service,
+        )
+        candidate = service.repository.get_candidate(candidate_id, "default")
+        assert candidate is not None
+        item = service.repository.find_knowledge_by_proposition(
+            "default",
+            candidate.proposition.proposition_key,
+        )
+        assert item is not None
+        before_revision = service.repository.get_revision(item.id, tenant_id="default")
+        assert before_revision is not None
+        legacy_mapping_id = signal_store.add_mapping(
+            "request_latency",
+            "legacy_checkout_latency_seconds",
+            0.9,
+            source_type="dashboard_ingest",
+            source_refs=[source_ref],
+            review_state="candidate",
+        )
+
+        reconcile_lifecycle = service.reconcile_source_lifecycle
+
+        def fail_after_lifecycle_reconciliation(**kwargs):
+            reconcile_lifecycle(**kwargs)
+            raise RuntimeError("simulated lifecycle checkpoint failure")
+
+        monkeypatch.setattr(service, "reconcile_source_lifecycle", fail_after_lifecycle_reconciliation)
+
+        with pytest.raises(RuntimeError, match="simulated lifecycle checkpoint failure"):
+            reject_ingested_dashboard_record(
+                dashboard_uid="governed-rollback",
+                backend_name="grafana",
+                store=signal_store,
+                knowledge_service=service,
+            )
+
+        persisted = signal_store.get_ingested_dashboard("governed-rollback", backend_name="grafana")
+        assert persisted is not None
+        assert persisted["status"] == "approved"
+        with signal_store._conn() as conn:
+            legacy_mapping = conn.execute(
+                "SELECT metric_pattern FROM signal_metric_mappings WHERE id=?",
+                (legacy_mapping_id,),
+            ).fetchone()
+        assert legacy_mapping is not None
+        assert legacy_mapping["metric_pattern"] == "legacy_checkout_latency_seconds"
+        after_revision = service.repository.get_revision(item.id, tenant_id="default")
+        assert after_revision == before_revision
+        assert service.repository.get_candidate(candidate_id, "default") == candidate
+
+    @pytest.mark.parametrize(
+        ("decision", "terminal_status"),
+        [
+            (reject_ingested_dashboard_record, "rejected"),
+            (ignore_ingested_dashboard_record, "ignored"),
+        ],
+    )
+    def test_terminal_dashboard_review_wins_pending_cas_before_approval_promotion(
+        self,
+        signal_store,
+        monkeypatch,
+        decision,
+        terminal_status,
+    ):
+        signal_store.record_ingested_dashboard(
+            "approval-race",
+            backend_name="grafana",
+            metrics_found=["checkout_latency_seconds"],
+            signals_inferred=[
+                {
+                    "signal_type": "request_latency",
+                    "metric": "checkout_latency_seconds",
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "confidence": 0.9,
+                    "auto_teach_eligible": True,
+                }
+            ],
+        )
+        claim_started = Event()
+        release_claim = Event()
+
+        class FakeKnowledgeService:
+            repository = KnowledgeRepository(signal_store._db_path)
+
+            def reconcile_source_lifecycle(self, **_kwargs):
+                return []
+
+        knowledge_service = FakeKnowledgeService()
+
+        original_claim = signal_store.claim_ingested_dashboard_approval
+
+        def delayed_claim(*args, **kwargs):
+            claim_started.set()
+            assert release_claim.wait(timeout=5)
+            return original_claim(*args, **kwargs)
+
+        monkeypatch.setattr(signal_store, "claim_ingested_dashboard_approval", delayed_claim)
+        monkeypatch.setattr(
+            "tacit.dashboard_ingest.service.persist_inferred_signal_review",
+            lambda **_kwargs: pytest.fail("promotion ran after the approval claim lost"),
+        )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            approval = executor.submit(
+                approve_ingested_dashboard_record,
+                dashboard_uid="approval-race",
+                backend_name="grafana",
+                store=signal_store,
+                knowledge_service=knowledge_service,
+            )
+            assert claim_started.wait(timeout=5)
+            try:
+                reviewed = decision(
+                    dashboard_uid="approval-race",
+                    backend_name="grafana",
+                    store=signal_store,
+                    knowledge_service=knowledge_service,
+                )
+            finally:
+                release_claim.set()
+            with pytest.raises(RuntimeError, match="approval claim was lost"):
+                approval.result(timeout=5)
+
+        assert reviewed["status"] == terminal_status
+        assert signal_store.get_ingested_dashboard("approval-race", backend_name="grafana")["status"] == terminal_status
+        assert signal_store.get_mappings_for_signal("request_latency", include_decayed=True) == []
+
+    def test_dashboard_approval_retry_recovers_an_approving_generation(self, signal_store, monkeypatch):
+        signal_store.record_ingested_dashboard(
+            "approval-retry",
+            backend_name="grafana",
+            metrics_found=["checkout_latency_seconds"],
+            signals_inferred=[
+                {
+                    "signal_type": "request_latency",
+                    "metric": "checkout_latency_seconds",
+                    "source": "heuristic",
+                    "confidence": 0.9,
+                    "auto_teach_eligible": True,
+                }
+            ],
+        )
+
+        knowledge_service = KnowledgeService(
+            KnowledgeRepository(signal_store._db_path),
+            signal_store=signal_store,
+        )
+
+        def idempotent_promotion(**kwargs):
+            kwargs["store"].add_mapping(
+                "request_latency",
+                "checkout_latency_seconds",
+                0.9,
+                source_type="dashboard_ingest",
+                source_refs=[kwargs["source_ref"]],
+                review_state="approved",
+            )
+            kwargs["governed_pairs"].add(("checkout_latency_seconds", "request_latency"))
+            return True
+
+        monkeypatch.setattr(
+            "tacit.dashboard_ingest.service.persist_inferred_signal_review",
+            idempotent_promotion,
+        )
+        original_finalize = signal_store.finalize_ingested_dashboard_approval
+        finalize_attempts = 0
+
+        def crash_once(*args, **kwargs):
+            nonlocal finalize_attempts
+            finalize_attempts += 1
+            if finalize_attempts == 1:
+                raise RuntimeError("simulated crash before finalization")
+            return original_finalize(*args, **kwargs)
+
+        monkeypatch.setattr(signal_store, "finalize_ingested_dashboard_approval", crash_once)
+
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            approve_ingested_dashboard_record(
+                dashboard_uid="approval-retry",
+                backend_name="grafana",
+                store=signal_store,
+                knowledge_service=knowledge_service,
+            )
+        assert signal_store.get_ingested_dashboard("approval-retry", backend_name="grafana")["status"] == "approving"
+        assert signal_store.get_mappings_for_signal("request_latency", include_decayed=True) == []
+
+        recovered = approve_ingested_dashboard_record(
+            dashboard_uid="approval-retry",
+            backend_name="grafana",
+            store=signal_store,
+            knowledge_service=knowledge_service,
+        )
+
+        assert recovered["status"] == "approved"
+        assert finalize_attempts == 2
+        mappings = signal_store.get_mappings_for_signal("request_latency", include_decayed=True)
+        assert [mapping["metric_pattern"] for mapping in mappings] == ["checkout_latency_seconds"]
+
+    def test_dashboard_approval_rolls_back_governed_authority_before_final_status(
+        self,
+        signal_store,
+        monkeypatch,
+    ):
+        signal_store.record_ingested_dashboard(
+            "governed-approval-rollback",
+            backend_name="grafana",
+            metrics_found=["checkout_latency_seconds"],
+            signals_inferred=[
+                {
+                    "signal_type": "request_latency",
+                    "metric": "checkout_latency_seconds",
+                    "source": "heuristic",
+                    "confidence": 0.9,
+                    "auto_teach_eligible": True,
+                }
+            ],
+        )
+        knowledge_service = KnowledgeService(
+            KnowledgeRepository(signal_store._db_path),
+            signal_store=signal_store,
+        )
+
+        def promote_governed_mapping(**kwargs):
+            candidate_id = migrate_signal_mapping(
+                {
+                    "id": "governed-approval-rollback",
+                    "signal_type": "request_latency",
+                    "metric_pattern": "checkout_latency_seconds",
+                    "source_type": "dashboard_ingest",
+                    "source_refs": [kwargs["source_ref"]],
+                },
+                service=knowledge_service,
+            )
+            knowledge_service.review_candidate(
+                candidate_id,
+                approved=True,
+                reviewer="test",
+            )
+            _decision, revision = knowledge_service.evaluate_candidate(
+                candidate_id,
+                live_verified=True,
+            )
+            assert revision is not None
+            kwargs["governed_candidate_ids"].add(candidate_id)
+            kwargs["governed_pairs"].add(("checkout_latency_seconds", "request_latency"))
+            return True
+
+        monkeypatch.setattr(
+            "tacit.dashboard_ingest.service.persist_inferred_signal_review",
+            promote_governed_mapping,
+        )
+        original_finalize = signal_store.finalize_ingested_dashboard_approval
+        finalize_attempts = 0
+
+        def crash_once(*args, **kwargs):
+            nonlocal finalize_attempts
+            finalize_attempts += 1
+            if finalize_attempts == 1:
+                raise RuntimeError("simulated finalization crash")
+            return original_finalize(*args, **kwargs)
+
+        monkeypatch.setattr(signal_store, "finalize_ingested_dashboard_approval", crash_once)
+
+        with pytest.raises(RuntimeError, match="simulated finalization crash"):
+            approve_ingested_dashboard_record(
+                dashboard_uid="governed-approval-rollback",
+                backend_name="grafana",
+                store=signal_store,
+                knowledge_service=knowledge_service,
+            )
+
+        assert (
+            signal_store.get_ingested_dashboard(
+                "governed-approval-rollback",
+                backend_name="grafana",
+            )["status"]
+            == "approving"
+        )
+        assert knowledge_service.repository.list_candidates() == []
+        assert knowledge_service.repository.list_current_revisions() == []
+        assert signal_store.get_mappings_for_signal("request_latency", include_decayed=True) == []
+
+        recovered = approve_ingested_dashboard_record(
+            dashboard_uid="governed-approval-rollback",
+            backend_name="grafana",
+            store=signal_store,
+            knowledge_service=knowledge_service,
+        )
+
+        assert recovered["status"] == "approved"
+        revisions = knowledge_service.repository.list_current_revisions()
+        assert len(revisions) == 1
+        mappings = signal_store.get_mappings_for_signal("request_latency", include_decayed=True)
+        assert len(mappings) == 1
+        assert mappings[0]["governance_ref"] == revisions[0].knowledge_id
+
+    def test_approval_claim_blocks_changed_dashboard_reingestion(self, signal_store, monkeypatch):
+        signal_store.record_ingested_dashboard(
+            "approval-reingest-race",
+            backend_name="grafana",
+            metrics_found=["old_latency_seconds"],
+            signals_inferred=[
+                {
+                    "signal_type": "old_latency",
+                    "metric": "old_latency_seconds",
+                    "source": "heuristic",
+                    "confidence": 0.9,
+                    "auto_teach_eligible": True,
+                }
+            ],
+        )
+
+        knowledge_service = KnowledgeService(
+            KnowledgeRepository(signal_store._db_path),
+            signal_store=signal_store,
+        )
+
+        def reingest_then_promote_old_generation(**kwargs):
+            kwargs["store"].record_ingested_dashboard(
+                "approval-reingest-race",
+                backend_name="grafana",
+                metrics_found=["new_latency_seconds"],
+                signals_inferred=[
+                    {
+                        "signal_type": "new_latency",
+                        "metric": "new_latency_seconds",
+                        "source": "heuristic",
+                        "confidence": 0.9,
+                        "auto_teach_eligible": True,
+                    }
+                ],
+                status="pending",
+            )
+            kwargs["store"].add_mapping(
+                "old_latency",
+                "old_latency_seconds",
+                0.9,
+                source_type="dashboard_ingest",
+                source_refs=[kwargs["source_ref"]],
+                review_state="approved",
+            )
+            kwargs["governed_pairs"].add(("old_latency_seconds", "old_latency"))
+            return True
+
+        monkeypatch.setattr(
+            "tacit.dashboard_ingest.service.persist_inferred_signal_review",
+            reingest_then_promote_old_generation,
+        )
+
+        with pytest.raises(RuntimeError, match="approval is in progress"):
+            approve_ingested_dashboard_record(
+                dashboard_uid="approval-reingest-race",
+                backend_name="grafana",
+                store=signal_store,
+                knowledge_service=knowledge_service,
+            )
+
+        current = signal_store.get_ingested_dashboard("approval-reingest-race", backend_name="grafana")
+        assert current is not None
+        assert current["status"] == "approving"
+        assert current["metrics_found"] == ["old_latency_seconds"]
+        assert signal_store.get_mappings_for_signal("old_latency", include_decayed=True) == []
+
+    def test_complete_crawl_does_not_stale_claimed_sources(self, signal_store):
+        signal_store.record_ingested_dashboard(
+            "claimed-dashboard",
+            backend_name="grafana",
+            metrics_found=["checkout_latency_seconds"],
+        )
+        dashboard = signal_store.get_ingested_dashboard("claimed-dashboard", backend_name="grafana")
+        assert dashboard is not None
+        assert signal_store.claim_ingested_dashboard_approval(
+            "claimed-dashboard",
+            backend_name="grafana",
+            expected_generation=dashboard["created_at"],
+        )
+        signal_store.record_ingested_alert(
+            "claimed-alert",
+            backend_name="grafana",
+            fingerprint="fingerprint:claimed-alert",
+        )
+        alert = signal_store.get_ingested_alert("claimed-alert", "grafana")
+        assert alert is not None
+        assert signal_store.claim_ingested_alert_approval(
+            "claimed-alert",
+            "grafana",
+            generation_fingerprint=alert["generation_fingerprint"],
+        )
+
+        assert (
+            signal_store.mark_missing_dashboards_stale(
+                backend_name="grafana",
+                seen_dashboard_uids=set(),
+            )
+            == 0
+        )
+        assert (
+            signal_store.mark_missing_alerts_stale(
+                backend_name="grafana",
+                seen_alert_uids=set(),
+            )
+            == 0
+        )
+        assert (
+            signal_store.get_ingested_dashboard(
+                "claimed-dashboard",
+                backend_name="grafana",
+            )["status"]
+            == "approving"
+        )
+        assert signal_store.get_ingested_alert("claimed-alert", "grafana")["status"] == "approving"
+
+    def test_complete_crawl_recovers_expired_approval_claims(self, signal_store):
+        signal_store.record_ingested_dashboard(
+            "abandoned-dashboard",
+            backend_name="grafana",
+            metrics_found=["checkout_latency_seconds"],
+        )
+        dashboard = signal_store.get_ingested_dashboard("abandoned-dashboard", backend_name="grafana")
+        assert dashboard is not None
+        assert signal_store.claim_ingested_dashboard_approval(
+            "abandoned-dashboard",
+            backend_name="grafana",
+            expected_generation=dashboard["created_at"],
+        )
+        signal_store.record_ingested_alert(
+            "abandoned-alert",
+            backend_name="grafana",
+            fingerprint="fingerprint:abandoned-alert",
+        )
+        alert = signal_store.get_ingested_alert("abandoned-alert", "grafana")
+        assert alert is not None
+        assert signal_store.claim_ingested_alert_approval(
+            "abandoned-alert",
+            "grafana",
+            generation_fingerprint=alert["generation_fingerprint"],
+        )
+        expired_at = time.time() - signal_store._settings.learning_approval_claim_ttl_seconds - 1
+        with signal_store._conn() as conn:
+            conn.execute(
+                "UPDATE ingested_dashboards SET reviewed_at=? WHERE dashboard_uid='abandoned-dashboard'",
+                (expired_at,),
+            )
+            conn.execute(
+                "UPDATE ingested_alerts SET reviewed_at=? WHERE alert_uid='abandoned-alert'",
+                (expired_at,),
+            )
+
+        crawl_started_at = time.time() + 1
+        assert (
+            signal_store.mark_missing_dashboards_stale(
+                backend_name="grafana",
+                seen_dashboard_uids=set(),
+                crawl_started_at=crawl_started_at,
+            )
+            == 1
+        )
+        assert (
+            signal_store.mark_missing_alerts_stale(
+                backend_name="grafana",
+                seen_alert_uids=set(),
+                crawl_started_at=crawl_started_at,
+            )
+            == 1
+        )
+        assert (
+            signal_store.get_ingested_dashboard(
+                "abandoned-dashboard",
+                backend_name="grafana",
+            )["status"]
+            == "stale"
+        )
+        assert signal_store.get_ingested_alert("abandoned-alert", "grafana")["status"] == "stale"
+
+    def test_alert_reingestion_serializes_with_approval_claim(self, signal_store, monkeypatch):
+        signal_store.record_ingested_alert(
+            "alert-generation-race",
+            backend_name="grafana",
+            fingerprint="generation:1",
+        )
+        original = signal_store.get_ingested_alert("alert-generation-race", "grafana")
+        assert original is not None
+        claimant = SignalStore(db_path=signal_store._db_path)
+        source_read = Event()
+        release_source = Event()
+        claim_started = Event()
+        original_source_conn = signal_store._conn
+        original_claim_conn = claimant._conn
+
+        class ConnectionProxy:
+            def __init__(self, connection, *, pause_source=False, observe_claim=False):
+                self._connection = connection
+                self._pause_source = pause_source
+                self._observe_claim = observe_claim
+
+            def execute(self, sql, *args, **kwargs):
+                if self._observe_claim and "SET status='approving'" in sql:
+                    claim_started.set()
+                result = self._connection.execute(sql, *args, **kwargs)
+                if self._pause_source and "SELECT id, fingerprint" in sql:
+                    source_read.set()
+                    assert release_source.wait(timeout=5)
+                return result
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+        @contextmanager
+        def delayed_source_conn():
+            with original_source_conn() as connection:
+                yield ConnectionProxy(connection, pause_source=True)
+
+        @contextmanager
+        def observed_claim_conn():
+            with original_claim_conn() as connection:
+                yield ConnectionProxy(connection, observe_claim=True)
+
+        monkeypatch.setattr(signal_store, "_conn", delayed_source_conn)
+        monkeypatch.setattr(claimant, "_conn", observed_claim_conn)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            reingestion = executor.submit(
+                signal_store.record_ingested_alert,
+                "alert-generation-race",
+                backend_name="grafana",
+                fingerprint="generation:2",
+            )
+            assert source_read.wait(timeout=5)
+            claim = executor.submit(
+                claimant.claim_ingested_alert_approval,
+                "alert-generation-race",
+                "grafana",
+                generation_fingerprint=original["generation_fingerprint"],
+            )
+            assert claim_started.wait(timeout=5)
+            assert not claim.done()
+            release_source.set()
+
+            assert reingestion.result(timeout=5) == "updated"
+            assert claim.result(timeout=5) is False
+
+        current = signal_store.get_ingested_alert("alert-generation-race", "grafana")
+        assert current is not None
+        assert current["fingerprint"] == "generation:2"
+        assert current["status"] == "pending"
+
+    def test_changed_alert_inference_invalidates_the_approved_generation(self, signal_store):
+        signal_store.record_ingested_alert(
+            "changed-alert-inference",
+            backend_name="grafana",
+            fingerprint="source-v1",
+            signals_inferred=[{"signal_type": "request_latency", "metric": "latency_seconds"}],
+            status="approved",
+        )
+        before = signal_store.get_ingested_alert("changed-alert-inference", "grafana")
+        assert before is not None
+
+        result = signal_store.record_ingested_alert(
+            "changed-alert-inference",
+            backend_name="grafana",
+            fingerprint="source-v1",
+            signals_inferred=[{"signal_type": "database_latency", "metric": "latency_seconds"}],
+            status="pending",
+        )
+        after = signal_store.get_ingested_alert("changed-alert-inference", "grafana")
+
+        assert result == "updated"
+        assert after is not None
+        assert after["fingerprint"] == before["fingerprint"]
+        assert after["generation_fingerprint"] != before["generation_fingerprint"]
+        assert after["status"] == "pending"
+        assert not signal_store.claim_ingested_alert_approval(
+            "changed-alert-inference",
+            "grafana",
+            generation_fingerprint=before["generation_fingerprint"],
+        )
+        assert signal_store.claim_ingested_alert_approval(
+            "changed-alert-inference",
+            "grafana",
+            generation_fingerprint=after["generation_fingerprint"],
+        )
 
     @pytest.mark.asyncio
     async def test_auto_approve_honors_heuristic_auto_teach_gate(self, signal_store, monkeypatch):
@@ -3836,17 +4692,32 @@ class TestIngestedDashboards:
             assert backend_name == "grafana"
             cursors.append(after_id)
             if after_id == 0:
-                return [{"id": index + 1, "dashboard_uid": f"stale-{index}"} for index in range(500)]
+                return [
+                    {
+                        "id": index + 1,
+                        "dashboard_uid": f"stale-{index}",
+                        "missing_since": float(index + 1),
+                    }
+                    for index in range(500)
+                ]
             if after_id == 500:
-                return [{"id": 501, "dashboard_uid": "stale-final"}]
+                return [{"id": 501, "dashboard_uid": "stale-final", "missing_since": 501.0}]
             return []
 
-        def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale):
+        def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale, source_generation_guard):
             assert tenant_id == "default"
             assert source_stale is True
             reconciled.append(provenance_ref)
 
+        def mark_reconciled(*, tenant_id, backend_name, dashboard_uid, missing_since):
+            assert tenant_id == "default"
+            assert backend_name == "grafana"
+            assert dashboard_uid
+            assert missing_since > 0
+            return True
+
         monkeypatch.setattr(signal_store, "list_unreconciled_stale_dashboards", list_stale_dashboards)
+        monkeypatch.setattr(signal_store, "mark_dashboard_knowledge_reconciled", mark_reconciled)
         monkeypatch.setattr(
             "tacit.knowledge.service.KnowledgeService.reconcile_source_lifecycle",
             reconcile_source,
@@ -3889,7 +4760,7 @@ class TestIngestedDashboards:
         )
         attempts: list[str] = []
 
-        def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale):
+        def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale, source_generation_guard):
             assert tenant_id == "default"
             assert source_stale is True
             attempts.append(provenance_ref)
@@ -3935,6 +4806,180 @@ class TestIngestedDashboards:
         third = await di.learn_backend_dashboards("grafana", store=signal_store)
         assert third["stale_marked"] == 0
         assert attempts == ["grafana:removed-dashboard", "grafana:removed-dashboard"]
+
+    def test_stale_knowledge_checkpoints_are_bound_to_the_missing_generation(
+        self,
+        signal_store,
+        monkeypatch,
+    ):
+        import tacit.signals.store as signal_store_module
+
+        clock = {"now": 100.0}
+        monkeypatch.setattr(signal_store_module.time, "time", lambda: clock["now"])
+        signal_store.record_ingested_dashboard("dash", backend_name="grafana")
+        signal_store.record_ingested_alert("alert", backend_name="grafana", fingerprint="alert-v1")
+        signal_store.record_learned_artifact(
+            artifact_id="runbook",
+            artifact_type="runbook",
+            fingerprint="runbook-v1",
+        )
+
+        clock["now"] = 200.0
+        signal_store.mark_missing_dashboards_stale(backend_name="grafana", seen_dashboard_uids=set())
+        signal_store.mark_missing_alerts_stale(backend_name="grafana", seen_alert_uids=set())
+        signal_store.mark_missing_artifacts_stale(artifact_type="runbook", seen_artifact_ids=set())
+        old_dashboard = signal_store.list_unreconciled_stale_dashboards(backend_name="grafana")[0]
+        old_alert = signal_store.list_unreconciled_stale_alerts(backend_name="grafana")[0]
+        old_artifact = signal_store.list_unreconciled_stale_artifacts(artifact_type="runbook")[0]
+
+        clock["now"] = 300.0
+        signal_store.record_ingested_dashboard("dash", backend_name="grafana")
+        signal_store.record_ingested_alert("alert", backend_name="grafana", fingerprint="alert-v1")
+        signal_store.record_learned_artifact(
+            artifact_id="runbook",
+            artifact_type="runbook",
+            fingerprint="runbook-v1",
+        )
+        clock["now"] = 400.0
+        signal_store.mark_missing_dashboards_stale(backend_name="grafana", seen_dashboard_uids=set())
+        signal_store.mark_missing_alerts_stale(backend_name="grafana", seen_alert_uids=set())
+        signal_store.mark_missing_artifacts_stale(artifact_type="runbook", seen_artifact_ids=set())
+        current_dashboard = signal_store.list_unreconciled_stale_dashboards(backend_name="grafana")[0]
+        current_alert = signal_store.list_unreconciled_stale_alerts(backend_name="grafana")[0]
+        current_artifact = signal_store.list_unreconciled_stale_artifacts(artifact_type="runbook")[0]
+
+        assert old_dashboard["missing_since"] == old_alert["missing_since"] == 200.0
+        assert old_artifact["missing_since"] == 200.0
+        assert current_dashboard["missing_since"] == current_alert["missing_since"] == 400.0
+        assert current_artifact["missing_since"] == 400.0
+        assert not signal_store.mark_dashboard_knowledge_reconciled(
+            backend_name="grafana",
+            dashboard_uid="dash",
+            missing_since=float(old_dashboard["missing_since"]),
+        )
+        assert not signal_store.mark_alert_knowledge_reconciled(
+            backend_name="grafana",
+            alert_uid="alert",
+            missing_since=float(old_alert["missing_since"]),
+        )
+        assert not signal_store.mark_artifact_knowledge_reconciled(
+            artifact_id="runbook",
+            missing_since=float(old_artifact["missing_since"]),
+        )
+        assert signal_store.mark_dashboard_knowledge_reconciled(
+            backend_name="grafana",
+            dashboard_uid="dash",
+            missing_since=float(current_dashboard["missing_since"]),
+        )
+        assert signal_store.mark_alert_knowledge_reconciled(
+            backend_name="grafana",
+            alert_uid="alert",
+            missing_since=float(current_alert["missing_since"]),
+        )
+        assert signal_store.mark_artifact_knowledge_reconciled(
+            artifact_id="runbook",
+            missing_since=float(current_artifact["missing_since"]),
+        )
+
+    def test_complete_crawl_does_not_stale_sources_seen_after_it_started(
+        self,
+        signal_store,
+        monkeypatch,
+    ):
+        import tacit.signals.store as signal_store_module
+
+        clock = {"now": 100.0}
+        monkeypatch.setattr(signal_store_module.time, "time", lambda: clock["now"])
+        signal_store.record_ingested_dashboard("dash", backend_name="grafana")
+        signal_store.record_ingested_alert("alert", backend_name="grafana", fingerprint="alert-v1")
+        signal_store.record_learned_artifact(
+            artifact_id="runbook",
+            artifact_type="runbook",
+            fingerprint="runbook-v1",
+        )
+        crawl_started_at = 150.0
+
+        clock["now"] = 200.0
+        signal_store.record_ingested_dashboard("dash", backend_name="grafana")
+        signal_store.record_ingested_alert("alert", backend_name="grafana", fingerprint="alert-v1")
+        signal_store.record_learned_artifact(
+            artifact_id="runbook",
+            artifact_type="runbook",
+            fingerprint="runbook-v1",
+        )
+
+        assert (
+            signal_store.mark_missing_dashboards_stale(
+                backend_name="grafana",
+                seen_dashboard_uids=set(),
+                crawl_started_at=crawl_started_at,
+            )
+            == 0
+        )
+        assert (
+            signal_store.mark_missing_alerts_stale(
+                backend_name="grafana",
+                seen_alert_uids=set(),
+                crawl_started_at=crawl_started_at,
+            )
+            == 0
+        )
+        assert (
+            signal_store.mark_missing_artifacts_stale(
+                artifact_type="runbook",
+                seen_artifact_ids=set(),
+                crawl_started_at=crawl_started_at,
+            )
+            == 0
+        )
+        assert not signal_store.get_ingested_dashboard("dash", backend_name="grafana")["stale"]
+        assert not signal_store.get_ingested_alert("alert", "grafana")["stale"]
+        assert not signal_store.get_learned_artifact("runbook")["stale"]
+
+    def test_complete_crawl_stale_scan_pages_every_source(
+        self,
+        signal_store,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("tacit.signals.store._STALE_SOURCE_PAGE_SIZE", 1)
+        for index in range(3):
+            signal_store.record_ingested_dashboard(f"dash-{index}", backend_name="grafana")
+            signal_store.record_ingested_alert(
+                f"alert-{index}",
+                backend_name="grafana",
+                fingerprint=f"alert-{index}",
+            )
+            signal_store.record_learned_artifact(
+                artifact_id=f"runbook-{index}",
+                artifact_type="runbook",
+                fingerprint=f"runbook-{index}",
+            )
+        crawl_started_at = time.time() + 1
+
+        assert (
+            signal_store.mark_missing_dashboards_stale(
+                backend_name="grafana",
+                seen_dashboard_uids=set(),
+                crawl_started_at=crawl_started_at,
+            )
+            == 3
+        )
+        assert (
+            signal_store.mark_missing_alerts_stale(
+                backend_name="grafana",
+                seen_alert_uids=set(),
+                crawl_started_at=crawl_started_at,
+            )
+            == 3
+        )
+        assert (
+            signal_store.mark_missing_artifacts_stale(
+                artifact_type="runbook",
+                seen_artifact_ids=set(),
+                crawl_started_at=crawl_started_at,
+            )
+            == 3
+        )
 
     def test_dashboard_uid_is_scoped_by_backend(self, signal_store):
         signal_store.record_ingested_dashboard(
@@ -4953,11 +5998,10 @@ class TestTeachUpsertContext:
     """Tenant-scoped mappings override, but never mutate, global defaults."""
 
     def test_tenant_mapping_preserves_global_context_fallback(self, signal_store):
-        signal_store.add_mapping(
+        signal_store._add_bootstrap_mapping(
             "request_latency",
             "checkout_latency_seconds",
             confidence=0.9,
-            source_type="bootstrap",
         )
         # Re-teach with a service scope
         signal_store.add_mapping(
@@ -4997,11 +6041,10 @@ class TestTeachUpsertContext:
         assert set(mappings[0]["context_services"]) == {"checkout", "payments"}
 
     def test_upsert_updates_source_type(self, signal_store):
-        signal_store.add_mapping(
+        signal_store._add_bootstrap_mapping(
             "request_latency",
             "latency_metric",
             confidence=0.8,
-            source_type="bootstrap",
         )
         signal_store.add_mapping(
             "request_latency",
@@ -5023,11 +6066,10 @@ class TestTeachUpsertContext:
             source_type="dashboard_ingest",
             source_refs=["grafana:checkout-dash"],
         )
-        signal_store.add_mapping(
+        signal_store._add_bootstrap_mapping(
             "request_latency",
             "http_requests_total",
             confidence=0.9,
-            source_type="bootstrap",
         )
 
         mappings = signal_store.get_mappings_for_signal("request_latency")
@@ -5284,6 +6326,101 @@ async def test_pending_dashboard_refresh_revalidates_changed_source_lineage(sign
     assert signal_store.get_mappings_for_signal("checkout_latency", include_decayed=True) == []
 
 
+@pytest.mark.asyncio
+async def test_dashboard_ingestion_uses_explicit_runtime_signal_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from tacit import dashboard_ingest as dashboard_ingest_module
+
+    db_path = tmp_path / "scoped-dashboard-signals.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        signals_db_path=str(db_path),
+        knowledge_tenant_id="tenant-a",
+    )
+
+    def unexpected_global_store():
+        raise AssertionError("explicit dashboard runtime consulted the process-global signal store")
+
+    monkeypatch.setattr("tacit.dashboard_ingest.service.get_signal_store", unexpected_global_store)
+    features = DashboardFeatures(
+        dashboard_uid="scoped-dashboard",
+        dashboard_title="Scoped dashboard",
+        backend_name="grafana",
+        query_language="promql",
+        metrics_found=["checkout_requests_total"],
+        panel_count=1,
+        panels=[{"title": "Requests", "metrics": ["checkout_requests_total"]}],
+    )
+
+    result = await dashboard_ingest_module.ingest_dashboard_features(
+        features,
+        runtime_settings=runtime_settings,
+    )
+
+    assert result["status"] == "pending"
+    scoped_store = SignalStore(db_path=db_path, runtime_settings=runtime_settings)
+    assert scoped_store.get_ingested_dashboard("scoped-dashboard", "grafana", tenant_id="tenant-a") is not None
+
+
+def test_manual_signal_teaching_rolls_back_the_complete_pattern_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi.testclient import TestClient
+
+    from tacit.api.app import create_app
+    from tacit.knowledge import migration as migration_module
+
+    db_path = tmp_path / "atomic-teach.db"
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            signals_db_path=str(db_path),
+            knowledge_tenant_id="tenant-a",
+        )
+    )
+    original = migration_module.migrate_signal_mapping
+    call_count = 0
+
+    def fail_second_mapping(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("injected second-pattern failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(migration_module, "migrate_signal_mapping", fail_second_mapping)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/api/v1/signals/teach",
+        json={
+            "signal_type": "atomic_custom_signal",
+            "metric_patterns": [
+                {"pattern": "atomic_metric_a", "confidence": 0.9},
+                {"pattern": "atomic_metric_b", "confidence": 0.8},
+            ],
+            "taught_by": "failure-injection",
+        },
+    )
+
+    assert response.status_code == 500
+    repository = app.state.runtime_stores.knowledge_repository()
+    signal_store = app.state.runtime_stores.signals()
+    assert repository.list_candidates("tenant-a", kind="signal_mapping") == []
+    assert repository.list_current_revisions("tenant-a") == []
+    assert signal_store.get_signal_type("atomic_custom_signal", tenant_id="tenant-a") is None
+    with signal_store._conn() as connection:
+        rows = connection.execute(
+            """SELECT metric_pattern FROM signal_metric_mappings
+               WHERE tenant_id=? AND metric_pattern IN (?, ?)""",
+            ("tenant-a", "atomic_metric_a", "atomic_metric_b"),
+        ).fetchall()
+    assert rows == []
+
+
 class TestLearningTabRendering:
     def _learning_load_section(self) -> str:
         html = (Path(__file__).parent.parent.parent / "tacit" / "static" / "index.html").read_text()
@@ -5310,6 +6447,13 @@ class TestLearningTabRendering:
         assert "data-dashboard-uid" in load_section
         assert "data-dashboard-backend" in load_section
         assert "data-dashboard-tenant" in load_section
-        assert "knowledgeHeaders({}, tenant)" in load_section
+        assert "const request = captureTenantRequest(tenant)" in load_section
+        assert "fetchTenantJson(`${BASE}/api/v1/learn/dashboards`, {}, request)" in load_section
         assert "btn.dataset.dashboardTenant" in html
         assert "encodeURIComponent(uid)" in html
+
+    def test_ingested_dashboard_approving_state_can_resume_for_loaded_tenant(self):
+        load_section = self._learning_load_section()
+        assert "d.status === 'approving'" in load_section
+        assert "Resume approval" in load_section
+        assert 'data-dashboard-tenant="${escAttr(request.tenant)}"' in load_section

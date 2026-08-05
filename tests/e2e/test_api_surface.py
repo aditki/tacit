@@ -11,6 +11,76 @@ from tests.e2e.framework import CapturingBackend, build_grafana_dashboard, load_
 from tests.e2e.test_dashboard_upload_learning import SCENARIO_PATH, _no_context
 
 
+@pytest.mark.e2e
+def test_browser_ui_uses_one_captured_tenant_context_for_scoped_requests():
+    response = TestClient(app).get("/")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "function captureTenantRequest(tenant = selectedTenant())" in html
+    assert "request.generation === tenantRequestGeneration" in html
+    assert "request.tenant === tenantInputValue()" in html
+    assert "headers: knowledgeHeaders(options.headers || {}, request.tenant)" in html
+    assert "if (!response.ok)" in html
+    assert "throw new Error(errMsg(body" in html
+    assert html.count("await fetch(") == 2  # Shared JSON helper plus the SSE stream.
+    assert "headers: knowledgeHeaders({ 'Content-Type': 'application/json' }, request.tenant)" in html
+    assert "?limit=100&cursor=${encodeURIComponent(cursor)}" in html
+    assert 'class="btn-secondary btn-sm signal-mappings-more"' in html
+    assert "Metric Mappings (${data.mapping_count || 0})" in html
+
+    scoped_endpoints = [
+        "/api/v1/chart",
+        "/api/v1/feedback/stats",
+        "/api/v1/feedback/analysis",
+        "/api/v1/archetypes",
+        "/api/v1/investigations${qs}",
+        "/api/v1/investigations/stats",
+        "/api/v1/learn/dashboard",
+        "/api/v1/learn/dashboard/json",
+        "/api/v1/learn/dashboards",
+        "/api/v1/knowledge/review-queue",
+        "/api/v1/knowledge/status",
+        "/api/v1/signals",
+        "/api/v1/signals/stats",
+    ]
+    for endpoint in scoped_endpoints:
+        assert f"fetchTenantJson(`${{BASE}}{endpoint}" in html
+
+    assert "if (isStaleTenantResponse(e)) return" in html
+    assert "tenantRequestGeneration += 1" in html
+    assert "invalidateTenantViews();" in html
+    assert "reloadActiveTenantView();" in html
+    reload_section = html.split("function reloadActiveTenantView()", 1)[1]
+    for tab, loader in {
+        "learning": "loadIngestedDashboards()",
+        "knowledge": "loadKnowledgeQueue()",
+        "signals": "loadSignals()",
+        "insights": "loadInsights()",
+        "archetypes": "loadArchetypes()",
+        "history": "loadHistory()",
+    }.items():
+        assert f"if (activeTab === '{tab}') {loader};" in reload_section
+
+
+@pytest.mark.e2e
+def test_browser_review_queues_render_recoverable_and_attention_states():
+    html = TestClient(app).get("/").text
+
+    assert "d.status === 'approving'" in html
+    assert "Resume approval" in html
+    assert 'data-dashboard-tenant="${escAttr(request.tenant)}"' in html
+    assert "btn.dataset.dashboardTenant" in html
+
+    assert "queue.unresolved_conflicts || []" in html
+    assert "queue.attention_items || []" in html
+    assert "Unresolved conflicts" in html
+    assert "Needs attention" in html
+    assert "Review queue is clear." in html
+    assert "No candidates pending review." not in html
+    assert 'data-knowledge-tenant="${escAttr(request.tenant)}"' in html
+
+
 def _http_catalog() -> list[MetricEntry]:
     return [
         MetricEntry(
@@ -29,6 +99,58 @@ def _http_catalog() -> list[MetricEntry]:
             "container_memory_working_set_bytes",
         )
     ]
+
+
+@pytest.mark.e2e
+def test_signal_detail_mapping_pages_are_bounded_and_stable(isolated_learning_runtime):
+    signal_store, _history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
+    signal_type = "large_mapping_history"
+    signal_store.register_signal_type(signal_type, tenant_id="default")
+    with signal_store.transaction() as connection:
+        for index in range(550):
+            signal_store.add_mapping(
+                signal_type,
+                f"large_metric_{index:04d}",
+                confidence=0.5 + ((index % 10) / 100),
+                source_type="teach",
+                tenant_id="default",
+                connection=connection,
+            )
+
+    client = TestClient(app)
+    cursor = None
+    seen_ids: list[int] = []
+    page_count = 0
+    while True:
+        params: dict[str, int | str] = {"limit": 73}
+        if cursor:
+            params["cursor"] = cursor
+        response = client.get(f"/api/v1/signals/{signal_type}", params=params)
+        assert response.status_code == 200
+        page = response.json()
+        assert page["mapping_count"] == 550
+        assert len(page["mappings"]) <= 73
+        seen_ids.extend(mapping["id"] for mapping in page["mappings"])
+        page_count += 1
+        if not page["has_more"]:
+            assert page["next_cursor"] is None
+            break
+        cursor = page["next_cursor"]
+        assert cursor
+
+    assert page_count == 8
+    assert len(seen_ids) == len(set(seen_ids)) == 550
+    assert client.get(f"/api/v1/signals/{signal_type}", params={"cursor": "not-a-cursor"}).status_code == 400
+
+    with signal_store._conn() as connection:
+        plan = connection.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT * FROM signal_metric_mappings
+               WHERE tenant_id=? AND signal_type=?
+               ORDER BY confidence DESC, id DESC LIMIT 74""",
+            ("default", signal_type),
+        ).fetchall()
+    assert any("idx_smm_tenant_signal_page" in str(row["detail"]) for row in plan)
 
 
 @pytest.mark.e2e
@@ -226,8 +348,8 @@ def test_learning_list_ignore_and_upload_validation_endpoints(isolated_learning_
     assert ignored.json()["dashboards"][0]["status"] == "ignored"
 
     already_ignored = client.post(f"/api/v1/learn/dashboards/{uid}/approve?backend=grafana_json")
-    assert already_ignored.status_code == 200
-    assert already_ignored.json()["message"] == "Dashboard already ignored"
+    assert already_ignored.status_code == 409
+    assert "already ignored" in already_ignored.json()["detail"]
 
     missing_ignore = client.post("/api/v1/learn/dashboards/missing/ignore?backend=grafana_json")
     assert missing_ignore.status_code == 404

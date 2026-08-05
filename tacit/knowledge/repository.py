@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import sqlite3
 import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +42,7 @@ from tacit.knowledge.models import (
     utc_now,
 )
 from tacit.knowledge.normalization import normalize_entity
+from tacit.pagination import decode_cursor, encode_cursor
 from tacit.signals.schema import SQLITE_BUSY_TIMEOUT_MS
 
 logger = structlog.get_logger()
@@ -97,6 +101,41 @@ def _candidate_matches_json(raw: str, expected: KnowledgeCandidate) -> bool:
         return False
 
 
+def _entity_matches_json(raw: str, expected: Entity) -> bool:
+    """Compare entity authority after model defaults normalize legacy JSON."""
+    try:
+        return Entity.model_validate_json(raw) == expected
+    except ValueError:
+        return False
+
+
+@dataclass(frozen=True)
+class CandidatePage:
+    candidates: list[KnowledgeCandidate]
+    has_more: bool
+    next_cursor: str | None
+
+
+def _encode_candidate_cursor(created_at: float, candidate_id: str) -> str:
+    return encode_cursor(created_at, candidate_id)
+
+
+def _decode_candidate_cursor(cursor: str) -> tuple[float, str]:
+    try:
+        raw_created_at, raw_candidate_id = decode_cursor(cursor, field_count=2)
+        if isinstance(raw_created_at, bool) or not isinstance(raw_created_at, (int, float)):
+            raise ValueError
+        if not isinstance(raw_candidate_id, str):
+            raise ValueError
+        created_at = float(raw_created_at)
+        candidate_id = raw_candidate_id
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid candidate cursor") from exc
+    if not math.isfinite(created_at) or not candidate_id or len(candidate_id) > 500:
+        raise ValueError("invalid candidate cursor")
+    return created_at, candidate_id
+
+
 class CandidateReviewConflictError(ValueError):
     """Raised when a reviewer acts on a candidate state that has already changed."""
 
@@ -115,6 +154,10 @@ class CandidateMergeConflictError(ValueError):
 
 class AliasRegistrationConflictError(ValueError):
     """Raised when an alias changes during a registration transition."""
+
+
+class EntityRegistrationConflictError(ValueError):
+    """Raised when an entity changes during an authority transition."""
 
 
 class KnowledgeRevisionConflictError(ValueError):
@@ -138,12 +181,19 @@ CREATE TABLE IF NOT EXISTS knowledge_candidates (
     review_priority INTEGER NOT NULL DEFAULT 0,
     has_unresolved_conflict INTEGER NOT NULL DEFAULT 0,
     candidate_json TEXT NOT NULL,
+    source_updated_at REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(tenant_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_kc_tenant_kind ON knowledge_candidates(tenant_id, kind, created_at);
 CREATE INDEX IF NOT EXISTS idx_kc_proposition ON knowledge_candidates(tenant_id, proposition_key);
+CREATE INDEX IF NOT EXISTS idx_kc_tenant_created_page
+    ON knowledge_candidates(tenant_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_kc_tenant_kind_created_page
+    ON knowledge_candidates(tenant_id, kind, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_kc_tenant_review_created_page
+    ON knowledge_candidates(tenant_id, review_state, created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS knowledge_candidate_evidence (
     candidate_id TEXT NOT NULL,
@@ -169,6 +219,17 @@ CREATE TABLE IF NOT EXISTS knowledge_candidate_provenance (
 );
 CREATE INDEX IF NOT EXISTS idx_kcp_tenant_provenance
     ON knowledge_candidate_provenance(tenant_id, provenance_ref, candidate_id);
+
+CREATE TABLE IF NOT EXISTS knowledge_candidate_entity_refs (
+    tenant_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    entity_ref TEXT NOT NULL,
+    role TEXT NOT NULL,
+    PRIMARY KEY(tenant_id, candidate_id, entity_ref, role),
+    FOREIGN KEY(candidate_id) REFERENCES knowledge_candidates(id)
+);
+CREATE INDEX IF NOT EXISTS idx_kcer_entity
+    ON knowledge_candidate_entity_refs(tenant_id, entity_ref, candidate_id);
 
 CREATE TABLE IF NOT EXISTS promotion_decisions (
     decision_id TEXT PRIMARY KEY,
@@ -474,6 +535,7 @@ class KnowledgeRepository:
         self._run_review_priority_migration()
         self._run_correction_projection_migration()
         self._run_candidate_provenance_migration()
+        self._run_candidate_entity_ref_migration()
         self._run_current_scope_projection_migration()
         self._run_current_contributor_projection_migration()
         self._run_conflict_lineage_migration()
@@ -514,6 +576,29 @@ class KnowledgeRepository:
                 self._transaction_connection.reset(token)
 
     @contextmanager
+    def bind_transaction_connection(self, conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+        """Join a transaction opened by another store over the same SQLite file."""
+        active = self._transaction_connection.get()
+        if active is not None:
+            if active is not conn:
+                raise RuntimeError("knowledge repository is already bound to another transaction")
+            yield conn
+            return
+
+        database_path = next(
+            (str(row[2]) for row in conn.execute("PRAGMA database_list") if str(row[1]) == "main"),
+            "",
+        )
+        if database_path and Path(database_path).expanduser().resolve() != self._db_path.expanduser().resolve():
+            raise ValueError("knowledge repository cannot join a transaction for another database")
+
+        token = self._transaction_connection.set(conn)
+        try:
+            yield conn
+        finally:
+            self._transaction_connection.reset(token)
+
+    @contextmanager
     def read_transaction(self) -> Iterator[sqlite3.Connection]:
         """Keep a multi-query read on one SQLite snapshot without taking a write lock."""
         active = self._transaction_connection.get()
@@ -542,6 +627,12 @@ class KnowledgeRepository:
             if "has_unresolved_conflict" not in candidate_columns:
                 conn.execute("""ALTER TABLE knowledge_candidates
                        ADD COLUMN has_unresolved_conflict INTEGER NOT NULL DEFAULT 0""")
+            if "source_updated_at" not in candidate_columns:
+                # Zero means the source generation predates this projection. It
+                # remains eligible for the first bounded reconciliation without
+                # requiring an unbounded migration update.
+                conn.execute("""ALTER TABLE knowledge_candidates
+                       ADD COLUMN source_updated_at REAL NOT NULL DEFAULT 0""")
             conn.execute("""CREATE INDEX IF NOT EXISTS idx_kc_review_queue
                    ON knowledge_candidates(tenant_id, review_state, review_priority DESC, id)""")
             correction_columns = {
@@ -775,6 +866,73 @@ class KnowledgeRepository:
                 "candidate_provenance_index_backfilled",
                 candidate_count=migrated,
                 batch_count=batch_count,
+                batch_size=_MIGRATION_BATCH_SIZE,
+            )
+
+    @staticmethod
+    def _replace_candidate_entity_refs(conn: sqlite3.Connection, candidate: KnowledgeCandidate) -> None:
+        conn.execute(
+            "DELETE FROM knowledge_candidate_entity_refs WHERE tenant_id=? AND candidate_id=?",
+            (candidate.tenant_id, candidate.id),
+        )
+        rows = [
+            (candidate.tenant_id, candidate.id, entity_ref, role)
+            for role, entity_ref in (
+                ("subject", candidate.proposition.subject_ref),
+                ("object", candidate.proposition.object_ref),
+            )
+            if entity_ref.startswith("entity:")
+        ]
+        if rows:
+            conn.executemany(
+                """INSERT INTO knowledge_candidate_entity_refs (
+                       tenant_id, candidate_id, entity_ref, role
+                   ) VALUES (?, ?, ?, ?)""",
+                rows,
+            )
+
+    def _run_candidate_entity_ref_migration(self) -> None:
+        migration_name = "candidate_entity_refs_v1"
+        migrated = 0
+        after_tenant = ""
+        after_id = ""
+        while True:
+            with self.transaction() as conn:
+                if conn.execute(
+                    "SELECT 1 FROM knowledge_migrations WHERE migration_name=?",
+                    (migration_name,),
+                ).fetchone():
+                    return
+                rows = conn.execute(
+                    """SELECT tenant_id, id, candidate_json FROM knowledge_candidates
+                       WHERE tenant_id>? OR (tenant_id=? AND id>?)
+                       ORDER BY tenant_id, id LIMIT ?""",
+                    (after_tenant, after_tenant, after_id, _MIGRATION_BATCH_SIZE),
+                ).fetchall()
+                if not rows:
+                    conn.execute(
+                        "INSERT INTO knowledge_migrations (migration_name, completed_at) VALUES (?, ?)",
+                        (migration_name, time.time()),
+                    )
+                    break
+                for row in rows:
+                    try:
+                        candidate = KnowledgeCandidate.model_validate_json(row["candidate_json"])
+                    except ValueError:
+                        logger.warning(
+                            "candidate_entity_ref_backfill_skipped",
+                            candidate_id=row["id"],
+                            reason="invalid_candidate_json",
+                        )
+                        continue
+                    self._replace_candidate_entity_refs(conn, candidate)
+                    migrated += 1
+                after_tenant = str(rows[-1]["tenant_id"])
+                after_id = str(rows[-1]["id"])
+        if migrated:
+            logger.info(
+                "candidate_entity_refs_backfilled",
+                candidate_count=migrated,
                 batch_size=_MIGRATION_BATCH_SIZE,
             )
 
@@ -1089,6 +1247,7 @@ class KnowledgeRepository:
         candidate: KnowledgeCandidate,
         *,
         expected: KnowledgeCandidate | None | object = _UNSET,
+        source_material_changed: bool = False,
     ) -> KnowledgeCandidate:
         with self.transaction() as conn:
             existing = conn.execute(
@@ -1125,8 +1284,8 @@ class KnowledgeRepository:
                        id, tenant_id, kind, payload_ref, proposition_key, scope_json, review_state,
                        lifecycle_status, eligibility, entity_resolution_status, promotion_policy_id,
                        promotion_policy_version, review_priority, has_unresolved_conflict,
-                       candidate_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       candidate_json, source_updated_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         candidate.id,
                         candidate.tenant_id,
@@ -1143,6 +1302,7 @@ class KnowledgeRepository:
                         review_priority,
                         int(unresolved_conflict),
                         candidate.model_dump_json(),
+                        time.time(),
                         _ts(candidate.created_at),
                         _ts(candidate.updated_at),
                     ),
@@ -1153,7 +1313,8 @@ class KnowledgeRepository:
                            proposition_key=?, scope_json=?, review_state=?, lifecycle_status=?,
                            eligibility=?, entity_resolution_status=?, promotion_policy_id=?,
                            promotion_policy_version=?, review_priority=?, has_unresolved_conflict=?,
-                           candidate_json=?, updated_at=?
+                           candidate_json=?, source_updated_at=CASE WHEN ? THEN ? ELSE source_updated_at END,
+                           updated_at=?
                        WHERE id=? AND tenant_id=?""",
                     (
                         candidate.proposition.proposition_key,
@@ -1167,6 +1328,8 @@ class KnowledgeRepository:
                         review_priority,
                         int(unresolved_conflict),
                         candidate.model_dump_json(),
+                        int(source_material_changed),
+                        time.time(),
                         _ts(candidate.updated_at),
                         candidate.id,
                         candidate.tenant_id,
@@ -1192,6 +1355,7 @@ class KnowledgeRepository:
                     ),
                 )
             self._replace_candidate_provenance(conn, candidate)
+            self._replace_candidate_entity_refs(conn, candidate)
         return candidate
 
     def save_candidate_with_proposition(
@@ -1201,10 +1365,15 @@ class KnowledgeRepository:
         lineage_group: str,
         independence_class: str,
         expected: KnowledgeCandidate | None | object = _UNSET,
+        source_material_changed: bool = True,
     ) -> KnowledgeCandidate:
         """Commit a candidate and its proposition membership as one unit."""
         with self.transaction():
-            self.save_candidate(candidate, expected=expected)
+            self.save_candidate(
+                candidate,
+                expected=expected,
+                source_material_changed=source_material_changed,
+            )
             self.save_proposition(candidate, lineage_group, independence_class)
         return candidate
 
@@ -1241,6 +1410,7 @@ class KnowledgeRepository:
             cursor = conn.execute(
                 """UPDATE knowledge_candidates SET
                        review_state=?, lifecycle_status=?, eligibility=?,
+                       entity_resolution_status=?,
                        promotion_policy_id=?, promotion_policy_version=?,
                        candidate_json=?, updated_at=?
                    WHERE id=? AND tenant_id=?""",
@@ -1248,6 +1418,7 @@ class KnowledgeRepository:
                     candidate.state.review_state.value,
                     candidate.state.lifecycle_status.value,
                     candidate.state.eligibility.value,
+                    candidate.entity_resolution.status.value,
                     candidate.policy.promotion_policy_ref,
                     (
                         candidate.policy.promotion_policy_ref.rsplit("-", 1)[-1]
@@ -1372,6 +1543,14 @@ class KnowledgeRepository:
         review_state: str | None = None,
         limit: int | None = 200,
     ) -> list[KnowledgeCandidate]:
+        if limit is not None:
+            return self.list_candidates_page(
+                tenant_id,
+                kind=kind,
+                review_state=review_state,
+                limit=limit,
+            ).candidates
+
         clauses = ["tenant_id=?"]
         params: list[Any] = [tenant_id]
         if kind:
@@ -1380,32 +1559,143 @@ class KnowledgeRepository:
         if review_state:
             clauses.append("review_state=?")
             params.append(review_state)
-        limit_clause = ""
-        if limit is not None:
-            params.append(limit)
-            limit_clause = " LIMIT ?"
         with self._conn() as conn:
             rows = conn.execute(
                 f"SELECT candidate_json FROM knowledge_candidates WHERE {' AND '.join(clauses)} "
-                f"ORDER BY created_at DESC{limit_clause}",
+                "ORDER BY created_at DESC, id DESC",
                 params,
             ).fetchall()
         return [KnowledgeCandidate.model_validate_json(row["candidate_json"]) for row in rows]
+
+    def list_candidates_page(
+        self,
+        tenant_id: str = "default",
+        *,
+        kind: str | None = None,
+        review_state: str | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> CandidatePage:
+        """Return one stable newest-first keyset page of candidate audit history."""
+        if limit < 1:
+            raise ValueError("candidate page limit must be positive")
+        clauses = ["tenant_id=?"]
+        params: list[Any] = [tenant_id]
+        if kind:
+            clauses.append("kind=?")
+            params.append(kind)
+        if review_state:
+            clauses.append("review_state=?")
+            params.append(review_state)
+        if cursor:
+            created_at, candidate_id = _decode_candidate_cursor(cursor)
+            clauses.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            params.extend([created_at, created_at, candidate_id])
+        params.append(limit + 1)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"""SELECT id, created_at, candidate_json
+                    FROM knowledge_candidates
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?""",
+                params,
+            ).fetchall()
+        has_more = len(rows) > limit
+        visible = rows[:limit]
+        next_cursor = None
+        if has_more and visible:
+            last = visible[-1]
+            next_cursor = _encode_candidate_cursor(float(last["created_at"]), str(last["id"]))
+        return CandidatePage(
+            candidates=[KnowledgeCandidate.model_validate_json(row["candidate_json"]) for row in visible],
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
 
     def list_candidates_for_provenance(
         self,
         tenant_id: str,
         provenance_ref: str,
+        *,
+        after_candidate_id: str = "",
+        limit: int = _MIGRATION_BATCH_SIZE,
+        source_updated_before: float | None = None,
+        kind: str | None = None,
     ) -> list[KnowledgeCandidate]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        clauses = [
+            "p.tenant_id=?",
+            "p.provenance_ref=?",
+            "c.id>?",
+        ]
+        params: list[Any] = [tenant_id, provenance_ref, after_candidate_id]
+        if source_updated_before is not None:
+            clauses.append("c.source_updated_at<=?")
+            params.append(source_updated_before)
+        if kind is not None:
+            clauses.append("c.kind=?")
+            params.append(kind)
+        params.append(limit)
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT c.candidate_json
+                f"""SELECT c.candidate_json
                    FROM knowledge_candidate_provenance p
                    JOIN knowledge_candidates c
                      ON c.tenant_id=p.tenant_id AND c.id=p.candidate_id
-                   WHERE p.tenant_id=? AND p.provenance_ref=?
-                   ORDER BY c.created_at""",
-                (tenant_id, provenance_ref),
+                   WHERE {' AND '.join(clauses)}
+                   ORDER BY c.id LIMIT ?""",
+                params,
+            ).fetchall()
+        return [KnowledgeCandidate.model_validate_json(row["candidate_json"]) for row in rows]
+
+    def has_candidate_for_provenance(
+        self,
+        tenant_id: str,
+        provenance_ref: str,
+        *,
+        kind: str | None = None,
+        source_updated_before: float | None = None,
+    ) -> bool:
+        clauses = ["p.tenant_id=?", "p.provenance_ref=?"]
+        params: list[Any] = [tenant_id, provenance_ref]
+        if kind is not None:
+            clauses.append("c.kind=?")
+            params.append(kind)
+        if source_updated_before is not None:
+            clauses.append("c.source_updated_at<=?")
+            params.append(source_updated_before)
+        with self._conn() as conn:
+            row = conn.execute(
+                f"""SELECT 1
+                    FROM knowledge_candidate_provenance p
+                    JOIN knowledge_candidates c
+                      ON c.tenant_id=p.tenant_id AND c.id=p.candidate_id
+                    WHERE {' AND '.join(clauses)} LIMIT 1""",
+                params,
+            ).fetchone()
+        return row is not None
+
+    def list_candidates_for_entity(
+        self,
+        tenant_id: str,
+        entity_ref: str,
+        *,
+        after_candidate_id: str = "",
+        limit: int = _MIGRATION_BATCH_SIZE,
+    ) -> list[KnowledgeCandidate]:
+        """Return a bounded keyset page of candidates bound to an entity."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT candidate.candidate_json
+                   FROM knowledge_candidate_entity_refs ref
+                   JOIN knowledge_candidates candidate
+                     ON candidate.tenant_id=ref.tenant_id AND candidate.id=ref.candidate_id
+                   WHERE ref.tenant_id=? AND ref.entity_ref=? AND ref.candidate_id>?
+                   GROUP BY candidate.id
+                   ORDER BY candidate.id LIMIT ?""",
+                (tenant_id, entity_ref, after_candidate_id, limit),
             ).fetchall()
         return [KnowledgeCandidate.model_validate_json(row["candidate_json"]) for row in rows]
 
@@ -1450,14 +1740,29 @@ class KnowledgeRepository:
                 unresolved.update(str(row["proposition_key"]) for row in rows)
         return unresolved
 
-    def save_entity(self, entity: Entity) -> Entity:
-        with self._conn() as conn:
+    def save_entity(
+        self,
+        entity: Entity,
+        *,
+        expected: Entity | None | object = _UNSET,
+    ) -> Entity:
+        with self.transaction() as conn:
             existing = conn.execute(
-                "SELECT kind FROM entities WHERE id=? AND tenant_id=?",
+                "SELECT kind, entity_json FROM entities WHERE id=? AND tenant_id=?",
                 (entity.id, entity.tenant_id),
             ).fetchone()
             if existing is not None and existing["kind"] != entity.kind.value:
                 raise ValueError("entity kind cannot change for an existing entity id")
+            if expected is not _UNSET:
+                matches_expected = (
+                    existing is not None
+                    and isinstance(expected, Entity)
+                    and _entity_matches_json(str(existing["entity_json"]), expected)
+                )
+                if not matches_expected and not (existing is None and expected is None):
+                    raise EntityRegistrationConflictError(
+                        "entity changed during registration; reload before updating authority"
+                    )
             conn.execute(
                 """INSERT INTO entities (
                    id, tenant_id, kind, canonical_name, normalized_name, display_name, status,
@@ -1564,6 +1869,23 @@ class KnowledgeRepository:
                 (tenant_id, entity_id),
             ).fetchone()
         return Entity.model_validate_json(row["entity_json"]) if row else None
+
+    def get_entities_by_ids(self, tenant_id: str, entity_ids: set[str]) -> dict[str, Entity]:
+        entities: dict[str, Entity] = {}
+        ordered_ids = sorted(entity_ids)
+        if not ordered_ids:
+            return entities
+        with self._conn() as conn:
+            for start in range(0, len(ordered_ids), _SQLITE_BIND_BATCH_SIZE):
+                batch = ordered_ids[start : start + _SQLITE_BIND_BATCH_SIZE]
+                placeholders = ", ".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""SELECT id, entity_json FROM entities
+                        WHERE tenant_id=? AND id IN ({placeholders})""",
+                    (tenant_id, *batch),
+                ).fetchall()
+                entities.update({str(row["id"]): Entity.model_validate_json(row["entity_json"]) for row in rows})
+        return entities
 
     def find_aliases(self, tenant_id: str, normalized_value: str) -> list[EntityAlias]:
         with self._conn() as conn:
@@ -1720,15 +2042,68 @@ class KnowledgeRepository:
                 ),
             )
 
-    def candidates_for_proposition(self, tenant_id: str, proposition_key: str) -> list[KnowledgeCandidate]:
+    def candidates_for_proposition(
+        self,
+        tenant_id: str,
+        proposition_key: str,
+        *,
+        review_states: set[str] | None = None,
+        lifecycle_status: str | None = None,
+        entity_resolution_status: str | None = None,
+        limit: int | None = None,
+    ) -> list[KnowledgeCandidate]:
+        clauses = ["p.tenant_id=?", "p.proposition_key=?"]
+        params: list[Any] = [tenant_id, proposition_key]
+        if review_states:
+            placeholders = ", ".join("?" for _ in review_states)
+            clauses.append(f"c.review_state IN ({placeholders})")
+            params.extend(sorted(review_states))
+        if lifecycle_status is not None:
+            clauses.append("c.lifecycle_status=?")
+            params.append(lifecycle_status)
+        if entity_resolution_status is not None:
+            clauses.append("c.entity_resolution_status=?")
+            params.append(entity_resolution_status)
+        limit_clause = ""
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be positive")
+            params.append(limit)
+            limit_clause = " LIMIT ?"
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT c.candidate_json FROM knowledge_candidates c
-                   JOIN proposition_candidates p ON p.candidate_id=c.id
-                   WHERE p.tenant_id=? AND p.proposition_key=? ORDER BY c.created_at""",
-                (tenant_id, proposition_key),
+                f"""SELECT c.candidate_json FROM knowledge_candidates c
+                   JOIN proposition_candidates p
+                     ON p.candidate_id=c.id AND p.tenant_id=c.tenant_id
+                   WHERE {' AND '.join(clauses)}
+                   ORDER BY c.created_at, c.id{limit_clause}""",
+                params,
             ).fetchall()
         return [KnowledgeCandidate.model_validate_json(row["candidate_json"]) for row in rows]
+
+    def get_candidates_by_ids(
+        self,
+        tenant_id: str,
+        candidate_ids: set[str],
+    ) -> dict[str, KnowledgeCandidate]:
+        """Bulk-load a bounded caller-provided candidate set."""
+        if not candidate_ids:
+            return {}
+        candidates: dict[str, KnowledgeCandidate] = {}
+        ordered_ids = sorted(candidate_ids)
+        with self._conn() as conn:
+            for start in range(0, len(ordered_ids), _SQLITE_BIND_BATCH_SIZE):
+                batch = ordered_ids[start : start + _SQLITE_BIND_BATCH_SIZE]
+                placeholders = ", ".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""SELECT candidate_json FROM knowledge_candidates
+                        WHERE tenant_id=? AND id IN ({placeholders})""",
+                    (tenant_id, *batch),
+                ).fetchall()
+                for row in rows:
+                    candidate = KnowledgeCandidate.model_validate_json(row["candidate_json"])
+                    candidates[candidate.id] = candidate
+        return candidates
 
     def list_propositions(
         self,
@@ -1784,11 +2159,22 @@ class KnowledgeRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def save_corroboration(self, summary: CorroborationSummary, tenant_id: str) -> str:
-        snapshot_id = f"corroboration_{uuid.uuid4().hex[:16]}"
+    def save_corroboration(
+        self,
+        summary: CorroborationSummary,
+        tenant_id: str,
+    ) -> tuple[str, bool]:
+        digest = hashlib.sha256(
+            json.dumps(
+                {"tenant_id": tenant_id, "summary": summary.model_dump(mode="json")},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        snapshot_id = f"corroboration_{digest[:20]}"
         with self._conn() as conn:
-            conn.execute(
-                """INSERT INTO corroboration_snapshots (
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO corroboration_snapshots (
                    snapshot_id, tenant_id, proposition_key, raw_source_count, independent_source_count,
                    independent_family_count, status, source_summary_json, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -1804,7 +2190,20 @@ class KnowledgeRepository:
                     time.time(),
                 ),
             )
-        return snapshot_id
+        return snapshot_id, cursor.rowcount == 1
+
+    def get_promotion_decision(
+        self,
+        decision_id: str,
+        tenant_id: str,
+    ) -> PromotionDecision | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """SELECT decision_json FROM promotion_decisions
+                   WHERE decision_id=? AND tenant_id=?""",
+                (decision_id, tenant_id),
+            ).fetchone()
+        return PromotionDecision.model_validate_json(row["decision_json"]) if row else None
 
     def save_conflict(self, conflict: KnowledgeConflict) -> KnowledgeConflict:
         with self._conn() as conn:
