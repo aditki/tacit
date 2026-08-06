@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
 from tacit.api.app import create_app
-from tacit.api.dependencies import get_history_store, get_signal_store
+from tacit.api.dependencies import get_history_store, get_knowledge_service, get_signal_store
 from tacit.api.security import (
     KnowledgeAction,
     assert_knowledge_action,
@@ -44,7 +44,10 @@ def _security_request(runtime_settings: Settings, tenant_id: str | None = None) 
         (KnowledgeAction.CORRECT, ("knowledge.correct",)),
         (KnowledgeAction.EXPORT, ("knowledge.read", "knowledge.export")),
         (KnowledgeAction.OVERRIDE, ("knowledge.override",)),
-        (KnowledgeAction.TEACH_SIGNALS, ("knowledge.review", "knowledge.trust")),
+        (
+            KnowledgeAction.TEACH_SIGNALS,
+            ("knowledge.review", "knowledge.trust", "knowledge.apply"),
+        ),
     ],
 )
 def test_knowledge_action_permission_matrix(action, required_permissions):
@@ -433,6 +436,7 @@ def test_replay_route_uses_app_scoped_runtime_settings(monkeypatch):
     [
         ("knowledge.read", "knowledge.review"),
         ("knowledge.read,knowledge.review", "knowledge.trust"),
+        ("knowledge.read,knowledge.review,knowledge.trust", "knowledge.apply"),
     ],
 )
 def test_learning_auto_approval_requires_knowledge_permissions(monkeypatch, permissions, missing_permission):
@@ -506,10 +510,20 @@ def test_artifact_learning_requires_review_permission_before_persistence(endpoin
     [
         ("knowledge.read", "knowledge.review"),
         ("knowledge.read,knowledge.review", "knowledge.trust"),
+        ("knowledge.read,knowledge.review,knowledge.trust", "knowledge.apply"),
     ],
 )
-def test_manual_signal_teaching_requires_review_and_trust_permissions(permissions, missing_permission):
-    client = TestClient(create_app(runtime_settings=Settings(knowledge_permissions=permissions)))
+def test_manual_signal_teaching_requires_all_permissions_before_transaction(permissions, missing_permission):
+    app = create_app(runtime_settings=Settings(knowledge_permissions=permissions))
+    app.dependency_overrides[get_signal_store] = lambda: object()
+
+    def fail_if_transaction_starts():
+        raise AssertionError("signal teaching transaction started before authorization")
+
+    app.dependency_overrides[get_knowledge_service] = lambda: SimpleNamespace(
+        repository=SimpleNamespace(transaction=fail_if_transaction_starts)
+    )
+    client = TestClient(app)
 
     response = client.post(
         "/api/v1/signals/teach",

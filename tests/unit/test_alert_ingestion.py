@@ -488,6 +488,101 @@ async def test_alert_approval_rolls_back_governed_authority_before_final_status(
 
 
 @pytest.mark.asyncio
+async def test_auto_approved_alert_rolls_back_authority_when_indexing_fails(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    features = AlertFeatures(
+        alert_uid="atomic-approved-alert",
+        alert_title="Atomic approved alert",
+        backend_name="grafana",
+        query_language="promql",
+        condition="A > 1",
+        metrics_found=["atomic_alert_latency_seconds"],
+        query_transformations=["atomic_alert_latency_seconds"],
+        service_hints=["checkout"],
+    )
+    inferred = [
+        {
+            "signal_type": "request_latency",
+            "metric": "atomic_alert_latency_seconds",
+            "source": "heuristic",
+            "confidence": 0.9,
+            "auto_teach_eligible": True,
+        }
+    ]
+    monkeypatch.setattr("tacit.alert_ingest.infer_signals_from_metrics", lambda *_args, **_kwargs: inferred)
+    knowledge_service = KnowledgeService(
+        KnowledgeRepository(store._db_path),
+        signal_store=store,
+    )
+    repository = knowledge_service.repository
+
+    def promote_governed_mapping(**kwargs):
+        candidate_id = migrate_signal_mapping(
+            {
+                "id": "atomic-approved-alert",
+                "signal_type": "request_latency",
+                "metric_pattern": "atomic_alert_latency_seconds",
+                "source_type": "alert_ingest",
+                "source_refs": [kwargs["source_ref"]],
+            },
+            service=knowledge_service,
+        )
+        knowledge_service.review_candidate(candidate_id, approved=True, reviewer="test")
+        _decision, revision = knowledge_service.evaluate_candidate(candidate_id, live_verified=True)
+        assert revision is not None
+        kwargs["governed_candidate_ids"].add(candidate_id)
+        kwargs["governed_pairs"].add(("atomic_alert_latency_seconds", "request_latency"))
+        return True
+
+    monkeypatch.setattr("tacit.alert_ingest.persist_inferred_signal_review", promote_governed_mapping)
+    index_generation = store.index_alert_context
+
+    def fail_after_index_write(**kwargs):
+        index_generation(**kwargs)
+        raise RuntimeError("simulated approved alert index failure")
+
+    monkeypatch.setattr(store, "index_alert_context", fail_after_index_write)
+
+    with pytest.raises(RuntimeError, match="simulated approved alert index failure"):
+        await ingest_alert_features(
+            features,
+            auto_approve=True,
+            store=store,
+            knowledge_service=knowledge_service,
+        )
+
+    source = store.get_ingested_alert("atomic-approved-alert", "grafana")
+    assert source is not None and source["status"] == "approving"
+    assert repository.list_candidates() == []
+    assert repository.list_current_revisions() == []
+    assert store.get_mappings_for_signal("request_latency", include_decayed=True) == []
+    with store._conn() as connection:
+        indexed = connection.execute(
+            "SELECT COUNT(*) FROM learning_context_fts WHERE tenant_id=? AND dashboard_uid=?",
+            ("default", "alert:atomic-approved-alert"),
+        ).fetchone()[0]
+    assert indexed == 0
+
+    monkeypatch.setattr(store, "index_alert_context", index_generation)
+    recovered = await ingest_alert_features(
+        features,
+        auto_approve=True,
+        store=store,
+        knowledge_service=knowledge_service,
+    )
+
+    assert recovered["status"] == "approved"
+    assert repository.list_current_revisions()
+    assert store.get_mappings_for_signal("request_latency", include_decayed=True)
+    with store._conn() as connection:
+        indexed = connection.execute(
+            "SELECT COUNT(*) FROM learning_context_fts WHERE tenant_id=? AND dashboard_uid=?",
+            ("default", "alert:atomic-approved-alert"),
+        ).fetchone()[0]
+    assert indexed > 0
+
+
+@pytest.mark.asyncio
 async def test_direct_alert_ingestion_authorizes_before_backend_access(tmp_path):
     store = SignalStore(
         db_path=tmp_path / "signals.db",
@@ -691,6 +786,138 @@ async def test_pending_alert_refresh_retires_removed_support_without_promoting_r
     assert old.state.lifecycle_status.value == "stale"
     assert all("new_latency_seconds" not in candidate.payload_ref for candidate in candidates)
     assert store.get_mappings_for_signal("old_latency", include_decayed=True) == []
+
+
+@pytest.mark.asyncio
+async def test_pending_alert_refresh_rolls_back_source_authority_and_index_together(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    batches = iter(
+        [
+            [
+                {
+                    "signal_type": "old_latency",
+                    "metric": "old_latency_seconds",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+            [
+                {
+                    "signal_type": "new_latency",
+                    "metric": "new_latency_seconds",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(
+        "tacit.alert_ingest.infer_signals_from_metrics",
+        lambda *args, **kwargs: next(batches),
+    )
+
+    def features(metric: str) -> AlertFeatures:
+        return AlertFeatures(
+            alert_uid="atomic-pending-alert",
+            alert_title="Atomic pending alert",
+            backend_name="grafana",
+            query_language="promql",
+            condition="A > 1",
+            metrics_found=[metric],
+            query_transformations=[metric],
+            service_hints=["checkout"],
+        )
+
+    await ingest_alert_features(features("old_latency_seconds"), auto_approve=True, store=store)
+    repository = KnowledgeRepository(store._db_path)
+    before_source = store.get_ingested_alert("atomic-pending-alert", "grafana")
+    before_candidate = next(
+        candidate
+        for candidate in repository.list_candidates("default", kind="signal_mapping", limit=None)
+        if "old_latency_seconds" in candidate.payload_ref
+    )
+    assert before_source is not None and before_source["status"] == "approved"
+    assert before_candidate.state.lifecycle_status.value == "active"
+    with store._conn() as connection:
+        before_mapping = connection.execute(
+            """SELECT id FROM signal_metric_mappings
+               WHERE tenant_id=? AND source_refs LIKE ?""",
+            ("default", '%"grafana:alert:atomic-pending-alert"%'),
+        ).fetchone()
+    assert before_mapping is not None
+
+    index_generation = store.index_alert_context
+
+    def fail_after_index_write(**kwargs):
+        index_generation(**kwargs)
+        raise RuntimeError("simulated pending alert index failure")
+
+    monkeypatch.setattr(store, "index_alert_context", fail_after_index_write)
+
+    with pytest.raises(RuntimeError, match="simulated pending alert index failure"):
+        await ingest_alert_features(
+            features("new_latency_seconds"),
+            auto_approve=False,
+            store=store,
+        )
+
+    after_source = store.get_ingested_alert("atomic-pending-alert", "grafana")
+    after_candidate = repository.get_candidate(before_candidate.id, "default")
+    assert after_source is not None
+    assert after_source["status"] == "approved"
+    assert after_source["metrics_found"] == ["old_latency_seconds"]
+    assert after_candidate == before_candidate
+    with store._conn() as connection:
+        after_mapping = connection.execute(
+            "SELECT id FROM signal_metric_mappings WHERE id=?",
+            (before_mapping["id"],),
+        ).fetchone()
+    assert after_mapping is not None
+    if store._learning_index_available():
+        assert store.search_learning_context("old_latency_seconds")
+        assert store.search_learning_context("new_latency_seconds") == []
+
+
+@pytest.mark.asyncio
+async def test_unchanged_approved_alert_reports_approved_learning_impact(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    inferred = [
+        {
+            "signal_type": "request_latency",
+            "metric": "checkout_latency_seconds",
+            "confidence": 0.9,
+            "source": "heuristic",
+            "signal_family": "latency",
+            "auto_teach_eligible": True,
+        }
+    ]
+    monkeypatch.setattr(
+        "tacit.alert_ingest.infer_signals_from_metrics",
+        lambda *args, **kwargs: inferred,
+    )
+    features = AlertFeatures(
+        alert_uid="approved-impact-alert",
+        alert_title="Approved impact alert",
+        backend_name="grafana",
+        query_language="promql",
+        condition="A > 1",
+        metrics_found=["checkout_latency_seconds"],
+        query_transformations=["checkout_latency_seconds"],
+        service_hints=["checkout"],
+    )
+
+    await ingest_alert_features(features, auto_approve=True, store=store)
+    refreshed = await ingest_alert_features(features, auto_approve=False, store=store)
+
+    assert refreshed["status"] == "approved"
+    assert refreshed["learning_impact"]["candidate_mappings_pending_approval"] == 0
+    assert {mapping["mapping_state"] for mapping in refreshed["learning_impact"]["newly_understood_metrics"]} == {
+        "approved"
+    }
 
 
 @pytest.mark.asyncio

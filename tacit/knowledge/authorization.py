@@ -29,7 +29,11 @@ KNOWLEDGE_ACTION_PERMISSIONS: Final[dict[KnowledgeAction, tuple[str, ...]]] = {
     KnowledgeAction.APPLY: ("knowledge.apply",),
     KnowledgeAction.EXPORT: ("knowledge.read", "knowledge.export"),
     KnowledgeAction.OVERRIDE: ("knowledge.override",),
-    KnowledgeAction.TEACH_SIGNALS: ("knowledge.review", "knowledge.trust"),
+    KnowledgeAction.TEACH_SIGNALS: (
+        "knowledge.review",
+        "knowledge.trust",
+        "knowledge.apply",
+    ),
 }
 
 

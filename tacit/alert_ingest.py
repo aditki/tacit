@@ -254,6 +254,84 @@ def _apply_alert_approval_generation(
     return mappings_created, activated_pairs, governed_candidate_ids
 
 
+def _record_alert_generation(
+    *,
+    store: Any,
+    features: AlertFeatures,
+    tenant_id: str,
+    fingerprint: str,
+    confidence: float,
+    signals: list[dict[str, Any]],
+    service_hints: list[str],
+) -> tuple[str, dict[str, Any]]:
+    """Persist and reload one alert source generation."""
+    change_state = store.record_ingested_alert(
+        alert_uid=features.alert_uid,
+        tenant_id=tenant_id,
+        backend_name=features.backend_name,
+        source_vendor=features.backend_name,
+        source_instance=_source_instance(features),
+        external_id=features.alert_uid,
+        fingerprint=fingerprint,
+        alert_title=features.alert_title,
+        alert_tags=features.alert_tags,
+        condition=features.condition,
+        severity=features.severity,
+        enabled=features.enabled,
+        labels=features.labels,
+        annotations=features.annotations,
+        metrics_found=features.metrics_found,
+        query_transformations=features.query_transformations,
+        service_hints=service_hints,
+        dashboard_uid=features.dashboard_uid,
+        panel_title=features.panel_title,
+        source_url=features.source_url,
+        provenance_url=features.source_url,
+        confidence=confidence,
+        signals_inferred=signals,
+        status="pending",
+    )
+    stored_alert = store.get_ingested_alert(
+        features.alert_uid,
+        features.backend_name,
+        tenant_id=tenant_id,
+    )
+    if stored_alert is None:
+        raise RuntimeError("Persisted alert source record could not be reloaded")
+    if not stored_alert.get("generation_fingerprint"):
+        raise RuntimeError("Persisted alert source record has no generation fingerprint")
+    return change_state, stored_alert
+
+
+def _index_alert_generation(
+    *,
+    store: Any,
+    features: AlertFeatures,
+    tenant_id: str,
+    signals: list[dict[str, Any]],
+    service_hints: list[str],
+    status: str,
+    activated_pairs: set[tuple[str, str]],
+    strict: bool = False,
+) -> int:
+    """Project one alert generation into the tenant retrieval index."""
+    return store.index_alert_context(
+        tenant_id=tenant_id,
+        alert_uid=features.alert_uid,
+        backend_name=features.backend_name,
+        alert_title=features.alert_title,
+        alert_tags=features.alert_tags,
+        condition=features.condition,
+        metrics_found=features.metrics_found,
+        query_transformations=features.query_transformations,
+        service_hints=service_hints,
+        signals_inferred=signals,
+        status=status,
+        activated_pairs=activated_pairs if status == "approved" else None,
+        strict=strict,
+    )
+
+
 async def ingest_alert_features(
     features: AlertFeatures,
     *,
@@ -280,11 +358,6 @@ async def ingest_alert_features(
         tenant_id=effective_tenant or "default",
     )
     signal_quality = build_signal_quality_report(metrics=features.metrics_found, signals=signals)
-    learning_impact = build_learning_impact_report(
-        metrics=features.metrics_found,
-        signals=signals,
-        approved=auto_approve,
-    )
     service_hints = list(dict.fromkeys([*features.service_hints, *_services_for_alert(features)]))
     runbook_links = _runbook_links(features)
     fingerprint = _alert_fingerprint(features)
@@ -305,63 +378,35 @@ async def ingest_alert_features(
         )
         assert knowledge_service is not None
         assert effective_tenant is not None
-        change_state = store.record_ingested_alert(
-            alert_uid=features.alert_uid,
-            tenant_id=effective_tenant,
-            backend_name=features.backend_name,
-            source_vendor=features.backend_name,
-            source_instance=_source_instance(features),
-            external_id=features.alert_uid,
-            fingerprint=fingerprint,
-            alert_title=features.alert_title,
-            alert_tags=features.alert_tags,
-            condition=features.condition,
-            severity=features.severity,
-            enabled=features.enabled,
-            labels=features.labels,
-            annotations=features.annotations,
-            metrics_found=features.metrics_found,
-            query_transformations=features.query_transformations,
-            service_hints=service_hints,
-            dashboard_uid=features.dashboard_uid,
-            panel_title=features.panel_title,
-            source_url=features.source_url,
-            provenance_url=features.source_url,
-            confidence=confidence,
-            signals_inferred=signals,
-            status="pending",
-        )
-        stored_alert = store.get_ingested_alert(
-            features.alert_uid,
-            features.backend_name,
-            tenant_id=effective_tenant,
-        )
-        if stored_alert is None:
-            raise RuntimeError("Persisted alert source record could not be reloaded")
-        effective_status = str(stored_alert.get("status") or "pending")
-        generation_fingerprint = str(stored_alert.get("generation_fingerprint") or "")
-        if not generation_fingerprint:
-            raise RuntimeError("Persisted alert source record has no generation fingerprint")
-
-        if auto_approve and effective_status == "pending":
-            claimed = store.claim_ingested_alert_approval(
-                features.alert_uid,
-                features.backend_name,
-                generation_fingerprint=generation_fingerprint,
-                tenant_id=effective_tenant,
-            )
-            current = store.get_ingested_alert(
-                features.alert_uid,
-                features.backend_name,
-                tenant_id=effective_tenant,
-            )
-            if current is None:
-                raise RuntimeError("Alert disappeared while claiming auto-approval")
-            effective_status = str(current.get("status") or "pending")
-            if not claimed and effective_status not in {"approving", "approved"}:
-                raise RuntimeError("Alert changed before auto-approval was claimed")
-
         if auto_approve:
+            change_state, stored_alert = _record_alert_generation(
+                store=store,
+                features=features,
+                tenant_id=effective_tenant,
+                fingerprint=fingerprint,
+                confidence=confidence,
+                signals=signals,
+                service_hints=service_hints,
+            )
+            effective_status = str(stored_alert.get("status") or "pending")
+            generation_fingerprint = str(stored_alert["generation_fingerprint"])
+            if effective_status == "pending":
+                claimed = store.claim_ingested_alert_approval(
+                    features.alert_uid,
+                    features.backend_name,
+                    generation_fingerprint=generation_fingerprint,
+                    tenant_id=effective_tenant,
+                )
+                current = store.get_ingested_alert(
+                    features.alert_uid,
+                    features.backend_name,
+                    tenant_id=effective_tenant,
+                )
+                if current is None:
+                    raise RuntimeError("Alert disappeared while claiming auto-approval")
+                effective_status = str(current.get("status") or "pending")
+                if not claimed and effective_status not in {"approving", "approved"}:
+                    raise RuntimeError("Alert changed before auto-approval was claimed")
             if effective_status not in {"approving", "approved"}:
                 raise RuntimeError(f"Alert is already {effective_status}")
             with _source_authority_transaction(
@@ -382,23 +427,18 @@ async def ingest_alert_features(
                     mapping_fingerprint=mapping_fingerprint,
                     generation_fingerprint=generation_fingerprint,
                 )
+                indexed_context_rows = _index_alert_generation(
+                    store=store,
+                    features=features,
+                    tenant_id=effective_tenant,
+                    signals=signals,
+                    service_hints=service_hints,
+                    status="approved",
+                    activated_pairs=activated_pairs,
+                    strict=True,
+                )
             effective_status = "approved"
         else:
-            if effective_status == "approved":
-                governed_candidate_ids = _existing_governed_candidate_ids(
-                    store=store,
-                    tenant_id=effective_tenant,
-                    source_ref=source_ref,
-                    active_pairs=governed_pairs,
-                    source_fingerprint=mapping_fingerprint,
-                    repository=knowledge_service.repository,
-                )
-                activated_pairs = _active_pairs_for_candidates(
-                    store=store,
-                    tenant_id=effective_tenant,
-                    candidate_ids=governed_candidate_ids,
-                    repository=knowledge_service.repository,
-                )
             with _source_authority_transaction(
                 store=store,
                 knowledge_service=knowledge_service,
@@ -406,6 +446,31 @@ async def ingest_alert_features(
                 source_ref=source_ref,
                 operation="reconcile_pending_alert",
             ):
+                change_state, stored_alert = _record_alert_generation(
+                    store=store,
+                    features=features,
+                    tenant_id=effective_tenant,
+                    fingerprint=fingerprint,
+                    confidence=confidence,
+                    signals=signals,
+                    service_hints=service_hints,
+                )
+                effective_status = str(stored_alert.get("status") or "pending")
+                if effective_status == "approved":
+                    governed_candidate_ids = _existing_governed_candidate_ids(
+                        store=store,
+                        tenant_id=effective_tenant,
+                        source_ref=source_ref,
+                        active_pairs=governed_pairs,
+                        source_fingerprint=mapping_fingerprint,
+                        repository=knowledge_service.repository,
+                    )
+                    activated_pairs = _active_pairs_for_candidates(
+                        store=store,
+                        tenant_id=effective_tenant,
+                        candidate_ids=governed_candidate_ids,
+                        repository=knowledge_service.repository,
+                    )
                 reconcile_signal_source(
                     store=store,
                     tenant_id=effective_tenant,
@@ -417,27 +482,28 @@ async def ingest_alert_features(
                     knowledge_service=knowledge_service,
                     max_candidate_count=int(active_settings.knowledge_source_atomic_candidate_limit),
                 )
-
-        indexed_context_rows = store.index_alert_context(
-            tenant_id=effective_tenant,
-            alert_uid=features.alert_uid,
-            backend_name=features.backend_name,
-            alert_title=features.alert_title,
-            alert_tags=features.alert_tags,
-            condition=features.condition,
-            metrics_found=features.metrics_found,
-            query_transformations=features.query_transformations,
-            service_hints=service_hints,
-            signals_inferred=signals,
-            status=effective_status,
-            activated_pairs=activated_pairs if effective_status == "approved" else None,
-        )
-        if auto_approve:
-            teachable_count = len(governed_pairs)
-            learning_impact["candidate_mappings_pending_approval"] = max(0, teachable_count - mappings_created)
-            learning_impact["new_active_mappings_after_approval"] = mappings_created
+                indexed_context_rows = _index_alert_generation(
+                    store=store,
+                    features=features,
+                    tenant_id=effective_tenant,
+                    signals=signals,
+                    service_hints=service_hints,
+                    status=effective_status,
+                    activated_pairs=activated_pairs,
+                    strict=True,
+                )
     else:
         indexed_context_rows = 0
+
+    learning_impact = build_learning_impact_report(
+        metrics=features.metrics_found,
+        signals=signals,
+        approved=auto_approve if dry_run else effective_status == "approved",
+    )
+    if auto_approve and not dry_run:
+        teachable_count = len(governed_pairs)
+        learning_impact["candidate_mappings_pending_approval"] = max(0, teachable_count - mappings_created)
+        learning_impact["new_active_mappings_after_approval"] = mappings_created
 
     result = {
         **asdict(features),

@@ -29,6 +29,7 @@ import inspect
 import json
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -547,6 +548,70 @@ def _dashboard_source_ref(ingested: dict[str, Any]) -> str:
     return f"{backend_name}:{dashboard_uid}" if backend_name else dashboard_uid
 
 
+def _record_dashboard_generation(
+    *,
+    store: Any,
+    features: Any,
+    signals: list[dict[str, Any]],
+    archetype_yaml: str,
+    tenant_id: str,
+) -> dict[str, Any]:
+    """Persist and reload one dashboard source generation."""
+    store.record_ingested_dashboard(
+        dashboard_uid=features.dashboard_uid,
+        tenant_id=tenant_id,
+        backend_name=features.backend_name,
+        dashboard_title=features.dashboard_title,
+        dashboard_tags=features.dashboard_tags,
+        metrics_found=features.metrics_found,
+        panel_count=features.panel_count,
+        row_groups=features.row_groups,
+        metric_cooccurrence=features.metric_cooccurrence,
+        aggregation_patterns=features.aggregation_patterns,
+        query_transformations=features.query_transformations,
+        panel_titles=features.panel_titles,
+        alert_links=features.alert_links,
+        drilldown_links=features.drilldown_links,
+        signals_inferred=signals,
+        archetype_generated=archetype_yaml,
+        status="pending",
+    )
+    stored_dashboard = store.get_ingested_dashboard(
+        features.dashboard_uid,
+        backend_name=features.backend_name,
+        tenant_id=tenant_id,
+    )
+    if stored_dashboard is None:
+        raise RuntimeError("Persisted dashboard source record could not be reloaded")
+    return stored_dashboard
+
+
+def _index_dashboard_generation(
+    *,
+    store: Any,
+    features: Any,
+    signals: list[dict[str, Any]],
+    tenant_id: str,
+    status: str,
+    activated_pairs: set[tuple[str, str]],
+    strict: bool = False,
+) -> int:
+    """Project one dashboard generation into the tenant retrieval index."""
+    return store.index_dashboard_context(
+        tenant_id=tenant_id,
+        dashboard_uid=features.dashboard_uid,
+        backend_name=features.backend_name,
+        dashboard_title=features.dashboard_title,
+        dashboard_tags=features.dashboard_tags,
+        panels=features.panels,
+        metrics_found=features.metrics_found,
+        signals_inferred=signals,
+        status=status,
+        activated_pairs=activated_pairs if status == "approved" else None,
+        strict=strict,
+    )
+
+
 def _active_pairs_for_candidates(
     *,
     store: Any,
@@ -872,6 +937,7 @@ def approve_ingested_dashboard_record(
     knowledge_service: Any | None = None,
     quarantine_archetype: bool = True,
     include_activated_pairs: bool = False,
+    context_indexer: Callable[[set[tuple[str, str]]], int] | None = None,
 ) -> dict[str, Any]:
     """Recoverably approve one claimed dashboard generation."""
     from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
@@ -897,6 +963,7 @@ def approve_ingested_dashboard_record(
     generation = float(ingested["created_at"])
     if status == "approved":
         source_ref = _dashboard_source_ref(ingested)
+        indexed_context_rows = 0
         with _source_authority_transaction(
             store=store,
             knowledge_service=knowledge_service,
@@ -913,6 +980,8 @@ def approve_ingested_dashboard_record(
                 tenant_id=effective_tenant,
                 runtime_settings=active_settings,
             )
+            if context_indexer is not None:
+                indexed_context_rows = context_indexer(active_pairs)
         result = {
             "dashboard_uid": dashboard_uid,
             "backend_name": ingested.get("backend_name", ""),
@@ -921,6 +990,7 @@ def approve_ingested_dashboard_record(
             "archetype_registered": False,
             "archetype_quarantined": False,
             "message": "Dashboard already approved",
+            "indexed_context_rows": indexed_context_rows,
         }
         if include_activated_pairs:
             result["activated_pairs"] = sorted(active_pairs)
@@ -949,6 +1019,7 @@ def approve_ingested_dashboard_record(
             current_status = str(current.get("status") or "")
             if current_status == "approved":
                 source_ref = _dashboard_source_ref(current)
+                indexed_context_rows = 0
                 with _source_authority_transaction(
                     store=store,
                     knowledge_service=knowledge_service,
@@ -965,6 +1036,8 @@ def approve_ingested_dashboard_record(
                         tenant_id=effective_tenant,
                         runtime_settings=active_settings,
                     )
+                    if context_indexer is not None:
+                        indexed_context_rows = context_indexer(active_pairs)
                 result = {
                     "dashboard_uid": dashboard_uid,
                     "backend_name": current.get("backend_name", ""),
@@ -973,6 +1046,7 @@ def approve_ingested_dashboard_record(
                     "archetype_registered": False,
                     "archetype_quarantined": False,
                     "message": "Dashboard already approved",
+                    "indexed_context_rows": indexed_context_rows,
                 }
                 if include_activated_pairs:
                     result["activated_pairs"] = sorted(active_pairs)
@@ -999,6 +1073,7 @@ def approve_ingested_dashboard_record(
             raise DashboardReviewConflictError("Dashboard was re-ingested during approval")
 
     source_ref = _dashboard_source_ref(ingested)
+    indexed_context_rows = 0
     with _source_authority_transaction(
         store=store,
         knowledge_service=knowledge_service,
@@ -1015,6 +1090,8 @@ def approve_ingested_dashboard_record(
             tenant_id=effective_tenant,
             runtime_settings=active_settings,
         )
+        if context_indexer is not None:
+            indexed_context_rows = context_indexer(activated_pairs)
 
     quarantine_paths = (
         quarantine_generated_archetype_if_enabled(
@@ -1035,6 +1112,7 @@ def approve_ingested_dashboard_record(
         "archetype_quarantined": bool(quarantine_paths),
         "archetype_quarantine_paths": quarantine_paths,
         "message": f"Dashboard approved, {mappings_created} signal mapping(s) created",
+        "indexed_context_rows": indexed_context_rows,
     }
     if include_activated_pairs:
         result["activated_pairs"] = sorted(activated_pairs)
@@ -1254,38 +1332,17 @@ async def ingest_dashboard_features(
         runtime_settings=active_settings,
     )
 
-    store.record_ingested_dashboard(
-        dashboard_uid=features.dashboard_uid,
-        tenant_id=effective_tenant,
-        backend_name=features.backend_name,
-        dashboard_title=features.dashboard_title,
-        dashboard_tags=features.dashboard_tags,
-        metrics_found=features.metrics_found,
-        panel_count=features.panel_count,
-        row_groups=features.row_groups,
-        metric_cooccurrence=features.metric_cooccurrence,
-        aggregation_patterns=features.aggregation_patterns,
-        query_transformations=features.query_transformations,
-        panel_titles=features.panel_titles,
-        alert_links=features.alert_links,
-        drilldown_links=features.drilldown_links,
-        signals_inferred=signals,
-        archetype_generated=archetype_yaml,
-        status="pending",
-    )
-    stored_dashboard = store.get_ingested_dashboard(
-        features.dashboard_uid,
-        backend_name=features.backend_name,
-        tenant_id=effective_tenant,
-    )
-    if stored_dashboard is None:
-        raise RuntimeError("Persisted dashboard source record could not be reloaded")
-
-    effective_status = str(stored_dashboard.get("status") or "pending")
     mappings_created = 0
     quarantine_paths: list[str] = []
     activated_pairs: set[tuple[str, str]] = set()
     if auto_approve:
+        _record_dashboard_generation(
+            store=store,
+            features=features,
+            signals=signals,
+            archetype_yaml=archetype_yaml,
+            tenant_id=effective_tenant,
+        )
         approval = approve_ingested_dashboard_record(
             dashboard_uid=features.dashboard_uid,
             backend_name=features.backend_name,
@@ -1295,11 +1352,21 @@ async def ingest_dashboard_features(
             knowledge_service=knowledge_service,
             quarantine_archetype=register_archetype,
             include_activated_pairs=True,
+            context_indexer=lambda active_pairs: _index_dashboard_generation(
+                store=store,
+                features=features,
+                signals=signals,
+                tenant_id=effective_tenant,
+                status="approved",
+                activated_pairs=active_pairs,
+                strict=True,
+            ),
         )
         effective_status = str(approval["status"])
         mappings_created = int(approval["mappings_created"])
         activated_pairs = {tuple(pair) for pair in approval.get("activated_pairs", [])}
         quarantine_paths = list(approval.get("archetype_quarantine_paths", []))
+        indexed_context_rows = int(approval.get("indexed_context_rows", 0))
         logger.info(
             "dashboard_ingested_auto_approved",
             uid=features.dashboard_uid,
@@ -1311,6 +1378,38 @@ async def ingest_dashboard_features(
             archetype_quarantined=bool(quarantine_paths),
         )
     else:
+        with _source_authority_transaction(
+            store=store,
+            knowledge_service=knowledge_service,
+            tenant_id=effective_tenant,
+            source_ref=source_ref,
+            operation="reconcile_pending_dashboard",
+        ):
+            stored_dashboard = _record_dashboard_generation(
+                store=store,
+                features=features,
+                signals=signals,
+                archetype_yaml=archetype_yaml,
+                tenant_id=effective_tenant,
+            )
+            effective_status = str(stored_dashboard.get("status") or "pending")
+            activated_pairs = _reconcile_dashboard_authority_for_state(
+                store=store,
+                ingested=stored_dashboard,
+                tenant_id=effective_tenant,
+                runtime_settings=active_settings,
+                knowledge_service=knowledge_service,
+                max_candidate_count=int(active_settings.knowledge_source_atomic_candidate_limit),
+            )
+            indexed_context_rows = _index_dashboard_generation(
+                store=store,
+                features=features,
+                signals=signals,
+                tenant_id=effective_tenant,
+                status=effective_status,
+                activated_pairs=activated_pairs,
+                strict=True,
+            )
         quarantine_paths = (
             quarantine_generated_archetype_if_enabled(
                 archetype_yaml,
@@ -1319,13 +1418,6 @@ async def ingest_dashboard_features(
             )
             if register_archetype
             else []
-        )
-        activated_pairs = _reconcile_dashboard_authority_for_state(
-            store=store,
-            ingested=stored_dashboard,
-            tenant_id=effective_tenant,
-            runtime_settings=active_settings,
-            knowledge_service=knowledge_service,
         )
         logger.info(
             "dashboard_ingested",
@@ -1345,19 +1437,6 @@ async def ingest_dashboard_features(
         teachable_count = len(_governable_signal_pairs(signals))
         learning_impact["candidate_mappings_pending_approval"] = max(0, teachable_count - mappings_created)
         learning_impact["new_active_mappings_after_approval"] = mappings_created
-
-    indexed_context_rows = store.index_dashboard_context(
-        tenant_id=effective_tenant,
-        dashboard_uid=features.dashboard_uid,
-        backend_name=features.backend_name,
-        dashboard_title=features.dashboard_title,
-        dashboard_tags=features.dashboard_tags,
-        panels=features.panels,
-        metrics_found=features.metrics_found,
-        signals_inferred=signals,
-        status=effective_status,
-        activated_pairs=activated_pairs if effective_status == "approved" else None,
-    )
 
     result = {
         "dashboard_uid": features.dashboard_uid,

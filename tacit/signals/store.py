@@ -2210,6 +2210,7 @@ class SignalStore:
         signals_inferred: list[dict[str, Any]] | list[str] | None = None,
         status: str = "pending",
         activated_pairs: set[tuple[str, str]] | None = None,
+        strict: bool = False,
     ) -> int:
         """Index learned dashboard context for fast operational-language retrieval.
 
@@ -2252,6 +2253,8 @@ class SignalStore:
                 )
         except sqlite3.OperationalError as exc:
             logger.warning("learning_context_index_failed", error=str(exc))
+            if strict:
+                raise
             return 0
         return len(rows)
 
@@ -3416,6 +3419,7 @@ class SignalStore:
         signals_inferred: list[dict[str, Any]] | list[str] | None = None,
         status: str = "pending",
         activated_pairs: set[tuple[str, str]] | None = None,
+        strict: bool = False,
     ) -> int:
         """Index learned alert-rule context for fast operational-language retrieval."""
         tenant_id = self._resolve_tenant(tenant_id)
@@ -3455,6 +3459,8 @@ class SignalStore:
                 )
         except sqlite3.OperationalError as exc:
             logger.warning("alert_context_index_failed", error=str(exc))
+            if strict:
+                raise
             return 0
         return len(rows)
 

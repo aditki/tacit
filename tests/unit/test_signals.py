@@ -6268,6 +6268,216 @@ async def test_pending_dashboard_refresh_retires_removed_support_without_promoti
     assert signal_store.get_mappings_for_signal("old_latency", include_decayed=True) == []
 
 
+async def test_pending_dashboard_refresh_rolls_back_source_authority_and_index_together(
+    signal_store,
+    monkeypatch,
+):
+    from tacit import dashboard_ingest as di
+
+    batches = iter(
+        [
+            [
+                {
+                    "signal_type": "old_latency",
+                    "metric": "old_latency_seconds",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+            [
+                {
+                    "signal_type": "new_latency",
+                    "metric": "new_latency_seconds",
+                    "confidence": 0.9,
+                    "source": "heuristic",
+                    "signal_family": "latency",
+                    "auto_teach_eligible": True,
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(
+        "tacit.dashboard_ingest.service.infer_signals_from_metrics",
+        lambda *args, **kwargs: next(batches),
+    )
+
+    def features(metric: str) -> DashboardFeatures:
+        return DashboardFeatures(
+            dashboard_uid="atomic-pending-refresh",
+            dashboard_title="Atomic pending refresh",
+            backend_name="grafana",
+            query_language="promql",
+            metrics_found=[metric],
+            panel_count=1,
+            panels=[{"title": "Latency", "metrics": [metric], "queries": [metric]}],
+        )
+
+    await di.ingest_dashboard_features(
+        features("old_latency_seconds"),
+        auto_approve=True,
+        store=signal_store,
+    )
+    repository = KnowledgeRepository(signal_store._db_path)
+    before_source = signal_store.get_ingested_dashboard("atomic-pending-refresh", "grafana")
+    before_candidate = next(
+        candidate
+        for candidate in repository.list_candidates("default", kind="signal_mapping", limit=None)
+        if "old_latency_seconds" in candidate.payload_ref
+    )
+    assert before_source is not None and before_source["status"] == "approved"
+    assert before_candidate.state.lifecycle_status.value == "active"
+    with signal_store._conn() as connection:
+        before_mapping = connection.execute(
+            """SELECT id FROM signal_metric_mappings
+               WHERE tenant_id=? AND source_refs LIKE ?""",
+            ("default", '%"grafana:atomic-pending-refresh"%'),
+        ).fetchone()
+    assert before_mapping is not None
+
+    index_generation = signal_store.index_dashboard_context
+
+    def fail_after_index_write(**kwargs):
+        index_generation(**kwargs)
+        raise RuntimeError("simulated pending dashboard index failure")
+
+    monkeypatch.setattr(signal_store, "index_dashboard_context", fail_after_index_write)
+
+    with pytest.raises(RuntimeError, match="simulated pending dashboard index failure"):
+        await di.ingest_dashboard_features(
+            features("new_latency_seconds"),
+            auto_approve=False,
+            store=signal_store,
+        )
+
+    after_source = signal_store.get_ingested_dashboard("atomic-pending-refresh", "grafana")
+    after_candidate = repository.get_candidate(before_candidate.id, "default")
+    assert after_source is not None
+    assert after_source["status"] == "approved"
+    assert after_source["metrics_found"] == ["old_latency_seconds"]
+    assert after_candidate == before_candidate
+    with signal_store._conn() as connection:
+        after_mapping = connection.execute(
+            "SELECT id FROM signal_metric_mappings WHERE id=?",
+            (before_mapping["id"],),
+        ).fetchone()
+    assert after_mapping is not None
+    if signal_store._learning_index_available():
+        assert signal_store.search_learning_context("old_latency_seconds")
+        assert signal_store.search_learning_context("new_latency_seconds") == []
+
+
+async def test_auto_approved_dashboard_rolls_back_authority_when_indexing_fails(
+    signal_store,
+    monkeypatch,
+):
+    from tacit import dashboard_ingest as di
+
+    inferred = [
+        {
+            "signal_type": "request_latency",
+            "metric": "atomic_approval_latency_seconds",
+            "confidence": 0.9,
+            "source": "heuristic",
+            "signal_family": "latency",
+            "auto_teach_eligible": True,
+        }
+    ]
+    monkeypatch.setattr(
+        "tacit.dashboard_ingest.service.infer_signals_from_metrics",
+        lambda *args, **kwargs: inferred,
+    )
+    features = DashboardFeatures(
+        dashboard_uid="atomic-approved-dashboard",
+        dashboard_title="Atomic approved dashboard",
+        backend_name="grafana",
+        query_language="promql",
+        metrics_found=["atomic_approval_latency_seconds"],
+        panel_count=1,
+        panels=[
+            {
+                "title": "Latency",
+                "metrics": ["atomic_approval_latency_seconds"],
+                "queries": ["atomic_approval_latency_seconds"],
+            }
+        ],
+    )
+    knowledge_service = KnowledgeService(
+        KnowledgeRepository(signal_store._db_path),
+        signal_store=signal_store,
+    )
+    repository = knowledge_service.repository
+
+    def promote_governed_mapping(**kwargs):
+        candidate_id = migrate_signal_mapping(
+            {
+                "id": "atomic-approved-dashboard",
+                "signal_type": "request_latency",
+                "metric_pattern": "atomic_approval_latency_seconds",
+                "source_type": "dashboard_ingest",
+                "source_refs": [kwargs["source_ref"]],
+            },
+            service=knowledge_service,
+        )
+        knowledge_service.review_candidate(candidate_id, approved=True, reviewer="test")
+        _decision, revision = knowledge_service.evaluate_candidate(candidate_id, live_verified=True)
+        assert revision is not None
+        kwargs["governed_candidate_ids"].add(candidate_id)
+        kwargs["governed_pairs"].add(("atomic_approval_latency_seconds", "request_latency"))
+        return True
+
+    monkeypatch.setattr(
+        "tacit.dashboard_ingest.service.persist_inferred_signal_review",
+        promote_governed_mapping,
+    )
+    index_generation = signal_store.index_dashboard_context
+
+    def fail_after_index_write(**kwargs):
+        index_generation(**kwargs)
+        raise RuntimeError("simulated approved dashboard index failure")
+
+    monkeypatch.setattr(signal_store, "index_dashboard_context", fail_after_index_write)
+
+    with pytest.raises(RuntimeError, match="simulated approved dashboard index failure"):
+        await di.ingest_dashboard_features(
+            features,
+            auto_approve=True,
+            store=signal_store,
+            knowledge_service=knowledge_service,
+        )
+
+    source = signal_store.get_ingested_dashboard("atomic-approved-dashboard", "grafana")
+    assert source is not None and source["status"] == "approving"
+    assert repository.list_candidates() == []
+    assert repository.list_current_revisions() == []
+    assert signal_store.get_mappings_for_signal("request_latency", include_decayed=True) == []
+    with signal_store._conn() as connection:
+        indexed = connection.execute(
+            "SELECT COUNT(*) FROM learning_context_fts WHERE tenant_id=? AND dashboard_uid=?",
+            ("default", "atomic-approved-dashboard"),
+        ).fetchone()[0]
+    assert indexed == 0
+
+    monkeypatch.setattr(signal_store, "index_dashboard_context", index_generation)
+    recovered = await di.ingest_dashboard_features(
+        features,
+        auto_approve=True,
+        store=signal_store,
+        knowledge_service=knowledge_service,
+    )
+
+    assert recovered["status"] == "approved"
+    assert repository.list_current_revisions()
+    assert signal_store.get_mappings_for_signal("request_latency", include_decayed=True)
+    with signal_store._conn() as connection:
+        indexed = connection.execute(
+            "SELECT COUNT(*) FROM learning_context_fts WHERE tenant_id=? AND dashboard_uid=?",
+            ("default", "atomic-approved-dashboard"),
+        ).fetchone()[0]
+    assert indexed > 0
+
+
 async def test_pending_dashboard_refresh_revalidates_changed_source_lineage(signal_store, monkeypatch):
     from tacit import dashboard_ingest as di
 
