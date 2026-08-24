@@ -20,6 +20,8 @@ from tacit.knowledge.service import KnowledgeService
 from tacit.runtime_ownership import RuntimeOwnershipMismatchError
 from tacit.signals import SignalStore
 
+_DEFAULT_OWNER_MARKER = "default_owner_v1"
+
 
 def _database_snapshot(path: Path) -> tuple[str, list[str]]:
     with sqlite3.connect(path) as conn:
@@ -237,8 +239,8 @@ def test_repository_revalidates_owner_after_acquiring_its_write_lock(
         original_check(conn)
         if checks == 2:
             conn.execute(
-                "UPDATE signal_tenant_migration_metadata SET value=? WHERE key='default_owner_v1'",
-                (tenant_b,),
+                "UPDATE signal_tenant_migration_metadata SET value=? WHERE key=?",
+                (tenant_b, _DEFAULT_OWNER_MARKER),
             )
             conn.commit()
 
@@ -250,8 +252,8 @@ def test_repository_revalidates_owner_after_acquiring_its_write_lock(
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT 1 FROM knowledge_events WHERE event_type='must_not_persist'").fetchone() is None
         conn.execute(
-            "UPDATE signal_tenant_migration_metadata SET value=? WHERE key='default_owner_v1'",
-            (tenant_a,),
+            "UPDATE signal_tenant_migration_metadata SET value=? WHERE key=?",
+            (tenant_a, _DEFAULT_OWNER_MARKER),
         )
 
 
@@ -276,8 +278,8 @@ def test_nested_read_transaction_revalidates_owner_when_upgrading_to_write(
         if checks == 2:
             with sqlite3.connect(db_path) as writer:
                 writer.execute(
-                    "UPDATE signal_tenant_migration_metadata SET value=? WHERE key='default_owner_v1'",
-                    (tenant_b,),
+                    "UPDATE signal_tenant_migration_metadata SET value=? WHERE key=?",
+                    (tenant_b, _DEFAULT_OWNER_MARKER),
                 )
 
     monkeypatch.setattr(repository, "_require_owner_on_connection", change_owner_after_connection_preflight)
@@ -289,8 +291,8 @@ def test_nested_read_transaction_revalidates_owner_when_upgrading_to_write(
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT 1 FROM knowledge_events WHERE event_type='must_not_persist'").fetchone() is None
         conn.execute(
-            "UPDATE signal_tenant_migration_metadata SET value=? WHERE key='default_owner_v1'",
-            (tenant_a,),
+            "UPDATE signal_tenant_migration_metadata SET value=? WHERE key=?",
+            (tenant_a, _DEFAULT_OWNER_MARKER),
         )
 
 
@@ -329,16 +331,16 @@ def test_bound_knowledge_transaction_revalidates_owner_before_writes(tmp_path: P
 
     with store.transaction() as conn:
         conn.execute(
-            "UPDATE signal_tenant_migration_metadata SET value=? WHERE key='default_owner_v1'",
-            (tenant_b,),
+            "UPDATE signal_tenant_migration_metadata SET value=? WHERE key=?",
+            (tenant_b, _DEFAULT_OWNER_MARKER),
         )
         with pytest.raises(RuntimeError, match="owner"):
             with repository.bind_transaction_connection(conn):
                 repository.append_event("must_not_persist", tenant_id=tenant_a)
         assert conn.execute("SELECT 1 FROM knowledge_events WHERE event_type='must_not_persist'").fetchone() is None
         conn.execute(
-            "UPDATE signal_tenant_migration_metadata SET value=? WHERE key='default_owner_v1'",
-            (tenant_a,),
+            "UPDATE signal_tenant_migration_metadata SET value=? WHERE key=?",
+            (tenant_a, _DEFAULT_OWNER_MARKER),
         )
 
 
@@ -352,7 +354,8 @@ def test_real_subprocess_conflicting_knowledge_first_openers_leave_only_winner_s
     loser = owners[1 - winner_index]
     with sqlite3.connect(db_path) as conn:
         owner = conn.execute(
-            "SELECT value FROM signal_tenant_migration_metadata WHERE key='default_owner_v1'"
+            "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_MARKER,),
         ).fetchone()
         events = conn.execute("SELECT tenant_id FROM knowledge_events WHERE event_type='first_open_canary'").fetchall()
         marker_values = {

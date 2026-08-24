@@ -242,11 +242,11 @@ def _finish_legacy_schema_migration(path, *, tenant: str, batch_size: int) -> li
     return operations
 
 
-def _fail_cursor_update_once(monkeypatch, *, key: str):
+def _fail_cursor_update_once(monkeypatch, *, marker_name: str):
     original = signal_migrations._record_migration_marker
 
     def fail(conn: sqlite3.Connection, marker_key: str, value: str) -> None:
-        if marker_key == key:
+        if marker_key == marker_name:
             raise RuntimeError("simulated bounded migration failure")
         original(conn, marker_key, value)
 
@@ -281,7 +281,7 @@ def test_legacy_signal_definitions_use_bounded_restartable_text_keyset_copy(tmp_
     with monkeypatch.context() as failure_patch:
         _fail_cursor_update_once(
             failure_patch,
-            key="legacy_schema_copy_cursor_v1:signal_types",
+            marker_name="legacy_schema_copy_cursor_v1:signal_types",
         )
         with pytest.raises(RuntimeError, match="simulated bounded migration failure"):
             with sqlite3.connect(db_path) as conn:
@@ -311,7 +311,7 @@ def test_legacy_signal_definitions_use_bounded_restartable_text_keyset_copy(tmp_
         assert (operation, copied) == ("signal_types:copy", expected_count)
 
     with monkeypatch.context() as final_swap_patch:
-        _fail_cursor_update_once(final_swap_patch, key="signal_definition_scope_v1")
+        _fail_cursor_update_once(final_swap_patch, marker_name="signal_definition_scope_v1")
         with pytest.raises(RuntimeError, match="simulated bounded migration failure"):
             with sqlite3.connect(db_path) as conn:
                 conn.row_factory = sqlite3.Row
@@ -328,7 +328,8 @@ def test_legacy_signal_definitions_use_bounded_restartable_text_keyset_copy(tmp_
         assert conn.execute("SELECT COUNT(*) FROM signal_types_tacit_tenant_migration_v1").fetchone()[0] == 0
         assert (
             conn.execute(
-                "SELECT 1 FROM signal_tenant_migration_metadata WHERE key='signal_definition_scope_v1'"
+                "SELECT 1 FROM signal_tenant_migration_metadata WHERE key=?",
+                ("signal_definition_scope_v1",),
             ).fetchone()
             is None
         )
@@ -372,7 +373,7 @@ def test_dashboard_lifecycle_backfill_is_shadowed_bounded_and_restartable(tmp_pa
     with monkeypatch.context() as failure_patch:
         _fail_cursor_update_once(
             failure_patch,
-            key="legacy_schema_copy_cursor_v1:ingested_dashboards",
+            marker_name="legacy_schema_copy_cursor_v1:ingested_dashboards",
         )
         with pytest.raises(RuntimeError, match="simulated bounded migration failure"):
             with sqlite3.connect(db_path) as conn:
@@ -441,7 +442,7 @@ def test_bootstrap_scope_normalization_is_shadowed_bounded_and_restartable(tmp_p
     with monkeypatch.context() as failure_patch:
         _fail_cursor_update_once(
             failure_patch,
-            key="legacy_schema_copy_cursor_v1:signal_metric_mappings",
+            marker_name="legacy_schema_copy_cursor_v1:signal_metric_mappings",
         )
         with pytest.raises(RuntimeError, match="simulated bounded migration failure"):
             with sqlite3.connect(db_path) as conn:

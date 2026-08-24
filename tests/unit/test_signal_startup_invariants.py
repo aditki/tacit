@@ -14,6 +14,9 @@ from structlog.testing import capture_logs
 from tacit.config import Settings
 from tacit.signals import SignalStore
 
+_DEFAULT_OWNER_MARKER = "default_owner_v1"
+_GOVERNED_PROJECTION_AUDIT_MARKER = "governed_projection_audit_v2"
+
 
 def _database_snapshot(path) -> tuple[str, list[str]]:
     with sqlite3.connect(path) as conn:
@@ -164,7 +167,8 @@ def test_same_owner_public_signal_store_reopen_converges(tmp_path) -> None:
 
     with reopened._conn() as conn:
         owners = conn.execute(
-            "SELECT value FROM signal_tenant_migration_metadata WHERE key='default_owner_v1'"
+            "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_MARKER,),
         ).fetchall()
     assert [row["value"] for row in owners] == ["tenant-owner"]
 
@@ -175,7 +179,8 @@ def test_real_subprocess_same_owner_first_openers_converge(tmp_path) -> None:
     assert results == [{"status": "ok"}, {"status": "ok"}]
     with sqlite3.connect(db_path) as conn:
         owner = conn.execute(
-            "SELECT value FROM signal_tenant_migration_metadata WHERE key='default_owner_v1'"
+            "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_OWNER_MARKER,),
         ).fetchone()
         custom = conn.execute(
             "SELECT tenant_id FROM tenant_signal_types WHERE signal_type='private_first_open_canary'"
@@ -275,10 +280,13 @@ def test_external_projection_marker_write_revalidates_owner_under_immediate_lock
         runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
     )
     with sqlite3.connect(db_path) as conn:
-        conn.execute("UPDATE signal_tenant_migration_metadata SET value='tenant-b' WHERE key='default_owner_v1'")
         conn.execute(
-            "UPDATE signal_tenant_migration_metadata SET value='dirty:external-test' "
-            "WHERE key='governed_projection_audit_v2'"
+            "UPDATE signal_tenant_migration_metadata SET value=? WHERE key=?",
+            ("tenant-b", _DEFAULT_OWNER_MARKER),
+        )
+        conn.execute(
+            "UPDATE signal_tenant_migration_metadata SET value=? WHERE key=?",
+            ("dirty:external-test", _GOVERNED_PROJECTION_AUDIT_MARKER),
         )
     before = _database_snapshot(db_path)
 
@@ -288,7 +296,8 @@ def test_external_projection_marker_write_revalidates_owner_under_immediate_lock
         with pytest.raises(RuntimeError, match="owner preflight"):
             store.mark_governed_projection_audit_current(conn)
         marker = conn.execute(
-            "SELECT value FROM signal_tenant_migration_metadata WHERE key='governed_projection_audit_v2'"
+            "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+            (_GOVERNED_PROJECTION_AUDIT_MARKER,),
         ).fetchone()
         conn.rollback()
 

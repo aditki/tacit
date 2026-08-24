@@ -8,7 +8,6 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -7580,20 +7579,16 @@ signals:
         mappings = store.get_mappings_for_signal("test_latency")
         assert len(mappings) == 2
 
-    def test_load_project_signals_yaml(self):
+    def test_load_project_signals_yaml(self, tmp_path):
         """Verify the actual project signals.yaml loads without errors."""
-        db_path = Path(tempfile.mktemp(suffix=".db"))
-        try:
-            store = SignalStore(db_path=db_path)
-            count = store.load_from_yaml()
-            assert count > 20  # should have many bootstrap mappings
-            types = store.list_signal_types()
-            assert len(types) > 10
-            stats = store.stats()
-            assert stats["signal_types"] > 10
-            assert stats["metric_mappings"] > 20
-        finally:
-            db_path.unlink(missing_ok=True)
+        store = SignalStore(db_path=tmp_path / "project-signals.db")
+        count = store.load_from_yaml()
+        assert count > 20  # should have many bootstrap mappings
+        types = store.list_signal_types()
+        assert len(types) > 10
+        stats = store.stats()
+        assert stats["signal_types"] > 10
+        assert stats["metric_mappings"] > 20
 
     def test_unchanged_bootstrap_catalog_skips_repeated_upserts(self, tmp_path, monkeypatch):
         yaml_path = tmp_path / "signals.yaml"

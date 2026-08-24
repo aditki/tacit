@@ -91,8 +91,9 @@ _SCOPE_REFERENCE_FIELDS = (
     "service_refs",
     "archetype_refs",
 )
+_DEFAULT_SIGNAL_OWNER_MARKER = "default_owner_v1"
 _SIGNAL_OWNER_MARKERS = (
-    "default_owner_v1",
+    _DEFAULT_SIGNAL_OWNER_MARKER,
     "default_owner_in_progress_v1",
     "legacy_schema_owner_v1",
 )
@@ -1166,12 +1167,16 @@ class KnowledgeRepository:
             legacy_tenant=None if self._tenant_owner == "*" else self._tenant_owner,
         ):
             row = conn.execute(
-                "SELECT value FROM signal_tenant_migration_metadata WHERE key='default_owner_v1'"
+                "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+                (_DEFAULT_SIGNAL_OWNER_MARKER,),
             ).fetchone()
             recorded_owner = str(row[0]) if row is not None else None
             if recorded_owner == self._tenant_owner:
                 return
-        row = conn.execute("SELECT value FROM signal_tenant_migration_metadata WHERE key='default_owner_v1'").fetchone()
+        row = conn.execute(
+            "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+            (_DEFAULT_SIGNAL_OWNER_MARKER,),
+        ).fetchone()
         self._reject_owner(
             reason_code="pinned_owner_mismatch" if row is not None else "owner_marker_missing",
             configured_owner=self._tenant_owner,

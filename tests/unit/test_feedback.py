@@ -525,7 +525,8 @@ def test_feedback_pre_tenant_migration_resumes_after_a_committed_bounded_batch(t
         ).fetchall()
         feedback = conn.execute("SELECT id, tenant_id, dashboard_uid FROM feedback ORDER BY id").fetchall()
         owner = conn.execute(
-            "SELECT value FROM feedback_tenant_migration_metadata WHERE key='default_owner_v1'"
+            "SELECT value FROM feedback_tenant_migration_metadata WHERE key=?",
+            (feedback_module._DEFAULT_OWNER_MARKER,),
         ).fetchone()
         in_progress = conn.execute("""SELECT 1 FROM feedback_tenant_migration_metadata
                WHERE key LIKE 'legacy_tenant_scope_%'""").fetchall()
