@@ -44,8 +44,7 @@ def discovery_cache_parts(
         "discovery",
         runtime_identity,
         tenant_id,
-        intent.summary,
-        ",".join(intent.keywords),
+        json.dumps(_cache_identity(intent), sort_keys=True, separators=(",", ":")),
         json.dumps(
             [_cache_identity(entry) for entry in ranked_catalog],
             sort_keys=True,

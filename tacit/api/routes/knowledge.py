@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from tacit.api.dependencies import (
@@ -17,10 +17,13 @@ from tacit.api.security import (
     KnowledgeAction,
     assert_contract_tenant_access,
     assert_knowledge_action,
+    authenticated_actor,
     knowledge_tenant,
     require_knowledge_action,
+    require_knowledge_tenant,
     verify_api_key,
 )
+from tacit.errors import SemanticAuthorizationError
 from tacit.knowledge.entities import normalize_entity
 from tacit.knowledge.enums import CorrectionType, EntityBindingMethod, EntityKind, ReviewState
 from tacit.knowledge.models import Entity, EntityAlias, KnowledgeScope
@@ -31,13 +34,24 @@ from tacit.knowledge.repository import (
     EntityRegistrationConflictError,
     KnowledgeRevisionConflictError,
 )
+from tacit.pagination import MAX_COMPATIBILITY_OFFSET
 
-router = APIRouter(dependencies=[Depends(verify_api_key), Depends(require_knowledge_action(KnowledgeAction.READ))])
+router = APIRouter(
+    dependencies=[
+        Depends(verify_api_key),
+        Depends(require_knowledge_tenant),
+        Depends(require_knowledge_action(KnowledgeAction.READ)),
+    ]
+)
 
 
 class CandidateReviewRequest(BaseModel):
     decision: Literal["approve", "reject", "trust"]
-    reviewer: str = Field(min_length=1, max_length=200)
+    reviewer: str = Field(
+        default="",
+        max_length=200,
+        description="Optional unverified display label; the audit actor is derived from authentication",
+    )
     evaluate: bool = True
     authoritative_source: bool = False
     live_verified: bool = False
@@ -50,13 +64,21 @@ class CorrectionRequest(BaseModel):
     proposed: dict[str, Any]
     scope: KnowledgeScope = Field(default_factory=KnowledgeScope)
     explanation: str = Field(min_length=1, max_length=10_000)
-    created_by: str = Field(min_length=1, max_length=200)
+    created_by: str = Field(
+        default="",
+        max_length=200,
+        description="Optional unverified display label; the audit actor is derived from authentication",
+    )
     target_ref: str = ""
 
 
 class CorrectionReviewRequest(BaseModel):
     decision: Literal["approve", "reject"]
-    reviewer: str = Field(min_length=1, max_length=200)
+    reviewer: str = Field(
+        default="",
+        max_length=200,
+        description="Optional unverified display label; the audit actor is derived from authentication",
+    )
     authoritative: bool = False
 
 
@@ -129,48 +151,95 @@ async def knowledge_status(request: Request):
 
 
 @router.get("/api/v1/knowledge/review-queue", tags=["Operational Knowledge"])
-async def review_queue(request: Request, limit: int = Query(default=100, ge=1, le=500)):
+async def review_queue(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    candidate_cursor: str | None = Query(default=None, max_length=1_024),
+    conflict_cursor: str | None = Query(default=None, max_length=1_024),
+    attention_cursor: str | None = Query(default=None, max_length=1_024),
+):
     tenant_id = _tenant(request)
     repository = get_knowledge_repository(request)
-    candidates = repository.list_review_candidates(tenant_id, limit=limit)
+    try:
+        candidate_page = repository.list_review_candidates_page(
+            tenant_id,
+            limit=limit,
+            cursor=candidate_cursor,
+        )
+        conflict_page = repository.list_conflicts_page(
+            tenant_id,
+            unresolved_only=True,
+            limit=limit,
+            cursor=conflict_cursor,
+        )
+        attention_page = repository.list_current_revisions_page(
+            tenant_id,
+            lifecycle_status="stale",
+            limit=limit,
+            cursor=attention_cursor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    candidates = candidate_page.candidates
     unresolved_keys = repository.unresolved_proposition_keys(
         tenant_id,
         {candidate.proposition.proposition_key for candidate in candidates},
     )
-    conflicts = repository.list_conflicts(tenant_id, unresolved_only=True, limit=limit)
     attention_items = [
         revision.model_dump(mode="json")
-        for revision in repository.list_current_revisions(
-            tenant_id,
-            lifecycle_status="stale",
-            limit=limit,
-        )
+        for revision in attention_page.revisions
         if revision.state.lifecycle_status.value == "stale"
         and revision.state.review_state in {ReviewState.APPROVED, ReviewState.TRUSTED}
     ]
     return {
         "tenant_id": tenant_id,
         "candidates": _prioritize_candidates(candidates, unresolved_keys),
-        "unresolved_conflicts": _dump(conflicts),
+        "candidate_has_more": candidate_page.has_more,
+        "candidate_next_cursor": candidate_page.next_cursor,
+        "unresolved_conflicts": _dump(conflict_page.conflicts),
+        "conflict_has_more": conflict_page.has_more,
+        "conflict_next_cursor": conflict_page.next_cursor,
         "attention_items": attention_items,
+        "attention_has_more": attention_page.has_more,
+        "attention_next_cursor": attention_page.next_cursor,
     }
 
 
 @router.get("/api/v1/knowledge/conflicts", tags=["Operational Knowledge"])
 async def list_conflicts(
     request: Request,
+    response: Response,
     unresolved_only: bool = False,
     limit: int = Query(default=200, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    cursor: str | None = Query(default=None, max_length=512),
+    offset: int | None = Query(default=None, ge=0, le=10_000),
 ):
-    return _dump(
-        get_knowledge_repository(request).list_conflicts(
-            _tenant(request),
+    repository = get_knowledge_repository(request)
+    tenant_id = _tenant(request)
+    try:
+        if offset is not None:
+            if cursor is not None:
+                raise ValueError("conflict cursor and offset cannot be combined")
+            return _dump(
+                repository.list_conflicts(
+                    tenant_id,
+                    unresolved_only=unresolved_only,
+                    limit=limit,
+                    offset=offset,
+                )
+            )
+        page = repository.list_conflicts_page(
+            tenant_id,
             unresolved_only=unresolved_only,
             limit=limit,
-            offset=offset,
+            cursor=cursor,
         )
-    )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    response.headers["X-Tacit-Has-More"] = str(page.has_more).lower()
+    if page.next_cursor:
+        response.headers["X-Tacit-Next-Cursor"] = page.next_cursor
+    return _dump(page.conflicts)
 
 
 @router.get("/api/v1/knowledge/candidates", tags=["Operational Knowledge"])
@@ -216,7 +285,7 @@ async def review_candidate(candidate_id: str, payload: CandidateReviewRequest, r
         candidate = service.review_candidate(
             candidate_id,
             approved=payload.decision != "reject",
-            reviewer=payload.reviewer,
+            reviewer=authenticated_actor(request),
             tenant_id=tenant_id,
             trust=payload.decision == "trust",
             can_trust=payload.decision == "trust",
@@ -237,7 +306,7 @@ async def review_candidate(candidate_id: str, payload: CandidateReviewRequest, r
             "promotion_decision": decision.model_dump(mode="json") if decision else None,
             "knowledge_revision": revision.model_dump(mode="json") if revision else None,
         }
-    except PermissionError as exc:
+    except SemanticAuthorizationError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (
         CandidateEvaluationConflictError,
@@ -275,7 +344,7 @@ async def create_entity(payload: EntityRequest, request: Request):
     )
     try:
         return get_knowledge_service(request).register_entity(entity).model_dump(mode="json")
-    except PermissionError as exc:
+    except SemanticAuthorizationError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except EntityRegistrationConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -348,7 +417,7 @@ async def create_correction(
             proposed=payload.proposed,
             scope=payload.scope.model_copy(update={"tenant_id": tenant_id}),
             explanation=payload.explanation,
-            created_by=payload.created_by,
+            created_by=authenticated_actor(request),
             target_ref=payload.target_ref,
             target_revision=target_usage.knowledge_revision if target_usage is not None else None,
             tenant_id=tenant_id,
@@ -380,7 +449,7 @@ async def review_correction(correction_id: str, payload: CorrectionReviewRequest
         correction, revision = service.review_correction(
             correction_id,
             approved=payload.decision == "approve",
-            reviewer=payload.reviewer,
+            reviewer=authenticated_actor(request),
             tenant_id=tenant_id,
             authoritative=payload.authoritative,
         )
@@ -411,35 +480,79 @@ async def get_correction(correction_id: str, request: Request):
 async def list_revisions(
     knowledge_id: str,
     request: Request,
+    response: Response,
     limit: int = Query(default=200, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    cursor: str | None = Query(default=None, max_length=512),
+    offset: int | None = Query(default=None, ge=0, le=10_000),
 ):
-    revisions = get_knowledge_repository(request).list_revisions(
-        knowledge_id,
-        _tenant(request),
-        limit=limit,
-        offset=offset,
-    )
-    if not revisions:
+    repository = get_knowledge_repository(request)
+    tenant_id = _tenant(request)
+    try:
+        if offset is not None:
+            if cursor is not None:
+                raise ValueError("revision cursor and offset cannot be combined")
+            revisions = repository.list_revisions(
+                knowledge_id,
+                tenant_id,
+                limit=limit,
+                offset=offset,
+            )
+            if not revisions and offset == 0:
+                raise HTTPException(status_code=404, detail="knowledge item not found")
+            return _dump(revisions)
+        page = repository.list_revisions_page(
+            knowledge_id,
+            tenant_id,
+            limit=limit,
+            cursor=cursor,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not page.revisions and cursor is None:
         raise HTTPException(status_code=404, detail="knowledge item not found")
-    return _dump(revisions)
+    response.headers["X-Tacit-Has-More"] = str(page.has_more).lower()
+    if page.next_cursor:
+        response.headers["X-Tacit-Next-Cursor"] = page.next_cursor
+    return _dump(page.revisions)
 
 
 @router.get("/api/v1/knowledge/{knowledge_id}/usage", tags=["Operational Knowledge"])
 async def list_usage(
     knowledge_id: str,
     request: Request,
+    response: Response,
     limit: int = Query(default=200, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    cursor: str | None = Query(default=None, max_length=512),
+    offset: int | None = Query(default=None, ge=0, le=10_000),
 ):
-    return _dump(
-        get_knowledge_repository(request).list_usage(
-            tenant_id=_tenant(request),
+    repository = get_knowledge_repository(request)
+    tenant_id = _tenant(request)
+    try:
+        if offset is not None:
+            if cursor is not None:
+                raise ValueError("usage cursor and offset cannot be combined")
+            return _dump(
+                repository.list_usage(
+                    tenant_id=tenant_id,
+                    knowledge_id=knowledge_id,
+                    limit=limit,
+                    offset=offset,
+                )
+            )
+        page = repository.list_usage_page(
+            tenant_id=tenant_id,
             knowledge_id=knowledge_id,
             limit=limit,
-            offset=offset,
+            cursor=cursor,
         )
-    )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    response.headers["X-Tacit-Has-More"] = str(page.has_more).lower()
+    if page.next_cursor:
+        response.headers["X-Tacit-Next-Cursor"] = page.next_cursor
+    return _dump(page.usage)
 
 
 @router.get("/api/v1/knowledge/{knowledge_id}/impact", tags=["Operational Knowledge"])
@@ -447,7 +560,7 @@ async def knowledge_impact(
     knowledge_id: str,
     request: Request,
     limit: int = Query(default=200, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_COMPATIBILITY_OFFSET),
 ):
     return (
         get_knowledge_service(request)
@@ -466,7 +579,7 @@ async def explain_knowledge(
     knowledge_id: str,
     request: Request,
     history_limit: int = Query(default=200, ge=1, le=500),
-    history_offset: int = Query(default=0, ge=0),
+    history_offset: int = Query(default=0, ge=0, le=MAX_COMPATIBILITY_OFFSET),
 ):
     try:
         return get_knowledge_service(request).explain(
@@ -494,16 +607,38 @@ async def get_knowledge(knowledge_id: str, request: Request, revision: int | Non
 @router.get("/api/v1/knowledge", tags=["Operational Knowledge"])
 async def list_knowledge(
     request: Request,
+    response: Response,
     kind: str | None = None,
     status: str | None = None,
     limit: int = Query(default=200, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    cursor: str | None = Query(default=None, max_length=512),
+    offset: int | None = Query(default=None, ge=0, le=10_000),
 ):
-    revisions = get_knowledge_repository(request).list_current_revisions(
-        _tenant(request),
-        kind=kind,
-        lifecycle_status=status,
-        limit=limit,
-        offset=offset,
-    )
-    return _dump(revisions)
+    tenant_id = _tenant(request)
+    repository = get_knowledge_repository(request)
+    try:
+        if offset is not None:
+            if cursor is not None:
+                raise ValueError("knowledge cursor and offset cannot be combined")
+            return _dump(
+                repository.list_current_revisions(
+                    tenant_id,
+                    kind=kind,
+                    lifecycle_status=status,
+                    limit=limit,
+                    offset=offset,
+                )
+            )
+        page = repository.list_current_revisions_page(
+            tenant_id,
+            kind=kind,
+            lifecycle_status=status,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    response.headers["X-Tacit-Has-More"] = str(page.has_more).lower()
+    if page.next_cursor:
+        response.headers["X-Tacit-Next-Cursor"] = page.next_cursor
+    return _dump(page.revisions)

@@ -1,7 +1,12 @@
 import asyncio
 
+from tacit.config import Settings
 from tacit.grafana.datasource import _cap_metric_results, discover_all_metrics
 from tacit.models.schemas import DatasourceInfo, MetricEntry
+from tacit.runtime_ownership import (
+    RuntimeRemoteIdentity,
+    runtime_descriptor_for_remote,
+)
 
 
 def _metric(name: str, datasource_uid: str) -> MetricEntry:
@@ -12,6 +17,20 @@ def _metric(name: str, datasource_uid: str) -> MetricEntry:
         datasource_type="prometheus",
         query_language="promql",
     )
+
+
+class _OwnedGrafanaClient:
+    def __init__(self, runtime_settings: Settings) -> None:
+        self.runtime_settings = runtime_settings
+        self.runtime_ownership = runtime_descriptor_for_remote(
+            component="test_grafana_discovery_client",
+            runtime_settings=runtime_settings,
+            remote=RuntimeRemoteIdentity(
+                provider="grafana",
+                endpoint=runtime_settings.grafana_url,
+                account=str(runtime_settings.grafana_org_id),
+            ),
+        )
 
 
 def test_metric_catalog_cap_interleaves_datasources():
@@ -60,7 +79,13 @@ def test_discover_all_metrics_marks_default_datasource(monkeypatch):
         DatasourceInfo(uid="default-prom", name="Default Prometheus", type="prometheus", is_default=True),
     ]
 
-    entries = asyncio.run(discover_all_metrics(client=object(), datasources=datasources, keywords=[]))
+    entries = asyncio.run(
+        discover_all_metrics(
+            client=_OwnedGrafanaClient(Settings(_env_file=None)),  # type: ignore[arg-type]
+            datasources=datasources,
+            keywords=[],
+        )
+    )
 
     defaults_by_uid = {entry.datasource_uid: entry.datasource_is_default for entry in entries}
     assert defaults_by_uid == {"classic-prom": False, "default-prom": True}

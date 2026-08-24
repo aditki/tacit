@@ -19,12 +19,22 @@ from typing import Any, Protocol
 import structlog
 
 from tacit.config import Settings, settings
+from tacit.dependencies import resolve_owned_database_path
 from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
+from tacit.runtime_ownership import (
+    RuntimeOwner,
+    describe_runtime_owner,
+    resolve_runtime_settings,
+)
 from tacit.signals import get_signal_store as _default_get_signal_store
 
 MAX_ARTIFACT_BODY_LENGTH = 200_000
 MAX_SOURCE_EXCERPT_LENGTH = 2_000
 logger = structlog.get_logger()
+
+
+def _diagnostic_fingerprint(value: object) -> str:
+    return hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 def get_signal_store():
@@ -743,26 +753,97 @@ def _resolve_tenant_id(
     return resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
 
 
+def resolve_artifact_runtime_settings(
+    *,
+    runtime_settings: Settings | None = None,
+    store: Any | None = None,
+    knowledge_service: Any | None = None,
+    connector_settings: Settings | None = None,
+) -> Settings:
+    """Resolve one fail-closed composition owner for artifact learning."""
+    store_owner = describe_runtime_owner("signal_store", store)
+    service_owner = describe_runtime_owner("knowledge_service", knowledge_service)
+    connector_owner = RuntimeOwner(
+        name="connector",
+        supplied=connector_settings is not None,
+        settings=connector_settings,
+    )
+    active_settings = resolve_runtime_settings(
+        boundary="Artifact learning",
+        explicit_settings=runtime_settings,
+        owners=(store_owner, service_owner, connector_owner),
+        fallback_settings=settings,
+    )
+    supplied_owners = tuple(
+        (name, owner)
+        for name, owner in (("signal_store", store), ("knowledge_service", knowledge_service))
+        if owner is not None
+    )
+    if supplied_owners:
+        resolve_owned_database_path(
+            boundary="Artifact learning",
+            database_role="signals",
+            owners=supplied_owners,
+            runtime_settings=active_settings,
+        )
+    return active_settings
+
+
 def _active_runtime_settings(
     runtime_settings: Settings | None,
     store: Any | None,
 ) -> Settings:
-    return runtime_settings or getattr(store, "_settings", None) or settings
+    return resolve_artifact_runtime_settings(runtime_settings=runtime_settings, store=store)
+
+
+def authorize_artifact_learning(
+    *,
+    dry_run: bool,
+    runtime_settings: Settings | None = None,
+    store: Any | None = None,
+    knowledge_service: Any | None = None,
+    connector_settings: Settings | None = None,
+    tenant_id: str | None = None,
+) -> tuple[Settings, str]:
+    """Resolve the tenant and authorize before reading any artifact source."""
+    active_settings = resolve_artifact_runtime_settings(
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        connector_settings=connector_settings,
+    )
+    resolved_tenant = _resolve_tenant_id(tenant_id, runtime_settings=active_settings)
+    action = KnowledgeAction.READ if dry_run else KnowledgeAction.LEARN_ARTIFACTS
+    enforce_knowledge_action(active_settings, action)
+    return active_settings, resolved_tenant
 
 
 def _resolve_artifact_store(
     *,
     dry_run: bool,
     store: Any | None,
-    runtime_settings: Settings | None,
+    runtime_settings: Settings,
+    knowledge_service: Any | None = None,
+    allow_global_fallback: bool = False,
 ) -> Any | None:
     if dry_run or store is not None:
         return store
-    if runtime_settings is not None:
-        from tacit.runtime_stores import RuntimeStores
+    if knowledge_service is not None:
+        database_path = resolve_owned_database_path(
+            boundary="Artifact learning signal store resolution",
+            database_role="signals",
+            owners=(("knowledge_service", knowledge_service),),
+            runtime_settings=runtime_settings,
+        )
+        from tacit.signals import SignalStore
 
-        return RuntimeStores(runtime_settings).signals()
-    return get_signal_store()
+        return SignalStore(database_path, runtime_settings=runtime_settings)
+    if allow_global_fallback:
+        return get_signal_store()
+
+    from tacit.runtime_stores import RuntimeStores
+
+    return RuntimeStores(runtime_settings).signals()
 
 
 def _reconcile_stale_artifact_knowledge(
@@ -775,13 +856,24 @@ def _reconcile_stale_artifact_knowledge(
 ) -> None:
     from tacit.dashboard_ingest.service import _knowledge_service_for_store
 
-    active_settings = _active_runtime_settings(runtime_settings, store)
-    enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
+    active_settings = resolve_artifact_runtime_settings(
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+    )
+    enforce_knowledge_action(active_settings, KnowledgeAction.LEARN_ARTIFACTS)
     knowledge_service = knowledge_service or _knowledge_service_for_store(
         store,
         runtime_settings=active_settings,
     )
-    after_id = 0
+    resolve_artifact_runtime_settings(
+        runtime_settings=active_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+    )
+    bind_connection = knowledge_service.repository.bind_transaction_connection
+    store.ensure_governed_projection_audit_current()
+    after_id: int | None = None
     page_size = 1_000
     pages = 0
     reconciled = 0
@@ -796,44 +888,66 @@ def _reconcile_stale_artifact_knowledge(
             break
         pages += 1
         for artifact in artifacts:
-            after_id = max(after_id, int(artifact["id"]))
-            try:
-                knowledge_service.reconcile_source_lifecycle(
-                    provenance_ref=f"prov_artifact:{artifact['artifact_id']}",
-                    tenant_id=tenant_id,
-                    source_stale=True,
-                    source_generation_guard=lambda conn, artifact=artifact: store.artifact_stale_generation_is_current(
-                        conn,
+            after_id = int(artifact["id"])
+            with store.transaction() as conn:
+                if not store.governed_projection_audit_is_current(conn):
+                    raise RuntimeError("governed projection changed before stale artifact reconciliation; retry")
+                with bind_connection(conn):
+                    knowledge_service.reconcile_source_lifecycle(
+                        provenance_ref=f"prov_artifact:{artifact['artifact_id']}",
+                        tenant_id=tenant_id,
+                        source_stale=True,
+                        source_generation_guard=lambda guard_conn, artifact=artifact: (
+                            store.artifact_stale_generation_is_current(
+                                guard_conn,
+                                tenant_id=tenant_id,
+                                artifact_id=str(artifact["artifact_id"]),
+                                missing_since=artifact["missing_since"],
+                            )
+                        ),
+                    )
+                    checkpointed = store.mark_artifact_knowledge_reconciled(
                         tenant_id=tenant_id,
                         artifact_id=str(artifact["artifact_id"]),
                         missing_since=artifact["missing_since"],
-                    ),
-                )
-                checkpointed = store.mark_artifact_knowledge_reconciled(
-                    tenant_id=tenant_id,
-                    artifact_id=str(artifact["artifact_id"]),
-                    missing_since=artifact["missing_since"],
-                )
-                if not checkpointed:
-                    raise RuntimeError("stale artifact generation changed during knowledge reconciliation")
-                reconciled += 1
-            except Exception:
-                logger.warning(
-                    "stale_artifact_knowledge_reconcile_failed",
-                    tenant_id=tenant_id,
-                    artifact_type=artifact_type,
-                    artifact_id=artifact["artifact_id"],
-                    exc_info=True,
-                )
+                    )
+                    if not checkpointed:
+                        raise RuntimeError("stale artifact generation changed during knowledge reconciliation")
+            reconciled += 1
         if len(artifacts) < page_size:
             break
     logger.info(
         "stale_artifact_knowledge_reconciled",
-        tenant_id=tenant_id,
-        artifact_type=artifact_type,
+        reason_code="stale_artifact_knowledge_reconciled",
+        tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+        artifact_type_fingerprint=_diagnostic_fingerprint(artifact_type),
         pages=pages,
         reconciled=reconciled,
     )
+
+
+def _stale_artifact_authority_reconciler(*, store: Any, knowledge_service: Any, tenant_id: str):
+    """Bind governed retirement to the signal-store transaction for one source."""
+    bind_connection = knowledge_service.repository.bind_transaction_connection
+    store.ensure_governed_projection_audit_current()
+
+    def reconcile(conn, artifact: dict[str, Any]) -> None:
+        if not store.governed_projection_audit_is_current(conn):
+            raise RuntimeError("governed projection changed before stale artifact reconciliation; retry")
+        with bind_connection(conn):
+            knowledge_service.reconcile_source_lifecycle(
+                provenance_ref=f"prov_artifact:{artifact['artifact_id']}",
+                tenant_id=tenant_id,
+                source_stale=True,
+                source_generation_guard=lambda guard_conn: store.artifact_stale_generation_is_current(
+                    guard_conn,
+                    tenant_id=tenant_id,
+                    artifact_id=str(artifact["artifact_id"]),
+                    missing_since=artifact["missing_since"],
+                ),
+            )
+
+    return reconcile
 
 
 def _preserve_review_states(rows: list[dict[str, Any]], existing_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -858,17 +972,43 @@ def learn_artifact(
     tenant_id: str | None = None,
     knowledge_service: Any | None = None,
 ) -> dict[str, object]:
-    active_settings = _active_runtime_settings(runtime_settings, store)
-    if not dry_run:
-        enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
-        enforce_knowledge_action(active_settings, KnowledgeAction.APPROVE)
+    allow_global_fallback = runtime_settings is None and store is None and knowledge_service is None
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
     store = _resolve_artifact_store(
         dry_run=dry_run,
         store=store,
-        runtime_settings=runtime_settings,
+        runtime_settings=active_settings,
+        knowledge_service=knowledge_service,
+        allow_global_fallback=allow_global_fallback,
     )
-    active_settings = _active_runtime_settings(runtime_settings, store)
-    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=active_settings)
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
+    if not dry_run:
+        assert store is not None
+        from tacit.dashboard_ingest.service import _knowledge_service_for_store
+
+        knowledge_service = knowledge_service or _knowledge_service_for_store(
+            store,
+            runtime_settings=active_settings,
+        )
+        active_settings, tenant_id = authorize_artifact_learning(
+            dry_run=dry_run,
+            runtime_settings=runtime_settings,
+            store=store,
+            knowledge_service=knowledge_service,
+            tenant_id=tenant_id,
+        )
     result = extractor.extract(artifact)
     evidence_rows = _as_store_rows(result.evidence_requirements)
     ownership_rows = _as_store_rows(result.ownership_hints)
@@ -885,29 +1025,22 @@ def learn_artifact(
         if candidate_count > atomic_candidate_limit:
             logger.warning(
                 "artifact_authority_fanout_rejected",
-                tenant_id=tenant_id,
-                artifact_id=artifact.id,
+                reason_code="artifact_authority_fanout_rejected",
+                tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+                artifact_fingerprint=_diagnostic_fingerprint(artifact.id),
                 candidate_count=candidate_count,
                 candidate_limit=atomic_candidate_limit,
             )
             raise ValueError(
-                f"artifact produced {candidate_count} candidates; "
-                f"the atomic source limit is {atomic_candidate_limit}"
+                f"artifact produced {candidate_count} candidates; the atomic source limit is {atomic_candidate_limit}"
             )
 
-        from tacit.dashboard_ingest.service import _knowledge_service_for_store
         from tacit.knowledge.migration import migrate_artifact_extractions
 
-        knowledge_service = knowledge_service or _knowledge_service_for_store(
-            store,
-            runtime_settings=active_settings,
-        )
+        assert knowledge_service is not None
         bind_connection = getattr(knowledge_service.repository, "bind_transaction_connection", None)
         if bind_connection is None:
             raise ValueError("artifact governance requires a transactional knowledge repository")
-        initialize_projection_store = getattr(knowledge_service, "_signal_store", None)
-        if callable(initialize_projection_store):
-            initialize_projection_store()
         store.ensure_governed_projection_audit_current()
 
         index_evidence_rows = evidence_rows
@@ -951,8 +1084,9 @@ def learn_artifact(
                         if should_replace_extractions:
                             logger.warning(
                                 "artifact_extraction_generation_repaired",
-                                tenant_id=tenant_id,
-                                artifact_id=artifact.id,
+                                reason_code="artifact_extraction_generation_repaired",
+                                tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+                                artifact_fingerprint=_diagnostic_fingerprint(artifact.id),
                             )
                             evidence_rows = _preserve_review_states(
                                 evidence_rows,
@@ -1020,6 +1154,7 @@ def learn_artifact(
                             tenant_id=tenant_id,
                             artifact_id=artifact.id,
                             artifact_type=artifact.artifact_type,
+                            strict=True,
                         )
                     ):
                         indexed_context_rows = store.index_artifact_context(
@@ -1032,6 +1167,7 @@ def learn_artifact(
                             ownership_hints=index_ownership_rows,
                             dependency_hints=index_dependency_rows,
                             signal_mapping_candidates=index_signal_rows,
+                            strict=True,
                         )
                     governed_candidate_ids = migrate_artifact_extractions(
                         artifact_id=artifact.id,
@@ -1057,21 +1193,24 @@ def learn_artifact(
                         active_candidate_ids=set(governed_candidate_ids),
                         max_candidate_count=atomic_candidate_limit,
                     )
-        except Exception:
+        except Exception as exc:
             logger.error(
                 "artifact_authority_transaction_failed",
-                tenant_id=tenant_id,
-                artifact_id=artifact.id,
+                reason_code="artifact_authority_transaction_failed",
+                exception_class=type(exc).__name__[:64],
+                error_fingerprint=_diagnostic_fingerprint(exc),
+                tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+                artifact_fingerprint=_diagnostic_fingerprint(artifact.id),
                 candidate_count=candidate_count,
                 candidate_limit=atomic_candidate_limit,
                 duration_ms=round((time.monotonic() - authority_started_at) * 1000, 2),
-                exc_info=True,
             )
             raise
         logger.info(
             "artifact_authority_transaction_committed",
-            tenant_id=tenant_id,
-            artifact_id=artifact.id,
+            reason_code="artifact_authority_transaction_committed",
+            tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+            artifact_fingerprint=_diagnostic_fingerprint(artifact.id),
             candidate_count=candidate_count,
             governed_candidate_count=len(governed_candidate_ids),
             indexed_context_rows=indexed_context_rows,
@@ -1118,11 +1257,18 @@ def learn_runbook_file(
     tenant_id: str | None = None,
     knowledge_service: Any | None = None,
 ) -> dict[str, object]:
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
     return learn_artifact(
         runbook_from_file(path),
         RunbookExtractor(),
         dry_run=dry_run,
-        runtime_settings=runtime_settings,
+        runtime_settings=active_settings,
         store=store,
         tenant_id=tenant_id,
         knowledge_service=knowledge_service,
@@ -1152,15 +1298,40 @@ def learn_incident_file(
     tenant_id: str | None = None,
     knowledge_service: Any | None = None,
 ) -> dict[str, object]:
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
     return learn_artifact(
         incident_from_file(path),
         IncidentExtractor(),
         dry_run=dry_run,
-        runtime_settings=runtime_settings,
+        runtime_settings=active_settings,
         store=store,
         tenant_id=tenant_id,
         knowledge_service=knowledge_service,
     )
+
+
+def _bounded_artifact_files(path: Path, *, limit: int) -> list[Path]:
+    """Collect one bounded crawl before any artifact source is read."""
+    files: list[Path] = []
+    for candidate in path.rglob("*"):
+        if candidate.suffix.lower() not in {".md", ".txt"} or not candidate.is_file():
+            continue
+        if len(files) >= limit:
+            logger.warning(
+                "artifact_directory_file_limit_exceeded",
+                reason_code="artifact_directory_file_limit_exceeded",
+                path_fingerprint=_diagnostic_fingerprint(path),
+                limit=limit,
+            )
+            raise ValueError(f"Artifact directory exceeds the configured file limit ({limit})")
+        files.append(candidate)
+    return sorted(files)
 
 
 def learn_incident_dir(
@@ -1170,26 +1341,40 @@ def learn_incident_dir(
     runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
 ) -> dict[str, object]:
-    active_settings = _active_runtime_settings(runtime_settings, store)
-    if not dry_run:
-        enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
-        enforce_knowledge_action(active_settings, KnowledgeAction.APPROVE)
+    allow_global_fallback = runtime_settings is None and store is None and knowledge_service is None
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
     store = _resolve_artifact_store(
         dry_run=dry_run,
         store=store,
-        runtime_settings=runtime_settings,
+        runtime_settings=active_settings,
+        knowledge_service=knowledge_service,
+        allow_global_fallback=allow_global_fallback,
     )
-    active_settings = _active_runtime_settings(runtime_settings, store)
-    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=active_settings)
-    knowledge_service = None
     if not dry_run:
         assert store is not None
         from tacit.dashboard_ingest.service import _knowledge_service_for_store
 
-        knowledge_service = _knowledge_service_for_store(store, runtime_settings=active_settings)
+        knowledge_service = knowledge_service or _knowledge_service_for_store(store, runtime_settings=active_settings)
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=active_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
     crawl_started_at = time.time()
-    files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
+    files = _bounded_artifact_files(
+        path,
+        limit=int(active_settings.artifact_learning_directory_file_limit),
+    )
     learned = [
         learn_incident_file(
             file,
@@ -1214,6 +1399,13 @@ def learn_incident_dir(
     if not dry_run:
         assert store is not None
         seen = {str(item["artifact_id"]) for item in learned}
+        _reconcile_stale_artifact_knowledge(
+            store=store,
+            tenant_id=tenant_id,
+            artifact_type="incident",
+            runtime_settings=active_settings,
+            knowledge_service=knowledge_service,
+        )
         stale_marked = store.mark_missing_artifacts_stale(
             tenant_id=tenant_id,
             artifact_type="incident",
@@ -1221,13 +1413,11 @@ def learn_incident_dir(
             source_vendor="file",
             external_id_prefix=f"{path.resolve()}/",
             crawl_started_at=crawl_started_at,
-        )
-        _reconcile_stale_artifact_knowledge(
-            store=store,
-            tenant_id=tenant_id,
-            artifact_type="incident",
-            runtime_settings=active_settings,
-            knowledge_service=knowledge_service,
+            authority_reconciler=_stale_artifact_authority_reconciler(
+                store=store,
+                knowledge_service=knowledge_service,
+                tenant_id=tenant_id,
+            ),
         )
     return {
         "artifact_type": "incident",
@@ -1255,26 +1445,40 @@ def learn_runbook_dir(
     runtime_settings: Settings | None = None,
     store: Any | None = None,
     tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
 ) -> dict[str, object]:
-    active_settings = _active_runtime_settings(runtime_settings, store)
-    if not dry_run:
-        enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
-        enforce_knowledge_action(active_settings, KnowledgeAction.APPROVE)
+    allow_global_fallback = runtime_settings is None and store is None and knowledge_service is None
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
     store = _resolve_artifact_store(
         dry_run=dry_run,
         store=store,
-        runtime_settings=runtime_settings,
+        runtime_settings=active_settings,
+        knowledge_service=knowledge_service,
+        allow_global_fallback=allow_global_fallback,
     )
-    active_settings = _active_runtime_settings(runtime_settings, store)
-    tenant_id = _resolve_tenant_id(tenant_id, runtime_settings=active_settings)
-    knowledge_service = None
     if not dry_run:
         assert store is not None
         from tacit.dashboard_ingest.service import _knowledge_service_for_store
 
-        knowledge_service = _knowledge_service_for_store(store, runtime_settings=active_settings)
+        knowledge_service = knowledge_service or _knowledge_service_for_store(store, runtime_settings=active_settings)
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=active_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
     crawl_started_at = time.time()
-    files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
+    files = _bounded_artifact_files(
+        path,
+        limit=int(active_settings.artifact_learning_directory_file_limit),
+    )
     learned = [
         learn_runbook_file(
             file,
@@ -1299,6 +1503,13 @@ def learn_runbook_dir(
     if not dry_run:
         assert store is not None
         seen = {str(item["artifact_id"]) for item in learned}
+        _reconcile_stale_artifact_knowledge(
+            store=store,
+            tenant_id=tenant_id,
+            artifact_type="runbook",
+            runtime_settings=active_settings,
+            knowledge_service=knowledge_service,
+        )
         stale_marked = store.mark_missing_artifacts_stale(
             tenant_id=tenant_id,
             artifact_type="runbook",
@@ -1306,13 +1517,11 @@ def learn_runbook_dir(
             source_vendor="file",
             external_id_prefix=f"{path.resolve()}/",
             crawl_started_at=crawl_started_at,
-        )
-        _reconcile_stale_artifact_knowledge(
-            store=store,
-            tenant_id=tenant_id,
-            artifact_type="runbook",
-            runtime_settings=active_settings,
-            knowledge_service=knowledge_service,
+            authority_reconciler=_stale_artifact_authority_reconciler(
+                store=store,
+                knowledge_service=knowledge_service,
+                tenant_id=tenant_id,
+            ),
         )
     return {
         "artifact_type": "runbook",

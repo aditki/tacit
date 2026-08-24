@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+from contextlib import nullcontext
 from typing import Any, Protocol
 
 import structlog
@@ -11,8 +12,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi import Path as PathParam
 
 import tacit.signals as signals_mod
-from tacit.api.dependencies import get_runtime_stores, get_signal_store
-from tacit.api.security import KnowledgeAction, assert_knowledge_action, knowledge_tenant, verify_api_key
+from tacit.api.dependencies import get_runtime_stores, get_signal_store, get_signal_store_factory
+from tacit.api.security import (
+    KnowledgeAction,
+    assert_knowledge_action,
+    knowledge_tenant,
+    require_knowledge_action,
+    require_knowledge_tenant,
+    verify_api_key,
+)
+from tacit.errors import SemanticAuthorizationError
 from tacit.models.schemas import (
     LearnAlertRequest,
     LearnDashboardRequest,
@@ -20,11 +29,47 @@ from tacit.models.schemas import (
     LearnIncidentRequest,
     LearnRunbookRequest,
 )
+from tacit.pagination import MAX_COMPATIBILITY_OFFSET
 from tacit.runtime_stores import RuntimeStores
 from tacit.signals.store import ArtifactGenerationConflictError
 
 logger = structlog.get_logger()
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter(dependencies=[Depends(verify_api_key), Depends(require_knowledge_tenant)])
+
+
+def _diagnostic_fingerprint(value: object) -> str:
+    return hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _log_learning_failure(event: str, exc: BaseException, **references: object) -> None:
+    logger.error(
+        event,
+        reason_code=event,
+        exception_class=type(exc).__name__[:64],
+        error_fingerprint=_diagnostic_fingerprint(exc),
+        **{f"{name}_fingerprint": _diagnostic_fingerprint(value) for name, value in references.items()},
+    )
+
+
+def _redact_bulk_learning_failures(result: Any, *, reason_code: str) -> Any:
+    """Return only classified diagnostics for bulk failures."""
+    if not isinstance(result, dict) or not isinstance(result.get("failures"), list):
+        return result
+    redacted = dict(result)
+    failures: list[dict[str, str]] = []
+    for value in result["failures"]:
+        failure = {
+            "error": "Learning item failed.",
+            "reason_code": reason_code,
+            "error_fingerprint": _diagnostic_fingerprint(value),
+        }
+        if isinstance(value, dict):
+            source_identity = value.get("dashboard_uid") or value.get("alert_uid") or value.get("title")
+            if source_identity:
+                failure["item_fingerprint"] = _diagnostic_fingerprint(source_identity)
+        failures.append(failure)
+    redacted["failures"] = failures
+    return redacted
 
 
 class _ArtifactPayload(Protocol):
@@ -42,9 +87,18 @@ def _authorize_signal_approval(request: Request, enabled: bool) -> None:
     assert_knowledge_action(request, KnowledgeAction.TEACH_SIGNALS)
 
 
+def _authorize_learning_read(request: Request) -> None:
+    assert_knowledge_action(request, KnowledgeAction.READ)
+
+
 def _authorize_learning_mutation(request: Request, enabled: bool = True) -> None:
     if enabled:
         assert_knowledge_action(request, KnowledgeAction.APPLY)
+
+
+def _authorize_artifact_learning(request: Request, *, dry_run: bool) -> None:
+    action = KnowledgeAction.READ if dry_run else KnowledgeAction.LEARN_ARTIFACTS
+    assert_knowledge_action(request, action)
 
 
 def _artifact_external_id(payload: _ArtifactPayload, artifact_type: str) -> str:
@@ -94,16 +148,18 @@ async def _call_learn_backend_alerts(learn_backend_alerts: Any, **kwargs: Any) -
 async def learn_from_dashboard(
     request: Request,
     payload: LearnDashboardRequest,
-    store: Any = Depends(get_signal_store),
+    store_factory: Any = Depends(get_signal_store_factory),
 ):
     """Ingest an existing dashboard to learn operational patterns."""
     from tacit.config import settings
-    from tacit.dashboard_ingest import ingest_dashboard
+    from tacit.dashboard_ingest import DashboardReviewConflictError, ingest_dashboard
 
+    _authorize_learning_read(request)
     _authorize_signal_approval(request, payload.auto_approve)
     _authorize_learning_mutation(request)
     tenant_id = knowledge_tenant(request)
     try:
+        store = store_factory()
         return await _call_ingest_dashboard(
             ingest_dashboard,
             dashboard_uid=payload.dashboard_uid,
@@ -113,14 +169,20 @@ async def learn_from_dashboard(
             store=store,
             tenant_id=tenant_id,
         )
+    except DashboardReviewConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        logger.exception("dashboard_ingest_failed", uid=payload.dashboard_uid, backend=payload.backend)
+    except Exception as exc:
+        _log_learning_failure(
+            "dashboard_ingest_failed",
+            exc,
+            source=payload.dashboard_uid,
+            backend=payload.backend,
+        )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to ingest dashboard '{payload.dashboard_uid}'. "
-            "Check that the UID exists and the backend is accessible.",
+            detail="Failed to ingest dashboard. Check that the source exists and the backend is accessible.",
         )
 
 
@@ -133,16 +195,18 @@ async def learn_from_dashboard(
 async def learn_from_alert(
     request: Request,
     payload: LearnAlertRequest,
-    store: Any = Depends(get_signal_store),
+    store_factory: Any = Depends(get_signal_store_factory),
 ):
     """Ingest an existing alert rule/detector to learn operational patterns."""
     from tacit.alert_ingest import ingest_alert
     from tacit.config import settings
 
+    _authorize_learning_read(request)
     _authorize_signal_approval(request, payload.auto_approve and not payload.dry_run)
     _authorize_learning_mutation(request, not payload.dry_run)
     tenant_id = knowledge_tenant(request)
     try:
+        store = store_factory() if not payload.dry_run else None
         return await _call_ingest_alert(
             ingest_alert,
             alert_uid=payload.alert_uid,
@@ -155,12 +219,16 @@ async def learn_from_alert(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        logger.exception("alert_ingest_failed", uid=payload.alert_uid, backend=payload.backend)
+    except Exception as exc:
+        _log_learning_failure(
+            "alert_ingest_failed",
+            exc,
+            source=payload.alert_uid,
+            backend=payload.backend,
+        )
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to ingest alert '{payload.alert_uid}'. "
-            "Check that the alert exists and the backend is accessible.",
+            detail="Failed to ingest alert. Check that the source exists and the backend is accessible.",
         )
 
 
@@ -178,9 +246,8 @@ async def learn_from_runbook(
     """Learn operational candidates from a markdown/plain-text runbook."""
     from tacit.artifact_learning import RunbookExtractor, artifact_from_text, learn_artifact
 
-    _authorize_learning_mutation(request, not payload.dry_run)
-    if not payload.dry_run:
-        assert_knowledge_action(request, KnowledgeAction.APPROVE)
+    _authorize_artifact_learning(request, dry_run=payload.dry_run)
+    tenant_id = knowledge_tenant(request)
     try:
         store = None if payload.dry_run else stores.signals()
         artifact = artifact_from_text(
@@ -198,14 +265,14 @@ async def learn_from_runbook(
             dry_run=payload.dry_run,
             runtime_settings=stores.settings,
             store=store,
-            tenant_id=knowledge_tenant(request),
+            tenant_id=tenant_id,
         )
-    except PermissionError as e:
+    except SemanticAuthorizationError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        logger.exception("runbook_artifact_learning_failed", title=payload.title)
+    except Exception as exc:
+        _log_learning_failure("runbook_artifact_learning_failed", exc, artifact=payload.title)
         raise HTTPException(status_code=500, detail="Failed to learn from runbook artifact.")
 
 
@@ -223,9 +290,8 @@ async def learn_from_incident(
     """Learn operational candidates from an incident-history record."""
     from tacit.artifact_learning import IncidentExtractor, artifact_from_text, learn_artifact
 
-    _authorize_learning_mutation(request, not payload.dry_run)
-    if not payload.dry_run:
-        assert_knowledge_action(request, KnowledgeAction.APPROVE)
+    _authorize_artifact_learning(request, dry_run=payload.dry_run)
+    tenant_id = knowledge_tenant(request)
     try:
         store = None if payload.dry_run else stores.signals()
         artifact = artifact_from_text(
@@ -243,14 +309,14 @@ async def learn_from_incident(
             dry_run=payload.dry_run,
             runtime_settings=stores.settings,
             store=store,
-            tenant_id=knowledge_tenant(request),
+            tenant_id=tenant_id,
         )
-    except PermissionError as e:
+    except SemanticAuthorizationError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        logger.exception("incident_artifact_learning_failed", title=payload.title)
+    except Exception as exc:
+        _log_learning_failure("incident_artifact_learning_failed", exc, artifact=payload.title)
         raise HTTPException(status_code=500, detail="Failed to learn from incident artifact.")
 
 
@@ -263,16 +329,18 @@ async def learn_from_incident(
 async def learn_from_dashboard_json(
     request: Request,
     payload: LearnDashboardUploadRequest,
-    store: Any = Depends(get_signal_store),
+    store_factory: Any = Depends(get_signal_store_factory),
 ):
     """Ingest an uploaded dashboard JSON export without contacting the vendor."""
-    from tacit.dashboard_ingest import ingest_dashboard_features
+    from tacit.dashboard_ingest import DashboardReviewConflictError, ingest_dashboard_features
     from tacit.dashboard_uploads import parse_uploaded_dashboard
 
+    _authorize_learning_read(request)
     _authorize_signal_approval(request, payload.auto_approve)
     _authorize_learning_mutation(request)
     tenant_id = knowledge_tenant(request)
     try:
+        store = store_factory()
         features = parse_uploaded_dashboard(
             payload.dashboard,
             vendor=payload.vendor,
@@ -287,10 +355,17 @@ async def learn_from_dashboard_json(
             store=store,
             tenant_id=tenant_id,
         )
+    except DashboardReviewConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        logger.exception("dashboard_json_ingest_failed", vendor=payload.vendor, source_name=payload.source_name)
+    except Exception as exc:
+        _log_learning_failure(
+            "dashboard_json_ingest_failed",
+            exc,
+            vendor=payload.vendor,
+            source=payload.source_name,
+        )
         raise HTTPException(
             status_code=500,
             detail="Failed to ingest uploaded dashboard JSON. Check that the file is a supported dashboard export.",
@@ -312,17 +387,19 @@ async def learn_backend(
         "generated archetypes remain quarantined",
     ),
     limit: int = Query(500, ge=1, le=5000, description="Maximum dashboards to crawl"),
-    store: Any = Depends(get_signal_store),
+    store_factory: Any = Depends(get_signal_store_factory),
 ):
     """Crawl a connected backend and persist learned dashboard context."""
     from tacit.config import settings
-    from tacit.dashboard_ingest import learn_backend_dashboards
+    from tacit.dashboard_ingest import DashboardReviewConflictError, learn_backend_dashboards
 
+    _authorize_learning_read(request)
     _authorize_signal_approval(request, auto_approve)
     _authorize_learning_mutation(request)
     tenant_id = knowledge_tenant(request)
     try:
-        return await _call_learn_backend_dashboards(
+        store = store_factory()
+        result = await _call_learn_backend_dashboards(
             learn_backend_dashboards,
             backend_name=backend_name,
             auto_approve=auto_approve,
@@ -331,13 +408,16 @@ async def learn_backend(
             store=store,
             tenant_id=tenant_id,
         )
+        return _redact_bulk_learning_failures(result, reason_code="dashboard_learning_item_failed")
+    except DashboardReviewConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        logger.exception("backend_learning_failed", backend=backend_name)
+    except Exception as exc:
+        _log_learning_failure("backend_learning_failed", exc, backend=backend_name)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to learn dashboards from backend '{backend_name}'. Check backend connectivity.",
+            detail="Failed to learn dashboards from the backend. Check backend connectivity.",
         )
 
 
@@ -357,17 +437,19 @@ async def learn_backend_alert_rules(
     ),
     dry_run: bool = Query(False, description="Preview alert ingestion without persisting learned context"),
     limit: int = Query(500, ge=1, le=5000, description="Maximum alerts to crawl"),
-    store: Any = Depends(get_signal_store),
+    store_factory: Any = Depends(get_signal_store_factory),
 ):
     """Crawl a connected backend and persist learned alert context."""
     from tacit.alert_ingest import learn_backend_alerts
     from tacit.config import settings
 
+    _authorize_learning_read(request)
     _authorize_signal_approval(request, auto_approve and not dry_run)
     _authorize_learning_mutation(request, not dry_run)
     tenant_id = knowledge_tenant(request)
     try:
-        return await _call_learn_backend_alerts(
+        store = store_factory() if not dry_run else None
+        result = await _call_learn_backend_alerts(
             learn_backend_alerts,
             backend_name=backend_name,
             auto_approve=auto_approve,
@@ -377,13 +459,14 @@ async def learn_backend_alert_rules(
             store=store,
             tenant_id=tenant_id,
         )
+        return _redact_bulk_learning_failures(result, reason_code="alert_learning_item_failed")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        logger.exception("backend_alert_learning_failed", backend=backend_name)
+    except Exception as exc:
+        _log_learning_failure("backend_alert_learning_failed", exc, backend=backend_name)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to learn alerts from backend '{backend_name}'. Check backend connectivity.",
+            detail="Failed to learn alerts from the backend. Check backend connectivity.",
         )
 
 
@@ -392,13 +475,14 @@ async def learn_backend_alert_rules(
     tags=["Learning"],
     summary="List ingested dashboards",
     response_description="Ingested dashboards with extracted features and status",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def list_ingested_dashboards(
     request: Request,
     status: str | None = None,
     limit: int = Query(default=50, ge=1, le=500),
-    before_created_at: float | None = Query(default=None, gt=0),
-    before_id: int | None = Query(default=None, ge=1),
+    before_created_at: float | None = Query(default=None),
+    before_id: int | None = Query(default=None),
     store: Any = Depends(get_signal_store),
 ):
     """List dashboards that have been ingested for learning."""
@@ -439,13 +523,14 @@ async def list_ingested_dashboards(
     tags=["Learning"],
     summary="List ingested alerts",
     response_description="Ingested alerts with extracted features and status",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def list_ingested_alerts(
     request: Request,
     status: str | None = None,
     limit: int = Query(default=50, ge=1, le=500),
-    before_created_at: float | None = Query(default=None, gt=0),
-    before_id: int | None = Query(default=None, ge=1),
+    before_created_at: float | None = Query(default=None),
+    before_id: int | None = Query(default=None),
     store: Any = Depends(get_signal_store),
 ):
     """List alerts that have been ingested for learning."""
@@ -486,33 +571,36 @@ async def list_ingested_alerts(
     tags=["Learning"],
     summary="List learned runbook artifacts",
     response_description="Learned runbooks and extracted operational IR candidates",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def list_learned_runbooks(
     request: Request,
     limit: int = Query(50, ge=1, le=500),
     cursor: str | None = Query(default=None, max_length=1024),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_COMPATIBILITY_OFFSET),
     store: Any = Depends(get_signal_store),
 ):
     """List bounded runbook summaries learned by Tacit Artifact Learning v1."""
     assert_knowledge_action(request, KnowledgeAction.READ)
     tenant_id = knowledge_tenant(request)
-    try:
-        page = store.list_learned_artifacts_page(
+    read_transaction = getattr(store, "read_transaction", None)
+    with read_transaction() if callable(read_transaction) else nullcontext():
+        try:
+            page = store.list_learned_artifacts_page(
+                tenant_id=tenant_id,
+                artifact_type="runbook",
+                limit=limit,
+                cursor=cursor,
+                offset=offset,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        counts = store.artifact_extraction_counts_batch(
+            [runbook["artifact_id"] for runbook in page.items],
             tenant_id=tenant_id,
-            artifact_type="runbook",
-            limit=limit,
-            cursor=cursor,
-            offset=offset,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    counts = store.artifact_extraction_counts_batch(
-        [runbook["artifact_id"] for runbook in page.items],
-        tenant_id=tenant_id,
-    )
-    for runbook in page.items:
-        runbook["extraction_counts"] = counts[runbook["artifact_id"]]
+        for runbook in page.items:
+            runbook["extraction_counts"] = counts[runbook["artifact_id"]]
     return {
         "count": len(page.items),
         "runbooks": page.items,
@@ -526,33 +614,36 @@ async def list_learned_runbooks(
     tags=["Learning"],
     summary="List learned incident artifacts",
     response_description="Learned incidents and extracted operational IR candidates",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def list_learned_incidents(
     request: Request,
     limit: int = Query(50, ge=1, le=500),
     cursor: str | None = Query(default=None, max_length=1024),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_COMPATIBILITY_OFFSET),
     store: Any = Depends(get_signal_store),
 ):
     """List bounded incident summaries learned by Tacit Artifact Learning v1."""
     assert_knowledge_action(request, KnowledgeAction.READ)
     tenant_id = knowledge_tenant(request)
-    try:
-        page = store.list_learned_artifacts_page(
+    read_transaction = getattr(store, "read_transaction", None)
+    with read_transaction() if callable(read_transaction) else nullcontext():
+        try:
+            page = store.list_learned_artifacts_page(
+                tenant_id=tenant_id,
+                artifact_type="incident",
+                limit=limit,
+                cursor=cursor,
+                offset=offset,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        counts = store.artifact_extraction_counts_batch(
+            [incident["artifact_id"] for incident in page.items],
             tenant_id=tenant_id,
-            artifact_type="incident",
-            limit=limit,
-            cursor=cursor,
-            offset=offset,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    counts = store.artifact_extraction_counts_batch(
-        [incident["artifact_id"] for incident in page.items],
-        tenant_id=tenant_id,
-    )
-    for incident in page.items:
-        incident["extraction_counts"] = counts[incident["artifact_id"]]
+        for incident in page.items:
+            incident["extraction_counts"] = counts[incident["artifact_id"]]
     return {
         "count": len(page.items),
         "incidents": page.items,
@@ -602,6 +693,7 @@ async def _list_artifact_extraction_page(
     "/api/v1/learn/runbooks/{artifact_id}/extractions",
     tags=["Learning"],
     summary="List one runbook extraction kind",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def list_runbook_extractions(
     artifact_id: str,
@@ -626,6 +718,7 @@ async def list_runbook_extractions(
     "/api/v1/learn/incidents/{artifact_id}/extractions",
     tags=["Learning"],
     summary="List one incident extraction kind",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def list_incident_extractions(
     artifact_id: str,
@@ -651,6 +744,7 @@ async def list_incident_extractions(
     tags=["Learning"],
     summary="Search learned operational context",
     response_description="FTS-ranked learned context rows",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def search_learning_context(
     request: Request,
@@ -680,6 +774,7 @@ async def search_learning_context(
     tags=["Learning"],
     summary="Describe a service from learned operational context",
     response_description="Service-level learned dashboards, metrics, panels, and signals",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def describe_service(
     request: Request,
@@ -711,21 +806,24 @@ async def approve_ingested_dashboard(
     request: Request,
     dashboard_uid: str,
     backend: str | None = None,
-    store: Any = Depends(get_signal_store),
+    store_factory: Any = Depends(get_signal_store_factory),
 ):
     """Approve a pending ingested dashboard, activating its signal mappings."""
     from tacit.config import settings
     from tacit.dashboard_ingest import DashboardReviewConflictError, approve_ingested_dashboard_record
 
+    _authorize_learning_read(request)
     _authorize_signal_approval(request, True)
     _authorize_learning_mutation(request)
+    tenant_id = knowledge_tenant(request)
     try:
+        store = store_factory()
         return approve_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend,
             store=store,
             runtime_settings=getattr(request.app.state, "settings", settings),
-            tenant_id=knowledge_tenant(request),
+            tenant_id=tenant_id,
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")
@@ -743,21 +841,24 @@ async def reject_ingested_dashboard(
     request: Request,
     dashboard_uid: str,
     backend: str | None = None,
-    store: Any = Depends(get_signal_store),
+    store_factory: Any = Depends(get_signal_store_factory),
 ):
     """Reject a pending ingested dashboard."""
     from tacit.config import settings
     from tacit.dashboard_ingest import DashboardReviewConflictError, reject_ingested_dashboard_record
 
+    _authorize_learning_read(request)
     assert_knowledge_action(request, KnowledgeAction.REJECT)
     _authorize_learning_mutation(request)
+    tenant_id = knowledge_tenant(request)
     try:
+        store = store_factory()
         return reject_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend,
             store=store,
             runtime_settings=getattr(request.app.state, "settings", settings),
-            tenant_id=knowledge_tenant(request),
+            tenant_id=tenant_id,
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")
@@ -775,21 +876,24 @@ async def ignore_ingested_dashboard(
     request: Request,
     dashboard_uid: str,
     backend: str | None = None,
-    store: Any = Depends(get_signal_store),
+    store_factory: Any = Depends(get_signal_store_factory),
 ):
     """Ignore a dashboard without creating mappings or negative examples."""
     from tacit.config import settings
     from tacit.dashboard_ingest import DashboardReviewConflictError, ignore_ingested_dashboard_record
 
+    _authorize_learning_read(request)
     assert_knowledge_action(request, KnowledgeAction.REJECT)
     _authorize_learning_mutation(request)
+    tenant_id = knowledge_tenant(request)
     try:
+        store = store_factory()
         return ignore_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend,
             store=store,
             runtime_settings=getattr(request.app.state, "settings", settings),
-            tenant_id=knowledge_tenant(request),
+            tenant_id=tenant_id,
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Ingested dashboard not found")

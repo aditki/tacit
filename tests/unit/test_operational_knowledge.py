@@ -22,6 +22,7 @@ from tacit.api.app import create_app
 from tacit.cli import _knowledge_tenant, cli
 from tacit.config import Settings
 from tacit.knowledge.enums import (
+    ConflictKind,
     ConflictResolutionStatus,
     CorrectionType,
     EntityBindingMethod,
@@ -49,6 +50,7 @@ from tacit.knowledge.models import (
     Entity,
     EntityAlias,
     KnowledgeCandidate,
+    KnowledgeConflict,
     KnowledgeCorrection,
     KnowledgeEvidenceReference,
     KnowledgeRevision,
@@ -81,6 +83,7 @@ from tacit.models.schemas import (
     CulpritCandidate,
     CulpritRanking,
     CulpritRankingMode,
+    DashResponse,
     EvidenceObservation,
     EvidenceObservationOutcome,
 )
@@ -88,6 +91,7 @@ from tacit.operational_learning_benchmark import (
     load_operational_learning_corpus,
     run_operational_learning_benchmark,
 )
+from tacit.pagination import MAX_COMPATIBILITY_OFFSET, encode_cursor
 from tacit.tenancy import TenantBoundaryError
 
 
@@ -133,11 +137,19 @@ class _TestHistoryStore:
 
 
 def _service(tmp_path: Path, tenant_id: str = "default") -> KnowledgeService:
-    repository = KnowledgeRepository(tmp_path / "knowledge.db")
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id=tenant_id,
+        api_auth_enabled=tenant_id == "*",
+    )
+    repository = KnowledgeRepository(
+        tmp_path / "knowledge.db",
+        runtime_settings=runtime_settings,
+    )
     service = KnowledgeService(
         repository,
         history_store=_TestHistoryStore(repository),
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id=tenant_id),
+        runtime_settings=runtime_settings,
     )
     scope = KnowledgeScope(tenant_id=tenant_id)
     for entity in (
@@ -1765,8 +1777,8 @@ def test_conflict_lookup_uses_each_indexed_side(tmp_path: Path):
         ).fetchall()
 
     details = "\n".join(str(row["detail"]) for row in plan)
-    assert "idx_conflicts_tenant_left_status" in details
-    assert "idx_conflicts_tenant_right_status" in details
+    assert "idx_conflicts_tenant_left_status_created_page" in details
+    assert "idx_conflicts_tenant_right_status_created_page" in details
 
 
 def test_rejecting_last_candidate_resolves_existing_conflicts(tmp_path: Path):
@@ -4739,6 +4751,12 @@ def test_impact_and_explanation_history_are_bounded_and_paginated(tmp_path: Path
     assert len(explanation["investigation_usage"]) == 1
     assert explanation["history_page"]["has_more"]["investigation_usage"] is True
 
+    with pytest.raises(ValueError, match="pagination is out of bounds"):
+        service.impact(
+            revision.knowledge_id,
+            offset=MAX_COMPATIBILITY_OFFSET + 1,
+        )
+
 
 def test_correction_rejects_target_that_advanced_after_creation(tmp_path: Path):
     service = _service(tmp_path)
@@ -5257,9 +5275,10 @@ def test_rejecting_applied_entity_mapping_correction_retires_alias(tmp_path: Pat
 
 
 def test_knowledge_service_enforces_its_runtime_tenant_boundary(tmp_path: Path):
+    pinned_settings = Settings(_env_file=None, knowledge_tenant_id="tenant-a")
     pinned = KnowledgeService(
-        KnowledgeRepository(tmp_path / "pinned.db"),
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+        KnowledgeRepository(tmp_path / "pinned.db", runtime_settings=pinned_settings),
+        runtime_settings=pinned_settings,
     )
     with pytest.raises(TenantBoundaryError, match="Tenant access denied"):
         pinned.create_candidate(
@@ -5272,9 +5291,10 @@ def test_knowledge_service_enforces_its_runtime_tenant_boundary(tmp_path: Path):
             tenant_id="tenant-b",
         )
 
+    wildcard_settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
     wildcard = KnowledgeService(
-        KnowledgeRepository(tmp_path / "wildcard.db"),
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        KnowledgeRepository(tmp_path / "wildcard.db", runtime_settings=wildcard_settings),
+        runtime_settings=wildcard_settings,
     )
     with pytest.raises(TenantBoundaryError, match="Knowledge tenant is required"):
         wildcard.create_candidate(
@@ -5324,14 +5344,16 @@ def test_knowledge_service_enforces_its_runtime_tenant_boundary(tmp_path: Path):
 
 
 def _wildcard_dependency_revisions(db_path: Path) -> tuple[KnowledgeRepository, dict[str, KnowledgeRevision]]:
-    repository = KnowledgeRepository(db_path)
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="*",
+        api_auth_enabled=True,
+        knowledge_permissions="knowledge.read,knowledge.review,knowledge.apply,knowledge.override",
+    )
+    repository = KnowledgeRepository(db_path, runtime_settings=runtime_settings)
     service = KnowledgeService(
         repository,
-        runtime_settings=Settings(
-            _env_file=None,
-            knowledge_tenant_id="*",
-            knowledge_permissions="knowledge.read,knowledge.review,knowledge.apply,knowledge.override",
-        ),
+        runtime_settings=runtime_settings,
     )
     revisions: dict[str, KnowledgeRevision] = {}
     for tenant_id in ("tenant-a", "tenant-b"):
@@ -5618,10 +5640,11 @@ def test_correction_creation_rejects_a_cross_tenant_contract(tmp_path: Path):
                 knowledge_usage=[],
             )
 
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
     service = KnowledgeService(
-        KnowledgeRepository(tmp_path / "knowledge.db"),
+        KnowledgeRepository(tmp_path / "knowledge.db", runtime_settings=runtime_settings),
         history_store=CrossTenantHistoryStore(),
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        runtime_settings=runtime_settings,
     )
 
     with pytest.raises(ValueError, match="belongs to another tenant"):
@@ -5715,6 +5738,35 @@ def test_snapshot_boundaries_enforce_runtime_read_permission(tmp_path: Path):
             investigation_id="inv-read-boundary",
             investigation_revision=1,
         )
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.read"):
+        service.reconcile_live_observations(usage, [])
+
+
+def test_artifact_migration_enforces_runtime_read_permission(tmp_path: Path):
+    service = _service(tmp_path)
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.review,knowledge.apply",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.read"):
+        migrate_artifact_extractions(
+            artifact_id="runbook:read-protected",
+            artifact_type="runbook",
+            rows={
+                "dependency_hints": [
+                    {
+                        "id": "dep-read-protected",
+                        "source_entity": "entity:service:checkout",
+                        "target_entity": "entity:service:redis",
+                        "direction": "depends_on",
+                    }
+                ]
+            },
+            service=service,
+        )
+
+    assert service.repository.list_candidates() == []
 
 
 def test_runtime_knowledge_application_boundaries_require_apply_permission(tmp_path: Path):
@@ -5747,6 +5799,8 @@ def test_runtime_knowledge_application_boundaries_require_apply_permission(tmp_p
         )
     with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
         service.apply_to_ranking(CulpritRanking(), usage)
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        service.reconcile_live_observations(usage, [])
 
 
 def test_source_lifecycle_reconciliation_enforces_apply_permission(tmp_path: Path):
@@ -5771,14 +5825,33 @@ def test_source_lifecycle_reconciliation_enforces_apply_permission(tmp_path: Pat
     assert persisted_revision.state.lifecycle_status == LifecycleStatus.ACTIVE
 
 
+def test_signal_scope_patch_enforces_teaching_permission_before_lookup(tmp_path: Path):
+    service = _service(tmp_path)
+    service._runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read",
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.review"):
+        service.resolve_signal_mapping_scope_patch(
+            record_ref="teach:request_latency:checkout_latency_seconds",
+            tenant_id="default",
+            services=[],
+            datasource_types=[],
+            environments=[],
+        )
+
+
 def test_mutation_permissions_are_checked_before_wildcard_tenant_or_resource_lookups(tmp_path: Path):
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="*",
+        api_auth_enabled=True,
+        knowledge_permissions="knowledge.read",
+    )
     service = KnowledgeService(
-        KnowledgeRepository(tmp_path / "permission-order.db"),
-        runtime_settings=Settings(
-            _env_file=None,
-            knowledge_tenant_id="*",
-            knowledge_permissions="knowledge.read",
-        ),
+        KnowledgeRepository(tmp_path / "permission-order.db", runtime_settings=runtime_settings),
+        runtime_settings=runtime_settings,
     )
 
     with pytest.raises(PermissionError, match="Missing permission: knowledge.review"):
@@ -6165,6 +6238,52 @@ def test_imported_review_state_enforces_runtime_permissions(tmp_path: Path):
     candidates = service.repository.list_candidates()
     assert candidates == []
     assert service.repository.list_current_revisions() == []
+
+
+def test_migration_adapters_use_only_public_knowledge_service_capabilities(tmp_path: Path):
+    service = _service(tmp_path)
+
+    class PublicOnlyKnowledgeService:
+        repository = service.repository
+        runtime_settings = service.runtime_settings
+        signal_store = service.signal_store
+
+        def __getattr__(self, name: str):
+            if name.startswith("_"):
+                raise AssertionError(f"migration accessed private knowledge-service capability: {name}")
+            return getattr(service, name)
+
+    public_service = PublicOnlyKnowledgeService()
+    artifact_ids = migrate_artifact_extractions(
+        artifact_id="public-capability-runbook",
+        artifact_type="runbook",
+        rows={
+            "dependency_hints": [
+                {
+                    "id": "public-capability-dependency",
+                    "source_entity": "entity:service:checkout",
+                    "target_entity": "entity:service:redis-session",
+                    "direction": "depends_on",
+                }
+            ]
+        },
+        service=public_service,
+    )
+    signal_id = migrate_signal_mapping(
+        {
+            "id": "public-capability-signal",
+            "signal_type": "request_latency",
+            "metric_pattern": "checkout_latency_seconds",
+            "source_type": "dashboard_ingest",
+            "source_refs": ["dashboard:public-capability"],
+            "review_state": "candidate",
+        },
+        service=public_service,
+    )
+
+    assert len(artifact_ids) == 1
+    assert service.repository.get_candidate(artifact_ids[0]) is not None
+    assert service.repository.get_candidate(signal_id) is not None
 
 
 @pytest.mark.parametrize(
@@ -6682,6 +6801,8 @@ def test_manual_signal_teaching_creates_governed_revision_before_activation(tmp_
     )
     assert candidate is not None
     assert candidate.policy.authoritative_source is False
+    assert candidate.provenance_refs == ["manual:local-unauthenticated"]
+    assert candidate.typed_payload["submitted_taught_by"] == "operator"
     mappings = stores.signals().get_mappings_for_signal("request_latency", tenant_id="tenant-a")
     taught = [mapping for mapping in mappings if mapping["metric_pattern"] == "AWS/ApplicationELB/TargetResponseTime"]
     assert len(taught) == 1
@@ -6731,6 +6852,133 @@ def test_manual_signal_reteach_uses_scope_in_candidate_identity(tmp_path: Path):
     )
     assert len(candidates) == 3
     assert len({candidate.id for candidate in candidates}) == 3
+
+
+def test_manual_signal_reteach_preserves_omitted_scope(tmp_path: Path):
+    db_path = tmp_path / "preserved-signal-scope.db"
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            signals_db_path=str(db_path),
+            knowledge_tenant_id="tenant-a",
+        )
+    )
+    client = TestClient(app)
+    initial = {
+        "signal_type": "request_latency",
+        "metric_patterns": [{"pattern": "checkout_latency_seconds", "confidence": 0.9}],
+        "services": ["checkout"],
+        "environments": ["production"],
+        "datasource_types": ["prometheus"],
+        "taught_by": "operator",
+    }
+
+    first = client.post("/api/v1/signals/teach", json=initial)
+    second = client.post(
+        "/api/v1/signals/teach",
+        json={
+            "signal_type": "request_latency",
+            "metric_patterns": [{"pattern": "checkout_latency_seconds", "confidence": 0.95}],
+            "taught_by": "operator",
+        },
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    candidates = app.state.runtime_stores.knowledge_repository().list_candidates(
+        "tenant-a",
+        kind=KnowledgeKind.SIGNAL_MAPPING.value,
+        limit=None,
+    )
+    assert len(candidates) == 1
+    assert candidates[0].scope.service_refs == ["entity:service:checkout"]
+    assert candidates[0].scope.environment_refs == ["environment:production"]
+    assert candidates[0].typed_payload["context_datasource_types"] == ["prometheus"]
+
+
+def test_manual_signal_reteach_requires_scope_when_existing_variants_are_ambiguous(tmp_path: Path):
+    db_path = tmp_path / "ambiguous-signal-scope.db"
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            signals_db_path=str(db_path),
+            knowledge_tenant_id="tenant-a",
+        )
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    base = {
+        "signal_type": "request_latency",
+        "metric_patterns": [{"pattern": "shared_latency_seconds", "confidence": 0.9}],
+        "taught_by": "operator",
+    }
+    for service in ("checkout", "payments"):
+        response = client.post(
+            "/api/v1/signals/teach",
+            json={
+                **base,
+                "services": [service],
+                "environments": ["production"],
+                "datasource_types": ["prometheus"],
+            },
+        )
+        assert response.status_code == 200, response.text
+
+    response = client.post("/api/v1/signals/teach", json=base)
+
+    assert response.status_code == 400
+    assert "multiple scoped variants" in response.json()["detail"]
+    candidates = app.state.runtime_stores.knowledge_repository().list_candidates(
+        "tenant-a",
+        kind=KnowledgeKind.SIGNAL_MAPPING.value,
+        limit=None,
+    )
+    assert len(candidates) == 2
+
+
+def test_manual_signal_reteach_uses_supplied_scope_to_select_one_variant(tmp_path: Path):
+    db_path = tmp_path / "partially-scoped-signal.db"
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            signals_db_path=str(db_path),
+            knowledge_tenant_id="tenant-a",
+        )
+    )
+    client = TestClient(app)
+    base = {
+        "signal_type": "request_latency",
+        "metric_patterns": [{"pattern": "shared_latency_seconds", "confidence": 0.9}],
+        "taught_by": "operator",
+        "datasource_types": ["prometheus"],
+    }
+    for service, environment in (("checkout", "production"), ("payments", "staging")):
+        response = client.post(
+            "/api/v1/signals/teach",
+            json={**base, "services": [service], "environments": [environment]},
+        )
+        assert response.status_code == 200, response.text
+
+    updated = client.post(
+        "/api/v1/signals/teach",
+        json={
+            "signal_type": "request_latency",
+            "metric_patterns": [{"pattern": "shared_latency_seconds", "confidence": 0.95}],
+            "services": ["checkout"],
+            "taught_by": "operator",
+        },
+    )
+
+    assert updated.status_code == 200, updated.text
+    candidates = app.state.runtime_stores.knowledge_repository().list_candidates(
+        "tenant-a",
+        kind=KnowledgeKind.SIGNAL_MAPPING.value,
+        limit=None,
+    )
+    assert len(candidates) == 2
+    checkout = next(candidate for candidate in candidates if "entity:service:checkout" in candidate.scope.service_refs)
+    assert checkout.scope.environment_refs == ["environment:production"]
+    assert checkout.typed_payload["context_datasource_types"] == ["prometheus"]
+    assert checkout.typed_payload["confidence"] == 0.95
 
 
 @pytest.mark.parametrize(
@@ -6889,7 +7137,10 @@ def test_removed_source_retires_promoted_knowledge(tmp_path: Path):
     assert service.repository.get_revision(active.knowledge_id).state.eligibility == KnowledgeEligibility.INELIGIBLE
 
 
-def test_atomic_source_reconciliation_limit_rolls_back_without_partial_retirement(tmp_path: Path):
+def test_atomic_source_reconciliation_limit_rolls_back_without_partial_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     service = _service(tmp_path)
     candidates = [
         service.create_candidate(
@@ -6907,49 +7158,71 @@ def test_atomic_source_reconciliation_limit_rolls_back_without_partial_retiremen
         for suffix in ("first", "second")
     ]
 
-    with pytest.raises(CandidateLifecycleConflictError, match="atomic candidate limit"):
-        with service.repository.transaction():
-            service.reconcile_source_lifecycle(
-                provenance_ref="runbook:shared-source",
-                active_candidate_ids=set(),
-                max_candidate_count=1,
-            )
+    monkeypatch.setattr("tacit.knowledge.service._SOURCE_RECONCILIATION_PAGE_SIZE", 1)
+    transaction = service.repository.transaction
+    transaction_entered = False
 
+    @contextmanager
+    def tracked_transaction():
+        nonlocal transaction_entered
+        transaction_entered = True
+        with transaction() as conn:
+            yield conn
+
+    monkeypatch.setattr(service.repository, "transaction", tracked_transaction)
+
+    with pytest.raises(CandidateLifecycleConflictError, match="atomic candidate limit"):
+        service.reconcile_source_lifecycle(
+            provenance_ref="runbook:shared-source",
+            active_candidate_ids=set(),
+            max_candidate_count=1,
+        )
+
+    assert transaction_entered is False
+    assert [service.repository.get_candidate(candidate.id).state.lifecycle_status for candidate in candidates] == [
+        LifecycleStatus.ACTIVE,
+        LifecycleStatus.ACTIVE,
+    ]
+
+    # Keep the in-transaction guard for a source that grows after preflight.
+    monkeypatch.setattr(service.repository, "count_candidates_for_provenance", lambda *_args, **_kwargs: 1)
+    with pytest.raises(CandidateLifecycleConflictError, match="atomic candidate limit"):
+        service.reconcile_source_lifecycle(
+            provenance_ref="runbook:shared-source",
+            active_candidate_ids=set(),
+            max_candidate_count=1,
+        )
+
+    assert transaction_entered is True
     assert [service.repository.get_candidate(candidate.id).state.lifecycle_status for candidate in candidates] == [
         LifecycleStatus.ACTIVE,
         LifecycleStatus.ACTIVE,
     ]
 
 
-def test_restored_source_generation_cannot_be_retired_by_a_stale_worker(tmp_path: Path):
+def test_stale_source_and_authority_retirement_roll_back_together(tmp_path: Path):
     from tacit.signals.store import SignalStore
 
     service = _service(tmp_path)
     candidate, active = _promoted_dependency(service)
     store = SignalStore(db_path=tmp_path / "knowledge.db")
     store.record_ingested_dashboard("source-dashboard", backend_name="grafana")
-    assert (
+
+    def fail_after_retirement(conn, _source):
+        with service.repository.bind_transaction_connection(conn):
+            service.reconcile_source_lifecycle(
+                provenance_ref=candidate.provenance_refs[0],
+                source_stale=True,
+                source_generation_guard=lambda _conn: True,
+            )
+            raise OSError("simulated source reconciliation failure")
+
+    with pytest.raises(OSError, match="simulated source reconciliation failure"):
         store.mark_missing_dashboards_stale(
             backend_name="grafana",
             seen_dashboard_uids=set(),
             crawl_started_at=time.time() + 1,
-        )
-        == 1
-    )
-    stale_generation = store.list_unreconciled_stale_dashboards(backend_name="grafana")[0]
-    store.record_ingested_dashboard("source-dashboard", backend_name="grafana")
-
-    with pytest.raises(CandidateLifecycleConflictError, match="source generation changed"):
-        service.reconcile_source_lifecycle(
-            provenance_ref=candidate.provenance_refs[0],
-            source_stale=True,
-            source_generation_guard=lambda conn: store.dashboard_stale_generation_is_current(
-                conn,
-                tenant_id="default",
-                backend_name="grafana",
-                dashboard_uid="source-dashboard",
-                missing_since=stale_generation["missing_since"],
-            ),
+            authority_reconciler=fail_after_retirement,
         )
 
     persisted_candidate = service.repository.get_candidate(candidate.id)
@@ -6958,6 +7231,51 @@ def test_restored_source_generation_cannot_be_retired_by_a_stale_worker(tmp_path
     assert persisted_candidate.state.lifecycle_status == LifecycleStatus.ACTIVE
     assert persisted_revision is not None
     assert persisted_revision.state.lifecycle_status == LifecycleStatus.ACTIVE
+    persisted_source = store.get_ingested_dashboard("source-dashboard", "grafana")
+    assert persisted_source is not None
+    assert persisted_source["stale"] is False
+    assert persisted_source["status"] == "pending"
+
+
+def test_stale_artifact_and_authority_retirement_roll_back_together(tmp_path: Path):
+    from tacit.signals.store import SignalStore
+
+    service = _service(tmp_path)
+    candidate, active = _promoted_dependency(service)
+    store = SignalStore(db_path=tmp_path / "knowledge.db")
+    store.record_learned_artifact(
+        artifact_id="source-runbook",
+        artifact_type="runbook",
+        source_vendor="file",
+        fingerprint="runbook-v1",
+    )
+
+    def fail_after_retirement(conn, _source):
+        with service.repository.bind_transaction_connection(conn):
+            service.reconcile_source_lifecycle(
+                provenance_ref=candidate.provenance_refs[0],
+                source_stale=True,
+                source_generation_guard=lambda _conn: True,
+            )
+            raise OSError("simulated artifact reconciliation failure")
+
+    with pytest.raises(OSError, match="simulated artifact reconciliation failure"):
+        store.mark_missing_artifacts_stale(
+            artifact_type="runbook",
+            seen_artifact_ids=set(),
+            crawl_started_at=time.time() + 1,
+            authority_reconciler=fail_after_retirement,
+        )
+
+    persisted_candidate = service.repository.get_candidate(candidate.id)
+    persisted_revision = service.repository.get_revision(active.knowledge_id)
+    persisted_source = store.get_learned_artifact("source-runbook")
+    assert persisted_candidate is not None
+    assert persisted_candidate.state.lifecycle_status == LifecycleStatus.ACTIVE
+    assert persisted_revision is not None
+    assert persisted_revision.state.lifecycle_status == LifecycleStatus.ACTIVE
+    assert persisted_source is not None
+    assert persisted_source["stale"] is False
 
 
 def test_source_reconciliation_rereads_candidate_after_concurrent_review(
@@ -8005,6 +8323,42 @@ def test_investigation_scope_does_not_extract_environment_from_service_identifie
 
 
 @pytest.mark.parametrize(
+    "prompt",
+    [
+        "Test whether checkout is failing.",
+        "Which stage is failing for checkout?",
+    ],
+)
+def test_investigation_scope_requires_context_for_ambiguous_environment_aliases(prompt: str):
+    scope = investigation_knowledge_scope(
+        tenant_id="tenant-a",
+        prompt=prompt,
+        services=["checkout"],
+        archetype_ids=["latency_investigation"],
+    )
+
+    assert scope.environment_refs == []
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ("Investigate checkout in the test environment", "environment:test"),
+        ("Investigate checkout environment:stage", "environment:staging"),
+    ],
+)
+def test_investigation_scope_accepts_explicit_ambiguous_environment_aliases(prompt: str, expected: str):
+    scope = investigation_knowledge_scope(
+        tenant_id="tenant-a",
+        prompt=prompt,
+        services=["checkout"],
+        archetype_ids=["latency_investigation"],
+    )
+
+    assert scope.environment_refs == [expected]
+
+
+@pytest.mark.parametrize(
     ("prompt", "expected"),
     [
         ("Investigate checkout release 2.4.1", "version:2.4.1"),
@@ -8021,6 +8375,17 @@ def test_investigation_scope_accepts_explicit_version_syntax(prompt: str, expect
     )
 
     assert expected in scope.version_constraints
+
+
+def test_investigation_scope_preserves_local_version_separator():
+    scope = investigation_knowledge_scope(
+        tenant_id="tenant-a",
+        prompt="Investigate checkout release 1.2.3+build.7",
+        services=["checkout"],
+        archetype_ids=["latency_investigation"],
+    )
+
+    assert scope.version_constraints == ["version:1.2.3+build.7"]
 
 
 @pytest.mark.parametrize(
@@ -8499,7 +8864,10 @@ def test_global_knowledge_repository_uses_active_signal_store_path(tmp_path: Pat
 
 
 def test_tenant_id_collision_cannot_overwrite_candidate(tmp_path: Path):
-    repository = KnowledgeRepository(tmp_path / "knowledge.db")
+    repository = KnowledgeRepository(
+        tmp_path / "knowledge.db",
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
     first = _service(tmp_path, "tenant-a")
     candidate = _dependency(
         first,
@@ -8542,7 +8910,17 @@ def test_api_queue_tenant_and_permissions(tmp_path: Path, monkeypatch: pytest.Mo
     client = TestClient(app)
     response = client.get("/api/v1/knowledge/review-queue")
     assert response.status_code == 200
-    assert response.json()["candidates"][0]["id"] == candidate.id
+    payload = response.json()
+    assert payload["candidates"][0]["id"] == candidate.id
+    assert payload["candidate_has_more"] is False
+    assert payload["candidate_next_cursor"] is None
+    assert (
+        client.get(
+            "/api/v1/knowledge/review-queue",
+            params={"candidate_cursor": "not-a-cursor"},
+        ).status_code
+        == 400
+    )
     assert client.get("/api/v1/knowledge/review-queue", headers={"X-Tacit-Tenant": "tenant-b"}).status_code == 403
     assert (
         client.post(
@@ -8551,6 +8929,56 @@ def test_api_queue_tenant_and_permissions(tmp_path: Path, monkeypatch: pytest.Mo
         ).status_code
         == 403
     )
+
+
+def test_review_queue_candidates_use_stable_priority_keyset_pages(tmp_path: Path):
+    service = _service(tmp_path)
+    candidates = [
+        _dependency(
+            service,
+            payload_ref=f"review-page-{index}",
+            family=SourceFamily.RUNBOOK,
+            lineage_group=f"review-page-{index}",
+        )
+        for index in range(5)
+    ]
+    priorities = {
+        candidate.id: (100 if index == 3 else 20 if index in {1, 4} else 0)
+        for index, candidate in enumerate(candidates)
+    }
+    with service.repository._conn() as conn:
+        conn.executemany(
+            "UPDATE knowledge_candidates SET review_priority=? WHERE id=?",
+            [(priority, candidate_id) for candidate_id, priority in priorities.items()],
+        )
+
+    cursor = None
+    observed: list[str] = []
+    while True:
+        page = service.repository.list_review_candidates_page(
+            "default",
+            limit=2,
+            cursor=cursor,
+        )
+        observed.extend(candidate.id for candidate in page.candidates)
+        if not page.has_more:
+            assert page.next_cursor is None
+            break
+        cursor = page.next_cursor
+        assert cursor
+
+    assert observed == sorted(priorities, key=lambda candidate_id: (-priorities[candidate_id], candidate_id))
+    assert len(set(observed)) == len(candidates)
+    with service.repository._conn() as conn:
+        plan = conn.execute(
+            """EXPLAIN QUERY PLAN SELECT id, review_priority, candidate_json
+               FROM knowledge_candidates
+               WHERE tenant_id=? AND review_state='candidate'
+                 AND (review_priority < ? OR (review_priority = ? AND id > ?))
+               ORDER BY review_priority DESC, id LIMIT ?""",
+            ("default", 20, 20, "kc-cursor", 3),
+        ).fetchall()
+    assert any("idx_kc_review_queue" in str(row["detail"]) for row in plan)
 
 
 def test_candidate_audit_history_is_keyset_paginated_beyond_ten_thousand(
@@ -8656,6 +9084,498 @@ def test_candidate_audit_history_is_keyset_paginated_beyond_ten_thousand(
     assert any("idx_kc_tenant_created_page" in str(row["detail"]) for row in plan)
 
 
+def test_conflict_and_usage_apis_use_stable_keyset_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path)
+    _candidate, revision = _promoted_dependency(service)
+    base_time = datetime(2026, 1, 1, tzinfo=UTC)
+    for index in range(3):
+        service.repository.save_conflict(
+            KnowledgeConflict(
+                id=f"conflict-page-{index}",
+                conflict_kind=ConflictKind.DIRECT_NEGATION,
+                left_proposition_ref=f"left-{index}",
+                right_proposition_ref=f"right-{index}",
+                created_at=base_time + timedelta(seconds=index),
+            )
+        )
+        service.repository.save_usage(
+            KnowledgeUsage(
+                usage_id=f"usage-page-{index}",
+                investigation_id=f"inv-usage-page-{index}",
+                investigation_revision=1,
+                knowledge_ref=revision.knowledge_id,
+                knowledge_revision=revision.revision,
+                disposition=KnowledgeUsageDisposition.APPLIED,
+                used_for=["ranking"],
+                created_at=base_time + timedelta(seconds=index),
+            )
+        )
+
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda request: service.repository)
+    app = create_app(runtime_settings=Settings(_env_file=None, knowledge_permissions="knowledge.read"))
+    client = TestClient(app)
+
+    first_conflicts = client.get("/api/v1/knowledge/conflicts", params={"limit": 2})
+    assert first_conflicts.status_code == 200
+    assert [row["id"] for row in first_conflicts.json()] == ["conflict-page-2", "conflict-page-1"]
+    assert first_conflicts.headers["X-Tacit-Has-More"] == "true"
+    conflict_cursor = first_conflicts.headers["X-Tacit-Next-Cursor"]
+    second_conflicts = client.get(
+        "/api/v1/knowledge/conflicts",
+        params={"limit": 2, "cursor": conflict_cursor},
+    )
+    assert [row["id"] for row in second_conflicts.json()] == ["conflict-page-0"]
+    assert second_conflicts.headers["X-Tacit-Has-More"] == "false"
+    assert [
+        conflict.id
+        for conflict in service.repository.list_conflicts_page(
+            proposition_key="left-1",
+            limit=2,
+        ).conflicts
+    ] == ["conflict-page-1"]
+    assert [
+        conflict.id
+        for conflict in service.repository.list_conflicts_page(
+            proposition_key="right-2",
+            limit=2,
+        ).conflicts
+    ] == ["conflict-page-2"]
+
+    usage_url = f"/api/v1/knowledge/{revision.knowledge_id}/usage"
+    first_usage = client.get(usage_url, params={"limit": 2})
+    assert first_usage.status_code == 200
+    assert [row["usage_id"] for row in first_usage.json()] == ["usage-page-2", "usage-page-1"]
+    usage_cursor = first_usage.headers["X-Tacit-Next-Cursor"]
+    second_usage = client.get(usage_url, params={"limit": 2, "cursor": usage_cursor})
+    assert [row["usage_id"] for row in second_usage.json()] == ["usage-page-0"]
+    assert client.get(usage_url, params={"cursor": "not-a-cursor"}).status_code == 400
+    assert (
+        client.get(
+            usage_url,
+            params={"cursor": usage_cursor, "offset": 1},
+        ).status_code
+        == 400
+    )
+
+    with service.repository._conn() as conn:
+        conflict_plan = conn.execute(
+            """EXPLAIN QUERY PLAN SELECT conflict_id, created_at, conflict_json
+               FROM knowledge_conflicts
+               WHERE tenant_id=? AND (created_at < ? OR (created_at = ? AND conflict_id < ?))
+               ORDER BY created_at DESC, conflict_id DESC LIMIT ?""",
+            ("default", base_time.timestamp(), base_time.timestamp(), "conflict-page-0", 3),
+        ).fetchall()
+        usage_plan = conn.execute(
+            """EXPLAIN QUERY PLAN SELECT usage_id, created_at, usage_json
+               FROM knowledge_usage_events
+               WHERE tenant_id=? AND knowledge_id=?
+                 AND (created_at < ? OR (created_at = ? AND usage_id < ?))
+               ORDER BY created_at DESC, usage_id DESC LIMIT ?""",
+            (
+                "default",
+                revision.knowledge_id,
+                base_time.timestamp(),
+                base_time.timestamp(),
+                "usage-page-0",
+                3,
+            ),
+        ).fetchall()
+        left_conflict_plan = conn.execute(
+            """EXPLAIN QUERY PLAN SELECT conflict_id, created_at, conflict_json
+               FROM knowledge_conflicts
+               WHERE tenant_id=? AND left_proposition_key=?
+                 AND (created_at < ? OR (created_at = ? AND conflict_id < ?))
+               ORDER BY created_at DESC, conflict_id DESC LIMIT ?""",
+            ("default", "left-0", base_time.timestamp(), base_time.timestamp(), "conflict-page-0", 3),
+        ).fetchall()
+        investigation_usage_plan = conn.execute(
+            """EXPLAIN QUERY PLAN SELECT usage_id, created_at, usage_json
+               FROM knowledge_usage_events
+               WHERE tenant_id=? AND investigation_id=?
+                 AND (created_at < ? OR (created_at = ? AND usage_id < ?))
+               ORDER BY created_at DESC, usage_id DESC LIMIT ?""",
+            (
+                "default",
+                "inv-usage-page-0",
+                base_time.timestamp(),
+                base_time.timestamp(),
+                "usage-page-0",
+                3,
+            ),
+        ).fetchall()
+    assert any("idx_conflicts_tenant_created_page" in str(row["detail"]) for row in conflict_plan)
+    assert any("idx_knowledge_usage_item_created_page" in str(row["detail"]) for row in usage_plan)
+    assert any("idx_conflicts_tenant_left_created_page" in str(row["detail"]) for row in left_conflict_plan)
+    assert any(
+        "idx_knowledge_usage_investigation_created_page" in str(row["detail"]) for row in investigation_usage_plan
+    )
+
+
+def test_knowledge_keyset_pages_round_trip_empty_text_and_integer_boundaries(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate, revision = _promoted_dependency(service)
+    minimum_integer = -(2**63)
+    maximum_integer = 2**63 - 1
+    base_time = datetime(2030, 1, 1, tzinfo=UTC)
+
+    empty_candidate = candidate.model_copy(
+        update={
+            "id": "",
+            "payload_ref": "legal-key-empty-candidate",
+            "created_at": base_time + timedelta(seconds=4),
+            "updated_at": base_time + timedelta(seconds=4),
+        }
+    )
+    later_candidate = candidate.model_copy(
+        update={
+            "id": "legal-key-later-candidate",
+            "payload_ref": "legal-key-later-candidate",
+            "created_at": base_time + timedelta(seconds=3),
+            "updated_at": base_time + timedelta(seconds=3),
+        }
+    )
+    service.repository.save_candidate(empty_candidate)
+    service.repository.save_candidate(later_candidate)
+
+    first_candidates = service.repository.list_candidates_page(limit=1)
+    assert [item.id for item in first_candidates.candidates] == [""]
+    assert first_candidates.next_cursor is not None
+    assert [
+        item.id
+        for item in service.repository.list_candidates_page(
+            limit=1,
+            cursor=first_candidates.next_cursor,
+        ).candidates
+    ] == ["legal-key-later-candidate"]
+
+    first_reviews = service.repository.list_review_candidates_page("default", limit=1)
+    assert [item.id for item in first_reviews.candidates] == [""]
+    assert first_reviews.next_cursor is not None
+    assert (
+        service.repository.list_review_candidates_page(
+            "default",
+            limit=1,
+            cursor=first_reviews.next_cursor,
+        )
+        .candidates[0]
+        .id
+        != ""
+    )
+    for priority in (minimum_integer, 0, maximum_integer):
+        service.repository.list_review_candidates_page(
+            "default",
+            limit=1,
+            cursor=encode_cursor(priority, ""),
+        )
+
+    empty_conflict = KnowledgeConflict(
+        id="",
+        conflict_kind=ConflictKind.DIRECT_NEGATION,
+        left_proposition_ref="",
+        right_proposition_ref="legal-key-right-empty",
+        created_at=base_time + timedelta(seconds=2),
+    )
+    service.repository.save_conflict(empty_conflict)
+    service.repository.save_conflict(
+        empty_conflict.model_copy(
+            update={
+                "id": "legal-key-later-conflict",
+                "created_at": base_time + timedelta(seconds=1),
+            }
+        )
+    )
+    first_conflicts = service.repository.list_conflicts_page(limit=1)
+    assert [item.id for item in first_conflicts.conflicts] == [""]
+    assert first_conflicts.next_cursor is not None
+    assert [
+        item.id
+        for item in service.repository.list_conflicts_page(
+            limit=1,
+            cursor=first_conflicts.next_cursor,
+        ).conflicts
+    ] == ["legal-key-later-conflict"]
+    assert [
+        item.id
+        for item in service.repository.list_conflicts_page(
+            proposition_key="",
+            limit=1,
+        ).conflicts
+    ] == [""]
+
+    empty_usage = KnowledgeUsage(
+        usage_id="",
+        investigation_id="legal-key-empty-usage",
+        investigation_revision=0,
+        knowledge_ref=revision.knowledge_id,
+        knowledge_revision=revision.revision,
+        disposition=KnowledgeUsageDisposition.APPLIED,
+        created_at=base_time + timedelta(seconds=2),
+    )
+    later_usage = empty_usage.model_copy(
+        update={
+            "usage_id": "legal-key-later-usage",
+            "investigation_id": "legal-key-later-usage",
+            "created_at": base_time + timedelta(seconds=1),
+        }
+    )
+    empty_filter_usage = empty_usage.model_copy(
+        update={
+            "usage_id": "legal-key-empty-filter-usage",
+            "investigation_id": "",
+            "knowledge_ref": "",
+            "created_at": base_time,
+        }
+    )
+    with service.repository._conn() as conn:
+        conn.executemany(
+            """INSERT INTO knowledge_usage_events(
+                   usage_id, tenant_id, investigation_id, investigation_revision,
+                   knowledge_id, knowledge_revision, disposition, used_for_json,
+                   target_ref, score_delta, decision_ref, usage_json, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '', 0, '', ?, ?)""",
+            [
+                (
+                    usage.usage_id,
+                    usage.tenant_id,
+                    usage.investigation_id,
+                    usage.investigation_revision,
+                    usage.knowledge_ref,
+                    usage.knowledge_revision,
+                    usage.disposition.value,
+                    usage.model_dump_json(),
+                    usage.created_at.timestamp(),
+                )
+                for usage in (empty_usage, later_usage, empty_filter_usage)
+            ],
+        )
+    first_usage = service.repository.list_usage_page(knowledge_id=revision.knowledge_id, limit=1)
+    assert [item.usage_id for item in first_usage.usage] == [""]
+    assert first_usage.next_cursor is not None
+    assert [
+        item.usage_id
+        for item in service.repository.list_usage_page(
+            knowledge_id=revision.knowledge_id,
+            limit=1,
+            cursor=first_usage.next_cursor,
+        ).usage
+    ] == ["legal-key-later-usage"]
+    assert [
+        item.usage_id
+        for item in service.repository.list_usage_page(
+            knowledge_id="",
+            investigation_id="",
+            limit=1,
+        ).usage
+    ] == ["legal-key-empty-filter-usage"]
+    assert [
+        item.usage_id
+        for item in service.repository.list_usage(
+            knowledge_id="",
+            investigation_id="",
+            limit=1,
+        )
+    ] == ["legal-key-empty-filter-usage"]
+
+    empty_revision = revision.model_copy(
+        update={
+            "knowledge_id": "",
+            "proposition": revision.proposition.model_copy(update={"proposition_key": "legal-key-empty-authority"}),
+            "decision_ref": "legal-key-empty-decision",
+            "semantic_fingerprint": "sha256:legal-key-empty-authority",
+        }
+    )
+    with service.repository._conn() as conn:
+        conn.execute(
+            """INSERT INTO operational_knowledge(
+                   knowledge_id, tenant_id, kind, proposition_key, current_revision,
+                   status, created_at, updated_at
+               ) VALUES ('', ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                empty_revision.tenant_id,
+                empty_revision.proposition.kind.value,
+                empty_revision.proposition.proposition_key,
+                empty_revision.revision,
+                empty_revision.state.lifecycle_status.value,
+                empty_revision.created_at.timestamp(),
+                empty_revision.created_at.timestamp(),
+            ),
+        )
+        conn.execute(
+            """INSERT INTO operational_knowledge_revisions(
+                   knowledge_id, tenant_id, revision, parent_revision, schema_version,
+                   proposition_key, scope_json, review_state, lifecycle_status,
+                   eligibility, corroboration_snapshot_ref, policy_id, policy_version,
+                   revision_reason, content_json, semantic_fingerprint, created_at
+               ) VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                empty_revision.tenant_id,
+                empty_revision.revision,
+                empty_revision.parent_revision,
+                empty_revision.schema_version,
+                empty_revision.proposition.proposition_key,
+                empty_revision.scope.model_dump_json(),
+                empty_revision.state.review_state.value,
+                empty_revision.state.lifecycle_status.value,
+                empty_revision.state.eligibility.value,
+                empty_revision.corroboration_snapshot_ref,
+                empty_revision.policy_id,
+                empty_revision.policy_version,
+                empty_revision.revision_reason,
+                empty_revision.model_dump_json(),
+                empty_revision.semantic_fingerprint,
+                empty_revision.created_at.timestamp(),
+            ),
+        )
+
+    first_knowledge = service.repository.list_current_revisions_page(limit=1)
+    assert [item.knowledge_id for item in first_knowledge.revisions] == [""]
+    assert first_knowledge.next_cursor is not None
+    assert (
+        service.repository.list_current_revisions_page(
+            limit=1,
+            cursor=first_knowledge.next_cursor,
+        )
+        .revisions[0]
+        .knowledge_id
+        != ""
+    )
+    for revision_cursor in (minimum_integer, 0, maximum_integer):
+        service.repository.list_revisions_page(
+            revision.knowledge_id,
+            limit=1,
+            cursor=encode_cursor(revision_cursor),
+        )
+
+    for loader in (
+        lambda: service.repository.list_candidates_page(cursor=""),
+        lambda: service.repository.list_review_candidates_page("default", limit=1, cursor=""),
+        lambda: service.repository.list_conflicts_page(cursor=""),
+        lambda: service.repository.list_usage_page(cursor=""),
+        lambda: service.repository.list_revisions_page(revision.knowledge_id, cursor=""),
+        lambda: service.repository.list_current_revisions_page(cursor=""),
+    ):
+        with pytest.raises(ValueError, match="invalid .*cursor"):
+            loader()
+
+
+def test_provenance_entity_scope_and_source_scans_treat_empty_ids_as_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    source_ref = "provenance:legal-key-source"
+    base = _dependency(
+        service,
+        payload_ref="legal-key-source",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="legal-key-source",
+    )
+    empty_candidate = base.model_copy(update={"id": "", "payload_ref": "legal-key-empty-source"})
+    later_candidate = base.model_copy(update={"id": "legal-key-later-source", "payload_ref": "legal-key-later-source"})
+    service.repository.save_candidate(empty_candidate)
+    service.repository.save_candidate(later_candidate)
+
+    first_provenance = service.repository.list_candidates_for_provenance(
+        "default",
+        source_ref,
+        limit=1,
+    )
+    assert [item.id for item in first_provenance] == [""]
+    assert [
+        item.id
+        for item in service.repository.list_candidates_for_provenance(
+            "default",
+            source_ref,
+            after_candidate_id="",
+            limit=1,
+        )
+    ] == [base.id]
+
+    first_entity = service.repository.list_candidates_for_entity(
+        "default",
+        "entity:service:checkout",
+        limit=1,
+    )
+    assert [item.id for item in first_entity] == [""]
+    assert (
+        service.repository.list_candidates_for_entity(
+            "default",
+            "entity:service:checkout",
+            after_candidate_id="",
+            limit=1,
+        )[0].id
+        != ""
+    )
+
+    candidate, revision = _promoted_dependency(service)
+    empty_revision = revision.model_copy(
+        update={
+            "knowledge_id": "",
+            "proposition": revision.proposition.model_copy(update={"proposition_key": "legal-key-empty-scope"}),
+            "decision_ref": "legal-key-empty-scope",
+            "semantic_fingerprint": "sha256:legal-key-empty-scope",
+        }
+    )
+    with service.repository._conn() as conn:
+        conn.execute(
+            """INSERT INTO operational_knowledge(
+                   knowledge_id, tenant_id, kind, proposition_key, current_revision,
+                   status, created_at, updated_at
+               ) VALUES ('', 'default', ?, ?, 1, 'active', ?, ?)""",
+            (
+                empty_revision.proposition.kind.value,
+                empty_revision.proposition.proposition_key,
+                empty_revision.created_at.timestamp(),
+                empty_revision.created_at.timestamp(),
+            ),
+        )
+        conn.execute(
+            """INSERT INTO operational_knowledge_revisions(
+                   knowledge_id, tenant_id, revision, parent_revision, schema_version,
+                   proposition_key, scope_json, review_state, lifecycle_status,
+                   eligibility, corroboration_snapshot_ref, policy_id, policy_version,
+                   revision_reason, content_json, semantic_fingerprint, created_at
+               ) VALUES ('', 'default', 1, NULL, '1.0', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                empty_revision.proposition.proposition_key,
+                empty_revision.scope.model_dump_json(),
+                empty_revision.state.review_state.value,
+                empty_revision.state.lifecycle_status.value,
+                empty_revision.state.eligibility.value,
+                empty_revision.corroboration_snapshot_ref,
+                empty_revision.policy_id,
+                empty_revision.policy_version,
+                empty_revision.revision_reason,
+                empty_revision.model_dump_json(),
+                empty_revision.semantic_fingerprint,
+                empty_revision.created_at.timestamp(),
+            ),
+        )
+    scope = KnowledgeScope(
+        environment_refs=["environment:production"],
+        service_refs=["entity:service:checkout"],
+    )
+    first_scope = service.repository.list_current_revisions_for_scope(scope, limit=1)
+    assert [item.knowledge_id for item in first_scope] == [""]
+    assert (
+        service.repository.list_current_revisions_for_scope(
+            scope,
+            limit=1,
+            after_knowledge_id="",
+        )[0].knowledge_id
+        != ""
+    )
+
+    monkeypatch.setattr("tacit.knowledge.service._SOURCE_RECONCILIATION_PAGE_SIZE", 1)
+    service.reconcile_source_lifecycle(provenance_ref=source_ref, source_stale=True)
+    for candidate_id in ("", base.id, later_candidate.id):
+        persisted = service.repository.get_candidate(candidate_id)
+        assert persisted is not None
+        assert persisted.state.lifecycle_status == LifecycleStatus.STALE
+
+
 def test_candidate_cli_returns_and_accepts_keyset_cursor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     service = _service(tmp_path)
     for index in range(3):
@@ -8686,6 +9606,186 @@ def test_candidate_cli_returns_and_accepts_keyset_cursor(tmp_path: Path, monkeyp
     second_payload = json.loads(second.output)
     assert len(second_payload["candidates"]) == 1
     assert second_payload["has_more"] is False
+
+
+def test_current_knowledge_api_and_cli_use_filtered_keyset_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path)
+    with pytest.raises(ValueError, match="between 1 and 500"):
+        service.repository.list_current_revisions_page(limit=501)
+    for index in range(3):
+        _promoted_signal_mapping(
+            service,
+            suffix=f"knowledge-page-{index}",
+            metric_pattern=f"knowledge_page_{index}_seconds",
+        )
+
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda _request: service.repository)
+    app = create_app(runtime_settings=Settings(_env_file=None, knowledge_permissions="knowledge.read"))
+    client = TestClient(app)
+    first = client.get(
+        "/api/v1/knowledge",
+        params={"kind": "signal_mapping", "status": "active", "limit": 2},
+    )
+    assert first.status_code == 200, first.text
+    assert len(first.json()) == 2
+    assert first.headers["X-Tacit-Has-More"] == "true"
+    second = client.get(
+        "/api/v1/knowledge",
+        params={
+            "kind": "signal_mapping",
+            "status": "active",
+            "limit": 2,
+            "cursor": first.headers["X-Tacit-Next-Cursor"],
+        },
+    )
+    assert len(second.json()) == 1
+    assert second.headers["X-Tacit-Has-More"] == "false"
+    assert client.get("/api/v1/knowledge", params={"cursor": "invalid"}).status_code == 400
+    assert (
+        client.get(
+            "/api/v1/knowledge",
+            params={"cursor": first.headers["X-Tacit-Next-Cursor"], "offset": 1},
+        ).status_code
+        == 400
+    )
+
+    stores = SimpleNamespace(
+        settings=Settings(_env_file=None, knowledge_permissions="knowledge.read"),
+        knowledge_repository=lambda: service.repository,
+    )
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: stores)
+    cli_first = CliRunner().invoke(
+        cli,
+        ["knowledge", "list", "--kind", "signal_mapping", "--status", "active", "--limit", "2"],
+    )
+    assert cli_first.exit_code == 0, cli_first.output
+    cli_payload = json.loads(cli_first.output)
+    assert len(cli_payload["revisions"]) == 2
+    assert cli_payload["has_more"] is True
+    cli_second = CliRunner().invoke(
+        cli,
+        [
+            "knowledge",
+            "list",
+            "--kind",
+            "signal_mapping",
+            "--status",
+            "active",
+            "--limit",
+            "2",
+            "--cursor",
+            cli_payload["next_cursor"],
+        ],
+    )
+    assert cli_second.exit_code == 0, cli_second.output
+    assert len(json.loads(cli_second.output)["revisions"]) == 1
+
+    with service.repository._conn() as conn:
+        plan = conn.execute(
+            """EXPLAIN QUERY PLAN SELECT knowledge_id FROM operational_knowledge
+               WHERE tenant_id=? AND kind=? AND status=? AND knowledge_id>?
+               ORDER BY knowledge_id LIMIT ?""",
+            ("default", "signal_mapping", "active", "", 3),
+        ).fetchall()
+        kind_only_plan = conn.execute(
+            """EXPLAIN QUERY PLAN SELECT knowledge_id FROM operational_knowledge
+               WHERE tenant_id=? AND kind=? AND knowledge_id>?
+               ORDER BY knowledge_id LIMIT ?""",
+            ("default", "signal_mapping", "", 3),
+        ).fetchall()
+    assert any(
+        index_name in str(row["detail"])
+        for row in plan
+        for index_name in (
+            "idx_operational_knowledge_kind_page",
+            "idx_operational_knowledge_signal_projection_page",
+        )
+    )
+    assert any("idx_operational_knowledge_kind_id_page" in str(row["detail"]) for row in kind_only_plan)
+
+
+def test_knowledge_audit_cli_and_revision_api_use_keyset_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    service = _service(tmp_path)
+    candidate, first_revision = _promoted_dependency(service)
+    previous = first_revision
+    for revision_number in (2, 3):
+        current = previous.model_copy(
+            update={
+                "revision": revision_number,
+                "parent_revision": revision_number - 1,
+                "revision_reason": f"pagination-{revision_number}",
+                "semantic_fingerprint": f"sha256:pagination-{revision_number}",
+            }
+        )
+        service.repository.persist_revision(
+            current,
+            candidate_id=candidate.id,
+            decision_ref=f"decision-pagination-{revision_number}",
+            expected_parent_revision=revision_number - 1,
+        )
+        previous = current
+
+    base_time = datetime(2026, 1, 1, tzinfo=UTC)
+    for index in range(3):
+        service.repository.save_conflict(
+            KnowledgeConflict(
+                id=f"cli-conflict-{index}",
+                conflict_kind=ConflictKind.DIRECT_NEGATION,
+                left_proposition_ref=f"left-cli-{index}",
+                right_proposition_ref=f"right-cli-{index}",
+                created_at=base_time + timedelta(seconds=index),
+            )
+        )
+        service.repository.save_usage(
+            KnowledgeUsage(
+                usage_id=f"cli-usage-{index}",
+                investigation_id=f"inv-cli-usage-{index}",
+                investigation_revision=1,
+                knowledge_ref=first_revision.knowledge_id,
+                knowledge_revision=first_revision.revision,
+                disposition=KnowledgeUsageDisposition.APPLIED,
+                used_for=["ranking"],
+                created_at=base_time + timedelta(seconds=index),
+            )
+        )
+
+    import tacit.api.routes.knowledge as routes
+
+    monkeypatch.setattr(routes, "get_knowledge_repository", lambda _request: service.repository)
+    app = create_app(runtime_settings=Settings(_env_file=None, knowledge_permissions="knowledge.read"))
+    client = TestClient(app)
+    revision_url = f"/api/v1/knowledge/{first_revision.knowledge_id}/revisions"
+    first_api = client.get(revision_url, params={"limit": 2})
+    assert first_api.status_code == 200
+    assert [row["revision"] for row in first_api.json()] == [1, 2]
+    second_api = client.get(
+        revision_url,
+        params={"limit": 2, "cursor": first_api.headers["X-Tacit-Next-Cursor"]},
+    )
+    assert [row["revision"] for row in second_api.json()] == [3]
+    assert client.get(revision_url, params={"cursor": "invalid"}).status_code == 400
+
+    stores = SimpleNamespace(
+        settings=Settings(_env_file=None, knowledge_permissions="knowledge.read"),
+        knowledge_repository=lambda: service.repository,
+    )
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: stores)
+    runner = CliRunner()
+    for arguments, resource in (
+        (["knowledge", "conflicts", "--limit", "2"], "conflicts"),
+        (["knowledge", "history", first_revision.knowledge_id, "--limit", "2"], "revisions"),
+        (["knowledge", "usage", first_revision.knowledge_id, "--limit", "2"], "usage"),
+    ):
+        first = runner.invoke(cli, arguments)
+        assert first.exit_code == 0, first.output
+        payload = json.loads(first.output)
+        assert len(payload[resource]) == 2
+        assert payload["has_more"] is True
+        second = runner.invoke(cli, [*arguments, "--cursor", payload["next_cursor"]])
+        assert second.exit_code == 0, second.output
+        assert len(json.loads(second.output)[resource]) == 1
 
 
 def test_review_queue_prioritizes_before_applying_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -8731,6 +9831,385 @@ def test_review_queue_prioritizes_before_applying_limit(tmp_path: Path, monkeypa
             ("default", 1),
         ).fetchall()
     assert any("idx_kc_review_queue" in str(row["detail"]) for row in plan)
+
+
+def test_knowledge_migration_queries_use_composite_keyset_indexes(tmp_path: Path):
+    service = _service(tmp_path)
+    with service.repository._conn() as conn:
+        plans = {
+            "candidate": conn.execute(
+                """EXPLAIN QUERY PLAN
+                   SELECT candidate.id, candidate.tenant_id, candidate.candidate_json,
+                          (
+                            EXISTS (
+                              SELECT 1 FROM knowledge_conflicts conflict
+                              WHERE conflict.tenant_id=candidate.tenant_id
+                                AND conflict.left_proposition_key=candidate.proposition_key
+                                AND conflict.resolution_status='unresolved'
+                            ) OR EXISTS (
+                              SELECT 1 FROM knowledge_conflicts conflict
+                              WHERE conflict.tenant_id=candidate.tenant_id
+                                AND conflict.right_proposition_key=candidate.proposition_key
+                                AND conflict.resolution_status='unresolved'
+                            )
+                          ) AS has_unresolved_conflict
+                   FROM knowledge_candidates candidate
+                   WHERE (candidate.tenant_id, candidate.id) > (?, ?)
+                   ORDER BY candidate.tenant_id, candidate.id LIMIT ?""",
+                ("", "", 500),
+            ).fetchall(),
+            "correction": conn.execute(
+                """EXPLAIN QUERY PLAN
+                   SELECT tenant_id, correction_id, correction_json
+                   FROM knowledge_corrections
+                   WHERE (tenant_id, correction_id) > (?, ?)
+                   ORDER BY tenant_id, correction_id LIMIT ?""",
+                ("", "", 500),
+            ).fetchall(),
+            "current": conn.execute(
+                """EXPLAIN QUERY PLAN
+                   SELECT current.tenant_id, current.knowledge_id,
+                          current.current_revision, revision.content_json
+                   FROM operational_knowledge current
+                   LEFT JOIN operational_knowledge_revisions revision
+                     ON revision.tenant_id=current.tenant_id
+                    AND revision.knowledge_id=current.knowledge_id
+                    AND revision.revision=current.current_revision
+                   WHERE (current.tenant_id, current.knowledge_id) > (?, ?)
+                   ORDER BY current.tenant_id, current.knowledge_id LIMIT ?""",
+                ("", "", 500),
+            ).fetchall(),
+            "conflict": conn.execute(
+                """EXPLAIN QUERY PLAN
+                   SELECT conflict_id, tenant_id, left_proposition_key,
+                          right_proposition_key, conflict_json
+                   FROM knowledge_conflicts
+                   WHERE resolution_status='unresolved'
+                     AND (tenant_id, conflict_id) > (?, ?)
+                   ORDER BY tenant_id, conflict_id LIMIT ?""",
+                ("", "", 500),
+            ).fetchall(),
+        }
+
+    expected_indexes = {
+        "candidate": "sqlite_autoindex_knowledge_candidates_2",
+        "correction": "idx_knowledge_corrections_migration_page",
+        "current": "sqlite_autoindex_operational_knowledge_1",
+        "conflict": "idx_conflicts_migration_page",
+    }
+    for source, plan in plans.items():
+        details = [str(row["detail"]) for row in plan]
+        assert any(expected_indexes[source] in detail for detail in details)
+        assert not any("USE TEMP B-TREE" in detail for detail in details)
+
+
+def _seed_invalid_first_knowledge_migration_row(
+    service: KnowledgeService,
+    *,
+    record_class: str,
+    row_id: str = "",
+    missing_current_revision: bool = False,
+) -> None:
+    invalid_json = '{"startup-exception-canary":'
+    with service.repository._conn() as conn:
+        if record_class == "candidate":
+            template = conn.execute("SELECT * FROM knowledge_candidates ORDER BY id LIMIT 1").fetchone()
+            assert template is not None
+            conn.execute(
+                """INSERT INTO knowledge_candidates(
+                       id, tenant_id, kind, payload_ref, proposition_key, scope_json,
+                       review_state, lifecycle_status, eligibility, entity_resolution_status,
+                       promotion_policy_id, promotion_policy_version, review_priority,
+                       has_unresolved_conflict, candidate_json, source_updated_at,
+                       created_at, updated_at
+                   ) VALUES (?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, ?, ?)""",
+                (
+                    row_id,
+                    template["kind"],
+                    f"invalid-migration:{row_id}",
+                    f"invalid-proposition:{row_id}",
+                    template["scope_json"],
+                    template["review_state"],
+                    template["lifecycle_status"],
+                    template["eligibility"],
+                    template["entity_resolution_status"],
+                    template["promotion_policy_id"],
+                    template["promotion_policy_version"],
+                    invalid_json,
+                    template["created_at"],
+                    template["updated_at"],
+                ),
+            )
+        elif record_class == "correction":
+            conn.execute(
+                """INSERT INTO knowledge_corrections(
+                       correction_id, tenant_id, investigation_id, investigation_revision,
+                       correction_type, target_ref, applied_knowledge_ref,
+                       applied_knowledge_revision, review_state, candidate_ref,
+                       correction_json, created_at, updated_at
+                   ) VALUES (?, '', '', 0, 'dependency', '', '', NULL,
+                             'candidate', '', ?, 0, 0)""",
+                (row_id, invalid_json),
+            )
+        elif record_class == "knowledge_revision":
+            conn.execute(
+                """INSERT INTO operational_knowledge(
+                       knowledge_id, tenant_id, kind, proposition_key, current_revision,
+                       status, created_at, updated_at
+                   ) VALUES (?, '', 'dependency', ?, 0, 'active', 0, 0)""",
+                (row_id, f"invalid-authority:{row_id}"),
+            )
+            if not missing_current_revision:
+                conn.execute(
+                    """INSERT INTO operational_knowledge_revisions(
+                           knowledge_id, tenant_id, revision, parent_revision, schema_version,
+                           proposition_key, scope_json, review_state, lifecycle_status,
+                           eligibility, corroboration_snapshot_ref, policy_id, policy_version,
+                           revision_reason, content_json, semantic_fingerprint, created_at
+                       ) VALUES (?, '', 0, NULL, '1.0', ?, '{}', 'approved',
+                                 'active', 'contextual_only', '', '', '', '', ?, '', 0)""",
+                    (row_id, f"invalid-authority:{row_id}", invalid_json),
+                )
+        elif record_class == "conflict":
+            conn.execute(
+                """INSERT INTO knowledge_conflicts(
+                       conflict_id, tenant_id, left_proposition_key, right_proposition_key,
+                       conflict_kind, resolution_status, severity, conflict_json, created_at
+                   ) VALUES (?, '', 'left', 'right', 'direct_negation',
+                             'unresolved', 'medium', ?, 0)""",
+                (row_id, invalid_json),
+            )
+        else:
+            raise AssertionError(f"unsupported migration fixture class: {record_class}")
+
+
+@pytest.mark.parametrize(
+    ("migration_name", "record_class", "missing_current_revision"),
+    [
+        ("candidate_review_priority_v2", "candidate", False),
+        ("correction_applied_projection_v1", "correction", False),
+        ("candidate_provenance_index_v1", "candidate", False),
+        ("candidate_entity_refs_v1", "candidate", False),
+        ("current_knowledge_scope_projection_v1", "knowledge_revision", True),
+        ("current_knowledge_contributor_projection_v1", "knowledge_revision", False),
+        ("resolve_conflicts_without_independent_support_v1", "conflict", False),
+    ],
+)
+def test_each_knowledge_migration_checks_its_empty_first_key_before_certifying(
+    tmp_path: Path,
+    migration_name: str,
+    record_class: str,
+    missing_current_revision: bool,
+):
+    service = _service(tmp_path)
+    if record_class == "candidate":
+        _dependency(
+            service,
+            payload_ref=f"migration-template:{migration_name}",
+            family=SourceFamily.RUNBOOK,
+            lineage_group=f"migration-template:{migration_name}",
+        )
+    _seed_invalid_first_knowledge_migration_row(
+        service,
+        record_class=record_class,
+        missing_current_revision=missing_current_revision,
+    )
+    with service.repository._conn() as conn:
+        conn.execute("DELETE FROM knowledge_migrations WHERE migration_name=?", (migration_name,))
+        conn.execute("DELETE FROM knowledge_migration_progress WHERE migration_name=?", (migration_name,))
+
+    with capture_logs() as logs, pytest.raises(RuntimeError, match="knowledge_migration_invalid_record") as exc_info:
+        KnowledgeRepository(service.repository.database_path)
+
+    rendered = json.dumps(logs, sort_keys=True) + str(exc_info.value)
+    assert "startup-exception-canary" not in rendered
+    failure = next(entry for entry in logs if entry["event"] == "knowledge_repository_migration_failed")
+    assert failure["reason_code"] == "knowledge_migration_invalid_record"
+    assert failure["migration_name"] == migration_name
+    assert failure["record_class"] == record_class
+    assert failure["record_count"] == 1
+    assert len(failure["record_fingerprint"]) == 12
+    assert len(failure["failure_fingerprint"]) == 12
+    with sqlite3.connect(service.repository.database_path) as conn:
+        marker = conn.execute(
+            "SELECT 1 FROM knowledge_migrations WHERE migration_name=?",
+            (migration_name,),
+        ).fetchone()
+    assert marker is None
+
+
+def test_legacy_knowledge_completion_markers_are_not_false_certification(tmp_path: Path):
+    service = _service(tmp_path)
+    _dependency(
+        service,
+        payload_ref="legacy-false-certification-template",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="legacy-false-certification-template",
+    )
+    _seed_invalid_first_knowledge_migration_row(service, record_class="candidate")
+    migration_name = "candidate_provenance_index_v1"
+    with service.repository._conn() as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM knowledge_migrations WHERE migration_name=?",
+                (migration_name,),
+            ).fetchone()
+            is not None
+        )
+        conn.execute("ALTER TABLE knowledge_migration_progress DROP COLUMN cursor_started")
+
+    with pytest.raises(RuntimeError, match="knowledge_migration_invalid_record"):
+        KnowledgeRepository(service.repository.database_path)
+
+    with sqlite3.connect(service.repository.database_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(knowledge_migration_progress)")}
+        marker = conn.execute(
+            "SELECT 1 FROM knowledge_migrations WHERE migration_name=?",
+            (migration_name,),
+        ).fetchone()
+    assert "cursor_started" in columns
+    assert marker is None
+
+
+@pytest.mark.parametrize(
+    ("migration_name", "record_class", "identity_canary"),
+    [
+        ("candidate_provenance_index_v1", "candidate", "candidate-identity-canary"),
+        (
+            "current_knowledge_scope_projection_v1",
+            "knowledge_revision",
+            "authority-identity-canary",
+        ),
+    ],
+)
+def test_knowledge_startup_failure_diagnostics_fingerprint_raw_authority_ids(
+    tmp_path: Path,
+    migration_name: str,
+    record_class: str,
+    identity_canary: str,
+):
+    service = _service(tmp_path)
+    if record_class == "candidate":
+        _dependency(
+            service,
+            payload_ref="diagnostic-template",
+            family=SourceFamily.RUNBOOK,
+            lineage_group="diagnostic-template",
+        )
+    _seed_invalid_first_knowledge_migration_row(
+        service,
+        record_class=record_class,
+        row_id=identity_canary,
+    )
+    with service.repository._conn() as conn:
+        conn.execute("DELETE FROM knowledge_migrations WHERE migration_name=?", (migration_name,))
+
+    with capture_logs() as logs, pytest.raises(RuntimeError) as exc_info:
+        KnowledgeRepository(service.repository.database_path)
+
+    rendered = json.dumps(logs, sort_keys=True) + str(exc_info.value)
+    assert identity_canary not in rendered
+    assert "startup-exception-canary" not in rendered
+    failure = next(entry for entry in logs if entry["event"] == "knowledge_repository_migration_failed")
+    assert failure["record_class"] == record_class
+    assert failure["record_count"] == 1
+    assert len(failure["record_fingerprint"]) == 12
+
+
+def test_candidate_projection_migration_resumes_after_committed_empty_composite_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    template = _dependency(
+        service,
+        payload_ref="empty-migration-cursor-template",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="empty-migration-cursor-template",
+    )
+    empty_scope = template.scope.model_copy(update={"tenant_id": ""})
+    empty_candidate = template.model_copy(
+        update={
+            "id": "",
+            "tenant_id": "",
+            "scope": empty_scope,
+            "payload_ref": "empty-migration-cursor",
+        }
+    )
+    later_candidate = empty_candidate.model_copy(
+        update={"id": "later-empty-tenant-candidate", "payload_ref": "later-empty-tenant-candidate"}
+    )
+    service.repository.save_candidate(empty_candidate)
+    service.repository.save_candidate(later_candidate)
+    migration_name = "candidate_provenance_index_v1"
+    with service.repository._conn() as conn:
+        conn.execute("DELETE FROM knowledge_candidate_provenance WHERE tenant_id='' ")
+        conn.execute("DELETE FROM knowledge_migrations WHERE migration_name=?", (migration_name,))
+        conn.execute("DELETE FROM knowledge_migration_progress WHERE migration_name=?", (migration_name,))
+
+    original_replace = KnowledgeRepository._replace_candidate_provenance
+    processed = 0
+
+    def interrupt_second_page(conn: sqlite3.Connection, candidate: KnowledgeCandidate) -> None:
+        nonlocal processed
+        processed += 1
+        if processed == 2:
+            raise RuntimeError("migration-interruption-text-canary")
+        original_replace(conn, candidate)
+
+    monkeypatch.setattr("tacit.knowledge.repository._MIGRATION_BATCH_SIZE", 1)
+    monkeypatch.setattr(
+        KnowledgeRepository,
+        "_replace_candidate_provenance",
+        staticmethod(interrupt_second_page),
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        KnowledgeRepository(service.repository.database_path)
+    assert "migration-interruption-text-canary" not in str(exc_info.value)
+
+    with sqlite3.connect(service.repository.database_path) as conn:
+        progress = conn.execute(
+            """SELECT cursor_tenant, cursor_id, cursor_started
+               FROM knowledge_migration_progress WHERE migration_name=?""",
+            (migration_name,),
+        ).fetchone()
+        marker = conn.execute(
+            "SELECT 1 FROM knowledge_migrations WHERE migration_name=?",
+            (migration_name,),
+        ).fetchone()
+    assert progress == ("", "", 1)
+    assert marker is None
+
+    resumed_ids: list[str] = []
+
+    def track_resume(conn: sqlite3.Connection, candidate: KnowledgeCandidate) -> None:
+        resumed_ids.append(candidate.id)
+        original_replace(conn, candidate)
+
+    monkeypatch.setattr(
+        KnowledgeRepository,
+        "_replace_candidate_provenance",
+        staticmethod(track_resume),
+    )
+    reopened = KnowledgeRepository(service.repository.database_path)
+
+    assert "" not in resumed_ids
+    assert later_candidate.id in resumed_ids
+    with reopened._conn() as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM knowledge_migrations WHERE migration_name=?",
+                (migration_name,),
+            ).fetchone()
+            is not None
+        )
+        assert (
+            conn.execute(
+                "SELECT 1 FROM knowledge_migration_progress WHERE migration_name=?",
+                (migration_name,),
+            ).fetchone()
+            is None
+        )
 
 
 def test_review_priority_migration_processes_multiple_bounded_batches(tmp_path: Path):
@@ -8819,8 +10298,9 @@ def test_review_priority_backfill_resumes_when_interrupted(
         raise RuntimeError("interrupted review priority backfill")
 
     monkeypatch.setattr(repository_module, "_candidate_review_priority", fail_priority_backfill)
-    with pytest.raises(RuntimeError, match="interrupted review priority backfill"):
+    with pytest.raises(RuntimeError, match="knowledge_migration_batch_failed") as exc_info:
         KnowledgeRepository(service.repository._db_path)
+    assert "interrupted review priority backfill" not in str(exc_info.value)
 
     with sqlite3.connect(service.repository._db_path) as conn:
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(knowledge_candidates)")}
@@ -8839,6 +10319,70 @@ def test_review_priority_backfill_resumes_when_interrupted(
         ).fetchone()
     assert "review_priority" in columns
     assert marker is not None
+
+
+def test_review_priority_backfill_resumes_from_last_committed_keyset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = _service(tmp_path)
+    for index in range(4):
+        _dependency(
+            service,
+            payload_ref=f"durable-priority-{index}",
+            family=SourceFamily.RUNBOOK,
+            lineage_group=f"durable-priority-{index}",
+        )
+    with service.repository._conn() as conn:
+        candidate_ids = [
+            str(row["id"])
+            for row in conn.execute("SELECT id FROM knowledge_candidates ORDER BY tenant_id, id").fetchall()
+        ]
+        conn.execute("DELETE FROM knowledge_migrations WHERE migration_name='candidate_review_priority_v2'")
+        conn.execute("DELETE FROM knowledge_migration_progress WHERE migration_name='candidate_review_priority_v2'")
+    assert len(candidate_ids) == 4
+
+    import tacit.knowledge.repository as repository_module
+
+    original_priority = repository_module._candidate_review_priority
+    processed = 0
+
+    def fail_in_second_batch(*args, **kwargs):
+        nonlocal processed
+        processed += 1
+        if processed == 3:
+            raise RuntimeError("interrupted after committed migration page")
+        return original_priority(*args, **kwargs)
+
+    monkeypatch.setattr(repository_module, "_MIGRATION_BATCH_SIZE", 2)
+    monkeypatch.setattr(repository_module, "_candidate_review_priority", fail_in_second_batch)
+    with pytest.raises(RuntimeError, match="knowledge_migration_batch_failed") as exc_info:
+        KnowledgeRepository(service.repository._db_path)
+    assert "interrupted after committed migration page" not in str(exc_info.value)
+
+    with sqlite3.connect(service.repository._db_path) as conn:
+        cursor = conn.execute("""SELECT cursor_tenant, cursor_id FROM knowledge_migration_progress
+               WHERE migration_name='candidate_review_priority_v2'""").fetchone()
+    assert cursor == ("default", candidate_ids[1])
+
+    resumed_ids: list[str] = []
+
+    def track_resumed(candidate, *args, **kwargs):
+        resumed_ids.append(candidate.id)
+        return original_priority(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(repository_module, "_candidate_review_priority", track_resumed)
+    reopened = KnowledgeRepository(service.repository._db_path)
+
+    assert resumed_ids == candidate_ids[2:]
+    with reopened._conn() as conn:
+        marker = conn.execute(
+            "SELECT 1 FROM knowledge_migrations WHERE migration_name='candidate_review_priority_v2'"
+        ).fetchone()
+        progress = conn.execute("""SELECT 1 FROM knowledge_migration_progress
+               WHERE migration_name='candidate_review_priority_v2'""").fetchone()
+    assert marker is not None
+    assert progress is None
 
 
 def test_derived_knowledge_indexes_rebuild_in_resumable_batches(
@@ -8886,6 +10430,57 @@ def test_derived_knowledge_indexes_rebuild_in_resumable_batches(
                 (revision.tenant_id, revision.knowledge_id, revision.revision),
             ).fetchone()[0]
             == 2
+        )
+
+
+def test_candidate_provenance_migration_fails_closed_on_invalid_authority_row(tmp_path: Path):
+    service = _service(tmp_path)
+    candidate = _dependency(
+        service,
+        payload_ref="invalid-provenance-migration",
+        family=SourceFamily.RUNBOOK,
+        lineage_group="invalid-provenance-migration",
+    )
+    migration_name = "candidate_provenance_index_v1"
+    with service.repository._conn() as conn:
+        conn.execute("UPDATE knowledge_candidates SET candidate_json='{' WHERE id=?", (candidate.id,))
+        conn.execute("DELETE FROM knowledge_migrations WHERE migration_name=?", (migration_name,))
+
+    with pytest.raises(RuntimeError, match="knowledge_migration_invalid_record"):
+        KnowledgeRepository(service.repository._db_path)
+
+    with sqlite3.connect(service.repository._db_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM knowledge_migrations WHERE migration_name=?",
+                (migration_name,),
+            ).fetchone()
+            is None
+        )
+
+
+def test_scope_projection_migration_fails_closed_on_invalid_authority_row(tmp_path: Path):
+    service = _service(tmp_path)
+    _candidate, revision = _promoted_dependency(service)
+    migration_name = "current_knowledge_scope_projection_v1"
+    with service.repository._conn() as conn:
+        conn.execute(
+            """UPDATE operational_knowledge_revisions SET content_json='{'
+               WHERE tenant_id=? AND knowledge_id=? AND revision=?""",
+            (revision.tenant_id, revision.knowledge_id, revision.revision),
+        )
+        conn.execute("DELETE FROM knowledge_migrations WHERE migration_name=?", (migration_name,))
+
+    with pytest.raises(RuntimeError, match="knowledge_migration_invalid_record"):
+        KnowledgeRepository(service.repository._db_path)
+
+    with sqlite3.connect(service.repository._db_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM knowledge_migrations WHERE migration_name=?",
+                (migration_name,),
+            ).fetchone()
+            is None
         )
 
 
@@ -9028,7 +10623,7 @@ def test_api_generic_candidate_review_rejects_correction_owned_candidates(
     assert response.json()["detail"] == "correction candidates must be reviewed through the correction workflow"
 
 
-def test_api_correction_lookup_is_scoped_before_authorization():
+def test_api_correction_lookup_is_scoped_before_authorization(tmp_path: Path):
     import tacit.api.routes.knowledge as routes
 
     class RecordingHistoryStore:
@@ -9046,6 +10641,8 @@ def test_api_correction_lookup_is_scoped_before_authorization():
             api_auth_enabled=True,
             knowledge_tenant_api_keys={"tenant-a": "tenant-a-secret"},
             knowledge_permissions="knowledge.read,knowledge.correct",
+            signals_db_path=str(tmp_path / "signals.db"),
+            history_db_path=str(tmp_path / "history.db"),
         )
     )
     app.dependency_overrides[routes.get_history_store] = lambda: history
@@ -9095,6 +10692,53 @@ def test_api_reports_concurrent_candidate_review_as_conflict(monkeypatch: pytest
 
     assert response.status_code == 409
     assert response.json()["detail"] == "candidate review state changed; reload before reviewing"
+
+
+def test_api_candidate_review_uses_authenticated_credential_as_audit_actor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import tacit.api.routes.knowledge as routes
+
+    service = _service(tmp_path, tenant_id="tenant-a")
+    candidate_id = migrate_signal_mapping(
+        {
+            "id": "credential-actor-candidate",
+            "signal_type": "request_latency",
+            "metric_pattern": "checkout_latency_seconds",
+            "source_type": "dashboard_ingest",
+            "source_refs": ["grafana:checkout"],
+        },
+        service=service,
+        tenant_id="tenant-a",
+    )
+    monkeypatch.setattr(routes, "get_knowledge_service", lambda request: service)
+    client = TestClient(
+        create_app(
+            runtime_settings=Settings(
+                _env_file=None,
+                knowledge_tenant_id="tenant-a",
+                api_auth_enabled=True,
+                api_auth_key="tenant-a-secret",
+                knowledge_permissions="knowledge.read,knowledge.review",
+            )
+        )
+    )
+
+    response = client.post(
+        f"/api/v1/knowledge/candidates/{candidate_id}/review",
+        headers={"X-API-Key": "tenant-a-secret"},
+        json={"decision": "approve", "reviewer": "spoofed-operator", "evaluate": False},
+    )
+
+    assert response.status_code == 200
+    event = next(
+        item
+        for item in service.repository.list_events("tenant-a", limit=1_000)
+        if item["subject_ref"] == candidate_id and item["event_type"] == "promotion_evaluated"
+    )
+    assert event["payload"]["reviewer"] == "api-key:tenant-a"
+    assert "spoofed-operator" not in event["payload"]["reviewer"]
 
 
 @pytest.mark.parametrize(
@@ -9599,6 +11243,13 @@ def test_cli_trust_requires_review_and_trust_permissions(monkeypatch: pytest.Mon
 @pytest.mark.parametrize(
     ("arguments", "permissions", "missing_permission"),
     [
+        (["learn", "dashboard", "dash-1", "--pending"], "knowledge.apply", "knowledge.read"),
+        (["learn", "alerts", "--dry-run"], "knowledge.apply", "knowledge.read"),
+        (
+            ["learn", "approve", "dash-1"],
+            "knowledge.review,knowledge.trust,knowledge.apply",
+            "knowledge.read",
+        ),
         (["learn", "dashboard", "dash-1", "--auto-approve"], "knowledge.read", "knowledge.review"),
         (
             ["learn", "dashboard", "dash-1", "--pending"],
@@ -9638,6 +11289,57 @@ def test_cli_learning_transitions_enforce_semantic_permissions(
     assert f"missing permission: {missing_permission}" in result.output
 
 
+@pytest.mark.parametrize("artifact_kind", ["runbooks", "incidents"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cli_artifact_learning_requires_read_before_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_kind: str,
+    dry_run: bool,
+):
+    artifact = tmp_path / f"{artifact_kind}.md"
+    artifact.write_text("checkout depends on redis")
+
+    class ForbiddenStores:
+        settings = Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.review,knowledge.apply",
+        )
+
+        def signals(self):
+            raise AssertionError("artifact store constructed before knowledge.read authorization")
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", ForbiddenStores)
+    args = ["learn", artifact_kind, "--file", str(artifact)]
+    if dry_run:
+        args.append("--dry-run")
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code != 0
+    assert "missing permission: knowledge.read" in result.output
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cli_pagerduty_learning_requires_read_before_client(monkeypatch: pytest.MonkeyPatch, dry_run: bool):
+    class ForbiddenStores:
+        settings = Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.review,knowledge.apply",
+        )
+
+        def signals(self):
+            raise AssertionError("artifact store constructed before knowledge.read authorization")
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", ForbiddenStores)
+    args = ["learn", "pagerduty", "--since", "2026-01-01T00:00:00Z"]
+    if dry_run:
+        args.append("--dry-run")
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code != 0
+    assert "missing permission: knowledge.read" in result.output
+
+
 def test_cli_exposes_phase_three_commands():
     runner = CliRunner()
     assert runner.invoke(cli, ["knowledge", "--help"]).exit_code == 0
@@ -9662,7 +11364,7 @@ def test_artifact_learning_cli_missing_tenant_exits_nonzero(tmp_path: Path, monk
     incident.write_text("Checkout latency increased during the incident.")
 
     class WildcardStores:
-        settings = Settings(_env_file=None, knowledge_tenant_id="*")
+        settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
 
         def signals(self):
             raise AssertionError("tenant validation must precede persistence")
@@ -9683,7 +11385,7 @@ def test_cli_rejects_the_reserved_bootstrap_tenant():
     with pytest.raises(ClickException, match="Invalid knowledge tenant"):
         _knowledge_tenant(
             "*bootstrap*",
-            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
         )
 
 
@@ -9711,6 +11413,7 @@ def test_pending_cli_learning_preserves_wildcard_tenant(monkeypatch: pytest.Monk
         def signals(self):
             return object()
 
+    monkeypatch.setattr("tacit.config.settings.api_auth_enabled", True)
     monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
     monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard", ingest_dashboard)
     monkeypatch.setattr("tacit.dashboard_ingest.learn_backend_dashboards", learn_dashboards)
@@ -9748,6 +11451,7 @@ def test_cli_reject_and_ignore_thread_wildcard_tenant(monkeypatch: pytest.Monkey
         seen.append(("ignore", kwargs["tenant_id"]))
         return {"status": "ignored", "message": "Dashboard ignored"}
 
+    monkeypatch.setattr("tacit.config.settings.api_auth_enabled", True)
     monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
     monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: FakeStores())
     monkeypatch.setattr(
@@ -9782,7 +11486,7 @@ def test_knowledge_ui_sends_selected_tenant_and_api_key_headers():
     assert "if (isStaleTenantResponse(error)) return" in html
     assert "if (tenant) payload.tenant_id = tenant" in html
     assert "data = await streamChart(payload, onStage, request)" in html
-    assert "fetchTenantJson(`${BASE}/api/v1/investigations${qs}`, {}, request)" in html
+    assert "fetchTenantJson(`${BASE}/api/v1/investigations?${params}`, {}, request)" in html
     assert "fetchTenantJson(`${BASE}/api/v1/investigations/${encodeURIComponent(id)}`, {}, request)" in html
     assert "fetchTenantJson(`${BASE}/api/v1/investigations/stats`, {}, request)" in html
     assert 'data-dashboard-tenant="${escAttr(request.tenant)}"' in html
@@ -9801,7 +11505,7 @@ def test_cli_resolves_tenants_from_active_runtime_settings(tmp_path: Path, monke
     incident.write_text("Checkout latency increased.")
 
     class WildcardStores:
-        settings = Settings(_env_file=None, knowledge_tenant_id="*")
+        settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
 
         def __getattr__(self, name):
             raise AssertionError(f"tenant validation must precede store access: {name}")
@@ -9824,6 +11528,52 @@ def test_cli_resolves_tenants_from_active_runtime_settings(tmp_path: Path, monke
         assert "--tenant is required" in result.output
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["investigate", "checkout latency"],
+        ["test", "--no-open-browser"],
+    ],
+)
+def test_cli_pipeline_failure_responses_exit_nonzero(command, monkeypatch: pytest.MonkeyPatch):
+    stores = SimpleNamespace(settings=Settings(_env_file=None))
+
+    async def failed_pipeline(*_args, **_kwargs):
+        return DashResponse(
+            dashboard_url="",
+            dashboard_uid="",
+            panel_count=0,
+            summary="No dashboard backends are enabled",
+            investigation_status="failed",
+            audit_status="run_completed",
+        )
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: stores)
+    monkeypatch.setattr("tacit.dependencies.build_pipeline_dependencies", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr("tacit.pipeline.run_pipeline", failed_pipeline)
+
+    result = CliRunner().invoke(cli, command)
+
+    assert result.exit_code != 0
+    assert "failed" in result.output.lower()
+
+
+def test_cli_test_pipeline_exception_exits_nonzero(monkeypatch: pytest.MonkeyPatch):
+    stores = SimpleNamespace(settings=Settings(_env_file=None))
+
+    async def failed_pipeline(*_args, **_kwargs):
+        raise RuntimeError("backend unavailable")
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: stores)
+    monkeypatch.setattr("tacit.dependencies.build_pipeline_dependencies", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr("tacit.pipeline.run_pipeline", failed_pipeline)
+
+    result = CliRunner().invoke(cli, ["test", "--no-open-browser"])
+
+    assert result.exit_code != 0
+    assert "backend unavailable" in result.output
+
+
 def test_operational_learning_benchmark_is_packaged_and_safe():
     corpus = load_operational_learning_corpus()
     report = run_operational_learning_benchmark()
@@ -9841,6 +11591,7 @@ def test_operational_learning_benchmark_isolated_from_runtime_governance(
 ):
     monkeypatch.setenv("KNOWLEDGE_TENANT_ID", "*")
     monkeypatch.setenv("KNOWLEDGE_PERMISSIONS", "knowledge.read")
+    monkeypatch.setattr("tacit.knowledge.service.settings.api_auth_enabled", True)
     monkeypatch.setattr("tacit.knowledge.service.settings.knowledge_tenant_id", "*")
     monkeypatch.setattr(
         "tacit.knowledge.service.settings.knowledge_permissions",
@@ -9851,6 +11602,19 @@ def test_operational_learning_benchmark_isolated_from_runtime_governance(
 
     assert report["passed"] is True
     assert report["metrics"]["passed_cases"]["numerator"] == report["case_count"]
+
+
+def test_operational_learning_benchmark_isolated_from_configured_signal_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    configured_path = tmp_path / "runtime" / "signals.db"
+    monkeypatch.setenv("SIGNALS_DB_PATH", str(configured_path))
+
+    report = run_operational_learning_benchmark()
+
+    assert report["passed"] is True
+    assert not configured_path.exists()
 
 
 def test_causal_benchmark_reviews_candidate_before_evaluation(monkeypatch: pytest.MonkeyPatch):

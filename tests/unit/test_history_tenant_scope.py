@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
+from structlog.testing import capture_logs
 
 from tacit.api.app import create_app
 from tacit.cli import cli
@@ -134,20 +135,192 @@ def test_wildcard_migration_rejects_ownerless_contracts_before_schema_mutation(t
         db_path,
         {"ownerless": "default", "owned": "tenant-b"},
     )
+    with sqlite3.connect(db_path) as conn:
+        identity_before = conn.execute("SELECT role, database_id FROM tacit_runtime_database_identity").fetchone()
 
     with pytest.raises(RuntimeError, match="Legacy investigation history has no tenant owner"):
         InvestigationStore(
             db_path=db_path,
-            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
         )
 
     with sqlite3.connect(db_path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
+        identity_after = conn.execute("SELECT role, database_id FROM tacit_runtime_database_identity").fetchone()
         tenant_index = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_inv_tenant_started'"
         ).fetchone()
     assert "tenant_id" not in columns
+    assert identity_after == identity_before
     assert tenant_index is None
+
+
+def test_wildcard_legacy_owner_preflight_redacts_investigation_ids(tmp_path):
+    db_path = tmp_path / "legacy-owner-diagnostic.db"
+    investigation_id = "PRIVATE-LEGACY-INVESTIGATION-CANARY"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE investigations (id TEXT PRIMARY KEY, prompt TEXT, started_at REAL)")
+        conn.execute(
+            "INSERT INTO investigations (id, prompt, started_at) VALUES (?, 'canary', ?)",
+            (investigation_id, time.time()),
+        )
+
+    with capture_logs() as logs:
+        with pytest.raises(RuntimeError, match="Legacy investigation history has no tenant owner"):
+            InvestigationStore(
+                db_path=db_path,
+                runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
+            )
+
+    rendered_logs = str(logs)
+    assert investigation_id not in rendered_logs
+    event = next(entry for entry in logs if entry.get("event") == "legacy_history_owner_required")
+    assert event["reason_code"] == "legacy_history_owner_required"
+    assert event["ownerless_count"] == 1
+    assert len(event["investigation_ids_fingerprint"]) == 16
+    assert "sample_investigation_ids" not in event
+
+
+def test_wildcard_unconfirmed_default_owner_preflight_redacts_investigation_ids(tmp_path):
+    db_path = tmp_path / "default-owner-diagnostic.db"
+    investigation_id = "PRIVATE-DEFAULT-INVESTIGATION-CANARY"
+    original = InvestigationStore(db_path=db_path, runtime_settings=Settings(_env_file=None))
+    with original._conn() as conn:
+        conn.execute(
+            "INSERT INTO investigations (id, tenant_id, prompt, started_at) VALUES (?, 'default', 'canary', ?)",
+            (investigation_id, time.time()),
+        )
+
+    with capture_logs() as logs:
+        with pytest.raises(RuntimeError, match="unconfirmed default-tenant ownership"):
+            InvestigationStore(
+                db_path=db_path,
+                runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
+            )
+
+    rendered_logs = str(logs)
+    assert investigation_id not in rendered_logs
+    event = next(entry for entry in logs if entry.get("event") == "legacy_history_default_owner_unconfirmed")
+    assert event["reason_code"] == "legacy_history_default_owner_unconfirmed"
+    assert event["ownerless_count"] == 1
+    assert len(event["investigation_ids_fingerprint"]) == 16
+    assert "sample_investigation_ids" not in event
+
+
+def test_contract_deserialization_diagnostics_redact_path_and_tenant(tmp_path):
+    tenant_canary = "PRIVATE-HISTORY-TENANT-CANARY"
+    path_canary = "PRIVATE-HISTORY-PATH-CANARY"
+    db_path = tmp_path / path_canary / "history.db"
+    store = InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_tenant_id=tenant_canary,
+            history_db_path=str(db_path),
+        ),
+    )
+    investigation_id = store.start("Diagnostic canary", tenant_id=tenant_canary)
+    with store._conn() as conn:
+        conn.execute(
+            """INSERT INTO investigation_revisions (
+                   investigation_id, revision, parent_revision, schema_version, contract_json,
+                   input_fingerprint, output_fingerprint, engine_version, created_at, reason
+               ) VALUES (?, 1, NULL, '1.0', ?, 'input', 'output', 'test', ?, 'fixture')""",
+            (
+                investigation_id,
+                json.dumps({"tenant": tenant_canary, "database_path": str(db_path)}),
+                time.time(),
+            ),
+        )
+
+    with capture_logs() as logs:
+        assert store.get_contract(investigation_id, 1, tenant_id=tenant_canary) is None
+
+    rendered = repr(logs)
+    assert tenant_canary not in rendered
+    assert path_canary not in rendered
+    assert str(db_path) not in rendered
+    warning = next(entry for entry in logs if entry.get("event") == "investigation_contract_deserialize_failed")
+    assert warning["reason_code"] == "investigation_contract_deserialize_failed"
+    assert len(str(warning["investigation_fingerprint"])) == 16
+    assert warning["failure_fingerprint"]
+    assert warning["error_type"]
+
+
+def test_wildcard_migration_rechecks_owner_after_acquiring_writer_lock(tmp_path):
+    db_path = tmp_path / "owner-race-history.db"
+    _seed_legacy_history(db_path, {"owned": "tenant-a"})
+
+    class RacingHistoryStore(InvestigationStore):
+        owner_checks = 0
+
+        def _require_legacy_tenant_owner(self, conn, *, tenant_column_existed):
+            type(self).owner_checks += 1
+            super()._require_legacy_tenant_owner(conn, tenant_column_existed=tenant_column_existed)
+
+        def _preflight_existing_owner(self):
+            super()._preflight_existing_owner()
+            with sqlite3.connect(db_path) as writer:
+                writer.execute(
+                    "INSERT INTO investigations (id, prompt, started_at) VALUES (?, ?, ?)",
+                    ("late-ownerless", "Inserted after preflight", time.time()),
+                )
+
+    with pytest.raises(RuntimeError, match="Legacy investigation history has no tenant owner"):
+        RacingHistoryStore(
+            db_path=db_path,
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
+        )
+
+    assert RacingHistoryStore.owner_checks == 2
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
+        progress = conn.execute("SELECT 1 FROM history_migration_progress").fetchone()
+    assert "tenant_id" not in columns
+    assert progress is None
+
+
+def test_wildcard_first_open_rechecks_legacy_table_existence_after_writer_lock(tmp_path):
+    db_path = tmp_path / "first-open-owner-race.db"
+
+    class RacingHistoryStore(InvestigationStore):
+        inserted_legacy_table = False
+
+        @classmethod
+        def _table_exists(cls, conn, table_name):
+            existed = super()._table_exists(conn, table_name)
+            if table_name == "investigations" and not existed and not cls.inserted_legacy_table:
+                cls.inserted_legacy_table = True
+                with sqlite3.connect(db_path) as writer:
+                    writer.execute("""CREATE TABLE investigations (
+                               id TEXT PRIMARY KEY,
+                               prompt TEXT NOT NULL,
+                               started_at REAL NOT NULL
+                           )""")
+                    writer.execute(
+                        "INSERT INTO investigations (id, prompt, started_at) VALUES (?, ?, ?)",
+                        ("late-ownerless", "Inserted after preflight", time.time()),
+                    )
+            return existed
+
+    with pytest.raises(RuntimeError, match="Legacy investigation history has no tenant owner"):
+        RacingHistoryStore(
+            db_path=db_path,
+            runtime_settings=Settings(
+                _env_file=None,
+                knowledge_tenant_id="*",
+                api_auth_enabled=True,
+            ),
+        )
+
+    assert RacingHistoryStore.inserted_legacy_table is True
+    with sqlite3.connect(db_path) as conn:
+        assert {row[1] for row in conn.execute("PRAGMA table_info(investigations)")} == {
+            "id",
+            "prompt",
+            "started_at",
+        }
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='history_migration_progress'").fetchone() is None
 
 
 def test_wildcard_migration_preserves_explicit_contract_owners(tmp_path):
@@ -159,7 +332,7 @@ def test_wildcard_migration_preserves_explicit_contract_owners(tmp_path):
 
     store = InvestigationStore(
         db_path=db_path,
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
     )
 
     assert store.get(investigation_ids["tenant-a"], tenant_id="tenant-a")["tenant_id"] == "tenant-a"
@@ -200,7 +373,7 @@ def test_wildcard_migration_rejects_partial_default_placeholders(tmp_path):
     with pytest.raises(RuntimeError, match="Legacy investigation history has no tenant owner"):
         InvestigationStore(
             db_path=db_path,
-            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
         )
 
     with sqlite3.connect(db_path) as conn:
@@ -225,7 +398,7 @@ def test_complete_schema_default_history_requires_and_records_a_migration_owner(
     with pytest.raises(RuntimeError, match="tenant owner"):
         InvestigationStore(
             db_path=db_path,
-            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
         )
 
     pinned = InvestigationStore(
@@ -236,10 +409,37 @@ def test_complete_schema_default_history_requires_and_records_a_migration_owner(
 
     wildcard = InvestigationStore(
         db_path=db_path,
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
     )
     assert wildcard.get(investigation_id, tenant_id="tenant-a") is not None
     assert wildcard.get(investigation_id, tenant_id="default") is None
+
+
+def test_current_history_schema_preflights_owner_then_rechecks_after_writer_lock(tmp_path, monkeypatch):
+    db_path = tmp_path / "current-history-owner-lock.db"
+    InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+    owner_checks: list[bool] = []
+    original = InvestigationStore._require_confirmed_default_tenant_owner
+
+    def require_locked_owner(self, conn):
+        owner_checks.append(conn.in_transaction)
+        return original(self, conn)
+
+    monkeypatch.setattr(
+        InvestigationStore,
+        "_require_confirmed_default_tenant_owner",
+        require_locked_owner,
+    )
+
+    InvestigationStore(
+        db_path=db_path,
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+    )
+
+    assert owner_checks == [False, True]
 
 
 def test_history_schema_migration_resumes_for_the_same_owner_and_rejects_an_owner_change(tmp_path):
@@ -279,11 +479,13 @@ def test_history_schema_migration_resumes_for_the_same_owner_and_rejects_an_owne
     assert assigned == (500,)
     assert progress is not None
 
-    with pytest.raises(RuntimeError, match="already in progress for another tenant"):
+    with pytest.raises(RuntimeError, match="already in progress for another tenant") as exc_info:
         InvestigationStore(
             db_path=db_path,
             runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-b"),
         )
+    assert "tenant-a" not in str(exc_info.value)
+    assert "tenant-b" not in str(exc_info.value)
 
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM investigation_tenant_assignments").fetchone() == (500,)
@@ -359,6 +561,90 @@ def test_current_history_schema_reopens_without_reconciling_every_tenant_row(tmp
     )
 
     assert reopened.stats(tenant_id="tenant-a")["total"] == 1
+
+
+def test_history_upgrade_adds_run_lease_before_creating_its_index(tmp_path):
+    db_path = tmp_path / "pre-lease-history.db"
+    runtime_settings = Settings(_env_file=None)
+    store = InvestigationStore(db_path=db_path, runtime_settings=runtime_settings)
+    investigation_id = store.start("Legacy run lease")
+    run_id = store.start_run(
+        investigation_id,
+        run_type=InvestigationRunType.INITIAL,
+        lease_seconds=60,
+    )
+    with store._conn() as conn:
+        conn.execute("DROP INDEX idx_inv_runs_investigation_active_lease")
+        conn.execute("ALTER TABLE investigation_runs DROP COLUMN lease_expires_at")
+
+    reopened = InvestigationStore(db_path=db_path, runtime_settings=runtime_settings)
+
+    with reopened._conn() as conn:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(investigation_runs)")}
+        indexes = {str(row[1]) for row in conn.execute("PRAGMA index_list(investigation_runs)")}
+        run = conn.execute(
+            "SELECT started_at, lease_expires_at FROM investigation_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+    assert "lease_expires_at" in columns
+    assert "idx_inv_runs_investigation_active_lease" in indexes
+    assert run is not None
+    assert run["lease_expires_at"] == run["started_at"]
+
+
+def test_history_run_lease_upgrade_is_bounded_and_restartable(tmp_path, monkeypatch):
+    db_path = tmp_path / "pre-lease-history-large.db"
+    runtime_settings = Settings(_env_file=None)
+    store = InvestigationStore(db_path=db_path, runtime_settings=runtime_settings)
+    investigation_id = store.start("Legacy run lease batch")
+    with store._conn() as conn:
+        conn.executemany(
+            """INSERT INTO investigation_runs (
+                   run_id, investigation_id, run_type, status, started_at
+               ) VALUES (?, ?, 'initial', 'running', ?)""",
+            [(f"legacy-run-{index:04d}", investigation_id, float(index + 1)) for index in range(1_201)],
+        )
+        conn.execute("DROP INDEX idx_inv_runs_investigation_active_lease")
+        conn.execute("ALTER TABLE investigation_runs DROP COLUMN lease_expires_at")
+
+    original_runner = InvestigationStore._run_history_run_lease_migration
+
+    def migrate_one_batch_then_stop(self):
+        migrated, completed = self._migrate_history_run_lease_batch()
+        assert migrated == 500
+        assert completed is False
+        raise RuntimeError("simulated lease migration interruption")
+
+    monkeypatch.setattr(InvestigationStore, "_run_history_run_lease_migration", migrate_one_batch_then_stop)
+    with pytest.raises(RuntimeError, match="simulated lease migration interruption"):
+        InvestigationStore(db_path=db_path, runtime_settings=runtime_settings)
+
+    with sqlite3.connect(db_path) as conn:
+        migrated = conn.execute(
+            "SELECT COUNT(*) FROM investigation_runs WHERE status='running' AND lease_expires_at>0"
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT cursor FROM history_migration_progress WHERE migration_name='history_run_lease_backfill_v1'"
+        ).fetchone()
+        current = conn.execute(
+            "SELECT 1 FROM history_schema_metadata WHERE migration_name='history_tenant_assignments_v2'"
+        ).fetchone()
+    assert migrated == 500
+    assert pending is not None
+    assert current is None
+
+    monkeypatch.setattr(InvestigationStore, "_run_history_run_lease_migration", original_runner)
+    InvestigationStore(db_path=db_path, runtime_settings=runtime_settings)
+
+    with sqlite3.connect(db_path) as conn:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM investigation_runs WHERE status='running' AND lease_expires_at=0"
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT 1 FROM history_migration_progress WHERE migration_name='history_run_lease_backfill_v1'"
+        ).fetchone()
+    assert remaining == 0
+    assert pending is None
 
 
 def test_history_cursor_pagination_is_stable_for_equal_timestamps(tmp_path):
@@ -483,7 +769,7 @@ def test_bundle_build_and_export_scope_every_lookup(tmp_path):
 
 
 def test_bundle_requires_a_concrete_tenant_for_wildcard_history(tmp_path):
-    settings = Settings(_env_file=None, knowledge_tenant_id="*")
+    settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
     store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=settings)
     investigation_id = store.start("Tenant A investigation", tenant_id="tenant-a")
     store.persist_contract_revision(_contract(investigation_id, tenant_id="tenant-a"))
@@ -509,7 +795,7 @@ def test_history_stats_rejects_cross_tenant_requests_in_pinned_runtime(tmp_path)
 def test_wildcard_history_id_mutations_require_an_explicit_tenant(tmp_path):
     store = InvestigationStore(
         db_path=tmp_path / "history.db",
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
     )
     investigation_id = store.start("Tenant A investigation", tenant_id="tenant-a")
     run_id = store.start_run(
@@ -596,7 +882,7 @@ def test_complete_run_rolls_back_state_when_terminal_event_fails(tmp_path, monke
 def test_history_mutations_enforce_tenant_and_run_ownership(tmp_path):
     store = InvestigationStore(
         db_path=tmp_path / "history.db",
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
     )
     investigation_id = store.start("Tenant A investigation", tenant_id="tenant-a")
     other_investigation_id = store.start("Other tenant A investigation", tenant_id="tenant-a")
@@ -692,7 +978,7 @@ def test_history_mutations_enforce_tenant_and_run_ownership(tmp_path):
 
 
 def test_history_child_records_require_and_enforce_the_selected_tenant(tmp_path):
-    settings = Settings(_env_file=None, knowledge_tenant_id="*")
+    settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
     store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=settings)
     investigation_id = store.start("Tenant A investigation", tenant_id="tenant-a")
     store.persist_contract_revision(_contract(investigation_id, tenant_id="tenant-a"))
@@ -737,7 +1023,7 @@ def test_history_child_records_require_and_enforce_the_selected_tenant(tmp_path)
 
 
 def test_wildcard_history_store_requires_a_tenant_for_direct_reads(tmp_path):
-    settings = Settings(_env_file=None, knowledge_tenant_id="*")
+    settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
     store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=settings)
     with pytest.raises(ValueError, match="tenant"):
         store.start("Ownerless investigation")
@@ -759,7 +1045,7 @@ def test_wildcard_history_store_requires_a_tenant_for_direct_reads(tmp_path):
 
 
 def test_legacy_migration_is_scoped_before_reading_or_persisting(tmp_path):
-    settings = Settings(_env_file=None, knowledge_tenant_id="*")
+    settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
     store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=settings)
     investigation_id = store.start("Tenant A legacy investigation", tenant_id="tenant-a")
     store.finish(investigation_id, status="success", tenant_id="tenant-a")
@@ -846,7 +1132,7 @@ class _FakeStores:
     ],
 )
 def test_history_cli_requires_tenant_in_wildcard_mode(monkeypatch, arguments):
-    stores = _FakeStores(Settings(_env_file=None, knowledge_tenant_id="*"))
+    stores = _FakeStores(Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True))
     monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: stores)
 
     result = CliRunner().invoke(cli, arguments)
@@ -857,7 +1143,7 @@ def test_history_cli_requires_tenant_in_wildcard_mode(monkeypatch, arguments):
 
 
 def test_history_cli_scopes_all_commands_to_selected_tenant(tmp_path, monkeypatch):
-    stores = _FakeStores(Settings(_env_file=None, knowledge_tenant_id="*"))
+    stores = _FakeStores(Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True))
     monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: stores)
     exported: list[str | None] = []
 

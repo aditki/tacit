@@ -34,6 +34,7 @@ from tacit.dashboard_ingest.service import (
     resolve_learning_tenant,
 )
 from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
+from tacit.query_parsing.languages import language_to_datasource_type
 from tacit.signals import get_signal_store as _default_get_signal_store
 from tacit.signals.learning_index import infer_services_for_learning
 
@@ -54,8 +55,11 @@ def alert_to_panel(features: AlertFeatures) -> dict[str, Any]:
         "description": features.condition,
         "panel_type": "alert_rule",
         "metrics": features.metrics_found,
+        "metric_sources": features.metric_sources,
         "queries": features.query_transformations,
-        "datasource_type": features.backend_name,
+        "datasource_type": (
+            language_to_datasource_type(features.query_language) if features.query_language else features.backend_name
+        ),
         "query_language": features.query_language,
         "row": "alerts",
         "service_hints": features.service_hints,
@@ -102,6 +106,21 @@ def _alert_fingerprint(features: AlertFeatures) -> str:
         "labels": dict(sorted(features.labels.items())),
         "annotations": dict(sorted(features.annotations.items())),
         "metrics": sorted(dict.fromkeys(features.metrics_found)),
+        "metric_sources": sorted(
+            (
+                {
+                    "metric": str(source.get("metric") or ""),
+                    "datasource_type": str(source.get("datasource_type") or "").casefold(),
+                    "query_language": str(source.get("query_language") or "").casefold(),
+                }
+                for source in features.metric_sources
+            ),
+            key=lambda source: (
+                source["metric"],
+                source["datasource_type"],
+                source["query_language"],
+            ),
+        ),
         "queries": sorted(dict.fromkeys(features.query_transformations)),
         "service_hints": sorted(dict.fromkeys(features.service_hints)),
         "dashboard_uid": features.dashboard_uid,
@@ -119,6 +138,21 @@ def _alert_mapping_fingerprint(features: AlertFeatures) -> str:
         "labels": dict(sorted(features.labels.items())),
         "annotations": dict(sorted(features.annotations.items())),
         "metrics": sorted(dict.fromkeys(features.metrics_found)),
+        "metric_sources": sorted(
+            (
+                {
+                    "metric": str(source.get("metric") or ""),
+                    "datasource_type": str(source.get("datasource_type") or "").casefold(),
+                    "query_language": str(source.get("query_language") or "").casefold(),
+                }
+                for source in features.metric_sources
+            ),
+            key=lambda source: (
+                source["metric"],
+                source["datasource_type"],
+                source["query_language"],
+            ),
+        ),
         "queries": sorted(dict.fromkeys(features.query_transformations)),
         "service_hints": sorted(dict.fromkeys(features.service_hints)),
     }
@@ -343,13 +377,19 @@ async def ingest_alert_features(
     knowledge_service: Any | None = None,
 ) -> dict[str, Any]:
     """Infer, persist, and optionally approve already-extracted alert features."""
-    active_settings = _active_runtime_settings(runtime_settings, store)
+    active_settings = _active_runtime_settings(runtime_settings, store, knowledge_service)
+    enforce_knowledge_action(active_settings, KnowledgeAction.READ)
     if auto_approve and not dry_run:
         enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
     if not dry_run:
         enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
-    store = _signal_store_for_runtime(store, runtime_settings, fallback_factory=get_signal_store)
+    store = _signal_store_for_runtime(
+        store,
+        runtime_settings,
+        fallback_factory=get_signal_store,
+        knowledge_service=knowledge_service,
+    )
     panel = alert_to_panel(features)
     signals = infer_signals_from_metrics(
         features.metrics_found,
@@ -379,15 +419,61 @@ async def ingest_alert_features(
         assert knowledge_service is not None
         assert effective_tenant is not None
         if auto_approve:
-            change_state, stored_alert = _record_alert_generation(
+            with _source_authority_transaction(
                 store=store,
-                features=features,
+                knowledge_service=knowledge_service,
                 tenant_id=effective_tenant,
-                fingerprint=fingerprint,
-                confidence=confidence,
-                signals=signals,
-                service_hints=service_hints,
-            )
+                source_ref=source_ref,
+                operation="prepare_auto_approved_alert",
+            ):
+                change_state, stored_alert = _record_alert_generation(
+                    store=store,
+                    features=features,
+                    tenant_id=effective_tenant,
+                    fingerprint=fingerprint,
+                    confidence=confidence,
+                    signals=signals,
+                    service_hints=service_hints,
+                )
+                prepared_status = str(stored_alert.get("status") or "pending")
+                prepared_candidate_ids: set[str] = set()
+                prepared_pairs: set[tuple[str, str]] = set()
+                if prepared_status == "approved":
+                    prepared_candidate_ids = _existing_governed_candidate_ids(
+                        store=store,
+                        tenant_id=effective_tenant,
+                        source_ref=source_ref,
+                        active_pairs=governed_pairs,
+                        source_fingerprint=mapping_fingerprint,
+                        repository=knowledge_service.repository,
+                    )
+                    prepared_pairs = _active_pairs_for_candidates(
+                        store=store,
+                        tenant_id=effective_tenant,
+                        candidate_ids=prepared_candidate_ids,
+                        repository=knowledge_service.repository,
+                    )
+                reconcile_signal_source(
+                    store=store,
+                    tenant_id=effective_tenant,
+                    source_type="alert_ingest",
+                    source_ref=source_ref,
+                    active_pairs=governed_pairs if prepared_status == "approved" else set(),
+                    active_candidate_ids=prepared_candidate_ids,
+                    runtime_settings=active_settings,
+                    knowledge_service=knowledge_service,
+                    max_candidate_count=int(active_settings.knowledge_source_atomic_candidate_limit),
+                )
+                _index_alert_generation(
+                    store=store,
+                    features=features,
+                    tenant_id=effective_tenant,
+                    signals=signals,
+                    service_hints=service_hints,
+                    status=prepared_status,
+                    activated_pairs=prepared_pairs,
+                    strict=True,
+                )
             effective_status = str(stored_alert.get("status") or "pending")
             generation_fingerprint = str(stored_alert["generation_fingerprint"])
             if effective_status == "pending":
@@ -557,13 +643,19 @@ async def ingest_alert(
     """Full alert ingestion pipeline: fetch -> extract -> infer -> persist."""
     from tacit.backends import get_active_backends
 
-    active_settings = _active_runtime_settings(runtime_settings, store)
+    active_settings = _active_runtime_settings(runtime_settings, store, knowledge_service)
+    enforce_knowledge_action(active_settings, KnowledgeAction.READ)
     if auto_approve and not dry_run:
         enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
     if not dry_run:
         enforce_knowledge_action(active_settings, KnowledgeAction.APPLY)
     effective_tenant = resolve_learning_tenant(tenant_id, runtime_settings=active_settings)
-    store = _signal_store_for_runtime(store, runtime_settings, fallback_factory=get_signal_store)
+    store = _signal_store_for_runtime(
+        store,
+        runtime_settings,
+        fallback_factory=get_signal_store,
+        knowledge_service=knowledge_service,
+    )
     all_backends: list[Any] = []
     own_backends = False
     try:
@@ -612,6 +704,7 @@ async def learn_backend_alerts(
     from tacit.backends import get_active_backends
 
     active_settings = _active_runtime_settings(runtime_settings, store)
+    enforce_knowledge_action(active_settings, KnowledgeAction.READ)
     if auto_approve and not dry_run:
         enforce_knowledge_action(active_settings, KnowledgeAction.TEACH_SIGNALS)
     if not dry_run:
@@ -703,76 +796,50 @@ async def learn_backend_alerts(
             assert effective_tenant is not None
             assert store is not None
             seen_alert_uids = {str(item.get("uid", "")) for item in alerts if item.get("uid")}
+            assert knowledge_service is not None
+            store.ensure_governed_projection_audit_current()
+            bind_connection = knowledge_service.repository.bind_transaction_connection
+
+            def reconcile_stale_alert_authority(conn, alert):
+                if not store.governed_projection_audit_is_current(conn):
+                    raise RuntimeError("governed signal projection changed before stale alert reconciliation; retry")
+
+                def source_generation_guard(guard_conn):
+                    return store.alert_stale_generation_is_current(
+                        guard_conn,
+                        tenant_id=effective_tenant,
+                        backend_name=backend_name,
+                        alert_uid=str(alert["alert_uid"]),
+                        missing_since=alert["missing_since"],
+                    )
+
+                with bind_connection(conn):
+                    knowledge_service.reconcile_source_lifecycle(
+                        provenance_ref=(
+                            f"{backend_name}:alert:{alert['alert_uid']}" if backend_name else str(alert["alert_uid"])
+                        ),
+                        tenant_id=effective_tenant,
+                        source_stale=True,
+                        source_generation_guard=source_generation_guard,
+                    )
+
+            stale_started_at = time.monotonic()
             totals["stale_marked"] = store.mark_missing_alerts_stale(
                 tenant_id=effective_tenant,
                 backend_name=backend_name,
                 seen_alert_uids=seen_alert_uids,
                 crawl_started_at=crawl_started_at,
+                authority_reconciler=reconcile_stale_alert_authority,
             )
-            assert knowledge_service is not None
-            after_id = 0
-            page_size = 500
-            reconciled_count = 0
-            reconciliation_failures = 0
-            page_count = 0
-            while True:
-                stale_alerts = store.list_unreconciled_stale_alerts(
-                    limit=page_size,
-                    tenant_id=effective_tenant,
-                    backend_name=backend_name,
-                    after_id=after_id,
-                )
-                if not stale_alerts:
-                    break
-                page_count += 1
-                for alert in stale_alerts:
-                    after_id = max(after_id, int(alert["id"]))
-                    try:
-                        knowledge_service.reconcile_source_lifecycle(
-                            provenance_ref=(
-                                f"{backend_name}:alert:{alert['alert_uid']}"
-                                if backend_name
-                                else str(alert["alert_uid"])
-                            ),
-                            tenant_id=effective_tenant,
-                            source_stale=True,
-                            source_generation_guard=lambda conn, alert=alert: store.alert_stale_generation_is_current(
-                                conn,
-                                tenant_id=effective_tenant,
-                                backend_name=backend_name,
-                                alert_uid=str(alert["alert_uid"]),
-                                missing_since=alert["missing_since"],
-                            ),
-                        )
-                        checkpointed = store.mark_alert_knowledge_reconciled(
-                            tenant_id=effective_tenant,
-                            backend_name=backend_name,
-                            alert_uid=str(alert["alert_uid"]),
-                            missing_since=alert["missing_since"],
-                        )
-                        if not checkpointed:
-                            raise RuntimeError("stale alert generation changed during knowledge reconciliation")
-                        reconciled_count += 1
-                    except Exception:
-                        reconciliation_failures += 1
-                        logger.warning(
-                            "stale_alert_knowledge_reconcile_failed",
-                            tenant_id=effective_tenant,
-                            backend_name=backend_name,
-                            alert_uid=alert["alert_uid"],
-                            exc_info=True,
-                        )
-                if len(stale_alerts) < page_size:
-                    break
-            totals["stale_reconciliation_failures"] = reconciliation_failures
+            totals["stale_reconciliation_failures"] = 0
             logger.info(
                 "stale_alert_knowledge_reconciled",
                 tenant_id=effective_tenant,
                 backend_name=backend_name,
                 stale_marked=totals["stale_marked"],
-                records_reconciled=reconciled_count,
-                reconciliation_failures=reconciliation_failures,
-                pages_scanned=page_count,
+                records_reconciled=totals["stale_marked"],
+                reconciliation_failures=0,
+                duration_ms=round((time.monotonic() - stale_started_at) * 1000, 2),
             )
         elif not dry_run:
             totals["stale_reconciliation_skipped"] = True

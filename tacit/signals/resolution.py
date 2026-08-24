@@ -4,13 +4,236 @@ from __future__ import annotations
 
 import fnmatch
 import math
-from typing import Any
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from threading import Lock
+from typing import Any, Literal
 
 from tacit.models.schemas import MetricEntry
 
 DECAY_HALF_LIFE_DAYS = 90
 MIN_CONFIDENCE = 0.05
 CONTEXT_MISSING_PENALTY = 0.7
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionInputTextLimits:
+    """Character and UTF-8 admission limits for resolver-adjacent inputs."""
+
+    max_scalar_characters: int = 65_536
+    max_scalar_utf8_bytes: int = 262_144
+    max_total_characters: int = 2_000_000
+    max_total_utf8_bytes: int = 8_000_000
+
+    def __post_init__(self) -> None:
+        for field_name in self.__dataclass_fields__:
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
+
+
+class ResolutionInputWorkLimitError(RuntimeError):
+    """Text admission failed before semantic processing could start."""
+
+    reason_code = "resolution_input_work_limit_exceeded"
+
+    def __init__(self, dimension: str, observed: int, limit: int) -> None:
+        self.dimension = dimension
+        self.observed = observed
+        self.limit = limit
+        super().__init__(f"{self.reason_code}: {dimension} exceeds {limit}")
+
+
+def admit_resolution_input_text(
+    values: Iterable[object],
+    *,
+    limits: ResolutionInputTextLimits | None = None,
+) -> dict[str, int]:
+    """Admit bounded text in character-first, UTF-8-second passes.
+
+    Callers must bound collection cardinality before building ``values``. The
+    first pass uses constant-time string lengths, allowing aggregate character
+    rejection before any UTF-8 allocation. Only then are byte lengths computed.
+    """
+    active_limits = limits or ResolutionInputTextLimits()
+    texts: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ResolutionInputWorkLimitError("scalar_type", 1, 0)
+        texts.append(value)
+    total_characters = 0
+    for value in texts:
+        scalar_characters = len(value)
+        if scalar_characters > active_limits.max_scalar_characters:
+            raise ResolutionInputWorkLimitError(
+                "scalar_characters",
+                scalar_characters,
+                active_limits.max_scalar_characters,
+            )
+        total_characters += scalar_characters
+        if total_characters > active_limits.max_total_characters:
+            raise ResolutionInputWorkLimitError(
+                "total_input_characters",
+                total_characters,
+                active_limits.max_total_characters,
+            )
+
+    total_utf8_bytes = 0
+    for value in texts:
+        scalar_utf8_bytes = len(value.encode("utf-8"))
+        if scalar_utf8_bytes > active_limits.max_scalar_utf8_bytes:
+            raise ResolutionInputWorkLimitError(
+                "scalar_utf8_bytes",
+                scalar_utf8_bytes,
+                active_limits.max_scalar_utf8_bytes,
+            )
+        total_utf8_bytes += scalar_utf8_bytes
+        if total_utf8_bytes > active_limits.max_total_utf8_bytes:
+            raise ResolutionInputWorkLimitError(
+                "total_input_utf8_bytes",
+                total_utf8_bytes,
+                active_limits.max_total_utf8_bytes,
+            )
+    return {
+        "input_scalar_count": len(texts),
+        "input_character_count": total_characters,
+        "input_utf8_byte_count": total_utf8_bytes,
+    }
+
+
+SignalResolutionWorkDimension = Literal[
+    "calls",
+    "mapping_catalog_comparisons",
+    "results_constructed",
+]
+
+
+class SignalResolutionWorkLimitError(RuntimeError):
+    """A first-party signal-resolution operation exhausted aggregate work."""
+
+    reason_code = "signal_resolution_aggregate_work_limit_exceeded"
+
+    def __init__(
+        self,
+        dimension: SignalResolutionWorkDimension,
+        observed: int,
+        limit: int,
+    ) -> None:
+        self.dimension = dimension
+        self.observed = observed
+        self.limit = limit
+        super().__init__(f"{self.reason_code}: {dimension} exceeds {limit}")
+
+
+@dataclass(slots=True)
+class SignalResolutionWorkBudget:
+    """Mutable aggregate admission budget shared by one investigation.
+
+    The budget reserves the full mapping-by-catalog comparison product before
+    matching starts and accounts for each result before it is materialized.
+    A lock keeps shared accounting deterministic if a future first-party caller
+    parallelizes independent resolution requests inside one operation.
+    """
+
+    max_calls: int
+    max_mapping_catalog_comparisons: int
+    max_results: int
+    calls: int = field(default=0, init=False)
+    mapping_catalog_comparisons: int = field(default=0, init=False)
+    results_constructed: int = field(default=0, init=False)
+    _exhaustion: tuple[SignalResolutionWorkDimension, int, int] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "max_calls",
+            "max_mapping_catalog_comparisons",
+            "max_results",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
+
+    def _reserve(
+        self,
+        dimension: SignalResolutionWorkDimension,
+        amount: int,
+        limit: int,
+    ) -> None:
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+            raise ValueError("signal-resolution work increments must be non-negative integers")
+        with self._lock:
+            if self._exhaustion is not None:
+                exhausted_dimension, exhausted_observed, exhausted_limit = self._exhaustion
+                raise SignalResolutionWorkLimitError(
+                    exhausted_dimension,
+                    exhausted_observed,
+                    exhausted_limit,
+                )
+            current = int(getattr(self, dimension))
+            observed = current + amount
+            if observed > limit:
+                self._exhaustion = (dimension, observed, limit)
+                raise SignalResolutionWorkLimitError(dimension, observed, limit)
+            setattr(self, dimension, observed)
+
+    def begin_call(self) -> None:
+        """Reserve one first-party resolver invocation."""
+        self._reserve("calls", 1, self.max_calls)
+
+    def reserve_mapping_catalog_comparisons(
+        self,
+        mapping_count: int,
+        eligible_catalog_count: int,
+    ) -> None:
+        """Reserve the worst-case comparison product before matching."""
+        if mapping_count < 0 or eligible_catalog_count < 0:
+            raise ValueError("resolution cardinalities must be non-negative")
+        self._reserve(
+            "mapping_catalog_comparisons",
+            mapping_count * eligible_catalog_count,
+            self.max_mapping_catalog_comparisons,
+        )
+
+    def consume_result(self) -> None:
+        """Reserve one result slot before constructing or appending it."""
+        self._reserve("results_constructed", 1, self.max_results)
+
+    def raise_if_exhausted(self) -> None:
+        """Re-raise a swallowed limit error before derived output can escape."""
+        with self._lock:
+            exhaustion = self._exhaustion
+        if exhaustion is not None:
+            dimension, observed, limit = exhaustion
+            raise SignalResolutionWorkLimitError(dimension, observed, limit)
+
+    def counters(self) -> dict[str, int]:
+        """Return bounded, payload-free observability counters."""
+        with self._lock:
+            return {
+                "resolution_call_count": self.calls,
+                "mapping_catalog_comparison_count": self.mapping_catalog_comparisons,
+                "result_construction_count": self.results_constructed,
+                "resolution_call_limit": self.max_calls,
+                "mapping_catalog_comparison_limit": self.max_mapping_catalog_comparisons,
+                "result_construction_limit": self.max_results,
+                "signal_resolution_work_limit_exhausted": int(self._exhaustion is not None),
+            }
+
+
+def signal_resolution_work_kwargs(
+    resolver: Any,
+    work_budget: SignalResolutionWorkBudget | None,
+) -> dict[str, SignalResolutionWorkBudget]:
+    """Pass work accounting only to resolvers declaring the first-party contract."""
+    if work_budget is None or not bool(getattr(resolver, "supports_signal_resolution_work_budget", False)):
+        return {}
+    return {"work_budget": work_budget}
 
 
 def context_matches(
@@ -38,6 +261,7 @@ def context_matches(
 
 PROMETHEUS_DATASOURCE_TYPES = {"prometheus", "mimir", "cortex", "thanos"}
 SIGNALFX_DATASOURCE_TYPES = {"signalfx", "grafana-signalfx-datasource"}
+ELASTICSEARCH_DATASOURCE_TYPES = {"elasticsearch", "opensearch"}
 
 
 def datasource_type_matches(candidate: str, requested: str) -> bool:
@@ -47,9 +271,25 @@ def datasource_type_matches(candidate: str, requested: str) -> bool:
         return True
     if candidate == requested:
         return True
-    if candidate in PROMETHEUS_DATASOURCE_TYPES and requested in PROMETHEUS_DATASOURCE_TYPES:
+    candidate_prometheus = candidate in PROMETHEUS_DATASOURCE_TYPES or any(
+        marker in candidate for marker in PROMETHEUS_DATASOURCE_TYPES
+    )
+    requested_prometheus = requested in PROMETHEUS_DATASOURCE_TYPES or any(
+        marker in requested for marker in PROMETHEUS_DATASOURCE_TYPES
+    )
+    if candidate_prometheus and requested_prometheus:
         return True
-    if candidate in SIGNALFX_DATASOURCE_TYPES and requested in SIGNALFX_DATASOURCE_TYPES:
+    candidate_signalfx = candidate in SIGNALFX_DATASOURCE_TYPES or "signalfx" in candidate
+    requested_signalfx = requested in SIGNALFX_DATASOURCE_TYPES or "signalfx" in requested
+    if candidate_signalfx and requested_signalfx:
+        return True
+    candidate_elastic = candidate in ELASTICSEARCH_DATASOURCE_TYPES or any(
+        marker in candidate for marker in ELASTICSEARCH_DATASOURCE_TYPES
+    )
+    requested_elastic = requested in ELASTICSEARCH_DATASOURCE_TYPES or any(
+        marker in requested for marker in ELASTICSEARCH_DATASOURCE_TYPES
+    )
+    if candidate_elastic and requested_elastic:
         return True
     return False
 

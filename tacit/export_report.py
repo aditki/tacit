@@ -28,7 +28,7 @@ AssessmentReport = dict[str, Any]
 
 ASSESSMENT_VERSION = "1"
 EXPORT_ROW_LIMIT = 10_000
-EXPORT_PAGE_SIZE = 1_000
+EXPORT_PAGE_SIZE = 500
 ANONYMOUS_BUNDLE_FILES = (
     "README.txt",
     "metadata.json",

@@ -3,6 +3,9 @@ publisher PromQL detection/translation, chart JSON builder, config routing."""
 
 import os
 import sys
+from unittest.mock import patch
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -15,6 +18,112 @@ from tacit.models.schemas import (
     PanelSpec,
     SignalType,
 )
+
+
+@pytest.mark.parametrize("realm", ["", "   ", "us1.example", "user:secret@us1"])
+def test_signalfx_client_rejects_invalid_explicit_realm_before_http_client_construction(realm):
+    from tacit.config import Settings
+    from tacit.runtime_ownership import RuntimeOwnershipError
+    from tacit.signalfx.client import SignalFxClient
+
+    runtime_settings = Settings(_env_file=None, signalfx_realm="us1")
+
+    with patch("tacit.signalfx.client.httpx.AsyncClient") as http_client:
+        with pytest.raises(RuntimeOwnershipError, match="SignalFx realm is invalid"):
+            SignalFxClient(realm=realm, runtime_settings=runtime_settings)
+
+    http_client.assert_not_called()
+
+
+def test_signalfx_client_override_is_the_effective_sole_remote_owner():
+    from tacit.backends.signalfx import SignalFxBackend
+    from tacit.config import Settings
+    from tacit.runtime_ownership import credential_fingerprint
+    from tacit.signalfx.client import SignalFxClient
+
+    configured = Settings(
+        _env_file=None,
+        signalfx_realm="us1",
+        signalfx_api_token="configured-token",
+    )
+
+    with patch("tacit.signalfx.client.httpx.AsyncClient") as http_client:
+        client = SignalFxClient(
+            realm="EU0",
+            api_token="override-token",
+            runtime_settings=configured,
+        )
+        backend = SignalFxBackend(client=client)
+
+    remote = backend.runtime_ownership.remotes[0]
+    assert remote.provider == "signalfx"
+    assert remote.endpoint == "https://api.eu0.signalfx.com"
+    assert remote.account == "eu0"
+    assert remote.credential_fingerprint == credential_fingerprint("override-token")
+    assert client.runtime_settings.signalfx_realm == "eu0"
+    assert client.runtime_settings.signalfx_api_token == "override-token"
+    assert backend.runtime_settings == client.runtime_settings
+    http_client.assert_not_called()
+
+
+def test_signalfx_backend_accepts_equivalent_explicit_second_owner():
+    from tacit.backends.signalfx import SignalFxBackend
+    from tacit.config import Settings
+    from tacit.signalfx.client import SignalFxClient
+
+    configured = Settings(
+        _env_file=None,
+        signalfx_realm="us1",
+        signalfx_api_token="configured-token",
+    )
+
+    with patch("tacit.signalfx.client.httpx.AsyncClient"):
+        client = SignalFxClient(
+            realm="eu0",
+            api_token="effective-token",
+            runtime_settings=configured,
+        )
+        backend = SignalFxBackend(client=client, runtime_settings=client.runtime_settings)
+
+    assert backend.runtime_ownership.remotes == client.runtime_ownership.remotes
+
+
+@pytest.mark.parametrize(
+    "settings_update",
+    [
+        {"signalfx_realm": "us2"},
+        {"signalfx_api_token": "other-token"},
+    ],
+)
+def test_signalfx_backend_rejects_disagreeing_explicit_owner_before_network_io(settings_update):
+    from tacit.backends.signalfx import SignalFxBackend
+    from tacit.config import Settings
+    from tacit.runtime_ownership import RuntimeOwnershipMismatchError
+    from tacit.signalfx.client import SignalFxClient
+
+    effective = Settings(
+        _env_file=None,
+        signalfx_realm="us1",
+        signalfx_api_token="configured-token",
+    )
+
+    with patch("tacit.signalfx.client.httpx.AsyncClient") as http_client:
+        client = SignalFxClient(
+            realm="eu0",
+            api_token="effective-token",
+            runtime_settings=effective,
+        )
+        transport = http_client.return_value
+        with pytest.raises(RuntimeOwnershipMismatchError):
+            SignalFxBackend(
+                client=client,
+                runtime_settings=client.runtime_settings.model_copy(deep=True, update=settings_update),
+            )
+
+    transport.get.assert_not_called()
+    transport.post.assert_not_called()
+    http_client.assert_not_called()
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 

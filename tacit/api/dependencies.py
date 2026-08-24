@@ -47,6 +47,11 @@ def get_signal_store(request: Request) -> Any:
     return get_runtime_stores(request).signals()
 
 
+def get_signal_store_factory(request: Request) -> Callable[[], Any]:
+    """Return a lazy app-scoped signal-store factory for authorization-first routes."""
+    return get_runtime_stores(request).signals
+
+
 def get_knowledge_repository(request: Request) -> Any:
     """Return Operational Knowledge persistence bound to this application."""
     return get_runtime_stores(request).knowledge_repository()

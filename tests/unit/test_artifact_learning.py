@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from bisect import bisect_right
+from contextlib import contextmanager
+from copy import deepcopy
+from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from tacit.artifact_learning import (
     IncidentExtractor,
@@ -11,10 +16,49 @@ from tacit.artifact_learning import (
     _reconcile_stale_artifact_knowledge,
     artifact_from_text,
     learn_artifact,
+    learn_incident_dir,
+    learn_incident_file,
     learn_runbook_dir,
+    learn_runbook_file,
 )
 from tacit.config import Settings
 from tacit.signals import SignalStore
+
+
+class _DescriptorOnlySignalStore:
+    """Delegate behavior while exposing ownership only through the public descriptor."""
+
+    def __init__(self, delegate: SignalStore):
+        self._delegate = delegate
+        self.runtime_settings = delegate.runtime_settings
+        self.runtime_ownership = delegate.runtime_ownership
+        self.private_accesses: list[str] = []
+
+    def __getattr__(self, name: str):
+        if name == "database_path":
+            raise AttributeError(name)
+        if name.startswith("_"):
+            self.private_accesses.append(name)
+            raise AssertionError(f"private ownership probe: {name}")
+        return getattr(self._delegate, name)
+
+
+class _DescriptorOnlyKnowledgeService:
+    """Delegate governance without exposing its private signal-store accessor."""
+
+    def __init__(self, delegate):
+        self._delegate = delegate
+        self.runtime_settings = delegate.runtime_settings
+        self.runtime_ownership = delegate.runtime_ownership
+        self.private_accesses: list[str] = []
+
+    def __getattr__(self, name: str):
+        if name == "database_path":
+            raise AttributeError(name)
+        if name == "_signal_store":
+            self.private_accesses.append(name)
+            raise AssertionError(f"private ownership probe: {name}")
+        return getattr(self._delegate, name)
 
 
 def _artifact(body: str):
@@ -61,6 +105,78 @@ def test_artifact_learning_requires_review_before_creating_storage(tmp_path):
         )
 
     assert not db_path.exists()
+
+
+def test_direct_artifact_learning_uses_descriptor_only_store_without_global_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    runtime_settings = Settings(
+        _env_file=None,
+        signals_db_path=str(tmp_path / "signals.db"),
+        knowledge_tenant_id="tenant-a",
+    )
+    real_store = SignalStore(runtime_settings.signals_db_path, runtime_settings=runtime_settings)
+    store = _DescriptorOnlySignalStore(real_store)
+
+    def forbidden_global_store():
+        raise AssertionError("descriptor-owned artifact learning consulted a process-global store")
+
+    monkeypatch.setattr("tacit.artifact_learning.get_signal_store", forbidden_global_store)
+    monkeypatch.setattr("tacit.dashboard_ingest.service.get_signal_store", forbidden_global_store)
+
+    result = learn_artifact(
+        _artifact("## Checks\n- check Redis misses"),
+        RunbookExtractor(),
+        runtime_settings=runtime_settings,
+        store=store,
+        tenant_id="tenant-a",
+    )
+
+    assert result["change_state"] == "created"
+    assert result["knowledge_candidate_ids"]
+    assert store.private_accesses == []
+
+
+def test_direct_artifact_learning_never_probes_injected_service_private_store(
+    tmp_path,
+    monkeypatch,
+):
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    database_path = tmp_path / "signals.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        signals_db_path=str(database_path),
+        knowledge_tenant_id="tenant-a",
+    )
+    real_store = SignalStore(database_path, runtime_settings=runtime_settings)
+    store = _DescriptorOnlySignalStore(real_store)
+    service = _DescriptorOnlyKnowledgeService(
+        KnowledgeService(
+            KnowledgeRepository(database_path),
+            signal_store=real_store,
+            runtime_settings=runtime_settings,
+        )
+    )
+
+    def forbidden_global_store():
+        raise AssertionError("descriptor-owned artifact learning consulted a process-global store")
+
+    monkeypatch.setattr("tacit.artifact_learning.get_signal_store", forbidden_global_store)
+    result = learn_artifact(
+        _artifact("## Checks\n- check Redis misses"),
+        RunbookExtractor(),
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=service,
+        tenant_id="tenant-a",
+    )
+
+    assert result["knowledge_candidate_ids"]
+    assert store.private_accesses == []
+    assert service.private_accesses == []
 
 
 def test_runbook_extractor_emits_evidence_requirement_for_check():
@@ -371,6 +487,7 @@ def test_incident_ignored_rca_text_is_not_indexed(tmp_path, monkeypatch):
 
 
 def test_artifact_learning_requires_explicit_tenant_for_wildcard_config(monkeypatch):
+    monkeypatch.setattr("tacit.config.settings.api_auth_enabled", True)
     monkeypatch.setattr("tacit.config.settings.knowledge_tenant_id", "*")
 
     with pytest.raises(ValueError, match="tenant_id is required"):
@@ -386,6 +503,377 @@ def test_artifact_learning_enforces_supplied_runtime_tenant():
             runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
             tenant_id="tenant-b",
         )
+
+
+def test_artifact_tenant_denial_precedes_store_initialization(tmp_path):
+    db_path = tmp_path / "signals.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        signals_db_path=str(db_path),
+        knowledge_tenant_id="tenant-a",
+    )
+
+    with pytest.raises(ValueError, match="Tenant access denied"):
+        learn_artifact(
+            _artifact("## Checks\n- check Redis misses"),
+            RunbookExtractor(),
+            runtime_settings=runtime_settings,
+            tenant_id="tenant-b",
+        )
+
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_artifact_learning_requires_read_before_extraction_or_store(tmp_path, dry_run):
+    db_path = tmp_path / "read-protected-artifacts.db"
+
+    class ForbiddenExtractor:
+        def extract(self, _artifact):
+            raise AssertionError("artifact extracted before knowledge.read authorization")
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.read"):
+        learn_artifact(
+            _artifact("## Checks\n- check Redis misses"),
+            ForbiddenExtractor(),
+            dry_run=dry_run,
+            runtime_settings=Settings(
+                _env_file=None,
+                knowledge_permissions="knowledge.review,knowledge.apply",
+                signals_db_path=str(db_path),
+            ),
+        )
+
+    assert not db_path.exists()
+
+
+def test_artifact_reingestion_without_read_discloses_nothing_and_changes_nothing(tmp_path):
+    db_path = tmp_path / "reingestion-read-boundary.db"
+    permissive_settings = Settings(_env_file=None)
+    store = SignalStore(db_path=db_path, runtime_settings=permissive_settings)
+    artifact = _artifact("## Checks\n- check Redis misses")
+    learned = learn_artifact(artifact, RunbookExtractor(), store=store)
+    assert learned["knowledge_candidate_ids"]
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE evidence_requirements SET review_state='trusted' WHERE tenant_id=? AND artifact_id=?",
+            ("default", artifact.id),
+        )
+        candidate_count = int(conn.execute("SELECT COUNT(*) FROM knowledge_candidates").fetchone()[0])
+    before = deepcopy(store.list_artifact_extractions(artifact.id, tenant_id="default"))
+
+    class ForbiddenExtractor:
+        def extract(self, _artifact):
+            raise AssertionError("artifact re-extracted before knowledge.read authorization")
+
+    restricted_settings = permissive_settings.model_copy(
+        update={"knowledge_permissions": "knowledge.review,knowledge.apply"}
+    )
+    restricted_store = SignalStore(db_path=db_path, runtime_settings=restricted_settings)
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.read"):
+        learn_artifact(
+            artifact,
+            ForbiddenExtractor(),
+            runtime_settings=restricted_settings,
+            store=restricted_store,
+        )
+
+    assert restricted_store.list_artifact_extractions(artifact.id, tenant_id="default") == before
+    with restricted_store._conn() as conn:
+        assert int(conn.execute("SELECT COUNT(*) FROM knowledge_candidates").fetchone()[0]) == candidate_count
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_artifact_learning_rejects_explicit_and_store_settings_disagreement_before_extraction(
+    tmp_path,
+    dry_run,
+):
+    from tacit.knowledge.repository import KnowledgeRepository
+
+    db_path = tmp_path / "split-runtime.db"
+    restricted_settings = Settings(
+        _env_file=None,
+        signals_db_path=str(db_path),
+        knowledge_permissions="knowledge.review,knowledge.apply",
+    )
+    permissive_settings = restricted_settings.model_copy(
+        update={"knowledge_permissions": "knowledge.read,knowledge.review,knowledge.apply"}
+    )
+    store = SignalStore(db_path=db_path, runtime_settings=restricted_settings)
+
+    class ForbiddenExtractor:
+        def extract(self, _artifact):
+            raise AssertionError("artifact extracted before runtime composition validation")
+
+    with pytest.raises(ValueError, match="runtime settings must match"):
+        learn_artifact(
+            _artifact("## Checks\n- check Redis misses"),
+            ForbiddenExtractor(),
+            dry_run=dry_run,
+            runtime_settings=permissive_settings,
+            store=store,
+        )
+
+    assert KnowledgeRepository(db_path).list_candidates(limit=None) == []
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_artifact_learning_rejects_an_unowned_injected_store_before_extraction(tmp_path, dry_run):
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
+    backing_store = SignalStore(
+        db_path=tmp_path / "unowned-store.db",
+        runtime_settings=runtime_settings,
+    )
+
+    class UnownedStore:
+        _db_path = backing_store._db_path
+
+        def __getattr__(self, name):
+            if name in {"runtime_settings", "settings", "_runtime_settings", "_settings"}:
+                raise AttributeError(name)
+            return getattr(backing_store, name)
+
+    class ForbiddenExtractor:
+        def extract(self, _artifact):
+            raise AssertionError("artifact extracted before runtime ownership validation")
+
+    with pytest.raises(ValueError, match="require explicit runtime settings"):
+        learn_artifact(
+            _artifact("## Checks\n- check Redis misses"),
+            ForbiddenExtractor(),
+            dry_run=dry_run,
+            store=UnownedStore(),
+        )
+
+
+@pytest.mark.parametrize("learner", [learn_runbook_file, learn_incident_file])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_artifact_file_learning_honors_restricted_service_before_file_access(
+    tmp_path,
+    monkeypatch,
+    learner,
+    dry_run,
+):
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    restricted_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.review,knowledge.apply",
+    )
+    service = KnowledgeService(
+        KnowledgeRepository(
+            tmp_path / "restricted-service.db",
+            runtime_settings=restricted_settings,
+        ),
+        runtime_settings=restricted_settings,
+    )
+
+    def forbidden_read_text(_path):
+        raise AssertionError("artifact file read before service authorization")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read_text)
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.read"):
+        learner(
+            tmp_path / "restricted.md",
+            dry_run=dry_run,
+            knowledge_service=service,
+        )
+
+
+@pytest.mark.parametrize("learner", [learn_runbook_file, learn_incident_file])
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("disagreement", ["settings", "database"])
+def test_artifact_file_learning_rejects_store_service_disagreement_before_file_access(
+    tmp_path,
+    monkeypatch,
+    learner,
+    dry_run,
+    disagreement,
+):
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    runtime_settings = Settings(_env_file=None)
+    store_path = tmp_path / "artifact-store.db"
+    store = SignalStore(db_path=store_path, runtime_settings=runtime_settings)
+    service_settings = (
+        runtime_settings.model_copy(
+            update={
+                "knowledge_tenant_id": "tenant-a",
+                "signals_db_path": str(store_path),
+            }
+        )
+        if disagreement == "settings"
+        else runtime_settings
+    )
+    if disagreement == "settings":
+        from tacit.runtime_ownership import runtime_descriptor_for_store
+
+        class SplitSettingsService:
+            runtime_settings = service_settings
+            database_path = store_path
+            runtime_ownership = runtime_descriptor_for_store(
+                component="split_settings_service",
+                runtime_settings=service_settings,
+                database_role="signals",
+                database_path=store_path,
+            )
+
+        service = SplitSettingsService()
+    else:
+        repository_path = tmp_path / "knowledge-service.db"
+        service = KnowledgeService(
+            KnowledgeRepository(repository_path, runtime_settings=service_settings),
+            runtime_settings=service_settings,
+        )
+
+    def forbidden_read_text(_path):
+        raise AssertionError("artifact file read before runtime composition validation")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read_text)
+    expected = "runtime settings must match" if disagreement == "settings" else "same database"
+    with pytest.raises(ValueError, match=expected):
+        learner(
+            tmp_path / "split.md",
+            dry_run=dry_run,
+            store=store,
+            knowledge_service=service,
+        )
+
+
+@pytest.mark.parametrize("learner", [learn_runbook_dir, learn_incident_dir])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_artifact_directory_learning_rejects_store_service_disagreement_before_traversal(
+    tmp_path,
+    monkeypatch,
+    learner,
+    dry_run,
+):
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    runtime_settings = Settings(_env_file=None)
+    store = SignalStore(db_path=tmp_path / "directory-store.db", runtime_settings=runtime_settings)
+    service = KnowledgeService(
+        KnowledgeRepository(
+            tmp_path / "directory-service.db",
+            runtime_settings=runtime_settings,
+        ),
+        runtime_settings=runtime_settings,
+    )
+
+    def forbidden_rglob(_path, _pattern):
+        raise AssertionError("artifact directory traversed before runtime composition validation")
+
+    monkeypatch.setattr(Path, "rglob", forbidden_rglob)
+    with pytest.raises(ValueError, match="same database"):
+        learner(
+            tmp_path / "split-directory",
+            dry_run=dry_run,
+            store=store,
+            knowledge_service=service,
+        )
+
+
+@pytest.mark.parametrize("learner", [learn_runbook_file, learn_incident_file])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_artifact_file_learning_requires_read_before_file_access(tmp_path, monkeypatch, learner, dry_run):
+    db_path = tmp_path / "file-read-protected.db"
+
+    def forbidden_read_text(_path):
+        raise AssertionError("artifact file read before knowledge.read authorization")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read_text)
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.read"):
+        learner(
+            tmp_path / "restricted.md",
+            dry_run=dry_run,
+            runtime_settings=Settings(
+                _env_file=None,
+                knowledge_permissions="knowledge.review,knowledge.apply",
+                signals_db_path=str(db_path),
+            ),
+        )
+
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("learner", [learn_runbook_dir, learn_incident_dir])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_artifact_directory_learning_requires_read_before_traversal(tmp_path, monkeypatch, learner, dry_run):
+    db_path = tmp_path / "directory-read-protected.db"
+
+    def forbidden_rglob(_path, _pattern):
+        raise AssertionError("artifact directory traversed before knowledge.read authorization")
+
+    monkeypatch.setattr(Path, "rglob", forbidden_rglob)
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.read"):
+        learner(
+            tmp_path / "restricted",
+            dry_run=dry_run,
+            runtime_settings=Settings(
+                _env_file=None,
+                knowledge_permissions="knowledge.review,knowledge.apply",
+                signals_db_path=str(db_path),
+            ),
+        )
+
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("learner", [learn_runbook_dir, learn_incident_dir])
+def test_artifact_directory_tenant_denial_precedes_store_initialization(tmp_path, learner):
+    source_dir = tmp_path / "artifacts"
+    source_dir.mkdir()
+    db_path = tmp_path / "signals.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        signals_db_path=str(db_path),
+        knowledge_tenant_id="tenant-a",
+    )
+
+    with pytest.raises(ValueError, match="Tenant access denied"):
+        learner(
+            source_dir,
+            runtime_settings=runtime_settings,
+            tenant_id="tenant-b",
+        )
+
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("learner", [learn_runbook_dir, learn_incident_dir])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_artifact_directory_limit_fails_before_source_reads_or_persistence(
+    tmp_path,
+    monkeypatch,
+    learner,
+    dry_run,
+):
+    source_dir = tmp_path / "artifacts"
+    source_dir.mkdir()
+    (source_dir / "one.md").write_text("service: checkout", encoding="utf-8")
+    (source_dir / "two.md").write_text("service: payments", encoding="utf-8")
+    runtime_settings = Settings(
+        _env_file=None,
+        artifact_learning_directory_file_limit=1,
+    )
+    store = SignalStore(tmp_path / "bounded-artifacts.db", runtime_settings=runtime_settings)
+
+    def forbidden_read_text(_path, *_args, **_kwargs):
+        raise AssertionError("artifact source read before directory limit validation")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read_text)
+    with pytest.raises(ValueError, match="configured file limit"):
+        learner(
+            source_dir,
+            dry_run=dry_run,
+            runtime_settings=runtime_settings,
+            store=store,
+        )
+
+    assert store.list_learned_artifacts(tenant_id="default") == []
 
 
 def test_incident_resolution_section_body_is_not_indexed(tmp_path, monkeypatch):
@@ -760,21 +1248,83 @@ def test_skipped_reingest_replaces_equal_count_extractions_from_an_old_generatio
 
 
 def test_artifact_source_and_extraction_generation_roll_back_together(tmp_path, monkeypatch):
-    store = SignalStore(db_path=tmp_path / "signals.db")
+    tenant_canary = "PRIVATE-ARTIFACT-TENANT-CANARY"
+    path_canary = "PRIVATE-ARTIFACT-PATH-CANARY"
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id=tenant_canary)
+    store = SignalStore(
+        db_path=tmp_path / path_canary / "signals.db",
+        runtime_settings=runtime_settings,
+    )
+    runtime_settings = store.runtime_settings
     monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     first_artifact = _artifact("## Checks\n- check redis_cache_misses_total")
     next_artifact = _artifact("## Checks\n- check checkout_latency_seconds")
-    learn_artifact(first_artifact, RunbookExtractor())
+    store.record_learned_artifact(
+        tenant_id=tenant_canary,
+        artifact_id=first_artifact.id,
+        artifact_type="runbook",
+        fingerprint=first_artifact.fingerprint,
+        body_text=first_artifact.body_text,
+    )
+    store.replace_artifact_extractions(
+        tenant_id=tenant_canary,
+        artifact_id=first_artifact.id,
+        evidence_requirements=[
+            {
+                "id": "baseline-evidence",
+                "subject": "Checkout Runbook",
+                "signal_hint": "redis_cache_misses_total",
+            }
+        ],
+    )
+
+    class FakeRepository:
+        database_path = store.database_path
+
+        @contextmanager
+        def bind_transaction_connection(self, connection):
+            yield connection
+
+    class FakeKnowledgeService:
+        pass
+
+    knowledge_service = FakeKnowledgeService()
+    knowledge_service.runtime_settings = store.runtime_settings
+    knowledge_service.database_path = store.database_path
+    knowledge_service.repository = FakeRepository()
+    knowledge_service.runtime_ownership = store.runtime_ownership
+    exception_canary = "PRIVATE-ARTIFACT-EXCEPTION-CANARY"
 
     def fail_replacement(**_kwargs):
-        raise RuntimeError("simulated extraction write failure")
+        raise RuntimeError(exception_canary)
 
     monkeypatch.setattr(store, "replace_artifact_extractions", fail_replacement)
-    with pytest.raises(RuntimeError, match="simulated extraction write failure"):
-        learn_artifact(next_artifact, RunbookExtractor())
+    with capture_logs() as logs:
+        with pytest.raises(RuntimeError, match=exception_canary):
+            learn_artifact(
+                next_artifact,
+                RunbookExtractor(),
+                store=store,
+                runtime_settings=runtime_settings,
+                tenant_id=tenant_canary,
+                knowledge_service=knowledge_service,
+            )
 
-    persisted = store.get_learned_artifact(first_artifact.id)
-    rows = store.list_artifact_extractions(first_artifact.id)
+    rendered = repr(logs)
+    assert tenant_canary not in rendered
+    assert next_artifact.id not in rendered
+    assert path_canary not in rendered
+    assert exception_canary not in rendered
+    diagnostic = next(entry for entry in logs if entry.get("event") == "artifact_authority_transaction_failed")
+    assert diagnostic["reason_code"] == "artifact_authority_transaction_failed"
+    assert diagnostic["exception_class"] == "RuntimeError"
+    assert len(str(diagnostic["tenant_fingerprint"])) == 16
+    assert len(str(diagnostic["artifact_fingerprint"])) == 16
+    assert len(str(diagnostic["error_fingerprint"])) == 16
+    assert "exc_info" not in diagnostic
+
+    persisted = store.get_learned_artifact(first_artifact.id, tenant_id=tenant_canary)
+    rows = store.list_artifact_extractions(first_artifact.id, tenant_id=tenant_canary)
     assert persisted is not None
     assert persisted["fingerprint"] == first_artifact.fingerprint
     assert [row["signal_hint"] for row in rows["evidence_requirements"]] == ["redis_cache_misses_total"]
@@ -828,6 +1378,38 @@ def test_artifact_generation_rolls_back_when_governed_lifecycle_fails(tmp_path, 
     assert indexed == 0
 
 
+def test_artifact_generation_rolls_back_when_context_indexing_fails(tmp_path, monkeypatch):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total")
+    index_context = store.index_artifact_context
+
+    def fail_after_index_write(**kwargs):
+        assert kwargs["strict"] is True
+        index_context(**kwargs)
+        raise sqlite3.OperationalError("simulated artifact FTS failure")
+
+    monkeypatch.setattr(store, "index_artifact_context", fail_after_index_write)
+    with pytest.raises(sqlite3.OperationalError, match="simulated artifact FTS failure"):
+        learn_artifact(artifact, RunbookExtractor(), store=store)
+
+    assert store.get_learned_artifact(artifact.id) is None
+    assert store.list_artifact_extractions(artifact.id) == {
+        "evidence_requirements": [],
+        "ownership_hints": [],
+        "dependency_hints": [],
+        "signal_mapping_candidates": [],
+    }
+    with store._conn() as conn:
+        assert (
+            conn.execute(
+                """SELECT COUNT(*) FROM learning_context_fts
+               WHERE tenant_id='default' AND source_kind='runbook' AND source_id=?""",
+                (artifact.id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def test_artifact_fanout_limit_is_checked_before_source_persistence(tmp_path):
     runtime_settings = Settings(
         _env_file=None,
@@ -837,7 +1419,7 @@ def test_artifact_fanout_limit_is_checked_before_source_persistence(tmp_path):
         db_path=tmp_path / "signals.db",
         runtime_settings=runtime_settings,
     )
-    artifact = _artifact("## Checks\n" "- check redis_cache_misses_total\n" "- check checkout_latency_seconds")
+    artifact = _artifact("## Checks\n- check redis_cache_misses_total\n- check checkout_latency_seconds")
 
     with pytest.raises(ValueError, match=r"artifact produced \d+ candidates"):
         learn_artifact(
@@ -917,7 +1499,11 @@ def test_missing_runbook_marks_stale_not_deleted(tmp_path):
         fingerprint=artifact.fingerprint,
     )
 
-    marked = store.mark_missing_artifacts_stale(artifact_type="runbook", seen_artifact_ids=set())
+    marked = store.mark_missing_artifacts_stale(
+        artifact_type="runbook",
+        seen_artifact_ids=set(),
+        authority_reconciler=lambda _conn, _artifact: None,
+    )
     row = store.get_learned_artifact(artifact.id)
 
     assert marked == 1
@@ -951,7 +1537,7 @@ def test_list_learned_artifacts_omits_body_text(tmp_path):
 def test_learned_artifacts_and_extractions_are_tenant_scoped(tmp_path):
     store = SignalStore(
         db_path=tmp_path / "signals.db",
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
     )
     for tenant_id, title in (("tenant-a", "Tenant A"), ("tenant-b", "Tenant B")):
         store.record_learned_artifact(
@@ -989,7 +1575,7 @@ def test_learned_artifacts_and_extractions_are_tenant_scoped(tmp_path):
 def test_artifact_governance_uses_explicit_runtime_settings(tmp_path):
     from tacit.knowledge.repository import KnowledgeRepository
 
-    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*")
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
     backing_store = SignalStore(
         db_path=tmp_path / "signals.db",
         runtime_settings=runtime_settings,
@@ -1021,7 +1607,7 @@ def test_artifact_governance_uses_explicit_runtime_settings(tmp_path):
 def test_artifact_governance_derives_settings_from_injected_store(tmp_path):
     from tacit.knowledge.repository import KnowledgeRepository
 
-    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*")
+    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
     store = SignalStore(
         db_path=tmp_path / "signals.db",
         runtime_settings=runtime_settings,
@@ -1051,6 +1637,7 @@ def test_artifact_governance_constructs_store_from_explicit_settings(
     runtime_settings = Settings(
         _env_file=None,
         knowledge_tenant_id="*",
+        api_auth_enabled=True,
         signals_db_path=str(db_path),
     )
 
@@ -1123,7 +1710,7 @@ def test_legacy_artifact_rows_migrate_to_configured_tenant(
     assert extractions["evidence_requirements"][0]["tenant_id"] == expected_tenant
     wildcard_store = SignalStore(
         db_path=db_path,
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
     )
     wildcard_store.record_learned_artifact(
         tenant_id="tenant-b",
@@ -1235,6 +1822,7 @@ def test_missing_artifact_stale_marking_is_scoped_to_crawled_source(tmp_path):
         seen_artifact_ids=set(),
         source_vendor="file",
         external_id_prefix="/tmp/team-a/",
+        authority_reconciler=lambda _conn, _artifact: None,
     )
 
     first_row = store.get_learned_artifact(first.id)
@@ -1276,6 +1864,7 @@ def test_missing_artifact_stale_prefix_treats_like_metacharacters_literally(tmp_
         seen_artifact_ids=set(),
         source_vendor="file",
         external_id_prefix="/tmp/runbooks/team_a/",
+        authority_reconciler=lambda _conn, _artifact: None,
     )
 
     team_a_row = store.get_learned_artifact(team_a.id)
@@ -1310,6 +1899,7 @@ def test_stale_artifact_removes_legacy_artifact_only_mappings(tmp_path):
         artifact_type="runbook",
         seen_artifact_ids=set(),
         source_vendor=artifact.source_vendor or "",
+        authority_reconciler=lambda _conn, _artifact: None,
     )
 
     signal_type = store.get_signal_type("cache_misses")
@@ -1327,7 +1917,11 @@ def test_stale_runbook_reappears_as_restored_and_reindexed(tmp_path, monkeypatch
     first_row = store.get_learned_artifact(artifact.id)
     assert first_row is not None
 
-    marked = store.mark_missing_artifacts_stale(artifact_type="runbook", seen_artifact_ids=set())
+    marked = store.mark_missing_artifacts_stale(
+        artifact_type="runbook",
+        seen_artifact_ids=set(),
+        authority_reconciler=lambda _conn, _artifact: None,
+    )
     stale_row = store.get_learned_artifact(artifact.id)
     assert marked == 1
     assert stale_row is not None
@@ -1346,26 +1940,50 @@ def test_stale_runbook_reappears_as_restored_and_reindexed(tmp_path, monkeypatch
         assert store.search_learning_context("redis_cache_misses_total")
 
 
-def test_stale_artifact_knowledge_reconciliation_pages_past_ten_thousand(monkeypatch):
-    total = 10_005
-    requested_cursors: list[int] = []
+def test_stale_artifact_knowledge_reconciliation_pages_past_ten_thousand(monkeypatch, tmp_path):
+    row_ids = [-(2**63), -19, 0, *range(1, 10_001), 100_003, 2**63 - 1]
+    total = len(row_ids)
+    requested_cursors: list[int | None] = []
     reconciled: list[str] = []
+    owner_settings = Settings(_env_file=None, signals_db_path=str(tmp_path / "signals.db"))
 
     class FakeStore:
-        _db_path = "/tmp/signals.db"
+        runtime_settings = owner_settings
+        database_path = Path(owner_settings.signals_db_path)
+
+        @property
+        def runtime_ownership(self):
+            from tacit.runtime_ownership import runtime_descriptor_for_store
+
+            return runtime_descriptor_for_store(
+                component="fake_signal_store",
+                runtime_settings=self.runtime_settings,
+                database_role="signals",
+                database_path=self.database_path,
+            )
+
+        def ensure_governed_projection_audit_current(self):
+            return None
+
+        def governed_projection_audit_is_current(self, _conn):
+            return True
+
+        @contextmanager
+        def transaction(self):
+            yield object()
 
         def list_unreconciled_stale_artifacts(self, *, tenant_id, artifact_type, limit, after_id):
             assert tenant_id == "tenant-a"
             assert artifact_type == "runbook"
             requested_cursors.append(after_id)
-            remaining = max(0, total - after_id)
+            start = 0 if after_id is None else bisect_right(row_ids, after_id)
             return [
                 {
                     "id": row_id,
-                    "artifact_id": f"artifact-{row_id - 1}",
-                    "missing_since": float(row_id),
+                    "artifact_id": f"artifact-{index}",
+                    "missing_since": float(index + 1),
                 }
-                for row_id in range(after_id + 1, after_id + 1 + min(limit, remaining))
+                for index, row_id in enumerate(row_ids[start : start + limit], start=start)
             ]
 
         def mark_artifact_knowledge_reconciled(self, *, tenant_id, artifact_id, missing_since):
@@ -1373,7 +1991,32 @@ def test_stale_artifact_knowledge_reconciliation_pages_past_ten_thousand(monkeyp
             assert missing_since > 0
             return True
 
+        def artifact_stale_generation_is_current(self, _conn, **_kwargs):
+            return True
+
+    class FakeRepository:
+        database_path = Path(owner_settings.signals_db_path)
+
+        @contextmanager
+        def bind_transaction_connection(self, conn):
+            yield conn
+
     class FakeKnowledgeService:
+        runtime_settings = owner_settings
+        repository = FakeRepository()
+        database_path = repository.database_path
+
+        @property
+        def runtime_ownership(self):
+            from tacit.runtime_ownership import runtime_descriptor_for_store
+
+            return runtime_descriptor_for_store(
+                component="fake_knowledge_service",
+                runtime_settings=self.runtime_settings,
+                database_role="signals",
+                database_path=self.repository.database_path,
+            )
+
         def reconcile_source_lifecycle(
             self,
             *,
@@ -1387,21 +2030,18 @@ def test_stale_artifact_knowledge_reconciliation_pages_past_ten_thousand(monkeyp
             reconciled.append(provenance_ref)
 
     service = FakeKnowledgeService()
-    monkeypatch.setattr("tacit.knowledge.repository.KnowledgeRepository", lambda _path: object())
-    monkeypatch.setattr(
-        "tacit.knowledge.service.KnowledgeService",
-        lambda _repository, **_kwargs: service,
-    )
 
     _reconcile_stale_artifact_knowledge(
         store=FakeStore(),
         tenant_id="tenant-a",
         artifact_type="runbook",
+        knowledge_service=service,
     )
 
-    assert requested_cursors == list(range(0, total, 1_000))
+    expected_cursors = [None, *(row_ids[index - 1] for index in range(1_000, total, 1_000))]
+    assert requested_cursors == expected_cursors
     assert len(reconciled) == total
-    assert reconciled[-1] == "prov_artifact:artifact-10004"
+    assert reconciled[-1] == f"prov_artifact:artifact-{total - 1}"
 
 
 def test_runbook_directory_reuses_one_scoped_knowledge_service(tmp_path, monkeypatch):

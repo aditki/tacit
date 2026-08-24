@@ -16,8 +16,10 @@ from typing import Any
 
 import structlog
 
-from tacit.config import settings
+from tacit.config import Settings
+from tacit.errors import AUTHORITY_BOUNDARY_ERRORS, safe_failure_diagnostics
 from tacit.models.schemas import DashboardSpec, PanelSpec
+from tacit.runtime_ownership import resolve_remote_runtime_settings
 from tacit.signalfx.client import SignalFxClient
 
 logger = structlog.get_logger()
@@ -377,13 +379,20 @@ async def publish_dashboard(
     client: SignalFxClient,
     spec: DashboardSpec,
     group_name: str | None = None,
+    runtime_settings: Settings | None = None,
 ) -> tuple[str, str]:
     """Publish a DashboardSpec to SignalFx.
 
     Creates charts, then a dashboard linking them.
     Returns (dashboard_url, dashboard_id).
     """
-    group_name = group_name or str(getattr(settings, "signalfx_dashboard_group", "Tacit"))
+    active_settings = resolve_remote_runtime_settings(
+        boundary="signalfx_dashboard_publication",
+        owner=client,
+        provider="signalfx",
+        explicit_settings=runtime_settings,
+    )
+    group_name = group_name or active_settings.signalfx_dashboard_group
 
     # 1. Get or create dashboard group
     group = await client.get_or_create_dashboard_group(group_name)
@@ -402,8 +411,17 @@ async def publish_dashboard(
                 logger.debug("signalfx_chart_created", title=panel.title, id=chart_id)
             else:
                 logger.warning("signalfx_chart_no_id", title=panel.title)
-        except Exception:
-            logger.warning("signalfx_chart_create_failed", title=panel.title, exc_info=True)
+        except AUTHORITY_BOUNDARY_ERRORS:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "signalfx_chart_create_failed",
+                title=panel.title,
+                **safe_failure_diagnostics(
+                    exc,
+                    reason_code="signalfx_chart_create_failed",
+                ),
+            )
 
     if not chart_ids:
         logger.error("signalfx_no_charts_created")
@@ -425,8 +443,16 @@ async def publish_dashboard(
             panels=len(spec.panels),
         )
         return dashboard_url, dashboard_id
-    except Exception:
-        logger.error("signalfx_dashboard_create_failed", exc_info=True)
+    except AUTHORITY_BOUNDARY_ERRORS:
+        raise
+    except Exception as exc:
+        logger.error(
+            "signalfx_dashboard_create_failed",
+            **safe_failure_diagnostics(
+                exc,
+                reason_code="signalfx_dashboard_create_failed",
+            ),
+        )
         # Clean up orphaned charts
         for cid in chart_ids:
             try:

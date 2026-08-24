@@ -19,8 +19,10 @@ import yaml
 
 from tacit.agents.providers.base import LLMProvider, LLMResult
 from tacit.backends.base import DashboardFeatures, DiscoveryStatus, PublishResult
+from tacit.config import Settings, settings
 from tacit.dashboard_ingest import extract_metrics_from_promql
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
+from tacit.runtime_ownership import RuntimeOwnershipDescriptor, runtime_descriptor_from_settings
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,7 @@ class CapturingBackend:
     catalog: list[MetricEntry]
     published_specs: list[DashboardSpec] = field(default_factory=list)
     last_discovery_status: DiscoveryStatus = field(default_factory=DiscoveryStatus)
+    runtime_settings: Settings | None = field(default=None, repr=False)
 
     @property
     def name(self) -> str:
@@ -75,6 +78,14 @@ class CapturingBackend:
     @property
     def query_language(self) -> str:
         return "promql"
+
+    @property
+    def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
+        active_settings = self.runtime_settings or settings
+        return runtime_descriptor_from_settings(
+            active_settings,
+            component="e2e_capturing_backend",
+        )
 
     async def discover_metrics(self, keywords: list[str], intent: Intent) -> list[MetricEntry]:
         del keywords, intent

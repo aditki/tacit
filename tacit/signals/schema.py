@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS tenant_signal_types (
     PRIMARY KEY (tenant_id, signal_type)
 );
 
+CREATE INDEX IF NOT EXISTS idx_signal_types_page
+    ON signal_types(category, signal_type);
+CREATE INDEX IF NOT EXISTS idx_tenant_signal_types_page
+    ON tenant_signal_types(tenant_id, category, signal_type);
+
 CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     tenant_id           TEXT NOT NULL DEFAULT 'default',
@@ -56,6 +61,8 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     -- Stable Operational Knowledge identity. Empty for legacy/non-governed rows.
     governance_ref      TEXT NOT NULL DEFAULT '',
     governance_revision INTEGER NOT NULL DEFAULT 0,
+    -- Stable identity for same-pattern resolver variants within one revision.
+    projection_key      TEXT NOT NULL DEFAULT '',
     -- Which inference ruleset produced this (for invalidate/replay).
     inference_version   TEXT NOT NULL DEFAULT '',
     -- Lifecycle: heuristic mappings start 'candidate' → 'approved' → 'trusted';
@@ -71,7 +78,7 @@ CREATE TABLE IF NOT EXISTS signal_metric_mappings (
     created_at          REAL NOT NULL,
     last_seen           REAL NOT NULL,
 
-    UNIQUE(tenant_id, signal_type, metric_pattern, governance_ref)
+    UNIQUE(tenant_id, signal_type, metric_pattern, governance_ref, projection_key)
 );
 
 -- Indexed provenance relation for lifecycle reconciliation. source_refs remains

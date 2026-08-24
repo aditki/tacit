@@ -34,7 +34,7 @@ def test_browser_ui_uses_one_captured_tenant_context_for_scoped_requests():
         "/api/v1/feedback/stats",
         "/api/v1/feedback/analysis",
         "/api/v1/archetypes",
-        "/api/v1/investigations${qs}",
+        "/api/v1/investigations?${params}",
         "/api/v1/investigations/stats",
         "/api/v1/learn/dashboard",
         "/api/v1/learn/dashboard/json",
@@ -207,7 +207,10 @@ def test_system_archetype_signal_and_auth_endpoints(isolated_learning_runtime, m
 def test_chart_history_feedback_and_insights_endpoints(isolated_learning_runtime, monkeypatch):
     _signal_store, history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
     client = TestClient(app)
-    backend = CapturingBackend(catalog=_http_catalog())
+    backend = CapturingBackend(
+        catalog=_http_catalog(),
+        runtime_settings=app.state.settings,
+    )
     monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
     monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
 
@@ -241,7 +244,7 @@ def test_chart_history_feedback_and_insights_endpoints(isolated_learning_runtime
     assert chart_body["panel_count"] > 0
     assert backend.published_specs
 
-    investigations = client.get("/api/v1/investigations?user_id=api-e2e")
+    investigations = client.get("/api/v1/investigations?user_id=local-unauthenticated")
     assert investigations.status_code == 200
     assert investigations.json()["count"] == 1
     investigation = investigations.json()["investigations"][0]
@@ -276,7 +279,7 @@ def test_chart_history_feedback_and_insights_endpoints(isolated_learning_runtime
     feedback_detail = client.get(f"/api/v1/feedback/{chart_body['dashboard_uid']}")
     assert feedback_detail.status_code == 200
     assert feedback_detail.json()["provenance"]["dashboard_uid"] == chart_body["dashboard_uid"]
-    assert feedback_detail.json()["feedback"][0]["reviewer"] == "e2e-reviewer"
+    assert feedback_detail.json()["feedback"][0]["reviewer"] == "local-unauthenticated"
 
     missing_feedback = client.get("/api/v1/feedback/not-found")
     assert missing_feedback.status_code == 404

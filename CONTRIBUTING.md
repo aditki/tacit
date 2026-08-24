@@ -39,10 +39,16 @@ Run them only against accounts and dashboards you are allowed to mutate.
 ## Design Guidance
 
 Before cross-cutting work, read the relevant records in `docs/adr/` and the
+[foundation invariant matrix](docs/foundation-invariant-matrix.md), then the
 [living engineering design notes](docs/engineering-design-notes.md). The ADRs
-capture accepted decisions; the living notes capture recurring invariants,
-refactor triggers, observability expectations, and validation matrices found
-during implementation.
+capture accepted decisions; the matrix defines mandatory test-first coverage;
+the living notes capture recurring invariants, refactor triggers, and
+observability expectations found during implementation.
+
+For every cross-cutting change, list the foundations and matrix rows touched in
+the PR description. Write failing matrix and no-side-effect tests before the
+implementation. If the same missing invariant appears in two paths, stop local
+patching and introduce a shared boundary instead.
 
 When a change exposes reusable design pressure, update the living notes. When it
 selects a durable product or architecture direction, create or amend an ADR.
@@ -58,6 +64,7 @@ selects a durable product or architecture direction, create or amend an ADR.
 
 - Prefer focused PRs over broad rewrites.
 - Include tests for behavior changes.
+- Complete the foundation-matrix evidence section for cross-cutting changes.
 - Label new vendor features as supported beta or experimental in docs.
 - If a change touches generated dashboards, include the user-visible behavior in
   the PR description.

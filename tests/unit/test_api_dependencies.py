@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +9,14 @@ from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
 from tacit.api.app import create_app
-from tacit.api.dependencies import get_history_store, get_knowledge_service, get_signal_store
+from tacit.api.dependencies import (
+    get_feedback_store,
+    get_history_store,
+    get_knowledge_service,
+    get_pipeline_dependencies,
+    get_signal_store,
+    get_signal_store_factory,
+)
 from tacit.api.security import (
     KnowledgeAction,
     assert_knowledge_action,
@@ -18,8 +26,10 @@ from tacit.api.security import (
 )
 from tacit.backends.base import DashboardFeatures
 from tacit.config import Settings
-from tacit.dependencies import PipelineDependencies, resolve_knowledge_service
+from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies, resolve_knowledge_service
+from tacit.errors import PipelineExecutionError, RuntimeOwnershipError, SemanticAuthorizationError
 from tacit.models.schemas import DashRequest, DashResponse
+from tacit.runtime_ownership import RuntimeOwnershipDescriptor, runtime_descriptor_for_store
 from tacit.signals import SignalStore
 
 
@@ -46,7 +56,11 @@ def _security_request(runtime_settings: Settings, tenant_id: str | None = None) 
         (KnowledgeAction.OVERRIDE, ("knowledge.override",)),
         (
             KnowledgeAction.TEACH_SIGNALS,
-            ("knowledge.review", "knowledge.trust", "knowledge.apply"),
+            ("knowledge.read", "knowledge.review", "knowledge.trust", "knowledge.apply"),
+        ),
+        (
+            KnowledgeAction.LEARN_ARTIFACTS,
+            ("knowledge.read", "knowledge.review", "knowledge.apply"),
         ),
     ],
 )
@@ -64,6 +78,48 @@ def test_knowledge_action_permission_matrix(action, required_permissions):
 
 
 @pytest.mark.parametrize(
+    ("failure", "expected_status", "expected_detail"),
+    [
+        (
+            SemanticAuthorizationError("Missing permission: knowledge.apply"),
+            403,
+            "Missing permission: knowledge.apply",
+        ),
+        (
+            PermissionError("/private/runtime/secret-signals.db"),
+            500,
+            "Failed to learn from runbook artifact.",
+        ),
+    ],
+    ids=["semantic-denial", "filesystem-permission"],
+)
+def test_artifact_route_distinguishes_semantic_and_os_permission_failures(
+    monkeypatch,
+    failure,
+    expected_status,
+    expected_detail,
+):
+    app = create_app(runtime_settings=Settings(_env_file=None))
+    monkeypatch.setattr(
+        "tacit.artifact_learning.learn_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/v1/learn/runbooks",
+        json={
+            "title": "Checkout recovery",
+            "body_text": "Check checkout latency.",
+            "dry_run": True,
+        },
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["detail"] == expected_detail
+    assert "/private/runtime/secret-signals.db" not in response.text
+
+
+@pytest.mark.parametrize(
     "endpoint",
     [
         "/api/v1/learn/dashboards",
@@ -78,11 +134,12 @@ def test_knowledge_action_permission_matrix(action, required_permissions):
     ],
 )
 def test_learning_and_signal_reads_require_knowledge_read(endpoint, tmp_path):
+    database_path = tmp_path / "signals.db"
     app = create_app(
         runtime_settings=Settings(
             _env_file=None,
             knowledge_permissions="",
-            signals_db_path=str(tmp_path / "signals.db"),
+            signals_db_path=str(database_path),
         )
     )
 
@@ -90,6 +147,96 @@ def test_learning_and_signal_reads_require_knowledge_read(endpoint, tmp_path):
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Missing permission: knowledge.read"
+    assert not database_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "settings_field"),
+    [
+        ("/api/v1/signals", "signals_db_path"),
+        ("/api/v1/investigations", "history_db_path"),
+        ("/api/v1/feedback/stats", "feedback_db_path"),
+    ],
+)
+def test_denied_reads_do_not_initialize_persistence(endpoint, settings_field, tmp_path):
+    database_path = tmp_path / f"{settings_field}.db"
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="",
+            **{settings_field: str(database_path)},
+        )
+    )
+
+    response = TestClient(app).get(endpoint)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.read"
+    assert not database_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("method", "endpoint", "payload"),
+    [
+        ("get", "/api/v1/knowledge/status", None),
+        (
+            "post",
+            "/api/v1/knowledge/corrections",
+            {
+                "investigation_id": "inv-other-tenant",
+                "investigation_revision": 1,
+                "correction_type": "knowledge_incorrect",
+                "proposed": {"reason": "incorrect"},
+                "explanation": "Incorrect dependency",
+                "created_by": "reviewer",
+                "target_ref": "knowledge-other-tenant",
+            },
+        ),
+    ],
+)
+def test_knowledge_tenant_denial_precedes_every_store_dependency(method, endpoint, payload, tmp_path):
+    signals_path = tmp_path / "signals.db"
+    history_path = tmp_path / "history.db"
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_tenant_id="tenant-a",
+            signals_db_path=str(signals_path),
+            history_db_path=str(history_path),
+        )
+    )
+
+    response = TestClient(app).request(
+        method,
+        endpoint,
+        headers={"X-Tacit-Tenant": "tenant-b"},
+        json=payload,
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Tenant access denied"
+    assert not signals_path.exists()
+    assert not history_path.exists()
+
+
+def test_denied_auto_approval_does_not_initialize_signal_persistence(tmp_path):
+    database_path = tmp_path / "signals.db"
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.apply",
+            signals_db_path=str(database_path),
+        )
+    )
+
+    response = TestClient(app).post(
+        "/api/v1/learn/dashboard",
+        json={"dashboard_uid": "restricted-dash", "auto_approve": True},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.read"
+    assert not database_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -118,9 +265,20 @@ def test_api_app_rejects_unauthenticated_wildcard_tenancy():
         create_app(runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"))
 
 
+def test_api_app_rejects_whitespace_wildcard_tenancy_when_auth_is_disabled():
+    with pytest.raises(ValueError, match="Wildcard knowledge tenancy requires API authentication"):
+        Settings(
+            _env_file=None,
+            knowledge_tenant_id="  *  ",
+            api_auth_enabled=False,
+        )
+
+
 async def test_api_key_dependency_fails_closed_for_unauthenticated_wildcard_tenancy():
+    payload = Settings(_env_file=None).model_dump()
+    payload.update(knowledge_tenant_id="*", api_auth_enabled=False)
     request = _security_request(
-        Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=False),
+        Settings.model_construct(**payload),
         "tenant-a",
     )
 
@@ -141,7 +299,14 @@ async def test_api_key_dependency_fails_closed_for_unauthenticated_wildcard_tena
     ],
 )
 def test_resource_tenant_access_matrix(configured, selected, resource_tenant, status_code):
-    request = _security_request(Settings(knowledge_tenant_id=configured), selected)
+    request = _security_request(
+        Settings(
+            _env_file=None,
+            knowledge_tenant_id=configured,
+            api_auth_enabled=configured == "*",
+        ),
+        selected,
+    )
     if status_code is None:
         assert assert_tenant_access(request, resource_tenant) == resource_tenant
         return
@@ -176,11 +341,69 @@ def test_chart_route_uses_app_scoped_pipeline_settings(monkeypatch):
     response = TestClient(app).post("/api/v1/chart", json={"prompt": "checkout latency"})
 
     assert response.status_code == 200
-    assert seen_settings == [runtime_settings]
-    assert seen_backend_settings == [runtime_settings]
+    assert len(seen_settings) == 1
+    assert seen_settings[0].pipeline_timeout_seconds == runtime_settings.pipeline_timeout_seconds
+    assert seen_settings[0].pipeline_max_concurrent == runtime_settings.pipeline_max_concurrent
+    assert len(seen_backend_settings) == 1
+    assert seen_backend_settings[0].pipeline_timeout_seconds == runtime_settings.pipeline_timeout_seconds
+    assert seen_backend_settings[0].pipeline_max_concurrent == runtime_settings.pipeline_max_concurrent
 
 
-def test_injected_signal_store_without_database_path_cannot_fall_back_globally():
+@pytest.mark.parametrize("endpoint", ["/api/v1/chart", "/api/v1/chart/stream"])
+def test_chart_authorization_precedes_pipeline_dependency_construction(endpoint):
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.read",
+        )
+    )
+    dependency_calls = 0
+
+    def fail_if_dependencies_are_built():
+        nonlocal dependency_calls
+        dependency_calls += 1
+        raise AssertionError("pipeline dependencies were built before authorization")
+
+    app.dependency_overrides[get_pipeline_dependencies] = fail_if_dependencies_are_built
+
+    response = TestClient(app).post(endpoint, json={"prompt": "checkout latency"})
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.apply"
+    assert dependency_calls == 0
+
+
+@pytest.mark.parametrize("endpoint", ["/api/v1/chart", "/api/v1/chart/stream"])
+def test_chart_exception_exposes_persisted_run_identity(endpoint, monkeypatch):
+    app = create_app(runtime_settings=Settings(_env_file=None))
+
+    async def fail_with_run_identity(_request, _deps):
+        raise PipelineExecutionError(
+            "backend failed",
+            investigation_id="inv-failed",
+            investigation_run_id="run-failed",
+            audit_status="run_created",
+        )
+
+    monkeypatch.setattr("tacit.api.routes.dashboard.run_pipeline", fail_with_run_identity)
+    response = TestClient(app).post(endpoint, json={"prompt": "checkout latency"})
+
+    expected_status = 500 if endpoint.endswith("/chart") else 200
+    assert response.status_code == expected_status
+    if endpoint.endswith("/stream"):
+        payload = json.loads(response.text.split("data: ", 1)[1].split("\n\n", 1)[0])
+    else:
+        payload = response.json()
+    assert payload == {
+        "detail": "Failed to generate dashboard",
+        "investigation_id": "inv-failed",
+        "investigation_run_id": "run-failed",
+        "investigation_status": "failed",
+        "audit_status": "run_created",
+    }
+
+
+def test_ownerless_injected_signal_store_cannot_fall_back_globally():
     injected_store = object()
     deps = PipelineDependencies(
         settings=Settings(),
@@ -192,8 +415,104 @@ def test_injected_signal_store_without_database_path_cannot_fall_back_globally()
         cache_key_factory=lambda *parts: ":".join(parts),
     )
 
-    with pytest.raises(RuntimeError, match="unavailable for the active signal store"):
+    with pytest.raises(RuntimeOwnershipError, match="public runtime ownership descriptor"):
         resolve_knowledge_service(deps, signal_store=injected_store)
+
+
+def test_pipeline_knowledge_uses_descriptor_only_signal_store_without_global_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "descriptor-signals.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        signals_db_path=str(database_path),
+        knowledge_tenant_id="tenant-a",
+    )
+    private_accesses: list[str] = []
+
+    class DescriptorOnlySignalStore:
+        def __init__(self):
+            self.runtime_settings = runtime_settings
+            self.runtime_ownership = runtime_descriptor_for_store(
+                component="descriptor-only-signal-store",
+                runtime_settings=runtime_settings,
+                database_role="signals",
+                database_path=database_path,
+            )
+
+        def __getattr__(self, name: str):
+            if name == "database_path":
+                raise AttributeError(name)
+            if name.startswith("_"):
+                private_accesses.append(name)
+                raise AssertionError(f"private ownership probe: {name}")
+            raise AttributeError(name)
+
+    injected = DescriptorOnlySignalStore()
+
+    def forbidden_global_store():
+        raise AssertionError("descriptor-owned dependency consulted the process-global signal store")
+
+    monkeypatch.setattr("tacit.signals.get_signal_store", forbidden_global_store)
+    dependencies = build_pipeline_dependencies(
+        runtime_settings,
+        signal_store_factory=lambda: injected,
+    )
+    assert dependencies.knowledge_service_factory is not None
+
+    factory_service = dependencies.knowledge_service_factory()
+    direct_dependencies = PipelineDependencies(
+        settings=runtime_settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        signal_store_factory=lambda: injected,
+        knowledge_service_factory=None,
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+    direct_service = resolve_knowledge_service(direct_dependencies, signal_store=injected)
+
+    assert factory_service.database_path == database_path
+    assert direct_service.database_path == database_path
+    assert private_accesses == []
+
+
+def test_pipeline_knowledge_preserves_explicit_unavailable_store_without_global_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "must-not-exist" / "signals.db"
+    runtime_settings = Settings(_env_file=None, signals_db_path=str(database_path))
+
+    class UnavailableSignalStore:
+        def __init__(self):
+            self.runtime_settings = runtime_settings
+            self.runtime_ownership = RuntimeOwnershipDescriptor.unavailable(
+                component="unavailable-signal-store",
+                reason="initialization_failed",
+            )
+
+    def forbidden_global_store():
+        raise AssertionError("explicitly unavailable dependency consulted the process-global signal store")
+
+    monkeypatch.setattr("tacit.signals.get_signal_store", forbidden_global_store)
+    dependencies = PipelineDependencies(
+        settings=runtime_settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        signal_store_factory=lambda: UnavailableSignalStore(),
+        knowledge_service_factory=None,
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    with pytest.raises(RuntimeOwnershipError, match="explicitly unavailable"):
+        resolve_knowledge_service(dependencies)
+
+    assert not database_path.parent.exists()
 
 
 def test_api_auth_uses_app_scoped_settings(monkeypatch):
@@ -218,6 +537,66 @@ def test_api_auth_uses_app_scoped_settings(monkeypatch):
         json={"prompt": "checkout latency"},
     )
     assert ok.status_code == 200
+
+
+@pytest.mark.parametrize("endpoint", ["/api/v1/chart", "/api/v1/chart/stream"])
+def test_chart_routes_use_authenticated_credential_as_requester(endpoint, monkeypatch):
+    runtime_settings = Settings(
+        _env_file=None,
+        api_auth_enabled=True,
+        api_auth_key="tenant-a-secret",
+        knowledge_tenant_id="tenant-a",
+    )
+    captured: list[DashRequest] = []
+
+    async def fake_run_pipeline(request: DashRequest, _deps):
+        captured.append(request)
+        return DashResponse(
+            dashboard_url="http://dash",
+            dashboard_uid="dash-actor",
+            panel_count=0,
+            summary=request.user_id,
+        )
+
+    monkeypatch.setattr("tacit.api.routes.dashboard.run_pipeline", fake_run_pipeline)
+    response = TestClient(create_app(runtime_settings=runtime_settings)).post(
+        endpoint,
+        headers={"X-API-Key": "tenant-a-secret"},
+        json={"prompt": "checkout latency", "user_id": "spoofed-operator"},
+    )
+
+    assert response.status_code == 200
+    assert captured[0].user_id == "api-key:tenant-a"
+    assert captured[0].user_id != "spoofed-operator"
+
+
+def test_feedback_route_uses_authenticated_credential_as_reviewer():
+    runtime_settings = Settings(
+        _env_file=None,
+        api_auth_enabled=True,
+        api_auth_key="tenant-a-secret",
+        knowledge_tenant_id="tenant-a",
+    )
+
+    class CapturingFeedbackStore:
+        reviewer = ""
+
+        def submit_feedback(self, **kwargs):
+            self.reviewer = kwargs["reviewer"]
+            return 1
+
+    store = CapturingFeedbackStore()
+    app = create_app(runtime_settings=runtime_settings)
+    app.dependency_overrides[get_feedback_store] = lambda: store
+
+    response = TestClient(app).post(
+        "/api/v1/feedback",
+        headers={"X-API-Key": "tenant-a-secret"},
+        json={"dashboard_uid": "dashboard-1", "reviewer": "spoofed-reviewer"},
+    )
+
+    assert response.status_code == 200
+    assert store.reviewer == "api-key:tenant-a"
 
 
 def test_wildcard_api_keys_are_bound_to_the_selected_tenant(monkeypatch):
@@ -280,6 +659,7 @@ def test_wildcard_settings_reject_duplicate_tenant_api_keys_without_disclosure()
     with pytest.raises(ValueError) as exc_info:
         Settings(
             _env_file=None,
+            api_auth_enabled=True,
             knowledge_tenant_id="*",
             knowledge_tenant_api_keys={
                 "tenant-a": duplicate_secret,
@@ -294,6 +674,7 @@ def test_wildcard_settings_reject_duplicate_tenant_api_keys_without_disclosure()
 def test_wildcard_settings_allow_multiple_unconfigured_tenant_keys():
     runtime_settings = Settings(
         _env_file=None,
+        api_auth_enabled=True,
         knowledge_tenant_id="*",
         knowledge_tenant_api_keys={"tenant-a": "", "tenant-b": ""},
     )
@@ -344,7 +725,9 @@ def test_learning_dashboard_route_uses_app_scoped_backend_settings(monkeypatch, 
 
     assert response.status_code == 200
     assert response.json()["dashboard_uid"] == "runtime-dash"
-    assert seen_settings == [runtime_settings]
+    assert len(seen_settings) == 1
+    assert seen_settings[0].grafana_url == runtime_settings.grafana_url
+    assert seen_settings[0].signals_db_path == str((tmp_path / "signals.db").resolve())
 
 
 def test_pending_learning_requires_and_threads_wildcard_tenant(monkeypatch, tmp_path):
@@ -434,6 +817,7 @@ def test_replay_route_uses_app_scoped_runtime_settings(monkeypatch):
 @pytest.mark.parametrize(
     ("permissions", "missing_permission"),
     [
+        ("", "knowledge.read"),
         ("knowledge.read", "knowledge.review"),
         ("knowledge.read,knowledge.review", "knowledge.trust"),
         ("knowledge.read,knowledge.review,knowledge.trust", "knowledge.apply"),
@@ -458,6 +842,79 @@ def test_learning_auto_approval_requires_knowledge_permissions(monkeypatch, perm
     assert response.status_code == 403
     assert response.json()["detail"] == f"Missing permission: {missing_permission}"
     assert called is False
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/v1/learn/dashboard", {"dashboard_uid": "read-protected"}),
+        (
+            "/api/v1/learn/alerts",
+            {"alert_uid": "read-protected", "backend": "grafana", "dry_run": True},
+        ),
+        (
+            "/api/v1/learn/dashboard/json",
+            {"vendor": "grafana", "source_name": "read-protected.json", "dashboard": {}},
+        ),
+        ("/api/v1/learn/grafana?limit=1", None),
+        ("/api/v1/learn/backends/grafana/alerts?dry_run=true&limit=1", None),
+        ("/api/v1/learn/dashboards/read-protected/approve?backend=grafana", None),
+    ],
+)
+def test_signal_learning_requires_read_before_store_construction(path, payload):
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.review,knowledge.trust,knowledge.apply",
+        )
+    )
+    store_constructed = False
+
+    def forbidden_store_factory():
+        nonlocal store_constructed
+        store_constructed = True
+        raise AssertionError("learning store constructed before read authorization")
+
+    app.dependency_overrides[get_signal_store_factory] = lambda: forbidden_store_factory
+    response = TestClient(app).post(path, json=payload)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.read"
+    assert store_constructed is False
+
+
+@pytest.mark.parametrize("endpoint", ["dashboard", "dashboard/json"])
+def test_dashboard_ingestion_conflicts_return_409(endpoint, monkeypatch):
+    from tacit.dashboard_ingest import DashboardReviewConflictError
+
+    app = create_app(runtime_settings=Settings(_env_file=None))
+    app.dependency_overrides[get_signal_store_factory] = lambda: lambda: object()
+
+    if endpoint == "dashboard":
+
+        async def conflicting_ingest(**_kwargs):
+            raise DashboardReviewConflictError("Dashboard generation changed")
+
+        monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard", conflicting_ingest)
+        payload = {"dashboard_uid": "racing-dashboard", "auto_approve": True}
+    else:
+
+        async def conflicting_ingest(_features, **_kwargs):
+            raise DashboardReviewConflictError("Dashboard generation changed")
+
+        monkeypatch.setattr("tacit.dashboard_uploads.parse_uploaded_dashboard", lambda *_args, **_kwargs: object())
+        monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard_features", conflicting_ingest)
+        payload = {
+            "vendor": "grafana",
+            "source_name": "racing.json",
+            "dashboard": {},
+            "auto_approve": True,
+        }
+
+    response = TestClient(app).post(f"/api/v1/learn/{endpoint}", json=payload)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Dashboard generation changed"
 
 
 def test_pending_learning_requires_apply_permission(monkeypatch):
@@ -492,7 +949,7 @@ def test_artifact_learning_requires_review_permission_before_persistence(endpoin
     app = create_app(
         runtime_settings=Settings(
             _env_file=None,
-            knowledge_permissions="knowledge.apply",
+            knowledge_permissions="knowledge.read,knowledge.apply",
         )
     )
 
@@ -503,6 +960,32 @@ def test_artifact_learning_requires_review_permission_before_persistence(endpoin
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Missing permission: knowledge.review"
+
+
+@pytest.mark.parametrize("endpoint", ["runbooks", "incidents"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_artifact_learning_requires_read_permission_before_processing(endpoint, dry_run, tmp_path):
+    database_path = tmp_path / f"{endpoint}.db"
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_permissions="knowledge.review,knowledge.apply",
+            signals_db_path=str(database_path),
+        )
+    )
+
+    response = TestClient(app).post(
+        f"/api/v1/learn/{endpoint}",
+        json={
+            "title": "Restricted artifact",
+            "body_text": "checkout depends on redis",
+            "dry_run": dry_run,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Missing permission: knowledge.read"
+    assert not database_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -571,7 +1054,11 @@ def test_dashboard_ignore_requires_knowledge_reject_permission(monkeypatch, tmp_
 def test_artifact_lists_use_the_requested_tenant(monkeypatch, tmp_path):
     store = SignalStore(
         db_path=tmp_path / "signals.db",
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        runtime_settings=Settings(
+            _env_file=None,
+            knowledge_tenant_id="*",
+            api_auth_enabled=True,
+        ),
     )
     for tenant_id in ("tenant-a", "tenant-b"):
         store.record_learned_artifact(
@@ -665,6 +1152,13 @@ def test_artifact_routes_page_all_rows_and_batch_extraction_summaries(monkeypatc
     app = create_app(runtime_settings=runtime_settings)
     app.dependency_overrides[get_signal_store] = lambda: store
     client = TestClient(app)
+    assert client.get("/api/v1/learn/runbooks", params={"offset": 10_001}).status_code == 422
+    with pytest.raises(ValueError, match="artifact page bounds"):
+        store.list_learned_artifacts_page(
+            tenant_id="default",
+            artifact_type="runbook",
+            offset=10_001,
+        )
 
     artifact_ids = []
     cursor = None
@@ -780,7 +1274,10 @@ def test_learning_backend_route_uses_app_scoped_backend_settings(monkeypatch, tm
 
     assert response.status_code == 200
     assert response.json()["backend"] == "grafana"
-    assert seen_settings == [runtime_settings]
+    assert len(seen_settings) == 1
+    assert seen_settings[0].grafana_url == runtime_settings.grafana_url
+    assert seen_settings[0].adapter_max_concurrent == runtime_settings.adapter_max_concurrent
+    assert seen_settings[0].signals_db_path == str((tmp_path / "signals.db").resolve())
 
 
 def test_uploaded_dashboard_route_uses_app_scoped_settings(monkeypatch, tmp_path):
@@ -932,6 +1429,40 @@ def test_artifact_dry_runs_do_not_initialize_signal_storage(endpoint, payload):
     assert response.status_code == 200, response.text
     assert response.json()["dry_run"] is True
     assert store_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload"),
+    [
+        (
+            "/api/v1/learn/runbooks",
+            {
+                "title": "Checkout recovery",
+                "body_text": "Check checkout_latency_seconds.",
+                "dry_run": True,
+            },
+        ),
+        (
+            "/api/v1/learn/incidents",
+            {
+                "title": "Checkout incident",
+                "body_text": "Observed checkout_latency_seconds.",
+                "dry_run": True,
+            },
+        ),
+    ],
+)
+def test_artifact_learning_preserves_pinned_tenant_denials(endpoint, payload):
+    app = create_app(runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"))
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        endpoint,
+        headers={"X-Tacit-Tenant": "tenant-b"},
+        json=payload,
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Tenant access denied"
 
 
 def test_alert_dry_runs_preserve_selected_wildcard_tenant(monkeypatch):

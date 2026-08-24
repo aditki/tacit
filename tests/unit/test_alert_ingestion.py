@@ -1,6 +1,6 @@
 import pytest
 
-from tacit.alert_ingest import ingest_alert, ingest_alert_features, learn_backend_alerts
+from tacit.alert_ingest import _alert_fingerprint, ingest_alert, ingest_alert_features, learn_backend_alerts
 from tacit.backends.base import AlertFeatures
 from tacit.backends.grafana import GrafanaBackend, _parse_grafana_alert_rule
 from tacit.backends.signalfx import SignalFxBackend, _parse_signalfx_detector
@@ -8,7 +8,44 @@ from tacit.config import Settings
 from tacit.knowledge.migration import migrate_signal_mapping
 from tacit.knowledge.repository import KnowledgeRepository
 from tacit.knowledge.service import KnowledgeService
+from tacit.runtime_ownership import (
+    RuntimeRemoteIdentity,
+    adapt_third_party_runtime_owner,
+    credential_fingerprint,
+)
 from tacit.signals import SignalStore
+
+
+def _test_client_owner(provider: str, client: object):
+    if provider == "grafana":
+        runtime_settings = Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            grafana_url="http://grafana.example",
+        )
+        remote = RuntimeRemoteIdentity(
+            provider="grafana",
+            endpoint="http://grafana.example",
+            account="1",
+            credential_fingerprint=credential_fingerprint(""),
+        )
+    else:
+        runtime_settings = Settings(  # type: ignore[call-arg]
+            _env_file=None,
+            signalfx_realm="us1",
+        )
+        remote = RuntimeRemoteIdentity(
+            provider="signalfx",
+            endpoint="https://api.us1.signalfx.com",
+            account="us1",
+            credential_fingerprint=credential_fingerprint(""),
+        )
+    setattr(client, "runtime_settings", runtime_settings)
+    return adapt_third_party_runtime_owner(
+        component=f"test_{provider}_client",
+        owner=client,
+        runtime_settings=runtime_settings,
+        remote=remote,
+    )
 
 
 def test_grafana_alert_rule_parses_to_common_alert_features():
@@ -126,6 +163,60 @@ def test_grafana_alert_rule_resolves_datasource_uid_only_prometheus_queries():
 
     assert features.metrics_found == ["checkout_latency_seconds_count"]
     assert features.query_transformations == ['rate(checkout_latency_seconds_count{service="checkout"}[5m])']
+    assert features.metric_sources == [
+        {
+            "metric": "checkout_latency_seconds_count",
+            "datasource_type": "prometheus",
+            "query_language": "promql",
+        }
+    ]
+
+
+def test_grafana_alert_rule_preserves_exact_promql_datasource_type():
+    features = _parse_grafana_alert_rule(
+        {
+            "uid": "checkout-latency",
+            "title": "Checkout latency high",
+            "condition": "A",
+            "data": [
+                {
+                    "refId": "A",
+                    "datasourceUid": "mimir-prod",
+                    "model": {"expr": "rate(checkout_latency_seconds_count[5m])"},
+                }
+            ],
+        },
+        backend_name="grafana",
+        base_url="http://grafana.example",
+        datasource_types_by_uid={"mimir-prod": "mimir"},
+    )
+
+    assert features.metric_sources == [
+        {
+            "metric": "checkout_latency_seconds_count",
+            "datasource_type": "mimir",
+            "query_language": "promql",
+        }
+    ]
+
+
+def test_alert_fingerprint_changes_when_metric_datasource_changes():
+    base = AlertFeatures(
+        alert_uid="shared-alert",
+        alert_title="Shared metric alert",
+        query_language="promql",
+        metrics_found=["shared_metric"],
+        query_transformations=["shared_metric > 1"],
+        metric_sources=[{"metric": "shared_metric", "datasource_type": "prometheus", "query_language": "promql"}],
+    )
+    mimir = AlertFeatures(
+        **{
+            **base.__dict__,
+            "metric_sources": [{"metric": "shared_metric", "datasource_type": "mimir", "query_language": "promql"}],
+        }
+    )
+
+    assert _alert_fingerprint(base) != _alert_fingerprint(mimir)
 
 
 def test_grafana_alert_rule_uses_uid_resolution_when_datasource_object_has_name_only():
@@ -198,6 +289,7 @@ def test_grafana_alert_threshold_details_change_condition_for_fingerprint():
 @pytest.mark.asyncio
 async def test_direct_alert_auto_approval_requires_teach_permissions():
     from tacit.config import Settings
+    from tacit.runtime_ownership import runtime_descriptor_from_settings
 
     features = AlertFeatures(
         alert_uid="protected-alert",
@@ -208,16 +300,56 @@ async def test_direct_alert_auto_approval_requires_teach_permissions():
         metrics_found=["protected_metric"],
     )
 
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read",
+    )
+
+    class RestrictedStoreOwner:
+        @property
+        def runtime_ownership(self):
+            return runtime_descriptor_from_settings(
+                runtime_settings,
+                component="restricted_signal_store",
+            )
+
+        @property
+        def runtime_settings(self):
+            return runtime_settings
+
     with pytest.raises(PermissionError, match="knowledge.review"):
         await ingest_alert_features(
             features,
             auto_approve=True,
-            store=object(),
+            store=RestrictedStoreOwner(),
+            runtime_settings=runtime_settings,
+        )
+
+
+@pytest.mark.asyncio
+async def test_alert_dry_run_requires_read_before_store_initialization(tmp_path):
+    db_path = tmp_path / "read-protected-alerts.db"
+    features = AlertFeatures(
+        alert_uid="read-protected-alert",
+        alert_title="Read protected alert",
+        backend_name="grafana",
+        query_language="promql",
+        condition="A > 1",
+        metrics_found=["protected_metric"],
+    )
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.read"):
+        await ingest_alert_features(
+            features,
+            dry_run=True,
             runtime_settings=Settings(
                 _env_file=None,
-                knowledge_permissions="knowledge.read",
+                knowledge_permissions="knowledge.apply",
+                signals_db_path=str(db_path),
             ),
         )
+
+    assert not db_path.exists()
 
 
 @pytest.mark.asyncio
@@ -552,7 +684,7 @@ async def test_auto_approved_alert_rolls_back_authority_when_indexing_fails(tmp_
         )
 
     source = store.get_ingested_alert("atomic-approved-alert", "grafana")
-    assert source is not None and source["status"] == "approving"
+    assert source is None
     assert repository.list_candidates() == []
     assert repository.list_current_revisions() == []
     assert store.get_mappings_for_signal("request_latency", include_decayed=True) == []
@@ -580,6 +712,96 @@ async def test_auto_approved_alert_rolls_back_authority_when_indexing_fails(tmp_
             ("default", "alert:atomic-approved-alert"),
         ).fetchone()[0]
     assert indexed > 0
+
+
+@pytest.mark.asyncio
+async def test_changed_auto_approved_alert_preserves_prior_authority_when_preparation_fails(
+    tmp_path,
+    monkeypatch,
+):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+
+    def inferred(metrics, *_args, **_kwargs):
+        metric = metrics[0]
+        return [
+            {
+                "signal_type": "request_latency",
+                "metric": metric,
+                "source": "heuristic",
+                "confidence": 0.9,
+                "auto_teach_eligible": True,
+            }
+        ]
+
+    monkeypatch.setattr("tacit.alert_ingest.infer_signals_from_metrics", inferred)
+    knowledge_service = KnowledgeService(
+        KnowledgeRepository(store._db_path),
+        signal_store=store,
+    )
+
+    def promote_governed_mapping(**kwargs):
+        signal = kwargs["sig"]
+        metric = signal["metric"]
+        candidate_id = migrate_signal_mapping(
+            {
+                "id": f"atomic-alert-refresh:{metric}",
+                "signal_type": signal["signal_type"],
+                "metric_pattern": metric,
+                "source_type": "alert_ingest",
+                "source_refs": [kwargs["source_ref"]],
+            },
+            service=knowledge_service,
+        )
+        knowledge_service.review_candidate(candidate_id, approved=True, reviewer="test")
+        _decision, revision = knowledge_service.evaluate_candidate(candidate_id, live_verified=True)
+        assert revision is not None
+        kwargs["governed_candidate_ids"].add(candidate_id)
+        kwargs["governed_pairs"].add((metric, signal["signal_type"]))
+        return True
+
+    monkeypatch.setattr("tacit.alert_ingest.persist_inferred_signal_review", promote_governed_mapping)
+
+    def features(metric: str) -> AlertFeatures:
+        return AlertFeatures(
+            alert_uid="atomic-refresh-alert",
+            alert_title="Atomic refresh alert",
+            backend_name="grafana",
+            query_language="promql",
+            condition="A > 1",
+            metrics_found=[metric],
+            query_transformations=[metric],
+            service_hints=["checkout"],
+        )
+
+    await ingest_alert_features(
+        features("old_alert_latency_seconds"),
+        auto_approve=True,
+        store=store,
+        knowledge_service=knowledge_service,
+    )
+    revisions_before = knowledge_service.repository.list_current_revisions()
+    index_generation = store.index_alert_context
+
+    def fail_after_index_write(**kwargs):
+        index_generation(**kwargs)
+        raise RuntimeError("simulated alert refresh preparation failure")
+
+    monkeypatch.setattr(store, "index_alert_context", fail_after_index_write)
+    with pytest.raises(RuntimeError, match="simulated alert refresh preparation failure"):
+        await ingest_alert_features(
+            features("new_alert_latency_seconds"),
+            auto_approve=True,
+            store=store,
+            knowledge_service=knowledge_service,
+        )
+
+    persisted = store.get_ingested_alert("atomic-refresh-alert", "grafana")
+    assert persisted is not None
+    assert persisted["status"] == "approved"
+    assert persisted["metrics_found"] == ["old_alert_latency_seconds"]
+    assert knowledge_service.repository.list_current_revisions() == revisions_before
+    mappings = store.get_mappings_for_signal("request_latency", include_decayed=True)
+    assert {mapping["metric_pattern"] for mapping in mappings} == {"old_alert_latency_seconds"}
 
 
 @pytest.mark.asyncio
@@ -631,6 +853,30 @@ async def test_bulk_alert_learning_authorizes_before_backend_access(tmp_path, mo
 
 
 @pytest.mark.asyncio
+async def test_bulk_alert_learning_rejects_split_runtime_before_backend_access(tmp_path, monkeypatch):
+    store_settings = Settings(_env_file=None, knowledge_tenant_id="tenant-a")
+    store = SignalStore(tmp_path / "split-alerts.db", runtime_settings=store_settings)
+    explicit_settings = store_settings.model_copy(update={"knowledge_tenant_id": "tenant-b"})
+    backend_accessed = False
+
+    def get_backends(*_args):
+        nonlocal backend_accessed
+        backend_accessed = True
+        return []
+
+    monkeypatch.setattr("tacit.backends.get_active_backends", get_backends)
+    with pytest.raises(ValueError, match="runtime settings must match"):
+        await learn_backend_alerts(
+            "grafana",
+            store=store,
+            runtime_settings=explicit_settings,
+            tenant_id="tenant-b",
+        )
+
+    assert backend_accessed is False
+
+
+@pytest.mark.asyncio
 async def test_grafana_backend_resolves_datasource_uid_for_managed_alerts():
     class FakeGrafanaClient:
         base_url = "http://grafana.example"
@@ -656,7 +902,9 @@ async def test_grafana_backend_resolves_datasource_uid_for_managed_alerts():
         async def close(self):
             return None
 
-    backend = GrafanaBackend(client=FakeGrafanaClient())
+    client = FakeGrafanaClient()
+    setattr(client, "runtime_ownership", _test_client_owner("grafana", client))
+    backend = GrafanaBackend(client=client)
 
     features = await backend.ingest_alert("checkout-latency")
 
@@ -984,44 +1232,22 @@ async def test_complete_alert_crawl_paginates_all_stale_sources_for_its_backend(
     from tacit.signals import SignalStore
 
     store = SignalStore(db_path=tmp_path / "signals.db")
-    store.record_ingested_alert(
-        "removed-alert",
-        backend_name="grafana",
-        alert_title="Removed alert",
-        fingerprint="abc",
-        metrics_found=["checkout_request_duration_seconds"],
-    )
-    cursors: list[int] = []
+    for index in range(3):
+        store.record_ingested_alert(
+            f"removed-alert-{index}",
+            backend_name="grafana",
+            alert_title=f"Removed alert {index}",
+            fingerprint=f"abc-{index}",
+            metrics_found=["checkout_request_duration_seconds"],
+        )
     reconciled: list[str] = []
-
-    def list_stale_alerts(*, limit, tenant_id, backend_name, after_id):
-        assert limit == 500
-        assert tenant_id == "default"
-        assert backend_name == "grafana"
-        cursors.append(after_id)
-        if after_id == 0:
-            return [
-                {"id": index + 1, "alert_uid": f"stale-{index}", "missing_since": float(index + 1)}
-                for index in range(500)
-            ]
-        if after_id == 500:
-            return [{"id": 501, "alert_uid": "stale-final", "missing_since": 501.0}]
-        return []
 
     def reconcile_source(_self, *, provenance_ref, tenant_id, source_stale, source_generation_guard):
         assert tenant_id == "default"
         assert source_stale is True
         reconciled.append(provenance_ref)
 
-    def mark_reconciled(*, tenant_id, backend_name, alert_uid, missing_since):
-        assert tenant_id == "default"
-        assert backend_name == "grafana"
-        assert alert_uid
-        assert missing_since > 0
-        return True
-
-    monkeypatch.setattr(store, "list_unreconciled_stale_alerts", list_stale_alerts)
-    monkeypatch.setattr(store, "mark_alert_knowledge_reconciled", mark_reconciled)
+    monkeypatch.setattr("tacit.signals.store._STALE_SOURCE_PAGE_SIZE", 1)
     monkeypatch.setattr("tacit.knowledge.service.KnowledgeService.reconcile_source_lifecycle", reconcile_source)
 
     class CompleteBackend:
@@ -1038,11 +1264,8 @@ async def test_complete_alert_crawl_paginates_all_stale_sources_for_its_backend(
 
     result = await learn_backend_alerts("grafana", store=store)
 
-    assert result["stale_marked"] == 1
-    assert cursors == [0, 500]
-    assert len(reconciled) == 501
-    assert reconciled[0] == "grafana:alert:stale-0"
-    assert reconciled[-1] == "grafana:alert:stale-final"
+    assert result["stale_marked"] == 3
+    assert reconciled == [f"grafana:alert:removed-alert-{index}" for index in range(3)]
 
 
 @pytest.mark.asyncio
@@ -1058,7 +1281,9 @@ async def test_signalfx_detector_crawl_marks_short_page_complete():
         async def close(self):
             return None
 
-    backend = SignalFxBackend(client=FakeSignalFxClient())
+    client = FakeSignalFxClient()
+    setattr(client, "runtime_ownership", _test_client_owner("signalfx", client))
+    backend = SignalFxBackend(client=client)
 
     alerts = await backend.list_alerts(limit=10)
 
@@ -1082,7 +1307,9 @@ async def test_signalfx_detector_crawl_keeps_paged_response_incomplete():
         async def close(self):
             return None
 
-    backend = SignalFxBackend(client=FakeSignalFxClient())
+    client = FakeSignalFxClient()
+    setattr(client, "runtime_ownership", _test_client_owner("signalfx", client))
+    backend = SignalFxBackend(client=client)
 
     await backend.list_alerts(limit=10)
 
@@ -1107,7 +1334,9 @@ async def test_signalfx_detector_crawl_pages_until_limit_or_complete():
         async def close(self):
             return None
 
-    backend = SignalFxBackend(client=FakeSignalFxClient())
+    client = FakeSignalFxClient()
+    setattr(client, "runtime_ownership", _test_client_owner("signalfx", client))
+    backend = SignalFxBackend(client=client)
 
     alerts = await backend.list_alerts(limit=200)
 
@@ -1136,7 +1365,9 @@ async def test_signalfx_detector_exact_limit_complete_snapshot_can_reconcile():
         async def close(self):
             return None
 
-    backend = SignalFxBackend(client=FakeSignalFxClient())
+    client = FakeSignalFxClient()
+    setattr(client, "runtime_ownership", _test_client_owner("signalfx", client))
+    backend = SignalFxBackend(client=client)
 
     alerts = await backend.list_alerts(limit=2)
 

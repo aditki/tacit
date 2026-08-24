@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import structlog
@@ -31,6 +32,7 @@ class PipelineRecorder:
         self.run_id = run_id
         self.tenant_id = tenant_id
         self.record_investigation_updates = record_investigation_updates
+        self.audit_status = "run_created" if run_id else "run_unavailable"
 
     def stage(self, stage: str, status: str, reason_code: str, **details: Any) -> None:
         emit_progress(stage, status, reason_code, **details)
@@ -70,6 +72,18 @@ class PipelineRecorder:
             )
         except Exception:
             logger.warning("history_append_event_failed", event_type=event_type, exc_info=True)
+
+    def required_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Append an audit event that must commit before an external side effect."""
+        if not self.run_id or not hasattr(self.history, "append_event"):
+            raise RuntimeError("required pipeline audit event storage is unavailable")
+        self.history.append_event(
+            self.investigation_id,
+            self.run_id,
+            event_type,
+            payload,
+            tenant_id=self.tenant_id,
+        )
 
     def intent(self, intent: Intent) -> None:
         emit_progress(
@@ -214,20 +228,34 @@ class PipelineRecorder:
                 exc_info=True,
             )
 
-    def finish(self, *, persist_record: bool | None = None, **kwargs: Any) -> None:
+    def finish(self, *, persist_record: bool | None = None, **kwargs: Any) -> str:
         run_warning_code = str(kwargs.pop("run_warning_code", ""))
         run_warning_detail = str(kwargs.pop("run_warning_detail", ""))
         should_persist_record = self.record_investigation_updates if persist_record is None else persist_record
-        if should_persist_record:
+        complete_run = getattr(self.history, "complete_run", None)
+        try:
+            supports_atomic_finish = bool(
+                self.run_id
+                and complete_run is not None
+                and "investigation_result" in inspect.signature(complete_run).parameters
+            )
+        except (TypeError, ValueError):
+            supports_atomic_finish = False
+        legacy_finish_failed = False
+        if should_persist_record and not supports_atomic_finish:
             try:
                 self.history.finish(self.investigation_id, tenant_id=self.tenant_id, **kwargs)
             except Exception:
+                legacy_finish_failed = True
                 logger.warning(
                     "history_finish_failed",
                     error_type=HistoryWriteFailed.__name__,
                     exc_info=True,
                 )
-        if self.run_id and hasattr(self.history, "complete_run"):
+        if self.run_id and complete_run is not None:
+            if legacy_finish_failed:
+                self.audit_status = "run_terminal_write_failed"
+                return self.audit_status
             try:
                 pipeline_status = str(kwargs.get("status", "success"))
                 succeeded = pipeline_status == "success"
@@ -240,15 +268,21 @@ class PipelineRecorder:
                     run_status, error_code = "failed", "pipeline_timeout"
                 else:
                     run_status, error_code = "failed", "pipeline_failed"
-                self.history.complete_run(
-                    self.run_id,
-                    status=run_status,
-                    error_code=error_code,
-                    error_detail=run_warning_detail or str(kwargs.get("error", "")),
-                    tenant_id=self.tenant_id,
-                )
+                completion_kwargs: dict[str, Any] = {
+                    "status": run_status,
+                    "error_code": error_code,
+                    "error_detail": run_warning_detail or str(kwargs.get("error", "")),
+                    "tenant_id": self.tenant_id,
+                }
+                if supports_atomic_finish:
+                    completion_kwargs["investigation_result"] = dict(kwargs) if should_persist_record else None
+                complete_run(self.run_id, **completion_kwargs)
             except Exception:
+                self.audit_status = "run_terminal_write_failed"
                 logger.warning("history_complete_run_failed", exc_info=True)
+            else:
+                self.audit_status = "run_completed"
+        return self.audit_status
 
 
 def record_stage(

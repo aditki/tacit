@@ -8,10 +8,18 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi import Path as PathParam
 
 from tacit.api.dependencies import get_feedback_store
-from tacit.api.security import KnowledgeAction, assert_knowledge_action, knowledge_tenant, verify_api_key
+from tacit.api.security import (
+    KnowledgeAction,
+    assert_knowledge_action,
+    authenticated_actor,
+    knowledge_tenant,
+    require_knowledge_action,
+    require_knowledge_tenant,
+    verify_api_key,
+)
 from tacit.models.schemas import FeedbackRequest, FeedbackResponse, FeedbackStatsResponse
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter(dependencies=[Depends(verify_api_key), Depends(require_knowledge_tenant)])
 
 
 @router.post(
@@ -37,7 +45,7 @@ async def submit_feedback(
             investigation_speed=req.investigation_speed,
             overall_useful=req.overall_useful,
             comment=req.comment,
-            reviewer=req.reviewer,
+            reviewer=authenticated_actor(request),
             tenant_id=tenant_id,
         )
     except ValueError as exc:
@@ -56,6 +64,7 @@ async def submit_feedback(
     response_description=(
         "Aggregate stats: total feedback, dashboards reviewed, useful rate, average dimensional scores"
     ),
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def get_feedback_stats(request: Request, store: Any = Depends(get_feedback_store)):
     """Aggregate feedback statistics across all reviewed dashboards."""
@@ -68,6 +77,7 @@ async def get_feedback_stats(request: Request, store: Any = Depends(get_feedback
     tags=["Insights"],
     summary="Feedback analysis & recommendations",
     response_description="Actionable improvement signals with prioritized recommendations",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def get_feedback_analysis(request: Request, store: Any = Depends(get_feedback_store)):
     """Analyze collected feedback to produce actionable improvement signals."""
@@ -80,6 +90,7 @@ async def get_feedback_analysis(request: Request, store: Any = Depends(get_feedb
     tags=["Feedback"],
     summary="Get feedback for a dashboard",
     response_description="Dashboard provenance metadata and all submitted feedback entries",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def get_feedback(
     request: Request,

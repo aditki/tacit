@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 CursorValue = str | int | float | None
 _MAX_CURSOR_LENGTH = 1_024
+MAX_COMPATIBILITY_OFFSET = 10_000
 
 
 @dataclass(frozen=True)

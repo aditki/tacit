@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, cast
 
 import structlog
 
 from tacit.backends.base import AlertFeatures, DashboardFeatures, DiscoveryStatus, PublishResult
 from tacit.config import Settings
+from tacit.errors import (
+    AUTHORITY_BOUNDARY_ERRORS,
+    RuntimeOwnershipError,
+    safe_failure_diagnostics,
+)
 from tacit.grafana.adapters.registry import get_adapter
 from tacit.grafana.client import GrafanaClient
 from tacit.grafana.dashboard import publish_dashboard as publish_dashboard_fn
@@ -18,6 +24,14 @@ from tacit.grafana.datasource import (
     list_datasources,
 )
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
+from tacit.runtime_ownership import (
+    RuntimeOwnershipDescriptor,
+    copy_runtime_settings,
+    get_runtime_ownership,
+    require_remote_runtime_ownership,
+    runtime_descriptor_from_settings,
+    snapshot_runtime_settings,
+)
 from tacit.validation import validate_dashboard_queries
 
 logger = structlog.get_logger()
@@ -25,15 +39,52 @@ PROMQL_DATASOURCE_TYPES = {"prometheus", "promql", "mimir", "cortex", "thanos"}
 GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE = 500
 
 
-class GrafanaBackend:
-    """Dashboard backend that talks to Grafana."""
+def _is_promql_datasource_type(value: str) -> bool:
+    normalized = value.casefold()
+    return normalized in PROMQL_DATASOURCE_TYPES or any(
+        marker in normalized for marker in ("prometheus", "mimir", "cortex", "thanos")
+    )
 
-    def __init__(self, client: GrafanaClient | None = None, runtime_settings: Settings | None = None):
-        self._settings = runtime_settings
-        self._client = client or GrafanaClient(runtime_settings=runtime_settings)
+
+class GrafanaBackend:
+    """Dashboard backend that talks to an ownership-described Grafana client."""
+
+    def __init__(self, client: Any | None = None, runtime_settings: Settings | None = None):
+        self._settings_owner_supplied = runtime_settings is not None
+        explicit_settings = snapshot_runtime_settings(runtime_settings) if runtime_settings is not None else None
+        self._client = client if client is not None else GrafanaClient(runtime_settings=explicit_settings)
+        client_descriptor = get_runtime_ownership(self._client, component="grafana_client")
+        require_remote_runtime_ownership(
+            boundary="grafana_backend",
+            descriptor=client_descriptor,
+            provider="grafana",
+        )
+        client_settings = getattr(self._client, "runtime_settings", None)
+        if explicit_settings is None:
+            if not isinstance(client_settings, Settings):
+                raise RuntimeOwnershipError("grafana_backend requires a public runtime settings owner")
+            self._settings = snapshot_runtime_settings(client_settings)
+        else:
+            self._settings = explicit_settings
+        settings_descriptor = runtime_descriptor_from_settings(
+            self._settings,
+            component="grafana_backend_settings",
+        )
+        require_remote_runtime_ownership(
+            boundary="grafana_backend",
+            descriptor=client_descriptor,
+            provider="grafana",
+            settings_descriptor=settings_descriptor,
+        )
+        self._runtime_ownership = replace(client_descriptor, component="grafana_backend")
         self.last_discovery_status = DiscoveryStatus()
         self.last_alert_list_complete = False
         self.last_dashboard_list_complete = False
+
+    @property
+    def runtime_settings(self) -> Settings | None:
+        """Return the immutable settings used for backend behavior."""
+        return copy_runtime_settings(self._settings) if self._settings is not None else None
 
     # ── Protocol properties ───────────────────────────────────────────
 
@@ -44,6 +95,11 @@ class GrafanaBackend:
     @property
     def query_language(self) -> str:
         return "promql"
+
+    @property
+    def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
+        """Return and validate the backend's effective Grafana ownership."""
+        return self._runtime_ownership
 
     # ── Discovery ─────────────────────────────────────────────────────
 
@@ -64,16 +120,29 @@ class GrafanaBackend:
                 )
                 return []
 
-            entries = await discover_all_metrics(self._client, searchable_ds, keywords)
+            entries = await discover_all_metrics(
+                self._client,
+                searchable_ds,
+                keywords,
+                runtime_settings=self._settings,
+            )
             self.last_discovery_status = DiscoveryStatus(
                 available=True,
                 datasource_count=len(all_ds),
                 searchable_datasource_count=len(searchable_ds),
             )
             return entries
+        except AUTHORITY_BOUNDARY_ERRORS:
+            raise
         except Exception as exc:
-            self.last_discovery_status = DiscoveryStatus(available=False, error=str(exc))
-            logger.error("grafana_discover_failed", error=str(exc), exc_info=True)
+            self.last_discovery_status = DiscoveryStatus(
+                available=False,
+                error="grafana_discover_failed",
+            )
+            logger.warning(
+                "grafana_discover_failed",
+                **safe_failure_diagnostics(exc, reason_code="grafana_discover_failed"),
+            )
             return []
 
     async def discover_datasource_targets(
@@ -85,9 +154,20 @@ class GrafanaBackend:
         del keywords
         try:
             all_ds, searchable_ds = await self._select_searchable_datasources(intent)
+        except AUTHORITY_BOUNDARY_ERRORS:
+            raise
         except Exception as exc:
-            self.last_discovery_status = DiscoveryStatus(available=False, error=str(exc))
-            logger.error("grafana_datasource_target_discovery_failed", error=str(exc), exc_info=True)
+            self.last_discovery_status = DiscoveryStatus(
+                available=False,
+                error="grafana_datasource_target_discovery_failed",
+            )
+            logger.warning(
+                "grafana_datasource_target_discovery_failed",
+                **safe_failure_diagnostics(
+                    exc,
+                    reason_code="grafana_datasource_target_discovery_failed",
+                ),
+            )
             return []
 
         self.last_discovery_status = DiscoveryStatus(
@@ -158,6 +238,7 @@ class GrafanaBackend:
             backend_name=self.name,
             query_language=self.query_language,
             metrics_found=extracted["metrics_found"],
+            metric_sources=extracted["metric_sources"],
             panel_count=extracted["panel_count"],
             panel_titles=extracted["panel_titles"],
             row_groups=extracted["row_groups"],
@@ -351,14 +432,14 @@ def _is_prometheus_alert_query_item(
     ]
     explicit_types = [value for value in datasource_types if value]
     if explicit_types:
-        return any(value in PROMQL_DATASOURCE_TYPES for value in explicit_types)
+        return any(_is_promql_datasource_type(value) for value in explicit_types)
     resolved_types = [
         (datasource_types_by_uid or {}).get(uid, "")
         for uid in datasource_uids
         if uid and uid not in {"__expr__", "-100"}
     ]
     if resolved_types:
-        return any(value in PROMQL_DATASOURCE_TYPES for value in resolved_types)
+        return any(_is_promql_datasource_type(value) for value in resolved_types)
     return False
 
 
@@ -399,6 +480,60 @@ def _extract_grafana_rule_queries(
             if isinstance(value, str) and value:
                 queries.append(value)
     return list(dict.fromkeys(queries))
+
+
+def _grafana_alert_datasource_type(
+    item: dict[str, Any],
+    model: dict[str, Any],
+    datasource_types_by_uid: dict[str, str] | None,
+) -> str:
+    """Resolve the exact datasource type retained by a Grafana alert target."""
+    explicit = [
+        _datasource_type(item.get("datasource")),
+        _datasource_type(model.get("datasource")),
+    ]
+    for datasource_type in explicit:
+        if datasource_type:
+            return datasource_type
+    uids = [
+        str(item.get("datasourceUid", "") or "").casefold(),
+        str(model.get("datasourceUid", "") or "").casefold(),
+    ]
+    for datasource in (item.get("datasource"), model.get("datasource")):
+        if isinstance(datasource, dict):
+            uids.append(str(datasource.get("uid", "") or "").casefold())
+    for uid in uids:
+        datasource_type = (datasource_types_by_uid or {}).get(uid, "")
+        if datasource_type:
+            return datasource_type.casefold()
+    return "prometheus"
+
+
+def _extract_grafana_rule_metric_sources(
+    rule: dict[str, Any],
+    datasource_types_by_uid: dict[str, str] | None = None,
+) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    for item in rule.get("data", []) or []:
+        if not isinstance(item, dict):
+            continue
+        model = item.get("model", {})
+        if not isinstance(model, dict) or not _is_prometheus_alert_query_item(item, model, datasource_types_by_uid):
+            continue
+        datasource_type = _grafana_alert_datasource_type(item, model, datasource_types_by_uid)
+        for key in ("expr", "query"):
+            query = model.get(key, "")
+            if not isinstance(query, str) or not query:
+                continue
+            for metric in _extract_promql_metrics([query]):
+                source = {
+                    "metric": metric,
+                    "datasource_type": datasource_type,
+                    "query_language": "promql",
+                }
+                if source not in sources:
+                    sources.append(source)
+    return sources
 
 
 def _extract_grafana_expression_conditions(rule: dict[str, Any]) -> list[str]:
@@ -444,6 +579,7 @@ def _parse_grafana_alert_rule(
     title = str(rule.get("title", ""))
     uid = str(rule.get("uid", ""))
     queries = _extract_grafana_rule_queries(rule, datasource_types_by_uid)
+    metric_sources = _extract_grafana_rule_metric_sources(rule, datasource_types_by_uid)
     expression_conditions = _extract_grafana_expression_conditions(rule)
     condition_parts = [str(rule.get("condition", "")), *expression_conditions]
     condition = " | ".join(part for part in condition_parts if part)
@@ -461,7 +597,8 @@ def _parse_grafana_alert_rule(
         enabled=not bool(rule.get("isPaused", False)),
         labels=labels,
         annotations=annotations,
-        metrics_found=_extract_promql_metrics(queries),
+        metrics_found=list(dict.fromkeys(source["metric"] for source in metric_sources)),
+        metric_sources=metric_sources,
         query_transformations=queries,
         service_hints=_service_hints_from_labels(labels, tags),
         dashboard_uid=dashboard_uid,

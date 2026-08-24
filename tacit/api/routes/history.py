@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import tacit.history as history_mod
@@ -13,25 +14,39 @@ from tacit.api.security import (
     KnowledgeAction,
     assert_contract_tenant_access,
     assert_knowledge_action,
+    authenticated_actor,
     knowledge_tenant,
+    require_knowledge_action,
+    require_knowledge_tenant,
     verify_api_key,
 )
 from tacit.config import settings
 from tacit.dependencies import PipelineDependencies
+from tacit.errors import PipelineExecutionError
 from tacit.investigation_bundle import build_investigation_bundle
 from tacit.investigation_contract import InvestigationRunType
 from tacit.investigation_replay import CounterfactualChanges, ReplayMode
 from tacit.models.schemas import DashRequest
+from tacit.pagination import MAX_COMPATIBILITY_OFFSET
 from tacit.pipeline import run_pipeline
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter(
+    dependencies=[
+        Depends(verify_api_key),
+        Depends(require_knowledge_tenant),
+        Depends(require_knowledge_action(KnowledgeAction.READ)),
+    ]
+)
 
 
 class CorrectionCandidateRequest(BaseModel):
     correction_text: str = Field(min_length=1, description="User-provided correction or feedback")
     target_ref: str = Field(default="", description="Optional contract object reference the correction applies to")
     revision: int | None = Field(default=None, description="Contract revision being corrected; defaults to current")
-    created_by: str = Field(default="", description="Reviewer or user identifier")
+    created_by: str = Field(
+        default="",
+        description="Optional unverified display label; the audit actor is derived from authentication",
+    )
 
 
 class ReplayRequest(BaseModel):
@@ -41,7 +56,31 @@ class ReplayRequest(BaseModel):
 
 class CorrectionReviewRequest(BaseModel):
     approved: bool
-    reviewed_by: str = Field(min_length=1)
+    reviewed_by: str = Field(
+        default="",
+        description="Optional unverified display label; the audit actor is derived from authentication",
+    )
+
+
+def _authorized_correction_review(
+    payload: CorrectionReviewRequest,
+    request: Request,
+) -> CorrectionReviewRequest:
+    assert_knowledge_action(
+        request,
+        KnowledgeAction.APPROVE if payload.approved else KnowledgeAction.REJECT,
+    )
+    return payload
+
+
+def _authorized_replay_request(
+    http_request: Request,
+    request: ReplayRequest | None = None,
+) -> ReplayRequest:
+    replay_request = request or ReplayRequest()
+    if replay_request.mode != ReplayMode.EXACT:
+        assert_knowledge_action(http_request, KnowledgeAction.APPLY)
+    return replay_request
 
 
 def _require_contract_tenant(request: Request, contract, runtime_settings, store=None) -> str:
@@ -93,7 +132,7 @@ def _authorize_investigation(request: Request, store, investigation_id: str):
 async def list_investigations(
     request: Request,
     limit: int = Query(default=50, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_COMPATIBILITY_OFFSET),
     status: str | None = None,
     user_id: str | None = None,
     before_started_at: float | None = None,
@@ -148,7 +187,7 @@ async def list_investigation_revisions(
     request: Request,
     limit: int = Query(default=200, ge=1, le=500),
     cursor: str | None = Query(default=None, max_length=1024),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_COMPATIBILITY_OFFSET),
     store: Any = Depends(get_history_store),
 ):
     assert_knowledge_action(request, KnowledgeAction.READ)
@@ -182,7 +221,7 @@ async def list_investigation_runs(
     request: Request,
     limit: int = Query(default=200, ge=1, le=500),
     cursor: str | None = Query(default=None, max_length=1024),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_COMPATIBILITY_OFFSET),
     store: Any = Depends(get_history_store),
 ):
     assert_knowledge_action(request, KnowledgeAction.READ)
@@ -217,7 +256,7 @@ async def list_investigation_events(
     run_id: str | None = None,
     limit: int = Query(default=500, ge=1, le=1000),
     cursor: str | None = Query(default=None, max_length=1024),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_COMPATIBILITY_OFFSET),
     store: Any = Depends(get_history_store),
 ):
     assert_knowledge_action(request, KnowledgeAction.READ)
@@ -294,15 +333,12 @@ async def compare_investigation_revisions(
 async def replay_investigation(
     investigation_id: str,
     http_request: Request,
-    request: ReplayRequest | None = None,
+    replay_request: ReplayRequest = Depends(_authorized_replay_request),
     revision: int | None = None,
     store: Any = Depends(get_history_store),
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     assert_knowledge_action(http_request, KnowledgeAction.READ)
-    replay_request = request or ReplayRequest()
-    if replay_request.mode != ReplayMode.EXACT:
-        assert_knowledge_action(http_request, KnowledgeAction.APPLY)
     selected_tenant = knowledge_tenant(http_request)
     source_contract = store.get_contract(investigation_id, revision, tenant_id=selected_tenant)
     if source_contract is None:
@@ -334,6 +370,7 @@ async def replay_investigation(
     tags=["History"],
     summary="Create a reviewable knowledge candidate from a correction",
     response_description="Correction stored as a scoped, provenance-bearing knowledge candidate",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.CORRECT))],
 )
 async def create_correction_candidate(
     investigation_id: str,
@@ -350,7 +387,7 @@ async def create_correction_candidate(
         revision=payload.revision,
         correction_text=payload.correction_text,
         target_ref=payload.target_ref,
-        created_by=payload.created_by,
+        created_by=authenticated_actor(request),
         tenant_id=selected_tenant,
     )
     if candidate is None:
@@ -367,7 +404,7 @@ async def list_correction_candidates(
     investigation_id: str,
     request: Request,
     limit: int = Query(default=200, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    offset: int = Query(default=0, ge=0, le=MAX_COMPATIBILITY_OFFSET),
     store: Any = Depends(get_history_store),
 ):
     assert_knowledge_action(request, KnowledgeAction.READ)
@@ -392,22 +429,18 @@ async def list_correction_candidates(
 async def review_correction_candidate(
     investigation_id: str,
     candidate_id: str,
-    payload: CorrectionReviewRequest,
     request: Request,
+    payload: CorrectionReviewRequest = Depends(_authorized_correction_review),
     store: Any = Depends(get_history_store),
 ):
     assert_knowledge_action(request, KnowledgeAction.READ)
-    assert_knowledge_action(
-        request,
-        KnowledgeAction.APPROVE if payload.approved else KnowledgeAction.REJECT,
-    )
     selected_tenant = knowledge_tenant(request)
     _authorize_investigation(request, store, investigation_id)
     candidate = store.review_knowledge_candidate(
         investigation_id,
         candidate_id,
         approved=payload.approved,
-        reviewed_by=payload.reviewed_by,
+        reviewed_by=authenticated_actor(request),
         tenant_id=selected_tenant,
     )
     if candidate is None:
@@ -419,6 +452,7 @@ async def review_correction_candidate(
     "/api/v1/investigations/{investigation_id}/corrections/{candidate_id}/apply",
     tags=["History"],
     summary="Apply an approved correction as a new revision",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.APPLY))],
 )
 async def apply_correction_candidate(
     investigation_id: str,
@@ -452,29 +486,52 @@ async def refresh_investigation(
 ):
     assert_knowledge_action(request, KnowledgeAction.READ)
     assert_knowledge_action(request, KnowledgeAction.APPLY)
-    store = deps.history_store_factory()
     selected_tenant = knowledge_tenant(request)
-    contract = store.get_contract(investigation_id, tenant_id=selected_tenant)
-    if contract is None:
-        raise HTTPException(status_code=404, detail="Investigation contract not found")
-    tenant_id = _require_contract_tenant(request, contract, deps.settings, store)
-    response = await run_pipeline(
-        DashRequest(
-            prompt=contract.request.question,
-            user_id=contract.request.requester,
-            tenant_id=tenant_id,
-        ),
-        deps,
-        investigation_id=investigation_id,
-        run_type=InvestigationRunType.REFRESH,
-        base_revision=contract.investigation.revision,
-    )
+    try:
+        store = deps.history_store_factory()
+        contract = store.get_contract(investigation_id, tenant_id=selected_tenant)
+        if contract is None:
+            raise HTTPException(status_code=404, detail="Investigation contract not found")
+        tenant_id = _require_contract_tenant(request, contract, deps.settings, store)
+    except HTTPException:
+        raise
+    except Exception:
+        await deps.close_resources()
+        failure = PipelineExecutionError(
+            "Investigation audit storage is unavailable",
+            investigation_id=investigation_id,
+            audit_status="run_unavailable",
+        )
+        return JSONResponse(
+            status_code=500,
+            content=failure.public_payload(detail="Failed to refresh investigation"),
+        )
+    try:
+        response = await run_pipeline(
+            DashRequest(
+                prompt=contract.request.question,
+                user_id=authenticated_actor(request),
+                tenant_id=tenant_id,
+            ),
+            deps,
+            investigation_id=investigation_id,
+            run_type=InvestigationRunType.REFRESH,
+            base_revision=contract.investigation.revision,
+        )
+    except PipelineExecutionError as exc:
+        return JSONResponse(
+            status_code=500,
+            content=exc.public_payload(detail="Failed to refresh investigation"),
+        )
     if response.investigation_revision is None:
         raise HTTPException(
             status_code=409,
             detail={
                 "message": "Refresh did not create an authoritative investigation revision.",
                 "investigation_id": investigation_id,
+                "investigation_run_id": response.investigation_run_id,
+                "investigation_status": response.investigation_status,
+                "audit_status": response.audit_status,
                 "dashboard_url": response.dashboard_url,
                 "dashboard_uid": response.dashboard_uid,
             },
@@ -486,6 +543,7 @@ async def refresh_investigation(
     "/api/v1/investigations/{investigation_id}/migrate",
     tags=["History"],
     summary="Migrate a legacy history record to Investigation Contract v1",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.APPLY))],
 )
 async def migrate_investigation(investigation_id: str, request: Request, store: Any = Depends(get_history_store)):
     assert_knowledge_action(request, KnowledgeAction.READ)
@@ -502,6 +560,7 @@ async def migrate_investigation(investigation_id: str, request: Request, store: 
     "/api/v1/investigations/{investigation_id}/assessment-bundle",
     tags=["History"],
     summary="Export a portable investigation assessment bundle",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.EXPORT))],
 )
 async def export_investigation_assessment_bundle(
     investigation_id: str,

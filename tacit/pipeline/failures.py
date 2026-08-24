@@ -14,12 +14,24 @@ class PipelineFailureFactory:
     """Create standard failed responses and matching history records."""
 
     @staticmethod
-    def no_backends() -> DashResponse:
+    def no_backends(*, recorder: PipelineRecorder | None = None) -> DashResponse:
         return DashResponse(
             dashboard_url="",
             dashboard_uid="",
             panel_count=0,
             summary="No dashboard backends are enabled. Enable at least one of: grafana, signalfx.",
+            investigation_id=recorder.investigation_id if recorder is not None else "",
+            investigation_run_id=(recorder.run_id or "") if recorder is not None else "",
+            investigation_status="failed",
+            audit_status=(
+                getattr(
+                    recorder,
+                    "audit_status",
+                    "run_created" if getattr(recorder, "run_id", None) else "run_unavailable",
+                )
+                if recorder is not None
+                else "run_unavailable"
+            ),
         )
 
     @staticmethod
@@ -44,6 +56,14 @@ class PipelineFailureFactory:
             panel_count=0,
             summary=summary,
             culprit_ranking=culprit_ranking,
+            investigation_id=recorder.investigation_id,
+            investigation_run_id=recorder.run_id or "",
+            investigation_status="failed",
+            audit_status=getattr(
+                recorder,
+                "audit_status",
+                "run_created" if recorder.run_id else "run_unavailable",
+            ),
         )
 
     @staticmethod

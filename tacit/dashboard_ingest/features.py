@@ -23,9 +23,19 @@ def extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
 
     queries = []
     metrics = []
+    metric_sources: list[dict[str, str]] = []
     agg_patterns = []
     cloudwatch_targets: list[dict[str, Any]] = []
-    datasource_type = ""
+
+    def add_metric(metric: str, datasource_type: str, query_language: str) -> None:
+        metrics.append(metric)
+        source = {
+            "metric": metric,
+            "datasource_type": datasource_type.casefold(),
+            "query_language": query_language.casefold(),
+        }
+        if source not in metric_sources:
+            metric_sources.append(source)
 
     for target in panel.get("targets", []):
         t_ds = target.get("datasource", {})
@@ -37,17 +47,17 @@ def extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
         if expr:
             queries.append(expr)
             if language == "promql":
-                metrics.extend(extract_metrics_from_promql(expr))
+                for metric in extract_metrics_from_promql(expr):
+                    add_metric(metric, eff_ds, language)
                 agg_patterns.extend(extract_aggregation_patterns(expr))
             elif language == "signalflow":
                 try:
                     from tacit.backends.signalfx import _extract_metrics_from_signalflow
 
-                    metrics.extend(_extract_metrics_from_signalflow(expr))
+                    for metric in _extract_metrics_from_signalflow(expr):
+                        add_metric(metric, eff_ds, language)
                 except Exception:  # pragma: no cover - defensive
                     pass
-            if eff_ds:
-                datasource_type = eff_ds
         else:
             cw_metric = target.get("metricName", "")
             if cw_metric:
@@ -56,7 +66,7 @@ def extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
                 region = target.get("region", "")
                 dimensions = target.get("dimensions", {}) or {}
                 metric_name = f"{cw_ns}/{cw_metric}" if cw_ns else cw_metric
-                metrics.append(metric_name)
+                add_metric(metric_name, eff_ds or "cloudwatch", "cloudwatch")
                 cloudwatch_targets.append(
                     {
                         "namespace": cw_ns,
@@ -66,14 +76,22 @@ def extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
                         "dimensions": dimensions,
                     }
                 )
-                datasource_type = eff_ds or "cloudwatch"
 
     if not metrics and not queries and not cloudwatch_targets:
         return None
 
-    if not datasource_type:
+    datasource_types = list(
+        dict.fromkeys(source["datasource_type"] for source in metric_sources if source["datasource_type"])
+    )
+    query_languages = list(
+        dict.fromkeys(source["query_language"] for source in metric_sources if source["query_language"])
+    )
+    datasource_type = datasource_types[0] if len(datasource_types) == 1 else ""
+    if not datasource_type and not metric_sources:
         datasource_type = panel_ds_type
-    query_language = datasource_type_to_language(datasource_type)
+    query_language = query_languages[0] if len(query_languages) == 1 else ""
+    if not query_language and datasource_type:
+        query_language = datasource_type_to_language(datasource_type)
 
     panel_links = []
     links = panel.get("links", [])
@@ -92,6 +110,7 @@ def extract_panel_data(panel: dict[str, Any]) -> dict[str, Any] | None:
         "description": panel.get("description", ""),
         "panel_type": panel_type,
         "metrics": list(dict.fromkeys(metrics)),
+        "metric_sources": metric_sources,
         "queries": queries,
         "aggregation_patterns": agg_patterns,
         "datasource_type": datasource_type,
@@ -130,6 +149,11 @@ def parse_dashboard_json(dashboard_json: dict[str, Any]) -> dict[str, Any]:
     for panel in all_panels:
         all_metrics.extend(panel["metrics"])
     unique_metrics = list(dict.fromkeys(all_metrics))
+    metric_sources: list[dict[str, str]] = []
+    for panel in all_panels:
+        for source in panel.get("metric_sources", []):
+            if source not in metric_sources:
+                metric_sources.append(source)
 
     row_groups = defaultdict(list)
     for panel in all_panels:
@@ -189,6 +213,7 @@ def parse_dashboard_json(dashboard_json: dict[str, Any]) -> dict[str, Any]:
         "dashboard_title": title,
         "dashboard_tags": tags,
         "metrics_found": unique_metrics,
+        "metric_sources": metric_sources,
         "panel_count": len(all_panels),
         "row_groups": row_groups_list,
         "metric_cooccurrence": cooccurrence,

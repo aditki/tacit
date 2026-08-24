@@ -580,6 +580,11 @@ def _build_registry() -> tuple[list[InvestigationArchetype], dict[str, Investiga
 ALL_ARCHETYPES, _ARCHETYPE_BY_PROBLEM = _build_registry()
 
 
+def curated_archetype_count() -> int:
+    """Return the current authoritative registry cardinality without traversal."""
+    return len(ALL_ARCHETYPES)
+
+
 def reload_archetypes() -> None:
     """Hot-reload curated archetypes after editing the configured YAML override."""
     global ALL_ARCHETYPES, _ARCHETYPE_BY_PROBLEM

@@ -12,7 +12,8 @@ from typing import Any
 
 import structlog
 
-from tacit.config import DEFAULT_SIGNALS_DB_PATH, settings
+from tacit.config import DEFAULT_SIGNALS_DB_PATH, Settings, settings
+from tacit.errors import SemanticAuthorizationError, safe_failure_diagnostics
 from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 from tacit.knowledge.corroboration import ConflictDetectionService, CorroborationService
 from tacit.knowledge.entities import EntityResolutionService
@@ -59,6 +60,7 @@ from tacit.knowledge.models import (
     MigrationProvenance,
     PromotionContext,
     PromotionDecision,
+    canonical_scope_references,
     utc_now,
 )
 from tacit.knowledge.normalization import (
@@ -83,6 +85,19 @@ from tacit.knowledge.repository import (
     get_knowledge_repository,
 )
 from tacit.knowledge.usage import KnowledgeRevisionRef, KnowledgeStageUse
+from tacit.pagination import MAX_COMPATIBILITY_OFFSET
+from tacit.runtime_ownership import (
+    RuntimeOwnershipDescriptor,
+    RuntimeOwnershipError,
+    RuntimeOwnershipMismatchError,
+    copy_runtime_settings,
+    get_runtime_ownership,
+    require_compatible_runtime_ownership,
+    runtime_descriptor_for_store,
+    runtime_descriptor_from_settings,
+    snapshot_runtime_settings,
+)
+from tacit.signals.projection import normalize_datasource_types, normalize_mapping_confidence
 from tacit.tenancy import resolve_tenant_boundary
 
 PROMPT_INJECTION_RE = re.compile(
@@ -95,6 +110,7 @@ _SNAPSHOT_PAGE_SIZE = 500
 _SOURCE_RECONCILIATION_PAGE_SIZE = 100
 _CONFLICT_TRANSITION_LIMIT = 1_000
 _SOURCE_RECONCILIATION_CONFLICT_BUDGET = 1_000
+_SIGNAL_MAPPING_SCOPE_VARIANT_LIMIT = 500
 
 _TARGET_RETIREMENT_CORRECTIONS = {
     CorrectionType.KNOWLEDGE_STALE,
@@ -105,6 +121,10 @@ _TARGET_SUPERSESSION_CORRECTIONS = {
     CorrectionType.TIME_WINDOW_CORRECTION,
 }
 _TARGET_REQUIRED_CORRECTIONS = _TARGET_RETIREMENT_CORRECTIONS | _TARGET_SUPERSESSION_CORRECTIONS
+
+
+def _diagnostic_fingerprint(*values: object) -> str:
+    return stable_fingerprint(list(values)).split(":", 1)[-1][:16]
 
 
 def _id(prefix: str, value: Any) -> str:
@@ -134,6 +154,39 @@ class CandidateEvaluationResult:
     revision: KnowledgeRevision | None
 
 
+def _signals_database_path(
+    descriptor: RuntimeOwnershipDescriptor,
+    *,
+    component: str,
+) -> Path:
+    paths = tuple(database.path for database in descriptor.databases if database.role == "signals")
+    if len(paths) != 1:
+        raise RuntimeOwnershipError(
+            f"{component} runtime ownership descriptor must expose one signals database identity"
+        )
+    return paths[0]
+
+
+def _require_knowledge_runtime_graph(
+    descriptors: tuple[RuntimeOwnershipDescriptor, ...],
+) -> None:
+    boundary = "knowledge authority and signal resolver"
+    try:
+        require_compatible_runtime_ownership(
+            boundary=boundary,
+            descriptors=descriptors,
+        )
+    except RuntimeOwnershipMismatchError as exc:
+        if "database" not in exc.dimensions:
+            raise
+        raise RuntimeOwnershipMismatchError(
+            boundary,
+            set(exc.dimensions),
+            exc.components,
+            message="knowledge authority and signal resolver must use the same database",
+        ) from None
+
+
 class KnowledgeService:
     def __init__(
         self,
@@ -142,44 +195,103 @@ class KnowledgeService:
         signal_store: Any | None = None,
         history_store: Any | None = None,
         history_store_factory: Callable[[], Any] | None = None,
-        runtime_settings: Any | None = None,
+        runtime_settings: Settings | None = None,
     ):
         if history_store is not None and history_store_factory is not None:
             raise ValueError("provide either history_store or history_store_factory, not both")
-        self._runtime_settings = runtime_settings or getattr(signal_store, "_settings", None) or settings
+
+        repository_descriptor = None
+        repository_path = None
+        repository_settings = None
+        repository_owner = None
+        if repository is not None:
+            repository_descriptor = get_runtime_ownership(
+                repository,
+                component="knowledge_repository",
+            )
+            repository_path = _signals_database_path(
+                repository_descriptor,
+                component="knowledge repository",
+            )
+            if repository_descriptor.tenant_policy is not None:
+                repository_owner = repository_descriptor.tenant_policy.tenant_id
+                repository_settings = settings.model_copy(
+                    update={
+                        "knowledge_tenant_id": repository_owner,
+                        "api_auth_enabled": bool(settings.api_auth_enabled or repository_owner == "*"),
+                    }
+                )
+
+        signal_descriptor = None
+        signal_settings = None
+        signal_db_path = None
+        if signal_store is not None:
+            signal_descriptor = get_runtime_ownership(signal_store, component="signal_store")
+            signal_db_path = _signals_database_path(
+                signal_descriptor,
+                component="signal store",
+            )
+        if signal_store is not None and runtime_settings is None:
+            signal_settings = getattr(signal_store, "runtime_settings", None)
+            if not isinstance(signal_settings, Settings):
+                raise ValueError("an injected signal store must expose public settings and database identity")
+
+        selected_database_path = repository_path or signal_db_path
+        adopted_database_path = (
+            selected_database_path
+            if repository_path is None or signal_db_path is None or repository_path == signal_db_path
+            else None
+        )
+        selected_settings = snapshot_runtime_settings(
+            runtime_settings or signal_settings or repository_settings or settings,
+            database_role="signals" if adopted_database_path is not None else None,
+            database_path=adopted_database_path,
+        )
+        self._runtime_settings = selected_settings
+        if repository_owner is not None:
+            configured_owner = str(self._runtime_settings.knowledge_tenant_id or "default")
+            if repository_owner != configured_owner:
+                raise RuntimeOwnershipMismatchError(
+                    "knowledge repository tenant owner",
+                    {"tenant"},
+                    ("knowledge_repository", "knowledge_service_settings"),
+                    message="knowledge repository tenant owner does not match the configured runtime",
+                )
+        settings_descriptor = runtime_descriptor_from_settings(
+            self._runtime_settings,
+            component="knowledge_service_settings",
+        )
+        supplied_descriptors = tuple(
+            descriptor
+            for descriptor in (settings_descriptor, repository_descriptor, signal_descriptor)
+            if descriptor is not None
+        )
+        _require_knowledge_runtime_graph(supplied_descriptors)
+
         if repository is not None:
             self.repository = repository
-        elif signal_store is not None:
-            signal_db_path = getattr(signal_store, "_db_path", None)
-            if signal_db_path is None:
-                raise ValueError("an injected signal store must expose its database path")
-            self.repository = KnowledgeRepository(Path(signal_db_path))
+        elif signal_db_path is not None:
+            self.repository = KnowledgeRepository(
+                Path(signal_db_path),
+                runtime_settings=self._runtime_settings,
+            )
         elif runtime_settings is not None:
             self.repository = KnowledgeRepository(
-                Path(getattr(self._runtime_settings, "signals_db_path", "") or DEFAULT_SIGNALS_DB_PATH)
+                Path(self._runtime_settings.signals_db_path or DEFAULT_SIGNALS_DB_PATH).expanduser().resolve(),
+                runtime_settings=self._runtime_settings,
             )
         else:
             self.repository = get_knowledge_repository()
-        if signal_store is not None:
-            signal_db_path = getattr(signal_store, "_db_path", None)
-            if signal_db_path is None:
-                raise ValueError("an injected signal store must expose its database path")
-            repository_path = Path(self.repository._db_path).expanduser().resolve()
-            resolver_path = Path(signal_db_path).expanduser().resolve()
-            if repository_path != resolver_path:
-                raise ValueError(
-                    "knowledge authority and signal resolver must use the same database: "
-                    f"authority={repository_path}, resolver={resolver_path}"
-                )
-            resolver_settings = getattr(signal_store, "_settings", None)
-            if resolver_settings is not None:
-                service_tenant = str(getattr(self._runtime_settings, "knowledge_tenant_id", "default") or "default")
-                resolver_tenant = str(getattr(resolver_settings, "knowledge_tenant_id", "default") or "default")
-                if service_tenant != resolver_tenant:
-                    raise ValueError(
-                        "knowledge authority and signal resolver must use the same tenant boundary: "
-                        f"authority={service_tenant}, resolver={resolver_tenant}"
-                    )
+        realized_repository_descriptor = get_runtime_ownership(
+            self.repository,
+            component="knowledge_repository",
+        )
+        self._database_path = _signals_database_path(
+            realized_repository_descriptor,
+            component="knowledge repository",
+        )
+        if repository_descriptor is None:
+            _require_knowledge_runtime_graph((*supplied_descriptors, realized_repository_descriptor))
         self._signal_store_instance = signal_store
         self._history_store_instance = history_store
         self._history_store_factory = history_store_factory
@@ -191,6 +303,32 @@ class KnowledgeService:
             comparison_limit=int(self._runtime_settings.knowledge_conflict_comparison_limit),
         )
         self.policies = default_policies()
+        self._runtime_ownership = runtime_descriptor_for_store(
+            component="knowledge_service",
+            runtime_settings=self._runtime_settings,
+            database_role="signals",
+            database_path=self.database_path,
+        )
+
+    @property
+    def runtime_settings(self) -> Settings:
+        """Return the settings that authorize this service."""
+        return copy_runtime_settings(self._runtime_settings)
+
+    @property
+    def database_path(self) -> Path:
+        """Return the authoritative knowledge database identity."""
+        return self._database_path
+
+    @property
+    def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
+        """Return this service's public runtime ownership descriptor."""
+        return self._runtime_ownership
+
+    @property
+    def signal_store(self) -> Any:
+        """Return the descriptor-compatible resolver projection store."""
+        return self._signal_store()
 
     def _resolve_tenant(self, tenant_id: str | None) -> str:
         return resolve_tenant_boundary(
@@ -271,7 +409,7 @@ class KnowledgeService:
         Promotion and snapshot selection independently revalidate entity state, so
         runtime use fails closed even if this paged audit repair is interrupted.
         """
-        after_candidate_id = ""
+        after_candidate_id: str | None = None
         invalidated_count = 0
         while True:
             page = self.repository.list_candidates_for_entity(
@@ -309,9 +447,9 @@ class KnowledgeService:
                     except CandidateEvaluationConflictError:
                         logger.info(
                             "entity_binding_invalidation_conflict",
-                            tenant_id=entity.tenant_id,
-                            entity_ref=entity.id,
-                            candidate_id=current.id,
+                            tenant_fingerprint=_diagnostic_fingerprint(entity.tenant_id),
+                            entity_ref_fingerprint=_diagnostic_fingerprint(entity.id),
+                            candidate_fingerprint=_diagnostic_fingerprint(current.id),
                         )
                         continue
                     self._resolve_conflicts_for_ineligible_proposition(
@@ -342,8 +480,8 @@ class KnowledgeService:
                 break
         logger.info(
             "entity_binding_invalidation_completed",
-            tenant_id=entity.tenant_id,
-            entity_ref=entity.id,
+            tenant_fingerprint=_diagnostic_fingerprint(entity.tenant_id),
+            entity_ref_fingerprint=_diagnostic_fingerprint(entity.id),
             invalidated_count=invalidated_count,
         )
 
@@ -428,6 +566,87 @@ class KnowledgeService:
             migration_provenance=migration_provenance,
             reactivate_stale=reactivate_stale,
             reactivate_source_change=reactivate_source_change,
+        )
+
+    def resolve_signal_mapping_scope_patch(
+        self,
+        *,
+        record_ref: str,
+        tenant_id: str | None,
+        services: list[str] | None,
+        datasource_types: list[str] | None,
+        environments: list[str] | None,
+    ) -> tuple[list[str] | None, list[str] | None, list[str] | None]:
+        """Preserve omitted taught-mapping scope without guessing among scoped variants."""
+        enforce_knowledge_action(self._runtime_settings, KnowledgeAction.TEACH_SIGNALS)
+        tenant_id = self._resolve_tenant(tenant_id)
+        if services is not None and datasource_types is not None and environments is not None:
+            return services, datasource_types, environments
+        candidates = self.repository.list_candidates_for_payload_ref(
+            tenant_id,
+            f"signal_mapping:{record_ref}",
+            kind=KnowledgeKind.SIGNAL_MAPPING.value,
+            limit=_SIGNAL_MAPPING_SCOPE_VARIANT_LIMIT + 1,
+        )
+        if not candidates:
+            return services, datasource_types, environments
+        if len(candidates) > _SIGNAL_MAPPING_SCOPE_VARIANT_LIMIT:
+            raise ValueError(
+                "Signal mapping has too many scoped variants; use a stable mapping identity "
+                "to select the variant to update"
+            )
+
+        requested_services = None if services is None else canonical_scope_references("service_refs", services)
+        requested_environments = (
+            None if environments is None else canonical_scope_references("environment_refs", environments)
+        )
+        requested_datasource_types = (
+            None
+            if datasource_types is None
+            else sorted({normalize_entity(value) for value in datasource_types if value.strip()})
+        )
+
+        def matches_explicit_scope(candidate: KnowledgeCandidate) -> bool:
+            candidate_datasource_types = candidate.typed_payload.get("context_datasource_types") or []
+            if not isinstance(candidate_datasource_types, list):
+                candidate_datasource_types = []
+            normalized_candidate_datasources = sorted(
+                {normalize_entity(str(value)) for value in candidate_datasource_types if str(value).strip()}
+            )
+            return (
+                (requested_services is None or candidate.scope.service_refs == requested_services)
+                and (requested_environments is None or candidate.scope.environment_refs == requested_environments)
+                and (
+                    requested_datasource_types is None or normalized_candidate_datasources == requested_datasource_types
+                )
+            )
+
+        matching_candidates = [candidate for candidate in candidates if matches_explicit_scope(candidate)]
+        if not matching_candidates:
+            return services, datasource_types, environments
+        if len(matching_candidates) != 1:
+            logger.warning(
+                "signal_mapping_scope_patch_ambiguous",
+                tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+                record_ref_fingerprint=_diagnostic_fingerprint(record_ref),
+                candidate_count=len(matching_candidates),
+            )
+            raise ValueError(
+                "Signal mapping has multiple scoped variants; provide services, "
+                "datasource_types, and environments explicitly"
+            )
+        existing = matching_candidates[0]
+        existing_datasource_types = existing.typed_payload.get("context_datasource_types") or []
+        if not isinstance(existing_datasource_types, list):
+            existing_datasource_types = []
+        return (
+            services if services is not None else list(existing.scope.service_refs),
+            (
+                datasource_types
+                if datasource_types is not None
+                else [str(value) for value in existing_datasource_types if str(value)]
+            ),
+            environments if environments is not None else list(existing.scope.environment_refs),
         )
 
     def _create_candidate(
@@ -622,7 +841,8 @@ class KnowledgeService:
             allowed_reasons.add("source_changed")
         return current.state.lifecycle_status == LifecycleStatus.STALE and current.revision_reason in allowed_reasons
 
-    def _enforce_candidate_review_action(self, *, approved: bool, trust: bool = False) -> None:
+    def enforce_candidate_review_action(self, *, approved: bool, trust: bool = False) -> None:
+        """Authorize one candidate review transition at the service boundary."""
         action = KnowledgeAction.TRUST if trust else KnowledgeAction.APPROVE if approved else KnowledgeAction.REJECT
         enforce_knowledge_action(self._runtime_settings, action)
 
@@ -637,12 +857,12 @@ class KnowledgeService:
         can_trust: bool = False,
         _correction_id: str | None = None,
     ) -> KnowledgeCandidate:
-        self._enforce_candidate_review_action(approved=approved, trust=trust)
+        self.enforce_candidate_review_action(approved=approved, trust=trust)
         tenant_id = self._resolve_tenant(tenant_id)
         candidate = self._require_candidate(candidate_id, tenant_id)
         self._require_candidate_workflow(candidate_id, tenant_id, _correction_id)
         if trust and not can_trust:
-            raise PermissionError("knowledge.trust permission is required")
+            raise SemanticAuthorizationError("knowledge.trust permission is required")
         review_state = ReviewState.TRUSTED if trust else ReviewState.APPROVED if approved else ReviewState.REJECTED
         if candidate.state.review_state == review_state:
             if review_state == ReviewState.REJECTED:
@@ -1136,7 +1356,7 @@ class KnowledgeService:
             )
         logger.info(
             "knowledge_snapshot_scope_selected",
-            tenant_id=scope.tenant_id,
+            tenant_fingerprint=_diagnostic_fingerprint(scope.tenant_id),
             applicable_revision_count=len(revisions),
             **scan_diagnostics,
         )
@@ -1213,7 +1433,7 @@ class KnowledgeService:
 
         logger.info(
             "knowledge_snapshot_scope_repinned",
-            tenant_id=scope.tenant_id,
+            tenant_fingerprint=_diagnostic_fingerprint(scope.tenant_id),
             applicable_revision_count=len(usage),
             preserved_revision_count=len(pinned_by_knowledge_id),
             added_revision_count=len(new_revisions),
@@ -1242,7 +1462,7 @@ class KnowledgeService:
         scanned_revision_count = 0
         excluded_by_complete_scope = 0
         page_count = 0
-        after_knowledge_id = ""
+        after_knowledge_id: str | None = None
         while True:
             page = self.repository.list_current_revisions_for_scope(
                 scope,
@@ -1257,7 +1477,7 @@ class KnowledgeService:
             if scanned_revision_count > scan_limit:
                 logger.error(
                     "knowledge_snapshot_scan_limit_exceeded",
-                    tenant_id=scope.tenant_id,
+                    tenant_fingerprint=_diagnostic_fingerprint(scope.tenant_id),
                     scanned_revision_count=scanned_revision_count,
                     scan_limit=scan_limit,
                     applicable_revision_count=len(revisions),
@@ -1276,12 +1496,13 @@ class KnowledgeService:
                 if len(revisions) > candidate_limit:
                     logger.error(
                         "knowledge_snapshot_candidate_limit_exceeded",
-                        tenant_id=scope.tenant_id,
+                        tenant_fingerprint=_diagnostic_fingerprint(scope.tenant_id),
                         candidate_count=len(revisions),
                         candidate_limit=candidate_limit,
                         scanned_revision_count=scanned_revision_count,
                         excluded_by_complete_scope=excluded_by_complete_scope,
-                        service_refs=scope.service_refs,
+                        service_ref_count=len(scope.service_refs),
+                        scope_fingerprint=_diagnostic_fingerprint(scope.model_dump(mode="json")),
                     )
                     raise RuntimeError(
                         f"Operational Knowledge scope matched more than {candidate_limit} applicable revisions"
@@ -1346,21 +1567,22 @@ class KnowledgeService:
                 metric_pattern = str(mapping.get("metric_pattern") or "").strip()
                 if not metric_pattern:
                     continue
+                datasource_types = normalize_datasource_types(mapping.get("context_datasource_types", []))
                 mappings.append(
                     {
                         "tenant_id": revision.tenant_id,
                         "signal_type": signal_type,
                         "metric_pattern": metric_pattern,
-                        "confidence": self._signal_mapping_confidence(revision, metric_pattern),
+                        "confidence": self._signal_mapping_confidence(
+                            revision,
+                            metric_pattern,
+                            datasource_types,
+                        ),
                         "context_services": self._resolver_scope_values(
                             revision.scope.service_refs,
                             "entity:service:",
                         ),
-                        "context_datasource_types": [
-                            str(value).strip()
-                            for value in mapping.get("context_datasource_types", [])
-                            if str(value).strip()
-                        ],
+                        "context_datasource_types": list(datasource_types),
                         "context_environments": self._resolver_scope_values(
                             revision.scope.environment_refs,
                             "environment:",
@@ -1608,8 +1830,8 @@ class KnowledgeService:
             }:
                 logger.warning(
                     "signal_mapping_usage_disposition_mismatch",
-                    tenant_id=item.tenant_id,
-                    knowledge_id=item.knowledge_ref,
+                    tenant_fingerprint=_diagnostic_fingerprint(item.tenant_id),
+                    knowledge_ref_fingerprint=_diagnostic_fingerprint(item.knowledge_ref),
                     knowledge_revision=item.knowledge_revision,
                     disposition=item.disposition.value,
                 )
@@ -1657,15 +1879,20 @@ class KnowledgeService:
                 logger.error(
                     "knowledge_stage_revision_mismatch",
                     stage=stage,
-                    requested_revisions=requested_revisions,
-                    selected_revisions=selected_revisions,
+                    requested_revision_count=len(requested_revisions),
+                    selected_revision_count=len(selected_revisions),
+                    requested_revisions_fingerprint=_diagnostic_fingerprint(requested_revisions),
+                    selected_revisions_fingerprint=_diagnostic_fingerprint(selected_revisions),
                 )
             logger.error(
                 "governed_stage_usage_missing",
                 stage=stage,
-                knowledge_refs=sorted(
-                    [f"{ref.knowledge_ref}@{ref.knowledge_revision}" for ref in missing_exact_refs]
-                    + list(missing_legacy_refs)
+                knowledge_ref_count=len(missing_exact_refs) + len(missing_legacy_refs),
+                knowledge_refs_fingerprint=_diagnostic_fingerprint(
+                    sorted(
+                        [f"{ref.knowledge_ref}@{ref.knowledge_revision}" for ref in missing_exact_refs]
+                        + list(missing_legacy_refs)
+                    )
                 ),
             )
             raise RuntimeError(
@@ -1875,6 +2102,8 @@ class KnowledgeService:
         """Let exact negative runtime evidence veto matching contextual knowledge."""
         from tacit.models.schemas import EvidenceObservationOutcome
 
+        enforce_knowledge_action(self._runtime_settings, KnowledgeAction.READ)
+        enforce_knowledge_action(self._runtime_settings, KnowledgeAction.APPLY)
         usage = self._validated_usage(usage)
         if not usage:
             return []
@@ -2194,7 +2423,7 @@ class KnowledgeService:
         authoritative: bool = False,
     ) -> tuple[KnowledgeCorrection, KnowledgeRevision | None]:
         """Review and apply a correction within one locked write transaction."""
-        self._enforce_candidate_review_action(approved=approved)
+        self.enforce_candidate_review_action(approved=approved)
         if approved:
             enforce_knowledge_action(self._runtime_settings, KnowledgeAction.APPLY)
         if authoritative:
@@ -2577,13 +2806,25 @@ class KnowledgeService:
         """Retire candidates and promoted knowledge no longer backed by a live source."""
         enforce_knowledge_action(self._runtime_settings, KnowledgeAction.APPLY)
         tenant_id = self._resolve_tenant(tenant_id)
-        # Establish the generation boundary behind any source writer that is
-        # already in flight. The lock is released immediately; page work below
-        # remains bounded.
-        with self.repository.transaction() as conn:
-            if source_generation_guard is not None and not source_generation_guard(conn):
-                raise CandidateLifecycleConflictError("source generation changed before lifecycle reconciliation")
-            reconciliation_started_at = time.time()
+        candidate_limit = (
+            int(self._runtime_settings.knowledge_source_atomic_candidate_limit)
+            if max_candidate_count is None
+            else int(max_candidate_count)
+        )
+        if candidate_limit < 1:
+            raise ValueError("source reconciliation candidate limit must be positive")
+        reconciliation_started_at = time.time()
+        preflight_count = self.repository.count_candidates_for_provenance(
+            tenant_id,
+            provenance_ref,
+            source_updated_before=reconciliation_started_at,
+            stop_after=candidate_limit + 1,
+        )
+        if preflight_count > candidate_limit:
+            raise CandidateLifecycleConflictError(
+                "source reconciliation exceeds the atomic candidate limit; "
+                "consolidate the source or use a bounded lifecycle worker"
+            )
         if self.repository.has_candidate_for_provenance(
             tenant_id,
             provenance_ref,
@@ -2591,16 +2832,18 @@ class KnowledgeService:
             source_updated_before=reconciliation_started_at,
         ):
             self._signal_store()
-        after_candidate_id = ""
+        after_candidate_id: str | None = None
         reconciled_revisions: list[KnowledgeRevision] = []
         candidate_count = 0
         try:
-            while True:
-                with self.repository.transaction() as conn:
-                    if source_generation_guard is not None and not source_generation_guard(conn):
-                        raise CandidateLifecycleConflictError(
-                            "source generation changed during lifecycle reconciliation"
-                        )
+            # Paging bounds memory, while the outer transaction makes the
+            # public lifecycle transition all-or-nothing. The configured cap
+            # bounds write-lock duration for long-lived sources.
+            with self.repository.transaction() as conn:
+                if source_generation_guard is not None and not source_generation_guard(conn):
+                    raise CandidateLifecycleConflictError("source generation changed before lifecycle reconciliation")
+                conflict_work = 0
+                while True:
                     page = self.repository.list_candidates_for_provenance(
                         tenant_id,
                         provenance_ref,
@@ -2612,7 +2855,7 @@ class KnowledgeService:
                         break
                     after_candidate_id = page[-1].id
                     candidate_count += len(page)
-                    if max_candidate_count is not None and candidate_count > max_candidate_count:
+                    if candidate_count > candidate_limit:
                         raise CandidateLifecycleConflictError(
                             "source reconciliation exceeds the atomic candidate limit; "
                             "consolidate the source or use a bounded lifecycle worker"
@@ -2638,13 +2881,12 @@ class KnowledgeService:
                         except CandidateLifecycleConflictError:
                             logger.warning(
                                 "source_lifecycle_transition_conflict",
-                                tenant_id=tenant_id,
-                                candidate_id=observed.id,
+                                tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+                                candidate_fingerprint=_diagnostic_fingerprint(observed.id),
                             )
                             raise
                         retired_candidates.append(updated)
 
-                    conflict_work = 0
                     retired_by_proposition = {
                         candidate.proposition.proposition_key: candidate for candidate in retired_candidates
                     }
@@ -2669,14 +2911,18 @@ class KnowledgeService:
                         )
                     )
             return reconciled_revisions
-        except Exception:
+        except Exception as exc:
             logger.error(
                 "source_lifecycle_reconciliation_failed",
-                tenant_id=tenant_id,
-                provenance_ref=provenance_ref,
+                reason_code="source_lifecycle_reconciliation_failed",
+                tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+                provenance_ref_fingerprint=_diagnostic_fingerprint(provenance_ref),
                 candidate_count=candidate_count,
                 source_stale=source_stale,
-                exc_info=True,
+                **safe_failure_diagnostics(
+                    exc,
+                    reason_code="source_lifecycle_reconciliation_failed",
+                ),
             )
             raise
 
@@ -2780,7 +3026,7 @@ class KnowledgeService:
             from tacit.signals.store import SignalStore
 
             self._signal_store_instance = SignalStore(
-                self.repository._db_path,
+                self.repository.database_path,
                 runtime_settings=self._runtime_settings,
             )
         return self._signal_store_instance
@@ -2819,8 +3065,8 @@ class KnowledgeService:
             self._sync_signal_mapping_state(current, store=store, connection=conn)
             logger.info(
                 "governed_signal_projection_reconciled",
-                tenant_id=current.tenant_id,
-                knowledge_id=current.knowledge_id,
+                tenant_fingerprint=_diagnostic_fingerprint(current.tenant_id),
+                knowledge_ref_fingerprint=_diagnostic_fingerprint(current.knowledge_id),
                 requested_revision=revision.revision,
                 authoritative_revision=current.revision,
             )
@@ -2854,14 +3100,18 @@ class KnowledgeService:
                     expected_parent_revision=expected_parent_revision,
                 )
                 self._sync_signal_mapping_state(persisted, store=store, connection=conn)
-        except Exception:
+        except Exception as exc:
             if store is not None:
                 logger.error(
                     "governed_signal_projection_transaction_failed",
-                    tenant_id=revision.tenant_id,
-                    knowledge_id=revision.knowledge_id,
+                    reason_code="governed_signal_projection_transaction_failed",
+                    tenant_fingerprint=_diagnostic_fingerprint(revision.tenant_id),
+                    knowledge_ref_fingerprint=_diagnostic_fingerprint(revision.knowledge_id),
                     knowledge_revision=revision.revision,
-                    exc_info=True,
+                    **safe_failure_diagnostics(
+                        exc,
+                        reason_code="governed_signal_projection_transaction_failed",
+                    ),
                 )
             raise
         return persisted
@@ -2884,8 +3134,8 @@ class KnowledgeService:
         if not result["active"]:
             logger.info(
                 "governed_signal_projection_deactivated",
-                tenant_id=revision.tenant_id,
-                knowledge_id=revision.knowledge_id,
+                tenant_fingerprint=_diagnostic_fingerprint(revision.tenant_id),
+                knowledge_ref_fingerprint=_diagnostic_fingerprint(revision.knowledge_id),
                 knowledge_revision=revision.revision,
                 mapping_count=result["deactivated"],
                 lifecycle_status=revision.state.lifecycle_status.value,
@@ -2910,16 +3160,19 @@ class KnowledgeService:
                 values.update(str(value).strip() for value in raw_values if str(value).strip())
         return sorted(values)
 
-    def _signal_mapping_confidence(self, revision: KnowledgeRevision, metric_pattern: str) -> float:
+    def _signal_mapping_confidence(
+        self,
+        revision: KnowledgeRevision,
+        metric_pattern: str,
+        datasource_types: tuple[str, ...],
+    ) -> float:
         confidences = []
         for mapping in revision.resolver_payload.get("mappings", []):
             if str(mapping.get("metric_pattern") or "").strip() != metric_pattern:
                 continue
-            try:
-                confidence = float(mapping.get("confidence", 0.5))
-            except (TypeError, ValueError):
-                confidence = 0.5
-            confidences.append(max(0.0, min(1.0, confidence)))
+            if normalize_datasource_types(mapping.get("context_datasource_types", [])) != datasource_types:
+                continue
+            confidences.append(normalize_mapping_confidence(mapping.get("confidence", 0.5)))
         return max(confidences, default=0.5)
 
     @staticmethod
@@ -2928,35 +3181,24 @@ class KnowledgeService:
         contributors: list[KnowledgeCandidate],
     ) -> dict[str, Any]:
         """Freeze exact resolver inputs so revisions never depend on mutable candidates."""
-        mappings: dict[str, dict[str, Any]] = {}
+        mappings: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
 
         def merge_mapping(raw: dict[str, Any]) -> None:
             pattern = str(raw.get("metric_pattern") or "").removeprefix("concept:").strip()
             if not pattern:
                 return
-            try:
-                confidence = float(raw.get("confidence", 0.5))
-            except (TypeError, ValueError):
-                confidence = 0.5
-            confidence = max(0.0, min(1.0, confidence))
-            datasource_types = raw.get("context_datasource_types", [])
-            if not isinstance(datasource_types, list):
-                datasource_types = []
+            confidence = normalize_mapping_confidence(raw.get("confidence", 0.5))
+            datasource_types = normalize_datasource_types(raw.get("context_datasource_types", []))
+            key = (pattern, datasource_types)
             existing = mappings.setdefault(
-                pattern,
+                key,
                 {
                     "metric_pattern": pattern,
                     "confidence": confidence,
-                    "context_datasource_types": [],
+                    "context_datasource_types": list(datasource_types),
                 },
             )
             existing["confidence"] = max(float(existing["confidence"]), confidence)
-            existing["context_datasource_types"] = sorted(
-                {
-                    *existing["context_datasource_types"],
-                    *[str(value).strip() for value in datasource_types if str(value).strip()],
-                }
-            )
 
         for contributor in contributors or [candidate]:
             merge_mapping(
@@ -2989,7 +3231,7 @@ class KnowledgeService:
     ) -> KnowledgeImpact:
         enforce_knowledge_action(self._runtime_settings, KnowledgeAction.READ)
         tenant_id = self._resolve_tenant(tenant_id)
-        if not 1 <= limit <= 500 or offset < 0:
+        if not 1 <= limit <= 500 or not 0 <= offset <= MAX_COMPATIBILITY_OFFSET:
             raise ValueError("knowledge impact pagination is out of bounds")
         affected, total = self.repository.list_applied_investigations(
             tenant_id=tenant_id,
@@ -3136,7 +3378,7 @@ class KnowledgeService:
     ) -> None:
         correction = self.repository.get_correction_for_candidate(candidate_id, tenant_id)
         if correction is not None and correction.id != correction_id:
-            raise PermissionError("correction candidates must be reviewed through the correction workflow")
+            raise SemanticAuthorizationError("correction candidates must be reviewed through the correction workflow")
 
     @staticmethod
     def _is_entity_resolution_repair(

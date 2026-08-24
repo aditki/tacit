@@ -216,6 +216,7 @@ def test_dashboard_terminal_review_retires_governed_source_support_e2e(
         mapping["metric_pattern"]
         for mapping in isolated_learning_store.get_mappings_for_signal(
             "request_latency",
+            context_datasource_type="prometheus",
             include_decayed=True,
         )
     }

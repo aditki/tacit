@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import os
+import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import tacit.config as config_mod
 import tacit.feedback as feedback_mod
 import tacit.history as history_mod
 import tacit.signals.store as signals_store_mod
 from tacit.alert_ingest import ingest_alert_features
 from tacit.backends.base import AlertFeatures
-from tacit.config import Settings, create_settings
+from tacit.config import Settings, create_settings, validate_distinct_sqlite_role_paths
+from tacit.errors import RuntimeOwnershipError
 from tacit.feedback import FeedbackStore
 from tacit.history import InvestigationStore
 from tacit.knowledge.enums import SourceFamily
@@ -18,8 +23,31 @@ from tacit.knowledge.repository import KnowledgeRepository
 from tacit.signals import SignalStore
 
 
+def _isolated_settings(**updates: object) -> Settings:
+    values: dict[str, Any] = {"_env_file": None, **updates}
+    return Settings(**values)
+
+
+def test_settings_reject_unauthenticated_wildcard_tenancy_before_storage_creation(
+    tmp_path,
+):
+    database_path = tmp_path / "must-not-exist" / "history.db"
+
+    with pytest.raises(ValueError, match="requires API authentication"):
+        _isolated_settings(
+            knowledge_tenant_id="*",
+            api_auth_enabled=False,
+            history_db_path=str(database_path),
+            feedback_db_path=str(tmp_path / "feedback.db"),
+            signals_db_path=str(tmp_path / "signals.db"),
+        )
+
+    assert not database_path.parent.exists()
+
+
 async def test_alert_dry_run_enforces_runtime_tenant_boundary(tmp_path):
-    store = SignalStore(db_path=tmp_path / "signals.db")
+    runtime_settings = Settings(knowledge_tenant_id="tenant-a")
+    store = SignalStore(db_path=tmp_path / "signals.db", runtime_settings=runtime_settings)
     features = AlertFeatures(
         alert_uid="cross-tenant-alert",
         alert_title="Cross tenant alert",
@@ -32,7 +60,7 @@ async def test_alert_dry_run_enforces_runtime_tenant_boundary(tmp_path):
         await ingest_alert_features(
             features,
             dry_run=True,
-            runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
+            runtime_settings=runtime_settings,
             store=store,
             tenant_id="tenant-b",
         )
@@ -112,15 +140,35 @@ signals:
     assert runtime_settings.signals_db_path == "state/yaml-signals.db"
 
 
-def test_history_and_signal_stores_reject_the_same_sqlite_path(tmp_path):
-    shared_path = tmp_path / "shared.db"
+@pytest.mark.parametrize(
+    ("relative_role", "absolute_role"),
+    [
+        ("history_db_path", "feedback_db_path"),
+        ("feedback_db_path", "history_db_path"),
+        ("history_db_path", "signals_db_path"),
+        ("signals_db_path", "history_db_path"),
+        ("feedback_db_path", "signals_db_path"),
+        ("signals_db_path", "feedback_db_path"),
+    ],
+)
+def test_sqlite_store_roles_reject_canonical_path_collisions_without_creation(
+    tmp_path,
+    monkeypatch,
+    relative_role,
+    absolute_role,
+):
+    shared_path = tmp_path / "must-not-exist" / "shared.db"
+    monkeypatch.chdir(tmp_path)
 
-    with pytest.raises(ValueError, match="history_db_path and signals_db_path must use distinct SQLite files"):
-        Settings(
-            _env_file=None,
-            history_db_path=str(shared_path),
-            signals_db_path=str(tmp_path / "state" / ".." / "shared.db"),
+    with pytest.raises(ValueError, match="SQLite database roles must use distinct files"):
+        _isolated_settings(
+            **{
+                relative_role: str(Path("must-not-exist") / "shared.db"),
+                absolute_role: str(shared_path),
+            },
         )
+
+    assert not shared_path.parent.exists()
 
 
 @pytest.mark.parametrize(
@@ -131,12 +179,257 @@ def test_history_and_signal_stores_reject_the_same_sqlite_path(tmp_path):
     ],
 )
 def test_sqlite_store_paths_include_defaults_when_detecting_collisions(history_path, signals_path):
-    with pytest.raises(ValueError, match="history_db_path and signals_db_path must use distinct SQLite files"):
-        Settings(
-            _env_file=None,
+    with pytest.raises(ValueError, match="SQLite database roles must use distinct files"):
+        _isolated_settings(
             history_db_path=history_path,
             signals_db_path=signals_path,
         )
+
+
+def test_sqlite_store_roles_reject_hard_linked_files(tmp_path):
+    history_path = tmp_path / "history.db"
+    feedback_path = tmp_path / "feedback.db"
+    signals_path = tmp_path / "signals.db"
+    history_path.touch()
+    feedback_path.hardlink_to(history_path)
+
+    with pytest.raises(ValueError, match="SQLite database roles must use distinct files"):
+        _isolated_settings(
+            history_db_path=str(history_path),
+            feedback_db_path=str(feedback_path),
+            signals_db_path=str(signals_path),
+        )
+
+    assert history_path.stat().st_ino == feedback_path.stat().st_ino
+    assert signals_path.exists() is False
+
+
+def test_sqlite_store_roles_reject_special_files_without_blocking(tmp_path):
+    history_path = tmp_path / "history.pipe"
+    os.mkfifo(history_path)
+
+    with pytest.raises(ValueError, match="regular file"):
+        _isolated_settings(
+            history_db_path=str(history_path),
+            feedback_db_path=str(tmp_path / "feedback.db"),
+            signals_db_path=str(tmp_path / "signals.db"),
+        )
+
+
+def _track_absolute_target_opens(monkeypatch, target: Path) -> list[Path]:
+    original_open = os.open
+    opened_targets: list[Path] = []
+
+    def tracked_open(path, *args, **kwargs):
+        if kwargs.get("dir_fd") is None:
+            candidate = Path(os.fsdecode(path))
+            if candidate == target:
+                opened_targets.append(candidate)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(config_mod.os, "open", tracked_open)
+    return opened_targets
+
+
+def test_sqlite_role_preflight_rejects_final_symlink_without_opening_target(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "target.db"
+    target.write_bytes(b"do-not-open")
+    configured = tmp_path / "history.db"
+    configured.symlink_to(target)
+    opened_targets = _track_absolute_target_opens(monkeypatch, target)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        _isolated_settings(
+            history_db_path=str(configured),
+            feedback_db_path=str(tmp_path / "feedback.db"),
+            signals_db_path=str(tmp_path / "signals.db"),
+        )
+
+    assert opened_targets == []
+    assert target.read_bytes() == b"do-not-open"
+
+
+def test_sqlite_role_preflight_rejects_component_symlink_without_opening_target(
+    tmp_path,
+    monkeypatch,
+):
+    target_directory = tmp_path / "target"
+    target_directory.mkdir()
+    target = target_directory / "history.db"
+    target.write_bytes(b"do-not-open")
+    configured_directory = tmp_path / "configured"
+    configured_directory.symlink_to(target_directory, target_is_directory=True)
+    opened_targets = _track_absolute_target_opens(monkeypatch, target)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        _isolated_settings(
+            history_db_path=str(configured_directory / "history.db"),
+            feedback_db_path=str(tmp_path / "feedback.db"),
+            signals_db_path=str(tmp_path / "signals.db"),
+        )
+
+    assert opened_targets == []
+    assert target.read_bytes() == b"do-not-open"
+
+
+def test_sqlite_role_preflight_rejects_fifo_without_opening_target(
+    tmp_path,
+    monkeypatch,
+):
+    configured = tmp_path / "history.pipe"
+    os.mkfifo(configured)
+    opened_targets = _track_absolute_target_opens(monkeypatch, configured)
+
+    with pytest.raises(ValueError, match="regular file"):
+        _isolated_settings(
+            history_db_path=str(configured),
+            feedback_db_path=str(tmp_path / "feedback.db"),
+            signals_db_path=str(tmp_path / "signals.db"),
+        )
+
+    assert opened_targets == []
+
+
+def test_sqlite_role_preflight_accepts_ordinary_distinct_paths_without_creation(
+    tmp_path,
+):
+    configured = {
+        "history": tmp_path / "missing" / "history.db",
+        "feedback": tmp_path / "missing" / "feedback.db",
+        "signals": tmp_path / "missing" / "signals.db",
+    }
+
+    canonical = validate_distinct_sqlite_role_paths(configured)
+
+    assert canonical == configured
+    assert not (tmp_path / "missing").exists()
+
+
+def test_sqlite_role_preflight_rejects_normalized_lexical_collision_without_creation(
+    tmp_path,
+):
+    database_path = tmp_path / "missing" / "shared.db"
+
+    with pytest.raises(ValueError, match="SQLite database roles must use distinct files"):
+        validate_distinct_sqlite_role_paths(
+            {
+                "history": database_path,
+                "feedback": tmp_path / "missing" / "nested" / ".." / "shared.db",
+                "signals": tmp_path / "missing" / "signals.db",
+            }
+        )
+
+    assert not database_path.parent.exists()
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    (InvestigationStore, FeedbackStore, SignalStore, KnowledgeRepository),
+)
+def test_direct_sqlite_stores_reject_fifo_without_blocking(tmp_path, store_factory):
+    database_path = tmp_path / f"{store_factory.__name__}.pipe"
+    os.mkfifo(database_path)
+
+    with pytest.raises(RuntimeOwnershipError, match="regular file"):
+        store_factory(database_path)
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    (InvestigationStore, FeedbackStore, SignalStore, KnowledgeRepository),
+)
+def test_direct_sqlite_stores_reject_directory_as_database(tmp_path, store_factory):
+    database_path = tmp_path / store_factory.__name__
+    database_path.mkdir()
+
+    with pytest.raises(RuntimeOwnershipError, match="regular file"):
+        store_factory(database_path)
+
+
+@pytest.mark.parametrize(
+    ("store_factory", "schema_table"),
+    [
+        (InvestigationStore, "investigations"),
+        (FeedbackStore, "dashboard_provenance"),
+        (SignalStore, "signal_types"),
+        (KnowledgeRepository, "knowledge_candidates"),
+    ],
+)
+def test_secure_sqlite_first_creation_and_existing_reopen(
+    tmp_path,
+    store_factory,
+    schema_table,
+):
+    database_path = tmp_path / "new" / f"{schema_table}.db"
+
+    first = store_factory(database_path)
+    second = store_factory(database_path)
+
+    assert first.database_path == database_path
+    assert second.database_path == database_path
+    with sqlite3.connect(database_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (schema_table,),
+            ).fetchone()
+            is not None
+        )
+
+
+def test_sqlite_connection_treats_uri_metacharacters_as_literal_path(tmp_path):
+    database_path = tmp_path / "history?tenant=acme#current.db"
+
+    InvestigationStore(database_path)
+
+    assert database_path.is_file()
+    assert not (tmp_path / "history").exists()
+
+
+def test_sqlite_store_roles_reject_case_aliases_when_filesystem_exposes_them(tmp_path):
+    history_path = tmp_path / "History.db"
+    case_alias = tmp_path / "history.db"
+    history_path.touch()
+    if not case_alias.exists():
+        pytest.skip("filesystem is case-sensitive")
+
+    with pytest.raises(ValueError, match="SQLite database roles must use distinct files"):
+        _isolated_settings(
+            history_db_path=str(history_path),
+            feedback_db_path=str(case_alias),
+            signals_db_path=str(tmp_path / "signals.db"),
+        )
+
+
+def test_generated_archetype_aggregate_retrieval_limits_have_bounded_defaults():
+    runtime_settings = _isolated_settings()
+
+    assert runtime_settings.learned_archetypes_retrieval_max_total_artifacts == 256
+    assert runtime_settings.learned_archetypes_retrieval_max_total_panels == 1_024
+    assert runtime_settings.learned_archetypes_retrieval_max_total_queries == 4_096
+    assert runtime_settings.learned_archetypes_retrieval_max_results == 256
+
+
+@pytest.mark.parametrize(
+    ("field_name", "too_large"),
+    [
+        ("learned_archetypes_retrieval_max_total_artifacts", 4_097),
+        ("learned_archetypes_retrieval_max_total_panels", 16_385),
+        ("learned_archetypes_retrieval_max_total_queries", 65_537),
+        ("learned_archetypes_retrieval_max_results", 4_097),
+    ],
+)
+def test_generated_archetype_aggregate_retrieval_limits_are_positive_and_bounded(
+    field_name,
+    too_large,
+):
+    with pytest.raises(ValueError):
+        _isolated_settings(**{field_name: 0})
+    with pytest.raises(ValueError):
+        _isolated_settings(**{field_name: too_large})
 
 
 def test_signal_store_sets_busy_timeout(tmp_path):
@@ -466,7 +759,11 @@ def test_missing_alerts_are_marked_stale_not_deleted(tmp_path):
         metrics_found=["checkout_request_duration_seconds"],
     )
 
-    stale_count = store.mark_missing_alerts_stale(backend_name="grafana", seen_alert_uids=set())
+    stale_count = store.mark_missing_alerts_stale(
+        backend_name="grafana",
+        seen_alert_uids=set(),
+        authority_reconciler=lambda _conn, _source: None,
+    )
     alerts = store.list_ingested_alerts()
 
     assert stale_count == 1
@@ -501,7 +798,11 @@ def test_missing_alerts_are_marked_stale_when_fts_unavailable(tmp_path, monkeypa
     )
     monkeypatch.setattr(store, "_learning_index_available", lambda: False)
 
-    stale_count = store.mark_missing_alerts_stale(backend_name="grafana", seen_alert_uids=set())
+    stale_count = store.mark_missing_alerts_stale(
+        backend_name="grafana",
+        seen_alert_uids=set(),
+        authority_reconciler=lambda _conn, _source: None,
+    )
     row = store.get_ingested_alert("checkout-latency", "grafana")
 
     assert stale_count == 1
@@ -536,7 +837,11 @@ def test_stale_alert_context_is_removed_from_active_search(tmp_path):
 
     assert store.search_learning_context("checkout latency", service="checkout")
 
-    store.mark_missing_alerts_stale(backend_name="grafana", seen_alert_uids=set())
+    store.mark_missing_alerts_stale(
+        backend_name="grafana",
+        seen_alert_uids=set(),
+        authority_reconciler=lambda _conn, _source: None,
+    )
 
     assert store.search_learning_context("checkout latency", service="checkout") == []
 

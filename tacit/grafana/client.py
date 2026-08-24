@@ -7,6 +7,15 @@ import structlog
 
 from tacit.cache import make_cache_key
 from tacit.config import Settings, settings
+from tacit.runtime_ownership import (
+    RuntimeOwnershipDescriptor,
+    RuntimeRemoteIdentity,
+    canonical_remote_endpoint,
+    copy_runtime_settings,
+    credential_fingerprint,
+    runtime_descriptor_for_remote,
+    snapshot_runtime_settings,
+)
 
 logger = structlog.get_logger()
 
@@ -21,10 +30,21 @@ class GrafanaClient:
         org_id: int | None = None,
         runtime_settings: Settings | None = None,
     ):
-        config = runtime_settings or settings
-        self.base_url = (base_url or config.grafana_url).rstrip("/")
-        self.api_key = api_key if api_key is not None else config.grafana_api_key
-        self.org_id = org_id if org_id is not None else config.grafana_org_id
+        configured_settings = snapshot_runtime_settings(runtime_settings or settings)
+        effective_base_url = configured_settings.grafana_url if base_url is None else base_url
+        self._base_url = canonical_remote_endpoint(effective_base_url)
+        self._api_key = api_key if api_key is not None else configured_settings.grafana_api_key
+        self._org_id = org_id if org_id is not None else configured_settings.grafana_org_id
+        self._runtime_settings = snapshot_runtime_settings(
+            configured_settings.model_copy(
+                deep=True,
+                update={
+                    "grafana_url": self._base_url,
+                    "grafana_api_key": self._api_key,
+                    "grafana_org_id": self._org_id,
+                },
+            )
+        )
         self.cache_namespace = make_cache_key(
             "grafana",
             self.base_url,
@@ -37,9 +57,60 @@ class GrafanaClient:
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        self._client = httpx.AsyncClient(
+        self._runtime_ownership = (
+            runtime_descriptor_for_remote(
+                component="grafana_client",
+                runtime_settings=self._runtime_settings,
+                remote=RuntimeRemoteIdentity(
+                    provider="grafana",
+                    endpoint=self.base_url,
+                    account=str(self.org_id),
+                    credential_fingerprint=credential_fingerprint(self.api_key),
+                ),
+            )
+            if isinstance(self._runtime_settings, Settings)
+            else None
+        )
+        self._headers = headers
+        self._http_client: httpx.AsyncClient | None = None
+        if base_url is None and api_key is None and org_id is None:
+            self._http_client = self._new_http_client()
+
+    @property
+    def runtime_settings(self) -> Settings:
+        """Return a detached copy of the client's settings snapshot."""
+        return copy_runtime_settings(self._runtime_settings)
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @property
+    def api_key(self) -> str:
+        return self._api_key
+
+    @property
+    def org_id(self) -> int:
+        return self._org_id
+
+    @property
+    def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
+        """Return the effective Grafana identity without exposing credentials."""
+        if self._runtime_ownership is None:
+            raise TypeError("Grafana runtime settings must be a Settings instance")
+        return self._runtime_ownership
+
+    @property
+    def _client(self) -> httpx.AsyncClient:
+        """Create network state only after composition has accepted this owner."""
+        if self._http_client is None:
+            self._http_client = self._new_http_client()
+        return self._http_client
+
+    def _new_http_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
             base_url=self.base_url,
-            headers=headers,
+            headers=self._headers,
             timeout=30.0,
         )
 
@@ -111,4 +182,7 @@ class GrafanaClient:
         return await self._post("/api/dashboards/db", json=payload)
 
     async def close(self):
-        await self._client.aclose()
+        client = self._http_client
+        if client is not None:
+            self._http_client = None
+            await client.aclose()

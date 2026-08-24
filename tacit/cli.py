@@ -523,11 +523,12 @@ def _cli_store_settings(stores: Any) -> Any:
 
 
 def _require_cli_knowledge_action(action: Any, runtime_settings: Any) -> None:
+    from tacit.errors import SemanticAuthorizationError
     from tacit.knowledge.authorization import enforce_knowledge_action
 
     try:
         enforce_knowledge_action(runtime_settings, action)
-    except PermissionError as exc:
+    except SemanticAuthorizationError as exc:
         raise click.ClickException(str(exc).replace("Missing permission", "missing permission")) from exc
 
 
@@ -883,6 +884,16 @@ def _update_env(updates: dict):
 
 
 # ── tacit test ───────────────────────────────────────────────────────────
+def _pipeline_result_failure(result) -> str | None:
+    status = str(getattr(result, "investigation_status", "") or "")
+    if status and status != "completed":
+        return str(getattr(result, "summary", "") or f"Investigation ended with status {status}")
+    audit_status = str(getattr(result, "audit_status", "") or "")
+    if audit_status and audit_status != "run_completed":
+        return f"Investigation audit ended with status {audit_status}"
+    return None
+
+
 @cli.command("investigate")
 @click.argument("prompt", required=False)
 @click.option("--json", "json_output", is_flag=True, help="Print the canonical Investigation Contract JSON")
@@ -923,10 +934,15 @@ def investigate(prompt: str | None, json_output: bool, open_browser: bool, tenan
         _info("Run `tacit doctor` to check your setup")
         raise SystemExit(1) from e
 
+    pipeline_failure = _pipeline_result_failure(result)
+    if pipeline_failure:
+        _fail(f"Investigation failed: {pipeline_failure}")
+        raise SystemExit(1)
+    if contract is None:
+        _fail("Investigation completed without a persisted contract")
+        raise SystemExit(1)
+
     if json_output:
-        if contract is None:
-            _fail("Investigation completed without a persisted contract")
-            raise SystemExit(1)
         click.echo(json.dumps(contract.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True))
         return
 
@@ -938,9 +954,8 @@ def investigate(prompt: str | None, json_output: bool, open_browser: bool, tenan
     if result.investigation_id and result.investigation_revision is not None:
         _info(f"Investigation: {result.investigation_id} revision {result.investigation_revision}")
     _info(f"Panels: {result.panel_count}")
-    if contract is not None:
-        _info(f"Grounding: {contract.grounding.status.value}")
-        _info(f"Conclusion: {contract.grounding.maximum_trustworthy_conclusion.get('text', '')}")
+    _info(f"Grounding: {contract.grounding.status.value}")
+    _info(f"Conclusion: {contract.grounding.maximum_trustworthy_conclusion.get('text', '')}")
     if open_browser and result.dashboard_url:
         webbrowser.open(result.dashboard_url)
 
@@ -979,26 +994,30 @@ def test_run(prompt: str | None, open_browser: bool, tenant: str | None):
     try:
         result = asyncio.run(_run())
 
-        if result.dashboard_url:
-            _success(f"Dashboard created: {result.dashboard_url}")
-            _info(f"  UID: {result.dashboard_uid}")
-            _info(f"  Panels: {result.panel_count}")
-            _info(f"  Path: {result.path_used}")
-            if result.archetypes:
-                arch_str = ", ".join(f"{a.type} ({a.confidence:.0%})" for a in result.archetypes)
-                _info(f"  Archetypes: {arch_str}")
-
-            if open_browser and result.dashboard_url:
-                _info("Opening in browser...")
-                webbrowser.open(result.dashboard_url)
-        else:
-            _fail("Pipeline completed but no dashboard URL returned")
-            if result.error:
-                _fail(f"Error: {result.error}")
-
     except Exception as e:
         _fail(f"Pipeline error: {e}")
         _info("Run `tacit doctor` to check your setup")
+        raise SystemExit(1) from e
+
+    pipeline_failure = _pipeline_result_failure(result)
+    if pipeline_failure:
+        _fail(f"Pipeline failed: {pipeline_failure}")
+        raise SystemExit(1)
+    if not result.dashboard_url:
+        _fail("Pipeline completed but no dashboard URL returned")
+        raise SystemExit(1)
+
+    _success(f"Dashboard created: {result.dashboard_url}")
+    _info(f"  UID: {result.dashboard_uid}")
+    _info(f"  Panels: {result.panel_count}")
+    _info(f"  Path: {result.path_used}")
+    if result.archetypes:
+        arch_str = ", ".join(f"{a.type} ({a.confidence:.0%})" for a in result.archetypes)
+        _info(f"  Archetypes: {arch_str}")
+
+    if open_browser:
+        _info("Opening in browser...")
+        webbrowser.open(result.dashboard_url)
 
 
 @cli.command("benchmark-grounding")
@@ -1254,6 +1273,7 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool, tenant
     stores = _cli_runtime_stores()
     runtime_settings = _cli_store_settings(stores)
     tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
     if auto_approve:
         _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
     _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
@@ -1273,9 +1293,17 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool, tenant
     try:
         result = asyncio.run(_run())
     except Exception as e:
-        _fail(f"Dashboard ingestion failed: {e}")
-        _info("Run `tacit doctor` to check backend connectivity.")
-        return
+        from tacit.errors import safe_failure_diagnostics
+
+        diagnostics = safe_failure_diagnostics(
+            e,
+            reason_code="dashboard_ingestion_failed",
+        )
+        raise click.ClickException(
+            "Dashboard ingestion failed "
+            f"({diagnostics['error_type']}; reference={diagnostics['failure_fingerprint']}). "
+            "Run `tacit doctor` to check backend connectivity."
+        ) from e
 
     quality = result.get("signal_quality", {})
     impact = result.get("learning_impact", {})
@@ -1435,11 +1463,10 @@ def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool,
         raise click.UsageError("Pass exactly one of --file or --dir.")
     stores = _cli_runtime_stores()
     tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
-    if not dry_run:
-        from tacit.knowledge.authorization import KnowledgeAction
+    from tacit.knowledge.authorization import KnowledgeAction
 
-        _require_cli_knowledge_action(KnowledgeAction.APPLY, stores.settings)
-        _require_cli_knowledge_action(KnowledgeAction.APPROVE, stores.settings)
+    action = KnowledgeAction.READ if dry_run else KnowledgeAction.LEARN_ARTIFACTS
+    _require_cli_knowledge_action(action, stores.settings)
     signal_store = None if dry_run else stores.signals()
     try:
         if file_path:
@@ -1483,11 +1510,10 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
         raise click.UsageError("Pass exactly one of --file or --dir.")
     stores = _cli_runtime_stores()
     tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
-    if not dry_run:
-        from tacit.knowledge.authorization import KnowledgeAction
+    from tacit.knowledge.authorization import KnowledgeAction
 
-        _require_cli_knowledge_action(KnowledgeAction.APPLY, stores.settings)
-        _require_cli_knowledge_action(KnowledgeAction.APPROVE, stores.settings)
+    action = KnowledgeAction.READ if dry_run else KnowledgeAction.LEARN_ARTIFACTS
+    _require_cli_knowledge_action(action, stores.settings)
     signal_store = None if dry_run else stores.signals()
     try:
         if file_path:
@@ -1548,18 +1574,17 @@ def learn_pagerduty(
     _load_env()
     stores = _cli_runtime_stores()
     tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
-    if not dry_run:
-        from tacit.knowledge.authorization import KnowledgeAction
+    from tacit.knowledge.authorization import KnowledgeAction
 
-        _require_cli_knowledge_action(KnowledgeAction.APPLY, stores.settings)
-        _require_cli_knowledge_action(KnowledgeAction.APPROVE, stores.settings)
+    action = KnowledgeAction.READ if dry_run else KnowledgeAction.LEARN_ARTIFACTS
+    _require_cli_knowledge_action(action, stores.settings)
 
     import asyncio
 
     async def _run():
         from tacit.integrations.pagerduty import PagerDutyClient, learn_pagerduty_incidents
 
-        async with PagerDutyClient() as client:
+        async with PagerDutyClient(runtime_settings=stores.settings) as client:
             signal_store = None if dry_run else stores.signals()
             return await learn_pagerduty_incidents(
                 client,
@@ -1570,6 +1595,7 @@ def learn_pagerduty(
                 dry_run=dry_run,
                 store=signal_store,
                 tenant_id=tenant_id,
+                runtime_settings=stores.settings,
             )
 
     try:
@@ -1603,6 +1629,7 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
 
     runtime_settings = _cli_store_settings(stores)
     tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
     if auto_approve and not dry_run:
         _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
     if not dry_run:
@@ -1681,6 +1708,7 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int, ten
     stores = _cli_runtime_stores()
     runtime_settings = _cli_store_settings(stores)
     tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
     if auto_approve:
         _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
     _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
@@ -1748,6 +1776,7 @@ def learn_approve(dashboard_uid: str, backend: str, tenant: str | None):
     stores = _cli_runtime_stores()
     runtime_settings = _cli_store_settings(stores)
     tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
     _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
     _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
     try:
@@ -1785,6 +1814,7 @@ def learn_reject(dashboard_uid: str, backend: str, tenant: str | None):
     stores = _cli_runtime_stores()
     runtime_settings = _cli_store_settings(stores)
     tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
     _require_cli_knowledge_action(KnowledgeAction.REJECT, runtime_settings)
     _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
     try:
@@ -1824,6 +1854,7 @@ def learn_ignore(dashboard_uid: str, backend: str, tenant: str | None):
     stores = _cli_runtime_stores()
     runtime_settings = _cli_store_settings(stores)
     tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
     _require_cli_knowledge_action(KnowledgeAction.REJECT, runtime_settings)
     _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
     try:
@@ -2073,17 +2104,36 @@ def knowledge_status(tenant: str | None):
 @click.option("--tenant", default=None)
 @click.option("--kind", default=None)
 @click.option("--status", default=None)
-def knowledge_list(tenant: str | None, kind: str | None, status: str | None):
+@click.option("--limit", default=200, type=click.IntRange(1, 500))
+@click.option("--cursor", default=None, help="Opaque cursor returned by the previous page.")
+def knowledge_list(
+    tenant: str | None,
+    kind: str | None,
+    status: str | None,
+    limit: int,
+    cursor: str | None,
+):
     """List current knowledge revisions."""
     _load_env()
 
     stores, tenant_id = _cli_knowledge_read_context(tenant)
-    values = stores.knowledge_repository().list_current_revisions(tenant_id)
-    if kind:
-        values = [item for item in values if item.proposition.kind.value == kind]
-    if status:
-        values = [item for item in values if item.state.lifecycle_status.value == status]
-    _knowledge_json(values)
+    try:
+        page = stores.knowledge_repository().list_current_revisions_page(
+            tenant_id,
+            kind=kind,
+            lifecycle_status=status,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _knowledge_json(
+        {
+            "revisions": [revision.model_dump(mode="json") for revision in page.revisions],
+            "has_more": page.has_more,
+            "next_cursor": page.next_cursor,
+        }
+    )
 
 
 @knowledge.command("candidates")
@@ -2154,16 +2204,28 @@ def knowledge_explain(knowledge_id: str, tenant: str | None):
 @knowledge.command("conflicts")
 @click.option("--tenant", default=None)
 @click.option("--unresolved-only", is_flag=True)
-def knowledge_conflicts(tenant: str | None, unresolved_only: bool):
+@click.option("--limit", default=200, type=click.IntRange(1, 500))
+@click.option("--cursor", default=None, help="Opaque cursor returned by the previous page.")
+def knowledge_conflicts(tenant: str | None, unresolved_only: bool, limit: int, cursor: str | None):
     """List proposition conflicts."""
     _load_env()
 
     stores, tenant_id = _cli_knowledge_read_context(tenant)
-    _knowledge_json(
-        stores.knowledge_repository().list_conflicts(
+    try:
+        page = stores.knowledge_repository().list_conflicts_page(
             tenant_id,
             unresolved_only=unresolved_only,
+            limit=limit,
+            cursor=cursor,
         )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _knowledge_json(
+        {
+            "conflicts": [conflict.model_dump(mode="json") for conflict in page.conflicts],
+            "has_more": page.has_more,
+            "next_cursor": page.next_cursor,
+        }
     )
 
 
@@ -2190,6 +2252,7 @@ def knowledge_review(
 ):
     """Review a candidate and evaluate it for promotion."""
     _load_env()
+    from tacit.errors import SemanticAuthorizationError
     from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
@@ -2232,8 +2295,10 @@ def knowledge_review(
             candidate = evaluation.candidate
             promotion = evaluation.decision
             revision = evaluation.revision
-    except (ValueError, PermissionError) as exc:
+    except (ValueError, SemanticAuthorizationError) as exc:
         raise click.ClickException(str(exc)) from exc
+    except OSError as exc:
+        raise click.ClickException("Knowledge review failed due to a local I/O error") from exc
     _knowledge_json(
         {
             "candidate": candidate.model_dump(mode="json"),
@@ -2246,27 +2311,56 @@ def knowledge_review(
 @knowledge.command("history")
 @click.argument("knowledge_id")
 @click.option("--tenant", default=None)
-def knowledge_history(knowledge_id: str, tenant: str | None):
+@click.option("--limit", default=200, type=click.IntRange(1, 500))
+@click.option("--cursor", default=None, help="Opaque cursor returned by the previous page.")
+def knowledge_history(knowledge_id: str, tenant: str | None, limit: int, cursor: str | None):
     """List immutable revisions for one knowledge item."""
     _load_env()
 
     stores, tenant_id = _cli_knowledge_read_context(tenant)
-    _knowledge_json(stores.knowledge_repository().list_revisions(knowledge_id, tenant_id))
+    try:
+        page = stores.knowledge_repository().list_revisions_page(
+            knowledge_id,
+            tenant_id,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _knowledge_json(
+        {
+            "revisions": [revision.model_dump(mode="json") for revision in page.revisions],
+            "has_more": page.has_more,
+            "next_cursor": page.next_cursor,
+        }
+    )
 
 
 @knowledge.command("usage")
 @click.argument("knowledge_id")
 @click.option("--tenant", default=None)
-def knowledge_usage(knowledge_id: str, tenant: str | None):
+@click.option("--limit", default=200, type=click.IntRange(1, 500))
+@click.option("--cursor", default=None, help="Opaque cursor returned by the previous page.")
+def knowledge_usage(knowledge_id: str, tenant: str | None, limit: int, cursor: str | None):
     """List investigations that considered a knowledge item."""
     _load_env()
 
     stores, tenant_id = _cli_knowledge_read_context(tenant)
-    _knowledge_json(
-        stores.knowledge_repository().list_usage(
+    try:
+        page = stores.knowledge_repository().list_usage_page(
             tenant_id=tenant_id,
             knowledge_id=knowledge_id,
+            limit=limit,
+            cursor=cursor,
         )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _knowledge_json(
+        {
+            "usage": [usage.model_dump(mode="json") for usage in page.usage],
+            "has_more": page.has_more,
+            "next_cursor": page.next_cursor,
+        }
     )
 
 

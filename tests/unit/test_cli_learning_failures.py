@@ -86,6 +86,27 @@ def test_backend_learning_cli_failures_return_nonzero(
     assert "injected backend failure" in result.output
 
 
+def test_single_dashboard_learning_failure_is_nonzero_and_payload_safe(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sensitive = "secret=" + ("x" * 10_000)
+
+    async def fail(*_args, **_kwargs):
+        raise RuntimeError(sensitive)
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", lambda: _Stores())
+    monkeypatch.setattr("tacit.dashboard_ingest.ingest_dashboard", fail)
+
+    result = CliRunner().invoke(cli, ["learn", "dashboard", "dash-1"])
+
+    assert result.exit_code != 0
+    assert "Dashboard ingestion failed" in result.output
+    assert "RuntimeError" in result.output
+    assert "reference=" in result.output
+    assert sensitive not in result.output
+    assert len(result.output) < 1_000
+
+
 @pytest.mark.parametrize("artifact_kind", ["runbooks", "incidents"])
 def test_artifact_learning_cli_requires_exactly_one_input(artifact_kind: str):
     result = CliRunner().invoke(cli, ["learn", artifact_kind])

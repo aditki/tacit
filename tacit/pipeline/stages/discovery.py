@@ -16,6 +16,7 @@ from tacit.pipeline.discovery import (
     semantic_mapping_diagnostics,
 )
 from tacit.pipeline.recording import PipelineRecorder
+from tacit.signals.resolution import SignalResolutionWorkBudget
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ async def run_discovery_stage(
     signal_store: Any | None = None,
     tenant_id: str = "default",
     knowledge_scope: Any | None = None,
+    signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
 ) -> DiscoveryStageResult:
     """Discover catalogs and record discovery diagnostics."""
     from tacit.pipeline.discovery import confirm_colloquial_keywords
@@ -64,5 +66,6 @@ async def run_discovery_stage(
         signal_store,
         tenant_id,
         knowledge_scope,
+        resolution_work_budget=signal_resolution_work_budget,
     )
     return DiscoveryStageResult(discovery=discovery, confirmed_keywords=confirmed_keywords)

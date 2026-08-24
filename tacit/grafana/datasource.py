@@ -4,10 +4,12 @@ import asyncio
 
 import structlog
 
-from tacit.config import settings
+from tacit.config import Settings
+from tacit.errors import AUTHORITY_BOUNDARY_ERRORS, safe_failure_diagnostics
 from tacit.grafana.adapters.registry import get_adapter, supported_datasource_types
 from tacit.grafana.client import GrafanaClient
 from tacit.models.schemas import DatasourceInfo, MetricEntry
+from tacit.runtime_ownership import resolve_remote_runtime_settings
 
 logger = structlog.get_logger()
 
@@ -96,14 +98,22 @@ async def discover_all_metrics(
     client: GrafanaClient,
     datasources: list[DatasourceInfo],
     keywords: list[str],
+    *,
+    runtime_settings: Settings | None = None,
 ) -> list[MetricEntry]:
     """Search ALL given datasources for metrics, using per-type adapters.
 
     Returns a unified list of MetricEntry objects across every datasource type,
     capped at settings.max_metric_catalog_size to stay within LLM context limits.
     """
-    sem = asyncio.Semaphore(settings.adapter_max_concurrent)
-    timeout = settings.adapter_timeout_seconds
+    active_settings = resolve_remote_runtime_settings(
+        boundary="grafana_metric_discovery",
+        owner=client,
+        provider="grafana",
+        explicit_settings=runtime_settings,
+    )
+    sem = asyncio.Semaphore(active_settings.adapter_max_concurrent)
+    timeout = active_settings.adapter_timeout_seconds
 
     async def _discover_one(ds: DatasourceInfo) -> list[MetricEntry]:
         adapter = get_adapter(ds)
@@ -120,14 +130,21 @@ async def discover_all_metrics(
             except TimeoutError:
                 logger.warning("adapter_timeout", datasource=ds.name, type=ds.type, timeout=timeout)
                 return []
-            except Exception:
-                logger.exception("adapter_discover_failed", datasource=ds.name, type=ds.type)
+            except AUTHORITY_BOUNDARY_ERRORS:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "adapter_discover_failed",
+                    datasource=ds.name,
+                    type=ds.type,
+                    **safe_failure_diagnostics(exc, reason_code="adapter_discover_failed"),
+                )
                 return []
 
     # Run all adapter discoveries concurrently (bounded by semaphore)
     results = await asyncio.gather(*[_discover_one(ds) for ds in datasources])
     # Cap total catalog size to stay within LLM context limits
-    max_total = settings.max_metric_catalog_size
+    max_total = active_settings.max_metric_catalog_size
     original_count = sum(len(entries) for entries in results)
     if original_count > max_total:
         logger.warning(

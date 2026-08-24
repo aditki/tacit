@@ -2,7 +2,7 @@
 
 Status: living implementation guidance
 
-Last reviewed: 2026-08-04
+Last reviewed: 2026-08-18
 
 This document records recurring engineering lessons and refactor signals found
 while building Tacit's Investigation Contract, Operational Knowledge, learning,
@@ -12,6 +12,9 @@ tests remain the executable specification for fixed regressions.
 
 ## How to use this document
 
+- Start with the mandatory
+  [foundation invariant matrix](foundation-invariant-matrix.md) and write the
+  applicable matrix tests before implementation.
 - Read the relevant sections before changing a cross-cutting workflow.
 - Apply the invariants to API, CLI, direct Python, replay, refresh, background,
   and web UI entry points.
@@ -80,6 +83,10 @@ selection.
   must not make independent scoped revisions retire each other.
 - Signal-to-metric semantics are many-to-many unless a predicate is explicitly
   exclusive.
+- Datasource provenance belongs to each query target and metric, not to the
+  containing panel or alert. Query language may narrow a compatibility family,
+  but exact governed scope is checked against the selected catalog entry before
+  authority is learned, applied, fingerprinted, or reconciled.
 - Bootstrap mappings remain globally identifiable and cannot be mutated or
   retired by a tenant named `default`.
 - Lifecycle changes and source disappearance must reconcile both governed
@@ -178,7 +185,37 @@ of adding more per-stage reference sets. A likely record contains:
   first lookup. Workflows that publish or persist a new authoritative result,
   including refresh and non-exact replay, also require apply permission before
   starting a run or external side effect.
+- Dashboard and alert learning, including dry-run inference, reverse-resolve
+  existing tenant mappings. They require read permission before constructing a
+  store or contacting a backend; pending persistence additionally requires
+  apply, and teaching requires the full read/review/trust/apply capability set.
+- Persisted artifact learning also consumes governed candidate history and
+  returns extracted rows plus governed identifiers. It requires read permission
+  before storage or extraction at API, CLI, and shared-service boundaries. A
+  dry run still returns structured Operational Knowledge records, so it requires
+  read before file traversal, extraction, or remote source access. Persistence
+  uses one semantic `learn_artifacts` action requiring read, review, and apply.
+- Remote artifact connectors retain explicitly supplied runtime settings.
+  Connector, store, and learning settings must agree before a remote request;
+  falling back to process-global authorization after constructing a scoped
+  client is a split-head security failure.
+- Composed workflows use one shared runtime-owner guard across explicit
+  settings, runtime store containers, signal stores, the Operational Knowledge
+  service, and remote connectors. All supplied settings must agree, and
+  persistence owners must resolve to the same canonical database before
+  extraction, file traversal, backend access, or dependency construction.
+  Core stores and services expose public settings and database identities;
+  compatibility introspection is isolated in the descriptor adapter.
+- Directory artifact learning preflights a configurable hard file limit before
+  reading or persisting any source. Each accepted artifact still owns a bounded
+  transaction; directory-wide write locks are prohibited.
 - Policy override inputs require their own privileged permission in API and CLI.
+- Human-readable actor labels in request bodies are untrusted metadata. Audit
+  ownership is derived from the authenticated credential slot (or explicitly
+  recorded as local unauthenticated operation), so callers cannot impersonate
+  another reviewer in durable events. This applies to investigation creation and
+  refresh, feedback review, and manually taught signal mappings as well as
+  explicit knowledge-review endpoints.
 - Review transitions use compare-and-swap predicates on tenant, identity, and
   expected state.
 - Candidate state and provenance review state change together.
@@ -234,6 +271,10 @@ layer is warranted.
 
 - Canonicalize entity IDs, aliases, service references, and scope lists at write
   boundaries with the same normalizer used for lookup.
+- Parse prompt-derived scope through one shared implementation. Ambiguous prose
+  aliases such as `test` and `stage` require an explicit environment label, and
+  version values use a version-specific canonicalizer that preserves selector
+  and local-version syntax.
 - IDs are kind-safe and entity kind is immutable.
 - Exact-ID resolution still checks active status, expected kind, tenant, and
   scope.
@@ -242,6 +283,10 @@ layer is warranted.
 - Applicability and conflict overlap use the same dimensions: tenant, service,
   environment, region, cluster, namespace, archetype, and version constraints.
 - Normalize timezone-naive validity values before comparing them with UTC times.
+- Tri-state scope inputs preserve omitted fields, interpret explicit empty
+  lists as an unscoped variant, and use populated lists as explicit scope. If several
+  scoped variants share a source identity, omission is ambiguous and fails
+  closed; a future update API should target a stable mapping revision directly.
 
 ## Generated archetype containment and growth
 
@@ -284,6 +329,10 @@ several of these conditions are present:
   export, and benchmark paths
 - tests cannot inject one store graph without patching globals
 - projection and authority updates need coordinated rollback
+- reverse resolution approaches its active-row scan budget or latency grows
+  with total tenant history rather than candidate patterns
+- projection repair is bounded by authority count but not by projection rows or
+  trigger writes inside one SQLite writer transaction
 
 The likely first step is a shared unit-of-work and typed repository API, not a
 wholesale ORM rewrite. Keep domain state transitions in services; keep storage
@@ -304,6 +353,9 @@ mechanics, tenant predicates, and transaction ownership in repositories.
   lacks enough exact resolver data to rebuild safely, leave the audit dirty and
   fail that knowledge store closed instead of certifying a partial graph. The
   pipeline may continue only through its explicit knowledge-unavailable path.
+  Legacy duplicate resolver entries are canonicalized with the same variant and
+  maximum-confidence rule during both projection repair and validation so the
+  audit always converges.
 - Current-engine replay fails closed when historical knowledge changed a stage
   that captured inputs cannot rebuild. Applied non-ranking usage must be pinned
   to an exact historical snapshot before replay can compare current authority.
@@ -334,7 +386,9 @@ mechanics, tenant predicates, and transaction ownership in repositories.
   memory. Datasource cache identities include endpoint, organization, and a
   non-secret credential fingerprint so app-scoped runtimes cannot share catalog
   values accidentally. LLM caches belong to one runtime dependency graph and
-  include provider, model, endpoint, engine version, and prompt identity. Exact
+  include provider, model, endpoint, engine version, and the complete rendered
+  prompt identity. Cache identity must change when any field rendered to the
+  model changes; maintaining a second hand-picked field list will drift. Exact
   aliases and non-authoritative fuzzy entity suggestions both use bounded
   indexed candidate buckets; truncation is ambiguous and fails closed.
 - Immutable knowledge usage is an authority projection, not a free-form audit
@@ -361,6 +415,10 @@ mechanics, tenant predicates, and transaction ownership in repositories.
   writer lock between batches, persist a per-table keyset cursor, and publish
   the terminal owner marker only after an under-lock sweep finds no legacy rows.
   A batch limit without a cursor is still quadratic on unindexed FTS state.
+- Schema and ownership migration preflight is part of the migration transition.
+  Read table shape, ownership markers, and migration necessity only after the
+  writer lock is acquired; metadata captured before lock contention can replay
+  a completed migration and reassign already-owned rows.
 - Bulk learning creates one tenant-scoped service/repository graph per crawl and
   reuses it across records and stale-source reconciliation. If more ingestion
   paths need this behavior, replace the private store-to-service helper with a
@@ -413,7 +471,10 @@ mechanics, tenant predicates, and transaction ownership in repositories.
 - Mapping provenance is projected into an indexed relational table maintained by
   SQLite triggers. Source refresh and retirement must query this relation rather
   than deserialize every tenant mapping. The JSON `source_refs` field remains a
-  compatibility payload, not a license to reintroduce history-wide scans.
+  compatibility payload, not a license to reintroduce history-wide scans. Its
+  public write boundary and database triggers enforce the same canonical,
+  non-blank string-array shape so the authoritative JSON and indexed projection
+  cannot diverge.
 - Corroboration filters review, lifecycle, and entity eligibility in SQL and has
   an explicit candidate scan budget. Exceeding that budget fails evaluation
   closed instead of holding the SQLite writer lock for an unbounded history scan.
@@ -440,10 +501,19 @@ mechanics, tenant predicates, and transaction ownership in repositories.
   resolver projections, source reconciliation, and the final approved status
   commit together; a failed finalization rolls all authority back while leaving
   only the retryable claim.
+- Pending refresh, rejection, ignore, and complete-crawl disappearance are also
+  authority transitions. Source workflow state, retrieval-index state, mutable
+  resolver support, governed lifecycle, projection repair, and the reconciliation
+  checkpoint commit on one write-locked connection. A failure surfaces to the
+  caller and rolls back the source state; it must not leave a terminal source row
+  beside authority that is still selectable.
 - Reviewing a candidate and publishing it are distinct capabilities. Review or
   trust permission can change queue state; any evaluation that can create or
   repair active authority additionally requires apply permission at the API,
   CLI, and shared service boundary before the review transition is attempted.
+- Expiring authority is revalidated after acquiring the writer lock and again
+  in the final compare-and-swap that publishes its effect. A preflight TTL check
+  cannot authorize work that waited past expiry behind another SQLite writer.
 - Resource lookup and lifecycle transition are separate API outcomes. Missing
   tenant-scoped resources return `404`; a present resource whose state no longer
   permits the requested transition returns `409`. Broad `ValueError -> 404`
@@ -462,17 +532,43 @@ mechanics, tenant predicates, and transaction ownership in repositories.
   unreachable; an unbounded list trades that bug for memory and latency risk.
   Parent list responses expose bounded child summaries loaded in set queries;
   child details use a separate cursor rather than an N+1 query loop or an
-  unbounded nested response.
+  unbounded nested response. Primary operator views consume those cursors with
+  tenant-generation-bound continuation actions; a paginated API with a
+  first-page-only browser still strands old review and audit work.
+- Derived authority migrations fail closed on malformed rows and publish their
+  completion marker only after every row is projected. Skipping invalid JSON and
+  marking the migration complete certifies a graph that cannot be audited or
+  repaired on a later startup. Potentially large derived-index backfills use
+  keyset batches and a durable cursor so interruption resumes from the last
+  committed page instead of deleting and rebuilding the whole index under one
+  startup write lock. Any ownership preflight performed outside a writer
+  transaction is repeated after `BEGIN IMMEDIATE` and before schema or progress
+  mutation; the unlocked result is advisory only.
 - Import and migration modes are authorized as a complete batch before the
   first storage read or write. A caller must not leave admitted candidates
   behind when a later requested trust/reject transition is unauthorized, and a
   failed row rolls back the batch's candidates, authority, projections, and
   audit events together.
+- Request authorization and tenant resolution precede persistence dependency
+  construction. A denied request must not create or migrate a database, load
+  bootstrap data, or acquire a SQLite write lock; route dependencies that open
+  stores therefore run only after the complete semantic action is authorized.
 - A learned source, its extracted rows, retrieval index, governed candidates,
   lifecycle reconciliation, and resolver projections form one authority
   transaction when they share a database. Candidate fan-out is checked before
   opening that write transaction so one source cannot monopolize SQLite's
   writer indefinitely.
+- Source lifecycle reconciliation remains one bounded authority transaction
+  even when candidate reads are paged. Paging bounds memory, not commit scope;
+  a later-page failure rolls back every earlier candidate, revision,
+  projection, conflict, and event mutation.
+- Tenant-owner migration includes every tenant-bearing authority child table.
+  Provenance, entity bindings, current-scope projections, and contributor
+  projections are archived before their parent authority rows, with foreign-key
+  enforcement enabled as a second integrity check.
+- Direct ingestion validates the configured tenant boundary before constructing
+  or bootstrapping a persistence store. A denied request must have no durable
+  side effects, including an empty SQLite file or bootstrap schema.
 - Replace-in-place child collections carry a source-generation identity in
   their pagination cursor. If a refresh replaces the generation between pages,
   continuation fails with a conflict and the caller restarts; silently mixing
@@ -481,6 +577,91 @@ mechanics, tenant predicates, and transaction ownership in repositories.
   failures return nonzero, and CI invokes suites excluded by default pytest
   markers explicitly; a documented-but-deselected E2E suite is not coverage.
 
+## SQLite protected-path architecture reset
+
+Wave 1 is resetting Tacit's SQLite integration to ordinary stdlib
+`sqlite3.Connection` and `sqlite3.Cursor` behavior. The custom Python
+connection/cursor subclasses, CPython object-layout inspection, native
+file-moved probe, retained main/WAL/SHM descriptors, generation lease,
+per-statement identity interception, and poison-on-rebind lifecycle are not a
+supported architecture and must be removed. SQLite, not a Python wrapper, owns
+the native handle, statement dispatch, checkpoint behavior, sidecar generations,
+and final close.
+
+The two principal-review findings that forced the reset are independent and
+must remain visible:
+
+1. The wrapper breaks normal multi-process WAL behavior. Cooperating SQLite
+   processes legitimately create, checkpoint, unlink, and recreate WAL/SHM
+   generations across first open, reopen, and last close. A Python layer that
+   freezes those pathname/inode generations cannot reliably distinguish normal
+   SQLite lifecycle from hostile replacement and can reject a healthy store.
+2. Inherited SQLite APIs and the native close lifecycle bypass the proposed
+   enforcement boundary. Base `sqlite3.Connection`/`sqlite3.Cursor` entry points
+   can be invoked without the Python overrides, and base/native close or object
+   finalization can run without wrapper cleanup. Retained guards can therefore
+   be skipped or outlive the connection they claim to protect. Expanding the
+   override list does not provide a complete VFS or lifetime guarantee.
+
+The replacement contract is a POSIX protected path. Other platforms fail before
+filesystem creation or SQLite access until equivalent owner/ACL admission is
+implemented:
+
+- Every configured SQLite role uses a distinct file. Resolve configured and
+  fallback paths into one effective role map and reject same-path or detectable
+  existing-file aliases before opening any store.
+- Canonicalize only trusted root-level operating-system aliases, such as macOS
+  `/tmp` to `/private/tmp`, before admission. Configuration-time traversal then
+  does not follow application symlinks. Reject symlink components and symlink
+  or non-regular main, WAL, and SHM entries before `sqlite3.connect()`.
+  Application directories, database files, and pre-existing sidecars are
+  service-owned and not group/world-writable. Root-owned platform ancestors are
+  trusted only when they are not group/world-writable, except for a sticky
+  temporary ancestor above a private service-owned directory; the final parent
+  never receives that exception. Never repair an unsafe configured path with
+  `chmod`.
+- Once admitted, the deployment protects the directory from untrusted mutation
+  and ordinary SQLite controls sidecar creation, replacement, checkpoint, and
+  deletion. Configuration preflight is not an inode pin and is not repeated as
+  a claim of connection-lifetime identity.
+- Every store requires an exact `wal` journal-mode result before role, schema,
+  migration, or user-data writes. A different result fails with the pre-attempt
+  database state intact.
+- The immutable role marker is file content, not pathname authority. First-open
+  role identity, legacy tenant ownership migration, schema migration, and their
+  completion markers commit in one explicit writer transaction. Every
+  concurrent post-lock fast path validates the role before returning.
+- Public runtime descriptors and the complete cross-store role map remain the
+  composition boundary. Private store fields and path coincidence do not grant
+  ownership.
+
+This threat model trusts the service identity and its protected deployment path.
+It does not defend same-UID pathname replacement, a swap-and-restore between
+preflight and SQLite I/O, or hostile hot replacement. Planned replacement
+requires all Tacit processes to stop. Detecting or safely continuing through
+those cases, descriptor-bound opening, and stronger live VFS guarantees require
+a real SQLite VFS/native integration or a server database.
+
+Architecture acceptance requires the full protected-path matrix and a real
+subprocess WAL scenario, not only unit tests with monkeypatched file calls. Two
+processes race first-open on a missing database, confirm exact WAL and one
+transactional role/schema, keep overlapping live connections while one writes
+and reopens, run a real `wal_checkpoint(TRUNCATE)`, vary which process closes
+last, and then use a fresh process to reopen, verify, write, checkpoint, and
+close. Assert committed state and bounded completion, not WAL/SHM pathname or
+inode persistence.
+
+Performance evidence must come from a checked-in reproducible harness. Run an
+ordinary stdlib control and the Tacit path against the same temporary filesystem,
+schema, pragmas, warmups, operation counts, and samples. Cover protected-path
+validation plus connect/WAL/close, single-row commits, batched statements,
+checkpoint/reopen, and the subprocess lifecycle. Emit machine-readable revision,
+Python/SQLite/platform, filesystem root, settings, parameters, error count,
+descriptor delta, and latency/throughput percentiles; fail on errors or empty
+samples. The local 2026-08-13 wrapper timings are historical diagnostics, not an
+acceptance baseline, because they measured the architecture being removed and
+were not produced by this harness.
+
 ## Observability expectations
 
 Best-effort behavior must be visible. Silent fallback is not resilience.
@@ -488,6 +669,9 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
 - Emit structured diagnostics for store initialization failure, blocked global
   fallback, persistence degradation, stale-parent races, replay mismatch,
   projection mismatch, and resolver/snapshot usage mismatch.
+- Expected degraded paths log stable reason codes, bounded counters, and error
+  classes only. They do not attach tracebacks, raw payloads, query text, tenant
+  data, credentials, or filesystem paths to routine warning events.
 - Time intent classification, discovery, semantic resolution, archetype
   selection, compilation, validation, publication, and persistence separately.
   Persist enough precision to distinguish sub-10ms stages; rounding seconds to
@@ -508,9 +692,151 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   percentiles, recall, signal-to-noise, and zero-match cases.
 - Failed chart runs should expose a run identifier and terminal status even when
   validation drops every panel and no investigation revision is produced. The
+  same identity travels with unexpected API and streaming failures; if the run
+  audit itself cannot be started, the pipeline fails closed and reports that
+  audit degradation instead of continuing without a lifecycle record. The
   audit record should retain per-datasource catalog counts and truncation,
   intended versus compiled archetypes, signal-binding disposition, and rejected
   query reasons so a safe abstention remains externally explainable.
+- Lifecycle runs carry a bounded lease. If a terminal audit write cannot be
+  persisted, the response reports that degradation and a later run/event read
+  atomically converts the expired lease into a failed terminal row and event.
+- Run leases are authority fences, not only cleanup hints. Revision writes,
+  public lifecycle-event appends, and terminal completion prove that the run is
+  still active inside the same write transaction; a targeted run read repairs
+  that exact expired lease even when a larger abandonment backlog exists.
+  Lease time is sampled after the SQLite writer lock is acquired and immediately
+  before the compare-and-swap. A timestamp captured before lock contention or
+  expensive fingerprint work is not a valid authority fence.
+- A new run's lease begins only after its `BEGIN IMMEDIATE` writer lock is
+  acquired. Queueing for SQLite cannot consume a run's active lease before the
+  run row and start event exist.
+- Initial-run completion updates the legacy investigation row, lifecycle run,
+  and terminal event in one transaction. A terminal run cannot subsequently
+  publish an authoritative revision; abandoned initial runs repair a still-
+  running legacy row when their lease is reconciled.
+- Operator-facing knowledge lists use bounded keyset pagination and indexes for
+  every supported filter combination. Compatibility offsets are capped and are
+  not the default path for long-lived audit stores.
+- Signal taxonomy definitions and per-signal mapping expansion are bounded too.
+  List APIs keyset-page effective tenant definitions, counts cover only the
+  visible page, and legacy approval refuses an oversized compatibility fan-out
+  before it can monopolize the authority writer transaction.
+- Display-oriented compatibility pages must never become an authority boundary.
+  Runtime semantic resolution uses a bounded, indexed reverse mapping scan and
+  fails closed when its candidate or scan budget is exceeded; it does not treat
+  a truncated taxonomy page as the complete organizational vocabulary.
+- Reverse semantic resolution is bounded across aggregate work, not merely SQL
+  pages. It bulk-loads mappings and definitions in one read snapshot, narrows
+  metric candidates with literal-fragment indexes, and reports mapping rows,
+  applicable mappings, exact pattern checks, and the configured check budget.
+  Broad patterns that cannot be indexed consume that budget and fail closed.
+- Pipeline resolution has one investigation-owned work budget. Discovery,
+  archetype selection and compilation, initial evidence, symptom rescue, and
+  evidence-gap rescue all consume that same budget; a leaf helper may create a
+  budget only for a genuinely standalone call.
+- Dashboard rescue composition admits aggregate panels, queries, nested nodes,
+  scalar characters, and encoded bytes before allocating combined lists. Each
+  component being valid independently does not make their composition valid.
+- Experimental generated-archetype retrieval requires a concrete environment
+  as well as tenant and service scope. Missing mandatory scope produces a
+  stable skipped result before the quarantine filesystem is opened; empty scope
+  is never interpreted as an exact match.
+- Governed resolver projections preserve applicability per metric pattern. Scope
+  from one backend-specific pattern must not be unioned into another pattern,
+  and projection reconciliation independently checks that invariant.
+- Reverse resolution retains same-signal, same-pattern variants for every scope
+  dimension that is resolved against an individual catalog entry. In particular,
+  datasource-scoped variants may be deduplicated only after the matching metric's
+  datasource is known; collapsing them during the mapping scan loses authority
+  and can suppress the correct fallback.
+- The resolver projection identity therefore includes the normalized datasource
+  scope in addition to tenant, signal, metric pattern, and knowledge ID. Schema
+  migration, idempotent upsert, and startup audit all compare that exact variant;
+  counting only distinct metric patterns can certify an incomplete projection.
+- Large derived-index migrations persist their keyset cursor in the same
+  transaction as each completed page. Idempotence protects duplicate writes;
+  durable progress prevents every process restart from replaying the entire
+  completed prefix.
+- Store admission that depends on tenant-owner metadata uses the shared
+  protected-path read-only connection boundary before enabling WAL, claiming a
+  role, or entering structural setup. The same owner decision is revalidated
+  inside the first writer transaction. A denied open must preserve the main
+  database bytes, journal mode, schema, indexes, markers, and rows exactly.
+- Ordinary SQLite `mode=ro` is not a nonmutating filesystem boundary in WAL
+  mode: it may create WAL/SHM files or update the shared WAL index. Quiescent
+  admission therefore uses SQLite immutable access. When committed live-WAL
+  frames exist, admission reads an isolated main-plus-WAL snapshot, verifies
+  source stability before and after the complete callback, and retries source
+  movement under one absolute busy deadline shared by file copy, SQLite query,
+  trusted callback, source verification, and retries. Snapshot work is capped
+  at 256 MiB against aggregate bytes actually read from main and WAL; each
+  chunk reserves budget before it is written, so source growth cannot overrun
+  the cap. SQLite work is interrupted cooperatively at expiry. Arbitrary
+  trusted Python callbacks cannot be force-killed safely, but a callback that
+  returns after expiry is rejected and cannot authorize mutation. Telemetry
+  contains only byte count, duration, attempt, and stable reason codes.
+  Larger live-WAL databases fail closed until checkpoint/last-close makes the
+  constant-space immutable path available. A live rollback journal also fails
+  closed; recovery is a trusted-writer operation, not an admission side effect.
+- Migration cursors encode the not-started state outside the source key's legal
+  domain. SQLite row IDs and application IDs may be negative, zero, positive,
+  sparse, empty text, or at their integer bounds; none of those values, nor an
+  all-empty composite key, doubles as an initialization sentinel. Durable
+  progress stores an explicit started bit; runtime scans use `None`.
+- Preserving a legal migration key commits every runtime consumer to the same
+  domain. Projection audit, quarantine, forward and reverse resolution, and API
+  cursors all use explicit absence for their initial state; zero, negative IDs,
+  and empty string keys remain data rather than control values. Tightening that
+  domain later requires a versioned schema and quarantine migration.
+- Optional database capabilities are durable migration outcomes. In particular,
+  FTS availability is recorded as available or unavailable after a bounded
+  capability probe, so a degraded runtime converges across restarts instead of
+  replaying schema and audit work indefinitely.
+- Public runtime descriptors and capabilities are the only composition API.
+  Migration and learning adapters may request `runtime_settings`,
+  `runtime_ownership`, `database_path`, or the public projection store, but may
+  not infer ownership from `_db_path`, `_runtime_settings`, `_settings`, or
+  `_signal_store`. A descriptor-only adapter is a required regression fixture.
+- Sharing a physical SQLite database does not imply sharing authority. The
+  knowledge repository must prove the signal-store role and durable tenant
+  owner through that public capability at construction and again immediately
+  after every writer lock, including caller-bound transactions. A conflicting
+  first-opener may leave no repository-specific schema, marker, or row behind.
+- Projection audits validate bounded key pages with an indexed relational join,
+  never a generated `OR` predicate over the authority table. Query-plan tests
+  exercise the exact production statement at representative long-lived-state
+  cardinality and reject full scans or temporary sorts.
+- Store first-open structure is one transaction: role identity, migration
+  metadata, and empty target-schema shadows either commit together or leave the
+  original database unchanged. Potentially large legacy rows are not copied in
+  that transaction. The legacy table remains authoritative while bounded
+  keyset batches populate the shadow and durably advance a cursor; only a final
+  writer transaction swaps names, rebuilds indexes, records completion, and
+  removes the legacy table. Do not use `sqlite3.executescript()` inside these
+  boundaries because it commits implicitly. Mixed-version writers are excluded
+  during migration. Feedback, history, knowledge, and signals still duplicate
+  parts of transaction-safe migration execution; consolidate that mechanism in
+  the persistence wave once the prepare/copy/swap contract is frozen.
+- Concurrent migration rechecks are ownership boundaries too. After acquiring
+  the writer lock, owner and role validation is the first structural action.
+  Every branch that discovers a now-current schema still claims and validates
+  the transactional database role identity before returning. Two first-open
+  processes with conflicting tenant owners must leave only the winner's schema,
+  markers, and tenant data.
+- Remote identity and executable settings are separate parts of one owner.
+  Backends require exactly one provider identity and a public settings snapshot,
+  then pass that snapshot through discovery and publication helpers. Authority
+  failures propagate; ordinary availability failures use stable reason codes
+  and bounded fingerprints rather than raw exception text or tracebacks.
+- Pipeline startup, backend construction, knowledge degradation, and terminal
+  failure persistence follow the same diagnostic rule: durable state and logs
+  contain a stable reason, exception class, and bounded fingerprint, while raw
+  exception messages and traceback state remain out of audit records.
+- External publication is an explicit commit phase. Every realized backend is
+  ownership-preflighted before remote I/O, the run records a required commit
+  marker before the first write, and cancellation is deferred through backend
+  fan-out, contract persistence, and terminal audit completion.
 - When debugging exposes missing telemetry, call it out and add focused
   instrumentation when it is in scope.
 
@@ -520,7 +846,9 @@ governed mapping that the selected snapshot cannot safely mark as applied.
 
 ## Validation expectations
 
-Cross-cutting work should use focused regression tests plus the relevant matrix:
+The [foundation invariant matrix](foundation-invariant-matrix.md) is the
+authoritative implementation checklist. Cross-cutting work should use focused
+regression tests plus every applicable matrix row, including:
 
 - tenant: pinned, wildcard, missing, mismatch, reserved, and legacy migration
 - permissions: read, review, reject, trust, correct, apply, and override

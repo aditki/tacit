@@ -205,56 +205,461 @@ class MetricsDiscoveryResult(BaseModel):
 # ── Query Builder ────────────────────────────────────────────────────────────
 
 
+MAX_DASHBOARD_PANELS = 256
+MAX_PANEL_QUERIES = 1_024
+MAX_DASHBOARD_QUERIES = 1_024
+MAX_DASHBOARD_TAGS = 256
+MAX_PANEL_THRESHOLDS = 256
+MAX_CLOUDWATCH_DIMENSIONS = 128
+MAX_CLOUDWATCH_DIMENSION_VALUES = 256
+MAX_DASHBOARD_SCALAR_CHARACTERS = 64 * 1_024
+MAX_DASHBOARD_TOTAL_SCALAR_CHARACTERS = 8 * 1_024 * 1_024
+MAX_DASHBOARD_SCALAR_BYTES = 128 * 1_024
+MAX_DASHBOARD_TOTAL_SCALAR_BYTES = 32 * 1_024 * 1_024
+MAX_DASHBOARD_NESTED_DEPTH = 32
+MAX_DASHBOARD_NESTED_NODES = 4_096
+_DASHBOARD_WORK_LIMIT_EXCEEDED = "dashboard_work_limit_exceeded"
+
+
+class DashboardWorkLimitError(ValueError):
+    """A dashboard shape exceeded a stable aggregate work bound."""
+
+    reason_code = _DASHBOARD_WORK_LIMIT_EXCEEDED
+
+    def __init__(self, dimension: str, observed: int, limit: int) -> None:
+        self.dimension = dimension
+        self.observed = observed
+        self.limit = limit
+        super().__init__(f"{self.reason_code}: {dimension} exceeds {limit}")
+
+
+def _raise_dashboard_work_limit(dimension: str, observed: int, limit: int) -> None:
+    raise DashboardWorkLimitError(dimension, observed, limit)
+
+
+def _raw_collection_length(value: Any) -> int | None:
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return None
+
+
+def _validate_nested_value_work_limits(value: Any, *, nodes_seen: int = 0) -> int:
+    """Bound arbitrary dashboard metadata without recursive traversal."""
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_DASHBOARD_NESTED_DEPTH:
+            _raise_dashboard_work_limit(
+                "nested_depth",
+                depth,
+                MAX_DASHBOARD_NESTED_DEPTH,
+            )
+
+        nodes_seen += 1
+        if nodes_seen > MAX_DASHBOARD_NESTED_NODES:
+            _raise_dashboard_work_limit(
+                "nested_nodes",
+                nodes_seen,
+                MAX_DASHBOARD_NESTED_NODES,
+            )
+
+        if isinstance(current, dict):
+            nodes_seen += len(current)
+            if nodes_seen > MAX_DASHBOARD_NESTED_NODES:
+                _raise_dashboard_work_limit(
+                    "nested_nodes",
+                    nodes_seen,
+                    MAX_DASHBOARD_NESTED_NODES,
+                )
+            stack.extend((nested, depth + 1) for nested in current.values())
+        elif isinstance(current, (list, tuple)):
+            stack.extend((nested, depth + 1) for nested in current)
+    return nodes_seen
+
+
+def _nested_scalar_values(value: Any) -> Any:
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, str):
+            yield current
+        elif isinstance(current, dict):
+            for key, nested in current.items():
+                stack.append(nested)
+                stack.append(str(key))
+        elif isinstance(current, (list, tuple)):
+            stack.extend(reversed(current))
+
+
+def _dashboard_scalar_values(dashboard_spec: DashboardSpec) -> Any:
+    """Yield bounded dashboard text without serializing or copying the model."""
+    yield dashboard_spec.title
+    yield dashboard_spec.timerange
+    yield from dashboard_spec.tags
+    for panel in dashboard_spec.panels:
+        yield panel.title
+        yield panel.description
+        yield panel.panel_type
+        yield panel.unit
+        yield panel.source_archetype
+        yield panel.row
+        yield from _nested_scalar_values(panel.thresholds)
+        for query in panel.queries:
+            yield query.expr
+            yield query.legend_format
+            yield query.datasource_uid
+            yield query.datasource_type
+            yield query.query_language
+            yield query.cloudwatch_namespace
+            yield query.cloudwatch_stat
+            yield query.cloudwatch_region
+            yield query.validation_status
+            for key, value in query.cloudwatch_dimensions.items():
+                yield key
+                if isinstance(value, str):
+                    yield value
+                else:
+                    yield from value
+
+
 class PanelQuery(BaseModel):
     """A single query expression for any supported datasource."""
 
     expr: str = Field(
-        description="Query expression (PromQL, LogQL, SignalFlow, Lucene, metric name for CloudWatch, etc.)"
+        max_length=MAX_DASHBOARD_SCALAR_CHARACTERS,
+        description="Query expression (PromQL, LogQL, SignalFlow, Lucene, metric name for CloudWatch, etc.)",
     )
-    legend_format: str = Field(default="{{instance}}", description="Legend template")
-    datasource_uid: str
-    datasource_type: str = "prometheus"
-    query_language: str = ""
+    legend_format: str = Field(
+        default="{{instance}}",
+        max_length=MAX_DASHBOARD_SCALAR_CHARACTERS,
+        description="Legend template",
+    )
+    datasource_uid: str = Field(max_length=MAX_DASHBOARD_SCALAR_CHARACTERS)
+    datasource_type: str = Field(default="prometheus", max_length=MAX_DASHBOARD_SCALAR_CHARACTERS)
+    query_language: str = Field(default="", max_length=MAX_DASHBOARD_SCALAR_CHARACTERS)
     # CloudWatch-specific fields (only set when datasource_type='cloudwatch')
-    cloudwatch_namespace: str = Field(default="", description="AWS CloudWatch namespace, e.g. 'AWS/ApplicationELB'")
-    cloudwatch_stat: str = Field(default="", description="CloudWatch statistic: Sum, Average, p99, etc.")
+    cloudwatch_namespace: str = Field(
+        default="",
+        max_length=MAX_DASHBOARD_SCALAR_CHARACTERS,
+        description="AWS CloudWatch namespace, e.g. 'AWS/ApplicationELB'",
+    )
+    cloudwatch_stat: str = Field(
+        default="",
+        max_length=MAX_DASHBOARD_SCALAR_CHARACTERS,
+        description="CloudWatch statistic: Sum, Average, p99, etc.",
+    )
     cloudwatch_dimensions: dict[str, str | list[str]] = Field(
         default_factory=dict,
+        max_length=MAX_CLOUDWATCH_DIMENSIONS,
         description=(
             "CloudWatch dimensions, e.g. {'LoadBalancer': '*'} or {'AvailabilityZone': ['us-east-1a', 'us-east-1b']}"
         ),
     )
-    cloudwatch_region: str = Field(default="", description="AWS region for this CloudWatch query, e.g. 'us-east-1'")
-    validation_status: str = Field(default="", description="Validation verdict for this query, e.g. ok/skipped")
+    cloudwatch_region: str = Field(
+        default="",
+        max_length=MAX_DASHBOARD_SCALAR_CHARACTERS,
+        description="AWS region for this CloudWatch query, e.g. 'us-east-1'",
+    )
+    validation_status: str = Field(
+        default="",
+        max_length=MAX_DASHBOARD_SCALAR_CHARACTERS,
+        description="Validation verdict for this query, e.g. ok/skipped",
+    )
     validation_has_data: bool = Field(default=False, description="Whether validation proved this query returned data")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_oversized_raw_cloudwatch_dimensions(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        dimensions = data.get("cloudwatch_dimensions")
+        if not isinstance(dimensions, dict):
+            return data
+        if len(dimensions) > MAX_CLOUDWATCH_DIMENSIONS:
+            _raise_dashboard_work_limit(
+                "cloudwatch_dimensions",
+                len(dimensions),
+                MAX_CLOUDWATCH_DIMENSIONS,
+            )
+        for value in dimensions.values():
+            if isinstance(value, (list, tuple)) and len(value) > MAX_CLOUDWATCH_DIMENSION_VALUES:
+                _raise_dashboard_work_limit(
+                    "cloudwatch_dimension_values",
+                    len(value),
+                    MAX_CLOUDWATCH_DIMENSION_VALUES,
+                )
+        _validate_nested_value_work_limits(dimensions)
+        return data
 
 
 class PanelSpec(BaseModel):
     """Specification for one Grafana panel."""
 
-    title: str
-    description: str = ""
+    title: str = Field(max_length=MAX_DASHBOARD_SCALAR_CHARACTERS)
+    description: str = Field(default="", max_length=MAX_DASHBOARD_SCALAR_CHARACTERS)
     panel_type: str = Field(
         default="timeseries",
+        max_length=MAX_DASHBOARD_SCALAR_CHARACTERS,
         description="Grafana panel type: timeseries, stat, gauge, table, logs …",
     )
-    queries: list[PanelQuery]
-    unit: str = Field(default="", description="Grafana unit id, e.g. 'percentunit', 's', 'bytes'")
-    thresholds: list[dict[str, Any]] = Field(default_factory=list)
-    source_archetype: str = Field(default="", description="Archetype id that compiled this panel, when known")
+    queries: list[PanelQuery] = Field(max_length=MAX_PANEL_QUERIES)
+    unit: str = Field(
+        default="",
+        max_length=MAX_DASHBOARD_SCALAR_CHARACTERS,
+        description="Grafana unit id, e.g. 'percentunit', 's', 'bytes'",
+    )
+    thresholds: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_PANEL_THRESHOLDS)
+    source_archetype: str = Field(
+        default="",
+        max_length=MAX_DASHBOARD_SCALAR_CHARACTERS,
+        description="Archetype id that compiled this panel, when known",
+    )
     row: str = Field(
         default="",
+        max_length=MAX_DASHBOARD_SCALAR_CHARACTERS,
         description="Optional row/section name for grouping, e.g. 'Latency', 'Traffic'. Leave empty for no grouping.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_oversized_raw_query_lists(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        query_count = _raw_collection_length(data.get("queries"))
+        if query_count is not None and query_count > MAX_PANEL_QUERIES:
+            _raise_dashboard_work_limit("queries_per_panel", query_count, MAX_PANEL_QUERIES)
+        threshold_count = _raw_collection_length(data.get("thresholds"))
+        if threshold_count is not None and threshold_count > MAX_PANEL_THRESHOLDS:
+            _raise_dashboard_work_limit(
+                "thresholds_per_panel",
+                threshold_count,
+                MAX_PANEL_THRESHOLDS,
+            )
+        if threshold_count is not None:
+            _validate_nested_value_work_limits(data.get("thresholds"))
+        return data
 
 
 class DashboardSpec(BaseModel):
     """Full spec handed to the Dashboard Builder."""
 
-    title: str
-    tags: list[str] = Field(default_factory=list)
-    timerange: str = "1h"
-    panels: list[PanelSpec]
+    title: str = Field(max_length=MAX_DASHBOARD_SCALAR_CHARACTERS)
+    tags: list[str] = Field(default_factory=list, max_length=MAX_DASHBOARD_TAGS)
+    timerange: str = Field(default="1h", max_length=MAX_DASHBOARD_SCALAR_CHARACTERS)
+    panels: list[PanelSpec] = Field(max_length=MAX_DASHBOARD_PANELS)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_oversized_raw_dashboard(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        tag_count = _raw_collection_length(data.get("tags"))
+        if tag_count is not None and tag_count > MAX_DASHBOARD_TAGS:
+            _raise_dashboard_work_limit("tags", tag_count, MAX_DASHBOARD_TAGS)
+        raw_panels = data.get("panels")
+        if not isinstance(raw_panels, (list, tuple)):
+            return data
+        panel_count = len(raw_panels)
+        if panel_count > MAX_DASHBOARD_PANELS:
+            _raise_dashboard_work_limit("panels", panel_count, MAX_DASHBOARD_PANELS)
+
+        total_queries = 0
+        for panel in raw_panels:
+            raw_queries = panel.queries if isinstance(panel, PanelSpec) else None
+            raw_thresholds = panel.thresholds if isinstance(panel, PanelSpec) else None
+            if isinstance(panel, dict):
+                raw_queries = panel.get("queries")
+                raw_thresholds = panel.get("thresholds")
+            threshold_count = _raw_collection_length(raw_thresholds)
+            if threshold_count is not None and threshold_count > MAX_PANEL_THRESHOLDS:
+                _raise_dashboard_work_limit(
+                    "thresholds_per_panel",
+                    threshold_count,
+                    MAX_PANEL_THRESHOLDS,
+                )
+            query_count = _raw_collection_length(raw_queries)
+            if query_count is None:
+                continue
+            if query_count > MAX_PANEL_QUERIES:
+                _raise_dashboard_work_limit("queries_per_panel", query_count, MAX_PANEL_QUERIES)
+            total_queries += query_count
+            if total_queries > MAX_DASHBOARD_QUERIES:
+                _raise_dashboard_work_limit("total_queries", total_queries, MAX_DASHBOARD_QUERIES)
+
+        nested_nodes = 0
+        for panel in raw_panels:
+            raw_queries = panel.queries if isinstance(panel, PanelSpec) else None
+            raw_thresholds = panel.thresholds if isinstance(panel, PanelSpec) else None
+            if isinstance(panel, dict):
+                raw_queries = panel.get("queries")
+                raw_thresholds = panel.get("thresholds")
+            if isinstance(raw_thresholds, (list, tuple)):
+                nested_nodes = _validate_nested_value_work_limits(
+                    raw_thresholds,
+                    nodes_seen=nested_nodes,
+                )
+            if not isinstance(raw_queries, (list, tuple)):
+                continue
+            for query in raw_queries:
+                dimensions = query.cloudwatch_dimensions if isinstance(query, PanelQuery) else None
+                if isinstance(query, dict):
+                    dimensions = query.get("cloudwatch_dimensions")
+                if isinstance(dimensions, dict):
+                    nested_nodes = _validate_nested_value_work_limits(
+                        dimensions,
+                        nodes_seen=nested_nodes,
+                    )
+        return data
+
+    @model_validator(mode="after")
+    def validate_aggregate_dashboard_work(self) -> DashboardSpec:
+        validate_dashboard_spec_work_limits(self)
+        return self
+
+
+def dashboard_spec_work_counts(dashboard_spec: DashboardSpec) -> tuple[int, int]:
+    """Return bounded panel/query counts without traversing query payloads."""
+    panel_count = len(dashboard_spec.panels)
+    if panel_count > MAX_DASHBOARD_PANELS:
+        _raise_dashboard_work_limit("panels", panel_count, MAX_DASHBOARD_PANELS)
+    if len(dashboard_spec.tags) > MAX_DASHBOARD_TAGS:
+        _raise_dashboard_work_limit("tags", len(dashboard_spec.tags), MAX_DASHBOARD_TAGS)
+
+    total_queries = 0
+    for panel in dashboard_spec.panels:
+        if len(panel.thresholds) > MAX_PANEL_THRESHOLDS:
+            _raise_dashboard_work_limit(
+                "thresholds_per_panel",
+                len(panel.thresholds),
+                MAX_PANEL_THRESHOLDS,
+            )
+        query_count = len(panel.queries)
+        if query_count > MAX_PANEL_QUERIES:
+            _raise_dashboard_work_limit("queries_per_panel", query_count, MAX_PANEL_QUERIES)
+        total_queries += query_count
+        if total_queries > MAX_DASHBOARD_QUERIES:
+            _raise_dashboard_work_limit("total_queries", total_queries, MAX_DASHBOARD_QUERIES)
+    return panel_count, total_queries
+
+
+def _validate_dashboard_nested_collection_work_limits(
+    dashboard_spec: DashboardSpec,
+    *,
+    nodes_seen: int = 0,
+) -> int:
+    """Return aggregate nested work after enforcing the stable node limit."""
+    nested_nodes = nodes_seen
+    for panel in dashboard_spec.panels:
+        nested_nodes = _validate_nested_value_work_limits(
+            panel.thresholds,
+            nodes_seen=nested_nodes,
+        )
+        for query in panel.queries:
+            dimension_count = len(query.cloudwatch_dimensions)
+            if dimension_count > MAX_CLOUDWATCH_DIMENSIONS:
+                _raise_dashboard_work_limit(
+                    "cloudwatch_dimensions",
+                    dimension_count,
+                    MAX_CLOUDWATCH_DIMENSIONS,
+                )
+            for value in query.cloudwatch_dimensions.values():
+                if isinstance(value, list) and len(value) > MAX_CLOUDWATCH_DIMENSION_VALUES:
+                    _raise_dashboard_work_limit(
+                        "cloudwatch_dimension_values",
+                        len(value),
+                        MAX_CLOUDWATCH_DIMENSION_VALUES,
+                    )
+            nested_nodes = _validate_nested_value_work_limits(
+                query.cloudwatch_dimensions,
+                nodes_seen=nested_nodes,
+            )
+    return nested_nodes
+
+
+def validate_dashboard_nested_collection_work_limits(dashboard_spec: DashboardSpec) -> None:
+    """Bound nested metadata only after aggregate query work is admitted."""
+    _validate_dashboard_nested_collection_work_limits(dashboard_spec)
+
+
+def validate_dashboard_spec_work_limits(dashboard_spec: DashboardSpec) -> None:
+    """Validate runtime-created specs that may bypass Pydantic validation."""
+    dashboard_spec_work_counts(dashboard_spec)
+    validate_dashboard_nested_collection_work_limits(dashboard_spec)
+    validate_dashboard_scalar_work_limits(dashboard_spec)
+
+
+def _validate_dashboard_scalar_work_limits(
+    dashboard_spec: DashboardSpec,
+    *,
+    total_characters: int = 0,
+    total_bytes: int = 0,
+) -> tuple[int, int]:
+    """Return aggregate scalar work after enforcing per-value and total limits."""
+    for value in _dashboard_scalar_values(dashboard_spec):
+        scalar_characters = len(value)
+        if scalar_characters > MAX_DASHBOARD_SCALAR_CHARACTERS:
+            _raise_dashboard_work_limit(
+                "scalar_characters",
+                scalar_characters,
+                MAX_DASHBOARD_SCALAR_CHARACTERS,
+            )
+        total_characters += scalar_characters
+        if total_characters > MAX_DASHBOARD_TOTAL_SCALAR_CHARACTERS:
+            _raise_dashboard_work_limit(
+                "total_scalar_characters",
+                total_characters,
+                MAX_DASHBOARD_TOTAL_SCALAR_CHARACTERS,
+            )
+        scalar_bytes = len(value.encode("utf-8"))
+        if scalar_bytes > MAX_DASHBOARD_SCALAR_BYTES:
+            _raise_dashboard_work_limit(
+                "scalar_bytes",
+                scalar_bytes,
+                MAX_DASHBOARD_SCALAR_BYTES,
+            )
+        total_bytes += scalar_bytes
+        if total_bytes > MAX_DASHBOARD_TOTAL_SCALAR_BYTES:
+            _raise_dashboard_work_limit(
+                "total_scalar_bytes",
+                total_bytes,
+                MAX_DASHBOARD_TOTAL_SCALAR_BYTES,
+            )
+    return total_characters, total_bytes
+
+
+def validate_dashboard_scalar_work_limits(dashboard_spec: DashboardSpec) -> None:
+    """Bound dashboard text before copying, regex scanning, or backend calls."""
+    _validate_dashboard_scalar_work_limits(dashboard_spec)
+
+
+def validate_dashboard_composition_work_limits(*dashboard_specs: DashboardSpec) -> None:
+    """Reject an oversized merge before allocating its combined panel list."""
+    total_panels = 0
+    total_queries = 0
+    for dashboard_spec in dashboard_specs:
+        panel_count, query_count = dashboard_spec_work_counts(dashboard_spec)
+        total_panels += panel_count
+        if total_panels > MAX_DASHBOARD_PANELS:
+            _raise_dashboard_work_limit("panels", total_panels, MAX_DASHBOARD_PANELS)
+        total_queries += query_count
+        if total_queries > MAX_DASHBOARD_QUERIES:
+            _raise_dashboard_work_limit("total_queries", total_queries, MAX_DASHBOARD_QUERIES)
+
+    nested_nodes = 0
+    for dashboard_spec in dashboard_specs:
+        nested_nodes = _validate_dashboard_nested_collection_work_limits(
+            dashboard_spec,
+            nodes_seen=nested_nodes,
+        )
+
+    total_characters = 0
+    total_bytes = 0
+    for dashboard_spec in dashboard_specs:
+        total_characters, total_bytes = _validate_dashboard_scalar_work_limits(
+            dashboard_spec,
+            total_characters=total_characters,
+            total_bytes=total_bytes,
+        )
 
 
 # ── Evidence model ───────────────────────────────────────────────────────────
@@ -397,7 +802,10 @@ class DashRequest(BaseModel):
 
     prompt: str = Field(description="Natural-language description of the dashboard you need")
     channel_id: str = Field(default="", description="Slack channel ID (set automatically by Slack integration)")
-    user_id: str = Field(default="", description="User identifier for provenance tracking")
+    user_id: str = Field(
+        default="",
+        description="Caller label for direct integrations; HTTP audit identity is derived from authentication",
+    )
     thread_ts: str = Field(default="", description="Slack thread timestamp (set automatically by Slack integration)")
     tenant_id: str = Field(default="", description="Organization scope for Operational Knowledge isolation")
 
@@ -421,6 +829,15 @@ class DashResponse(BaseModel):
     panel_count: int = Field(description="Number of panels in the generated dashboard")
     summary: str = Field(description="Human-readable summary of what was generated")
     investigation_id: str = Field(default="", description="Stable investigation identifier")
+    investigation_run_id: str = Field(default="", description="Lifecycle run identifier for this pipeline attempt")
+    investigation_status: str = Field(
+        default="",
+        description="Terminal lifecycle status for this pipeline attempt",
+    )
+    audit_status: str = Field(
+        default="",
+        description="Durability state of the investigation run audit",
+    )
     investigation_revision: int | None = Field(default=None, description="Immutable investigation contract revision")
     signalfx_url: str = Field(default="", description="SignalFx dashboard URL (when signalfx_enabled)")
     signalfx_dashboard_id: str = Field(default="", description="SignalFx dashboard ID (when signalfx_enabled)")
@@ -466,7 +883,10 @@ class FeedbackRequest(BaseModel):
         description="Would you use this dashboard in a real incident?",
     )
     comment: str = Field(default="", description="Free-text feedback")
-    reviewer: str = Field(default="", description="Reviewer identifier (user ID or email)")
+    reviewer: str = Field(
+        default="",
+        description="Optional unverified display label; HTTP audit identity is derived from authentication",
+    )
 
 
 class FeedbackResponse(BaseModel):
@@ -584,15 +1004,18 @@ class TeachSignalRequest(BaseModel):
     description: str = Field(default="", description="Human-readable description of the signal")
     category: str = Field(default="", description="Signal category, e.g. 'saturation'")
     unit: str = Field(default="", description="Unit hint for the signal")
-    # Scope fields use None (omitted) vs [] (explicit clear) vs [..] (union):
-    # omitting a field leaves existing scope unchanged on re-teach; an empty
-    # list clears it (makes the mapping global); values union with existing.
+    # Scope fields use None (inherit) vs [] (unscoped) vs [..] (explicit scope).
+    # Inheritance is valid only when one existing taught variant identifies the
+    # omitted scope; ambiguous variants require all dimensions explicitly.
     services: list[str] | None = Field(default=None, description="Context: services this mapping applies to")
     datasource_types: list[str] | None = Field(
         default=None, description="Context: datasource types this mapping applies to"
     )
     environments: list[str] | None = Field(default=None, description="Context: environments this mapping applies to")
-    taught_by: str = Field(default="api", description="Provenance: who taught this mapping")
+    taught_by: str = Field(
+        default="api",
+        description="Optional unverified display label; HTTP audit identity is derived from authentication",
+    )
 
     @field_validator("signal_type")
     @classmethod

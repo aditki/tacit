@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 
 from tacit.config import settings
+from tacit.errors import SemanticAuthorizationError
 from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
 from tacit.tenancy import MAX_TENANT_LENGTH as MAX_TENANT_LENGTH
 from tacit.tenancy import TenantBoundaryError, resolve_tenant_boundary
@@ -25,8 +26,10 @@ async def verify_api_key(request: Request, api_key: str | None = Security(api_ke
     if configured_tenant == "*" and not runtime_settings.api_auth_enabled:
         raise HTTPException(status_code=503, detail="Wildcard knowledge tenancy requires API authentication")
     if not runtime_settings.api_auth_enabled:
+        request.state.authenticated_actor = "local-unauthenticated"
         return
     expected_key = runtime_settings.api_auth_key
+    selected_tenant = configured_tenant
     if configured_tenant == "*":
         selected_tenant = resolve_knowledge_tenant(
             configured_tenant,
@@ -36,6 +39,16 @@ async def verify_api_key(request: Request, api_key: str | None = Security(api_ke
         expected_key = tenant_keys.get(selected_tenant, "")
     if not api_key or not expected_key or not secrets.compare_digest(api_key, expected_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    key_slot = "tenant-key" if configured_tenant == "*" else "api-key"
+    request.state.authenticated_actor = f"{key_slot}:{selected_tenant}"
+
+
+def authenticated_actor(request: Request) -> str:
+    """Return the credential-derived audit identity established by authentication."""
+    actor = str(getattr(request.state, "authenticated_actor", "") or "")
+    if not actor:
+        raise HTTPException(status_code=500, detail="Authenticated audit identity is unavailable")
+    return actor
 
 
 def sanitize_prompt(prompt: str) -> str:
@@ -129,12 +142,17 @@ def require_knowledge_action(action: KnowledgeAction):
     return dependency
 
 
+async def require_knowledge_tenant(request: Request) -> None:
+    """Validate the request tenant before any tenant-scoped store is opened."""
+    knowledge_tenant(request)
+
+
 def assert_knowledge_action(request: Request, action: KnowledgeAction) -> None:
     """Authorize every permission required by a semantic product action."""
     runtime_settings = getattr(request.app.state, "settings", settings)
     try:
         enforce_knowledge_action(runtime_settings, action)
-    except PermissionError as exc:
+    except SemanticAuthorizationError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 

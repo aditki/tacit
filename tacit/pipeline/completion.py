@@ -8,7 +8,9 @@ import structlog
 
 from tacit.agents.providers.base import TokenUsage
 from tacit.backends.base import DashboardBackend, PublishResult
+from tacit.config import Settings
 from tacit.dependencies import PipelineDependencies, resolve_knowledge_service
+from tacit.errors import safe_failure_detail, safe_failure_diagnostics
 from tacit.investigation_contract import InvestigationContractAssembler, InvestigationRunType, RuntimeManifest
 from tacit.investigation_replay import InvestigationReplaySnapshot
 from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
@@ -32,7 +34,11 @@ from tacit.pipeline.recording import (
     surviving_datasource_names,
 )
 from tacit.pipeline.side_effects import safe_record_provenance
-from tacit.pipeline.stages.publish import publish_dashboard
+from tacit.pipeline.stages.publish import (
+    PublicationState,
+    preflight_publish_backends,
+    publish_dashboard,
+)
 
 logger = structlog.get_logger()
 _TIMING_DECIMAL_PLACES = 4
@@ -72,8 +78,22 @@ async def complete_pipeline(
     started_at: float,
 ) -> DashResponse:
     """Publish a validated dashboard and record completion/provenance."""
+    runtime_settings = deps.settings if isinstance(deps.settings, Settings) else None
+    preflight_publish_backends(backends, runtime_settings)
+    recorder.required_event(
+        "publication_commit_started",
+        {"backends": [backend.name for backend in backends]},
+    )
+    publication_state = PublicationState(commit_started=True)
     emit_progress("publish", "started", "publishing_dashboard", backends=[b.name for b in backends])
-    publish_results = await publish_dashboard(backends=backends, dashboard_spec=dashboard_spec, timings=timings)
+    publish_results = await publish_dashboard(
+        backends=backends,
+        dashboard_spec=dashboard_spec,
+        timings=timings,
+        runtime_settings=runtime_settings,
+        preserve_commit_on_cancellation=True,
+        state=publication_state,
+    )
     emit_progress(
         "publish",
         "passed",
@@ -218,22 +238,26 @@ async def complete_pipeline(
             expected_parent_revision=(base_revision if run_type == InvestigationRunType.REFRESH else None),
         )
     except Exception as exc:
-        contract_persist_error = f"{type(exc).__name__}: {exc}"
+        contract_persist_error, diagnostics = safe_failure_detail(
+            exc,
+            reason_code="contract_revision_persist_failed",
+        )
         logger.warning(
             "investigation_contract_persist_failed",
             investigation_id=recorder.investigation_id,
             dashboard_uid=effective_uid,
-            exc_info=True,
+            reason_code="contract_revision_persist_failed",
+            **diagnostics,
         )
         recorder.stage(
             "contract_persistence",
             "failed",
             "contract_revision_persist_failed",
-            error_type=type(exc).__name__,
+            **diagnostics,
         )
         recorder.event(
             "contract_persistence_failed",
-            {"error_type": type(exc).__name__, "dashboard_uid": effective_uid},
+            {**diagnostics, "dashboard_uid": effective_uid},
         )
     else:
         recorder.stage(
@@ -249,14 +273,34 @@ async def complete_pipeline(
                 investigation_id=persisted_contract.investigation.id,
                 investigation_revision=persisted_contract.investigation.revision,
             )
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "knowledge_usage_persist_failed",
                 investigation_id=recorder.investigation_id,
-                exc_info=True,
+                reason_code="knowledge_usage_persist_failed",
+                **safe_failure_diagnostics(
+                    exc,
+                    reason_code="knowledge_usage_persist_failed",
+                ),
             )
 
     refresh_persist_failed = run_type == InvestigationRunType.REFRESH and persisted_contract is None
+    cancellation_warning_code = (
+        "cancellation_after_publication_commit" if publication_state.cancellation_requested else ""
+    )
+    if publication_state.cancellation_requested:
+        recorder.event(
+            "publication_commit_cancellation_deferred",
+            {"published_backends": sorted(publish_results)},
+        )
+    run_warning_code = (
+        "contract_persistence_failed"
+        if contract_persist_error and not refresh_persist_failed
+        else cancellation_warning_code
+    )
+    run_warning_detail = (
+        contract_persist_error if contract_persist_error and not refresh_persist_failed else cancellation_warning_code
+    )
     recorder.finish(
         status="failed" if refresh_persist_failed else "success",
         dashboard_uid=effective_uid,
@@ -269,10 +313,8 @@ async def complete_pipeline(
         # with the refreshed dashboard; revision persistence updates only its
         # current_revision pointer.
         persist_record=run_type != InvestigationRunType.REFRESH,
-        run_warning_code=(
-            "contract_persistence_failed" if contract_persist_error and not refresh_persist_failed else ""
-        ),
-        run_warning_detail=(contract_persist_error if not refresh_persist_failed else ""),
+        run_warning_code=run_warning_code,
+        run_warning_detail=run_warning_detail,
     )
 
     return DashResponse(
@@ -281,6 +323,9 @@ async def complete_pipeline(
         panel_count=len(dashboard_spec.panels),
         summary=summary,
         investigation_id=recorder.investigation_id,
+        investigation_run_id=recorder.run_id or "",
+        investigation_status="failed" if refresh_persist_failed else "completed",
+        audit_status=recorder.audit_status,
         investigation_revision=(persisted_contract.investigation.revision if persisted_contract else None),
         signalfx_url=sfx_result.url,
         signalfx_dashboard_id=sfx_result.uid,

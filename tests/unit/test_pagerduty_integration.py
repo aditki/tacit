@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -53,6 +54,320 @@ def test_missing_token_raises_config_error():
     empty = Settings(pagerduty_api_token="", _env_file=None)
     with pytest.raises(PagerDutyConfigError):
         PagerDutyClient(runtime_settings=empty)
+
+
+@pytest.mark.parametrize("base_url", ["", "   ", "pagerduty.example"])
+def test_pagerduty_client_rejects_explicit_invalid_base_url_before_http_client_construction(base_url):
+    from tacit.runtime_ownership import RuntimeOwnershipError
+
+    runtime_settings = Settings(
+        _env_file=None,
+        pagerduty_api_token="test-token",
+        pagerduty_base_url="https://configured.pagerduty.example",
+    )
+
+    with patch("tacit.integrations.pagerduty.httpx.AsyncClient") as http_client:
+        with pytest.raises(RuntimeOwnershipError, match="remote endpoint is invalid"):
+            PagerDutyClient(base_url=base_url, runtime_settings=runtime_settings)
+
+    http_client.assert_not_called()
+
+
+def test_pagerduty_client_uses_configured_base_url_when_override_is_none():
+    runtime_settings = Settings(
+        _env_file=None,
+        pagerduty_api_token="test-token",
+        pagerduty_base_url="https://Configured.PagerDuty.Example:443/api/",
+    )
+
+    with patch("tacit.integrations.pagerduty.httpx.AsyncClient") as http_client:
+        client = PagerDutyClient(base_url=None, runtime_settings=runtime_settings)
+
+    assert client.base_url == "https://configured.pagerduty.example/api"
+    assert http_client.call_args.kwargs["base_url"] == client.base_url
+
+
+def test_pagerduty_client_override_is_the_effective_sole_remote_owner():
+    from tacit.runtime_ownership import credential_fingerprint
+
+    configured = Settings(
+        _env_file=None,
+        pagerduty_api_token="configured-token",
+        pagerduty_base_url="https://configured.pagerduty.example",
+    )
+
+    with patch("tacit.integrations.pagerduty.httpx.AsyncClient"):
+        client = PagerDutyClient(
+            api_token="override-token",
+            base_url="https://Override.PagerDuty.Example:443/api/",
+            runtime_settings=configured,
+        )
+
+    remote = client.runtime_ownership.remotes[0]
+    assert remote.provider == "pagerduty"
+    assert remote.endpoint == "https://override.pagerduty.example/api"
+    assert remote.credential_fingerprint == credential_fingerprint("override-token")
+    assert client.runtime_settings.pagerduty_base_url == remote.endpoint
+    assert client.runtime_settings.pagerduty_api_token == "override-token"
+
+
+def test_pagerduty_configured_and_semantically_equivalent_override_owners_are_compatible():
+    from tacit.runtime_ownership import require_compatible_runtime_ownership
+
+    effective = Settings(
+        _env_file=None,
+        pagerduty_api_token="effective-token",
+        pagerduty_base_url="https://effective.pagerduty.example/api",
+    )
+    configured = effective.model_copy(
+        deep=True,
+        update={
+            "pagerduty_api_token": "configured-token",
+            "pagerduty_base_url": "https://configured.pagerduty.example",
+        },
+    )
+
+    with patch("tacit.integrations.pagerduty.httpx.AsyncClient"):
+        configured_client = PagerDutyClient(runtime_settings=effective)
+        override_client = PagerDutyClient(
+            api_token="effective-token",
+            base_url="https://Effective.PagerDuty.Example:443/api/",
+            runtime_settings=configured,
+        )
+
+    require_compatible_runtime_ownership(
+        boundary="PagerDuty client construction",
+        descriptors=(configured_client.runtime_ownership, override_client.runtime_ownership),
+    )
+    assert configured_client.runtime_settings == override_client.runtime_settings
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "settings_update",
+    [
+        {"pagerduty_base_url": "https://other.pagerduty.example"},
+        {"pagerduty_api_token": "other-token"},
+    ],
+)
+async def test_learning_rejects_effective_pagerduty_owner_mismatch_before_remote_read(settings_update):
+    from tacit.runtime_ownership import RuntimeOwnershipMismatchError
+
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"incidents": [], "more": False})
+
+    effective = Settings(
+        _env_file=None,
+        pagerduty_api_token="effective-token",
+        pagerduty_base_url="https://effective.pagerduty.example",
+    )
+    configured = effective.model_copy(deep=True, update=settings_update)
+    async with PagerDutyClient(
+        api_token=effective.pagerduty_api_token,
+        base_url=effective.pagerduty_base_url,
+        runtime_settings=configured,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(RuntimeOwnershipMismatchError, match="runtime settings must match"):
+            await learn_pagerduty_incidents(
+                client,
+                since="2026-01-01T00:00:00Z",
+                dry_run=True,
+                runtime_settings=configured,
+            )
+
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_learning_authorizes_before_pagerduty_remote_read(dry_run):
+    class TrackingClient:
+        base_url = "https://api.pagerduty.example"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def list_incidents(self, **_kwargs):
+            self.calls += 1
+            return [], False
+
+    client: Any = TrackingClient()
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.read"):
+        await learn_pagerduty_incidents(
+            client,
+            since="2026-01-01T00:00:00Z",
+            dry_run=dry_run,
+            runtime_settings=Settings(
+                _env_file=None,
+                knowledge_permissions="knowledge.review,knowledge.apply",
+            ),
+        )
+
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_learning_validates_tenant_before_pagerduty_remote_read(dry_run):
+    class TrackingClient:
+        base_url = "https://api.pagerduty.example"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def list_incidents(self, **_kwargs):
+            self.calls += 1
+            return [], False
+
+    client: Any = TrackingClient()
+    with pytest.raises(ValueError, match="Tenant access denied"):
+        await learn_pagerduty_incidents(
+            client,
+            since="2026-01-01T00:00:00Z",
+            dry_run=dry_run,
+            tenant_id="tenant-b",
+            runtime_settings=Settings(
+                _env_file=None,
+                knowledge_tenant_id="tenant-a",
+            ),
+        )
+
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_learning_inherits_explicit_client_security_settings_before_remote_read(tmp_path, dry_run):
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"incidents": [], "more": False})
+
+    db_path = tmp_path / "restricted-pagerduty.db"
+    restricted = Settings(
+        _env_file=None,
+        pagerduty_api_token="restricted-token",
+        knowledge_permissions="knowledge.review,knowledge.apply",
+        signals_db_path=str(db_path),
+    )
+    async with PagerDutyClient(runtime_settings=restricted, transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PermissionError, match="Missing permission: knowledge.read"):
+            await learn_pagerduty_incidents(
+                client,
+                since="2026-01-01T00:00:00Z",
+                dry_run=dry_run,
+            )
+
+    assert calls == 0
+    assert not db_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_learning_rejects_split_pagerduty_runtime_settings_before_remote_read():
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"incidents": [], "more": False})
+
+    client_settings = Settings(
+        _env_file=None,
+        pagerduty_api_token="client-token",
+        knowledge_tenant_id="tenant-a",
+    )
+    learning_settings = Settings(
+        _env_file=None,
+        pagerduty_api_token="learning-token",
+        knowledge_tenant_id="tenant-b",
+    )
+    async with PagerDutyClient(runtime_settings=client_settings, transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError, match="runtime settings must match"):
+            await learn_pagerduty_incidents(
+                client,
+                since="2026-01-01T00:00:00Z",
+                dry_run=True,
+                runtime_settings=learning_settings,
+                tenant_id="tenant-b",
+            )
+
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_learning_rejects_split_pagerduty_store_settings_before_remote_read(tmp_path, dry_run):
+    from tacit.signals import SignalStore
+
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"incidents": [], "more": False})
+
+    client_settings = Settings(
+        _env_file=None,
+        pagerduty_api_token="client-token",
+        knowledge_tenant_id="tenant-a",
+    )
+    store_settings = client_settings.model_copy(update={"knowledge_tenant_id": "tenant-b"})
+    store = SignalStore(db_path=tmp_path / "pagerduty-store.db", runtime_settings=store_settings)
+    async with PagerDutyClient(runtime_settings=client_settings, transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError, match="runtime settings must match"):
+            await learn_pagerduty_incidents(
+                client,
+                since="2026-01-01T00:00:00Z",
+                dry_run=dry_run,
+                store=store,
+                tenant_id="tenant-b",
+            )
+
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_default_pagerduty_client_preserves_its_effective_settings_owner_before_remote_read(
+    monkeypatch,
+    dry_run,
+):
+    import tacit.integrations.pagerduty as pagerduty_module
+
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"incidents": [], "more": False})
+
+    global_settings = Settings(
+        _env_file=None,
+        pagerduty_api_token="global-token",
+        knowledge_tenant_id="tenant-a",
+    )
+    scoped_settings = global_settings.model_copy(update={"knowledge_tenant_id": "tenant-b"})
+    monkeypatch.setattr(pagerduty_module, "settings", global_settings)
+    async with PagerDutyClient(transport=httpx.MockTransport(handler)) as client:
+        assert client.runtime_settings.knowledge_tenant_id == "tenant-a"
+        assert client.runtime_settings.pagerduty_api_token == "global-token"
+        with pytest.raises(ValueError, match="runtime settings must match"):
+            await learn_pagerduty_incidents(
+                client,
+                since="2026-01-01T00:00:00Z",
+                dry_run=dry_run,
+                runtime_settings=scoped_settings,
+                tenant_id="tenant-b",
+            )
+
+    assert calls == 0
 
 
 @pytest.mark.asyncio
@@ -549,6 +864,53 @@ async def test_dry_run_does_not_open_signal_store(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_persisted_import_reuses_one_runtime_store_for_every_incident(monkeypatch):
+    import tacit.integrations.pagerduty as pagerduty_module
+    import tacit.runtime_stores as runtime_stores_module
+
+    runtime_settings = Settings(_env_file=None, pagerduty_api_token="runtime-token")
+    resolved_store = object()
+    store_initializations = 0
+    learned_stores: list[object] = []
+
+    class RuntimeStores:
+        def __init__(self, supplied_settings):
+            assert supplied_settings.pagerduty_api_token == runtime_settings.pagerduty_api_token
+            assert supplied_settings.knowledge_tenant_id == runtime_settings.knowledge_tenant_id
+
+        def signals(self):
+            nonlocal store_initializations
+            store_initializations += 1
+            return resolved_store
+
+    class Client:
+        base_url = "https://api.pagerduty.example"
+
+        def __init__(self):
+            self.runtime_settings = runtime_settings
+
+        async def list_incidents(self, **_kwargs):
+            return [{"id": "PD1"}, {"id": "PD2"}], False
+
+    def fake_learn_artifact(_artifact, _extractor, **kwargs):
+        learned_stores.append(kwargs["store"])
+        return {}
+
+    monkeypatch.setattr(runtime_stores_module, "RuntimeStores", RuntimeStores)
+    monkeypatch.setattr(pagerduty_module, "learn_artifact", fake_learn_artifact)
+
+    result = await learn_pagerduty_incidents(
+        Client(),  # type: ignore[arg-type]
+        since="2026-01-01T00:00:00Z",
+        runtime_settings=runtime_settings,
+    )
+
+    assert result["artifacts_learned"] == 2
+    assert store_initializations == 1
+    assert learned_stores == [resolved_store, resolved_store]
+
+
+@pytest.mark.asyncio
 async def test_learn_requires_since():
     """The history-safety contract holds for programmatic callers, not just the CLI."""
 
@@ -581,6 +943,61 @@ def test_cli_rejects_non_positive_limit():
     result = CliRunner().invoke(cli, ["learn", "pagerduty", "--since", "2026-01-01T00:00:00Z", "--limit", "0"])
     assert result.exit_code != 0
     assert "--limit" in result.output
+
+
+def test_cli_threads_active_settings_into_pagerduty_client_and_learning(monkeypatch):
+    from click.testing import CliRunner
+
+    from tacit.cli import cli
+
+    runtime_settings = Settings(
+        _env_file=None,
+        pagerduty_api_token="runtime-token",
+        pagerduty_base_url="https://runtime.pagerduty.example",
+    )
+    seen: dict[str, Any] = {}
+
+    class RuntimeStores:
+        settings = runtime_settings
+
+        def signals(self):  # pragma: no cover - dry run must not construct storage
+            raise AssertionError("dry-run should not open the signal store")
+
+    class TrackingClient:
+        def __init__(self, *, runtime_settings=None):
+            seen["client_settings"] = runtime_settings
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    async def fake_learning(_client, **kwargs):
+        seen["learning_settings"] = kwargs["runtime_settings"]
+        return {
+            "artifact_type": "incident",
+            "dry_run": True,
+            "artifacts_discovered": 0,
+            "artifacts_learned": 0,
+            "learned": [],
+            "summary": {"artifact_type": "incident", "learned": 0},
+        }
+
+    monkeypatch.setattr("tacit.cli._cli_runtime_stores", RuntimeStores)
+    monkeypatch.setattr("tacit.integrations.pagerduty.PagerDutyClient", TrackingClient)
+    monkeypatch.setattr("tacit.integrations.pagerduty.learn_pagerduty_incidents", fake_learning)
+
+    result = CliRunner().invoke(
+        cli,
+        ["learn", "pagerduty", "--since", "2026-01-01T00:00:00Z", "--dry-run"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == {
+        "client_settings": runtime_settings,
+        "learning_settings": runtime_settings,
+    }
 
 
 def test_cli_exits_nonzero_on_failure(monkeypatch):

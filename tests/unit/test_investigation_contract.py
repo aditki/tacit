@@ -8,7 +8,7 @@ import threading
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from structlog.testing import capture_logs
 
 from tacit import __version__
 from tacit.agents.providers.base import TokenUsage
@@ -28,6 +29,7 @@ from tacit.api.dependencies import (
 from tacit.backends.base import PublishResult
 from tacit.config import Settings
 from tacit.dependencies import PipelineDependencies
+from tacit.errors import PipelineExecutionError
 from tacit.grounding_benchmark import (
     _contract_for_case,
     load_grounding_corpus,
@@ -48,6 +50,7 @@ from tacit.investigation_contract import (
     InvestigationContract,
     InvestigationContractAssembler,
     InvestigationRunType,
+    KnowledgeCandidateStatus,
     ProvenanceRecord,
     load_investigation_contract_schema,
     stamp_fingerprints,
@@ -82,6 +85,7 @@ from tacit.models.schemas import (
 from tacit.pipeline.completion import complete_pipeline
 from tacit.pipeline.recording import PipelineRecorder
 from tacit.pipeline.runner import _applied_stage_knowledge_refs
+from tacit.runtime_ownership import runtime_descriptor_from_settings
 
 
 def _draft_contract(
@@ -434,7 +438,14 @@ def test_chart_route_uses_configured_tenant_when_request_omits_it(monkeypatch):
     import tacit.api.routes.dashboard as dashboard_routes
 
     monkeypatch.setattr(dashboard_routes, "run_pipeline", fake_run_pipeline)
-    app = create_app(runtime_settings=SimpleNamespace(api_auth_enabled=False, knowledge_tenant_id="tenant-a"))
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            api_auth_enabled=False,
+            knowledge_tenant_id="tenant-a",
+            knowledge_permissions="knowledge.read,knowledge.apply",
+        )
+    )
     app.dependency_overrides[get_pipeline_dependencies] = lambda: SimpleNamespace(
         settings=SimpleNamespace(knowledge_tenant_id="tenant-a")
     )
@@ -465,7 +476,8 @@ def test_chart_route_requires_header_tenant_for_wildcard_configuration(monkeypat
 
     monkeypatch.setattr(dashboard_routes, "run_pipeline", fake_run_pipeline)
     app = create_app(
-        runtime_settings=SimpleNamespace(
+        runtime_settings=Settings(
+            _env_file=None,
             api_auth_enabled=True,
             api_auth_key="",
             knowledge_tenant_id="*",
@@ -473,6 +485,7 @@ def test_chart_route_requires_header_tenant_for_wildcard_configuration(monkeypat
                 "tenant-a": "tenant-a-secret",
                 "tenant-b": "tenant-b-secret",
             },
+            knowledge_permissions="knowledge.read,knowledge.apply",
         )
     )
     app.dependency_overrides[get_pipeline_dependencies] = lambda: SimpleNamespace(
@@ -516,6 +529,7 @@ async def test_direct_pipeline_rejects_configured_tenant_mismatch(monkeypatch):
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_tenant_id="tenant-a",
+            knowledge_permissions="knowledge.read,knowledge.apply",
         ),
         backend_factory=lambda: [],
         history_store_factory=lambda: object(),
@@ -545,6 +559,7 @@ async def test_direct_pipeline_resolves_pinned_tenant_before_inner_pipeline(monk
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_tenant_id="tenant-a",
+            knowledge_permissions="knowledge.read,knowledge.apply",
         ),
         backend_factory=lambda: [],
         history_store_factory=lambda: object(),
@@ -585,6 +600,7 @@ async def test_non_default_pipeline_rejects_tenant_blind_history_store(
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_tenant_id=configured_tenant,
+            knowledge_permissions="knowledge.read,knowledge.apply",
         ),
         backend_factory=lambda: [],
         history_store_factory=lambda: history,
@@ -618,6 +634,7 @@ async def test_direct_pipeline_requires_tenant_for_wildcard_configuration(monkey
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_tenant_id="*",
+            knowledge_permissions="knowledge.read,knowledge.apply",
         ),
         backend_factory=lambda: [],
         history_store_factory=lambda: object(),
@@ -649,6 +666,7 @@ async def test_direct_pipeline_rejects_invalid_wildcard_tenants(monkeypatch, ten
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_tenant_id="*",
+            knowledge_permissions="knowledge.read,knowledge.apply",
         ),
         backend_factory=lambda: [],
         history_store_factory=lambda: object(),
@@ -1207,18 +1225,22 @@ def test_replay_rebuild_failure_closes_the_run(tmp_path, monkeypatch):
     draft = _draft_contract(investigation_id)
     store.persist_contract_revision(draft, snapshot=_snapshot_for(draft))
 
+    sensitive_detail = "api_key=replay-secret path=/private/replay-snapshot.json"
+
     def fail_rebuild(*args, **kwargs):
-        raise ValueError("snapshot is incompatible with the current assembler")
+        raise ValueError(sensitive_detail)
 
     monkeypatch.setattr("tacit.history.rebuild_contract", fail_rebuild)
 
-    with pytest.raises(ValueError, match="snapshot is incompatible"):
+    with pytest.raises(ValueError, match="replay-secret"):
         store.replay_contract(investigation_id, mode=ReplayMode.EXACT)
 
     replay_run = store.list_runs(investigation_id)[-1]
     assert replay_run["status"] == "failed"
     assert replay_run["error_code"] == "replay_failed"
-    assert "ValueError: snapshot is incompatible" in replay_run["error_detail"]
+    assert replay_run["error_detail"].startswith("replay_failed;error_type=ValueError;")
+    assert "failure_fingerprint=" in replay_run["error_detail"]
+    assert sensitive_detail not in replay_run["error_detail"]
     assert store.list_events(investigation_id, replay_run["run_id"])[-1]["event_type"] == "run_failed"
 
 
@@ -1686,7 +1708,10 @@ def test_current_engine_replay_builds_default_knowledge_service_from_store_setti
 
     assert replayed is not None
     assert replayed.request.scope.tenant_id == "tenant-a"
-    assert seen_settings == [runtime_settings]
+    assert len(seen_settings) == 1
+    assert seen_settings[0].knowledge_tenant_id == runtime_settings.knowledge_tenant_id
+    assert seen_settings[0].signals_db_path == runtime_settings.signals_db_path
+    assert seen_settings[0].history_db_path == str((tmp_path / "history.db").resolve())
 
 
 def test_current_engine_replay_succeeds_when_usage_persistence_fails(tmp_path, monkeypatch):
@@ -1749,7 +1774,7 @@ def test_current_engine_replay_succeeds_when_usage_persistence_fails(tmp_path, m
 def test_current_engine_replay_requires_concrete_tenant_in_wildcard_mode(tmp_path):
     store = InvestigationStore(
         db_path=tmp_path / "history.db",
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
     )
     investigation_id = store.start("Why did checkout latency increase?", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
@@ -1985,6 +2010,54 @@ def test_candidate_application_rolls_back_revision_if_candidate_transition_fails
     assert corrected is not None
     assert corrected.investigation.revision == 2
     assert store.apply_knowledge_candidate(investigation_id, candidate.id) == corrected
+
+
+def test_candidate_expiring_while_waiting_for_writer_lock_cannot_apply(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    db_path = tmp_path / "history.db"
+    store = InvestigationStore(db_path=db_path)
+    investigation_id = store.start("Why did checkout latency increase?")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    candidate = store.create_knowledge_candidate(
+        investigation_id,
+        revision=1,
+        correction_text="Cache was saturated.",
+        expires_at=datetime.now(UTC) + timedelta(seconds=0.5),
+    )
+    assert candidate is not None
+    store.review_knowledge_candidate(
+        investigation_id,
+        candidate.id,
+        approved=True,
+        reviewed_by="reviewer",
+    )
+    reached_revision_persist = threading.Event()
+    original_persist = store.persist_contract_revision
+
+    def observed_persist(*args, **kwargs):
+        reached_revision_persist.set()
+        return original_persist(*args, **kwargs)
+
+    monkeypatch.setattr(store, "persist_contract_revision", observed_persist)
+    blocker = sqlite3.connect(db_path, timeout=10)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(store.apply_knowledge_candidate, investigation_id, candidate.id)
+            assert reached_revision_persist.wait(timeout=2)
+            time.sleep(0.7)
+            blocker.rollback()
+            assert future.result(timeout=10) is None
+    finally:
+        blocker.close()
+
+    assert [row["revision"] for row in store.list_revisions(investigation_id)] == [1]
+    assert store.get(investigation_id)["current_revision"] == 1
+    stored = store.list_knowledge_candidates(investigation_id)[0]
+    assert stored.status == KnowledgeCandidateStatus.APPROVED
+    assert stored.applied_revision is None
 
 
 def test_expiry_does_not_overwrite_applied_or_rejected_candidate_states(tmp_path):
@@ -2289,12 +2362,40 @@ def test_history_audit_routes_keyset_page_newest_records_without_caps(tmp_path):
             )
             for value in row
         )
+        lease_plan = " ".join(
+            str(value)
+            for row in conn.execute(
+                """EXPLAIN QUERY PLAN SELECT run_id FROM investigation_runs
+                    WHERE investigation_id=? AND status='running'
+                      AND lease_expires_at>0 AND lease_expires_at<=?
+                    ORDER BY lease_expires_at, run_id LIMIT 20""",
+                (investigation_id, time.time()),
+            )
+            for value in row
+        )
     assert "idx_inv_runs_page" in run_plan
     assert "idx_inv_events_page" in event_plan
+    assert "idx_inv_runs_investigation_active_lease" in lease_plan
+    assert "USE TEMP B-TREE" not in lease_plan
 
     app = create_app(runtime_settings=runtime_settings)
     app.dependency_overrides[get_history_store] = lambda: store
     client = TestClient(app)
+    assert client.get("/api/v1/investigations", params={"offset": 10_001}).status_code == 422
+    assert (
+        client.get(
+            f"/api/v1/investigations/{investigation_id}/runs",
+            params={"offset": 10_001},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.get(
+            f"/api/v1/investigations/{investigation_id}/events",
+            params={"offset": 10_001},
+        ).status_code
+        == 422
+    )
 
     def collect(
         path: str,
@@ -2362,6 +2463,93 @@ def test_history_audit_routes_keyset_page_newest_records_without_caps(tmp_path):
     assert malformed.status_code == 400
 
 
+def test_history_keyset_pages_round_trip_every_schema_legal_integer_and_empty_id(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history-legal-keys.db")
+    investigation_id = store.start("Legal key history")
+    contract_json = _draft_contract(investigation_id).model_dump_json(by_alias=True)
+    minimum_integer = -(2**63)
+    maximum_integer = 2**63 - 1
+
+    with store._conn() as conn:
+        conn.executemany(
+            """INSERT INTO investigation_revisions(
+                   investigation_id, revision, parent_revision, schema_version,
+                   contract_json, input_fingerprint, output_fingerprint,
+                   engine_version, created_at, reason
+               ) VALUES (?, ?, NULL, '1.0', ?, 'input', 'output', 'test', ?, 'fixture')""",
+            [
+                (investigation_id, maximum_integer, contract_json, 3.0),
+                (investigation_id, 0, contract_json, 2.0),
+                (investigation_id, minimum_integer, contract_json, 1.0),
+            ],
+        )
+        conn.executemany(
+            """INSERT INTO investigation_runs(
+                   run_id, investigation_id, base_revision, run_type, status,
+                   started_at, runtime_manifest_json
+               ) VALUES (?, ?, NULL, 'refresh', 'completed', ?, '{}')""",
+            [
+                ("run-high", investigation_id, 3.0),
+                ("", investigation_id, 2.0),
+                ("run-low", investigation_id, 1.0),
+                ("event-run", investigation_id, 0.0),
+            ],
+        )
+        conn.executemany(
+            """INSERT INTO investigation_events(
+                   event_id, investigation_id, run_id, sequence, event_type,
+                   payload_json, created_at
+               ) VALUES (?, ?, 'event-run', ?, 'fixture', '{}', 1.0)""",
+            [
+                ("event-high", investigation_id, maximum_integer),
+                ("", investigation_id, 0),
+                ("event-low", investigation_id, minimum_integer),
+            ],
+        )
+
+    def collect(page_loader, identity: str) -> list[object]:
+        values: list[object] = []
+        cursor = None
+        while True:
+            page = page_loader(cursor)
+            values.extend(item[identity] for item in page.items)
+            if not page.has_more:
+                assert page.next_cursor is None
+                return values
+            assert page.next_cursor is not None
+            cursor = page.next_cursor
+
+    assert collect(
+        lambda cursor: store.list_revisions_page(investigation_id, limit=1, cursor=cursor),
+        "revision",
+    ) == [maximum_integer, 0, minimum_integer]
+    assert collect(
+        lambda cursor: store.list_runs_page(investigation_id, limit=1, cursor=cursor),
+        "run_id",
+    ) == ["run-high", "", "run-low", "event-run"]
+    assert collect(
+        lambda cursor: store.list_events_page(
+            investigation_id,
+            "event-run",
+            limit=1,
+            cursor=cursor,
+        ),
+        "sequence",
+    ) == [maximum_integer, 0, minimum_integer]
+    assert collect(
+        lambda cursor: store.list_events_page(investigation_id, limit=1, cursor=cursor),
+        "event_id",
+    ) == ["event-high", "", "event-low"]
+
+    for loader in (
+        lambda: store.list_revisions_page(investigation_id, cursor=""),
+        lambda: store.list_runs_page(investigation_id, cursor=""),
+        lambda: store.list_events_page(investigation_id, cursor=""),
+    ):
+        with pytest.raises(ValueError, match="invalid .*cursor"):
+            loader()
+
+
 def test_failed_knowledge_audit_guard_includes_applied_ranking_usage():
     usage = [
         KnowledgeUsage(
@@ -2426,7 +2614,7 @@ async def test_failed_refresh_does_not_overwrite_current_investigation_row(tmp_p
 async def test_direct_refresh_rejects_a_cross_tenant_investigation_before_starting_a_run(tmp_path):
     store = InvestigationStore(
         db_path=tmp_path / "history.db",
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
     )
     investigation_id = store.start("Tenant B investigation", tenant_id="tenant-b")
     draft = _draft_contract(investigation_id)
@@ -2549,19 +2737,67 @@ async def test_direct_refresh_authorizes_before_history_or_backend_access(
     assert accessed == []
 
 
+@pytest.mark.parametrize(
+    ("permissions", "missing_permission"),
+    [
+        ("knowledge.apply", "knowledge.read"),
+        ("knowledge.read", "knowledge.apply"),
+    ],
+)
+async def test_direct_initial_pipeline_authorizes_before_history_or_backend_access(
+    permissions,
+    missing_permission,
+):
+    accessed: list[str] = []
+
+    def history_store_factory():
+        accessed.append("history")
+        raise AssertionError("history must not be opened before authorization")
+
+    def backend_factory():
+        accessed.append("backend")
+        raise AssertionError("backends must not be opened before authorization")
+
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_permissions=permissions,
+            knowledge_tenant_id="default",
+        ),
+        backend_factory=backend_factory,
+        history_store_factory=history_store_factory,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    with pytest.raises(PermissionError, match=f"Missing permission: {missing_permission}"):
+        await run_pipeline(DashRequest(prompt="Investigate checkout"), deps)
+
+    assert accessed == []
+
+
 async def test_backend_factory_failure_completes_the_pipeline_run(tmp_path):
     store = InvestigationStore(db_path=tmp_path / "history.db")
     resources_closed = False
+    sensitive_detail = "api_key=backend-secret path=/private/runtime/backend.json"
 
     def failing_backend_factory():
-        raise RuntimeError("backend configuration is invalid")
+        raise RuntimeError(sensitive_detail)
 
     async def close_resources():
         nonlocal resources_closed
         resources_closed = True
 
     deps = PipelineDependencies(
-        settings=SimpleNamespace(pipeline_max_concurrent=1, pipeline_timeout_seconds=5),
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_permissions="knowledge.read,knowledge.apply",
+        ),
         backend_factory=failing_backend_factory,
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -2572,16 +2808,528 @@ async def test_backend_factory_failure_completes_the_pipeline_run(tmp_path):
 
     from tacit.pipeline import run_pipeline
 
-    with pytest.raises(RuntimeError, match="backend configuration is invalid"):
-        await run_pipeline(DashRequest(prompt="Investigate checkout", user_id="api"), deps)
+    with capture_logs() as logs:
+        with pytest.raises(PipelineExecutionError, match="Dashboard backend initialization failed") as exc_info:
+            await run_pipeline(DashRequest(prompt="Investigate checkout", user_id="api"), deps)
 
     investigation = store.list_recent()[0]
     run = store.list_runs(investigation["id"])[0]
     assert investigation["status"] == "failed"
     assert run["status"] == "failed"
     assert run["error_code"] == "pipeline_failed"
-    assert "backend configuration is invalid" in run["error_detail"]
+    assert "backend_construction_failed" in run["error_detail"]
+    assert "error_type=RuntimeError" in run["error_detail"]
+    assert "failure_fingerprint=" in run["error_detail"]
+    assert sensitive_detail not in run["error_detail"]
+    assert sensitive_detail not in str(exc_info.value)
+    assert sensitive_detail not in json.dumps(logs, default=str)
+    assert exc_info.value.investigation_id == investigation["id"]
+    assert exc_info.value.investigation_run_id == run["run_id"]
+    assert exc_info.value.audit_status == "run_completed"
     assert resources_closed is True
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_status"),
+    [
+        ("/api/v1/chart", 500),
+        ("/api/v1/chart/stream", 200),
+    ],
+    ids=["rest", "sse"],
+)
+def test_chart_routes_do_not_traceback_log_hidden_pipeline_causes(
+    path,
+    expected_status,
+    monkeypatch,
+):
+    runtime_settings = Settings(_env_file=None)
+    deps = PipelineDependencies(
+        settings=runtime_settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+    sensitive_detail = "api_key=route-secret path=/private/pipeline.json"
+
+    async def fail_pipeline(*_args, **_kwargs):
+        try:
+            raise RuntimeError(sensitive_detail)
+        except RuntimeError as cause:
+            raise PipelineExecutionError(
+                "Dashboard pipeline failed",
+                investigation_id="inv-safe-error",
+                investigation_run_id="run-safe-error",
+                audit_status="run_completed",
+            ) from cause
+
+    monkeypatch.setattr("tacit.api.routes.dashboard.run_pipeline", fail_pipeline)
+    app = create_app(runtime_settings=runtime_settings)
+    app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
+
+    with capture_logs() as logs:
+        response = TestClient(app).post(path, json={"prompt": "Investigate checkout"})
+
+    assert response.status_code == expected_status
+    assert sensitive_detail not in json.dumps(logs, default=str)
+    assert "exc_info" not in json.dumps(logs, default=str)
+    if path.endswith("/stream"):
+        assert "event: error" in response.text
+        assert "run-safe-error" in response.text
+    else:
+        assert response.json()["investigation_run_id"] == "run-safe-error"
+
+
+async def test_run_start_failure_fails_closed_with_explicit_audit_state(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    resources_closed = False
+    backends_created = False
+
+    sensitive_detail = "token=run-secret path=/private/runtime/history.db"
+
+    def fail_start_run(*_args, **_kwargs):
+        raise sqlite3.OperationalError(sensitive_detail)
+
+    def backend_factory():
+        nonlocal backends_created
+        backends_created = True
+        return []
+
+    async def close_resources():
+        nonlocal resources_closed
+        resources_closed = True
+
+    monkeypatch.setattr(store, "start_run", fail_start_run)
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_permissions="knowledge.read,knowledge.apply",
+        ),
+        backend_factory=backend_factory,
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+        resource_cleanup=close_resources,
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    with capture_logs() as logs:
+        with pytest.raises(PipelineExecutionError, match="run audit could not be started") as exc_info:
+            await run_pipeline(DashRequest(prompt="Investigate checkout", user_id="api"), deps)
+
+    investigation = store.list_recent()[0]
+    assert exc_info.value.investigation_id == investigation["id"]
+    assert exc_info.value.investigation_run_id == ""
+    assert exc_info.value.audit_status == "run_unavailable"
+    assert investigation["status"] == "failed"
+    assert "investigation_run_start_failed" in investigation["error"]
+    assert "error_type=OperationalError" in investigation["error"]
+    assert sensitive_detail not in investigation["error"]
+    assert sensitive_detail not in json.dumps(logs, default=str)
+    assert all("exc_info" not in entry for entry in logs)
+    assert store.list_runs(investigation["id"]) == []
+    assert backends_created is False
+    assert resources_closed is True
+
+
+async def test_history_store_initialization_failure_has_explicit_unavailable_audit_state():
+    resources_closed = False
+
+    def fail_history_store():
+        raise sqlite3.OperationalError("history schema unavailable")
+
+    async def close_resources():
+        nonlocal resources_closed
+        resources_closed = True
+
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_permissions="knowledge.read,knowledge.apply",
+            knowledge_tenant_id="default",
+        ),
+        backend_factory=lambda: [],
+        history_store_factory=fail_history_store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+        resource_cleanup=close_resources,
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    with pytest.raises(PipelineExecutionError, match="audit storage is unavailable") as exc_info:
+        await run_pipeline(DashRequest(prompt="Investigate checkout", user_id="api"), deps)
+
+    assert exc_info.value.investigation_id == ""
+    assert exc_info.value.investigation_run_id == ""
+    assert exc_info.value.audit_status == "run_unavailable"
+    assert resources_closed is True
+
+
+async def test_existing_investigation_lookup_failure_has_explicit_unavailable_audit_state(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    resources_closed = False
+    backends_created = False
+
+    def fail_contract_lookup(*_args, **_kwargs):
+        raise sqlite3.OperationalError("history lookup unavailable")
+
+    def backend_factory():
+        nonlocal backends_created
+        backends_created = True
+        return []
+
+    async def close_resources():
+        nonlocal resources_closed
+        resources_closed = True
+
+    monkeypatch.setattr(store, "get_contract", fail_contract_lookup)
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_permissions="knowledge.read,knowledge.apply",
+            knowledge_tenant_id="default",
+        ),
+        backend_factory=backend_factory,
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+        resource_cleanup=close_resources,
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    with pytest.raises(PipelineExecutionError, match="audit storage is unavailable") as exc_info:
+        await run_pipeline(
+            DashRequest(prompt="Refresh checkout", tenant_id="default"),
+            deps,
+            investigation_id="inv-known",
+            run_type=InvestigationRunType.REFRESH,
+        )
+
+    assert exc_info.value.investigation_id == "inv-known"
+    assert exc_info.value.audit_status == "run_unavailable"
+    assert backends_created is False
+    assert resources_closed is True
+
+
+async def test_initial_history_write_failure_has_explicit_unavailable_audit_state():
+    resources_closed = False
+
+    class FailingHistory:
+        def start(self, _prompt, _user_id, _channel_id, *, tenant_id):
+            raise sqlite3.OperationalError("history write unavailable")
+
+    async def close_resources():
+        nonlocal resources_closed
+        resources_closed = True
+
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_permissions="knowledge.read,knowledge.apply",
+            knowledge_tenant_id="default",
+        ),
+        backend_factory=lambda: [],
+        history_store_factory=FailingHistory,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+        resource_cleanup=close_resources,
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    with pytest.raises(PipelineExecutionError, match="audit storage is unavailable") as exc_info:
+        await run_pipeline(DashRequest(prompt="Investigate checkout"), deps)
+
+    assert exc_info.value.investigation_id == ""
+    assert exc_info.value.audit_status == "run_unavailable"
+    assert resources_closed is True
+
+
+async def test_terminal_audit_failure_is_disclosed_and_expired_run_is_recovered(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    complete_run = store.complete_run
+
+    def fail_complete_run(*_args, **_kwargs):
+        raise sqlite3.OperationalError("terminal audit unavailable")
+
+    monkeypatch.setattr(store, "complete_run", fail_complete_run)
+    deps = PipelineDependencies(
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_permissions="knowledge.read,knowledge.apply",
+            knowledge_tenant_id="default",
+        ),
+        backend_factory=lambda: (_ for _ in ()).throw(RuntimeError("backend failed")),
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    from tacit.pipeline import run_pipeline
+
+    with pytest.raises(PipelineExecutionError) as exc_info:
+        await run_pipeline(DashRequest(prompt="Investigate checkout", user_id="api"), deps)
+
+    assert exc_info.value.audit_status == "run_terminal_write_failed"
+    investigation_id = exc_info.value.investigation_id
+    run_id = exc_info.value.investigation_run_id
+    monkeypatch.setattr(store, "complete_run", complete_run)
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE investigation_runs SET lease_expires_at=? WHERE run_id=?",
+            (time.time() - 1, run_id),
+        )
+
+    run = store.list_runs(investigation_id)[0]
+    assert run["status"] == "failed"
+    assert run["error_code"] == "audit_lease_expired"
+    assert store.list_events(investigation_id, run_id)[-1]["event_type"] == "run_failed"
+
+
+def test_atomic_terminal_failure_leaves_both_rows_recoverable_by_event_read(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Investigate checkout", user_id="api")
+    run_id = store.start_run(
+        investigation_id,
+        run_type=InvestigationRunType.INITIAL,
+        lease_seconds=60,
+    )
+    finish_in_transaction = store._finish_in_transaction
+
+    def fail_investigation_finish(*_args, **_kwargs):
+        raise sqlite3.OperationalError("legacy row unavailable")
+
+    monkeypatch.setattr(store, "_finish_in_transaction", fail_investigation_finish)
+    recorder = PipelineRecorder(store, investigation_id, run_id=run_id, tenant_id="default")
+
+    assert recorder.finish(status="failed", error="backend failed") == "run_terminal_write_failed"
+    assert store.get(investigation_id)["status"] == "running"
+    assert store.list_runs(investigation_id)[0]["status"] == "running"
+
+    monkeypatch.setattr(store, "_finish_in_transaction", finish_in_transaction)
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE investigation_runs SET lease_expires_at=? WHERE run_id=?",
+            (time.time() - 1, run_id),
+        )
+
+    events = store.list_events(investigation_id, run_id)
+    assert events[-1]["event_type"] == "run_failed"
+    assert store.get(investigation_id)["status"] == "failed"
+    assert store.list_runs(investigation_id)[0]["status"] == "failed"
+
+
+def test_expired_run_cannot_persist_an_authoritative_revision_before_recovery(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Investigate checkout", user_id="api")
+    run_id = store.start_run(
+        investigation_id,
+        run_type=InvestigationRunType.INITIAL,
+        lease_seconds=60,
+    )
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE investigation_runs SET lease_expires_at=? WHERE run_id=?",
+            (time.time() - 1, run_id),
+        )
+
+    with pytest.raises(StaleRevisionError, match="lease has expired"):
+        store.persist_contract_revision(_draft_contract(investigation_id), run_id=run_id)
+
+    assert store.list_revisions(investigation_id) == []
+
+
+def test_run_expiring_while_waiting_for_writer_lock_cannot_persist_revision(tmp_path):
+    db_path = tmp_path / "history.db"
+    store = InvestigationStore(db_path=db_path)
+    investigation_id = store.start("Investigate checkout", user_id="api")
+    run_id = store.start_run(
+        investigation_id,
+        run_type=InvestigationRunType.INITIAL,
+        lease_seconds=1,
+    )
+
+    blocker = sqlite3.connect(db_path, timeout=10)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                store.persist_contract_revision,
+                _draft_contract(investigation_id),
+                run_id=run_id,
+            )
+            time.sleep(1.2)
+            blocker.rollback()
+            with pytest.raises(StaleRevisionError, match="lease has expired"):
+                future.result(timeout=10)
+    finally:
+        blocker.close()
+
+    assert store.list_revisions(investigation_id) == []
+    assert store.get(investigation_id)["current_revision"] == 0
+
+
+def test_run_lease_starts_after_waiting_for_writer_lock(tmp_path):
+    db_path = tmp_path / "history.db"
+    store = InvestigationStore(db_path=db_path)
+    investigation_id = store.start("Investigate checkout", user_id="api")
+
+    blocker = sqlite3.connect(db_path, timeout=10)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                store.start_run,
+                investigation_id,
+                run_type=InvestigationRunType.INITIAL,
+                lease_seconds=2,
+            )
+            time.sleep(2.2)
+            blocker.rollback()
+            run_id = future.result(timeout=10)
+    finally:
+        blocker.close()
+
+    run = store.list_runs(investigation_id)[0]
+    assert run["run_id"] == run_id
+    assert run["lease_expires_at"] > time.time()
+    assert run["lease_expires_at"] - run["started_at"] == pytest.approx(2.0)
+    store.append_event(investigation_id, run_id, "post_lock_stage")
+
+
+def test_expired_run_cannot_complete_or_update_the_investigation_before_recovery(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Investigate checkout", user_id="api")
+    run_id = store.start_run(
+        investigation_id,
+        run_type=InvestigationRunType.INITIAL,
+        lease_seconds=60,
+    )
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE investigation_runs SET lease_expires_at=? WHERE run_id=?",
+            (time.time() - 1, run_id),
+        )
+
+    with pytest.raises(RuntimeError, match="lease has expired"):
+        store.complete_run(
+            run_id,
+            status="completed",
+            investigation_result={
+                "status": "success",
+                "dashboard_uid": "late-dashboard",
+                "dashboard_url": "https://example.test/late-dashboard",
+            },
+        )
+
+    with store._conn() as conn:
+        investigation = conn.execute(
+            "SELECT status, dashboard_uid FROM investigations WHERE id=?",
+            (investigation_id,),
+        ).fetchone()
+        run = conn.execute(
+            "SELECT status, completed_at FROM investigation_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        terminal_events = conn.execute(
+            "SELECT COUNT(*) FROM investigation_events WHERE run_id=? AND event_type!='run_started'",
+            (run_id,),
+        ).fetchone()[0]
+
+    assert investigation is not None
+    assert investigation["status"] == "running"
+    assert investigation["dashboard_uid"] == ""
+    assert run is not None
+    assert run["status"] == "running"
+    assert run["completed_at"] is None
+    assert terminal_events == 0
+
+
+def test_targeted_event_read_recovers_expired_run_beyond_general_batch(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Investigate checkout", user_id="api")
+    expired_at = time.time() - 1_000
+    rows = [
+        (
+            f"expired-{index:04d}",
+            investigation_id,
+            InvestigationRunType.REFRESH.value,
+            "running",
+            expired_at + index,
+            expired_at + index,
+        )
+        for index in range(501)
+    ]
+    with store._conn() as conn:
+        conn.executemany(
+            """INSERT INTO investigation_runs (
+                   run_id, investigation_id, run_type, status, started_at, lease_expires_at
+               ) VALUES (?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+    target_run_id = rows[-1][0]
+    events = store.list_events(investigation_id, target_run_id)
+
+    assert events[-1]["event_type"] == "run_failed"
+    with store._conn() as conn:
+        target = conn.execute(
+            "SELECT status, error_code FROM investigation_runs WHERE run_id=?",
+            (target_run_id,),
+        ).fetchone()
+        unrecovered = conn.execute(
+            "SELECT COUNT(*) FROM investigation_runs WHERE investigation_id=? AND status='running'",
+            (investigation_id,),
+        ).fetchone()[0]
+    assert target is not None
+    assert target["status"] == "failed"
+    assert target["error_code"] == "audit_lease_expired"
+    assert unrecovered == 500
+
+
+def test_public_events_cannot_follow_terminal_or_expired_runs(tmp_path):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Investigate checkout", user_id="api")
+    completed_run = store.start_run(
+        investigation_id,
+        run_type=InvestigationRunType.REFRESH,
+        lease_seconds=60,
+    )
+    store.complete_run(completed_run, status="completed")
+
+    with pytest.raises(RuntimeError, match="not active"):
+        store.append_event(investigation_id, completed_run, "late_stage")
+
+    expired_run = store.start_run(
+        investigation_id,
+        run_type=InvestigationRunType.REFRESH,
+        lease_seconds=60,
+    )
+    with store._conn() as conn:
+        conn.execute(
+            "UPDATE investigation_runs SET lease_expires_at=? WHERE run_id=?",
+            (time.time() - 1, expired_run),
+        )
+
+    with pytest.raises(RuntimeError, match="not active"):
+        store.append_event(investigation_id, expired_run, "late_stage")
+
+    completed_events = store.list_events(investigation_id, completed_run)
+    assert [event["event_type"] for event in completed_events] == ["run_started", "run_completed"]
 
 
 async def test_caller_cancellation_records_cancelled_not_timeout(tmp_path, monkeypatch):
@@ -2601,7 +3349,11 @@ async def test_caller_cancellation_records_cancelled_not_timeout(tmp_path, monke
     monkeypatch.setattr("tacit.pipeline.classify_intent", waiting_classify)
     store = InvestigationStore(db_path=tmp_path / "history.db")
     deps = PipelineDependencies(
-        settings=SimpleNamespace(pipeline_max_concurrent=1, pipeline_timeout_seconds=5),
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=5,
+            knowledge_permissions="knowledge.read,knowledge.apply",
+        ),
         backend_factory=lambda: [WaitingBackend()],
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -2628,6 +3380,114 @@ async def test_caller_cancellation_records_cancelled_not_timeout(tmp_path, monke
     assert store.stats()["timed_out"] == 0
 
 
+async def test_cancellation_after_publication_commit_finishes_authoritative_audit(tmp_path):
+    runtime_settings = Settings(_env_file=None)
+    owner = runtime_descriptor_from_settings(
+        runtime_settings,
+        component="publication_commit_test_backend",
+    )
+    second_started = asyncio.Event()
+    release_second = asyncio.Event()
+
+    class FirstBackend:
+        name = "grafana"
+        query_language = "promql"
+        runtime_ownership = owner
+        publish_calls = 0
+
+        async def publish(self, dashboard_spec):
+            self.publish_calls += 1
+            return PublishResult(
+                url="http://grafana/committed",
+                uid="committed-grafana",
+                backend_name=self.name,
+            )
+
+    class SecondBackend:
+        name = "signalfx"
+        query_language = "signalflow"
+        runtime_ownership = owner
+        publish_calls = 0
+
+        async def publish(self, dashboard_spec):
+            self.publish_calls += 1
+            second_started.set()
+            await release_second.wait()
+            return PublishResult(
+                url="http://signalfx/committed",
+                uid="committed-signalfx",
+                backend_name=self.name,
+            )
+
+    class FeedbackStore:
+        def record_provenance(self, **kwargs):
+            return None
+
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Investigate checkout", user_id="api")
+    run_id = store.start_run(investigation_id, run_type=InvestigationRunType.INITIAL)
+    recorder = PipelineRecorder(
+        store,
+        investigation_id,
+        run_id=run_id,
+        tenant_id="default",
+    )
+    dashboard = DashboardSpec(
+        title="Committed dashboard",
+        panels=[PanelSpec(title="Traffic", queries=[PanelQuery(expr="up", datasource_uid="prom")])],
+    )
+    deps = PipelineDependencies(
+        settings=runtime_settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: store,
+        feedback_store_factory=FeedbackStore,
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+    first = FirstBackend()
+    second = SecondBackend()
+    task = asyncio.create_task(
+        complete_pipeline(
+            request=DashRequest(prompt="Investigate checkout", user_id="api"),
+            deps=deps,
+            backends=[first, second],
+            dashboard_spec=dashboard,
+            intent=Intent(summary="checkout", domain="application", services=["checkout"]),
+            metric_catalog=[],
+            datasource_catalog=[],
+            ranked_archetypes_present=False,
+            validation_warnings=[],
+            panels_before=1,
+            evidence_requirements=[],
+            evidence_resolutions=[],
+            evidence_observations=[],
+            culprit_ranking=CulpritRanking(),
+            timings={},
+            recorder=recorder,
+            token_usage=TokenUsage(),
+            started_at=time.monotonic(),
+        )
+    )
+    await second_started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0)
+    release_second.set()
+    response = await task
+
+    persisted = store.get_contract(investigation_id)
+    run = store.list_runs(investigation_id)[0]
+    events = store.list_events(investigation_id, run_id)
+    assert response.investigation_revision == 1
+    assert persisted is not None
+    assert first.publish_calls == 1
+    assert second.publish_calls == 1
+    assert run["status"] == "completed"
+    assert run["error_code"] == "cancellation_after_publication_commit"
+    assert any(event["event_type"] == "publication_commit_started" for event in events)
+    assert events[-1]["event_type"] == "run_completed"
+
+
 async def test_pipeline_deadline_still_records_timeout(tmp_path, monkeypatch):
     class WaitingBackend:
         name = "grafana"
@@ -2642,7 +3502,11 @@ async def test_pipeline_deadline_still_records_timeout(tmp_path, monkeypatch):
     monkeypatch.setattr("tacit.pipeline.classify_intent", waiting_classify)
     store = InvestigationStore(db_path=tmp_path / "history.db")
     deps = PipelineDependencies(
-        settings=SimpleNamespace(pipeline_max_concurrent=1, pipeline_timeout_seconds=0.01),
+        settings=SimpleNamespace(
+            pipeline_max_concurrent=1,
+            pipeline_timeout_seconds=0.01,
+            knowledge_permissions="knowledge.read,knowledge.apply",
+        ),
         backend_factory=lambda: [WaitingBackend()],
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -3260,8 +4124,11 @@ async def test_published_dashboard_succeeds_when_contract_persistence_fails():
         def complete_run(self, run_id, **kwargs):
             self.completed_runs.append({"run_id": run_id, **kwargs})
 
+        def append_event(self, investigation_id, run_id, event_type, payload, **kwargs):
+            return None
+
         def persist_contract_revision(self, contract, **kwargs):
-            raise RuntimeError("database is locked")
+            raise RuntimeError("api_key=contract-secret path=/private/history.db")
 
     class FeedbackStore:
         def record_provenance(self, **kwargs):
@@ -3287,31 +4154,32 @@ async def test_published_dashboard_succeeds_when_contract_persistence_fails():
         cache_key_factory=lambda *parts: ":".join(parts),
     )
 
-    response = await complete_pipeline(
-        request=DashRequest(prompt="checkout latency", user_id="sdet"),
-        deps=deps,
-        backends=[PublishedBackend()],
-        dashboard_spec=dashboard,
-        intent=Intent(
-            summary="checkout latency",
-            domain="application",
-            services=["checkout"],
-            signals=[SignalType.METRICS],
-        ),
-        metric_catalog=[],
-        datasource_catalog=[],
-        ranked_archetypes_present=True,
-        validation_warnings=[],
-        panels_before=1,
-        evidence_requirements=[],
-        evidence_resolutions=[],
-        evidence_observations=[],
-        culprit_ranking=CulpritRanking(),
-        timings={},
-        recorder=recorder,
-        token_usage=TokenUsage(),
-        started_at=time.monotonic(),
-    )
+    with capture_logs() as logs:
+        response = await complete_pipeline(
+            request=DashRequest(prompt="checkout latency", user_id="sdet"),
+            deps=deps,
+            backends=[PublishedBackend()],
+            dashboard_spec=dashboard,
+            intent=Intent(
+                summary="checkout latency",
+                domain="application",
+                services=["checkout"],
+                signals=[SignalType.METRICS],
+            ),
+            metric_catalog=[],
+            datasource_catalog=[],
+            ranked_archetypes_present=True,
+            validation_warnings=[],
+            panels_before=1,
+            evidence_requirements=[],
+            evidence_resolutions=[],
+            evidence_observations=[],
+            culprit_ranking=CulpritRanking(),
+            timings={},
+            recorder=recorder,
+            token_usage=TokenUsage(),
+            started_at=time.monotonic(),
+        )
 
     assert response.dashboard_url == "http://grafana/d/published"
     assert response.dashboard_uid == "published"
@@ -3325,10 +4193,17 @@ async def test_published_dashboard_succeeds_when_contract_persistence_fails():
             "run_id": "run-published",
             "status": "completed",
             "error_code": "contract_persistence_failed",
-            "error_detail": "RuntimeError: database is locked",
+            "error_detail": history.completed_runs[0]["error_detail"],
             "tenant_id": "default",
         }
     ]
+    warning_detail = history.completed_runs[0]["error_detail"]
+    assert warning_detail.startswith("contract_revision_persist_failed;error_type=RuntimeError;")
+    assert "failure_fingerprint=" in warning_detail
+    assert "contract-secret" not in warning_detail
+    assert "contract-secret" not in json.dumps(logs, default=str)
+    persist_log = next(entry for entry in logs if entry.get("event") == "investigation_contract_persist_failed")
+    assert "exc_info" not in persist_log
 
 
 def test_packaged_schema_matches_contract_model():
@@ -3478,6 +4353,46 @@ def test_legacy_correction_mutations_require_action_permissions(tmp_path, monkey
     assert apply_response.status_code == 403
     assert apply_response.json()["detail"] == "Missing permission: knowledge.apply"
     assert len(store.list_revisions(investigation_id)) == 1
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "payload"),
+    [
+        (
+            "post",
+            "/api/v1/investigations/missing/corrections",
+            {"correction_text": "Unauthorized correction"},
+        ),
+        (
+            "post",
+            "/api/v1/investigations/missing/corrections/candidate/review",
+            {"approved": True, "reviewed_by": "reviewer"},
+        ),
+        (
+            "post",
+            "/api/v1/investigations/missing/corrections/candidate/review",
+            {"approved": False, "reviewed_by": "reviewer"},
+        ),
+        ("post", "/api/v1/investigations/missing/corrections/candidate/apply", None),
+        ("post", "/api/v1/investigations/missing/replay", {"mode": "current_engine"}),
+        ("post", "/api/v1/investigations/missing/migrate", None),
+        ("get", "/api/v1/investigations/missing/assessment-bundle", None),
+    ],
+)
+def test_denied_history_mutations_do_not_initialize_storage(tmp_path, method, path, payload):
+    case_id = abs(hash((method, path, json.dumps(payload, sort_keys=True))))
+    db_path = tmp_path / f"denied-history-{case_id}.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_permissions="knowledge.read",
+        history_db_path=str(db_path),
+    )
+    client = TestClient(create_app(runtime_settings=runtime_settings))
+
+    response = client.request(method, path, json=payload)
+
+    assert response.status_code == 403
+    assert not db_path.exists()
 
 
 def test_legacy_correction_store_enforces_permissions_for_direct_callers(tmp_path):
@@ -3727,6 +4642,8 @@ def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch
     assert response.status_code == 200
     assert received["deps"] is deps
     assert received["request"].tenant_id == "tenant-a"
+    assert received["request"].user_id == "local-unauthenticated"
+    assert received["request"].user_id != draft.request.requester
     assert received["investigation_id"] == investigation_id
     assert received["run_type"] == InvestigationRunType.REFRESH
     assert received["base_revision"] == 1
@@ -3824,6 +4741,8 @@ def test_wildcard_history_routes_are_tenant_scoped(tmp_path, monkeypatch):
         knowledge_tenant_id="*",
         api_auth_enabled=True,
         knowledge_tenant_api_keys={"tenant-a": "tenant-a-secret", "tenant-b": "tenant-b-secret"},
+        signals_db_path=str(tmp_path / "signals.db"),
+        history_db_path=str(tmp_path / "history.db"),
     )
     store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=runtime_settings)
     investigation_ids = {}
@@ -4043,7 +4962,11 @@ def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeyp
         db_path=db_path,
         runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
     )
-    runtime_settings = Settings(knowledge_tenant_id="tenant-a")
+    knowledge_path = tmp_path / "knowledge.db"
+    runtime_settings = Settings(
+        knowledge_tenant_id="tenant-a",
+        signals_db_path=str(knowledge_path),
+    )
     deps = PipelineDependencies(
         settings=runtime_settings,
         backend_factory=lambda: [],
@@ -4067,7 +4990,7 @@ def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeyp
 
     monkeypatch.setattr("tacit.api.routes.history.run_pipeline", fake_refresh)
     knowledge_service = KnowledgeService(
-        KnowledgeRepository(tmp_path / "knowledge.db"),
+        KnowledgeRepository(knowledge_path, runtime_settings=runtime_settings),
         history_store=migrated,
         runtime_settings=runtime_settings,
     )
@@ -4111,25 +5034,87 @@ def test_wildcard_history_migration_refuses_ownerless_rows_before_schema_mutatio
                    prompt TEXT NOT NULL
                );
                INSERT INTO investigations (id, prompt) VALUES ('private-inv', 'Private prompt');""")
+        journal_before = conn.execute("PRAGMA journal_mode").fetchone()[0]
 
     with pytest.raises(RuntimeError, match="Legacy investigation history has no tenant owner"):
         InvestigationStore(
             db_path=db_path,
-            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
         )
 
     with sqlite3.connect(db_path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(investigations)")}
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        journal_after = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        canary = conn.execute("SELECT id, prompt FROM investigations").fetchall()
     assert "tenant_id" not in columns
     assert "current_revision" not in columns
     assert "investigation_revisions" not in tables
+    assert journal_after == journal_before == "delete"
+    assert canary == [("private-inv", "Private prompt")]
+
+
+def test_history_initializer_rechecks_migration_progress_after_writer_lock(tmp_path, monkeypatch):
+    db_path = tmp_path / "concurrent-history-migration.db"
+    original_store = InvestigationStore(db_path=db_path)
+    investigation_id = original_store.start("Migration race")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM investigation_tenant_assignments WHERE investigation_id=?",
+            (investigation_id,),
+        )
+        conn.execute("DELETE FROM history_schema_metadata WHERE migration_name='history_tenant_assignments_v2'")
+
+    original_pending = InvestigationStore._pending_history_tenant_migration
+    preflight_injected = False
+
+    def inject_concurrent_progress(store, connection):
+        nonlocal preflight_injected
+        details = original_pending(store, connection)
+        if preflight_injected:
+            return details
+        preflight_injected = True
+        with sqlite3.connect(db_path) as concurrent:
+            concurrent.execute(
+                """INSERT INTO history_migration_progress (
+                       migration_name, cursor, details_json, updated_at
+                   ) VALUES (?, '', ?, ?)""",
+                (
+                    "history_tenant_assignment_backfill_v2",
+                    json.dumps(
+                        {
+                            "tenant_column_existed": True,
+                            "configured_tenant": "default",
+                        }
+                    ),
+                    time.time(),
+                ),
+            )
+        return None
+
+    monkeypatch.setattr(
+        InvestigationStore,
+        "_pending_history_tenant_migration",
+        inject_concurrent_progress,
+    )
+
+    InvestigationStore(db_path=db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        assignment = conn.execute(
+            "SELECT tenant_id FROM investigation_tenant_assignments WHERE investigation_id=?",
+            (investigation_id,),
+        ).fetchone()
+        progress = conn.execute("""SELECT 1 FROM history_migration_progress
+               WHERE migration_name='history_tenant_assignment_backfill_v2'""").fetchone()
+    assert assignment == ("default",)
+    assert progress is None
 
 
 def test_wildcard_history_stats_require_and_filter_by_tenant(tmp_path):
     store = InvestigationStore(
         db_path=tmp_path / "history.db",
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*"),
+        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
     )
     store.start("Tenant A", tenant_id="tenant-a")
     store.start("Tenant B", tenant_id="tenant-b")
@@ -4161,6 +5146,9 @@ def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp
             panel_count=1,
             summary="Dashboard published; revision persistence failed.",
             investigation_id=investigation_id,
+            investigation_run_id="run-refresh-failed",
+            investigation_status="failed",
+            audit_status="run_completed",
             investigation_revision=None,
         )
 
@@ -4174,4 +5162,80 @@ def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp
     detail = response.json()["detail"]
     assert detail["message"] == "Refresh did not create an authoritative investigation revision."
     assert detail["investigation_id"] == investigation_id
+    assert detail["investigation_run_id"] == "run-refresh-failed"
+    assert detail["investigation_status"] == "failed"
+    assert detail["audit_status"] == "run_completed"
     assert detail["dashboard_url"] == "http://grafana/published-but-stale"
+
+
+def test_refresh_pipeline_exception_preserves_run_identity(tmp_path, monkeypatch):
+    store = InvestigationStore(db_path=tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    deps = PipelineDependencies(
+        settings=Settings(_env_file=None),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    async def failed_refresh(_request, _supplied_deps=None, **_kwargs):
+        raise PipelineExecutionError(
+            "backend failed",
+            investigation_id=investigation_id,
+            investigation_run_id="run-refresh-exception",
+            audit_status="run_completed",
+        )
+
+    monkeypatch.setattr("tacit.api.routes.history.run_pipeline", failed_refresh)
+    app = create_app(runtime_settings=deps.settings)
+    app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
+
+    response = TestClient(app).post(f"/api/v1/investigations/{investigation_id}/refresh")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": "Failed to refresh investigation",
+        "investigation_id": investigation_id,
+        "investigation_run_id": "run-refresh-exception",
+        "investigation_status": "failed",
+        "audit_status": "run_completed",
+    }
+
+
+def test_refresh_history_preflight_failure_preserves_investigation_identity():
+    resources_closed = False
+
+    def fail_history_store():
+        raise sqlite3.OperationalError("history unavailable")
+
+    async def close_resources():
+        nonlocal resources_closed
+        resources_closed = True
+
+    runtime_settings = Settings(_env_file=None)
+    deps = PipelineDependencies(
+        settings=runtime_settings,
+        backend_factory=lambda: [],
+        history_store_factory=fail_history_store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+        resource_cleanup=close_resources,
+    )
+    app = create_app(runtime_settings=runtime_settings)
+    app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
+
+    response = TestClient(app).post("/api/v1/investigations/inv-known/refresh")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": "Failed to refresh investigation",
+        "investigation_id": "inv-known",
+        "investigation_run_id": "",
+        "investigation_status": "failed",
+        "audit_status": "run_unavailable",
+    }
+    assert resources_closed is True

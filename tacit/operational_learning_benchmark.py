@@ -48,13 +48,17 @@ def run_operational_learning_benchmark() -> dict[str, Any]:
     dataset_hash = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
     results = []
     with tempfile.TemporaryDirectory(prefix="tacit-learning-benchmark-") as tmp:
-        benchmark_settings = Settings(
-            knowledge_tenant_id="default",
-            knowledge_permissions=_BENCHMARK_PERMISSIONS,
-        )
         for index, case in enumerate(corpus["cases"]):
+            case_path = Path(tmp) / f"case-{index}.db"
+            benchmark_settings = Settings.model_validate(
+                {
+                    "knowledge_tenant_id": "default",
+                    "knowledge_permissions": _BENCHMARK_PERMISSIONS,
+                    "signals_db_path": str(case_path),
+                }
+            )
             service = KnowledgeService(
-                KnowledgeRepository(Path(tmp) / f"case-{index}.db"),
+                KnowledgeRepository(case_path, runtime_settings=benchmark_settings),
                 runtime_settings=benchmark_settings,
             )
             _seed_entities(service)

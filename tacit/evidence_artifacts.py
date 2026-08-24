@@ -6,7 +6,16 @@ import re
 from typing import Any
 
 from tacit.catalog import catalog_for_services
-from tacit.evidence import SUPPORTED_OBSERVATION
+from tacit.errors import (
+    AUTHORITY_BOUNDARY_ERRORS,
+    EvidenceResolutionError,
+    safe_failure_diagnostics,
+)
+from tacit.evidence import (
+    SUPPORTED_OBSERVATION,
+    EvidenceObservationWorkBudget,
+    EvidenceObservationWorkLimits,
+)
 from tacit.knowledge.usage import KnowledgeRevisionRef
 from tacit.models.schemas import (
     DashboardSpec,
@@ -20,6 +29,29 @@ from tacit.models.schemas import (
     PanelSpec,
 )
 from tacit.signals.availability import resolve_signal_store
+from tacit.signals.resolution import (
+    SignalResolutionWorkBudget,
+    SignalResolutionWorkLimitError,
+    signal_resolution_work_kwargs,
+)
+
+# Compatibility alias for stage modules; new consumers should use the shared policy.
+EVIDENCE_AUTHORITY_ERRORS = AUTHORITY_BOUNDARY_ERRORS
+
+
+def evidence_failure_diagnostics(
+    exc: BaseException,
+    *,
+    reason_code: str,
+    requirement_count: int,
+) -> dict[str, str | int]:
+    """Return a bounded diagnostic envelope without exception messages or state."""
+    return safe_failure_diagnostics(
+        exc,
+        reason_code=reason_code,
+        counters={"requirement_count": requirement_count},
+    )
+
 
 _SYMPTOM_SIGNAL_PANELS = {
     "request_latency": ("Observed Request Latency", "Application request timing evidence", "s"),
@@ -298,8 +330,12 @@ def build_symptom_evidence_dashboard(
     tenant_id: str = "default",
     knowledge_scope: Any | None = None,
     knowledge_query_uses: list[Any] | None = None,
+    work_budget: EvidenceObservationWorkBudget | None = None,
+    signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
 ) -> tuple[DashboardSpec, list[EvidenceResolution]]:
     """Build direct, validation-gated panels for observed application symptoms."""
+    budget = work_budget or EvidenceObservationWorkBudget(EvidenceObservationWorkLimits())
+    budget.validate_rescue_plan(requirements, resolutions, catalog, intent)
     resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
     panels: list[PanelSpec] = []
     rescue_resolutions: list[EvidenceResolution] = []
@@ -318,6 +354,7 @@ def build_symptom_evidence_dashboard(
                 tenant_id=tenant_id,
                 knowledge_scope=knowledge_scope,
                 applied_governance_revision_refs=resolution_refs,
+                signal_resolution_work_budget=signal_resolution_work_budget,
             )
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             continue
@@ -399,8 +436,12 @@ def build_evidence_gap_dashboard(
     tenant_id: str = "default",
     knowledge_scope: Any | None = None,
     knowledge_query_uses: list[Any] | None = None,
+    work_budget: EvidenceObservationWorkBudget | None = None,
+    signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
 ) -> tuple[DashboardSpec, list[EvidenceResolution]]:
     """Build validation-gated panels for supported observations found while closing evidence gaps."""
+    budget = work_budget or EvidenceObservationWorkBudget(EvidenceObservationWorkLimits())
+    budget.validate_rescue_plan(requirements, resolutions, catalog, intent)
     resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
     panels: list[PanelSpec] = []
     gap_resolutions: list[EvidenceResolution] = []
@@ -427,6 +468,7 @@ def build_evidence_gap_dashboard(
                 tenant_id=tenant_id,
                 knowledge_scope=knowledge_scope,
                 applied_governance_revision_refs=resolution_refs,
+                signal_resolution_work_budget=signal_resolution_work_budget,
             )
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             continue
@@ -572,6 +614,7 @@ def _resolve_direct_symptom_evidence(
     knowledge_scope: Any | None = None,
     applied_governance_refs: set[str] | None = None,
     applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
+    signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
 ) -> EvidenceResolution | None:
     """Resolve symptom evidence for direct observation panels."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal_details
@@ -587,27 +630,36 @@ def _resolve_direct_symptom_evidence(
     scoped_catalog = catalog_for_services(target_catalog, intent.services, include_unscoped=True)
     inferred_by: KnowledgeRevisionRef | None = None
     signal_type = requirement.signal_type
-    if not signal_type:
-        signal_type, inferred_by = _legacy_metric_signal_details(
-            store,
-            requirement.default_metric,
+    try:
+        if not signal_type:
+            signal_type, inferred_by = _legacy_metric_signal_details(
+                store,
+                requirement.default_metric,
+                scoped_catalog,
+                target_language,
+                tenant_id,
+                knowledge_scope,
+                signal_resolution_work_budget,
+            )
+        if signal_type not in _SYMPTOM_SIGNAL_PANELS:
+            return None
+        resolved = store.resolve_signal_details(
+            signal_type,
             scoped_catalog,
-            target_language,
-            tenant_id,
-            knowledge_scope,
+            context_service=intent.services[0] if intent.services else "",
+            context_datasource_type=_datasource_type_for_language(target_language),
+            context_archetype=requirement.source,
+            target_query_language=target_language,
+            tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
+            **signal_resolution_work_kwargs(store, signal_resolution_work_budget),
         )
-    if signal_type not in _SYMPTOM_SIGNAL_PANELS:
-        return None
-    resolved = store.resolve_signal_details(
-        signal_type,
-        scoped_catalog,
-        context_service=intent.services[0] if intent.services else "",
-        context_datasource_type=_datasource_type_for_language(target_language),
-        context_archetype=requirement.source,
-        target_query_language=target_language,
-        tenant_id=tenant_id,
-        knowledge_scope=knowledge_scope,
-    )
+    except EVIDENCE_AUTHORITY_ERRORS:
+        raise
+    except SignalResolutionWorkLimitError:
+        raise
+    except Exception as exc:
+        raise EvidenceResolutionError("symptom evidence rescue resolution failed") from exc
     if not resolved:
         return None
     best_score = resolved[0].confidence
@@ -654,6 +706,7 @@ def _resolve_evidence_gap_observation(
     knowledge_scope: Any | None = None,
     applied_governance_refs: set[str] | None = None,
     applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
+    signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
 ) -> EvidenceResolution | None:
     """Resolve an evidence gap only when ownership is specific enough to observe safely."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal_details
@@ -669,27 +722,36 @@ def _resolve_evidence_gap_observation(
     scoped_catalog = catalog_for_services(target_catalog, intent.services, include_unscoped=False)
     inferred_by: KnowledgeRevisionRef | None = None
     signal_type = requirement.signal_type
-    if not signal_type:
-        signal_type, inferred_by = _legacy_metric_signal_details(
-            store,
-            requirement.default_metric,
+    try:
+        if not signal_type:
+            signal_type, inferred_by = _legacy_metric_signal_details(
+                store,
+                requirement.default_metric,
+                scoped_catalog,
+                target_language,
+                tenant_id,
+                knowledge_scope,
+                signal_resolution_work_budget,
+            )
+        if signal_type not in _EVIDENCE_GAP_SIGNAL_PANELS:
+            return None
+        resolved = store.resolve_signal_details(
+            signal_type,
             scoped_catalog,
-            target_language,
-            tenant_id,
-            knowledge_scope,
+            context_service=intent.services[0] if intent.services else "",
+            context_datasource_type=_datasource_type_for_language(target_language),
+            context_archetype=requirement.source,
+            target_query_language=target_language,
+            tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
+            **signal_resolution_work_kwargs(store, signal_resolution_work_budget),
         )
-    if signal_type not in _EVIDENCE_GAP_SIGNAL_PANELS:
-        return None
-    resolved = store.resolve_signal_details(
-        signal_type,
-        scoped_catalog,
-        context_service=intent.services[0] if intent.services else "",
-        context_datasource_type=_datasource_type_for_language(target_language),
-        context_archetype=requirement.source,
-        target_query_language=target_language,
-        tenant_id=tenant_id,
-        knowledge_scope=knowledge_scope,
-    )
+    except EVIDENCE_AUTHORITY_ERRORS:
+        raise
+    except SignalResolutionWorkLimitError:
+        raise
+    except Exception as exc:
+        raise EvidenceResolutionError("evidence gap rescue resolution failed") from exc
     if not resolved:
         return None
     best_score = resolved[0].confidence

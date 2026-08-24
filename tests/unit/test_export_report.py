@@ -6,11 +6,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from click.testing import CliRunner
 
+from tacit.cli import cli
 from tacit.config import Settings
 from tacit.export_report import (
     ANONYMOUS_BUNDLE_FILES,
     ReportAnonymizer,
+    _collect_recent_investigations,
     build_assessment_report,
     export_assessment_report,
     validate_report_for_leakage,
@@ -81,6 +84,42 @@ class FakeFeedbackStore:
             "recommendations": ["raw recommendation mentioning https://internal.example.company"],
             "metric_quality": [{"metric": "checkout_latency_seconds", "good": 1, "bad": 0}],
         }
+
+
+def test_history_export_respects_the_store_page_limit() -> None:
+    rows = [{"id": f"inv-{index}"} for index in range(501)]
+    calls: list[tuple[int, int]] = []
+
+    class CappedHistoryStore:
+        def list_recent(self, *, limit, offset, tenant_id):
+            assert tenant_id == "tenant-a"
+            assert 1 <= limit <= 500
+            calls.append((limit, offset))
+            return rows[offset : offset + limit]
+
+    exported = _collect_recent_investigations(CappedHistoryStore(), tenant_id="tenant-a")
+
+    assert exported == rows
+    assert calls == [(500, 0), (500, 500)]
+
+
+def test_anonymous_cli_export_succeeds_with_configured_role_paths(tmp_path: Path) -> None:
+    output = tmp_path / "assessment.tar.gz"
+    environment = {
+        "HISTORY_DB_PATH": str(tmp_path / "history" / "history.db"),
+        "FEEDBACK_DB_PATH": str(tmp_path / "feedback" / "feedback.db"),
+        "SIGNALS_DB_PATH": str(tmp_path / "signals" / "signals.db"),
+        "KNOWLEDGE_TENANT_ID": "default",
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["export-report", "--anonymous", "--validate", "--output", str(output)],
+        env=environment,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert output.is_file()
 
 
 class FakeSignalStore:

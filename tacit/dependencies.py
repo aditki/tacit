@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -13,9 +14,110 @@ from tacit.backends.base import DashboardBackend
 from tacit.cache import make_cache_key
 from tacit.config import Settings, settings
 from tacit.context.base import ContextProvider
+from tacit.errors import RuntimeOwnershipError
+from tacit.runtime_ownership import (
+    RuntimeOwnershipMismatchError,
+    describe_runtime_owner,
+    get_runtime_ownership,
+    require_compatible_runtime_ownership,
+    resolve_runtime_settings,
+    runtime_descriptor_from_settings,
+    snapshot_runtime_settings,
+)
 from tacit.runtime_stores import RuntimeStores
 
 logger = structlog.get_logger()
+
+
+def resolve_owned_database_path(
+    *,
+    boundary: str,
+    database_role: str,
+    owners: tuple[tuple[str, Any], ...],
+    runtime_settings: Settings | None = None,
+) -> Path:
+    """Resolve one database through public ownership descriptors only."""
+    owner_descriptors = tuple(get_runtime_ownership(owner, component=name) for name, owner in owners)
+    if owner_descriptors:
+        require_compatible_runtime_ownership(
+            boundary=boundary,
+            descriptors=owner_descriptors,
+        )
+    owner_paths: list[Path] = []
+    for descriptor in owner_descriptors:
+        matches = tuple(database.path for database in descriptor.databases if database.role == database_role)
+        if len(matches) != 1:
+            raise RuntimeOwnershipError(
+                f"{boundary} {descriptor.component} must expose one {database_role} database identity"
+            )
+        owner_paths.append(matches[0])
+
+    descriptors = list(owner_descriptors)
+    if runtime_settings is not None:
+        selected_settings = (
+            snapshot_runtime_settings(
+                runtime_settings,
+                database_role=database_role,
+                database_path=owner_paths[0],
+            )
+            if owner_paths
+            else snapshot_runtime_settings(runtime_settings)
+        )
+        descriptors.insert(
+            0,
+            runtime_descriptor_from_settings(
+                selected_settings,
+                component=f"{boundary}_settings",
+            ),
+        )
+    if not descriptors:
+        raise RuntimeOwnershipError(f"{boundary} requires a runtime database owner")
+
+    require_compatible_runtime_ownership(
+        boundary=boundary,
+        descriptors=tuple(descriptors),
+    )
+    paths: list[Path] = []
+    for descriptor in descriptors:
+        matches = tuple(database.path for database in descriptor.databases if database.role == database_role)
+        if len(matches) != 1:
+            raise RuntimeOwnershipError(
+                f"{boundary} {descriptor.component} must expose one {database_role} database identity"
+            )
+        paths.append(matches[0])
+    if len(set(paths)) != 1:
+        raise RuntimeOwnershipMismatchError(
+            boundary,
+            {"database"},
+            tuple(descriptor.component for descriptor in descriptors),
+            message=f"{boundary} persistence owners must use the same database",
+        )
+    return paths[0]
+
+
+def create_scoped_knowledge_service(
+    signal_store: Any,
+    *,
+    runtime_settings: Settings,
+    history_store_factory: Callable[[], Any] | None = None,
+    boundary: str = "Operational Knowledge service",
+) -> Any:
+    """Build Operational Knowledge beside one descriptor-owned signal store."""
+    database_path = resolve_owned_database_path(
+        boundary=boundary,
+        database_role="signals",
+        owners=(("signal_store", signal_store),),
+        runtime_settings=runtime_settings,
+    )
+    from tacit.knowledge.repository import KnowledgeRepository
+    from tacit.knowledge.service import KnowledgeService
+
+    return KnowledgeService(
+        KnowledgeRepository(database_path, runtime_settings=runtime_settings),
+        signal_store=signal_store,
+        history_store_factory=history_store_factory,
+        runtime_settings=runtime_settings,
+    )
 
 
 @dataclass(frozen=True)
@@ -54,6 +156,15 @@ def build_pipeline_dependencies(
 ) -> PipelineDependencies:
     """Build a dependency bundle scoped to one runtime settings object."""
 
+    stores_owner = describe_runtime_owner("runtime_stores", stores)
+    if stores is not None and stores_owner.settings is None:
+        raise ValueError("Pipeline runtime stores must expose their runtime settings")
+    resolve_runtime_settings(
+        boundary="Pipeline dependencies",
+        explicit_settings=runtime_settings,
+        owners=(stores_owner,),
+        fallback_settings=runtime_settings,
+    )
     runtime_stores = stores or RuntimeStores(runtime_settings)
     resolved_signal_store_factory = signal_store_factory or runtime_stores.signals
     resolved_history_store_factory = history_store_factory or runtime_stores.history
@@ -63,22 +174,29 @@ def build_pipeline_dependencies(
     def runtime_knowledge_service() -> Any:
         nonlocal scoped_knowledge_path, scoped_knowledge_service
         if knowledge_service_factory is not None:
-            return knowledge_service_factory()
+            service = knowledge_service_factory()
+            resolve_owned_database_path(
+                boundary="Pipeline knowledge service realization",
+                database_role="signals",
+                owners=(("knowledge_service", service),),
+                runtime_settings=runtime_settings,
+            )
+            return service
         if signal_store_factory is None and history_store_factory is None:
             return runtime_stores.knowledge()
         signal_store = resolved_signal_store_factory()
-        db_path = getattr(signal_store, "_db_path", None)
-        if db_path is None:
-            raise RuntimeError("the injected signal store does not expose its database path")
+        db_path = resolve_owned_database_path(
+            boundary="Pipeline signal and knowledge persistence",
+            database_role="signals",
+            owners=(("signal_store", signal_store),),
+            runtime_settings=runtime_settings,
+        )
         if scoped_knowledge_service is None or scoped_knowledge_path != db_path:
-            from tacit.knowledge.repository import KnowledgeRepository
-            from tacit.knowledge.service import KnowledgeService
-
-            scoped_knowledge_service = KnowledgeService(
-                KnowledgeRepository(db_path),
-                signal_store=signal_store,
+            scoped_knowledge_service = create_scoped_knowledge_service(
+                signal_store,
                 history_store_factory=resolved_history_store_factory,
                 runtime_settings=runtime_settings,
+                boundary="Pipeline signal and knowledge persistence",
             )
             scoped_knowledge_path = db_path
         return scoped_knowledge_service
@@ -153,23 +271,26 @@ def resolve_knowledge_service(
 ) -> Any:
     """Resolve Operational Knowledge from the active runtime's signal database."""
     if deps.knowledge_service_factory is not None:
-        return deps.knowledge_service_factory()
+        service = deps.knowledge_service_factory()
+        owners: list[tuple[str, Any]] = [("knowledge_service", service)]
+        if signal_store is not None:
+            owners.append(("signal_store", signal_store))
+        resolve_owned_database_path(
+            boundary="Pipeline knowledge service resolution",
+            database_role="signals",
+            owners=tuple(owners),
+            runtime_settings=deps.settings,
+        )
+        return service
     active_signal_store = signal_store
     if active_signal_store is None and deps.signal_store_factory is not None:
         active_signal_store = deps.signal_store_factory()
-    db_path = getattr(active_signal_store, "_db_path", None)
-    if db_path is not None:
-        from tacit.knowledge.repository import KnowledgeRepository
-        from tacit.knowledge.service import KnowledgeService
-
-        return KnowledgeService(
-            KnowledgeRepository(db_path),
-            signal_store=active_signal_store,
-            history_store_factory=deps.history_store_factory,
-            runtime_settings=deps.settings,
-        )
-    logger.error(
-        "knowledge_service_scoped_store_unavailable",
-        signal_store_type=type(active_signal_store).__name__ if active_signal_store is not None else "none",
+    if active_signal_store is None:
+        logger.error("knowledge_service_scoped_store_unavailable", signal_store_type="none")
+        raise RuntimeError("Operational Knowledge service is unavailable for the active signal store")
+    return create_scoped_knowledge_service(
+        active_signal_store,
+        history_store_factory=deps.history_store_factory,
+        runtime_settings=deps.settings,
+        boundary="Pipeline signal and knowledge persistence",
     )
-    raise RuntimeError("Operational Knowledge service is unavailable for the active signal store")

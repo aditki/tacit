@@ -43,6 +43,8 @@ def migrate_artifact_extractions(
     max_candidate_count: int | None = None,
 ) -> list[str]:
     """Wrap existing typed rows without changing their payload semantics."""
+    runtime_settings = service.runtime_settings
+    enforce_knowledge_action(runtime_settings, KnowledgeAction.LEARN_ARTIFACTS)
     collections = (
         ("dependency_hints", KnowledgeKind.DEPENDENCY),
         ("ownership_hints", KnowledgeKind.OWNERSHIP),
@@ -55,7 +57,7 @@ def migrate_artifact_extractions(
         for row in rows.get(collection, [])
     ]
     candidate_limit = (
-        int(service._runtime_settings.knowledge_source_atomic_candidate_limit)
+        int(runtime_settings.knowledge_source_atomic_candidate_limit)
         if max_candidate_count is None
         else int(max_candidate_count)
     )
@@ -65,7 +67,7 @@ def migrate_artifact_extractions(
         )
     _preflight_imported_review_states(service, review_states)
     if rows.get("signal_mapping_candidates"):
-        service._signal_store()
+        service.signal_store
 
     created = []
     with service.repository.transaction():
@@ -252,8 +254,8 @@ def migrate_signal_mapping(
     _preflight_imported_review_states(service, [review])
     reviewed_source_change = review in {ReviewState.APPROVED.value, ReviewState.TRUSTED.value}
     if reviewed_source_change:
-        enforce_knowledge_action(service._runtime_settings, KnowledgeAction.APPLY)
-    service._signal_store()
+        enforce_knowledge_action(service.runtime_settings, KnowledgeAction.APPLY)
+    service.signal_store
     with service.repository.transaction():
         existing = service.repository.get_candidate(candidate_id, tenant_id)
         candidate = service.create_candidate(
@@ -289,13 +291,13 @@ def _preflight_imported_review_states(service: KnowledgeService, raw_states: lis
     """Authorize a whole legacy batch before reading or persisting any row."""
     if not raw_states:
         return
-    service._enforce_candidate_review_action(approved=True)
+    service.enforce_candidate_review_action(approved=True)
     valid_states = {state.value for state in ReviewState}
     for raw_state in raw_states:
         if raw_state not in valid_states or raw_state == ReviewState.CANDIDATE.value:
             continue
         review_state = ReviewState(raw_state)
-        service._enforce_candidate_review_action(
+        service.enforce_candidate_review_action(
             approved=review_state != ReviewState.REJECTED,
             trust=review_state == ReviewState.TRUSTED,
         )
@@ -321,7 +323,7 @@ def _apply_imported_review_state(
     ):
         return candidate
     review_state = ReviewState(raw_review_state)
-    service._enforce_candidate_review_action(
+    service.enforce_candidate_review_action(
         approved=review_state != ReviewState.REJECTED,
         trust=review_state == ReviewState.TRUSTED,
     )

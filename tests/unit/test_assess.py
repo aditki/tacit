@@ -36,7 +36,7 @@ class TestEmptyStore:
         assert report["activity"]["investigations_total"] == 0
 
     def test_wildcard_assessment_requires_and_propagates_a_tenant(self, tmp_path):
-        runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*")
+        runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
         store = SignalStore(
             db_path=tmp_path / "wildcard-signals.db",
             runtime_settings=runtime_settings,
@@ -44,7 +44,7 @@ class TestEmptyStore:
         history = _history()
 
         class Stores:
-            settings = runtime_settings
+            settings = store.runtime_settings
 
             @staticmethod
             def signals():
@@ -116,7 +116,7 @@ class TestEmptyStore:
         assert report["tenant_id"] == "tenant-a"
         assert report["activity"]["investigations_total"] == 0
 
-    def test_partial_injection_rejects_a_store_outside_its_settings_graph(self, tmp_path):
+    def test_partial_injection_adopts_the_store_owned_database_path(self, tmp_path):
         signal_store = SignalStore(
             db_path=tmp_path / "ad-hoc-signals.db",
             runtime_settings=Settings(
@@ -125,8 +125,10 @@ class TestEmptyStore:
             ),
         )
 
-        with pytest.raises(ValueError, match="Settings-backed configured database path"):
-            build_assessment(signal_store=signal_store)
+        report = build_assessment(signal_store=signal_store)
+
+        assert report["tenant_id"] == "default"
+        assert signal_store.runtime_settings.signals_db_path == str((tmp_path / "ad-hoc-signals.db").resolve())
 
 
 class TestPopulatedStore:

@@ -8,9 +8,11 @@ from typing import Any
 import structlog
 
 from tacit.cache import cache_owner_namespace, make_cache_key, metric_cache
-from tacit.config import settings
+from tacit.config import Settings
+from tacit.errors import AUTHORITY_BOUNDARY_ERRORS, safe_failure_diagnostics
 from tacit.grafana.adapters.signalfx import KEYWORD_METRIC_MAP
 from tacit.models.schemas import MetricEntry
+from tacit.runtime_ownership import resolve_remote_runtime_settings
 from tacit.signalfx.client import SignalFxClient
 
 logger = structlog.get_logger()
@@ -63,6 +65,8 @@ async def _fetch_dimensions(
             values = sorted(dim_values[key])[:_MAX_DIMENSION_VALUES]
             dims.append(f"{key}={{{','.join(values)}}}")
         return dims
+    except AUTHORITY_BOUNDARY_ERRORS:
+        raise
     except Exception:
         logger.debug("signalfx_direct_dims_failed", metric=metric_name)
         return []
@@ -71,6 +75,8 @@ async def _fetch_dimensions(
 async def discover_metrics(
     client: SignalFxClient,
     keywords: list[str],
+    *,
+    runtime_settings: Settings | None = None,
 ) -> list[MetricEntry]:
     """Discover metrics directly from SignalFx API.
 
@@ -80,6 +86,12 @@ async def discover_metrics(
     Returns normalized MetricEntry objects compatible with the rest of
     the Tacit pipeline.
     """
+    active_settings = resolve_remote_runtime_settings(
+        boundary="signalfx_metric_discovery",
+        owner=client,
+        provider="signalfx",
+        explicit_settings=runtime_settings,
+    )
     norm_kw = _normalize_keywords(keywords)
     cache_key = make_cache_key("sfx_direct", cache_owner_namespace(client), ",".join(norm_kw))
     cached = metric_cache.get(cache_key)
@@ -102,7 +114,7 @@ async def discover_metrics(
         search_queries = {"*"}
 
     # Execute searches with bounded concurrency to avoid API burst
-    search_sem = asyncio.Semaphore(settings.adapter_max_concurrent)
+    search_sem = asyncio.Semaphore(active_settings.adapter_max_concurrent)
     search_errors = 0
 
     async def _search_one(query: str) -> list[dict[str, Any]]:
@@ -111,13 +123,21 @@ async def discover_metrics(
             try:
                 data = await client.search_metrics(query=query, limit=100)
                 return data.get("results", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            except Exception:
+            except AUTHORITY_BOUNDARY_ERRORS:
+                raise
+            except Exception as exc:
                 search_errors += 1
-                logger.warning("signalfx_direct_search_failed", query=query)
+                logger.warning(
+                    "signalfx_direct_search_failed",
+                    **safe_failure_diagnostics(
+                        exc,
+                        reason_code="signalfx_direct_search_failed",
+                    ),
+                )
                 return []
 
     tasks = [_search_one(q) for q in list(search_queries)[:10]]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(*tasks)
 
     # Deduplicate
     seen: set[str] = set()
@@ -133,11 +153,12 @@ async def discover_metrics(
     # Keyword prioritization
     matched = [n for n in metric_names if any(k in n.lower() for k in kw_lower)]
     unmatched = [n for n in metric_names if n not in set(matched)]
-    metric_names = (matched + unmatched)[:_MAX_CATALOG_SIZE]
+    catalog_limit = min(_MAX_CATALOG_SIZE, int(active_settings.max_metric_catalog_size))
+    metric_names = (matched + unmatched)[:catalog_limit]
 
     # Fetch dimensions for top metrics with bounded concurrency
     to_sample = metric_names[:50]
-    dim_sem = asyncio.Semaphore(settings.adapter_max_concurrent)
+    dim_sem = asyncio.Semaphore(active_settings.adapter_max_concurrent)
     dim_errors = 0
 
     async def _bounded_dims(name: str) -> tuple[str, list[str]]:
@@ -146,12 +167,14 @@ async def discover_metrics(
             try:
                 dims = await _fetch_dimensions(client, name)
                 return name, dims
+            except AUTHORITY_BOUNDARY_ERRORS:
+                raise
             except Exception:
                 dim_errors += 1
                 return name, []
 
     dim_tasks = [_bounded_dims(name) for name in to_sample]
-    dim_results = await asyncio.gather(*dim_tasks, return_exceptions=True)
+    dim_results = await asyncio.gather(*dim_tasks)
 
     catalog: dict[str, list[str]] = {name: [] for name in metric_names}
     for dim_result in dim_results:

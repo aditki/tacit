@@ -287,25 +287,23 @@ async def test_manual_teach_signal_mapping_is_used_before_dashboard_creation(
 
 
 @pytest.mark.e2e
-async def test_read_only_pipeline_does_not_publish_applied_knowledge_usage(
+async def test_read_only_pipeline_is_rejected_before_history_or_publish(
     isolated_learning_runtime,
     monkeypatch,
 ):
     _signal_store, history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
     _install_taught_latency_archetype(archetypes_path)
     _teach_taught_latency_mapping()
-    _configure_taught_latency_pipeline(monkeypatch)
+    backend = _configure_taught_latency_pipeline(monkeypatch)
     monkeypatch.setattr(settings, "knowledge_permissions", "knowledge.read")
 
-    response = await pipeline_mod.run_pipeline(
-        DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="read-only")
-    )
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        await pipeline_mod.run_pipeline(
+            DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="read-only")
+        )
 
-    assert response.dashboard_uid
-    contract = history_store.get_contract(response.investigation_id)
-    assert contract is not None
-    assert contract.knowledge_snapshot_ref == ""
-    assert contract.knowledge_usage == []
+    assert history_store.list_recent() == []
+    assert backend.published_specs == []
 
 
 @pytest.mark.e2e
@@ -398,6 +396,7 @@ async def test_governed_ranking_fails_closed_when_final_snapshot_is_unavailable(
     monkeypatch,
 ):
     signal_store, history_store, feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
+    runtime_settings = signal_store.runtime_settings
     _install_taught_latency_archetype(archetypes_path)
     backend = CapturingBackend(
         catalog=[
@@ -409,7 +408,8 @@ async def test_governed_ranking_fails_closed_when_final_snapshot_is_unavailable(
                 query_language="promql",
                 dimensions=['service="checkout-api"', "le={0.1,0.5,1,5}"],
             )
-        ]
+        ],
+        runtime_settings=runtime_settings,
     )
     monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
 
@@ -431,6 +431,8 @@ async def test_governed_ranking_fails_closed_when_final_snapshot_is_unavailable(
     monkeypatch.setattr(pipeline_mod, "classify_intent", fake_classify_intent)
 
     class RankingKnowledgeService:
+        runtime_ownership = signal_store.runtime_ownership
+
         def create_snapshot(self, scope):
             return (
                 KnowledgeSnapshot(
@@ -486,7 +488,7 @@ async def test_governed_ranking_fails_closed_when_final_snapshot_is_unavailable(
 
     knowledge_service = RankingKnowledgeService()
     deps = build_pipeline_dependencies(
-        settings,
+        runtime_settings,
         backend_factory=lambda: [backend],
         history_store_factory=lambda: history_store,
         feedback_store_factory=lambda: feedback_store,
@@ -546,7 +548,7 @@ async def test_pipeline_returns_helpful_no_metrics_response_without_publishing(
     isolated_learning_runtime,
     monkeypatch,
 ):
-    _signal_store, _history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
+    _signal_store, history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
     backend = CapturingBackend(catalog=[])
     monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
     monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
@@ -576,4 +578,10 @@ async def test_pipeline_returns_helpful_no_metrics_response_without_publishing(
     assert response.dashboard_url == ""
     assert response.panel_count == 0
     assert "No metrics found" in response.summary
+    assert response.investigation_id
+    assert response.investigation_run_id
+    assert response.investigation_status == "failed"
+    assert history_store.get(response.investigation_id) is not None
+    assert history_store.list_runs(response.investigation_id)[-1]["run_id"] == response.investigation_run_id
+    assert history_store.list_runs(response.investigation_id)[-1]["status"] == "failed"
     assert backend.published_specs == []
