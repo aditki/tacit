@@ -95,7 +95,19 @@ class TestHeuristicIntent:
         assert production.environments == ["production"]
         assert production.services == ["checkout"]
         assert heuristic_intent("checkout latency on checkout env:us-east-prod").environments == ["us-east-prod"]
+        assert heuristic_intent("checkout latency in the test environment").environments == ["test"]
+        assert heuristic_intent("checkout latency environment:stage").environments == ["staging"]
         assert heuristic_intent("checkout latency").environments == []
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "test whether checkout is failing",
+            "which stage is failing for checkout",
+        ],
+    )
+    def test_ambiguous_environment_aliases_require_explicit_context(self, prompt):
+        assert heuristic_intent(prompt).environments == []
 
     @pytest.mark.parametrize("service", ["checkout-prod", "prod-checkout"])
     def test_environment_alias_inside_service_name_is_not_scope(self, service):

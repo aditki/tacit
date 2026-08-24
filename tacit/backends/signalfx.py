@@ -3,13 +3,27 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import Any, cast
 
 import structlog
 
 from tacit.backends.base import AlertFeatures, DashboardFeatures, DiscoveryStatus, PublishResult
 from tacit.config import Settings
+from tacit.errors import (
+    AUTHORITY_BOUNDARY_ERRORS,
+    RuntimeOwnershipError,
+    safe_failure_diagnostics,
+)
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
+from tacit.runtime_ownership import (
+    RuntimeOwnershipDescriptor,
+    copy_runtime_settings,
+    get_runtime_ownership,
+    require_remote_runtime_ownership,
+    runtime_descriptor_from_settings,
+    snapshot_runtime_settings,
+)
 from tacit.signalfx.client import SignalFxClient
 from tacit.signalfx.discovery import discover_metrics as sfx_discover
 from tacit.signalfx.publisher import publish_dashboard as sfx_publish
@@ -20,13 +34,44 @@ SIGNALFX_DASHBOARD_GROUP_PAGE_SIZE = 200
 
 
 class SignalFxBackend:
-    """Dashboard backend that talks to Splunk Observability Cloud (SignalFx)."""
+    """Backend for an ownership-described Splunk Observability client."""
 
-    def __init__(self, client: SignalFxClient | None = None, runtime_settings: Settings | None = None):
-        self._settings = runtime_settings
-        self._client = client or SignalFxClient(runtime_settings=runtime_settings)
+    def __init__(self, client: Any | None = None, runtime_settings: Settings | None = None):
+        self._settings_owner_supplied = runtime_settings is not None
+        explicit_settings = snapshot_runtime_settings(runtime_settings) if runtime_settings is not None else None
+        self._client = client if client is not None else SignalFxClient(runtime_settings=explicit_settings)
+        client_descriptor = get_runtime_ownership(self._client, component="signalfx_client")
+        require_remote_runtime_ownership(
+            boundary="signalfx_backend",
+            descriptor=client_descriptor,
+            provider="signalfx",
+        )
+        client_settings = getattr(self._client, "runtime_settings", None)
+        if explicit_settings is None:
+            if not isinstance(client_settings, Settings):
+                raise RuntimeOwnershipError("signalfx_backend requires a public runtime settings owner")
+            self._settings = snapshot_runtime_settings(client_settings)
+        else:
+            self._settings = explicit_settings
+        settings_descriptor = runtime_descriptor_from_settings(
+            self._settings,
+            component="signalfx_backend_settings",
+        )
+        require_remote_runtime_ownership(
+            boundary="signalfx_backend",
+            descriptor=client_descriptor,
+            provider="signalfx",
+            settings_descriptor=settings_descriptor,
+        )
+        self._runtime_ownership = replace(client_descriptor, component="signalfx_backend")
         self.last_discovery_status = DiscoveryStatus()
         self.last_alert_list_complete = False
+        self.last_dashboard_list_complete = False
+
+    @property
+    def runtime_settings(self) -> Settings | None:
+        """Return the immutable settings used for backend behavior."""
+        return copy_runtime_settings(self._settings) if self._settings is not None else None
 
     # ── Protocol properties ───────────────────────────────────────────
 
@@ -38,6 +83,11 @@ class SignalFxBackend:
     def query_language(self) -> str:
         return "signalflow"
 
+    @property
+    def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
+        """Return and validate the backend's effective SignalFx ownership."""
+        return self._runtime_ownership
+
     # ── Discovery ─────────────────────────────────────────────────────
 
     async def discover_metrics(
@@ -46,12 +96,24 @@ class SignalFxBackend:
         intent: Intent,
     ) -> list[MetricEntry]:
         try:
-            entries = await sfx_discover(self._client, keywords)
+            entries = await sfx_discover(
+                self._client,
+                keywords,
+                runtime_settings=self._settings,
+            )
             self.last_discovery_status = DiscoveryStatus(available=True)
             return entries
+        except AUTHORITY_BOUNDARY_ERRORS:
+            raise
         except Exception as exc:
-            self.last_discovery_status = DiscoveryStatus(available=False, error=str(exc))
-            logger.error("signalfx_discover_failed", error=str(exc), exc_info=True)
+            self.last_discovery_status = DiscoveryStatus(
+                available=False,
+                error="signalfx_discover_failed",
+            )
+            logger.warning(
+                "signalfx_discover_failed",
+                **safe_failure_diagnostics(exc, reason_code="signalfx_discover_failed"),
+            )
             return []
 
     async def discover_datasource_targets(
@@ -89,7 +151,12 @@ class SignalFxBackend:
         spec: DashboardSpec,
     ) -> PublishResult:
         group_name = self._settings.signalfx_dashboard_group if self._settings else None
-        url, uid = await sfx_publish(self._client, spec, group_name=group_name)
+        url, uid = await sfx_publish(
+            self._client,
+            spec,
+            group_name=group_name,
+            runtime_settings=self._settings,
+        )
         return PublishResult(url=url, uid=uid, backend_name="signalfx")
 
     # ── Ingestion ─────────────────────────────────────────────────────
@@ -100,6 +167,7 @@ class SignalFxBackend:
 
     async def list_dashboards(self, limit: int = 500) -> list[dict]:
         """List SignalFx dashboards from dashboard groups when available."""
+        self.last_dashboard_list_complete = False
         out: list[dict] = []
         seen: set[str] = set()
         offset = 0
@@ -149,6 +217,7 @@ class SignalFxBackend:
                 total_seen=offset + len(group_items),
             )
             if page_complete or not group_items:
+                self.last_dashboard_list_complete = True
                 break
             offset += len(group_items)
         return out
@@ -268,6 +337,16 @@ class SignalFxBackend:
                         "metrics": list(
                             dict.fromkeys(_extract_metrics_from_signalflow(program_text) if program_text else [])
                         ),
+                        "metric_sources": [
+                            {
+                                "metric": metric,
+                                "datasource_type": "signalfx",
+                                "query_language": "signalflow",
+                            }
+                            for metric in dict.fromkeys(
+                                _extract_metrics_from_signalflow(program_text) if program_text else []
+                            )
+                        ],
                         "queries": [program_text] if program_text else [],
                         "aggregation_patterns": agg if program_text else [],
                         "datasource_type": "signalfx",
@@ -300,6 +379,10 @@ class SignalFxBackend:
             backend_name=self.name,
             query_language=self.query_language,
             metrics_found=unique_metrics,
+            metric_sources=[
+                {"metric": metric, "datasource_type": "signalfx", "query_language": "signalflow"}
+                for metric in unique_metrics
+            ],
             panel_count=len(charts),
             panel_titles=[t for t in panel_titles if t],
             row_groups=row_groups,
@@ -429,6 +512,7 @@ def _parse_signalfx_detector(detector: dict[str, Any], *, backend_name: str, rea
     teams = _string_list(detector.get("teams", []))
     if teams:
         labels.setdefault("team", teams[0])
+    metrics = _extract_metrics_from_signalflow(program)
     return AlertFeatures(
         alert_uid=uid,
         alert_title=title,
@@ -440,7 +524,10 @@ def _parse_signalfx_detector(detector: dict[str, Any], *, backend_name: str, rea
         enabled=not bool(detector.get("disabled", False)),
         labels=labels,
         annotations=_detector_annotations(detector),
-        metrics_found=_extract_metrics_from_signalflow(program),
+        metrics_found=metrics,
+        metric_sources=[
+            {"metric": metric, "datasource_type": "signalfx", "query_language": "signalflow"} for metric in metrics
+        ],
         query_transformations=[program] if program else [],
         service_hints=[],
         dashboard_uid="",

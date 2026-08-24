@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
+from tacit.runtime_ownership import RuntimeOwnershipDescriptor
 
 
 @dataclass
@@ -59,6 +60,7 @@ class DashboardFeatures:
 
     # Per-panel detail (for archetype generation)
     panels: list[dict] = field(default_factory=list)
+    metric_sources: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -87,6 +89,7 @@ class AlertFeatures:
     dashboard_uid: str = ""
     panel_title: str = ""
     source_url: str = ""
+    metric_sources: list[dict[str, str]] = field(default_factory=list)
 
 
 @runtime_checkable
@@ -101,6 +104,11 @@ class DashboardBackend(Protocol):
     @property
     def query_language(self) -> str:
         """Target query language: 'promql', 'signalflow', etc."""
+        ...
+
+    @property
+    def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
+        """Return the backend's effective runtime ownership descriptor."""
         ...
 
     async def discover_metrics(

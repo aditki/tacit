@@ -6,12 +6,22 @@ import asyncio
 import json
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from tacit.api.dependencies import get_pipeline_dependencies
-from tacit.api.security import sanitize_prompt, verify_api_key
+from tacit.api.security import (
+    KnowledgeAction,
+    authenticated_actor,
+    knowledge_tenant,
+    require_knowledge_action,
+    require_knowledge_tenant,
+    resolve_knowledge_tenant,
+    sanitize_prompt,
+    verify_api_key,
+)
 from tacit.dependencies import PipelineDependencies
+from tacit.errors import PipelineExecutionError, safe_failure_diagnostics
 from tacit.models.schemas import DashRequest, DashResponse
 from tacit.pipeline import run_pipeline
 from tacit.pipeline.progress import reset_progress_callback, set_progress_callback
@@ -20,27 +30,64 @@ logger = structlog.get_logger()
 router = APIRouter()
 
 
+def _pipeline_error_payload(exc: PipelineExecutionError) -> dict[str, str]:
+    return exc.public_payload()
+
+
+def _configured_tenant(request: DashRequest, http_request: Request, deps: PipelineDependencies) -> str:
+    selected_tenant = knowledge_tenant(http_request)
+    configured_tenant = getattr(deps.settings, "knowledge_tenant_id", "default")
+    resolved_tenant = resolve_knowledge_tenant(configured_tenant, selected_tenant)
+    if request.tenant_id and request.tenant_id != resolved_tenant:
+        raise HTTPException(status_code=403, detail="Tenant access denied")
+    return resolved_tenant
+
+
 @router.post(
     "/api/v1/chart",
     response_model=DashResponse,
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[
+        Depends(verify_api_key),
+        Depends(require_knowledge_tenant),
+        Depends(require_knowledge_action(KnowledgeAction.READ)),
+        Depends(require_knowledge_action(KnowledgeAction.APPLY)),
+    ],
     tags=["Investigation Generation"],
     summary="Generate a dashboard",
     response_description="Published dashboard URL, UID, panel count, and summary",
 )
 async def create_chart(
     request: DashRequest,
+    http_request: Request,
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     """Generate a Grafana dashboard from a natural-language prompt."""
-    request = request.model_copy(update={"prompt": sanitize_prompt(request.prompt)})
+    request = request.model_copy(
+        update={
+            "prompt": sanitize_prompt(request.prompt),
+            "tenant_id": _configured_tenant(request, http_request, deps),
+            "user_id": authenticated_actor(http_request),
+        }
+    )
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
     try:
         return await run_pipeline(request, deps)
-    except Exception:
-        logger.exception("api_pipeline_error")
-        raise HTTPException(status_code=500, detail="Failed to generate dashboard")
+    except PipelineExecutionError as exc:
+        logger.error(
+            "api_pipeline_error",
+            investigation_id=exc.investigation_id,
+            investigation_run_id=exc.investigation_run_id,
+            audit_status=exc.audit_status,
+            **safe_failure_diagnostics(exc, reason_code="api_pipeline_error"),
+        )
+        return JSONResponse(status_code=500, content=_pipeline_error_payload(exc))
+    except Exception as exc:
+        logger.error(
+            "api_pipeline_error",
+            **safe_failure_diagnostics(exc, reason_code="api_pipeline_error"),
+        )
+        raise HTTPException(status_code=500, detail="Failed to generate dashboard") from None
 
 
 def _sse_frame(event: str, data: dict) -> str:
@@ -49,7 +96,12 @@ def _sse_frame(event: str, data: dict) -> str:
 
 @router.post(
     "/api/v1/chart/stream",
-    dependencies=[Depends(verify_api_key)],
+    dependencies=[
+        Depends(verify_api_key),
+        Depends(require_knowledge_tenant),
+        Depends(require_knowledge_action(KnowledgeAction.READ)),
+        Depends(require_knowledge_action(KnowledgeAction.APPLY)),
+    ],
     tags=["Investigation Generation"],
     summary="Generate a dashboard with live stage streaming (SSE)",
     response_description="Server-Sent Events: `stage` events while the pipeline runs, "
@@ -57,6 +109,7 @@ def _sse_frame(event: str, data: dict) -> str:
 )
 async def create_chart_stream(
     request: DashRequest,
+    http_request: Request,
     deps: PipelineDependencies = Depends(get_pipeline_dependencies),
 ):
     """Stream pipeline progress as Server-Sent Events.
@@ -65,7 +118,13 @@ async def create_chart_stream(
     ranking, publish, ...) as the investigation is built, followed by a final
     `result` event containing the standard DashResponse JSON.
     """
-    request = request.model_copy(update={"prompt": sanitize_prompt(request.prompt)})
+    request = request.model_copy(
+        update={
+            "prompt": sanitize_prompt(request.prompt),
+            "tenant_id": _configured_tenant(request, http_request, deps),
+            "user_id": authenticated_actor(http_request),
+        }
+    )
     if not request.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
@@ -92,8 +151,27 @@ async def create_chart_stream(
                 yield _sse_frame("stage", event)
             try:
                 result = task.result()
-            except Exception:
-                logger.exception("api_pipeline_stream_error")
+            except PipelineExecutionError as exc:
+                logger.error(
+                    "api_pipeline_stream_error",
+                    investigation_id=exc.investigation_id,
+                    investigation_run_id=exc.investigation_run_id,
+                    audit_status=exc.audit_status,
+                    **safe_failure_diagnostics(
+                        exc,
+                        reason_code="api_pipeline_stream_error",
+                    ),
+                )
+                yield _sse_frame("error", _pipeline_error_payload(exc))
+                return
+            except Exception as exc:
+                logger.error(
+                    "api_pipeline_stream_error",
+                    **safe_failure_diagnostics(
+                        exc,
+                        reason_code="api_pipeline_stream_error",
+                    ),
+                )
                 yield _sse_frame("error", {"detail": "Failed to generate dashboard"})
                 return
             yield _sse_frame("result", result.model_dump(mode="json"))

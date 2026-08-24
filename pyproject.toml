@@ -24,6 +24,7 @@ dependencies = [
     "click>=8.1.0",
     "rich>=13.0.0",
     "promql-parser>=0.9.0",
+    "packaging>=24.0",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +44,7 @@ dev = [
     "mypy>=2.1.0",
     "types-PyYAML>=6.0",
     "respx>=0.21.0",
+    "playwright>=1.52.0",
 ]
 
 [tool.pytest.ini_options]
@@ -69,6 +71,7 @@ target-version = ["py312"]
 [tool.mypy]
 python_version = "3.12"
 files = ["tacit"]
+exclude = ["^demo/", "^tests/"]
 ignore_missing_imports = true
 warn_unused_ignores = true
 no_implicit_optional = true
@@ -82,6 +85,7 @@ packages = ["tacit"]
 # load the same bootstrap resources without depending on the working directory.
 "tacit/data/archetypes.yaml" = "tacit/data/archetypes.yaml"
 "tacit/data/grounding_benchmark_v1.json" = "tacit/data/grounding_benchmark_v1.json"
+"tacit/data/operational_learning_v1.json" = "tacit/data/operational_learning_v1.json"
 "tacit/data/signals.yaml" = "tacit/data/signals.yaml"
 
 [tool.hatch.build.targets.sdist]

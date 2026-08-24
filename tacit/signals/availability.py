@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Final
 
+from tacit.errors import AUTHORITY_BOUNDARY_ERRORS
+
 
 class UnavailableSignalStore:
     """Marker that forbids fallback to process-global signal storage."""
@@ -34,5 +36,7 @@ def resolve_signal_store(
         return signal_store
     try:
         return fallback_factory()
+    except AUTHORITY_BOUNDARY_ERRORS:
+        raise
     except Exception:
         return None

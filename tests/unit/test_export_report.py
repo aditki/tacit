@@ -3,12 +3,18 @@ from __future__ import annotations
 import json
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from click.testing import CliRunner
 
+from tacit.cli import cli
+from tacit.config import Settings
 from tacit.export_report import (
     ANONYMOUS_BUNDLE_FILES,
     ReportAnonymizer,
+    _collect_recent_investigations,
+    build_assessment_report,
     export_assessment_report,
     validate_report_for_leakage,
 )
@@ -24,7 +30,7 @@ SENSITIVE_STRINGS = (
 
 
 class FakeHistoryStore:
-    def stats(self):
+    def stats(self, *, tenant_id=None):
         return {
             "total": 1,
             "succeeded": 1,
@@ -37,7 +43,7 @@ class FakeHistoryStore:
             "freeform_path": 0,
         }
 
-    def list_recent(self, limit=50, offset=0, status=None, user_id=None):
+    def list_recent(self, limit=50, offset=0, status=None, user_id=None, tenant_id=None):
         return [
             {
                 "id": "inv-1",
@@ -61,7 +67,7 @@ class FakeHistoryStore:
 
 
 class FakeFeedbackStore:
-    def get_aggregate_stats(self):
+    def get_aggregate_stats(self, *, tenant_id="default"):
         return {
             "total_feedback": 1,
             "total_dashboards": 1,
@@ -72,7 +78,7 @@ class FakeFeedbackStore:
             "avg_investigation_speed": 5,
         }
 
-    def analyze(self):
+    def analyze(self, *, tenant_id="default"):
         return {
             "total_feedback": 1,
             "recommendations": ["raw recommendation mentioning https://internal.example.company"],
@@ -80,8 +86,44 @@ class FakeFeedbackStore:
         }
 
 
+def test_history_export_respects_the_store_page_limit() -> None:
+    rows = [{"id": f"inv-{index}"} for index in range(501)]
+    calls: list[tuple[int, int]] = []
+
+    class CappedHistoryStore:
+        def list_recent(self, *, limit, offset, tenant_id):
+            assert tenant_id == "tenant-a"
+            assert 1 <= limit <= 500
+            calls.append((limit, offset))
+            return rows[offset : offset + limit]
+
+    exported = _collect_recent_investigations(CappedHistoryStore(), tenant_id="tenant-a")
+
+    assert exported == rows
+    assert calls == [(500, 0), (500, 500)]
+
+
+def test_anonymous_cli_export_succeeds_with_configured_role_paths(tmp_path: Path) -> None:
+    output = tmp_path / "assessment.tar.gz"
+    environment = {
+        "HISTORY_DB_PATH": str(tmp_path / "history" / "history.db"),
+        "FEEDBACK_DB_PATH": str(tmp_path / "feedback" / "feedback.db"),
+        "SIGNALS_DB_PATH": str(tmp_path / "signals" / "signals.db"),
+        "KNOWLEDGE_TENANT_ID": "default",
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["export-report", "--anonymous", "--validate", "--output", str(output)],
+        env=environment,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert output.is_file()
+
+
 class FakeSignalStore:
-    def stats(self):
+    def stats(self, *, tenant_id="default"):
         return {
             "signal_types": 2,
             "metric_mappings": 3,
@@ -95,7 +137,7 @@ class FakeSignalStore:
             "signals_by_category": {"latency": 1, "prod-us-east-1-payments-vip": 1},
         }
 
-    def list_ingested_dashboards(self, status=None, limit=50):
+    def list_ingested_dashboards(self, status=None, limit=50, *, tenant_id="default"):
         return [
             {
                 "dashboard_uid": "checkout-dashboard",
@@ -108,7 +150,7 @@ class FakeSignalStore:
             }
         ]
 
-    def list_ingested_alerts(self, status=None, limit=50):
+    def list_ingested_alerts(self, status=None, limit=50, *, tenant_id="default"):
         return [
             {
                 "alert_uid": "checkout-alert",
@@ -120,7 +162,7 @@ class FakeSignalStore:
             }
         ]
 
-    def list_learned_artifacts(self, *, artifact_type=None, limit=50):
+    def list_learned_artifacts(self, *, tenant_id="default", artifact_type=None, limit=50):
         return [
             {
                 "artifact_id": "runbook-1",
@@ -132,16 +174,74 @@ class FakeSignalStore:
 
 
 @pytest.fixture
-def fake_stores(monkeypatch):
-    monkeypatch.setattr("tacit.history.get_investigation_store", lambda: FakeHistoryStore())
-    monkeypatch.setattr("tacit.feedback.get_feedback_store", lambda: FakeFeedbackStore())
-    monkeypatch.setattr("tacit.signals.get_signal_store", lambda: FakeSignalStore())
+def fake_stores():
+    return SimpleNamespace(
+        settings=Settings(_env_file=None),
+        history=FakeHistoryStore,
+        feedback=FakeFeedbackStore,
+        signals=FakeSignalStore,
+    )
+
+
+def test_assessment_report_scopes_every_store_to_the_configured_tenant():
+    seen: list[tuple[str, str | None]] = []
+
+    class ScopedHistoryStore(FakeHistoryStore):
+        def stats(self, *, tenant_id=None):
+            seen.append(("history_stats", tenant_id))
+            return super().stats(tenant_id=tenant_id)
+
+        def list_recent(self, limit=50, offset=0, status=None, user_id=None, tenant_id=None):
+            seen.append(("history_rows", tenant_id))
+            return super().list_recent(limit, offset, status, user_id, tenant_id)
+
+    class ScopedFeedbackStore(FakeFeedbackStore):
+        def get_aggregate_stats(self, *, tenant_id="default"):
+            seen.append(("feedback_stats", tenant_id))
+            return super().get_aggregate_stats(tenant_id=tenant_id)
+
+        def analyze(self, *, tenant_id="default"):
+            seen.append(("feedback_analysis", tenant_id))
+            return super().analyze(tenant_id=tenant_id)
+
+    class ScopedSignalStore(FakeSignalStore):
+        def stats(self, *, tenant_id="default"):
+            seen.append(("signal_stats", tenant_id))
+            return super().stats(tenant_id=tenant_id)
+
+        def list_ingested_dashboards(self, status=None, limit=50, *, tenant_id="default"):
+            seen.append(("dashboards", tenant_id))
+            return super().list_ingested_dashboards(status, limit, tenant_id=tenant_id)
+
+        def list_ingested_alerts(self, status=None, limit=50, *, tenant_id="default"):
+            seen.append(("alerts", tenant_id))
+            return super().list_ingested_alerts(status, limit, tenant_id=tenant_id)
+
+        def list_learned_artifacts(self, *, tenant_id="default", artifact_type=None, limit=50):
+            seen.append(("artifacts", tenant_id))
+            return super().list_learned_artifacts(
+                tenant_id=tenant_id,
+                artifact_type=artifact_type,
+                limit=limit,
+            )
+
+    stores = SimpleNamespace(
+        settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+        history=lambda: ScopedHistoryStore(),
+        feedback=lambda: ScopedFeedbackStore(),
+        signals=lambda: ScopedSignalStore(),
+    )
+
+    build_assessment_report(anonymous=False, stores=stores)
+
+    assert seen
+    assert {tenant_id for _, tenant_id in seen} == {"tenant-a"}
 
 
 def test_anonymous_export_writes_safe_bundle_files(tmp_path: Path, fake_stores):
     output = tmp_path / "bundle.tar.gz"
 
-    result = export_assessment_report(output=output, anonymous=True, validate=True)
+    result = export_assessment_report(output=output, anonymous=True, validate=True, stores=fake_stores)
 
     assert result.output_path == output.resolve()
     assert result.validation_report["passed"] is True
@@ -176,7 +276,7 @@ def test_anonymous_export_includes_evaluation_summary_when_results_exist(tmp_pat
     monkeypatch.setenv("TACIT_EVALUATION_RESULTS_DIR", str(evaluation_dir))
     output = tmp_path / "bundle.tar.gz"
 
-    result = export_assessment_report(output=output, anonymous=True, validate=True)
+    result = export_assessment_report(output=output, anonymous=True, validate=True, stores=fake_stores)
 
     assert result.validation_report["passed"] is True
     with tarfile.open(output, "r:gz") as tar:
@@ -199,7 +299,7 @@ def test_anonymous_export_includes_evaluation_summary_when_results_exist(tmp_pat
 def test_raw_export_includes_local_details(tmp_path: Path, fake_stores):
     output = tmp_path / "raw.tar.gz"
 
-    result = export_assessment_report(output=output, anonymous=False)
+    result = export_assessment_report(output=output, anonymous=False, stores=fake_stores)
 
     with tarfile.open(output, "r:gz") as tar:
         names = tar.getnames()

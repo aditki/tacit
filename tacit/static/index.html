@@ -28,7 +28,7 @@
     .subtitle { color: #9ca3af; font-size: 0.9rem; margin-bottom: 1.5rem; }
 
     /* Tabs */
-    .tabs { display: flex; gap: 0.25rem; margin-bottom: 1.5rem; }
+    .tabs { display: flex; gap: 0.25rem; margin-bottom: 0.75rem; }
     .tab {
       padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem;
       cursor: pointer; color: #9ca3af; background: transparent; border: 1px solid transparent;
@@ -36,6 +36,15 @@
     }
     .tab:hover { color: #e4e6eb; }
     .tab.active { background: #1a1d27; border-color: #3b3f54; color: #c7d2fe; }
+    .runtime-context {
+      width: 100%; max-width: 640px; display: flex; justify-content: flex-end;
+      gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap;
+    }
+    .runtime-context input {
+      width: 10rem; max-width: 45vw; background: #0f1117; border: 1px solid #3b3f54;
+      border-radius: 6px; color: #e4e6eb; padding: 0.45rem 0.6rem; font-size: 0.8rem;
+    }
+    .runtime-context input:focus { outline: none; border-color: #6366f1; }
     .tab-content { display: none; width: 100%; max-width: 640px; }
     .tab-content.active { display: block; }
 
@@ -259,15 +268,20 @@
 </head>
 <body>
   <h1>Tacit</h1>
-  <p class="subtitle">Natural language &rarr; Grafana dashboards</p>
+  <p class="subtitle">Operational investigations with evidence and governed knowledge</p>
 
   <div class="tabs">
     <div class="tab active" onclick="switchTab('generate')">Generate</div>
     <div class="tab" onclick="switchTab('learning')">Learning</div>
+    <div class="tab" onclick="switchTab('knowledge')">Knowledge</div>
     <div class="tab" onclick="switchTab('signals')">Signals</div>
     <div class="tab" onclick="switchTab('insights')">Insights</div>
     <div class="tab" onclick="switchTab('archetypes')">Archetypes</div>
     <div class="tab" onclick="switchTab('history')">History</div>
+  </div>
+  <div class="runtime-context">
+    <input id="knowledge-tenant" type="text" placeholder="Tenant" aria-label="Knowledge tenant">
+    <input id="api-key" type="password" placeholder="API key" aria-label="API key" autocomplete="off">
   </div>
 
   <!-- Generate tab -->
@@ -333,6 +347,18 @@
       <hr class="section-divider">
       <div class="result-label">Ingested Dashboards</div>
       <div id="ingested-list"><div class="status">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Knowledge tab -->
+  <div class="tab-content" id="tab-knowledge">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem">
+        <div class="result-label" style="margin:0">Knowledge Review Queue</div>
+        <button class="btn-secondary btn-sm" onclick="loadKnowledgeQueue()" title="Refresh review queue">&#8635;</button>
+      </div>
+      <div id="knowledge-status" style="font-size:0.75rem;color:#6b7280;margin-bottom:0.75rem"></div>
+      <div id="knowledge-queue"><div class="status">Loading...</div></div>
     </div>
   </div>
 
@@ -411,10 +437,97 @@
   </div>
 
   <script>
-    const BASE = window.location.origin;
+    const LOCAL_API_BASE = 'http://127.0.0.1:8000';
+    const BASE = window.location.protocol === 'file:' ? LOCAL_API_BASE : window.location.origin;
+    const KNOWLEDGE_TENANT_KEY = 'tacit.knowledgeTenant';
+    const API_KEY_SESSION_KEY = 'tacit.apiKey';
     let lastDashboardUid = null;
+    let lastDashboardTenant = '';
+    let tenantRequestGeneration = 0;
+    let signalCatalogState = {
+      tenant: '', items: [], hasMore: false, nextCursor: null, total: 0, mappingTotal: 0,
+    };
+    let historyListState = {
+      tenant: '', status: '', items: [], nextCursor: null,
+    };
+    let ingestedDashboardState = {
+      tenant: '', items: [], nextCursor: null,
+    };
+    let knowledgeQueueState = {
+      tenant: '', candidates: [], conflicts: [], attention: [], statsTenant: '',
+      candidateHasMore: false, candidateNextCursor: null,
+      conflictHasMore: false, conflictNextCursor: null,
+      attentionHasMore: false, attentionNextCursor: null,
+    };
 
-    const TAB_ORDER = ['generate','learning','signals','insights','archetypes','history'];
+    class StaleTenantResponse extends Error {
+      constructor() {
+        super('Tenant changed while the request was in flight');
+        this.name = 'StaleTenantResponse';
+      }
+    }
+
+    function tenantInputValue() {
+      return document.getElementById('knowledge-tenant')?.value.trim() || '';
+    }
+
+    function selectedTenant() {
+      const tenant = tenantInputValue();
+      if (tenant) localStorage.setItem(KNOWLEDGE_TENANT_KEY, tenant);
+      else localStorage.removeItem(KNOWLEDGE_TENANT_KEY);
+      return tenant;
+    }
+
+    function captureTenantRequest(tenant = selectedTenant()) {
+      return Object.freeze({ tenant, generation: tenantRequestGeneration });
+    }
+
+    function tenantRequestIsCurrent(request) {
+      return request.generation === tenantRequestGeneration && request.tenant === tenantInputValue();
+    }
+
+    function requireCurrentTenantRequest(request) {
+      if (!tenantRequestIsCurrent(request)) throw new StaleTenantResponse();
+    }
+
+    function isStaleTenantResponse(error) {
+      return error instanceof StaleTenantResponse;
+    }
+
+    function knowledgeHeaders(extra = {}, tenant = '') {
+      const headers = { ...extra };
+      if (tenant) headers['X-Tacit-Tenant'] = tenant;
+      const apiKey = document.getElementById('api-key')?.value || sessionStorage.getItem(API_KEY_SESSION_KEY) || '';
+      if (apiKey) headers['X-API-Key'] = apiKey;
+      return headers;
+    }
+
+    async function fetchTenantJson(url, options = {}, request) {
+      requireCurrentTenantRequest(request);
+      const response = await fetch(url, {
+        ...options,
+        headers: knowledgeHeaders(options.headers || {}, request.tenant),
+      });
+      const text = await response.text();
+      requireCurrentTenantRequest(request);
+      let body = null;
+      if (text) {
+        try {
+          body = JSON.parse(text);
+        } catch {
+          if (!response.ok) {
+            throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 160)}`);
+          }
+          throw new Error(`Invalid JSON response: ${text.slice(0, 160)}`);
+        }
+      }
+      if (!response.ok) {
+        throw new Error(errMsg(body, `${response.status} ${response.statusText}`));
+      }
+      return body ?? {};
+    }
+
+    const TAB_ORDER = ['generate','learning','knowledge','signals','insights','archetypes','history'];
 
     /* ── Tabs ──────────────────────────────────────────────────── */
     function switchTab(name) {
@@ -426,6 +539,7 @@
       if (name === 'archetypes') loadArchetypes();
       if (name === 'history') loadHistory();
       if (name === 'learning') loadIngestedDashboards();
+      if (name === 'knowledge') loadKnowledgeQueue();
       if (name === 'signals') loadSignals();
     }
 
@@ -482,16 +596,19 @@
       }
     }
 
-    async function streamChart(payload, onStage) {
+    async function streamChart(payload, onStage, request) {
+      requireCurrentTenantRequest(request);
       const resp = await fetch(`${BASE}/api/v1/chart/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: knowledgeHeaders({ 'Content-Type': 'application/json' }, request.tenant),
         body: JSON.stringify(payload),
       });
       if (!resp.ok || !resp.body) {
         const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+        requireCurrentTenantRequest(request);
         throw new Error(errMsg(err, `HTTP ${resp.status}`));
       }
+      requireCurrentTenantRequest(request);
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buf = '', result = null;
@@ -500,6 +617,10 @@
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
+          if (!tenantRequestIsCurrent(request)) {
+            await reader.cancel();
+            throw new StaleTenantResponse();
+          }
           buf += decoder.decode(value, { stream: true });
           let idx;
           while ((idx = buf.indexOf('\n\n')) >= 0) {
@@ -517,6 +638,7 @@
           }
         }
       } catch (e) {
+        if (isStaleTenantResponse(e)) throw e;
         if (workStarted) throw new PipelineStreamError(e.message || 'Stream failed after pipeline started');
         throw e;
       }
@@ -524,6 +646,7 @@
         if (workStarted) throw new PipelineStreamError('Stream ended without a result');
         throw new Error('Stream ended without a result');
       }
+      requireCurrentTenantRequest(request);
       return result;
     }
 
@@ -537,8 +660,12 @@
       result.innerHTML = '<div class="status"><span class="spinner"></span>Starting investigation pipeline...</div>';
 
       const payload = { prompt, user_id: 'web-ui', channel_id: 'web' };
+      const request = captureTenantRequest();
+      const tenant = request.tenant;
+      if (tenant) payload.tenant_id = tenant;
       const stages = [];
       const onStage = (ev) => {
+        if (!tenantRequestIsCurrent(request)) return;
         // Collapse repeat events for the same stage (e.g. publish started → passed)
         const existing = stages.findIndex(s => s.stage === ev.stage);
         if (existing >= 0) stages[existing] = ev; else stages.push(ev);
@@ -549,32 +676,40 @@
       try {
         let data;
         try {
-          data = await streamChart(payload, onStage);
+          data = await streamChart(payload, onStage, request);
         } catch (streamErr) {
-          if (streamErr instanceof PipelineStreamError) throw streamErr;
+          if (streamErr instanceof PipelineStreamError || isStaleTenantResponse(streamErr)) throw streamErr;
           // Fall back to the non-streaming endpoint (older servers / proxies)
           console.warn('SSE stream failed, falling back to /api/v1/chart:', streamErr);
-          const resp = await fetch(`${BASE}/api/v1/chart`, {
+          data = await fetchTenantJson(`${BASE}/api/v1/chart`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
-          });
-          if (!resp.ok) {
-            const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-            throw new Error(errMsg(err, `HTTP ${resp.status}`));
-          }
-          data = await resp.json();
+          }, request);
         }
+        requireCurrentTenantRequest(request);
         lastDashboardUid = data.dashboard_uid;
+        lastDashboardTenant = tenant;
         let contract = null;
+        let contractWarning = '';
         if (data.investigation_id) {
           const revisionQuery = data.investigation_revision == null ? '' : `?revision=${data.investigation_revision}`;
-          const contractResp = await fetch(`${BASE}/api/v1/investigations/${encodeURIComponent(data.investigation_id)}/contract${revisionQuery}`);
-          if (contractResp.ok) contract = await contractResp.json();
+          try {
+            contract = await fetchTenantJson(
+              `${BASE}/api/v1/investigations/${encodeURIComponent(data.investigation_id)}/contract${revisionQuery}`,
+              {},
+              request,
+            );
+          } catch (error) {
+            if (isStaleTenantResponse(error)) throw error;
+            contractWarning = `Investigation contract unavailable: ${error.message}`;
+          }
         }
         const dashUrl = data.dashboard_url ? data.dashboard_url.replace('http://localhost:3000', 'http://' + window.location.hostname + ':3000') : '';
-        const grafanaLink = dashUrl ? `<div class="result-url"><a href="${esc(dashUrl)}" target="_blank">${esc(data.dashboard_uid)} &mdash; Open in Grafana &rarr;</a></div>` : '';
-        const sfxLink = data.signalfx_url ? `<div class="result-url" style="margin-top:4px"><a href="${esc(data.signalfx_url)}" target="_blank">Open in SignalFx &rarr;</a></div>` : '';
+        const grafanaUrl = safeExternalUrl(dashUrl);
+        const signalFxUrl = safeExternalUrl(data.signalfx_url);
+        const grafanaLink = grafanaUrl ? `<div class="result-url"><a href="${escAttr(grafanaUrl)}" target="_blank" rel="noopener noreferrer">${esc(data.dashboard_uid)} &mdash; Open in Grafana &rarr;</a></div>` : '';
+        const sfxLink = signalFxUrl ? `<div class="result-url" style="margin-top:4px"><a href="${escAttr(signalFxUrl)}" target="_blank" rel="noopener noreferrer">Open in SignalFx &rarr;</a></div>` : '';
         const grounding = contract?.grounding;
         const groundingHtml = grounding ? `<div class="result-meta" style="margin-top:10px">
           <strong>Grounding:</strong> ${esc(grounding.status)}${grounding.abstained ? ' (abstained)' : ''}<br>
@@ -592,6 +727,7 @@
               ${esc(data.summary).replace(/\n/g, '<br>')}
             </div>
             ${groundingHtml}
+            ${contractWarning ? `<div class="result-meta" style="color:#fbbf24">${esc(contractWarning)}</div>` : ''}
             <div class="feedback-form" id="feedback-form">
               <h3>Rate this dashboard</h3>
               ${ratingRow('symptom', 'Symptom visibility')}
@@ -611,6 +747,7 @@
             </div>
           </div>`;
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
         result.innerHTML = (stages.length ? renderStages(stages) : '') + `
           <div class="result-card error">
             <div class="result-label">Error</div>
@@ -666,24 +803,20 @@
         comment: document.getElementById('fb-comment').value.trim(),
         reviewer: 'web-ui',
       };
+      const request = captureTenantRequest(lastDashboardTenant);
       try {
         statusEl.textContent = 'Submitting...';
         statusEl.style.color = '#9ca3af';
-        const resp = await fetch(`${BASE}/api/v1/feedback`, {
+        await fetchTenantJson(`${BASE}/api/v1/feedback`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
-        });
-        if (resp.ok) {
-          statusEl.textContent = 'Feedback submitted!';
-          statusEl.style.color = '#34d399';
-          document.getElementById('feedback-form').querySelectorAll('button,textarea').forEach(el => el.disabled = true);
-        } else {
-          const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-          statusEl.textContent = `Error: ${errMsg(err, resp.statusText)}`;
-          statusEl.style.color = '#ef4444';
-        }
+        }, request);
+        statusEl.textContent = 'Feedback submitted!';
+        statusEl.style.color = '#34d399';
+        document.getElementById('feedback-form').querySelectorAll('button,textarea').forEach(el => el.disabled = true);
       } catch(e) {
+        if (isStaleTenantResponse(e)) return;
         statusEl.textContent = 'Failed to submit: ' + e.message;
         statusEl.style.color = '#ef4444';
       }
@@ -693,10 +826,11 @@
     async function loadInsights() {
       const el = document.getElementById('stats-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      const request = captureTenantRequest();
       try {
         const [stats, analysis] = await Promise.all([
-          fetchJson(`${BASE}/api/v1/feedback/stats`),
-          fetchJson(`${BASE}/api/v1/feedback/analysis`),
+          fetchTenantJson(`${BASE}/api/v1/feedback/stats`, {}, request),
+          fetchTenantJson(`${BASE}/api/v1/feedback/analysis`, {}, request),
         ]);
 
         if (!stats.total_feedback && stats.total_feedback !== 0) {
@@ -704,18 +838,29 @@
           return;
         }
 
+        const finiteNumber = (value, fallback = null) => {
+          const parsed = Number(value);
+          return Number.isFinite(parsed) ? parsed : fallback;
+        };
+        const totalFeedback = finiteNumber(stats.total_feedback, 0);
+        const totalDashboards = finiteNumber(stats.total_dashboards, 0);
+        const usefulRate = finiteNumber(stats.useful_rate);
+        const averageNoise = finiteNumber(stats.avg_noise_level);
         let html = `<div class="stats-grid">
-          <div class="stat-card"><div class="stat-value">${stats.total_feedback || 0}</div><div class="stat-label">Total reviews</div></div>
-          <div class="stat-card"><div class="stat-value">${stats.total_dashboards || 0}</div><div class="stat-label">Dashboards reviewed</div></div>
-          <div class="stat-card"><div class="stat-value">${stats.useful_rate != null ? (stats.useful_rate * 100).toFixed(0) + '%' : '--'}</div><div class="stat-label">Useful rate</div></div>
-          <div class="stat-card"><div class="stat-value">${stats.avg_noise_level || '--'}</div><div class="stat-label">Avg signal clarity</div></div>
+          <div class="stat-card"><div class="stat-value">${totalFeedback}</div><div class="stat-label">Total reviews</div></div>
+          <div class="stat-card"><div class="stat-value">${totalDashboards}</div><div class="stat-label">Dashboards reviewed</div></div>
+          <div class="stat-card"><div class="stat-value">${usefulRate != null ? (usefulRate * 100).toFixed(0) + '%' : '--'}</div><div class="stat-label">Useful rate</div></div>
+          <div class="stat-card"><div class="stat-value">${averageNoise != null ? averageNoise : '--'}</div><div class="stat-label">Avg signal clarity</div></div>
         </div>`;
 
         if (analysis.recommendations && analysis.recommendations.length > 0) {
           html += '<div class="rec-list"><div class="result-label" style="margin-top:1rem">Recommendations</div>';
           for (const r of analysis.recommendations) {
-            const parts = r.split(':');
-            html += `<div class="rec-item"><strong>${parts[0]}:</strong>${parts.slice(1).join(':')}</div>`;
+            const recommendation = String(r ?? '');
+            const separator = recommendation.indexOf(':');
+            const label = separator >= 0 ? recommendation.slice(0, separator) : 'Recommendation';
+            const detail = separator >= 0 ? recommendation.slice(separator + 1) : recommendation;
+            html += `<div class="rec-item"><strong>${esc(label)}:</strong>${esc(detail)}</div>`;
           }
           html += '</div>';
         }
@@ -723,12 +868,17 @@
         if (analysis.per_archetype_quality && analysis.per_archetype_quality.length > 0) {
           html += '<div class="result-label" style="margin-top:1rem">Per-archetype quality</div>';
           for (const a of analysis.per_archetype_quality) {
-            html += `<div class="rec-item">${a.archetype}: useful=${(a.useful_rate*100).toFixed(0)}%, noise=${a.avg_noise}/5, symptom=${a.avg_symptom}/5 (n=${a.count})</div>`;
+            const useful = finiteNumber(a.useful_rate, 0);
+            const noise = finiteNumber(a.avg_noise, 0);
+            const symptom = finiteNumber(a.avg_symptom, 0);
+            const count = finiteNumber(a.count, 0);
+            html += `<div class="rec-item">${esc(a.archetype || '')}: useful=${(useful * 100).toFixed(0)}%, noise=${noise}/5, symptom=${symptom}/5 (n=${count})</div>`;
           }
         }
 
         el.innerHTML = html;
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
         el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${esc(e.message)}</div>`;
       }
     }
@@ -737,9 +887,9 @@
     async function loadArchetypes() {
       const el = document.getElementById('archetypes-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      const request = captureTenantRequest();
       try {
-        const resp = await fetch(`${BASE}/api/v1/archetypes`);
-        const data = await resp.json();
+        const data = await fetchTenantJson(`${BASE}/api/v1/archetypes`, {}, request);
         let html = '';
         for (const a of data.archetypes) {
           const tags = a.tags.map(t => `<span class="arch-tag">${esc(t)}</span>`).join('');
@@ -752,64 +902,146 @@
         }
         el.innerHTML = html || '<div class="status">No archetypes loaded</div>';
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
         el.innerHTML = `<div class="status" style="color:#fca5a5">Failed to load: ${esc(e.message)}</div>`;
       }
     }
 
     async function reloadArchetypes() {
+      const request = captureTenantRequest();
       try {
-        await fetch(`${BASE}/api/v1/archetypes/reload`, { method: 'POST' });
-        loadArchetypes();
-      } catch(e) { alert('Reload failed: ' + e.message); }
+        await fetchTenantJson(`${BASE}/api/v1/archetypes/reload`, { method: 'POST' }, request);
+        if (tenantRequestIsCurrent(request)) loadArchetypes();
+      } catch(e) {
+        if (isStaleTenantResponse(e)) return;
+        document.getElementById('archetypes-content').innerHTML = `<div class="status" style="color:#fca5a5">Reload failed: ${esc(e.message)}</div>`;
+      }
     }
 
     /* ── History tab ──────────────────────────────────────────── */
+    function renderHistoryList(request) {
+      const el = document.getElementById('history-content');
+      if (!tenantRequestIsCurrent(request) || historyListState.tenant !== request.tenant) return;
+      if (!historyListState.items.length) {
+        el.innerHTML = '<div class="status">No investigations yet. Generate a dashboard to see history.</div>';
+        return;
+      }
+      const table = document.createElement('table');
+      table.className = 'hist-table';
+      const head = table.createTHead().insertRow();
+      for (const [label, width] of [
+        ['Status', '70px'], ['Prompt', '30%'], ['Path', '65px'], ['Panels', '50px'],
+        ['Time', '50px'], ['Archetypes', '25%'], ['', '55px'],
+      ]) {
+        const cell = document.createElement('th');
+        cell.textContent = label;
+        cell.style.width = width;
+        head.appendChild(cell);
+      }
+      const body = table.createTBody();
+      for (const inv of historyListState.items) {
+        const promptValue = String(inv.prompt || '');
+        const prompt = promptValue.length > 50 ? promptValue.slice(0, 47) + '...' : promptValue;
+        const archs = (inv.archetypes || []).slice(0, 2).map(a => {
+          const src = a.source === 'learned' ? ' learned' : '';
+          return `${a.type}(${Math.round(a.confidence*100)}%${src})`;
+        }).join(', ') || '—';
+        const row = body.insertRow();
+        const statusCell = row.insertCell();
+        statusCell.appendChild(statusBadgeElement(inv.status));
+        const promptCell = row.insertCell();
+        promptCell.className = 'prompt-cell';
+        promptCell.title = promptValue;
+        promptCell.textContent = prompt;
+        row.insertCell().textContent = String(inv.path_used || '—');
+        row.insertCell().textContent = String(inv.panel_count ?? 0);
+        row.insertCell().textContent = inv.total_time ? `${Number(inv.total_time).toFixed(1)}s` : '—';
+        const archetypeCell = row.insertCell();
+        archetypeCell.className = 'arch-cell';
+        archetypeCell.style.fontSize = '0.75rem';
+        archetypeCell.textContent = archs;
+        const actionCell = row.insertCell();
+        const detail = document.createElement('span');
+        detail.className = 'hist-back investigation-detail-btn';
+        detail.dataset.investigationId = String(inv.id || '');
+        detail.dataset.investigationTenant = request.tenant;
+        detail.textContent = 'Details';
+        actionCell.appendChild(detail);
+      }
+      const children = [table];
+      if (historyListState.nextCursor) {
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+        actions.style.justifyContent = 'center';
+        actions.style.marginTop = '1rem';
+        const more = document.createElement('button');
+        more.className = 'btn-secondary btn-sm history-more';
+        more.dataset.historyTenant = request.tenant;
+        more.textContent = 'Load more investigations';
+        actions.appendChild(more);
+        children.push(actions);
+      }
+      el.replaceChildren(...children);
+    }
+
     async function loadHistory() {
       const el = document.getElementById('history-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
       const status = document.getElementById('hist-status').value;
-      const qs = status ? `?status=${status}&limit=50` : '?limit=50';
+      const request = captureTenantRequest();
+      historyListState = { tenant: request.tenant, status, items: [], nextCursor: null };
+      const params = new URLSearchParams({ limit: '50' });
+      if (status) params.set('status', status);
       try {
-        const resp = await fetch(`${BASE}/api/v1/investigations${qs}`);
-        const data = await resp.json();
-        if (!data.investigations || data.investigations.length === 0) {
-          el.innerHTML = '<div class="status">No investigations yet. Generate a dashboard to see history.</div>';
-          return;
-        }
-        let html = `<table class="hist-table"><thead><tr>
-          <th style="width:70px">Status</th><th style="width:30%">Prompt</th><th style="width:65px">Path</th><th style="width:50px">Panels</th><th style="width:50px">Time</th><th style="width:25%">Archetypes</th><th style="width:55px"></th>
-        </tr></thead><tbody>`;
-        for (const inv of data.investigations) {
-          const badge = statusBadge(inv.status);
-          const prompt = inv.prompt.length > 50 ? inv.prompt.slice(0, 47) + '...' : inv.prompt;
-          const archs = (inv.archetypes || []).slice(0, 2).map(a => {
-            const src = a.source === 'learned' ? ' learned' : '';
-            return `${a.type}(${Math.round(a.confidence*100)}%${src})`;
-          }).join(', ') || '—';
-          html += `<tr>
-            <td>${badge}</td>
-            <td class="prompt-cell" title="${esc(inv.prompt)}">${esc(prompt)}</td>
-            <td>${inv.path_used || '—'}</td>
-            <td>${inv.panel_count}</td>
-            <td>${inv.total_time ? inv.total_time.toFixed(1) + 's' : '—'}</td>
-            <td class="arch-cell" style="font-size:0.75rem">${esc(archs)}</td>
-            <td><span class="hist-back" onclick="showInvestigation('${inv.id}')">Details</span></td>
-          </tr>`;
-        }
-        html += '</tbody></table>';
-        el.innerHTML = html;
+        const data = await fetchTenantJson(`${BASE}/api/v1/investigations?${params}`, {}, request);
+        requireCurrentTenantRequest(request);
+        historyListState = {
+          tenant: request.tenant,
+          status,
+          items: data.investigations || [],
+          nextCursor: data.next_cursor || null,
+        };
+        renderHistoryList(request);
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
         el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
       }
     }
 
-    async function showInvestigation(id) {
+    async function loadMoreHistory(button) {
+      const request = captureTenantRequest(button.dataset.historyTenant || '');
+      const cursor = historyListState.nextCursor;
+      if (!cursor || !tenantRequestIsCurrent(request) || historyListState.tenant !== request.tenant) return;
+      button.disabled = true;
+      button.textContent = 'Loading...';
+      const params = new URLSearchParams({
+        limit: '50',
+        before_started_at: String(cursor.before_started_at),
+        before_id: String(cursor.before_id),
+      });
+      if (historyListState.status) params.set('status', historyListState.status);
+      try {
+        const data = await fetchTenantJson(`${BASE}/api/v1/investigations?${params}`, {}, request);
+        requireCurrentTenantRequest(request);
+        historyListState = {
+          ...historyListState,
+          items: [...historyListState.items, ...(data.investigations || [])],
+          nextCursor: data.next_cursor || null,
+        };
+        renderHistoryList(request);
+      } catch (e) {
+        if (isStaleTenantResponse(e) || !button.isConnected) return;
+        button.disabled = false;
+        button.textContent = 'Retry loading investigations';
+      }
+    }
+
+    async function showInvestigation(id, tenant = selectedTenant()) {
       const el = document.getElementById('history-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      const request = captureTenantRequest(tenant);
       try {
-        const resp = await fetch(`${BASE}/api/v1/investigations/${id}`);
-        if (!resp.ok) throw new Error('Not found');
-        const inv = await resp.json();
+        const inv = await fetchTenantJson(`${BASE}/api/v1/investigations/${encodeURIComponent(id)}`, {}, request);
         const badge = statusBadge(inv.status);
         const archs = (inv.archetypes || []).map(a => {
           const src = a.source ? `, ${a.source}` : '';
@@ -828,7 +1060,7 @@
 
         let timingsHtml = '';
         for (const [step, secs] of Object.entries(inv.timings || {})) {
-          timingsHtml += `<span class="hist-timing">${step}: ${Number(secs).toFixed(2)}s</span>`;
+          timingsHtml += `<span class="hist-timing">${esc(step)}: ${Number(secs).toFixed(2)}s</span>`;
         }
 
         let warningsHtml = '';
@@ -836,11 +1068,12 @@
           warningsHtml += `<div style="font-size:0.78rem;color:#fbbf24">⚠ ${esc(w)}</div>`;
         }
 
+        const dashboardUrl = safeExternalUrl(inv.dashboard_url);
         el.innerHTML = `
           <span class="hist-back" onclick="loadHistory()">&larr; Back to list</span>
           <div class="hist-detail">
             <div style="display:flex;justify-content:space-between;align-items:center">
-              <span style="font-size:0.75rem;color:#6b7280">${inv.id}</span>
+              <span style="font-size:0.75rem;color:#6b7280">${esc(inv.id)}</span>
               ${badge}
             </div>
             ${inv.error ? `<div style="color:#fca5a5;font-size:0.82rem;margin-top:0.3rem">${esc(inv.error)}</div>` : ''}
@@ -876,9 +1109,10 @@
             <h4>Timings</h4>
             <div>${timingsHtml || '<span class="kv">—</span>'}</div>
 
-            ${inv.dashboard_url ? `<h4>Result</h4><div class="kv"><a href="${esc(inv.dashboard_url)}" target="_blank" style="color:#6366f1">${esc(inv.dashboard_url)} &rarr;</a></div>` : ''}
+            ${dashboardUrl ? `<h4>Result</h4><div class="kv"><a href="${escAttr(dashboardUrl)}" target="_blank" rel="noopener noreferrer" style="color:#6366f1">${esc(dashboardUrl)} &rarr;</a></div>` : ''}
           </div>`;
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
         el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
       }
     }
@@ -886,9 +1120,9 @@
     async function loadHistoryStats() {
       const el = document.getElementById('history-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      const request = captureTenantRequest();
       try {
-        const resp = await fetch(`${BASE}/api/v1/investigations/stats`);
-        const s = await resp.json();
+        const s = await fetchTenantJson(`${BASE}/api/v1/investigations/stats`, {}, request);
         if (!s.total) {
           el.innerHTML = '<div class="status">No investigations recorded yet.</div>';
           return;
@@ -907,18 +1141,35 @@
             <div class="stat-card"><div class="stat-value">${s.archetype_path || 0} / ${s.freeform_path || 0}</div><div class="stat-label">Archetype / Freeform</div></div>
           </div>`;
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
         el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
       }
     }
 
-    function statusBadge(status) {
+    function statusBadgeElement(status) {
       const cls = { success: 'badge-success', failed: 'badge-failed', timeout: 'badge-timeout', cancelled: 'badge-cancelled', running: 'badge-running' }[status] || 'badge-running';
-      return `<span class="badge ${cls}">${status}</span>`;
+      const badge = document.createElement('span');
+      badge.className = `badge ${cls}`;
+      badge.textContent = String(status || 'unknown');
+      return badge;
+    }
+
+    function statusBadge(status) {
+      return statusBadgeElement(status).outerHTML;
     }
 
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
     function escAttr(s) {
       return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    function safeExternalUrl(value) {
+      if (!value) return '';
+      try {
+        const url = new URL(String(value), window.location.href);
+        return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : '';
+      } catch (_) {
+        return '';
+      }
     }
     // Normalize an error response body into a readable string. FastAPI returns
     // a plain string `detail` for HTTPExceptions but an array of
@@ -933,26 +1184,6 @@
         }).join('; ');
       }
       return fallback;
-    }
-
-    async function fetchJson(url, options) {
-      const resp = await fetch(url, options);
-      const text = await resp.text();
-      let body = null;
-      if (text) {
-        try {
-          body = JSON.parse(text);
-        } catch {
-          if (!resp.ok) {
-            throw new Error(`${resp.status} ${resp.statusText}: ${text.slice(0, 160)}`);
-          }
-          throw new Error(`Invalid JSON response: ${text.slice(0, 160)}`);
-        }
-      }
-      if (!resp.ok) {
-        throw new Error(errMsg(body, `${resp.status} ${resp.statusText}`));
-      }
-      return body ?? {};
     }
 
     /* ── Learning tab ─────────────────────────────────────────── */
@@ -972,23 +1203,20 @@
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span>Ingesting...';
       resultEl.innerHTML = '<div class="status"><span class="spinner"></span>Fetching and parsing dashboard...</div>';
+      const request = captureTenantRequest();
 
       try {
         const body = { dashboard_uid: uid, auto_approve: autoApprove };
         if (backend) body.backend = backend;
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboard`, {
+        const data = await fetchTenantJson(`${BASE}/api/v1/learn/dashboard`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
-        });
-        if (!resp.ok) {
-          const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-          throw new Error(errMsg(err, `HTTP ${resp.status}`));
-        }
-        const data = await resp.json();
+        }, request);
         resultEl.innerHTML = renderIngestionResult(data, uid);
-        loadIngestedDashboards();
+        if (tenantRequestIsCurrent(request)) loadIngestedDashboards();
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
         resultEl.innerHTML = `<div class="result-card error" style="margin-top:1rem"><div class="result-label">Error</div><div class="result-meta" style="color:#fca5a5">${esc(e.message)}</div></div>`;
       } finally {
         btn.disabled = false;
@@ -1062,10 +1290,12 @@
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span>Uploading...';
       resultEl.innerHTML = '<div class="status"><span class="spinner"></span>Parsing dashboard JSON...</div>';
+      const request = captureTenantRequest();
 
       try {
         const dashboard = JSON.parse(await file.text());
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboard/json`, {
+        requireCurrentTenantRequest(request);
+        const data = await fetchTenantJson(`${BASE}/api/v1/learn/dashboard/json`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1074,15 +1304,11 @@
             dashboard,
             auto_approve: autoApprove,
           }),
-        });
-        if (!resp.ok) {
-          const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-          throw new Error(errMsg(err, `HTTP ${resp.status}`));
-        }
-        const data = await resp.json();
+        }, request);
         resultEl.innerHTML = renderIngestionResult(data, file.name);
-        loadIngestedDashboards();
+        if (tenantRequestIsCurrent(request)) loadIngestedDashboards();
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
         resultEl.innerHTML = `<div class="result-card error" style="margin-top:1rem"><div class="result-label">Error</div><div class="result-meta" style="color:#fca5a5">${esc(e.message)}</div></div>`;
       } finally {
         btn.disabled = false;
@@ -1090,163 +1316,508 @@
       }
     }
 
+    function renderIngestedDashboards(request) {
+      const el = document.getElementById('ingested-list');
+      if (!tenantRequestIsCurrent(request) || ingestedDashboardState.tenant !== request.tenant) return;
+      const dashboards = ingestedDashboardState.items;
+      if (!dashboards.length) {
+        el.innerHTML = '<div class="status">No dashboards ingested yet. Paste a UID above to get started.</div>';
+        return;
+      }
+      let html = '';
+      for (const d of dashboards) {
+        const badge = d.status === 'approved'
+          ? '<span class="badge badge-success">approved</span>'
+          : d.status === 'pending' || d.status === 'approving'
+            ? `<span class="badge badge-running">${esc(d.status)}</span>`
+            : `<span class="badge">${esc(d.status)}</span>`;
+        const signals = (d.signals_inferred || []).slice(0, 8).map(s => {
+          if (typeof s === 'string') {
+            return `<span class="signal-chip">${esc(s)}</span>`;
+          }
+          const signalType = esc(s.signal_type || 'unknown');
+          const metric = s.metric ? ` &rarr; <code>${esc(s.metric)}</code>` : '';
+          const confidence = Number.isFinite(s.confidence)
+            ? ` (${Math.round(s.confidence * 100)}%)`
+            : '';
+          return `<span class="signal-chip">${signalType}${metric}${confidence}</span>`;
+        }).join('');
+        const archetypeYaml = d.archetype_generated
+          ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Quarantined experimental archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(d.archetype_generated)}</pre></details>`
+          : '';
+        const quality = renderSignalQuality(d.signal_quality, d.learning_impact);
+        const reviewBtns = d.status === 'pending'
+          ? `<button class="btn-sm btn-success review-dashboard-btn" data-dashboard-action="approve" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}" data-dashboard-tenant="${escAttr(request.tenant)}">Approve</button>
+             <button class="btn-sm review-dashboard-btn" data-dashboard-action="reject" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}" data-dashboard-tenant="${escAttr(request.tenant)}">Reject</button>
+             <button class="btn-sm review-dashboard-btn" data-dashboard-action="ignore" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}" data-dashboard-tenant="${escAttr(request.tenant)}">Ignore</button>`
+          : d.status === 'approving'
+            ? `<button class="btn-sm btn-success review-dashboard-btn" data-dashboard-action="approve" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}" data-dashboard-tenant="${escAttr(request.tenant)}">Resume approval</button>`
+            : '';
+        html += `
+          <div class="ingest-card">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <span class="ingest-title">${esc(d.dashboard_title || d.dashboard_uid)}</span>
+              <span>${badge} ${reviewBtns}</span>
+            </div>
+            <div class="ingest-meta">
+              UID: <code>${esc(d.dashboard_uid)}</code> &middot;
+              ${d.backend_name ? `Backend: <code>${esc(d.backend_name)}</code> &middot; ` : ''}
+              ${d.panel_count || 0} panels &middot;
+              ${(d.metrics_found || []).length} metrics
+            </div>
+            ${signals ? `<div class="ingest-signals">${signals}</div>` : ''}
+            ${quality}
+            ${archetypeYaml}
+          </div>`;
+      }
+      if (ingestedDashboardState.nextCursor) {
+        html += `<div class="actions" style="justify-content:center;margin-top:1rem">
+          <button class="btn-secondary btn-sm dashboard-learning-more"
+            data-dashboard-tenant="${escAttr(request.tenant)}">Load more dashboards</button>
+        </div>`;
+      }
+      el.innerHTML = html;
+    }
+
     async function loadIngestedDashboards() {
       const el = document.getElementById('ingested-list');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      const request = captureTenantRequest();
+      ingestedDashboardState = { tenant: request.tenant, items: [], nextCursor: null };
       try {
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboards`);
-        const data = await resp.json();
-        const dashboards = data.dashboards || [];
-        if (!dashboards.length) {
-          el.innerHTML = '<div class="status">No dashboards ingested yet. Paste a UID above to get started.</div>';
-          return;
-        }
-        let html = '';
-        for (const d of dashboards) {
-          const badge = d.status === 'approved'
-            ? '<span class="badge badge-success">approved</span>'
-            : d.status === 'pending'
-              ? '<span class="badge badge-running">pending</span>'
-              : `<span class="badge">${esc(d.status)}</span>`;
-          const signals = (d.signals_inferred || []).slice(0, 8).map(s => {
-            if (typeof s === 'string') {
-              return `<span class="signal-chip">${esc(s)}</span>`;
-            }
-            const signalType = esc(s.signal_type || 'unknown');
-            const metric = s.metric ? ` &rarr; <code>${esc(s.metric)}</code>` : '';
-            const confidence = Number.isFinite(s.confidence)
-              ? ` (${Math.round(s.confidence * 100)}%)`
-              : '';
-            return `<span class="signal-chip">${signalType}${metric}${confidence}</span>`;
-          }).join('');
-          const archetypeYaml = d.archetype_generated
-            ? `<details style="margin-top:0.5rem"><summary style="font-size:0.78rem;color:#6b7280;cursor:pointer">Quarantined experimental archetype YAML</summary><pre style="font-size:0.72rem;color:#9ca3af;margin-top:0.3rem;white-space:pre-wrap">${esc(d.archetype_generated)}</pre></details>`
-            : '';
-          const quality = renderSignalQuality(d.signal_quality, d.learning_impact);
-          const reviewBtns = d.status === 'pending'
-            ? `<button class="btn-sm btn-success review-dashboard-btn" data-dashboard-action="approve" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Approve</button>
-               <button class="btn-sm review-dashboard-btn" data-dashboard-action="reject" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Reject</button>
-               <button class="btn-sm review-dashboard-btn" data-dashboard-action="ignore" data-dashboard-uid="${escAttr(d.dashboard_uid)}" data-dashboard-backend="${escAttr(d.backend_name || '')}">Ignore</button>`
-            : '';
-          html += `
-            <div class="ingest-card">
-              <div style="display:flex;justify-content:space-between;align-items:center">
-                <span class="ingest-title">${esc(d.dashboard_title || d.dashboard_uid)}</span>
-                <span>${badge} ${reviewBtns}</span>
-              </div>
-              <div class="ingest-meta">
-                UID: <code>${esc(d.dashboard_uid)}</code> &middot;
-                ${d.backend_name ? `Backend: <code>${esc(d.backend_name)}</code> &middot; ` : ''}
-                ${d.panel_count || 0} panels &middot;
-                ${(d.metrics_found || []).length} metrics
-              </div>
-              ${signals ? `<div class="ingest-signals">${signals}</div>` : ''}
-              ${quality}
-              ${archetypeYaml}
-            </div>`;
-        }
-        el.innerHTML = html;
+        const data = await fetchTenantJson(`${BASE}/api/v1/learn/dashboards?limit=50`, {}, request);
+        requireCurrentTenantRequest(request);
+        ingestedDashboardState = {
+          tenant: request.tenant,
+          items: data.dashboards || [],
+          nextCursor: data.next_cursor || null,
+        };
+        renderIngestedDashboards(request);
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
         el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
       }
     }
 
-    async function reviewDashboard(uid, action, backend = '') {
+    async function loadMoreIngestedDashboards(button) {
+      const request = captureTenantRequest(button.dataset.dashboardTenant || '');
+      const cursor = ingestedDashboardState.nextCursor;
+      if (!cursor || !tenantRequestIsCurrent(request) || ingestedDashboardState.tenant !== request.tenant) return;
+      button.disabled = true;
+      button.textContent = 'Loading...';
+      const params = new URLSearchParams({
+        limit: '50',
+        before_created_at: String(cursor.before_created_at),
+        before_id: String(cursor.before_id),
+      });
+      try {
+        const data = await fetchTenantJson(`${BASE}/api/v1/learn/dashboards?${params}`, {}, request);
+        requireCurrentTenantRequest(request);
+        ingestedDashboardState = {
+          ...ingestedDashboardState,
+          items: [...ingestedDashboardState.items, ...(data.dashboards || [])],
+          nextCursor: data.next_cursor || null,
+        };
+        renderIngestedDashboards(request);
+      } catch (e) {
+        if (isStaleTenantResponse(e) || !button.isConnected) return;
+        button.disabled = false;
+        button.textContent = 'Retry loading dashboards';
+      }
+    }
+
+    async function reviewDashboard(uid, action, backend = '', tenant = selectedTenant()) {
+      const request = captureTenantRequest(tenant);
+      if (!tenantRequestIsCurrent(request)) return;
       try {
         const backendQuery = backend ? `?backend=${encodeURIComponent(backend)}` : '';
-        const resp = await fetch(`${BASE}/api/v1/learn/dashboards/${encodeURIComponent(uid)}/${encodeURIComponent(action)}${backendQuery}`, { method: 'POST' });
-        if (!resp.ok) throw new Error(`${action} failed`);
-        loadIngestedDashboards();
-      } catch (e) { alert(`${action} failed: ` + e.message); }
+        await fetchTenantJson(`${BASE}/api/v1/learn/dashboards/${encodeURIComponent(uid)}/${encodeURIComponent(action)}${backendQuery}`, {
+          method: 'POST',
+        }, request);
+        if (tenantRequestIsCurrent(request)) loadIngestedDashboards();
+      } catch (e) {
+        if (isStaleTenantResponse(e)) return;
+        document.getElementById('ingest-result').innerHTML = `<div class="result-card error" style="margin-top:1rem"><div class="result-label">Review failed</div><div class="result-meta" style="color:#fca5a5">${esc(e.message)}</div></div>`;
+      }
     }
 
     async function approveDashboard(uid, backend = '') {
       return reviewDashboard(uid, 'approve', backend);
     }
 
+    /* ── Knowledge tab ────────────────────────────────────────── */
+    function mergeUniqueBy(items, additions, key) {
+      const merged = new Map(items.map(item => [String(item?.[key] || ''), item]));
+      for (const item of additions) merged.set(String(item?.[key] || ''), item);
+      return Array.from(merged.values());
+    }
+
+    function renderKnowledgeQueue(request) {
+      const content = document.getElementById('knowledge-queue');
+      const status = document.getElementById('knowledge-status');
+      if (!tenantRequestIsCurrent(request) || knowledgeQueueState.tenant !== request.tenant) return;
+      const pending = knowledgeQueueState.candidates;
+      const conflicts = knowledgeQueueState.conflicts;
+      const attention = knowledgeQueueState.attention;
+      status.textContent = `${pending.length} pending loaded · ${conflicts.length} unresolved conflicts loaded · ${attention.length} attention items loaded · tenant ${knowledgeQueueState.statsTenant || request.tenant}`;
+
+      const sections = [];
+      if (pending.length) {
+        let candidatesHtml = `<div class="result-label">Pending review</div><table class="hist-table"><thead><tr>
+          <th style="width:18%">Kind</th><th>Proposition</th><th style="width:25%">Policy</th><th style="width:25%">Review</th>
+        </tr></thead><tbody>`;
+        for (const candidate of pending) {
+          const proposition = candidate.proposition || {};
+          const state = candidate.state || {};
+          const policy = candidate.policy || {};
+          const scope = candidate.scope || {};
+          const corroboration = candidate.corroboration || {};
+          const relation = [proposition.subject_ref, proposition.predicate, proposition.object_ref || proposition.concept_ref]
+            .filter(Boolean).join(' ');
+          const reasonCodes = (policy.eligibility_reason_codes || []).join(', ') || state.eligibility || 'not evaluated';
+          const priorityReasons = (candidate.review_priority_reasons || []).join(', ');
+          const scopeText = ['environment_refs','region_refs','service_refs'].flatMap(key => scope[key] || []).join(', ') || 'tenant-wide';
+          const sourceText = `${corroboration.independent_source_count || 0} independent · ${(corroboration.source_families || []).join(', ') || 'unclassified'}`;
+          candidatesHtml += `<tr>
+            <td>${esc(candidate.kind || '')}<br><span style="color:#6b7280">${esc(priorityReasons)}</span></td>
+            <td class="arch-cell">${esc(relation)}<br><span style="color:#6b7280">Scope: ${esc(scopeText)}</span></td>
+            <td class="arch-cell">${esc(policy.promotion_policy_ref || 'not evaluated')}<br><span style="color:#6b7280">${esc(reasonCodes)} · ${esc(sourceText)}</span></td>
+            <td>
+              <button class="btn-sm btn-success knowledge-review-btn" data-candidate-id="${escAttr(candidate.id)}" data-decision="approve" data-knowledge-tenant="${escAttr(request.tenant)}">Approve</button>
+              <button class="btn-sm btn-secondary knowledge-review-btn" data-candidate-id="${escAttr(candidate.id)}" data-decision="reject" data-knowledge-tenant="${escAttr(request.tenant)}">Reject</button>
+            </td>
+          </tr>`;
+        }
+        sections.push(candidatesHtml + '</tbody></table>');
+      }
+
+      if (conflicts.length) {
+        let conflictsHtml = `<div class="result-label" style="margin-top:1rem">Unresolved conflicts</div><table class="hist-table"><thead><tr>
+          <th style="width:20%">Type</th><th>Competing propositions</th><th style="width:18%">Severity</th>
+        </tr></thead><tbody>`;
+        for (const conflict of conflicts) {
+          conflictsHtml += `<tr>
+            <td>${esc(conflict.conflict_kind || 'conflict')}<br><span style="color:#6b7280">${esc(conflict.id || '')}</span></td>
+            <td class="arch-cell">${esc(conflict.left_proposition_ref || '')}<br><span style="color:#6b7280">versus ${esc(conflict.right_proposition_ref || '')}</span></td>
+            <td>${esc(conflict.severity || 'medium')}<br><span style="color:#fbbf24">${esc(conflict.resolution_status || 'unresolved')}</span></td>
+          </tr>`;
+        }
+        sections.push(conflictsHtml + '</tbody></table>');
+      }
+
+      if (attention.length) {
+        let attentionHtml = `<div class="result-label" style="margin-top:1rem">Needs attention</div><table class="hist-table"><thead><tr>
+          <th style="width:20%">Knowledge</th><th>Proposition</th><th style="width:22%">Lifecycle</th>
+        </tr></thead><tbody>`;
+        for (const revision of attention) {
+          const proposition = revision.proposition || {};
+          const state = revision.state || {};
+          const relation = [proposition.subject_ref, proposition.predicate, proposition.object_ref || proposition.concept_ref]
+            .filter(Boolean).join(' ');
+          attentionHtml += `<tr>
+            <td>${esc(revision.knowledge_id || '')}<br><span style="color:#6b7280">revision ${esc(revision.revision ?? '')}</span></td>
+            <td class="arch-cell">${esc(relation || proposition.kind || '')}</td>
+            <td><span class="badge badge-timeout">${esc(state.lifecycle_status || 'stale')}</span><br><span style="color:#6b7280">${esc(state.review_state || '')}</span></td>
+          </tr>`;
+        }
+        sections.push(attentionHtml + '</tbody></table>');
+      }
+
+      const hasMore = (
+        knowledgeQueueState.candidateHasMore ||
+        knowledgeQueueState.conflictHasMore ||
+        knowledgeQueueState.attentionHasMore
+      );
+      if (hasMore) {
+        sections.push(`<div class="actions" style="justify-content:center;margin-top:1rem">
+          <button class="btn-secondary btn-sm knowledge-queue-more"
+            data-knowledge-tenant="${escAttr(request.tenant)}">Load more review work</button>
+        </div>`);
+      }
+      content.innerHTML = sections.join('') || '<div class="status">Review queue is clear.</div>';
+    }
+
+    async function loadKnowledgeQueue() {
+      const content = document.getElementById('knowledge-queue');
+      const status = document.getElementById('knowledge-status');
+      content.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      const request = captureTenantRequest();
+      knowledgeQueueState = {
+        tenant: request.tenant, candidates: [], conflicts: [], attention: [], statsTenant: '',
+        candidateHasMore: false, candidateNextCursor: null,
+        conflictHasMore: false, conflictNextCursor: null,
+        attentionHasMore: false, attentionNextCursor: null,
+      };
+      try {
+        const [queue, stats] = await Promise.all([
+          fetchTenantJson(`${BASE}/api/v1/knowledge/review-queue?limit=100`, {}, request),
+          fetchTenantJson(`${BASE}/api/v1/knowledge/status`, {}, request),
+        ]);
+        requireCurrentTenantRequest(request);
+        knowledgeQueueState = {
+          tenant: request.tenant,
+          candidates: queue.candidates || [],
+          conflicts: queue.unresolved_conflicts || [],
+          attention: queue.attention_items || [],
+          statsTenant: stats.tenant_id || request.tenant,
+          candidateHasMore: Boolean(queue.candidate_has_more),
+          candidateNextCursor: queue.candidate_next_cursor || null,
+          conflictHasMore: Boolean(queue.conflict_has_more),
+          conflictNextCursor: queue.conflict_next_cursor || null,
+          attentionHasMore: Boolean(queue.attention_has_more),
+          attentionNextCursor: queue.attention_next_cursor || null,
+        };
+        renderKnowledgeQueue(request);
+      } catch (error) {
+        if (isStaleTenantResponse(error)) return;
+        const detail = window.location.protocol === 'file:' && error instanceof TypeError
+          ? `Unable to reach Tacit API at ${BASE}. Start the local server or open ${BASE}/.`
+          : error.message;
+        status.textContent = 'Knowledge queue unavailable';
+        content.innerHTML = `<div class="status" style="color:#ef4444">${esc(detail)}</div>`;
+      }
+    }
+
+    async function loadMoreKnowledgeQueue(button) {
+      const request = captureTenantRequest(button.dataset.knowledgeTenant || '');
+      if (!tenantRequestIsCurrent(request) || knowledgeQueueState.tenant !== request.tenant) return;
+      const loadCandidates = knowledgeQueueState.candidateHasMore && knowledgeQueueState.candidateNextCursor;
+      const loadConflicts = knowledgeQueueState.conflictHasMore && knowledgeQueueState.conflictNextCursor;
+      const loadAttention = knowledgeQueueState.attentionHasMore && knowledgeQueueState.attentionNextCursor;
+      if (!loadCandidates && !loadConflicts && !loadAttention) return;
+      button.disabled = true;
+      button.textContent = 'Loading...';
+      const params = new URLSearchParams({ limit: '100' });
+      if (loadCandidates) params.set('candidate_cursor', knowledgeQueueState.candidateNextCursor);
+      if (loadConflicts) params.set('conflict_cursor', knowledgeQueueState.conflictNextCursor);
+      if (loadAttention) params.set('attention_cursor', knowledgeQueueState.attentionNextCursor);
+      try {
+        const queue = await fetchTenantJson(`${BASE}/api/v1/knowledge/review-queue?${params}`, {}, request);
+        requireCurrentTenantRequest(request);
+        knowledgeQueueState = {
+          ...knowledgeQueueState,
+          candidates: loadCandidates
+            ? mergeUniqueBy(knowledgeQueueState.candidates, queue.candidates || [], 'id')
+            : knowledgeQueueState.candidates,
+          conflicts: loadConflicts
+            ? mergeUniqueBy(knowledgeQueueState.conflicts, queue.unresolved_conflicts || [], 'id')
+            : knowledgeQueueState.conflicts,
+          attention: loadAttention
+            ? mergeUniqueBy(knowledgeQueueState.attention, queue.attention_items || [], 'knowledge_id')
+            : knowledgeQueueState.attention,
+          candidateHasMore: loadCandidates ? Boolean(queue.candidate_has_more) : knowledgeQueueState.candidateHasMore,
+          candidateNextCursor: loadCandidates
+            ? queue.candidate_next_cursor || null
+            : knowledgeQueueState.candidateNextCursor,
+          conflictHasMore: loadConflicts ? Boolean(queue.conflict_has_more) : knowledgeQueueState.conflictHasMore,
+          conflictNextCursor: loadConflicts
+            ? queue.conflict_next_cursor || null
+            : knowledgeQueueState.conflictNextCursor,
+          attentionHasMore: loadAttention ? Boolean(queue.attention_has_more) : knowledgeQueueState.attentionHasMore,
+          attentionNextCursor: loadAttention
+            ? queue.attention_next_cursor || null
+            : knowledgeQueueState.attentionNextCursor,
+        };
+        renderKnowledgeQueue(request);
+      } catch (error) {
+        if (isStaleTenantResponse(error) || !button.isConnected) return;
+        button.disabled = false;
+        button.textContent = 'Retry loading review work';
+      }
+    }
+
+    async function reviewKnowledgeCandidate(candidateId, decision, tenant = selectedTenant()) {
+      const request = captureTenantRequest(tenant);
+      if (!tenantRequestIsCurrent(request)) return;
+      await fetchTenantJson(`${BASE}/api/v1/knowledge/candidates/${encodeURIComponent(candidateId)}/review`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ decision, reviewer: 'web-ui', evaluate: true }),
+        }, request);
+      if (tenantRequestIsCurrent(request)) await loadKnowledgeQueue();
+    }
+
     /* ── Signals tab ──────────────────────────────────────────── */
+    function renderSignalCatalog(request) {
+      const el = document.getElementById('signals-content');
+      const statsEl = document.getElementById('signal-stats');
+      if (!tenantRequestIsCurrent(request) || signalCatalogState.tenant !== request.tenant) return;
+      const signalList = signalCatalogState.items;
+      const loaded = signalList.length;
+      statsEl.textContent = `${loaded} of ${signalCatalogState.total || loaded} signals loaded · ${signalCatalogState.mappingTotal} mappings`;
+
+      const teachSelect = document.getElementById('teach-signal');
+      const selectedSignal = teachSelect.value;
+      teachSelect.innerHTML = signalList.map(s =>
+        `<option value="${escAttr(s.signal_type)}">${esc(s.signal_type)} (${esc(s.category || '')})</option>`
+      ).join('');
+      if (selectedSignal && signalList.some(signal => signal.signal_type === selectedSignal)) {
+        teachSelect.value = selectedSignal;
+      }
+
+      const byCategory = {};
+      for (const s of signalList) {
+        const cat = s.category || 'other';
+        if (!byCategory[cat]) byCategory[cat] = [];
+        byCategory[cat].push(s);
+      }
+
+      let html = '';
+      for (const [cat, sigs] of Object.entries(byCategory)) {
+        html += `<div class="result-label" style="margin-top:1rem;text-transform:capitalize">${esc(cat)}</div>`;
+        for (const s of sigs) {
+          html += `
+            <div class="signal-card">
+              <h3>${esc(s.signal_type)}</h3>
+              <div class="signal-desc">${esc(s.description || '')} &middot; <code>${esc(s.unit || '')}</code></div>
+              <div class="signal-patterns">
+                <span style="font-size:0.72rem;color:#6b7280">${s.mapping_count || 0} mappings</span>
+                <span class="hist-back signal-detail-btn" style="margin-left:0.5rem" data-signal="${escAttr(s.signal_type)}" data-signal-tenant="${escAttr(request.tenant)}">View mappings</span>
+              </div>
+            </div>`;
+        }
+      }
+      if (signalCatalogState.hasMore && signalCatalogState.nextCursor) {
+        html += `<div class="actions" style="justify-content:center;margin-top:1rem">
+          <button class="btn-secondary btn-sm signal-taxonomy-more"
+            data-signal-tenant="${escAttr(request.tenant)}"
+            data-cursor="${escAttr(signalCatalogState.nextCursor)}">Load more signals</button>
+        </div>`;
+      }
+      el.innerHTML = html || '<div class="status">No signals registered</div>';
+    }
+
     async function loadSignals() {
       const el = document.getElementById('signals-content');
       const statsEl = document.getElementById('signal-stats');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      const request = captureTenantRequest();
+      signalCatalogState = {
+        tenant: request.tenant, items: [], hasMore: false, nextCursor: null, total: 0, mappingTotal: 0,
+      };
 
       try {
-        const [listResp, statsResp] = await Promise.all([
-          fetch(`${BASE}/api/v1/signals`),
-          fetch(`${BASE}/api/v1/signals/stats`),
+        const [signals, stats] = await Promise.all([
+          fetchTenantJson(`${BASE}/api/v1/signals?limit=100`, {}, request),
+          fetchTenantJson(`${BASE}/api/v1/signals/stats`, {}, request),
         ]);
-        const signals = await listResp.json();
-        const stats = await statsResp.json();
-
-        statsEl.textContent = `${stats.signal_types || 0} signals, ${stats.metric_mappings || 0} mappings`;
-
-        const signalList = signals.signal_types || [];
-        const teachSelect = document.getElementById('teach-signal');
-        teachSelect.innerHTML = signalList.map(s =>
-          `<option value="${escAttr(s.signal_type)}">${esc(s.signal_type)} (${esc(s.category || '')})</option>`
-        ).join('');
-
-        // Group by category
-        const byCategory = {};
-        for (const s of signalList) {
-          const cat = s.category || 'other';
-          if (!byCategory[cat]) byCategory[cat] = [];
-          byCategory[cat].push(s);
-        }
-
-        let html = '';
-        for (const [cat, sigs] of Object.entries(byCategory)) {
-          html += `<div class="result-label" style="margin-top:1rem;text-transform:capitalize">${esc(cat)}</div>`;
-          for (const s of sigs) {
-            html += `
-              <div class="signal-card">
-                <h3>${esc(s.signal_type)}</h3>
-                <div class="signal-desc">${esc(s.description || '')} &middot; <code>${esc(s.unit || '')}</code></div>
-                <div class="signal-patterns">
-                  <span style="font-size:0.72rem;color:#6b7280">${s.mapping_count || 0} mappings</span>
-                  <span class="hist-back signal-detail-btn" style="margin-left:0.5rem" data-signal="${escAttr(s.signal_type)}">View mappings</span>
-                </div>
-              </div>`;
-          }
-        }
-        el.innerHTML = html || '<div class="status">No signals registered</div>';
+        requireCurrentTenantRequest(request);
+        signalCatalogState = {
+          tenant: request.tenant,
+          items: signals.signal_types || [],
+          hasMore: Boolean(signals.has_more),
+          nextCursor: signals.next_cursor || null,
+          total: stats.signal_types || 0,
+          mappingTotal: stats.metric_mappings || 0,
+        };
+        renderSignalCatalog(request);
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
+        statsEl.textContent = 'Unavailable';
         el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
       }
     }
 
-    async function showSignalDetail(signalType) {
+    async function loadMoreSignals(button) {
+      const request = captureTenantRequest(button.dataset.signalTenant || '');
+      const cursor = button.dataset.cursor || '';
+      if (!cursor || !tenantRequestIsCurrent(request) || signalCatalogState.tenant !== request.tenant) return;
+      button.disabled = true;
+      button.textContent = 'Loading...';
+      try {
+        const data = await fetchTenantJson(
+          `${BASE}/api/v1/signals?limit=100&cursor=${encodeURIComponent(cursor)}`,
+          {},
+          request,
+        );
+        requireCurrentTenantRequest(request);
+        const signalsByName = new Map(
+          signalCatalogState.items.map(signal => [signal.signal_type, signal]),
+        );
+        for (const signal of data.signal_types || []) signalsByName.set(signal.signal_type, signal);
+        signalCatalogState = {
+          ...signalCatalogState,
+          items: Array.from(signalsByName.values()),
+          hasMore: Boolean(data.has_more),
+          nextCursor: data.next_cursor || null,
+        };
+        renderSignalCatalog(request);
+      } catch (e) {
+        if (isStaleTenantResponse(e) || !button.isConnected) return;
+        button.disabled = false;
+        button.textContent = 'Retry loading signals';
+      }
+    }
+
+    function signalMappingRowsHtml(mappings) {
+      return mappings.map((mapping) => {
+        const confidence = Math.round((mapping.effective_confidence || mapping.confidence || 0) * 100);
+        const confidenceWidth = Math.min(Math.max(confidence, 0), 100);
+        return `
+          <div style="margin:0.3rem 0;display:flex;align-items:center;gap:0.5rem">
+            <span class="signal-pattern">${esc(mapping.metric_pattern)}</span>
+            <span class="confidence-bar"><span class="confidence-fill" style="width:${confidenceWidth}%"></span></span>
+            <span style="font-size:0.72rem;color:#6b7280">${confidence}%</span>
+            <span style="font-size:0.68rem;color:#4b5563">${esc(mapping.source_type || '')}</span>
+          </div>`;
+      }).join('');
+    }
+
+    function signalMappingsMoreButton(data, signalType, tenant) {
+      if (!data.has_more || !data.next_cursor) return '';
+      return `<button class="btn-secondary btn-sm signal-mappings-more"
+        data-signal="${escAttr(signalType)}"
+        data-signal-tenant="${escAttr(tenant)}"
+        data-cursor="${escAttr(data.next_cursor)}">Load more</button>`;
+    }
+
+    async function showSignalDetail(signalType, tenant = selectedTenant()) {
       const el = document.getElementById('signals-content');
       el.innerHTML = '<div class="status"><span class="spinner"></span>Loading...</div>';
+      const request = captureTenantRequest(tenant);
       try {
-        const resp = await fetch(`${BASE}/api/v1/signals/${encodeURIComponent(signalType)}`);
-        if (!resp.ok) throw new Error('Not found');
-        const data = await resp.json();
+        const data = await fetchTenantJson(`${BASE}/api/v1/signals/${encodeURIComponent(signalType)}?limit=100`, {}, request);
         const mappings = data.mappings || [];
 
-        let mappingsHtml = '';
-        for (const m of mappings) {
-          const conf = Math.round((m.effective_confidence || m.confidence || 0) * 100);
-          const confWidth = Math.min(conf, 100);
-          mappingsHtml += `
-            <div style="margin:0.3rem 0;display:flex;align-items:center;gap:0.5rem">
-              <span class="signal-pattern">${esc(m.metric_pattern)}</span>
-              <span class="confidence-bar"><span class="confidence-fill" style="width:${confWidth}%"></span></span>
-              <span style="font-size:0.72rem;color:#6b7280">${conf}%</span>
-              <span style="font-size:0.68rem;color:#4b5563">${esc(m.source_type || '')}</span>
-            </div>`;
-        }
-
         el.innerHTML = `
-          <span class="hist-back" onclick="loadSignals()">&larr; Back to taxonomy</span>
+          <span class="hist-back signal-back-btn">&larr; Back to taxonomy</span>
           <div class="signal-card" style="margin-top:0.75rem">
             <h3>${esc(data.signal_type)}</h3>
             <div class="signal-desc">${esc(data.description || '')} &middot; <code>${esc(data.unit || '')}</code> &middot; Category: ${esc(data.category || '')}</div>
-            <div class="result-label" style="margin-top:1rem">Metric Mappings (${mappings.length})</div>
-            ${mappingsHtml || '<div class="status">No mappings</div>'}
+            <div class="result-label" style="margin-top:1rem">Metric Mappings (${data.mapping_count || 0})</div>
+            <div class="signal-mapping-rows">${signalMappingRowsHtml(mappings) || '<div class="status">No mappings</div>'}</div>
+            <div class="signal-mapping-page-actions">${signalMappingsMoreButton(data, signalType, request.tenant)}</div>
           </div>`;
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
         el.innerHTML = `<div class="status" style="color:#fca5a5">Failed: ${esc(e.message)}</div>`;
+      }
+    }
+
+    async function loadMoreSignalMappings(button) {
+      const request = captureTenantRequest(button.dataset.signalTenant || '');
+      const signalType = button.dataset.signal || '';
+      const cursor = button.dataset.cursor || '';
+      if (!signalType || !cursor || !tenantRequestIsCurrent(request)) return;
+      button.disabled = true;
+      button.textContent = 'Loading...';
+      try {
+        const data = await fetchTenantJson(
+          `${BASE}/api/v1/signals/${encodeURIComponent(signalType)}?limit=100&cursor=${encodeURIComponent(cursor)}`,
+          {},
+          request,
+        );
+        if (!tenantRequestIsCurrent(request) || !button.isConnected) return;
+        const card = button.closest('.signal-card');
+        const rows = card ? card.querySelector('.signal-mapping-rows') : null;
+        if (!rows) return;
+        rows.insertAdjacentHTML('beforeend', signalMappingRowsHtml(data.mappings || []));
+        const actions = button.closest('.signal-mapping-page-actions');
+        if (actions) actions.innerHTML = signalMappingsMoreButton(data, signalType, request.tenant);
+      } catch (e) {
+        if (isStaleTenantResponse(e) || !button.isConnected) return;
+        button.disabled = false;
+        button.textContent = 'Retry';
       }
     }
 
@@ -1257,6 +1828,7 @@
       const confidence = Number.isFinite(confidenceInput) ? confidenceInput : 0.8;
       const service = document.getElementById('teach-service').value.trim();
       const statusEl = document.getElementById('teach-status');
+      const request = captureTenantRequest();
 
       if (!signalType || !metric) {
         statusEl.textContent = 'Signal and metric are required';
@@ -1272,20 +1844,17 @@
           metric_patterns: [{ pattern: metric, confidence }],
         };
         if (service) body.services = [service];
-        const resp = await fetch(`${BASE}/api/v1/signals/teach`, {
+        await fetchTenantJson(`${BASE}/api/v1/signals/teach`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
-        });
-        if (!resp.ok) {
-          const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-          throw new Error(errMsg(err, `HTTP ${resp.status}`));
-        }
+        }, request);
         statusEl.textContent = 'Mapping taught!';
         statusEl.style.color = '#34d399';
         document.getElementById('teach-metric').value = '';
-        loadSignals();
+        if (tenantRequestIsCurrent(request)) loadSignals();
       } catch (e) {
+        if (isStaleTenantResponse(e)) return;
         statusEl.textContent = 'Error: ' + e.message;
         statusEl.style.color = '#ef4444';
       }
@@ -1293,16 +1862,129 @@
 
     // Delegate signal detail clicks (avoids inline onclick + quote escaping issues)
     document.getElementById('signals-content').addEventListener('click', (e) => {
+      const back = e.target.closest('.signal-back-btn');
+      if (back) {
+        loadSignals();
+        return;
+      }
+      const more = e.target.closest('.signal-mappings-more');
+      if (more) {
+        loadMoreSignalMappings(more);
+        return;
+      }
+      const taxonomyMore = e.target.closest('.signal-taxonomy-more');
+      if (taxonomyMore) {
+        loadMoreSignals(taxonomyMore);
+        return;
+      }
       const btn = e.target.closest('.signal-detail-btn');
-      if (btn && btn.dataset.signal) showSignalDetail(btn.dataset.signal);
+      if (btn && btn.dataset.signal) showSignalDetail(btn.dataset.signal, btn.dataset.signalTenant || '');
+    });
+
+    document.getElementById('history-content').addEventListener('click', (e) => {
+      const more = e.target.closest('.history-more');
+      if (more) {
+        loadMoreHistory(more);
+        return;
+      }
+      const btn = e.target.closest('.investigation-detail-btn');
+      if (btn && btn.dataset.investigationId) {
+        showInvestigation(btn.dataset.investigationId, btn.dataset.investigationTenant || '');
+      }
     });
 
     // Delegate dashboard review clicks so UIDs are never embedded in JS strings.
     document.getElementById('ingested-list').addEventListener('click', (e) => {
+      const more = e.target.closest('.dashboard-learning-more');
+      if (more) {
+        loadMoreIngestedDashboards(more);
+        return;
+      }
       const btn = e.target.closest('.review-dashboard-btn');
       if (btn && btn.dataset.dashboardUid) {
-        reviewDashboard(btn.dataset.dashboardUid, btn.dataset.dashboardAction || 'approve', btn.dataset.dashboardBackend || '');
+        reviewDashboard(
+          btn.dataset.dashboardUid,
+          btn.dataset.dashboardAction || 'approve',
+          btn.dataset.dashboardBackend || '',
+          btn.dataset.dashboardTenant || '',
+        );
       }
+    });
+
+    document.getElementById('knowledge-queue').addEventListener('click', async (e) => {
+      const more = e.target.closest('.knowledge-queue-more');
+      if (more) {
+        await loadMoreKnowledgeQueue(more);
+        return;
+      }
+      const btn = e.target.closest('.knowledge-review-btn');
+      if (!btn || !btn.dataset.candidateId) return;
+      btn.disabled = true;
+      try {
+        await reviewKnowledgeCandidate(
+          btn.dataset.candidateId,
+          btn.dataset.decision || 'approve',
+          btn.dataset.knowledgeTenant || '',
+        );
+      } catch (error) {
+        if (isStaleTenantResponse(error)) return;
+        document.getElementById('knowledge-status').textContent = error.message;
+        btn.disabled = false;
+      }
+    });
+
+    function invalidateTenantViews() {
+      tenantRequestGeneration += 1;
+      signalCatalogState = {
+        tenant: '', items: [], hasMore: false, nextCursor: null, total: 0, mappingTotal: 0,
+      };
+      historyListState = { tenant: '', status: '', items: [], nextCursor: null };
+      ingestedDashboardState = { tenant: '', items: [], nextCursor: null };
+      knowledgeQueueState = {
+        tenant: '', candidates: [], conflicts: [], attention: [], statsTenant: '',
+        candidateHasMore: false, candidateNextCursor: null,
+        conflictHasMore: false, conflictNextCursor: null,
+        attentionHasMore: false, attentionNextCursor: null,
+      };
+      lastDashboardUid = null;
+      lastDashboardTenant = '';
+      document.getElementById('result').innerHTML = '<div class="status">Tenant changed. Generate a dashboard to start a new investigation.</div>';
+      document.getElementById('ingest-result').innerHTML = '';
+      document.getElementById('ingested-list').innerHTML = '<div class="status">Tenant changed. Reloading dashboards...</div>';
+      document.getElementById('knowledge-status').textContent = '';
+      document.getElementById('knowledge-queue').innerHTML = '<div class="status">Tenant changed. Reloading review work...</div>';
+      document.getElementById('signal-stats').textContent = '';
+      document.getElementById('signals-content').innerHTML = '<div class="status">Tenant changed. Reloading signals...</div>';
+      document.getElementById('teach-signal').innerHTML = '';
+      document.getElementById('teach-status').textContent = '';
+      document.getElementById('stats-content').innerHTML = '<div class="status">Tenant changed. Reloading insights...</div>';
+      document.getElementById('archetypes-content').innerHTML = '<div class="status">Tenant changed. Reloading archetypes...</div>';
+      document.getElementById('history-content').innerHTML = '<div class="status">Tenant changed. Reloading history...</div>';
+    }
+
+    function reloadActiveTenantView() {
+      const activeTab = document.querySelector('.tab.active')?.textContent?.trim().toLowerCase();
+      if (activeTab === 'learning') loadIngestedDashboards();
+      if (activeTab === 'knowledge') loadKnowledgeQueue();
+      if (activeTab === 'signals') loadSignals();
+      if (activeTab === 'insights') loadInsights();
+      if (activeTab === 'archetypes') loadArchetypes();
+      if (activeTab === 'history') loadHistory();
+    }
+
+    const knowledgeTenantInput = document.getElementById('knowledge-tenant');
+    knowledgeTenantInput.value = localStorage.getItem(KNOWLEDGE_TENANT_KEY) || '';
+    knowledgeTenantInput.addEventListener('change', () => {
+      selectedTenant();
+      invalidateTenantViews();
+      reloadActiveTenantView();
+    });
+    const apiKeyInput = document.getElementById('api-key');
+    apiKeyInput.value = sessionStorage.getItem(API_KEY_SESSION_KEY) || '';
+    apiKeyInput.addEventListener('change', () => {
+      const value = apiKeyInput.value;
+      if (value) sessionStorage.setItem(API_KEY_SESSION_KEY, value);
+      else sessionStorage.removeItem(API_KEY_SESSION_KEY);
     });
 
     // Submit on Ctrl+Enter

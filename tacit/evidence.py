@@ -13,10 +13,14 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any
+
+import structlog
 
 from tacit.archetypes.schema import InvestigationArchetype
 from tacit.catalog import catalog_for_services
+from tacit.knowledge.usage import KnowledgeRevisionRef
 from tacit.models.schemas import (
     DashboardSpec,
     EvidenceLifecycleStatus,
@@ -28,8 +32,16 @@ from tacit.models.schemas import (
     EvidenceResolutionStatus,
     Intent,
     MetricEntry,
+    dashboard_spec_work_counts,
+    validate_dashboard_nested_collection_work_limits,
+    validate_dashboard_scalar_work_limits,
+    validate_dashboard_spec_work_limits,
 )
 from tacit.signals.availability import resolve_signal_store
+from tacit.signals.resolution import (
+    SignalResolutionWorkBudget,
+    signal_resolution_work_kwargs,
+)
 
 _METRIC_TOKEN_CHARS = r"A-Za-z0-9_:."
 _PROMETHEUS_HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
@@ -38,10 +50,339 @@ MISSING_EVIDENCE = EvidenceObservationOutcome.MISSING_EVIDENCE
 AMBIGUOUS_EVIDENCE = EvidenceObservationOutcome.AMBIGUOUS_EVIDENCE
 NEGATIVE_EVIDENCE = EvidenceObservationOutcome.NEGATIVE_EVIDENCE
 UNSUPPORTED_CAUSE = EvidenceObservationOutcome.UNSUPPORTED_CAUSE
+EVIDENCE_RESOLUTION_FAILED = "evidence_resolution_failed"
+_EVIDENCE_OBSERVATION_WORK_LIMIT_EXCEEDED = "evidence_observation_work_limit_exceeded"
 _GAP_RESOLUTION_REASON_CODES = {
     "direct_symptom_signal_resolved",
     "evidence_gap_supported_observation",
 }
+
+logger = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class EvidenceObservationWorkLimits:
+    """Aggregate bounds for one validation stage's observation work."""
+
+    max_ranked_archetypes: int = 64
+    max_archetype_panels: int = 256
+    max_services: int = 64
+    max_catalog_entries: int = 5_000
+    max_dimensions_per_catalog_entry: int = 128
+    max_total_catalog_dimensions: int = 100_000
+    max_requirements: int = 256
+    max_resolutions: int = 512
+    max_total_resolution_catalog_checks: int = 2_000_000
+    max_signal_resolution_results_per_call: int = 5_000
+    max_total_signal_resolution_results: int = 32_768
+    max_observation_passes: int = 3
+    max_total_query_checks: int = 2_000_000
+    max_total_observation_slots: int = 32_768
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "max_ranked_archetypes",
+            "max_archetype_panels",
+            "max_services",
+            "max_catalog_entries",
+            "max_dimensions_per_catalog_entry",
+            "max_total_catalog_dimensions",
+            "max_requirements",
+            "max_resolutions",
+            "max_total_resolution_catalog_checks",
+            "max_signal_resolution_results_per_call",
+            "max_total_signal_resolution_results",
+            "max_observation_passes",
+            "max_total_query_checks",
+            "max_total_observation_slots",
+        ):
+            if getattr(self, field_name) < 1:
+                raise ValueError(f"{field_name} must be positive")
+
+
+class EvidenceObservationWorkLimitError(RuntimeError):
+    """Evidence observation exceeded a stable, payload-free work bound."""
+
+    reason_code = _EVIDENCE_OBSERVATION_WORK_LIMIT_EXCEEDED
+
+    def __init__(self, dimension: str, observed: int, limit: int) -> None:
+        self.dimension = dimension
+        self.observed = observed
+        self.limit = limit
+        super().__init__(f"{self.reason_code}: {dimension} exceeds {limit}")
+
+
+def _raise_evidence_observation_work_limit(
+    dimension: str,
+    observed: int,
+    limit: int,
+) -> None:
+    logger.warning(
+        _EVIDENCE_OBSERVATION_WORK_LIMIT_EXCEEDED,
+        reason_code=_EVIDENCE_OBSERVATION_WORK_LIMIT_EXCEEDED,
+        dimension=dimension,
+        observed=min(observed, 10_000_000),
+        limit=min(limit, 10_000_000),
+    )
+    raise EvidenceObservationWorkLimitError(dimension, observed, limit)
+
+
+@dataclass
+class EvidenceObservationWorkBudget:
+    """Mutable aggregate budget shared by initial, rescue, and final observation."""
+
+    limits: EvidenceObservationWorkLimits = EvidenceObservationWorkLimits()
+    total_resolution_catalog_checks: int = 0
+    total_signal_resolution_results: int = 0
+    observation_passes: int = 0
+    total_query_checks: int = 0
+    total_observation_slots: int = 0
+
+    def validate_ranked_archetypes(
+        self,
+        ranked_archetypes: list[tuple[InvestigationArchetype, float]],
+        *,
+        project_requirements: bool,
+    ) -> None:
+        """Admit raw archetype inputs before panel or requirement traversal."""
+        archetype_count = len(ranked_archetypes)
+        if archetype_count > self.limits.max_ranked_archetypes:
+            _raise_evidence_observation_work_limit(
+                "ranked_archetypes",
+                archetype_count,
+                self.limits.max_ranked_archetypes,
+            )
+        archetype_ids = [archetype.id for archetype, _ in ranked_archetypes]
+        duplicate_count = len(archetype_ids) - len(set(archetype_ids))
+        if duplicate_count:
+            _raise_evidence_observation_work_limit(
+                "duplicate_archetype_ids",
+                duplicate_count,
+                0,
+            )
+        projected_requirements = 0
+        for archetype, _ in ranked_archetypes:
+            panel_count = len(archetype.panels)
+            if panel_count > self.limits.max_archetype_panels:
+                _raise_evidence_observation_work_limit(
+                    "archetype_panels",
+                    panel_count,
+                    self.limits.max_archetype_panels,
+                )
+            if not project_requirements:
+                continue
+            projected_requirements += (
+                len(archetype.required_signals) + len(archetype.signal_bindings) + len(archetype.required_metrics)
+            )
+            if projected_requirements > self.limits.max_requirements:
+                _raise_evidence_observation_work_limit(
+                    "projected_requirements",
+                    projected_requirements,
+                    self.limits.max_requirements,
+                )
+
+    def validate_archetypes(
+        self,
+        ranked_archetypes: list[tuple[InvestigationArchetype, float]],
+        intent: Intent,
+        *,
+        project_requirements: bool,
+    ) -> None:
+        """Admit archetypes and their request scope before derived work."""
+        self.validate_ranked_archetypes(
+            ranked_archetypes,
+            project_requirements=project_requirements,
+        )
+        service_count = len(intent.services)
+        if service_count > self.limits.max_services:
+            _raise_evidence_observation_work_limit(
+                "services",
+                service_count,
+                self.limits.max_services,
+            )
+
+    def validate_catalog(
+        self,
+        catalog: list[MetricEntry],
+        *,
+        service_count: int = 0,
+    ) -> None:
+        """Admit a raw catalog before service filtering or resolver traversal."""
+        catalog_count = len(catalog)
+        if catalog_count > self.limits.max_catalog_entries:
+            _raise_evidence_observation_work_limit(
+                "catalog_entries",
+                catalog_count,
+                self.limits.max_catalog_entries,
+            )
+        if service_count > self.limits.max_services:
+            _raise_evidence_observation_work_limit(
+                "services",
+                service_count,
+                self.limits.max_services,
+            )
+        total_dimensions = 0
+        for entry in catalog:
+            dimension_count = len(entry.dimensions)
+            if dimension_count > self.limits.max_dimensions_per_catalog_entry:
+                _raise_evidence_observation_work_limit(
+                    "dimensions_per_catalog_entry",
+                    dimension_count,
+                    self.limits.max_dimensions_per_catalog_entry,
+                )
+            total_dimensions += dimension_count
+            if total_dimensions > self.limits.max_total_catalog_dimensions:
+                _raise_evidence_observation_work_limit(
+                    "total_catalog_dimensions",
+                    total_dimensions,
+                    self.limits.max_total_catalog_dimensions,
+                )
+
+    def validate_resolution_plan(
+        self,
+        ranked_archetypes: list[tuple[InvestigationArchetype, float]],
+        requirements: list[EvidenceRequirement],
+        catalog: list[MetricEntry],
+        intent: Intent,
+    ) -> None:
+        """Bound aggregate catalog work before evidence resolution begins."""
+        self.validate_archetypes(ranked_archetypes, intent, project_requirements=False)
+        self.validate_inputs(requirements, [])
+        self.validate_catalog(catalog, service_count=len(intent.services))
+        projected_checks = len(catalog) * (
+            len(ranked_archetypes) + len(requirements) * (4 + (2 * len(intent.services)))
+        )
+        self.reserve_resolution_catalog_checks(projected_checks)
+
+    def reserve_resolution_catalog_checks(self, projected_checks: int) -> None:
+        """Reserve aggregate catalog comparisons before resolution starts."""
+        next_checks = self.total_resolution_catalog_checks + projected_checks
+        if next_checks > self.limits.max_total_resolution_catalog_checks:
+            _raise_evidence_observation_work_limit(
+                "total_resolution_catalog_checks",
+                next_checks,
+                self.limits.max_total_resolution_catalog_checks,
+            )
+        self.total_resolution_catalog_checks = next_checks
+
+    def reserve_signal_resolution_results(self, result_count: int) -> None:
+        """Admit one resolver result before aggregation or sorting."""
+        if result_count > self.limits.max_signal_resolution_results_per_call:
+            _raise_evidence_observation_work_limit(
+                "signal_resolution_results_per_call",
+                result_count,
+                self.limits.max_signal_resolution_results_per_call,
+            )
+        next_results = self.total_signal_resolution_results + result_count
+        if next_results > self.limits.max_total_signal_resolution_results:
+            _raise_evidence_observation_work_limit(
+                "total_signal_resolution_results",
+                next_results,
+                self.limits.max_total_signal_resolution_results,
+            )
+        self.total_signal_resolution_results = next_results
+
+    def validate_rescue_plan(
+        self,
+        requirements: list[EvidenceRequirement],
+        resolutions: list[EvidenceResolution],
+        catalog: list[MetricEntry],
+        intent: Intent,
+    ) -> None:
+        """Bound one direct rescue helper before indexing or resolving inputs."""
+        self.validate_inputs(requirements, resolutions)
+        self.validate_catalog(catalog, service_count=len(intent.services))
+        projected_checks = len(catalog) * (len(requirements) * (4 + (2 * len(intent.services))))
+        self.reserve_resolution_catalog_checks(projected_checks)
+
+    def diagnostics(self) -> dict[str, int]:
+        """Return bounded, payload-free counters for stage observability."""
+        return {
+            "evidence_resolution_catalog_checks": self.total_resolution_catalog_checks,
+            "evidence_resolution_catalog_check_limit": self.limits.max_total_resolution_catalog_checks,
+            "evidence_signal_resolution_results": self.total_signal_resolution_results,
+            "evidence_signal_resolution_result_limit": self.limits.max_total_signal_resolution_results,
+            "observation_passes": self.observation_passes,
+            "observation_pass_limit": self.limits.max_observation_passes,
+            "evidence_query_checks": self.total_query_checks,
+            "evidence_query_check_limit": self.limits.max_total_query_checks,
+            "evidence_observation_slots": self.total_observation_slots,
+            "evidence_observation_slot_limit": self.limits.max_total_observation_slots,
+        }
+
+    def validate_inputs(
+        self,
+        requirements: list[EvidenceRequirement],
+        resolutions: list[EvidenceResolution],
+    ) -> None:
+        self.validate_counts(len(requirements), len(resolutions))
+
+    def validate_counts(self, requirement_count: int, resolution_count: int) -> None:
+        """Check projected collection sizes without allocating a combined list."""
+        if requirement_count > self.limits.max_requirements:
+            _raise_evidence_observation_work_limit(
+                "requirements",
+                requirement_count,
+                self.limits.max_requirements,
+            )
+        if resolution_count > self.limits.max_resolutions:
+            _raise_evidence_observation_work_limit(
+                "resolutions",
+                resolution_count,
+                self.limits.max_resolutions,
+            )
+
+    def reserve_observation_pass(
+        self,
+        requirements: list[EvidenceRequirement],
+        resolutions: list[EvidenceResolution],
+        pre_validation: DashboardSpec,
+        post_validation: DashboardSpec,
+    ) -> None:
+        """Reserve the worst-case pass before traversing or allocating observations."""
+        self.validate_inputs(requirements, resolutions)
+        next_passes = self.observation_passes + 1
+        if next_passes > self.limits.max_observation_passes:
+            _raise_evidence_observation_work_limit(
+                "observation_passes",
+                next_passes,
+                self.limits.max_observation_passes,
+            )
+
+        _, pre_query_count = dashboard_spec_work_counts(pre_validation)
+        _, post_query_count = dashboard_spec_work_counts(post_validation)
+        resolved_count = sum(resolution.status == EvidenceResolutionStatus.RESOLVED for resolution in resolutions)
+        unresolved_count = len(resolutions) - resolved_count
+
+        # Each resolved query comparison can test the resolved and default
+        # metrics, each with the base token plus three histogram suffixes.
+        pass_query_checks = post_query_count + (resolved_count * pre_query_count * 8)
+        next_query_checks = self.total_query_checks + pass_query_checks
+        if next_query_checks > self.limits.max_total_query_checks:
+            _raise_evidence_observation_work_limit(
+                "total_query_checks",
+                next_query_checks,
+                self.limits.max_total_query_checks,
+            )
+
+        pass_observation_slots = unresolved_count + (resolved_count * max(1, pre_query_count))
+        next_observation_slots = self.total_observation_slots + pass_observation_slots
+        if next_observation_slots > self.limits.max_total_observation_slots:
+            _raise_evidence_observation_work_limit(
+                "total_observation_slots",
+                next_observation_slots,
+                self.limits.max_total_observation_slots,
+            )
+
+        validate_dashboard_nested_collection_work_limits(pre_validation)
+        validate_dashboard_scalar_work_limits(pre_validation)
+        if post_validation is not pre_validation:
+            validate_dashboard_nested_collection_work_limits(post_validation)
+            validate_dashboard_scalar_work_limits(post_validation)
+
+        self.observation_passes = next_passes
+        self.total_query_checks = next_query_checks
+        self.total_observation_slots = next_observation_slots
 
 
 def _gap_outcome(reason_code: str) -> EvidenceObservationOutcome:
@@ -72,8 +413,24 @@ def requirements_for_archetype(
     intent: Intent,
     *,
     priority: str = "critical",
+    work_limits: EvidenceObservationWorkLimits | None = None,
 ) -> list[EvidenceRequirement]:
     """Return declared evidence needs for one selected archetype."""
+    EvidenceObservationWorkBudget(work_limits or EvidenceObservationWorkLimits()).validate_archetypes(
+        [(archetype, 1.0)],
+        intent,
+        project_requirements=True,
+    )
+    return _requirements_for_archetype(archetype, intent, priority=priority)
+
+
+def _requirements_for_archetype(
+    archetype: InvestigationArchetype,
+    intent: Intent,
+    *,
+    priority: str,
+) -> list[EvidenceRequirement]:
+    """Build requirements after the enclosing collection has been admitted."""
     requirements: list[EvidenceRequirement] = []
     seen: set[tuple[str, str, str]] = set()
 
@@ -106,19 +463,48 @@ def requirements_for_archetype(
 def requirements_for_archetypes(
     ranked_archetypes: list[tuple[InvestigationArchetype, float]],
     intent: Intent,
+    *,
+    work_limits: EvidenceObservationWorkLimits | None = None,
 ) -> list[EvidenceRequirement]:
     """Return evidence needs for the selected archetype set."""
+    budget = EvidenceObservationWorkBudget(work_limits or EvidenceObservationWorkLimits())
+    budget.validate_archetypes(ranked_archetypes, intent, project_requirements=True)
     requirements: list[EvidenceRequirement] = []
     for archetype, _ in ranked_archetypes:
-        requirements.extend(requirements_for_archetype(archetype, intent))
+        requirements.extend(_requirements_for_archetype(archetype, intent, priority="critical"))
+    budget.validate_inputs(requirements, [])
     return requirements
+
+
+def unresolved_resolutions_for_requirements(
+    requirements: list[EvidenceRequirement],
+    *,
+    reason_code: str,
+) -> list[EvidenceResolution]:
+    """Preserve declared obligations when their binding stage cannot complete."""
+    return [
+        EvidenceResolution(
+            requirement_id=requirement.id,
+            status=EvidenceResolutionStatus.UNRESOLVED,
+            reason_code=reason_code,
+        )
+        for requirement in requirements
+    ]
 
 
 def contributing_archetypes(
     ranked_archetypes: list[tuple[InvestigationArchetype, float]],
     dashboard_spec: DashboardSpec,
+    *,
+    work_limits: EvidenceObservationWorkLimits | None = None,
 ) -> list[tuple[InvestigationArchetype, float]]:
     """Return selected archetypes that actually contributed compiled panels."""
+    budget = EvidenceObservationWorkBudget(work_limits or EvidenceObservationWorkLimits())
+    budget.validate_ranked_archetypes(
+        ranked_archetypes,
+        project_requirements=False,
+    )
+    validate_dashboard_spec_work_limits(dashboard_spec)
     if not ranked_archetypes or not dashboard_spec.panels:
         return []
     source_ids = {panel.source_archetype for panel in dashboard_spec.panels if panel.source_archetype}
@@ -141,26 +527,45 @@ def _unique_owner(entries: list[MetricEntry]) -> MetricEntry | None:
     return entries[0] if len(owners) == 1 else None
 
 
-def resolve_requirements_for_archetype(
+def resolve_declared_requirements_for_archetype(
     archetype: InvestigationArchetype,
     intent: Intent,
     catalog: list[MetricEntry],
+    requirements: list[EvidenceRequirement],
     *,
     target_language: str = "promql",
     signal_store: Any | None = None,
-) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
-    """Resolve one archetype's evidence needs against the live catalog."""
+    tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    applied_governance_refs: set[str] | None = None,
+    governance_refs_by_requirement: dict[str, set[str]] | None = None,
+    applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
+    governance_revision_refs_by_requirement: dict[str, set[KnowledgeRevisionRef]] | None = None,
+    work_limits: EvidenceObservationWorkLimits | None = None,
+    work_budget: EvidenceObservationWorkBudget | None = None,
+    signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
+    _work_admitted: bool = False,
+) -> list[EvidenceResolution]:
+    """Bind already-declared evidence needs for one archetype."""
     from tacit.archetypes.engine import (
         _archetype_query_languages,
         _datasource_type_for_language,
-        _legacy_metric_signal,
+        _legacy_metric_signal_details,
         _substitution_shape_compatible,
     )
     from tacit.signals import get_signal_store
 
-    requirements = requirements_for_archetype(archetype, intent)
     if not requirements:
-        return requirements, []
+        return []
+
+    budget = work_budget or EvidenceObservationWorkBudget(work_limits or EvidenceObservationWorkLimits())
+    if not _work_admitted:
+        budget.validate_resolution_plan(
+            [(archetype, 1.0)],
+            requirements,
+            catalog,
+            intent,
+        )
 
     query_languages = _archetype_query_languages(archetype, target_language)
     target_catalog = [
@@ -229,12 +634,21 @@ def resolve_requirements_for_archetype(
             continue
 
         signal_type = requirement.signal_type
+        inferred_by: KnowledgeRevisionRef | None = None
         if not signal_type and default_metric:
             for language in sorted(query_languages or {target_language}):
                 language_catalog = [
                     entry for entry in target_catalog if (entry.query_language or "").lower() == language.lower()
                 ]
-                signal_type = _legacy_metric_signal(store, default_metric, language_catalog, language)
+                signal_type, inferred_by = _legacy_metric_signal_details(
+                    store,
+                    default_metric,
+                    language_catalog,
+                    language,
+                    tenant_id,
+                    knowledge_scope,
+                    signal_resolution_work_budget,
+                )
                 if signal_type:
                     break
         if not signal_type:
@@ -247,24 +661,27 @@ def resolve_requirements_for_archetype(
             )
             continue
 
-        resolved: list[tuple[MetricEntry, float]] = []
+        resolved = []
         for language in sorted(query_languages or {target_language}):
             target_datasource_type = _datasource_type_for_language(language)
-            resolved.extend(
-                store.resolve_signal(
-                    signal_type,
-                    resolution_catalog,
-                    context_service=intent.services[0] if intent.services else "",
-                    context_datasource_type=target_datasource_type,
-                    context_archetype=archetype.id,
-                    target_query_language=language,
-                )
+            matches = store.resolve_signal_details(
+                signal_type,
+                resolution_catalog,
+                context_service=intent.services[0] if intent.services else "",
+                context_datasource_type=target_datasource_type,
+                context_archetype=archetype.id,
+                target_query_language=language,
+                tenant_id=tenant_id,
+                knowledge_scope=knowledge_scope,
+                **signal_resolution_work_kwargs(store, signal_resolution_work_budget),
             )
-        resolved.sort(key=lambda item: item[1], reverse=True)
+            budget.reserve_signal_resolution_results(len(matches))
+            resolved.extend(matches)
+        resolved.sort(key=lambda item: item.confidence, reverse=True)
         compatible = [
-            (entry, score)
-            for entry, score in resolved
-            if not default_metric or _substitution_shape_compatible(archetype, default_metric, entry)
+            match
+            for match in resolved
+            if not default_metric or _substitution_shape_compatible(archetype, default_metric, match.entry)
         ]
         if not compatible:
             resolutions.append(
@@ -277,10 +694,11 @@ def resolve_requirements_for_archetype(
             continue
 
         if requirement.evidence_type != "semantic_signal":
-            best_score = compatible[0][1]
-            best = [item for item in compatible if item[1] == best_score]
+            best_score = compatible[0].confidence
+            best = [item for item in compatible if item.confidence == best_score]
             best_owners = {
-                (entry.name, entry.datasource_uid, entry.datasource_type, entry.query_language) for entry, _ in best
+                (item.entry.name, item.entry.datasource_uid, item.entry.datasource_type, item.entry.query_language)
+                for item in best
             }
             if len(best_owners) > 1:
                 resolutions.append(
@@ -293,7 +711,31 @@ def resolve_requirements_for_archetype(
                 )
                 continue
 
-        entry, score = compatible[0]
+        selected = compatible[0]
+        entry, score = selected.entry, selected.confidence
+        if applied_governance_refs is not None:
+            if inferred_by:
+                applied_governance_refs.add(inferred_by.knowledge_ref)
+            if selected.governance_ref:
+                applied_governance_refs.add(selected.governance_ref)
+        if governance_refs_by_requirement is not None:
+            refs = governance_refs_by_requirement.setdefault(requirement.id, set())
+            if inferred_by:
+                refs.add(inferred_by.knowledge_ref)
+            if selected.governance_ref:
+                refs.add(selected.governance_ref)
+        selected_revision_ref = selected.knowledge_revision_ref
+        if applied_governance_revision_refs is not None:
+            if inferred_by is not None:
+                applied_governance_revision_refs.add(inferred_by)
+            if selected_revision_ref is not None:
+                applied_governance_revision_refs.add(selected_revision_ref)
+        if governance_revision_refs_by_requirement is not None:
+            revision_refs = governance_revision_refs_by_requirement.setdefault(requirement.id, set())
+            if inferred_by is not None:
+                revision_refs.add(inferred_by)
+            if selected_revision_ref is not None:
+                revision_refs.add(selected_revision_ref)
         resolutions.append(
             resolved_from_entry(
                 requirement,
@@ -304,7 +746,94 @@ def resolve_requirements_for_archetype(
             )
         )
 
+    return resolutions
+
+
+def resolve_requirements_for_archetype(
+    archetype: InvestigationArchetype,
+    intent: Intent,
+    catalog: list[MetricEntry],
+    *,
+    target_language: str = "promql",
+    signal_store: Any | None = None,
+    tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    applied_governance_refs: set[str] | None = None,
+    governance_refs_by_requirement: dict[str, set[str]] | None = None,
+    applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
+    governance_revision_refs_by_requirement: dict[str, set[KnowledgeRevisionRef]] | None = None,
+    work_limits: EvidenceObservationWorkLimits | None = None,
+    signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
+) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
+    """Declare and resolve one archetype's evidence needs against the live catalog."""
+    requirements = requirements_for_archetype(archetype, intent, work_limits=work_limits)
+    resolutions = resolve_declared_requirements_for_archetype(
+        archetype,
+        intent,
+        catalog,
+        requirements,
+        target_language=target_language,
+        signal_store=signal_store,
+        tenant_id=tenant_id,
+        knowledge_scope=knowledge_scope,
+        applied_governance_refs=applied_governance_refs,
+        governance_refs_by_requirement=governance_refs_by_requirement,
+        applied_governance_revision_refs=applied_governance_revision_refs,
+        governance_revision_refs_by_requirement=governance_revision_refs_by_requirement,
+        work_limits=work_limits,
+        signal_resolution_work_budget=signal_resolution_work_budget,
+    )
     return requirements, resolutions
+
+
+def resolve_declared_requirements_for_archetypes(
+    ranked_archetypes: list[tuple[InvestigationArchetype, float]],
+    intent: Intent,
+    catalog: list[MetricEntry],
+    requirements: list[EvidenceRequirement],
+    *,
+    target_language: str = "promql",
+    signal_store: Any | None = None,
+    tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    applied_governance_refs: set[str] | None = None,
+    governance_refs_by_requirement: dict[str, set[str]] | None = None,
+    applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
+    governance_revision_refs_by_requirement: dict[str, set[KnowledgeRevisionRef]] | None = None,
+    work_limits: EvidenceObservationWorkLimits | None = None,
+    work_budget: EvidenceObservationWorkBudget | None = None,
+    signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
+) -> list[EvidenceResolution]:
+    """Bind a frozen declaration set for the selected archetypes."""
+    budget = work_budget or EvidenceObservationWorkBudget(work_limits or EvidenceObservationWorkLimits())
+    budget.validate_resolution_plan(ranked_archetypes, requirements, catalog, intent)
+    requirements_by_source: dict[str, list[EvidenceRequirement]] = defaultdict(list)
+    for requirement in requirements:
+        requirements_by_source[requirement.source].append(requirement)
+
+    resolutions: list[EvidenceResolution] = []
+    for archetype, _ in ranked_archetypes:
+        resolutions.extend(
+            resolve_declared_requirements_for_archetype(
+                archetype,
+                intent,
+                catalog,
+                requirements_by_source.get(archetype.id, []),
+                target_language=target_language,
+                signal_store=signal_store,
+                tenant_id=tenant_id,
+                knowledge_scope=knowledge_scope,
+                applied_governance_refs=applied_governance_refs,
+                governance_refs_by_requirement=governance_refs_by_requirement,
+                applied_governance_revision_refs=applied_governance_revision_refs,
+                governance_revision_refs_by_requirement=governance_revision_refs_by_requirement,
+                work_limits=work_limits,
+                work_budget=budget,
+                signal_resolution_work_budget=signal_resolution_work_budget,
+                _work_admitted=True,
+            )
+        )
+    return resolutions
 
 
 def resolve_requirements_for_archetypes(
@@ -314,20 +843,37 @@ def resolve_requirements_for_archetypes(
     *,
     target_language: str = "promql",
     signal_store: Any | None = None,
+    tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    applied_governance_refs: set[str] | None = None,
+    governance_refs_by_requirement: dict[str, set[str]] | None = None,
+    applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
+    governance_revision_refs_by_requirement: dict[str, set[KnowledgeRevisionRef]] | None = None,
+    work_limits: EvidenceObservationWorkLimits | None = None,
+    signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
 ) -> tuple[list[EvidenceRequirement], list[EvidenceResolution]]:
     """Resolve evidence needs for all selected archetypes."""
-    requirements: list[EvidenceRequirement] = []
-    resolutions: list[EvidenceResolution] = []
-    for archetype, _ in ranked_archetypes:
-        arch_requirements, arch_resolutions = resolve_requirements_for_archetype(
-            archetype,
-            intent,
-            catalog,
-            target_language=target_language,
-            signal_store=signal_store,
-        )
-        requirements.extend(arch_requirements)
-        resolutions.extend(arch_resolutions)
+    requirements = requirements_for_archetypes(
+        ranked_archetypes,
+        intent,
+        work_limits=work_limits,
+    )
+    resolutions = resolve_declared_requirements_for_archetypes(
+        ranked_archetypes,
+        intent,
+        catalog,
+        requirements,
+        target_language=target_language,
+        signal_store=signal_store,
+        tenant_id=tenant_id,
+        knowledge_scope=knowledge_scope,
+        applied_governance_refs=applied_governance_refs,
+        governance_refs_by_requirement=governance_refs_by_requirement,
+        applied_governance_revision_refs=applied_governance_revision_refs,
+        governance_revision_refs_by_requirement=governance_revision_refs_by_requirement,
+        work_limits=work_limits,
+        signal_resolution_work_budget=signal_resolution_work_budget,
+    )
     return requirements, resolutions
 
 
@@ -346,8 +892,17 @@ def observe_evidence(
     resolutions: list[EvidenceResolution],
     pre_validation: DashboardSpec,
     post_validation: DashboardSpec,
+    *,
+    work_budget: EvidenceObservationWorkBudget | None = None,
 ) -> list[EvidenceObservation]:
     """Record whether resolved evidence appears in a query that survived validation."""
+    budget = work_budget or EvidenceObservationWorkBudget()
+    budget.reserve_observation_pass(
+        requirements,
+        resolutions,
+        pre_validation,
+        post_validation,
+    )
     requirements_by_id = {requirement.id: requirement for requirement in requirements}
     surviving_queries = {
         (query.expr, query.datasource_uid): query

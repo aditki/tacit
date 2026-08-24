@@ -19,6 +19,7 @@ import structlog
 
 from tacit.agents.synonyms import expand_operational_terms, operational_evidence
 from tacit.config import Settings
+from tacit.knowledge.scope import explicit_environment_values
 from tacit.models.schemas import ArchetypeMatch, Intent, SignalType
 
 logger = structlog.get_logger()
@@ -205,10 +206,6 @@ _ENVIRONMENT = re.compile(
     r"\b(production|prod|staging|stage|development|dev|qa|test|sandbox)\b",
     re.IGNORECASE,
 )
-_QUALIFIED_ENVIRONMENT = re.compile(
-    r"\b(?:environment|env)\s*[:=]\s*([a-z0-9][a-z0-9_.:-]*)",
-    re.IGNORECASE,
-)
 
 
 def zero_key_mode(settings: Settings) -> bool:
@@ -260,16 +257,7 @@ def _extract_timerange(text: str) -> str:
 
 def _extract_environments(text: str) -> list[str]:
     """Capture only environment names explicitly present in the prompt."""
-    qualified = _QUALIFIED_ENVIRONMENT.findall(text)
-    unqualified_text = _QUALIFIED_ENVIRONMENT.sub("", text)
-    standalone = [
-        match.group(1)
-        for match in _ENVIRONMENT.finditer(unqualified_text)
-        if (match.start() == 0 or unqualified_text[match.start() - 1] not in "-_.")
-        and (match.end() == len(unqualified_text) or unqualified_text[match.end()] not in "-_.")
-    ]
-    candidates = [*qualified, *standalone]
-    return list(dict.fromkeys(match.casefold() for match in candidates))
+    return explicit_environment_values(text)
 
 
 def _extract_signals(text: str) -> list[SignalType]:

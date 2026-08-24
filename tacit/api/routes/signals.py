@@ -4,24 +4,52 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from tacit.api.dependencies import get_signal_store
-from tacit.api.security import verify_api_key
+from tacit.api.dependencies import get_knowledge_service, get_signal_store
+from tacit.api.security import (
+    KnowledgeAction,
+    assert_knowledge_action,
+    authenticated_actor,
+    knowledge_tenant,
+    require_knowledge_action,
+    require_knowledge_tenant,
+    verify_api_key,
+)
+from tacit.errors import SemanticAuthorizationError
 from tacit.models.schemas import TeachSignalRequest, TeachSignalResponse
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter(dependencies=[Depends(verify_api_key), Depends(require_knowledge_tenant)])
 
 
 @router.get(
     "/api/v1/signals",
     tags=["Signals"],
-    summary="List all signal types",
-    response_description="All registered semantic signal types with categories",
+    summary="List signal types",
+    response_description="One bounded page of registered semantic signal types with categories",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
-async def list_signals(store: Any = Depends(get_signal_store)):
-    """List all registered semantic signal types."""
-    return {"signal_types": store.list_signal_types()}
+async def list_signals(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    cursor: str | None = Query(default=None, max_length=1_024),
+    store: Any = Depends(get_signal_store),
+):
+    """List one stable page of registered semantic signal types."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
+    try:
+        page = store.list_signal_types_page(
+            tenant_id=knowledge_tenant(request),
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "signal_types": page.items,
+        "has_more": page.has_more,
+        "next_cursor": page.next_cursor,
+    }
 
 
 @router.get(
@@ -29,21 +57,39 @@ async def list_signals(store: Any = Depends(get_signal_store)):
     tags=["Signals"],
     summary="Signal store statistics",
     response_description="Summary stats: signal types, mappings, ingested dashboards",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
-async def signal_stats(store: Any = Depends(get_signal_store)):
+async def signal_stats(request: Request, store: Any = Depends(get_signal_store)):
     """Summary statistics for the signal mapping store."""
-    return store.stats()
+    assert_knowledge_action(request, KnowledgeAction.READ)
+    return store.stats(tenant_id=knowledge_tenant(request))
 
 
 @router.get(
     "/api/v1/signals/{signal_type}",
     tags=["Signals"],
     summary="Get signal type details",
-    response_description="Signal type with all metric mappings, confidence scores, and provenance",
+    response_description="Signal type with one bounded metric-mapping page",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
-async def get_signal(signal_type: str, store: Any = Depends(get_signal_store)):
-    """Get a signal type with all its metric mappings."""
-    result = store.get_signal_type(signal_type)
+async def get_signal(
+    signal_type: str,
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    cursor: str | None = Query(default=None, max_length=1_024),
+    store: Any = Depends(get_signal_store),
+):
+    """Get a signal type with one stable page of metric mappings."""
+    assert_knowledge_action(request, KnowledgeAction.READ)
+    try:
+        result = store.get_signal_type_page(
+            signal_type,
+            tenant_id=knowledge_tenant(request),
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if result is None:
         raise HTTPException(status_code=404, detail=f"Signal type '{signal_type}' not found")
     return result
@@ -55,35 +101,78 @@ async def get_signal(signal_type: str, store: Any = Depends(get_signal_store)):
     summary="Teach Tacit a signal mapping",
     response_model=TeachSignalResponse,
     response_description="Confirmation of the created mapping",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.TEACH_SIGNALS))],
 )
 async def teach_signal(
-    request: TeachSignalRequest,
+    payload: TeachSignalRequest,
+    request: Request,
     store: Any = Depends(get_signal_store),
+    knowledge_service: Any = Depends(get_knowledge_service),
 ) -> TeachSignalResponse:
     """Teach Tacit an organization-specific signal mapping."""
-    store.register_signal_type(
-        signal_type=request.signal_type,
-        description=request.description,
-        category=request.category,
-        unit=request.unit,
-    )
-
+    assert_knowledge_action(request, KnowledgeAction.TEACH_SIGNALS)
+    tenant_id = knowledge_tenant(request)
     mappings_created = 0
-    for mp in request.metric_patterns:
-        store.add_mapping(
-            signal_type=request.signal_type,
-            metric_pattern=mp.pattern,
-            confidence=mp.confidence,
-            context_services=request.services,
-            context_datasource_types=request.datasource_types,
-            context_environments=request.environments,
-            source_type="teach",
-            source_refs=[f"manual:{request.taught_by}"],
-        )
-        mappings_created += 1
+    source_ref = f"manual:{authenticated_actor(request)}"
+    from tacit.knowledge.enums import KnowledgeEligibility, LifecycleStatus
+    from tacit.knowledge.migration import migrate_signal_mapping
+
+    # Signal definitions, governed authority, and resolver projections share one
+    # SQLite database. Keep the whole teaching request as one authority change.
+    try:
+        with knowledge_service.repository.transaction() as connection:
+            store.register_signal_type(
+                signal_type=payload.signal_type,
+                description=payload.description,
+                category=payload.category,
+                unit=payload.unit,
+                tenant_id=tenant_id,
+                connection=connection,
+            )
+
+            for mp in payload.metric_patterns:
+                record_ref = f"teach:{payload.signal_type}:{mp.pattern}"
+                services, datasource_types, environments = knowledge_service.resolve_signal_mapping_scope_patch(
+                    record_ref=record_ref,
+                    tenant_id=tenant_id,
+                    services=payload.services,
+                    datasource_types=payload.datasource_types,
+                    environments=payload.environments,
+                )
+                candidate_id = migrate_signal_mapping(
+                    {
+                        "id": record_ref,
+                        "signal_type": payload.signal_type,
+                        "metric_pattern": mp.pattern,
+                        "confidence": mp.confidence,
+                        "context_services": services,
+                        "context_datasource_types": datasource_types,
+                        "context_environments": environments,
+                        "source_type": "human",
+                        "source_refs": [source_ref],
+                        "submitted_taught_by": payload.taught_by,
+                        "review_state": "trusted",
+                    },
+                    service=knowledge_service,
+                    tenant_id=tenant_id,
+                )
+                _decision, revision = knowledge_service.evaluate_candidate(
+                    candidate_id,
+                    tenant_id=tenant_id,
+                )
+                if (
+                    revision is not None
+                    and revision.state.lifecycle_status == LifecycleStatus.ACTIVE
+                    and revision.state.eligibility != KnowledgeEligibility.INELIGIBLE
+                ):
+                    mappings_created += 1
+    except SemanticAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return TeachSignalResponse(
-        signal_type=request.signal_type,
+        signal_type=payload.signal_type,
         mappings_created=mappings_created,
-        message=f"Signal '{request.signal_type}' updated with {mappings_created} mapping(s)",
+        message=f"Signal '{payload.signal_type}' updated with {mappings_created} mapping(s)",
     )

@@ -5,19 +5,45 @@ from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
 import tacit.backends as backends_mod
+import tacit.cli as cli_mod
 import tacit.signals as signals_mod
 from tacit.backends.base import AlertFeatures, DashboardFeatures
 from tacit.cli import cli
+from tacit.config import Settings, settings
 from tacit.main import app
+from tacit.runtime_stores import RuntimeStores
 
 
 @pytest.fixture
 def isolated_learning_store(tmp_path, monkeypatch):
-    monkeypatch.setattr(signals_mod, "_DEFAULT_DB_PATH", tmp_path / "learning_e2e.db")
-    signals_mod._store = None
-    store = signals_mod.get_signal_store()
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="default",
+        knowledge_permissions=(
+            "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.correct,"
+            "knowledge.apply,knowledge.export,knowledge.override"
+        ),
+        api_auth_enabled=False,
+        signals_db_path=str(tmp_path / "learning_e2e.db"),
+        history_db_path=str(tmp_path / "history_e2e.db"),
+        feedback_db_path=str(tmp_path / "feedback_e2e.db"),
+    )
+    runtime_stores = RuntimeStores(runtime_settings)
+    store = runtime_stores.signals()
+    monkeypatch.setattr(signals_mod, "get_signal_store", lambda: store)
+    monkeypatch.setattr(cli_mod, "_cli_runtime_stores", lambda: runtime_stores)
+    for field in (
+        "knowledge_tenant_id",
+        "knowledge_permissions",
+        "api_auth_enabled",
+        "signals_db_path",
+        "history_db_path",
+        "feedback_db_path",
+    ):
+        monkeypatch.setattr(settings, field, getattr(runtime_settings, field))
+    monkeypatch.setattr(app.state, "settings", runtime_settings)
+    monkeypatch.setattr(app.state, "runtime_stores", runtime_stores)
     yield store
-    signals_mod._store = None
 
 
 @pytest.fixture
@@ -65,6 +91,33 @@ def _checkout_dashboard_upload() -> dict:
     }
 
 
+def _corroborating_dashboard_upload(uid: str, panel_title: str, expression: str) -> dict:
+    return {
+        "vendor": "grafana",
+        "source_name": f"{uid}.json",
+        "auto_approve": True,
+        "dashboard": {
+            "dashboard": {
+                "uid": uid,
+                "title": panel_title,
+                "tags": ["service:checkout"],
+                "panels": [
+                    {
+                        "type": "timeseries",
+                        "title": panel_title,
+                        "targets": [
+                            {
+                                "expr": expression,
+                                "datasource": {"type": "prometheus", "uid": "prom"},
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
+    }
+
+
 def test_dashboard_upload_approval_search_and_service_question_e2e(client, isolated_learning_store):
     if not isolated_learning_store._learning_index_available():
         pytest.skip("SQLite FTS5 is not available")
@@ -103,26 +156,87 @@ def test_dashboard_upload_approval_search_and_service_question_e2e(client, isola
         params={"q": "checkout latency", "service": "checkout", "include_candidates": "false"},
     )
     assert approved_search.status_code == 200
-    assert approved_search.json()["count"] >= 1
-    assert approved_search.json()["results"][0]["review_state"] == "approved"
+    assert approved_search.json()["count"] == 0
 
-    service = client.get("/api/v1/services/checkout", params={"include_candidates": "false"})
+    governed_search = client.get(
+        "/api/v1/learning/search",
+        params={"q": "checkout latency", "service": "checkout"},
+    )
+    assert governed_search.status_code == 200
+    assert governed_search.json()["count"] >= 1
+    assert governed_search.json()["results"][0]["review_state"] == "candidate"
+
+    service = client.get("/api/v1/services/checkout")
     assert service.status_code == 200
     service_body = service.json()
-    assert service_body["trusted_context_rows"] >= 1
+    assert service_body["trusted_context_rows"] == 0
+    assert service_body["candidate_context_rows"] >= 1
     assert any(metric["metric"] == "checkout_custom_latency_ms" for metric in service_body["top_metrics"])
 
-    service_cli = runner.invoke(cli, ["learn", "service", "checkout", "--approved-only"])
+    service_cli = runner.invoke(cli, ["learn", "service", "checkout"])
     assert service_cli.exit_code == 0
     assert "Checkout Service Health" in service_cli.output
     assert "checkout_custom_latency_ms" in service_cli.output
 
     search_cli = runner.invoke(
         cli,
-        ["learn", "search", "checkout latency", "--service", "checkout", "--approved-only"],
+        ["learn", "search", "checkout latency", "--service", "checkout"],
     )
     assert search_cli.exit_code == 0
     assert "checkout_custom_latency_ms" in search_cli.output
+
+
+@pytest.mark.parametrize(("action", "terminal_status"), [("reject", "rejected"), ("ignore", "ignored")])
+def test_dashboard_terminal_review_retires_governed_source_support_e2e(
+    client,
+    isolated_learning_store,
+    action,
+    terminal_status,
+):
+    first = client.post(
+        "/api/v1/learn/dashboard/json",
+        json=_corroborating_dashboard_upload(
+            "checkout-latency-source-a",
+            "Checkout latency p95",
+            "checkout_custom_latency_ms",
+        ),
+    )
+    second = client.post(
+        "/api/v1/learn/dashboard/json",
+        json=_corroborating_dashboard_upload(
+            "checkout-latency-source-b",
+            "Checkout latency p99",
+            "avg(checkout_custom_latency_ms)",
+        ),
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["status"] == second.json()["status"] == "approved"
+    active_patterns = {
+        mapping["metric_pattern"]
+        for mapping in isolated_learning_store.get_mappings_for_signal(
+            "request_latency",
+            context_datasource_type="prometheus",
+            include_decayed=True,
+        )
+    }
+    assert "checkout_custom_latency_ms" in active_patterns
+
+    reviewed = client.post(
+        f"/api/v1/learn/dashboards/checkout-latency-source-b/{action}",
+        params={"backend": "grafana_json"},
+    )
+
+    assert reviewed.status_code == 200
+    assert reviewed.json()["status"] == terminal_status
+    remaining_patterns = {
+        mapping["metric_pattern"]
+        for mapping in isolated_learning_store.get_mappings_for_signal(
+            "request_latency",
+            include_decayed=True,
+        )
+    }
+    assert "checkout_custom_latency_ms" not in remaining_patterns
 
 
 def test_runbook_artifact_learning_cli_and_api_e2e(client, isolated_learning_store, tmp_path):
@@ -317,10 +431,11 @@ def test_bulk_grafana_learning_cli_indexes_backend_dashboards_e2e(isolated_learn
     assert result.exit_code == 0
     assert "Learned from 1 grafana dashboards" in result.output
     assert "Indexed context rows: 2" in result.output
-    assert "Mappings created: 2" in result.output
+    assert "Mappings created: 0" in result.output
 
-    summary = isolated_learning_store.describe_service("checkout", include_candidates=False)
-    assert summary["trusted_context_rows"] == 2
+    summary = isolated_learning_store.describe_service("checkout", include_candidates=True)
+    assert summary["trusted_context_rows"] == 0
+    assert summary["candidate_context_rows"] == 2
     assert {metric["metric"] for metric in summary["top_metrics"]} == {
         "checkout_custom_latency_ms",
         "checkout_5xx_count",

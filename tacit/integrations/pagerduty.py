@@ -39,9 +39,19 @@ from tacit.artifact_learning import (
     IncidentExtractor,
     LearnedArtifact,
     artifact_from_text,
+    authorize_artifact_learning,
     learn_artifact,
 )
 from tacit.config import Settings, settings
+from tacit.runtime_ownership import (
+    RuntimeOwnershipDescriptor,
+    RuntimeRemoteIdentity,
+    canonical_remote_endpoint,
+    copy_runtime_settings,
+    credential_fingerprint,
+    runtime_descriptor_for_remote,
+    snapshot_runtime_settings,
+)
 
 logger = structlog.get_logger()
 
@@ -71,11 +81,30 @@ class PagerDutyClient:
         runtime_settings: Settings | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
-        config = runtime_settings or settings
-        self.api_token = api_token if api_token is not None else config.pagerduty_api_token
-        self.base_url = (base_url or config.pagerduty_base_url).rstrip("/")
+        configured_settings = snapshot_runtime_settings(runtime_settings or settings)
+        self._api_token = api_token if api_token is not None else configured_settings.pagerduty_api_token
+        effective_base_url = configured_settings.pagerduty_base_url if base_url is None else base_url
+        self._base_url = canonical_remote_endpoint(effective_base_url)
         if not self.api_token:
             raise PagerDutyConfigError("PagerDuty API token is required (pagerduty_api_token via env or .env).")
+        self._runtime_settings = snapshot_runtime_settings(
+            configured_settings.model_copy(
+                deep=True,
+                update={
+                    "pagerduty_api_token": self._api_token,
+                    "pagerduty_base_url": self._base_url,
+                },
+            )
+        )
+        self._runtime_ownership = runtime_descriptor_for_remote(
+            component="pagerduty_client",
+            runtime_settings=self._runtime_settings,
+            remote=RuntimeRemoteIdentity(
+                provider="pagerduty",
+                endpoint=self.base_url,
+                credential_fingerprint=credential_fingerprint(self.api_token),
+            ),
+        )
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             headers={
@@ -88,6 +117,24 @@ class PagerDutyClient:
             timeout=_DEFAULT_TIMEOUT,
             transport=transport,
         )
+
+    @property
+    def runtime_settings(self) -> Settings:
+        """Return a detached copy of the client's settings snapshot."""
+        return copy_runtime_settings(self._runtime_settings)
+
+    @property
+    def api_token(self) -> str:
+        return self._api_token
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @property
+    def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
+        """Return the effective PagerDuty identity without exposing credentials."""
+        return self._runtime_ownership
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -451,6 +498,8 @@ async def learn_pagerduty_incidents(
     max_items: int = 1000,
     dry_run: bool = False,
     store: Any | None = None,
+    tenant_id: str | None = None,
+    runtime_settings: Settings | None = None,
 ) -> dict[str, object]:
     """Fetch PagerDuty incident metadata and learn it as incident artifacts.
 
@@ -460,6 +509,19 @@ async def learn_pagerduty_incidents(
     """
     if not since:
         raise ValueError("since is required: an explicit ISO8601 window start prevents silent partial ingestion")
+    client_settings = getattr(client, "runtime_settings", None)
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        connector_settings=client_settings,
+        tenant_id=tenant_id,
+    )
+    resolved_store = store
+    if not dry_run and resolved_store is None:
+        from tacit.runtime_stores import RuntimeStores
+
+        resolved_store = RuntimeStores(active_settings).signals()
     incidents, truncated = await client.list_incidents(
         statuses=statuses or ["resolved"],
         since=since,
@@ -480,7 +542,9 @@ async def learn_pagerduty_incidents(
             incident_artifact(inc, source_instance=_account_instance(inc, client.base_url)),
             extractor,
             dry_run=dry_run,
-            store=store,
+            runtime_settings=active_settings,
+            store=resolved_store,
+            tenant_id=tenant_id,
         )
         for inc in incidents
         if inc.get("id")

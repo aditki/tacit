@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 import structlog
 
-from tacit.cache import make_cache_key, metric_cache
+from tacit.cache import cache_owner_namespace, make_cache_key, metric_cache
 from tacit.config import settings
 from tacit.grafana.adapters.base import DatasourceAdapter
 from tacit.grafana.client import GrafanaClient
@@ -74,7 +74,7 @@ class PrometheusAdapter(DatasourceAdapter):
         datasource: DatasourceInfo,
     ) -> dict[str, list[str]]:
         """Return {metric_name: [dim_strings]} from cache or live fetch."""
-        cache_key = make_cache_key("prom_catalog", datasource.uid)
+        cache_key = make_cache_key("prom_catalog", cache_owner_namespace(client), datasource.uid)
         cached = metric_cache.get(cache_key)
         if cached is not None:
             logger.info("prometheus_catalog_cache_hit", datasource=datasource.name, metrics=len(cached))
@@ -147,7 +147,7 @@ class PrometheusAdapter(DatasourceAdapter):
         histogram/summary suffixes ``_bucket``/``_sum``/``_count``), so callers
         should look up the base name. Cached alongside the catalog.
         """
-        cache_key = make_cache_key("prom_metadata", datasource.uid)
+        cache_key = make_cache_key("prom_metadata", cache_owner_namespace(client), datasource.uid)
         cached = metric_cache.get(cache_key)
         if cached is not None:
             return cached

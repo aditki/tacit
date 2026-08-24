@@ -9,13 +9,32 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+import structlog
+
+from tacit.config import Settings, settings
+from tacit.dependencies import resolve_owned_database_path
+from tacit.knowledge.authorization import KnowledgeAction, enforce_knowledge_action
+from tacit.runtime_ownership import (
+    RuntimeOwner,
+    describe_runtime_owner,
+    resolve_runtime_settings,
+)
 from tacit.signals import get_signal_store as _default_get_signal_store
+
+MAX_ARTIFACT_BODY_LENGTH = 200_000
+MAX_SOURCE_EXCERPT_LENGTH = 2_000
+logger = structlog.get_logger()
+
+
+def _diagnostic_fingerprint(value: object) -> str:
+    return hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 def get_signal_store():
@@ -166,6 +185,20 @@ def _fingerprint(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def _artifact_content_fingerprint(body_text: str) -> str:
+    """Build a MinHash-style lineage signature tolerant of small copied edits."""
+    lines = body_text.splitlines()
+    first_content = next((index for index, line in enumerate(lines) if line.strip()), None)
+    if first_content is not None and lines[first_content].lstrip().startswith("#"):
+        lines.pop(first_content)
+    tokens = re.sub(r"[^a-z0-9]+", " ", "\n".join(lines).casefold()).split()
+    if not tokens:
+        return _fingerprint("")
+    shingle_size = min(5, len(tokens))
+    shingles = {" ".join(tokens[index : index + shingle_size]) for index in range(len(tokens) - shingle_size + 1)}
+    return min(_fingerprint(shingle) for shingle in shingles)
+
+
 def _row_id(*parts: str) -> str:
     payload = "\0".join(parts)
     return hashlib.sha256(payload.encode()).hexdigest()[:24]
@@ -182,8 +215,12 @@ def _artifact_id(
     return f"{artifact_type}:{_fingerprint(stable)[:20]}"
 
 
-def _clean_line(line: str) -> str:
+def _normalized_line(line: str) -> str:
     return BULLET_PREFIX_RE.sub("", line.strip(), count=1).strip()
+
+
+def _clean_line(line: str) -> str:
+    return _normalized_line(line)[:MAX_SOURCE_EXCERPT_LENGTH]
 
 
 def _normalize_entity_token(value: str) -> str:
@@ -200,12 +237,12 @@ def _is_causal_heading(line: str) -> bool:
 
 
 def _is_causal_section_label(line: str) -> bool:
-    cleaned = _clean_line(line).strip()
+    cleaned = _normalized_line(line)
     return cleaned.endswith(":") and bool(CAUSAL_CLAIM_RE.search(cleaned))
 
 
 def _starts_causal_claim(line: str) -> bool:
-    cleaned = _clean_line(line).strip().lower()
+    cleaned = _normalized_line(line).lower()
     return bool(LEADING_CAUSAL_CLAIM_RE.search(cleaned))
 
 
@@ -329,19 +366,20 @@ class RunbookExtractor:
             if maybe_section:
                 section = "suppressed_causal" if maybe_section == "resolution" else maybe_section
                 continue
-            line = _clean_line(raw)
+            scan_line = _normalized_line(raw)
+            line = scan_line[:MAX_SOURCE_EXCERPT_LENGTH]
             if not line:
                 continue
             if section == "suppressed_causal":
                 result.warnings.append(f"ignored_causal_claim:{line}")
                 continue
-            if _is_causal_section_label(line):
+            if _is_causal_section_label(scan_line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
                 section = "suppressed_causal"
                 continue
-            if CAUSAL_CLAIM_RE.search(line):
+            if CAUSAL_CLAIM_RE.search(scan_line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
-                if _starts_causal_claim(line):
+                if _starts_causal_claim(scan_line):
                     section = "suppressed_causal"
                 continue
             if section == "symptoms":
@@ -476,19 +514,20 @@ class IncidentExtractor:
             if maybe_section:
                 section = "suppressed_causal" if maybe_section == "resolution" else maybe_section
                 continue
-            line = _clean_line(raw)
+            scan_line = _normalized_line(raw)
+            line = scan_line[:MAX_SOURCE_EXCERPT_LENGTH]
             if not line:
                 continue
             if section == "suppressed_causal":
                 result.warnings.append(f"ignored_causal_claim:{line}")
                 continue
-            if _is_causal_section_label(line):
+            if _is_causal_section_label(scan_line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
                 section = "suppressed_causal"
                 continue
-            if CAUSAL_CLAIM_RE.search(line):
+            if CAUSAL_CLAIM_RE.search(scan_line):
                 result.warnings.append(f"ignored_causal_claim:{line}")
-                if _starts_causal_claim(line):
+                if _starts_causal_claim(scan_line):
                     section = "suppressed_causal"
                 continue
 
@@ -623,6 +662,8 @@ def artifact_from_text(
     source_instance: str | None = None,
     provenance_url: str | None = None,
 ) -> LearnedArtifact:
+    if len(body_text) > MAX_ARTIFACT_BODY_LENGTH:
+        raise ValueError(f"artifact body exceeds {MAX_ARTIFACT_BODY_LENGTH} characters")
     now = _now()
     return LearnedArtifact(
         id=_artifact_id(artifact_type, external_id, source_instance or "", source_vendor or ""),
@@ -681,23 +722,232 @@ def _sanitized_body_text_for_index(artifact: LearnedArtifact, result: Extraction
     return "\n".join(kept)
 
 
-def _expected_extraction_counts(
+def _extraction_generation_matches(
+    existing: dict[str, list[dict[str, Any]]],
     *,
     evidence_rows: list[dict[str, Any]],
     ownership_rows: list[dict[str, Any]],
     dependency_rows: list[dict[str, Any]],
     signal_rows: list[dict[str, Any]],
-) -> dict[str, int]:
-    return {
-        "evidence_requirements": len(evidence_rows),
-        "ownership_hints": len(ownership_rows),
-        "dependency_hints": len(dependency_rows),
-        "signal_mapping_candidates": len(signal_rows),
+) -> bool:
+    expected = {
+        "evidence_requirements": evidence_rows,
+        "ownership_hints": ownership_rows,
+        "dependency_hints": dependency_rows,
+        "signal_mapping_candidates": signal_rows,
     }
+    return all(
+        sorted(str(row.get("id", "")) for row in existing.get(kind, []))
+        == sorted(str(row.get("id", "")) for row in expected_rows)
+        for kind, expected_rows in expected.items()
+    )
 
 
-def _has_missing_extractions(existing: dict[str, int], expected: dict[str, int]) -> bool:
-    return any(existing.get(key, 0) < count for key, count in expected.items())
+def _resolve_tenant_id(
+    tenant_id: str | None,
+    *,
+    runtime_settings: Settings | None = None,
+) -> str:
+    from tacit.dashboard_ingest.service import resolve_learning_tenant
+
+    return resolve_learning_tenant(tenant_id, runtime_settings=runtime_settings)
+
+
+def resolve_artifact_runtime_settings(
+    *,
+    runtime_settings: Settings | None = None,
+    store: Any | None = None,
+    knowledge_service: Any | None = None,
+    connector_settings: Settings | None = None,
+) -> Settings:
+    """Resolve one fail-closed composition owner for artifact learning."""
+    store_owner = describe_runtime_owner("signal_store", store)
+    service_owner = describe_runtime_owner("knowledge_service", knowledge_service)
+    connector_owner = RuntimeOwner(
+        name="connector",
+        supplied=connector_settings is not None,
+        settings=connector_settings,
+    )
+    active_settings = resolve_runtime_settings(
+        boundary="Artifact learning",
+        explicit_settings=runtime_settings,
+        owners=(store_owner, service_owner, connector_owner),
+        fallback_settings=settings,
+    )
+    supplied_owners = tuple(
+        (name, owner)
+        for name, owner in (("signal_store", store), ("knowledge_service", knowledge_service))
+        if owner is not None
+    )
+    if supplied_owners:
+        resolve_owned_database_path(
+            boundary="Artifact learning",
+            database_role="signals",
+            owners=supplied_owners,
+            runtime_settings=active_settings,
+        )
+    return active_settings
+
+
+def _active_runtime_settings(
+    runtime_settings: Settings | None,
+    store: Any | None,
+) -> Settings:
+    return resolve_artifact_runtime_settings(runtime_settings=runtime_settings, store=store)
+
+
+def authorize_artifact_learning(
+    *,
+    dry_run: bool,
+    runtime_settings: Settings | None = None,
+    store: Any | None = None,
+    knowledge_service: Any | None = None,
+    connector_settings: Settings | None = None,
+    tenant_id: str | None = None,
+) -> tuple[Settings, str]:
+    """Resolve the tenant and authorize before reading any artifact source."""
+    active_settings = resolve_artifact_runtime_settings(
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        connector_settings=connector_settings,
+    )
+    resolved_tenant = _resolve_tenant_id(tenant_id, runtime_settings=active_settings)
+    action = KnowledgeAction.READ if dry_run else KnowledgeAction.LEARN_ARTIFACTS
+    enforce_knowledge_action(active_settings, action)
+    return active_settings, resolved_tenant
+
+
+def _resolve_artifact_store(
+    *,
+    dry_run: bool,
+    store: Any | None,
+    runtime_settings: Settings,
+    knowledge_service: Any | None = None,
+    allow_global_fallback: bool = False,
+) -> Any | None:
+    if dry_run or store is not None:
+        return store
+    if knowledge_service is not None:
+        database_path = resolve_owned_database_path(
+            boundary="Artifact learning signal store resolution",
+            database_role="signals",
+            owners=(("knowledge_service", knowledge_service),),
+            runtime_settings=runtime_settings,
+        )
+        from tacit.signals import SignalStore
+
+        return SignalStore(database_path, runtime_settings=runtime_settings)
+    if allow_global_fallback:
+        return get_signal_store()
+
+    from tacit.runtime_stores import RuntimeStores
+
+    return RuntimeStores(runtime_settings).signals()
+
+
+def _reconcile_stale_artifact_knowledge(
+    *,
+    store,
+    tenant_id: str,
+    artifact_type: str,
+    runtime_settings: Settings | None = None,
+    knowledge_service: Any | None = None,
+) -> None:
+    from tacit.dashboard_ingest.service import _knowledge_service_for_store
+
+    active_settings = resolve_artifact_runtime_settings(
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+    )
+    enforce_knowledge_action(active_settings, KnowledgeAction.LEARN_ARTIFACTS)
+    knowledge_service = knowledge_service or _knowledge_service_for_store(
+        store,
+        runtime_settings=active_settings,
+    )
+    resolve_artifact_runtime_settings(
+        runtime_settings=active_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+    )
+    bind_connection = knowledge_service.repository.bind_transaction_connection
+    store.ensure_governed_projection_audit_current()
+    after_id: int | None = None
+    page_size = 1_000
+    pages = 0
+    reconciled = 0
+    while True:
+        artifacts = store.list_unreconciled_stale_artifacts(
+            tenant_id=tenant_id,
+            artifact_type=artifact_type,
+            limit=page_size,
+            after_id=after_id,
+        )
+        if not artifacts:
+            break
+        pages += 1
+        for artifact in artifacts:
+            after_id = int(artifact["id"])
+            with store.transaction() as conn:
+                if not store.governed_projection_audit_is_current(conn):
+                    raise RuntimeError("governed projection changed before stale artifact reconciliation; retry")
+                with bind_connection(conn):
+                    knowledge_service.reconcile_source_lifecycle(
+                        provenance_ref=f"prov_artifact:{artifact['artifact_id']}",
+                        tenant_id=tenant_id,
+                        source_stale=True,
+                        source_generation_guard=lambda guard_conn, artifact=artifact: (
+                            store.artifact_stale_generation_is_current(
+                                guard_conn,
+                                tenant_id=tenant_id,
+                                artifact_id=str(artifact["artifact_id"]),
+                                missing_since=artifact["missing_since"],
+                            )
+                        ),
+                    )
+                    checkpointed = store.mark_artifact_knowledge_reconciled(
+                        tenant_id=tenant_id,
+                        artifact_id=str(artifact["artifact_id"]),
+                        missing_since=artifact["missing_since"],
+                    )
+                    if not checkpointed:
+                        raise RuntimeError("stale artifact generation changed during knowledge reconciliation")
+            reconciled += 1
+        if len(artifacts) < page_size:
+            break
+    logger.info(
+        "stale_artifact_knowledge_reconciled",
+        reason_code="stale_artifact_knowledge_reconciled",
+        tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+        artifact_type_fingerprint=_diagnostic_fingerprint(artifact_type),
+        pages=pages,
+        reconciled=reconciled,
+    )
+
+
+def _stale_artifact_authority_reconciler(*, store: Any, knowledge_service: Any, tenant_id: str):
+    """Bind governed retirement to the signal-store transaction for one source."""
+    bind_connection = knowledge_service.repository.bind_transaction_connection
+    store.ensure_governed_projection_audit_current()
+
+    def reconcile(conn, artifact: dict[str, Any]) -> None:
+        if not store.governed_projection_audit_is_current(conn):
+            raise RuntimeError("governed projection changed before stale artifact reconciliation; retry")
+        with bind_connection(conn):
+            knowledge_service.reconcile_source_lifecycle(
+                provenance_ref=f"prov_artifact:{artifact['artifact_id']}",
+                tenant_id=tenant_id,
+                source_stale=True,
+                source_generation_guard=lambda guard_conn: store.artifact_stale_generation_is_current(
+                    guard_conn,
+                    tenant_id=tenant_id,
+                    artifact_id=str(artifact["artifact_id"]),
+                    missing_since=artifact["missing_since"],
+                ),
+            )
+
+    return reconcile
 
 
 def _preserve_review_states(rows: list[dict[str, Any]], existing_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -717,8 +967,48 @@ def learn_artifact(
     extractor: ArtifactExtractor,
     *,
     dry_run: bool = False,
+    runtime_settings: Settings | None = None,
     store: Any | None = None,
+    tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
 ) -> dict[str, object]:
+    allow_global_fallback = runtime_settings is None and store is None and knowledge_service is None
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
+    store = _resolve_artifact_store(
+        dry_run=dry_run,
+        store=store,
+        runtime_settings=active_settings,
+        knowledge_service=knowledge_service,
+        allow_global_fallback=allow_global_fallback,
+    )
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
+    if not dry_run:
+        assert store is not None
+        from tacit.dashboard_ingest.service import _knowledge_service_for_store
+
+        knowledge_service = knowledge_service or _knowledge_service_for_store(
+            store,
+            runtime_settings=active_settings,
+        )
+        active_settings, tenant_id = authorize_artifact_learning(
+            dry_run=dry_run,
+            runtime_settings=runtime_settings,
+            store=store,
+            knowledge_service=knowledge_service,
+            tenant_id=tenant_id,
+        )
     result = extractor.extract(artifact)
     evidence_rows = _as_store_rows(result.evidence_requirements)
     ownership_rows = _as_store_rows(result.ownership_hints)
@@ -727,93 +1017,209 @@ def learn_artifact(
     change_state = "dry_run"
     indexed_context_rows = 0
     mappings_created = 0
+    governed_candidate_ids: list[str] = []
     if not dry_run:
-        store = store or get_signal_store()
-        change_state = store.record_learned_artifact(
-            artifact_id=artifact.id,
-            artifact_type=artifact.artifact_type,
-            source_vendor=artifact.source_vendor or "",
-            source_instance=artifact.source_instance or "",
-            external_id=artifact.external_id,
-            title=artifact.title,
-            body_text=artifact.body_text,
-            provenance_url=artifact.provenance_url or "",
-            fingerprint=artifact.fingerprint,
-        )
+        assert store is not None
+        candidate_count = len(evidence_rows) + len(ownership_rows) + len(dependency_rows) + len(signal_rows)
+        atomic_candidate_limit = int(active_settings.knowledge_source_atomic_candidate_limit)
+        if candidate_count > atomic_candidate_limit:
+            logger.warning(
+                "artifact_authority_fanout_rejected",
+                reason_code="artifact_authority_fanout_rejected",
+                tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+                artifact_fingerprint=_diagnostic_fingerprint(artifact.id),
+                candidate_count=candidate_count,
+                candidate_limit=atomic_candidate_limit,
+            )
+            raise ValueError(
+                f"artifact produced {candidate_count} candidates; the atomic source limit is {atomic_candidate_limit}"
+            )
+
+        from tacit.knowledge.migration import migrate_artifact_extractions
+
+        assert knowledge_service is not None
+        bind_connection = getattr(knowledge_service.repository, "bind_transaction_connection", None)
+        if bind_connection is None:
+            raise ValueError("artifact governance requires a transactional knowledge repository")
+        store.ensure_governed_projection_audit_current()
+
         index_evidence_rows = evidence_rows
         index_ownership_rows = ownership_rows
         index_dependency_rows = dependency_rows
         index_signal_rows = signal_rows
-        should_replace_extractions = change_state != "skipped"
-        existing_rows = (
-            store.list_artifact_extractions(artifact.id) if change_state in {"updated", "restored", "skipped"} else None
+        should_replace_extractions = True
+        authority_started_at = time.monotonic()
+        try:
+            # The source, extraction, search, and governed authority rows are one
+            # generation. A failed late stage rolls the complete generation back.
+            with store.transaction() as conn:
+                with bind_connection(conn):
+                    change_state = store.record_learned_artifact(
+                        tenant_id=tenant_id,
+                        artifact_id=artifact.id,
+                        artifact_type=artifact.artifact_type,
+                        source_vendor=artifact.source_vendor or "",
+                        source_instance=artifact.source_instance or "",
+                        external_id=artifact.external_id,
+                        title=artifact.title,
+                        body_text=artifact.body_text,
+                        provenance_url=artifact.provenance_url or "",
+                        fingerprint=artifact.fingerprint,
+                    )
+                    should_replace_extractions = change_state != "skipped"
+                    existing_rows = (
+                        store.list_artifact_extractions(artifact.id, tenant_id=tenant_id)
+                        if change_state in {"updated", "restored", "skipped"}
+                        else None
+                    )
+                    if change_state == "skipped":
+                        assert existing_rows is not None
+                        should_replace_extractions = not _extraction_generation_matches(
+                            existing_rows,
+                            evidence_rows=evidence_rows,
+                            ownership_rows=ownership_rows,
+                            dependency_rows=dependency_rows,
+                            signal_rows=signal_rows,
+                        )
+                        if should_replace_extractions:
+                            logger.warning(
+                                "artifact_extraction_generation_repaired",
+                                reason_code="artifact_extraction_generation_repaired",
+                                tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+                                artifact_fingerprint=_diagnostic_fingerprint(artifact.id),
+                            )
+                            evidence_rows = _preserve_review_states(
+                                evidence_rows,
+                                existing_rows["evidence_requirements"],
+                            )
+                            ownership_rows = _preserve_review_states(
+                                ownership_rows,
+                                existing_rows["ownership_hints"],
+                            )
+                            dependency_rows = _preserve_review_states(
+                                dependency_rows,
+                                existing_rows["dependency_hints"],
+                            )
+                            signal_rows = _preserve_review_states(
+                                signal_rows,
+                                existing_rows["signal_mapping_candidates"],
+                            )
+                            index_evidence_rows = evidence_rows
+                            index_ownership_rows = ownership_rows
+                            index_dependency_rows = dependency_rows
+                            index_signal_rows = signal_rows
+                        else:
+                            index_evidence_rows = existing_rows["evidence_requirements"]
+                            index_ownership_rows = existing_rows["ownership_hints"]
+                            index_dependency_rows = existing_rows["dependency_hints"]
+                            index_signal_rows = existing_rows["signal_mapping_candidates"]
+                            evidence_rows = index_evidence_rows
+                            ownership_rows = index_ownership_rows
+                            dependency_rows = index_dependency_rows
+                            signal_rows = index_signal_rows
+                    elif existing_rows is not None:
+                        evidence_rows = _preserve_review_states(
+                            evidence_rows,
+                            existing_rows["evidence_requirements"],
+                        )
+                        ownership_rows = _preserve_review_states(
+                            ownership_rows,
+                            existing_rows["ownership_hints"],
+                        )
+                        dependency_rows = _preserve_review_states(
+                            dependency_rows,
+                            existing_rows["dependency_hints"],
+                        )
+                        signal_rows = _preserve_review_states(
+                            signal_rows,
+                            existing_rows["signal_mapping_candidates"],
+                        )
+                        index_evidence_rows = evidence_rows
+                        index_ownership_rows = ownership_rows
+                        index_dependency_rows = dependency_rows
+                        index_signal_rows = signal_rows
+                    if should_replace_extractions:
+                        store.replace_artifact_extractions(
+                            tenant_id=tenant_id,
+                            artifact_id=artifact.id,
+                            evidence_requirements=evidence_rows,
+                            ownership_hints=ownership_rows,
+                            dependency_hints=dependency_rows,
+                            signal_mapping_candidates=signal_rows,
+                        )
+                    if (
+                        change_state != "skipped"
+                        or should_replace_extractions
+                        or not store.artifact_context_indexed(
+                            tenant_id=tenant_id,
+                            artifact_id=artifact.id,
+                            artifact_type=artifact.artifact_type,
+                            strict=True,
+                        )
+                    ):
+                        indexed_context_rows = store.index_artifact_context(
+                            tenant_id=tenant_id,
+                            artifact_id=artifact.id,
+                            artifact_type=artifact.artifact_type,
+                            title=artifact.title,
+                            body_text=_sanitized_body_text_for_index(artifact, result),
+                            evidence_requirements=index_evidence_rows,
+                            ownership_hints=index_ownership_rows,
+                            dependency_hints=index_dependency_rows,
+                            signal_mapping_candidates=index_signal_rows,
+                            strict=True,
+                        )
+                    governed_candidate_ids = migrate_artifact_extractions(
+                        artifact_id=artifact.id,
+                        artifact_type=artifact.artifact_type,
+                        artifact_fingerprint=artifact.fingerprint,
+                        artifact_content_fingerprint=_artifact_content_fingerprint(artifact.body_text),
+                        source_vendor=artifact.source_vendor or "",
+                        source_instance=artifact.source_instance or "",
+                        external_id=artifact.external_id,
+                        rows={
+                            "evidence_requirements": evidence_rows,
+                            "ownership_hints": ownership_rows,
+                            "dependency_hints": dependency_rows,
+                            "signal_mapping_candidates": signal_rows,
+                        },
+                        service=knowledge_service,
+                        tenant_id=tenant_id,
+                        max_candidate_count=atomic_candidate_limit,
+                    )
+                    knowledge_service.reconcile_source_lifecycle(
+                        provenance_ref=f"prov_artifact:{artifact.id}",
+                        tenant_id=tenant_id,
+                        active_candidate_ids=set(governed_candidate_ids),
+                        max_candidate_count=atomic_candidate_limit,
+                    )
+        except Exception as exc:
+            logger.error(
+                "artifact_authority_transaction_failed",
+                reason_code="artifact_authority_transaction_failed",
+                exception_class=type(exc).__name__[:64],
+                error_fingerprint=_diagnostic_fingerprint(exc),
+                tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+                artifact_fingerprint=_diagnostic_fingerprint(artifact.id),
+                candidate_count=candidate_count,
+                candidate_limit=atomic_candidate_limit,
+                duration_ms=round((time.monotonic() - authority_started_at) * 1000, 2),
+            )
+            raise
+        logger.info(
+            "artifact_authority_transaction_committed",
+            reason_code="artifact_authority_transaction_committed",
+            tenant_fingerprint=_diagnostic_fingerprint(tenant_id),
+            artifact_fingerprint=_diagnostic_fingerprint(artifact.id),
+            candidate_count=candidate_count,
+            governed_candidate_count=len(governed_candidate_ids),
+            indexed_context_rows=indexed_context_rows,
+            duration_ms=round((time.monotonic() - authority_started_at) * 1000, 2),
         )
-        if change_state == "skipped":
-            assert existing_rows is not None
-            expected_counts = _expected_extraction_counts(
-                evidence_rows=evidence_rows,
-                ownership_rows=ownership_rows,
-                dependency_rows=dependency_rows,
-                signal_rows=signal_rows,
-            )
-            should_replace_extractions = _has_missing_extractions(
-                store.artifact_extraction_counts(artifact.id), expected_counts
-            )
-            if should_replace_extractions:
-                evidence_rows = _preserve_review_states(evidence_rows, existing_rows["evidence_requirements"])
-                ownership_rows = _preserve_review_states(ownership_rows, existing_rows["ownership_hints"])
-                dependency_rows = _preserve_review_states(dependency_rows, existing_rows["dependency_hints"])
-                signal_rows = _preserve_review_states(signal_rows, existing_rows["signal_mapping_candidates"])
-                index_evidence_rows = evidence_rows
-                index_ownership_rows = ownership_rows
-                index_dependency_rows = dependency_rows
-                index_signal_rows = signal_rows
-            else:
-                index_evidence_rows = existing_rows["evidence_requirements"]
-                index_ownership_rows = existing_rows["ownership_hints"]
-                index_dependency_rows = existing_rows["dependency_hints"]
-                index_signal_rows = existing_rows["signal_mapping_candidates"]
-                evidence_rows = index_evidence_rows
-                ownership_rows = index_ownership_rows
-                dependency_rows = index_dependency_rows
-                signal_rows = index_signal_rows
-        elif existing_rows is not None:
-            evidence_rows = _preserve_review_states(evidence_rows, existing_rows["evidence_requirements"])
-            ownership_rows = _preserve_review_states(ownership_rows, existing_rows["ownership_hints"])
-            dependency_rows = _preserve_review_states(dependency_rows, existing_rows["dependency_hints"])
-            signal_rows = _preserve_review_states(signal_rows, existing_rows["signal_mapping_candidates"])
-            index_evidence_rows = evidence_rows
-            index_ownership_rows = ownership_rows
-            index_dependency_rows = dependency_rows
-            index_signal_rows = signal_rows
-        if should_replace_extractions:
-            store.replace_artifact_extractions(
-                artifact_id=artifact.id,
-                evidence_requirements=evidence_rows,
-                ownership_hints=ownership_rows,
-                dependency_hints=dependency_rows,
-                signal_mapping_candidates=signal_rows,
-            )
-        if (
-            change_state != "skipped"
-            or should_replace_extractions
-            or not store.artifact_context_indexed(
-                artifact_id=artifact.id,
-                artifact_type=artifact.artifact_type,
-            )
-        ):
-            indexed_context_rows = store.index_artifact_context(
-                artifact_id=artifact.id,
-                artifact_type=artifact.artifact_type,
-                title=artifact.title,
-                body_text=_sanitized_body_text_for_index(artifact, result),
-                evidence_requirements=index_evidence_rows,
-                ownership_hints=index_ownership_rows,
-                dependency_hints=index_dependency_rows,
-                signal_mapping_candidates=index_signal_rows,
-            )
+    artifact_summary = asdict(artifact)
+    artifact_summary.pop("body_text", None)
     return {
-        "artifact": asdict(artifact),
+        "artifact": artifact_summary,
         "artifact_id": artifact.id,
         "artifact_type": artifact.artifact_type,
         "title": artifact.title,
@@ -826,6 +1232,7 @@ def learn_artifact(
         "warnings": result.warnings,
         "indexed_context_rows": indexed_context_rows,
         "mappings_created": mappings_created,
+        "knowledge_candidate_ids": governed_candidate_ids,
         "summary": {
             "artifact_type": artifact.artifact_type,
             "learned": 0 if dry_run else 1,
@@ -841,8 +1248,31 @@ def learn_artifact(
     }
 
 
-def learn_runbook_file(path: Path, *, dry_run: bool = False, store: Any | None = None) -> dict[str, object]:
-    return learn_artifact(runbook_from_file(path), RunbookExtractor(), dry_run=dry_run, store=store)
+def learn_runbook_file(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    runtime_settings: Settings | None = None,
+    store: Any | None = None,
+    tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
+) -> dict[str, object]:
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
+    return learn_artifact(
+        runbook_from_file(path),
+        RunbookExtractor(),
+        dry_run=dry_run,
+        runtime_settings=active_settings,
+        store=store,
+        tenant_id=tenant_id,
+        knowledge_service=knowledge_service,
+    )
 
 
 def incident_from_file(path: Path) -> LearnedArtifact:
@@ -859,13 +1289,103 @@ def incident_from_file(path: Path) -> LearnedArtifact:
     )
 
 
-def learn_incident_file(path: Path, *, dry_run: bool = False, store: Any | None = None) -> dict[str, object]:
-    return learn_artifact(incident_from_file(path), IncidentExtractor(), dry_run=dry_run, store=store)
+def learn_incident_file(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    runtime_settings: Settings | None = None,
+    store: Any | None = None,
+    tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
+) -> dict[str, object]:
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
+    return learn_artifact(
+        incident_from_file(path),
+        IncidentExtractor(),
+        dry_run=dry_run,
+        runtime_settings=active_settings,
+        store=store,
+        tenant_id=tenant_id,
+        knowledge_service=knowledge_service,
+    )
 
 
-def learn_incident_dir(path: Path, *, dry_run: bool = False, store: Any | None = None) -> dict[str, object]:
-    files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
-    learned = [learn_incident_file(file, dry_run=dry_run, store=store) for file in files]
+def _bounded_artifact_files(path: Path, *, limit: int) -> list[Path]:
+    """Collect one bounded crawl before any artifact source is read."""
+    files: list[Path] = []
+    for candidate in path.rglob("*"):
+        if candidate.suffix.lower() not in {".md", ".txt"} or not candidate.is_file():
+            continue
+        if len(files) >= limit:
+            logger.warning(
+                "artifact_directory_file_limit_exceeded",
+                reason_code="artifact_directory_file_limit_exceeded",
+                path_fingerprint=_diagnostic_fingerprint(path),
+                limit=limit,
+            )
+            raise ValueError(f"Artifact directory exceeds the configured file limit ({limit})")
+        files.append(candidate)
+    return sorted(files)
+
+
+def learn_incident_dir(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    runtime_settings: Settings | None = None,
+    store: Any | None = None,
+    tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
+) -> dict[str, object]:
+    allow_global_fallback = runtime_settings is None and store is None and knowledge_service is None
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
+    store = _resolve_artifact_store(
+        dry_run=dry_run,
+        store=store,
+        runtime_settings=active_settings,
+        knowledge_service=knowledge_service,
+        allow_global_fallback=allow_global_fallback,
+    )
+    if not dry_run:
+        assert store is not None
+        from tacit.dashboard_ingest.service import _knowledge_service_for_store
+
+        knowledge_service = knowledge_service or _knowledge_service_for_store(store, runtime_settings=active_settings)
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=active_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
+    crawl_started_at = time.time()
+    files = _bounded_artifact_files(
+        path,
+        limit=int(active_settings.artifact_learning_directory_file_limit),
+    )
+    learned = [
+        learn_incident_file(
+            file,
+            dry_run=dry_run,
+            runtime_settings=active_settings,
+            store=store,
+            tenant_id=tenant_id,
+            knowledge_service=knowledge_service,
+        )
+        for file in files
+    ]
 
     def _count(key: str) -> int:
         total = 0
@@ -877,13 +1397,27 @@ def learn_incident_dir(path: Path, *, dry_run: bool = False, store: Any | None =
 
     stale_marked = 0
     if not dry_run:
-        store = store or get_signal_store()
+        assert store is not None
         seen = {str(item["artifact_id"]) for item in learned}
+        _reconcile_stale_artifact_knowledge(
+            store=store,
+            tenant_id=tenant_id,
+            artifact_type="incident",
+            runtime_settings=active_settings,
+            knowledge_service=knowledge_service,
+        )
         stale_marked = store.mark_missing_artifacts_stale(
+            tenant_id=tenant_id,
             artifact_type="incident",
             seen_artifact_ids=seen,
             source_vendor="file",
             external_id_prefix=f"{path.resolve()}/",
+            crawl_started_at=crawl_started_at,
+            authority_reconciler=_stale_artifact_authority_reconciler(
+                store=store,
+                knowledge_service=knowledge_service,
+                tenant_id=tenant_id,
+            ),
         )
     return {
         "artifact_type": "incident",
@@ -904,9 +1438,58 @@ def learn_incident_dir(path: Path, *, dry_run: bool = False, store: Any | None =
     }
 
 
-def learn_runbook_dir(path: Path, *, dry_run: bool = False, store: Any | None = None) -> dict[str, object]:
-    files = sorted(p for p in path.rglob("*") if p.suffix.lower() in {".md", ".txt"} and p.is_file())
-    learned = [learn_runbook_file(file, dry_run=dry_run, store=store) for file in files]
+def learn_runbook_dir(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    runtime_settings: Settings | None = None,
+    store: Any | None = None,
+    tenant_id: str | None = None,
+    knowledge_service: Any | None = None,
+) -> dict[str, object]:
+    allow_global_fallback = runtime_settings is None and store is None and knowledge_service is None
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=runtime_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
+    store = _resolve_artifact_store(
+        dry_run=dry_run,
+        store=store,
+        runtime_settings=active_settings,
+        knowledge_service=knowledge_service,
+        allow_global_fallback=allow_global_fallback,
+    )
+    if not dry_run:
+        assert store is not None
+        from tacit.dashboard_ingest.service import _knowledge_service_for_store
+
+        knowledge_service = knowledge_service or _knowledge_service_for_store(store, runtime_settings=active_settings)
+    active_settings, tenant_id = authorize_artifact_learning(
+        dry_run=dry_run,
+        runtime_settings=active_settings,
+        store=store,
+        knowledge_service=knowledge_service,
+        tenant_id=tenant_id,
+    )
+    crawl_started_at = time.time()
+    files = _bounded_artifact_files(
+        path,
+        limit=int(active_settings.artifact_learning_directory_file_limit),
+    )
+    learned = [
+        learn_runbook_file(
+            file,
+            dry_run=dry_run,
+            runtime_settings=active_settings,
+            store=store,
+            tenant_id=tenant_id,
+            knowledge_service=knowledge_service,
+        )
+        for file in files
+    ]
 
     def _count(key: str) -> int:
         total = 0
@@ -918,13 +1501,27 @@ def learn_runbook_dir(path: Path, *, dry_run: bool = False, store: Any | None = 
 
     stale_marked = 0
     if not dry_run:
-        store = store or get_signal_store()
+        assert store is not None
         seen = {str(item["artifact_id"]) for item in learned}
+        _reconcile_stale_artifact_knowledge(
+            store=store,
+            tenant_id=tenant_id,
+            artifact_type="runbook",
+            runtime_settings=active_settings,
+            knowledge_service=knowledge_service,
+        )
         stale_marked = store.mark_missing_artifacts_stale(
+            tenant_id=tenant_id,
             artifact_type="runbook",
             seen_artifact_ids=seen,
             source_vendor="file",
             external_id_prefix=f"{path.resolve()}/",
+            crawl_started_at=crawl_started_at,
+            authority_reconciler=_stale_artifact_authority_reconciler(
+                store=store,
+                knowledge_service=knowledge_service,
+                tenant_id=tenant_id,
+            ),
         )
     return {
         "artifact_type": "runbook",

@@ -85,6 +85,14 @@ Useful settings include:
 - `SIGNALS_DB_PATH`
 - `API_AUTH_ENABLED`
 - `API_AUTH_KEY`
+- `KNOWLEDGE_TENANT_ID`
+- `KNOWLEDGE_TENANT_API_KEYS`
+- `LEARNING_APPROVAL_CLAIM_TTL_SECONDS`
+
+Wildcard tenancy requires API authentication with a distinct key per tenant.
+`HISTORY_DB_PATH`, `FEEDBACK_DB_PATH`, and `SIGNALS_DB_PATH` must each reference
+a different SQLite file. Tacit rejects shared paths and cross-role database
+identities before initializing the stores.
 
 ## More Documentation
 

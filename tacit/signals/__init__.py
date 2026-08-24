@@ -27,7 +27,7 @@ from tacit.signals.resolution import (
 from tacit.signals.resolution import (
     unit_compatibility as _unit_compatibility,
 )
-from tacit.signals.store import LearningIndexUnavailable, SignalStore
+from tacit.signals.store import ArtifactGenerationConflictError, LearningIndexUnavailable, SignalStore
 
 _DEFAULT_DB_PATH = _store_module._DEFAULT_DB_PATH
 _store = _store_module._store
@@ -45,6 +45,7 @@ def get_signal_store() -> SignalStore:
 
 __all__ = [
     "LearningIndexUnavailable",
+    "ArtifactGenerationConflictError",
     "SignalStore",
     "_DEFAULT_DB_PATH",
     "_context_matches",

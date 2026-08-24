@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tacit.assess import build_assessment
+from tacit.config import Settings
 from tacit.signals.store import SignalStore
 
 
@@ -33,6 +34,101 @@ class TestEmptyStore:
         history.stats.side_effect = RuntimeError("no db")
         report = build_assessment(signal_store=store, history_store=history)
         assert report["activity"]["investigations_total"] == 0
+
+    def test_wildcard_assessment_requires_and_propagates_a_tenant(self, tmp_path):
+        runtime_settings = Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True)
+        store = SignalStore(
+            db_path=tmp_path / "wildcard-signals.db",
+            runtime_settings=runtime_settings,
+        )
+        history = _history()
+
+        class Stores:
+            settings = store.runtime_settings
+
+            @staticmethod
+            def signals():
+                return store
+
+            @staticmethod
+            def history():
+                return history
+
+        with pytest.raises(ValueError, match="tenant"):
+            build_assessment(stores=Stores())
+
+        report = build_assessment(stores=Stores(), tenant_id="tenant-a")
+
+        assert report["tenant_id"] == "tenant-a"
+        history.stats.assert_called_once_with(tenant_id="tenant-a")
+
+    def test_injected_store_boundaries_must_match(self, tmp_path):
+        signal_store = SignalStore(
+            db_path=tmp_path / "signals.db",
+            runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+        )
+        history = MagicMock()
+        history._settings = Settings(_env_file=None, knowledge_tenant_id="tenant-b")
+
+        with pytest.raises(ValueError, match="different tenant boundaries"):
+            build_assessment(signal_store=signal_store, history_store=history)
+
+    def test_injected_store_database_graphs_must_match(self, tmp_path):
+        signal_store = SignalStore(
+            db_path=tmp_path / "signals-a.db",
+            runtime_settings=Settings(
+                _env_file=None,
+                knowledge_tenant_id="tenant-a",
+                signals_db_path=str(tmp_path / "signals-a.db"),
+                history_db_path=str(tmp_path / "history-a.db"),
+            ),
+        )
+        history = MagicMock()
+        history._settings = Settings(
+            _env_file=None,
+            knowledge_tenant_id="tenant-a",
+            signals_db_path=str(tmp_path / "signals-b.db"),
+            history_db_path=str(tmp_path / "history-b.db"),
+        )
+
+        with pytest.raises(ValueError, match="different runtime compositions"):
+            build_assessment(signal_store=signal_store, history_store=history)
+
+    def test_partial_signal_store_injection_derives_history_from_same_runtime(self, monkeypatch, tmp_path):
+        runtime_settings = Settings(
+            _env_file=None,
+            knowledge_tenant_id="tenant-a",
+            signals_db_path=str(tmp_path / "signals.db"),
+            history_db_path=str(tmp_path / "history.db"),
+        )
+        signal_store = SignalStore(
+            db_path=tmp_path / "signals.db",
+            runtime_settings=runtime_settings,
+        )
+
+        def unexpected_global_history():
+            raise AssertionError("assessment composed with the process-global history store")
+
+        monkeypatch.setattr("tacit.history.get_investigation_store", unexpected_global_history)
+
+        report = build_assessment(signal_store=signal_store)
+
+        assert report["tenant_id"] == "tenant-a"
+        assert report["activity"]["investigations_total"] == 0
+
+    def test_partial_injection_adopts_the_store_owned_database_path(self, tmp_path):
+        signal_store = SignalStore(
+            db_path=tmp_path / "ad-hoc-signals.db",
+            runtime_settings=Settings(
+                _env_file=None,
+                history_db_path=str(tmp_path / "history.db"),
+            ),
+        )
+
+        report = build_assessment(signal_store=signal_store)
+
+        assert report["tenant_id"] == "default"
+        assert signal_store.runtime_settings.signals_db_path == str((tmp_path / "ad-hoc-signals.db").resolve())
 
 
 class TestPopulatedStore:

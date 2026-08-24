@@ -5,11 +5,80 @@ from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
 from tacit.agents.providers.base import TokenUsage
-from tacit.config import settings
 from tacit.main import app
 from tacit.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
 from tests.e2e.framework import CapturingBackend, build_grafana_dashboard, load_scenario
 from tests.e2e.test_dashboard_upload_learning import SCENARIO_PATH, _no_context
+
+
+@pytest.mark.e2e
+def test_browser_ui_uses_one_captured_tenant_context_for_scoped_requests():
+    response = TestClient(app).get("/")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "function captureTenantRequest(tenant = selectedTenant())" in html
+    assert "request.generation === tenantRequestGeneration" in html
+    assert "request.tenant === tenantInputValue()" in html
+    assert "headers: knowledgeHeaders(options.headers || {}, request.tenant)" in html
+    assert "if (!response.ok)" in html
+    assert "throw new Error(errMsg(body" in html
+    assert html.count("await fetch(") == 2  # Shared JSON helper plus the SSE stream.
+    assert "headers: knowledgeHeaders({ 'Content-Type': 'application/json' }, request.tenant)" in html
+    assert "?limit=100&cursor=${encodeURIComponent(cursor)}" in html
+    assert 'class="btn-secondary btn-sm signal-mappings-more"' in html
+    assert "Metric Mappings (${data.mapping_count || 0})" in html
+
+    scoped_endpoints = [
+        "/api/v1/chart",
+        "/api/v1/feedback/stats",
+        "/api/v1/feedback/analysis",
+        "/api/v1/archetypes",
+        "/api/v1/investigations?${params}",
+        "/api/v1/investigations/stats",
+        "/api/v1/learn/dashboard",
+        "/api/v1/learn/dashboard/json",
+        "/api/v1/learn/dashboards",
+        "/api/v1/knowledge/review-queue",
+        "/api/v1/knowledge/status",
+        "/api/v1/signals",
+        "/api/v1/signals/stats",
+    ]
+    for endpoint in scoped_endpoints:
+        assert f"fetchTenantJson(`${{BASE}}{endpoint}" in html
+
+    assert "if (isStaleTenantResponse(e)) return" in html
+    assert "tenantRequestGeneration += 1" in html
+    assert "invalidateTenantViews();" in html
+    assert "reloadActiveTenantView();" in html
+    reload_section = html.split("function reloadActiveTenantView()", 1)[1]
+    for tab, loader in {
+        "learning": "loadIngestedDashboards()",
+        "knowledge": "loadKnowledgeQueue()",
+        "signals": "loadSignals()",
+        "insights": "loadInsights()",
+        "archetypes": "loadArchetypes()",
+        "history": "loadHistory()",
+    }.items():
+        assert f"if (activeTab === '{tab}') {loader};" in reload_section
+
+
+@pytest.mark.e2e
+def test_browser_review_queues_render_recoverable_and_attention_states():
+    html = TestClient(app).get("/").text
+
+    assert "d.status === 'approving'" in html
+    assert "Resume approval" in html
+    assert 'data-dashboard-tenant="${escAttr(request.tenant)}"' in html
+    assert "btn.dataset.dashboardTenant" in html
+
+    assert "queue.unresolved_conflicts || []" in html
+    assert "queue.attention_items || []" in html
+    assert "Unresolved conflicts" in html
+    assert "Needs attention" in html
+    assert "Review queue is clear." in html
+    assert "No candidates pending review." not in html
+    assert 'data-knowledge-tenant="${escAttr(request.tenant)}"' in html
 
 
 def _http_catalog() -> list[MetricEntry]:
@@ -30,6 +99,58 @@ def _http_catalog() -> list[MetricEntry]:
             "container_memory_working_set_bytes",
         )
     ]
+
+
+@pytest.mark.e2e
+def test_signal_detail_mapping_pages_are_bounded_and_stable(isolated_learning_runtime):
+    signal_store, _history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
+    signal_type = "large_mapping_history"
+    signal_store.register_signal_type(signal_type, tenant_id="default")
+    with signal_store.transaction() as connection:
+        for index in range(550):
+            signal_store.add_mapping(
+                signal_type,
+                f"large_metric_{index:04d}",
+                confidence=0.5 + ((index % 10) / 100),
+                source_type="teach",
+                tenant_id="default",
+                connection=connection,
+            )
+
+    client = TestClient(app)
+    cursor = None
+    seen_ids: list[int] = []
+    page_count = 0
+    while True:
+        params: dict[str, int | str] = {"limit": 73}
+        if cursor:
+            params["cursor"] = cursor
+        response = client.get(f"/api/v1/signals/{signal_type}", params=params)
+        assert response.status_code == 200
+        page = response.json()
+        assert page["mapping_count"] == 550
+        assert len(page["mappings"]) <= 73
+        seen_ids.extend(mapping["id"] for mapping in page["mappings"])
+        page_count += 1
+        if not page["has_more"]:
+            assert page["next_cursor"] is None
+            break
+        cursor = page["next_cursor"]
+        assert cursor
+
+    assert page_count == 8
+    assert len(seen_ids) == len(set(seen_ids)) == 550
+    assert client.get(f"/api/v1/signals/{signal_type}", params={"cursor": "not-a-cursor"}).status_code == 400
+
+    with signal_store._conn() as connection:
+        plan = connection.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT * FROM signal_metric_mappings
+               WHERE tenant_id=? AND signal_type=?
+               ORDER BY confidence DESC, id DESC LIMIT 74""",
+            ("default", signal_type),
+        ).fetchall()
+    assert any("idx_smm_tenant_signal_page" in str(row["detail"]) for row in plan)
 
 
 @pytest.mark.e2e
@@ -67,8 +188,8 @@ def test_system_archetype_signal_and_auth_endpoints(isolated_learning_runtime, m
     )
     assert invalid_teach.status_code == 422
 
-    monkeypatch.setattr(settings, "api_auth_enabled", True)
-    monkeypatch.setattr(settings, "api_auth_key", "secret-e2e")
+    monkeypatch.setattr(app.state.settings, "api_auth_enabled", True)
+    monkeypatch.setattr(app.state.settings, "api_auth_key", "secret-e2e")
     assert client.get("/api/v1/signals").status_code == 401
     assert client.get("/api/v1/signals", headers={"X-API-Key": "wrong"}).status_code == 401
     assert client.get("/api/v1/signals", headers={"X-API-Key": "secret-e2e"}).status_code == 200
@@ -86,7 +207,10 @@ def test_system_archetype_signal_and_auth_endpoints(isolated_learning_runtime, m
 def test_chart_history_feedback_and_insights_endpoints(isolated_learning_runtime, monkeypatch):
     _signal_store, history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
     client = TestClient(app)
-    backend = CapturingBackend(catalog=_http_catalog())
+    backend = CapturingBackend(
+        catalog=_http_catalog(),
+        runtime_settings=app.state.settings,
+    )
     monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
     monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
 
@@ -120,7 +244,7 @@ def test_chart_history_feedback_and_insights_endpoints(isolated_learning_runtime
     assert chart_body["panel_count"] > 0
     assert backend.published_specs
 
-    investigations = client.get("/api/v1/investigations?user_id=api-e2e")
+    investigations = client.get("/api/v1/investigations?user_id=local-unauthenticated")
     assert investigations.status_code == 200
     assert investigations.json()["count"] == 1
     investigation = investigations.json()["investigations"][0]
@@ -155,7 +279,7 @@ def test_chart_history_feedback_and_insights_endpoints(isolated_learning_runtime
     feedback_detail = client.get(f"/api/v1/feedback/{chart_body['dashboard_uid']}")
     assert feedback_detail.status_code == 200
     assert feedback_detail.json()["provenance"]["dashboard_uid"] == chart_body["dashboard_uid"]
-    assert feedback_detail.json()["feedback"][0]["reviewer"] == "e2e-reviewer"
+    assert feedback_detail.json()["feedback"][0]["reviewer"] == "local-unauthenticated"
 
     missing_feedback = client.get("/api/v1/feedback/not-found")
     assert missing_feedback.status_code == 404
@@ -227,8 +351,8 @@ def test_learning_list_ignore_and_upload_validation_endpoints(isolated_learning_
     assert ignored.json()["dashboards"][0]["status"] == "ignored"
 
     already_ignored = client.post(f"/api/v1/learn/dashboards/{uid}/approve?backend=grafana_json")
-    assert already_ignored.status_code == 200
-    assert already_ignored.json()["message"] == "Dashboard already ignored"
+    assert already_ignored.status_code == 409
+    assert "already ignored" in already_ignored.json()["detail"]
 
     missing_ignore = client.post("/api/v1/learn/dashboards/missing/ignore?backend=grafana_json")
     assert missing_ignore.status_code == 404

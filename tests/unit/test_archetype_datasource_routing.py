@@ -1,4 +1,6 @@
-from tacit.archetypes.engine import compile_archetype
+import time
+
+from tacit.archetypes.engine import _legacy_metric_signal_details, compile_archetype
 from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from tacit.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
 from tacit.signals import SignalStore
@@ -547,6 +549,39 @@ def test_legacy_required_metrics_bind_through_live_semantic_signals(tmp_path, mo
     expressions = [query.expr for panel in dashboard.panels for query in panel.queries]
     assert "rate(gamma_container_cpu_usage_seconds_total[5m])" in expressions
     assert "gamma_container_memory_working_set_bytes" in expressions
+
+
+def test_legacy_metric_signal_lookup_reaches_definitions_beyond_the_first_page(tmp_path):
+    store = SignalStore(db_path=tmp_path / "signals.db")
+    now = time.time()
+    target_signal = "zz_legacy_signal_0500"
+    with store._conn() as conn:
+        conn.executemany(
+            """INSERT INTO signal_types
+               (signal_type, description, category, unit, created_at, updated_at)
+               VALUES (?, '', 'zz-legacy', '', ?, ?)""",
+            [(f"zz_legacy_signal_{index:04d}", now, now) for index in range(501)],
+        )
+    store.add_mapping(target_signal, "legacy_default_metric", confidence=0.9)
+    catalog = [
+        MetricEntry(
+            name="live_metric",
+            datasource_uid="prometheus",
+            datasource_name="Prometheus",
+            datasource_type="prometheus",
+            query_language="promql",
+        )
+    ]
+
+    signal_type, _ = _legacy_metric_signal_details(
+        store,
+        "legacy_default_metric",
+        catalog,
+        "promql",
+    )
+
+    assert target_signal not in {row["signal_type"] for row in store.list_signal_types()}
+    assert signal_type == target_signal
 
 
 def test_legacy_metric_existence_is_scoped_to_target_backend(tmp_path, monkeypatch):

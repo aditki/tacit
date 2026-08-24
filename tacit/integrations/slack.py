@@ -22,6 +22,17 @@ def _strip_mention(text: str) -> str:
     return re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
 
 
+def _tenant_for_slack(payload: dict, deps: PipelineDependencies | None) -> str:
+    runtime_settings = getattr(deps, "settings", settings)
+    configured = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
+    if configured != "*":
+        return configured
+    tenant_id = str(payload.get("team_id") or payload.get("team") or "").strip()
+    if not tenant_id:
+        raise ValueError("Slack team id is required when knowledge_tenant_id is '*'")
+    return tenant_id
+
+
 def _build_action_buttons(response) -> list[dict]:
     """Build Slack action buttons for Grafana (and optionally SignalFx)."""
     buttons = [
@@ -57,7 +68,7 @@ def _contract_text(response, contract) -> str:
     )
 
 
-def _load_contract(deps: PipelineDependencies | None, response):
+def _load_contract(deps: PipelineDependencies | None, response, *, tenant_id: str):
     if not response.investigation_id:
         return None
     try:
@@ -67,7 +78,11 @@ def _load_contract(deps: PipelineDependencies | None, response):
             from tacit.history import get_investigation_store
 
             store = get_investigation_store()
-        return store.get_contract(response.investigation_id, response.investigation_revision)
+        return store.get_contract(
+            response.investigation_id,
+            response.investigation_revision,
+            tenant_id=tenant_id,
+        )
     except Exception:
         logger.warning("slack_contract_load_failed", investigation_id=response.investigation_id, exc_info=True)
         return None
@@ -98,15 +113,16 @@ async def handle_mention(
     )
 
     try:
+        deps = deps_factory() if deps_factory else None
         request = DashRequest(
             prompt=prompt,
             channel_id=channel,
             user_id=user,
             thread_ts=thread_ts,
+            tenant_id=_tenant_for_slack(event, deps),
         )
-        deps = deps_factory() if deps_factory else None
         response = await run_pipeline(request, deps)
-        contract_text = _contract_text(response, _load_contract(deps, response))
+        contract_text = _contract_text(response, _load_contract(deps, response, tenant_id=request.tenant_id))
 
         if response.dashboard_url:
             blocks = [
@@ -152,10 +168,15 @@ async def handle_slash_command(
     await say(text=f"🔍 Analyzing: _{prompt}_\nBuilding your dashboard…")
 
     try:
-        request = DashRequest(prompt=prompt, channel_id=channel, user_id=user)
         deps = deps_factory() if deps_factory else None
+        request = DashRequest(
+            prompt=prompt,
+            channel_id=channel,
+            user_id=user,
+            tenant_id=_tenant_for_slack(command, deps),
+        )
         response = await run_pipeline(request, deps)
-        contract_text = _contract_text(response, _load_contract(deps, response))
+        contract_text = _contract_text(response, _load_contract(deps, response, tenant_id=request.tenant_id))
 
         if response.dashboard_url:
             blocks = [

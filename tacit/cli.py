@@ -318,11 +318,12 @@ def _split_config(config: dict) -> tuple[dict, dict]:
 
 # ── tacit doctor ─────────────────────────────────────────────────────────
 @cli.command()
-def doctor():
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def doctor(tenant: str | None):
     """Validate Grafana, datasources, LLM connectivity, and cache state."""
     _header("Tacit Doctor")
     _load_env()
-    stores = _cli_runtime_stores()
+    stores, selected_tenant = _cli_knowledge_read_context(tenant)
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -417,7 +418,7 @@ def doctor():
     try:
         from tacit.assess import build_assessment
 
-        _report = build_assessment(stores=stores)
+        _report = build_assessment(stores=stores, tenant_id=selected_tenant)
         _inv = _report["inventory"]
         knowledge = {
             "dashboards": _inv["dashboards_ingested"],
@@ -513,6 +514,22 @@ def _cli_runtime_stores():
     from tacit.runtime_stores import RuntimeStores
 
     return RuntimeStores(create_settings())
+
+
+def _cli_store_settings(stores: Any) -> Any:
+    from tacit.config import settings
+
+    return getattr(stores, "settings", settings)
+
+
+def _require_cli_knowledge_action(action: Any, runtime_settings: Any) -> None:
+    from tacit.errors import SemanticAuthorizationError
+    from tacit.knowledge.authorization import enforce_knowledge_action
+
+    try:
+        enforce_knowledge_action(runtime_settings, action)
+    except SemanticAuthorizationError as exc:
+        raise click.ClickException(str(exc).replace("Missing permission", "missing permission")) from exc
 
 
 def _llm_zero_key_mode() -> bool:
@@ -867,31 +884,47 @@ def _update_env(updates: dict):
 
 
 # ── tacit test ───────────────────────────────────────────────────────────
+def _pipeline_result_failure(result) -> str | None:
+    status = str(getattr(result, "investigation_status", "") or "")
+    if status and status != "completed":
+        return str(getattr(result, "summary", "") or f"Investigation ended with status {status}")
+    audit_status = str(getattr(result, "audit_status", "") or "")
+    if audit_status and audit_status != "run_completed":
+        return f"Investigation audit ended with status {audit_status}"
+    return None
+
+
 @cli.command("investigate")
 @click.argument("prompt", required=False)
 @click.option("--json", "json_output", is_flag=True, help="Print the canonical Investigation Contract JSON")
 @click.option("--open-browser/--no-open-browser", default=False, help="Open dashboard rendering in browser")
-def investigate(prompt: str | None, json_output: bool, open_browser: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def investigate(prompt: str | None, json_output: bool, open_browser: bool, tenant: str | None):
     """Run an investigation and render the versioned contract."""
     _load_env()
     if prompt is None:
         prompt = "High latency on the checkout service in the last hour"
+    stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
 
     import asyncio
 
     from tacit.dependencies import build_pipeline_dependencies
 
-    stores = _cli_runtime_stores()
     deps = build_pipeline_dependencies(stores.settings, stores=stores)
 
     async def _run():
         from tacit.models.schemas import DashRequest
         from tacit.pipeline import run_pipeline
 
-        result = await run_pipeline(DashRequest(prompt=prompt, user_id="cli"), deps)
+        result = await run_pipeline(DashRequest(prompt=prompt, user_id="cli", tenant_id=tenant_id), deps)
         contract = None
         if result.investigation_id:
-            contract = stores.history().get_contract(result.investigation_id, result.investigation_revision)
+            contract = stores.history().get_contract(
+                result.investigation_id,
+                result.investigation_revision,
+                tenant_id=tenant_id,
+            )
         return result, contract
 
     try:
@@ -901,10 +934,15 @@ def investigate(prompt: str | None, json_output: bool, open_browser: bool):
         _info("Run `tacit doctor` to check your setup")
         raise SystemExit(1) from e
 
+    pipeline_failure = _pipeline_result_failure(result)
+    if pipeline_failure:
+        _fail(f"Investigation failed: {pipeline_failure}")
+        raise SystemExit(1)
+    if contract is None:
+        _fail("Investigation completed without a persisted contract")
+        raise SystemExit(1)
+
     if json_output:
-        if contract is None:
-            _fail("Investigation completed without a persisted contract")
-            raise SystemExit(1)
         click.echo(json.dumps(contract.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True))
         return
 
@@ -916,9 +954,8 @@ def investigate(prompt: str | None, json_output: bool, open_browser: bool):
     if result.investigation_id and result.investigation_revision is not None:
         _info(f"Investigation: {result.investigation_id} revision {result.investigation_revision}")
     _info(f"Panels: {result.panel_count}")
-    if contract is not None:
-        _info(f"Grounding: {contract.grounding.status.value}")
-        _info(f"Conclusion: {contract.grounding.maximum_trustworthy_conclusion.get('text', '')}")
+    _info(f"Grounding: {contract.grounding.status.value}")
+    _info(f"Conclusion: {contract.grounding.maximum_trustworthy_conclusion.get('text', '')}")
     if open_browser and result.dashboard_url:
         webbrowser.open(result.dashboard_url)
 
@@ -926,13 +963,16 @@ def investigate(prompt: str | None, json_output: bool, open_browser: bool):
 @cli.command("test")
 @click.option("--prompt", "-p", default=None, help="Custom test prompt")
 @click.option("--open-browser/--no-open-browser", default=True, help="Open dashboard in browser")
-def test_run(prompt: str | None, open_browser: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def test_run(prompt: str | None, open_browser: bool, tenant: str | None):
     """Run a sample investigation and open the resulting dashboard."""
     _header("Tacit Test Run")
     _load_env()
 
     if prompt is None:
         prompt = "High latency on the checkout service in the last hour"
+    stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
     _info(f'Prompt: "{prompt}"')
     console.print()
 
@@ -940,14 +980,13 @@ def test_run(prompt: str | None, open_browser: bool):
 
     from tacit.dependencies import build_pipeline_dependencies
 
-    stores = _cli_runtime_stores()
     deps = build_pipeline_dependencies(stores.settings, stores=stores)
 
     async def _run():
         from tacit.models.schemas import DashRequest
         from tacit.pipeline import run_pipeline
 
-        req = DashRequest(prompt=prompt)
+        req = DashRequest(prompt=prompt, tenant_id=tenant_id)
         _info("Running pipeline...")
         result = await run_pipeline(req, deps)
         return result
@@ -955,26 +994,30 @@ def test_run(prompt: str | None, open_browser: bool):
     try:
         result = asyncio.run(_run())
 
-        if result.dashboard_url:
-            _success(f"Dashboard created: {result.dashboard_url}")
-            _info(f"  UID: {result.dashboard_uid}")
-            _info(f"  Panels: {result.panel_count}")
-            _info(f"  Path: {result.path_used}")
-            if result.archetypes:
-                arch_str = ", ".join(f"{a.type} ({a.confidence:.0%})" for a in result.archetypes)
-                _info(f"  Archetypes: {arch_str}")
-
-            if open_browser and result.dashboard_url:
-                _info("Opening in browser...")
-                webbrowser.open(result.dashboard_url)
-        else:
-            _fail("Pipeline completed but no dashboard URL returned")
-            if result.error:
-                _fail(f"Error: {result.error}")
-
     except Exception as e:
         _fail(f"Pipeline error: {e}")
         _info("Run `tacit doctor` to check your setup")
+        raise SystemExit(1) from e
+
+    pipeline_failure = _pipeline_result_failure(result)
+    if pipeline_failure:
+        _fail(f"Pipeline failed: {pipeline_failure}")
+        raise SystemExit(1)
+    if not result.dashboard_url:
+        _fail("Pipeline completed but no dashboard URL returned")
+        raise SystemExit(1)
+
+    _success(f"Dashboard created: {result.dashboard_url}")
+    _info(f"  UID: {result.dashboard_uid}")
+    _info(f"  Panels: {result.panel_count}")
+    _info(f"  Path: {result.path_used}")
+    if result.archetypes:
+        arch_str = ", ".join(f"{a.type} ({a.confidence:.0%})" for a in result.archetypes)
+        _info(f"  Archetypes: {arch_str}")
+
+    if open_browser:
+        _info("Opening in browser...")
+        webbrowser.open(result.dashboard_url)
 
 
 @cli.command("benchmark-grounding")
@@ -986,6 +1029,27 @@ def benchmark_grounding():
     click.echo(json.dumps(result, indent=2, sort_keys=True))
     if not result["passed"]:
         raise SystemExit(1)
+
+
+def _run_operational_learning_benchmark() -> None:
+    from tacit.operational_learning_benchmark import run_operational_learning_benchmark
+
+    result = run_operational_learning_benchmark()
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
+    if not result["passed"]:
+        raise SystemExit(1)
+
+
+@cli.command("operational-learning-benchmark")
+def operational_learning_benchmark():
+    """Run the deterministic Operational Learning v1 quality gate."""
+    _run_operational_learning_benchmark()
+
+
+@cli.command("benchmark-learning")
+def benchmark_learning():
+    """Alias for the Operational Learning v1 quality gate."""
+    _run_operational_learning_benchmark()
 
 
 # ── tacit demo ───────────────────────────────────────────────────────────
@@ -1080,7 +1144,8 @@ def demo(tear_down: bool, no_build: bool, skip_generate: bool, open_browser: boo
 @cli.command()
 @click.option("--json", "as_json", is_flag=True, help="Emit the raw assessment as JSON")
 @click.option("--llm", "with_llm", is_flag=True, help="Add an LLM narrative on top of the deterministic report")
-def assess(as_json: bool, with_llm: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def assess(as_json: bool, with_llm: bool, tenant: str | None):
     """Operational knowledge assessment — fully deterministic, zero API keys.
 
     Reports what Tacit has ingested, extracted, resolved, and failed to
@@ -1093,8 +1158,8 @@ def assess(as_json: bool, with_llm: bool):
     _load_env()
     from tacit.assess import build_assessment
 
-    stores = _cli_runtime_stores()
-    report = build_assessment(stores=stores)
+    stores, selected_tenant = _cli_knowledge_read_context(tenant)
+    report = build_assessment(stores=stores, tenant_id=selected_tenant)
 
     if as_json:
         import json as json_module
@@ -1195,14 +1260,23 @@ def learn():
     default=False,
     help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
 )
-def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool, tenant: str | None):
     """Ingest a dashboard and show what Tacit learned."""
     _header("Learn Dashboard")
     _load_env()
 
     import asyncio
 
+    from tacit.knowledge.authorization import KnowledgeAction
+
     stores = _cli_runtime_stores()
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
+    if auto_approve:
+        _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
 
     async def _run():
         from tacit.dashboard_ingest import ingest_dashboard
@@ -1211,16 +1285,25 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool):
             dashboard_uid=dashboard_uid,
             backend_name=backend,
             auto_approve=auto_approve,
-            runtime_settings=stores.settings,
+            runtime_settings=runtime_settings,
             store=stores.signals(),
+            tenant_id=tenant_id,
         )
 
     try:
         result = asyncio.run(_run())
     except Exception as e:
-        _fail(f"Dashboard ingestion failed: {e}")
-        _info("Run `tacit doctor` to check backend connectivity.")
-        return
+        from tacit.errors import safe_failure_diagnostics
+
+        diagnostics = safe_failure_diagnostics(
+            e,
+            reason_code="dashboard_ingestion_failed",
+        )
+        raise click.ClickException(
+            "Dashboard ingestion failed "
+            f"({diagnostics['error_type']}; reference={diagnostics['failure_fingerprint']}). "
+            "Run `tacit doctor` to check backend connectivity."
+        ) from e
 
     quality = result.get("signal_quality", {})
     impact = result.get("learning_impact", {})
@@ -1256,6 +1339,16 @@ def learn_dashboard(dashboard_uid: str, backend: str, auto_approve: bool):
                 _info(f"    {item['reason']}")
     if auto_approve:
         _info(f"Mappings created: {result.get('mappings_created', 0)}")
+
+
+@learn.command("status")
+@click.option("--tenant", default=None, help="Knowledge tenant (defaults to configured tenant)")
+def learn_status(tenant: str | None):
+    """Show governed learning inventory and review status."""
+    _load_env()
+
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    click.echo(json.dumps(stores.knowledge_repository().stats(tenant_id), indent=2, sort_keys=True))
 
 
 def _print_bulk_learning_summary(result: dict):
@@ -1361,27 +1454,44 @@ def _print_artifact_learning_summary(result: dict):
     "--dir", "dir_path", type=click.Path(exists=True, file_okay=False, path_type=Path), help="Runbook directory"
 )
 @click.option("--dry-run", is_flag=True, help="Preview extraction without persisting learned context")
-def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool, tenant: str | None):
     """Learn operational candidates from runbook artifacts."""
     _header("Learn Runbooks")
     _load_env()
     if bool(file_path) == bool(dir_path):
-        _fail("Pass exactly one of --file or --dir.")
-        return
+        raise click.UsageError("Pass exactly one of --file or --dir.")
     stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    from tacit.knowledge.authorization import KnowledgeAction
+
+    action = KnowledgeAction.READ if dry_run else KnowledgeAction.LEARN_ARTIFACTS
+    _require_cli_knowledge_action(action, stores.settings)
     signal_store = None if dry_run else stores.signals()
     try:
         if file_path:
             from tacit.artifact_learning import learn_runbook_file
 
-            result = learn_runbook_file(file_path, dry_run=dry_run, store=signal_store)
+            result = learn_runbook_file(
+                file_path,
+                dry_run=dry_run,
+                runtime_settings=stores.settings,
+                store=signal_store,
+                tenant_id=tenant_id,
+            )
         else:
             from tacit.artifact_learning import learn_runbook_dir
 
-            result = learn_runbook_dir(dir_path, dry_run=dry_run, store=signal_store)  # type: ignore[arg-type]
+            assert dir_path is not None
+            result = learn_runbook_dir(
+                dir_path,
+                dry_run=dry_run,
+                runtime_settings=stores.settings,
+                store=signal_store,
+                tenant_id=tenant_id,
+            )
     except Exception as e:
-        _fail(f"Runbook learning failed: {e}")
-        return
+        raise click.ClickException(f"Runbook learning failed: {e}") from e
     _print_artifact_learning_summary(result)
 
 
@@ -1391,27 +1501,44 @@ def learn_runbooks(file_path: Path | None, dir_path: Path | None, dry_run: bool)
     "--dir", "dir_path", type=click.Path(exists=True, file_okay=False, path_type=Path), help="Incident directory"
 )
 @click.option("--dry-run", is_flag=True, help="Preview extraction without persisting learned context")
-def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool, tenant: str | None):
     """Learn operational IR candidates from incident history artifacts."""
     _header("Learn Incidents")
     _load_env()
     if bool(file_path) == bool(dir_path):
-        _fail("Pass exactly one of --file or --dir.")
-        return
+        raise click.UsageError("Pass exactly one of --file or --dir.")
     stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    from tacit.knowledge.authorization import KnowledgeAction
+
+    action = KnowledgeAction.READ if dry_run else KnowledgeAction.LEARN_ARTIFACTS
+    _require_cli_knowledge_action(action, stores.settings)
     signal_store = None if dry_run else stores.signals()
     try:
         if file_path:
             from tacit.artifact_learning import learn_incident_file
 
-            result = learn_incident_file(file_path, dry_run=dry_run, store=signal_store)
+            result = learn_incident_file(
+                file_path,
+                dry_run=dry_run,
+                runtime_settings=stores.settings,
+                store=signal_store,
+                tenant_id=tenant_id,
+            )
         else:
             from tacit.artifact_learning import learn_incident_dir
 
-            result = learn_incident_dir(dir_path, dry_run=dry_run, store=signal_store)  # type: ignore[arg-type]
+            assert dir_path is not None
+            result = learn_incident_dir(
+                dir_path,
+                dry_run=dry_run,
+                runtime_settings=stores.settings,
+                store=signal_store,
+                tenant_id=tenant_id,
+            )
     except Exception as e:
-        _fail(f"Incident learning failed: {e}")
-        return
+        raise click.ClickException(f"Incident learning failed: {e}") from e
     _print_artifact_learning_summary(result)
 
 
@@ -1433,19 +1560,31 @@ def learn_incidents(file_path: Path | None, dir_path: Path | None, dry_run: bool
 )
 @click.option("--limit", default=1000, show_default=True, type=click.IntRange(min=1), help="Maximum incidents to fetch")
 @click.option("--dry-run", is_flag=True, help="Preview extraction without persisting learned context")
-def learn_pagerduty(since: str, until: str | None, statuses: tuple[str, ...], limit: int, dry_run: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_pagerduty(
+    since: str,
+    until: str | None,
+    statuses: tuple[str, ...],
+    limit: int,
+    dry_run: bool,
+    tenant: str | None,
+):
     """Learn incident metadata from PagerDuty (read-only)."""
     _header("Learn PagerDuty Incidents")
     _load_env()
+    stores = _cli_runtime_stores()
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    from tacit.knowledge.authorization import KnowledgeAction
+
+    action = KnowledgeAction.READ if dry_run else KnowledgeAction.LEARN_ARTIFACTS
+    _require_cli_knowledge_action(action, stores.settings)
 
     import asyncio
-
-    stores = _cli_runtime_stores()
 
     async def _run():
         from tacit.integrations.pagerduty import PagerDutyClient, learn_pagerduty_incidents
 
-        async with PagerDutyClient() as client:
+        async with PagerDutyClient(runtime_settings=stores.settings) as client:
             signal_store = None if dry_run else stores.signals()
             return await learn_pagerduty_incidents(
                 client,
@@ -1455,6 +1594,8 @@ def learn_pagerduty(since: str, until: str | None, statuses: tuple[str, ...], li
                 max_items=limit,
                 dry_run=dry_run,
                 store=signal_store,
+                tenant_id=tenant_id,
+                runtime_settings=stores.settings,
             )
 
     try:
@@ -1475,7 +1616,8 @@ def learn_pagerduty(since: str, until: str | None, statuses: tuple[str, ...], li
 )
 @click.option("--dry-run", is_flag=True, help="Preview alert ingestion without persisting learned context")
 @click.option("--limit", default=500, show_default=True, help="Maximum alerts to crawl")
-def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool, limit: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required for persistence in wildcard mode)")
+def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool, limit: int, tenant: str | None):
     """Crawl or preview alert rules from a backend."""
     _header(f"Learn {source.title()} Alerts")
     _load_env()
@@ -1483,6 +1625,15 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
     import asyncio
 
     stores = _cli_runtime_stores()
+    from tacit.knowledge.authorization import KnowledgeAction
+
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
+    if auto_approve and not dry_run:
+        _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
+    if not dry_run:
+        _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
 
     async def _run():
         if alert_uid:
@@ -1493,8 +1644,9 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
                 backend_name=source,
                 auto_approve=auto_approve,
                 dry_run=dry_run,
-                runtime_settings=stores.settings,
+                runtime_settings=runtime_settings,
                 store=stores.signals(),
+                tenant_id=tenant_id,
             )
         from tacit.alert_ingest import learn_backend_alerts
 
@@ -1503,16 +1655,17 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
             auto_approve=auto_approve,
             dry_run=dry_run,
             limit=limit,
-            runtime_settings=stores.settings,
+            runtime_settings=runtime_settings,
             store=stores.signals(),
+            tenant_id=tenant_id,
         )
 
     try:
         result = asyncio.run(_run())
     except Exception as e:
-        _fail(f"Alert ingestion failed: {e}")
-        _info("Run `tacit doctor` to check backend connectivity.")
-        return
+        raise click.ClickException(
+            f"Alert ingestion failed: {e}. Run `tacit doctor` to check backend connectivity."
+        ) from e
 
     if "alerts_learned" in result:
         _print_bulk_alert_learning_summary(result)
@@ -1544,13 +1697,21 @@ def learn_alerts(source: str, alert_uid: str, auto_approve: bool, dry_run: bool,
         _info(f"Mappings created: {result.get('mappings_created', 0)}")
 
 
-def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
+def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int, tenant: str | None):
     _header(f"Learn {backend_name.title()} Dashboards")
     _load_env()
 
     import asyncio
 
+    from tacit.knowledge.authorization import KnowledgeAction
+
     stores = _cli_runtime_stores()
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
+    if auto_approve:
+        _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
 
     async def _run():
         from tacit.dashboard_ingest import learn_backend_dashboards
@@ -1559,16 +1720,17 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
             backend_name,
             auto_approve=auto_approve,
             limit=limit,
-            runtime_settings=stores.settings,
+            runtime_settings=runtime_settings,
             store=stores.signals(),
+            tenant_id=tenant_id,
         )
 
     try:
         result = asyncio.run(_run())
     except Exception as e:
-        _fail(f"Bulk learning failed: {e}")
-        _info("Run `tacit doctor` to check backend connectivity.")
-        return
+        raise click.ClickException(
+            f"Bulk learning failed: {e}. Run `tacit doctor` to check backend connectivity."
+        ) from e
 
     _print_bulk_learning_summary(result)
 
@@ -1580,9 +1742,10 @@ def _run_backend_learning(backend_name: str, auto_approve: bool, limit: int):
     help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
 )
 @click.option("--limit", default=500, show_default=True, help="Maximum dashboards to crawl")
-def learn_grafana(auto_approve: bool, limit: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def learn_grafana(auto_approve: bool, limit: int, tenant: str | None):
     """Crawl Grafana dashboards and persist learned operational context."""
-    _run_backend_learning("grafana", auto_approve, limit)
+    _run_backend_learning("grafana", auto_approve, limit, tenant)
 
 
 @learn.command("signalfx")
@@ -1592,28 +1755,37 @@ def learn_grafana(auto_approve: bool, limit: int):
     help="Request automated review for eligible signal mappings; generated archetypes remain quarantined",
 )
 @click.option("--limit", default=500, show_default=True, help="Maximum dashboards to crawl")
-def learn_signalfx(auto_approve: bool, limit: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def learn_signalfx(auto_approve: bool, limit: int, tenant: str | None):
     """Crawl SignalFx dashboards and persist learned operational context."""
-    _run_backend_learning("signalfx", auto_approve, limit)
+    _run_backend_learning("signalfx", auto_approve, limit, tenant)
 
 
 @learn.command("approve")
 @click.argument("dashboard_uid")
 @click.option("--backend", default="", help="Backend name, e.g. grafana_json or signalfx")
-def learn_approve(dashboard_uid: str, backend: str):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_approve(dashboard_uid: str, backend: str, tenant: str | None):
     """Approve a pending dashboard and evaluate eligible signal mappings."""
     _header("Approve Learned Dashboard")
     _load_env()
 
     from tacit.dashboard_ingest import approve_ingested_dashboard_record
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.TEACH_SIGNALS, runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
     try:
         result = approve_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend or None,
             store=stores.signals(),
-            runtime_settings=stores.settings,
+            runtime_settings=runtime_settings,
+            tenant_id=tenant_id,
         )
     except LookupError:
         _fail("Ingested dashboard not found")
@@ -1630,19 +1802,28 @@ def learn_approve(dashboard_uid: str, backend: str):
 @learn.command("reject")
 @click.argument("dashboard_uid")
 @click.option("--backend", default="", help="Backend name, e.g. grafana_json or signalfx")
-def learn_reject(dashboard_uid: str, backend: str):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_reject(dashboard_uid: str, backend: str, tenant: str | None):
     """Reject a pending learned dashboard and remove it from default retrieval."""
     _header("Reject Learned Dashboard")
     _load_env()
 
     from tacit.dashboard_ingest import reject_ingested_dashboard_record
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.REJECT, runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
     try:
         result = reject_ingested_dashboard_record(
             dashboard_uid=dashboard_uid,
             backend_name=backend or None,
             store=stores.signals(),
+            runtime_settings=getattr(stores, "settings", None),
+            tenant_id=tenant_id,
         )
     except LookupError:
         _fail("Ingested dashboard not found or not pending")
@@ -1661,16 +1842,36 @@ def learn_reject(dashboard_uid: str, backend: str):
 @learn.command("ignore")
 @click.argument("dashboard_uid")
 @click.option("--backend", default="", help="Backend name, e.g. grafana_json or signalfx")
-def learn_ignore(dashboard_uid: str, backend: str):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_ignore(dashboard_uid: str, backend: str, tenant: str | None):
     """Ignore a pending learned dashboard without negative training data."""
     _header("Ignore Learned Dashboard")
     _load_env()
 
-    store = _cli_runtime_stores().signals()
-    if store.ignore_ingested_dashboard(dashboard_uid, backend_name=backend or None):
-        _success("Dashboard ignored")
-    else:
+    from tacit.dashboard_ingest import ignore_ingested_dashboard_record
+    from tacit.knowledge.authorization import KnowledgeAction
+
+    stores = _cli_runtime_stores()
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.READ, runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.REJECT, runtime_settings)
+    _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
+    try:
+        result = ignore_ingested_dashboard_record(
+            dashboard_uid=dashboard_uid,
+            backend_name=backend or None,
+            store=stores.signals(),
+            runtime_settings=runtime_settings,
+            tenant_id=tenant_id,
+        )
+    except LookupError:
         _fail("Ingested dashboard not found or not pending")
+        return
+    except RuntimeError:
+        _fail("Dashboard review state changed; reload before ignoring")
+        return
+    _success(result.get("message", "Dashboard ignored"))
 
 
 @learn.command("search")
@@ -1678,20 +1879,23 @@ def learn_ignore(dashboard_uid: str, backend: str):
 @click.option("--service", default="", help="Optional service/component filter")
 @click.option("--approved-only", is_flag=True, help="Only show approved/trusted context")
 @click.option("--limit", default=10, show_default=True, help="Maximum context rows")
-def learn_search(query: str, service: str, approved_only: bool, limit: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_search(query: str, service: str, approved_only: bool, limit: int, tenant: str | None):
     """Search learned dashboards, panels, metrics, and signal mappings."""
     _header("Search Learned Context")
     _load_env()
 
     from tacit.signals import LearningIndexUnavailable
 
-    store = _cli_runtime_stores().signals()
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    store = stores.signals()
     try:
         rows = store.search_learning_context(
             query,
             service=service,
             include_candidates=not approved_only,
             limit=limit,
+            tenant_id=tenant_id,
         )
     except LearningIndexUnavailable as e:
         _fail(str(e))
@@ -1714,22 +1918,21 @@ def learn_search(query: str, service: str, approved_only: bool, limit: int):
 @click.argument("service")
 @click.option("--approved-only", is_flag=True, help="Only use approved/trusted context")
 @click.option("--limit", default=50, show_default=True, help="Maximum context rows")
-def learn_service(service: str, approved_only: bool, limit: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required when configured tenant is '*')")
+def learn_service(service: str, approved_only: bool, limit: int, tenant: str | None):
     """Describe a service from learned operational context."""
     _header(f"Service Context: {service}")
     _load_env()
 
     from tacit.signals import LearningIndexUnavailable
 
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
     try:
-        summary = (
-            _cli_runtime_stores()
-            .signals()
-            .describe_service(
-                service,
-                include_candidates=not approved_only,
-                limit=limit,
-            )
+        summary = stores.signals().describe_service(
+            service,
+            include_candidates=not approved_only,
+            limit=limit,
+            tenant_id=tenant_id,
         )
     except LearningIndexUnavailable as e:
         _fail(str(e))
@@ -1811,20 +2014,24 @@ def serve(host: str, port: int, reload: bool, no_slack: bool):
 @click.option("--anonymous", is_flag=True, help="Create a shareable anonymized assessment bundle")
 @click.option("--output", type=click.Path(dir_okay=False, path_type=Path), default=None, help="Output tar.gz path")
 @click.option("--validate", "validate_bundle", is_flag=True, help="Fail if anonymous leakage checks find issues")
-def export_report(anonymous: bool, output: Path | None, validate_bundle: bool):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def export_report(anonymous: bool, output: Path | None, validate_bundle: bool, tenant: str | None):
     """Export a local or anonymous Tacit assessment bundle."""
     _header("Export Assessment Report")
     _load_env()
 
     from tacit.export_report import export_assessment_report
+    from tacit.knowledge.authorization import KnowledgeAction
 
     stores = _cli_runtime_stores()
+    _require_cli_knowledge_action(KnowledgeAction.EXPORT, stores.settings)
     try:
         result = export_assessment_report(
             output=output,
             anonymous=anonymous,
             validate=validate_bundle,
             stores=stores,
+            tenant_id=_knowledge_tenant(tenant, runtime_settings=stores.settings),
         )
     except ValueError as exc:
         _fail(str(exc))
@@ -1843,6 +2050,320 @@ def export_report(anonymous: bool, output: Path | None, validate_bundle: bool):
         _info("Leakage validation skipped for raw local export.")
 
 
+# ── tacit knowledge ───────────────────────────────────────────────────
+@cli.group()
+def knowledge():
+    """Review and audit governed Operational Knowledge."""
+    pass
+
+
+def _knowledge_tenant(tenant: str | None, *, runtime_settings: Any | None = None) -> str:
+    from fastapi import HTTPException
+
+    from tacit.api.security import resolve_knowledge_tenant
+    from tacit.config import settings
+
+    configured = (runtime_settings or settings).knowledge_tenant_id or "default"
+    try:
+        return resolve_knowledge_tenant(configured, tenant)
+    except HTTPException as exc:
+        detail = str(exc.detail)
+        if configured == "*" and not tenant:
+            detail = "--tenant is required when the configured tenant is '*'"
+        raise click.ClickException(detail) from exc
+
+
+def _cli_knowledge_read_context(tenant: str | None) -> tuple[Any, str]:
+    """Resolve one authorized, settings-backed store graph for a CLI read."""
+    from tacit.knowledge.authorization import KnowledgeAction
+
+    stores = _cli_runtime_stores()
+    _require_cli_knowledge_action(KnowledgeAction.READ, stores.settings)
+    return stores, _knowledge_tenant(tenant, runtime_settings=stores.settings)
+
+
+def _knowledge_json(value: Any) -> None:
+    if isinstance(value, list):
+        value = [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in value]
+    elif hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    click.echo(json.dumps(value, indent=2, sort_keys=True))
+
+
+@knowledge.command("status")
+@click.option("--tenant", default=None)
+def knowledge_status(tenant: str | None):
+    """Show lifecycle counts and pending work."""
+    _load_env()
+
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    _knowledge_json(stores.knowledge_repository().stats(tenant_id))
+
+
+@knowledge.command("list")
+@click.option("--tenant", default=None)
+@click.option("--kind", default=None)
+@click.option("--status", default=None)
+@click.option("--limit", default=200, type=click.IntRange(1, 500))
+@click.option("--cursor", default=None, help="Opaque cursor returned by the previous page.")
+def knowledge_list(
+    tenant: str | None,
+    kind: str | None,
+    status: str | None,
+    limit: int,
+    cursor: str | None,
+):
+    """List current knowledge revisions."""
+    _load_env()
+
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    try:
+        page = stores.knowledge_repository().list_current_revisions_page(
+            tenant_id,
+            kind=kind,
+            lifecycle_status=status,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _knowledge_json(
+        {
+            "revisions": [revision.model_dump(mode="json") for revision in page.revisions],
+            "has_more": page.has_more,
+            "next_cursor": page.next_cursor,
+        }
+    )
+
+
+@knowledge.command("candidates")
+@click.option("--tenant", default=None)
+@click.option("--kind", default=None)
+@click.option("--review-state", default=None)
+@click.option("--limit", default=200, type=click.IntRange(1, 500))
+@click.option("--cursor", default=None, help="Opaque cursor returned by the previous page.")
+def knowledge_candidates(
+    tenant: str | None,
+    kind: str | None,
+    review_state: str | None,
+    limit: int,
+    cursor: str | None,
+):
+    """List extracted candidates awaiting governance."""
+    _load_env()
+
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    try:
+        page = stores.knowledge_repository().list_candidates_page(
+            tenant_id,
+            kind=kind,
+            review_state=review_state,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _knowledge_json(
+        {
+            "candidates": [candidate.model_dump(mode="json") for candidate in page.candidates],
+            "has_more": page.has_more,
+            "next_cursor": page.next_cursor,
+        }
+    )
+
+
+@knowledge.command("show")
+@click.argument("knowledge_id")
+@click.option("--revision", type=int, default=None)
+@click.option("--tenant", default=None)
+def knowledge_show(knowledge_id: str, revision: int | None, tenant: str | None):
+    """Show one immutable knowledge revision."""
+    _load_env()
+
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    value = stores.knowledge_repository().get_revision(knowledge_id, revision=revision, tenant_id=tenant_id)
+    if value is None:
+        raise click.ClickException("knowledge item not found")
+    _knowledge_json(value)
+
+
+@knowledge.command("explain")
+@click.argument("knowledge_id")
+@click.option("--tenant", default=None)
+def knowledge_explain(knowledge_id: str, tenant: str | None):
+    """Explain provenance, policy, conflicts, and investigation use."""
+    _load_env()
+
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    try:
+        _knowledge_json(stores.knowledge().explain(knowledge_id, tenant_id))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@knowledge.command("conflicts")
+@click.option("--tenant", default=None)
+@click.option("--unresolved-only", is_flag=True)
+@click.option("--limit", default=200, type=click.IntRange(1, 500))
+@click.option("--cursor", default=None, help="Opaque cursor returned by the previous page.")
+def knowledge_conflicts(tenant: str | None, unresolved_only: bool, limit: int, cursor: str | None):
+    """List proposition conflicts."""
+    _load_env()
+
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    try:
+        page = stores.knowledge_repository().list_conflicts_page(
+            tenant_id,
+            unresolved_only=unresolved_only,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _knowledge_json(
+        {
+            "conflicts": [conflict.model_dump(mode="json") for conflict in page.conflicts],
+            "has_more": page.has_more,
+            "next_cursor": page.next_cursor,
+        }
+    )
+
+
+@knowledge.command("review")
+@click.argument("candidate_id")
+@click.option("--decision", type=click.Choice(["approve", "reject", "trust"]), default=None)
+@click.option("--approve", is_flag=True, help="Approve the candidate")
+@click.option("--reject", is_flag=True, help="Reject the candidate")
+@click.option("--trust", is_flag=True, help="Trust the candidate (privileged)")
+@click.option("--reviewer", required=True)
+@click.option("--tenant", default=None)
+@click.option("--authoritative-source", is_flag=True)
+@click.option("--live-verified", is_flag=True)
+def knowledge_review(
+    candidate_id: str,
+    decision: str | None,
+    approve: bool,
+    reject: bool,
+    trust: bool,
+    reviewer: str,
+    tenant: str | None,
+    authoritative_source: bool,
+    live_verified: bool,
+):
+    """Review a candidate and evaluate it for promotion."""
+    _load_env()
+    from tacit.errors import SemanticAuthorizationError
+    from tacit.knowledge.authorization import KnowledgeAction
+
+    stores = _cli_runtime_stores()
+    runtime_settings = _cli_store_settings(stores)
+    tenant_id = _knowledge_tenant(tenant, runtime_settings=runtime_settings)
+    selected = [value for value, enabled in (("approve", approve), ("reject", reject), ("trust", trust)) if enabled]
+    if decision:
+        selected.append(decision)
+    if len(set(selected)) != 1:
+        raise click.ClickException("choose exactly one of --approve, --reject, --trust, or --decision")
+    decision = selected[0]
+    action = {
+        "approve": KnowledgeAction.APPROVE,
+        "reject": KnowledgeAction.REJECT,
+        "trust": KnowledgeAction.TRUST,
+    }[decision]
+    _require_cli_knowledge_action(action, runtime_settings)
+    if authoritative_source or live_verified:
+        _require_cli_knowledge_action(KnowledgeAction.OVERRIDE, runtime_settings)
+    if decision != "reject":
+        _require_cli_knowledge_action(KnowledgeAction.APPLY, runtime_settings)
+    service = stores.knowledge()
+    try:
+        candidate = service.review_candidate(
+            candidate_id,
+            approved=decision != "reject",
+            reviewer=reviewer,
+            tenant_id=tenant_id,
+            trust=decision == "trust",
+            can_trust=decision == "trust",
+        )
+        promotion = revision = None
+        if decision != "reject":
+            evaluation = service.evaluate_candidate_result(
+                candidate_id,
+                tenant_id=tenant_id,
+                authoritative_source=authoritative_source,
+                live_verified=live_verified,
+            )
+            candidate = evaluation.candidate
+            promotion = evaluation.decision
+            revision = evaluation.revision
+    except (ValueError, SemanticAuthorizationError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    except OSError as exc:
+        raise click.ClickException("Knowledge review failed due to a local I/O error") from exc
+    _knowledge_json(
+        {
+            "candidate": candidate.model_dump(mode="json"),
+            "promotion_decision": promotion.model_dump(mode="json") if promotion else None,
+            "knowledge_revision": revision.model_dump(mode="json") if revision else None,
+        }
+    )
+
+
+@knowledge.command("history")
+@click.argument("knowledge_id")
+@click.option("--tenant", default=None)
+@click.option("--limit", default=200, type=click.IntRange(1, 500))
+@click.option("--cursor", default=None, help="Opaque cursor returned by the previous page.")
+def knowledge_history(knowledge_id: str, tenant: str | None, limit: int, cursor: str | None):
+    """List immutable revisions for one knowledge item."""
+    _load_env()
+
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    try:
+        page = stores.knowledge_repository().list_revisions_page(
+            knowledge_id,
+            tenant_id,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _knowledge_json(
+        {
+            "revisions": [revision.model_dump(mode="json") for revision in page.revisions],
+            "has_more": page.has_more,
+            "next_cursor": page.next_cursor,
+        }
+    )
+
+
+@knowledge.command("usage")
+@click.argument("knowledge_id")
+@click.option("--tenant", default=None)
+@click.option("--limit", default=200, type=click.IntRange(1, 500))
+@click.option("--cursor", default=None, help="Opaque cursor returned by the previous page.")
+def knowledge_usage(knowledge_id: str, tenant: str | None, limit: int, cursor: str | None):
+    """List investigations that considered a knowledge item."""
+    _load_env()
+
+    stores, tenant_id = _cli_knowledge_read_context(tenant)
+    try:
+        page = stores.knowledge_repository().list_usage_page(
+            tenant_id=tenant_id,
+            knowledge_id=knowledge_id,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _knowledge_json(
+        {
+            "usage": [usage.model_dump(mode="json") for usage in page.usage],
+            "has_more": page.has_more,
+            "next_cursor": page.next_cursor,
+        }
+    )
+
+
 # ── tacit history ─────────────────────────────────────────────────────
 @cli.group()
 def history():
@@ -1854,12 +2375,18 @@ def history():
 @click.option("--limit", "-n", default=20, type=int, help="Number of records")
 @click.option("--status", type=click.Choice(["success", "failed", "timeout"]), default=None)
 @click.option("--user", default=None, help="Filter by user ID")
-def history_list(limit: int, status: str | None, user: str | None):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_list(limit: int, status: str | None, user: str | None, tenant: str | None):
     """List recent investigations."""
     _load_env()
 
-    store = _cli_runtime_stores().history()
-    investigations = store.list_recent(limit=limit, status=status, user_id=user)
+    stores, selected_tenant = _cli_knowledge_read_context(tenant)
+    investigations = stores.history().list_recent(
+        limit=limit,
+        status=status,
+        user_id=user,
+        tenant_id=selected_tenant,
+    )
 
     if not investigations:
         _info("No investigations found.")
@@ -1902,12 +2429,13 @@ def history_list(limit: int, status: str | None, user: str | None):
 
 @history.command("show")
 @click.argument("investigation_id")
-def history_show(investigation_id: str):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_show(investigation_id: str, tenant: str | None):
     """Show full details of a single investigation."""
     _load_env()
 
-    store = _cli_runtime_stores().history()
-    inv = store.get(investigation_id)
+    stores, selected_tenant = _cli_knowledge_read_context(tenant)
+    inv = stores.history().get(investigation_id, tenant_id=selected_tenant)
 
     if inv is None:
         _fail(f"Investigation {investigation_id} not found")
@@ -1987,11 +2515,21 @@ def history_show(investigation_id: str):
 @history.command("contract")
 @click.argument("investigation_id")
 @click.option("--revision", type=int, default=None)
-def history_contract(investigation_id: str, revision: int | None):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_contract(investigation_id: str, revision: int | None, tenant: str | None):
     """Print the canonical contract for an investigation."""
     _load_env()
 
-    contract = _cli_runtime_stores().history().get_contract(investigation_id, revision)
+    stores = _cli_runtime_stores()
+    from tacit.knowledge.authorization import KnowledgeAction
+
+    _require_cli_knowledge_action(KnowledgeAction.READ, stores.settings)
+    selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    contract = stores.history().get_contract(
+        investigation_id,
+        revision,
+        tenant_id=selected_tenant,
+    )
     if contract is None:
         raise click.ClickException("Investigation contract not found")
     click.echo(json.dumps(contract.model_dump(mode="json", by_alias=True), indent=2, sort_keys=True))
@@ -2001,21 +2539,40 @@ def history_contract(investigation_id: str, revision: int | None):
 @click.argument("investigation_id")
 @click.option("--revision", type=int, default=None)
 @click.option("--mode", type=click.Choice(["exact", "current_engine", "counterfactual"]), default="exact")
-def history_replay(investigation_id: str, revision: int | None, mode: str):
+@click.option("--tenant", default=None, help="Knowledge tenant that owns the investigation.")
+def history_replay(investigation_id: str, revision: int | None, mode: str, tenant: str | None):
     """Replay an investigation from captured inputs without external refetch."""
     _load_env()
     from tacit.history import ReplayError, StaleRevisionError
     from tacit.investigation_replay import ReplayMode
 
+    stores = _cli_runtime_stores()
+    from tacit.knowledge.authorization import KnowledgeAction
+
+    _require_cli_knowledge_action(KnowledgeAction.READ, stores.settings)
+    if mode != "exact":
+        _require_cli_knowledge_action(KnowledgeAction.APPLY, stores.settings)
+    selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    history_store = stores.history()
+    existing_contract = history_store.get_contract(
+        investigation_id,
+        revision,
+        tenant_id=selected_tenant,
+    )
+    investigation = history_store.get(investigation_id, tenant_id=selected_tenant)
+    if existing_contract is None or investigation is None:
+        raise click.ClickException("Investigation or captured inputs not found")
+    recorded_tenant = str(investigation.get("tenant_id") or existing_contract.request.scope.tenant_id or "default")
+    if recorded_tenant != selected_tenant:
+        raise click.ClickException("Tenant access denied")
     try:
-        contract = (
-            _cli_runtime_stores()
-            .history()
-            .replay_contract(
-                investigation_id,
-                revision,
-                mode=ReplayMode(mode),
-            )
+        contract = history_store.replay_contract(
+            investigation_id,
+            revision,
+            mode=ReplayMode(mode),
+            runtime_settings=stores.settings,
+            knowledge_service_factory=stores.knowledge,
+            tenant_id=selected_tenant,
         )
     except (StaleRevisionError, ReplayError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -2028,11 +2585,18 @@ def history_replay(investigation_id: str, revision: int | None, mode: str):
 @click.argument("investigation_id")
 @click.argument("left", type=int)
 @click.argument("right", type=int)
-def history_compare(investigation_id: str, left: int, right: int):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_compare(investigation_id: str, left: int, right: int, tenant: str | None):
     """Compare two immutable investigation revisions."""
     _load_env()
 
-    comparison = _cli_runtime_stores().history().compare_revisions(investigation_id, left, right)
+    stores, selected_tenant = _cli_knowledge_read_context(tenant)
+    comparison = stores.history().compare_revisions(
+        investigation_id,
+        left,
+        right,
+        tenant_id=selected_tenant,
+    )
     if comparison is None:
         raise click.ClickException("Investigation revision not found")
     click.echo(json.dumps(comparison, indent=2, sort_keys=True))
@@ -2042,18 +2606,24 @@ def history_compare(investigation_id: str, left: int, right: int):
 @click.argument("investigation_id")
 @click.option("--revision", type=int, default=None)
 @click.option("--output", type=click.Path(dir_okay=False, path_type=Path), default=None)
-def history_export(investigation_id: str, revision: int | None, output: Path | None):
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_export(investigation_id: str, revision: int | None, output: Path | None, tenant: str | None):
     """Export one investigation as a portable Assessment Bundle."""
     _load_env()
     from tacit.investigation_bundle import export_investigation_bundle
+    from tacit.knowledge.authorization import KnowledgeAction
 
+    stores = _cli_runtime_stores()
+    selected_tenant = _knowledge_tenant(tenant, runtime_settings=stores.settings)
+    _require_cli_knowledge_action(KnowledgeAction.EXPORT, stores.settings)
     target = output or Path(f"tacit-investigation-{investigation_id}.tar.gz")
     try:
         export_investigation_bundle(
-            _cli_runtime_stores().history(),
+            stores.history(),
             investigation_id,
             target,
             revision=revision,
+            tenant_id=selected_tenant,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -2061,12 +2631,13 @@ def history_export(investigation_id: str, revision: int | None, output: Path | N
 
 
 @history.command("stats")
-def history_stats():
+@click.option("--tenant", default=None, help="Knowledge tenant (required in wildcard mode)")
+def history_stats(tenant: str | None):
     """Show aggregate investigation statistics."""
     _load_env()
 
-    store = _cli_runtime_stores().history()
-    s = store.stats()
+    stores, selected_tenant = _cli_knowledge_read_context(tenant)
+    s = stores.history().stats(tenant_id=selected_tenant)
 
     _header("Investigation Stats")
     total = s.get("total", 0)

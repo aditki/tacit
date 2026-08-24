@@ -9,8 +9,14 @@ import tacit.archetypes.templates as templates
 import tacit.pipeline as pipeline_mod
 from tacit.agents.providers import registry as provider_registry
 from tacit.agents.providers.base import TokenUsage
+from tacit.config import settings
+from tacit.dependencies import build_pipeline_dependencies
+from tacit.errors import FatalPipelineError
+from tacit.knowledge.enums import KnowledgeUsageDisposition
+from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
+from tacit.knowledge.service import KnowledgeService
 from tacit.main import app
-from tacit.models.schemas import ArchetypeMatch, DashRequest, Intent, MetricEntry, SignalType
+from tacit.models.schemas import ArchetypeMatch, CulpritCandidate, DashRequest, Intent, MetricEntry, SignalType
 from tests.e2e.framework import (
     CapturingBackend,
     IncidentFixtureProvider,
@@ -23,10 +29,109 @@ from tests.e2e.framework import (
 )
 
 SCENARIO_PATH = Path(__file__).parent / "scenarios" / "checkout_upload_incident.yaml"
+TAUGHT_LATENCY_ARCHETYPE = """
+archetypes:
+  - id: taught_latency
+    name: Taught Latency
+    description: Uses manually taught latency mappings
+    problem_types: [latency_investigation]
+    required_metrics:
+      - http_request_duration_seconds
+    required_signals:
+      - request_latency
+    signal_bindings:
+      request_latency: http_request_duration_seconds
+    tags: [manual-teach, latency]
+    default_timerange: 1h
+    panels:
+      - title: Taught p95 latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: >
+              histogram_quantile(
+                0.95,
+                sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le)
+              )
+            legend_format: p95
+"""
+
+CATALOG_SCOPE_ARCHETYPE = """
+archetypes:
+  - id: catalog_scope_latency
+    name: Catalog Scope Latency
+    description: Curated latency path discovered only from live catalog overlap
+    problem_types: [catalog_scope_only]
+    required_metrics: [catalog_scope_latency_seconds]
+    tags: [catalog-scope, latency]
+    default_timerange: 1h
+    panels:
+      - title: Catalog latency
+        row: Latency
+        unit: s
+        queries:
+          - expr: 'catalog_scope_latency_seconds{{{service_filter}}}'
+            legend_format: latency
+"""
 
 
 async def _no_context(_intent):
     return []
+
+
+def _install_taught_latency_archetype(archetypes_path: Path) -> None:
+    archetypes_path.write_text(TAUGHT_LATENCY_ARCHETYPE, encoding="utf-8")
+    templates.reload_archetypes()
+
+
+def _teach_taught_latency_mapping() -> None:
+    teach = TestClient(app).post(
+        "/api/v1/signals/teach",
+        json={
+            "signal_type": "request_latency",
+            "metric_patterns": [{"pattern": "acme_checkout_latency_seconds", "confidence": 0.94}],
+            "category": "latency",
+            "datasource_types": ["prometheus"],
+            "taught_by": "e2e",
+        },
+    )
+    assert teach.status_code == 200, teach.text
+    assert teach.json()["mappings_created"] == 1
+
+
+def _configure_taught_latency_pipeline(monkeypatch) -> CapturingBackend:
+    backend = CapturingBackend(
+        catalog=[
+            MetricEntry(
+                name="acme_checkout_latency_seconds_bucket",
+                datasource_uid="prom-e2e",
+                datasource_name="Prometheus E2E",
+                datasource_type="prometheus",
+                query_language="promql",
+                dimensions=['service="checkout-api"', "le={0.1,0.5,1,5}"],
+            )
+        ]
+    )
+    monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
+    monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
+
+    async def fake_classify_intent(prompt: str):
+        return (
+            Intent(
+                summary=prompt,
+                domain="application",
+                services=["checkout-api"],
+                signals=[SignalType.METRICS],
+                keywords=["checkout", "latency", "p95"],
+                timerange="1h",
+                problem_type="latency_investigation",
+                archetypes=[ArchetypeMatch(type="latency_investigation", confidence=0.97)],
+            ),
+            TokenUsage(),
+        )
+
+    monkeypatch.setattr(pipeline_mod, "classify_intent", fake_classify_intent)
+    return backend
 
 
 @pytest.mark.e2e
@@ -76,10 +181,29 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
     assert approve.status_code == 200, approve.text
     approved = approve.json()
     assert approved["status"] == "approved"
-    assert approved["mappings_created"] >= 5
+    assert approved["mappings_created"] == 0
     assert approved["archetype_registered"] is False
     assert approved["archetype_quarantined"] is True
     assert len(list(quarantine_path.rglob("*.yaml"))) == 1
+
+    candidates = client.get(
+        "/api/v1/knowledge/candidates",
+        params={"kind": "signal_mapping", "limit": 100},
+    )
+    assert candidates.status_code == 200, candidates.text
+    signal_candidates = candidates.json()["candidates"]
+    assert len(signal_candidates) >= 5
+    for candidate in signal_candidates:
+        promoted = client.post(
+            f"/api/v1/knowledge/candidates/{candidate['id']}/review",
+            json={
+                "decision": "trust",
+                "reviewer": "e2e-live-verifier",
+                "live_verified": True,
+            },
+        )
+        assert promoted.status_code == 200, promoted.text
+        assert promoted.json()["knowledge_revision"] is not None
 
     learned_sources = signal_store.stats()["mappings_by_source"]
     assert learned_sources.get("dashboard_ingest", 0) >= 5
@@ -137,65 +261,156 @@ async def test_manual_teach_signal_mapping_is_used_before_dashboard_creation(
     isolated_learning_runtime,
     monkeypatch,
 ):
+    _signal_store, history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
+    _install_taught_latency_archetype(archetypes_path)
+    _teach_taught_latency_mapping()
+    backend = _configure_taught_latency_pipeline(monkeypatch)
+
+    response = await pipeline_mod.run_pipeline(
+        DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="manual-teach")
+    )
+
+    assert response.dashboard_uid
+    assert backend.published_specs
+    found = {query.expr for panel in backend.published_specs[-1].panels for query in panel.queries}
+    assert any("acme_checkout_latency_seconds_bucket" in expr for expr in found)
+    assert all("http_request_duration_seconds" not in expr for expr in found)
+    contract = history_store.get_contract(response.investigation_id)
+    assert contract is not None
+    compilation_usage = [
+        usage
+        for usage in contract.knowledge_usage
+        if usage.disposition == "applied" and "query_compilation" in usage.used_for
+    ]
+    assert len(compilation_usage) == 1
+    assert compilation_usage[0].score_delta == 0
+
+
+@pytest.mark.e2e
+async def test_read_only_pipeline_is_rejected_before_history_or_publish(
+    isolated_learning_runtime,
+    monkeypatch,
+):
+    _signal_store, history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
+    _install_taught_latency_archetype(archetypes_path)
+    _teach_taught_latency_mapping()
+    backend = _configure_taught_latency_pipeline(monkeypatch)
+    monkeypatch.setattr(settings, "knowledge_permissions", "knowledge.read")
+
+    with pytest.raises(PermissionError, match="Missing permission: knowledge.apply"):
+        await pipeline_mod.run_pipeline(
+            DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="read-only")
+        )
+
+    assert history_store.list_recent() == []
+    assert backend.published_specs == []
+
+
+@pytest.mark.e2e
+async def test_pipeline_repins_knowledge_when_catalog_retrieval_widens_archetype_scope(
+    isolated_learning_runtime,
+    monkeypatch,
+):
     _signal_store, _history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
-    archetypes_path.write_text(
-        """
-archetypes:
-  - id: taught_latency
-    name: Taught Latency
-    description: Uses manually taught latency mappings
-    problem_types: [latency_investigation]
-    required_metrics:
-      - http_request_duration_seconds
-    required_signals:
-      - request_latency
-    signal_bindings:
-      request_latency: http_request_duration_seconds
-    tags: [manual-teach, latency]
-    default_timerange: 1h
-    panels:
-      - title: Taught p95 latency
-        row: Latency
-        unit: s
-        queries:
-          - expr: >
-              histogram_quantile(
-                0.95,
-                sum(rate(http_request_duration_seconds_bucket{{{service_filter}}}[{rate_interval}])) by (le)
-              )
-            legend_format: p95
-""",
-        encoding="utf-8",
-    )
+    archetypes_path.write_text(CATALOG_SCOPE_ARCHETYPE, encoding="utf-8")
     templates.reload_archetypes()
-
-    client = TestClient(app)
-    teach = client.post(
-        "/api/v1/signals/teach",
-        json={
-            "signal_type": "request_latency",
-            "metric_patterns": [{"pattern": "acme_checkout_latency_seconds", "confidence": 0.94}],
-            "category": "latency",
-            "datasource_types": ["prometheus"],
-            "taught_by": "e2e",
-        },
-    )
-    assert teach.status_code == 200, teach.text
-    assert teach.json()["mappings_created"] == 1
-
     backend = CapturingBackend(
         catalog=[
             MetricEntry(
-                name="acme_checkout_latency_seconds_bucket",
+                name="catalog_scope_latency_seconds",
+                datasource_uid="prom-e2e",
+                datasource_name="Prometheus E2E",
+                datasource_type="prometheus",
+                query_language="promql",
+                dimensions=['service="checkout-api"'],
+            )
+        ]
+    )
+    monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
+    monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
+
+    async def fake_classify_intent(prompt: str):
+        return (
+            Intent(
+                summary=prompt,
+                domain="application",
+                services=["checkout-api"],
+                signals=[SignalType.METRICS],
+                keywords=["checkout", "health"],
+                timerange="1h",
+                problem_type="general",
+                archetypes=[ArchetypeMatch(type="general", confidence=0.9)],
+            ),
+            TokenUsage(),
+        )
+
+    monkeypatch.setattr(pipeline_mod, "classify_intent", fake_classify_intent)
+    repinned_scopes: list[list[str]] = []
+    original_repin = KnowledgeService.repin_snapshot
+
+    def record_repin(self, scope, usage, *, previous_scope):
+        repinned_scopes.append(list(scope.archetype_refs))
+        return original_repin(self, scope, usage, previous_scope=previous_scope)
+
+    monkeypatch.setattr(KnowledgeService, "repin_snapshot", record_repin)
+
+    response = await pipeline_mod.run_pipeline(
+        DashRequest(prompt="checkout-api general health", user_id="e2e", channel_id="scope-repin")
+    )
+
+    assert response.dashboard_uid
+    assert repinned_scopes
+    assert "archetype:catalog_scope_latency" in repinned_scopes[-1]
+    assert any(panel.source_archetype == "catalog_scope_latency" for panel in backend.published_specs[-1].panels)
+
+
+@pytest.mark.e2e
+async def test_governed_compilation_fails_closed_when_usage_audit_is_unavailable(
+    isolated_learning_runtime,
+    monkeypatch,
+):
+    _signal_store, history_store, _feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
+    _install_taught_latency_archetype(archetypes_path)
+    _teach_taught_latency_mapping()
+    backend = _configure_taught_latency_pipeline(monkeypatch)
+
+    def fail_snapshot(_self, _scope, _usage):
+        raise OSError("knowledge audit database unavailable")
+
+    monkeypatch.setattr("tacit.knowledge.service.KnowledgeService.reconcile_pinned_usage", fail_snapshot)
+
+    with pytest.raises(FatalPipelineError, match="usage audit could not be persisted"):
+        await pipeline_mod.run_pipeline(
+            DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="audit-failure")
+        )
+
+    assert backend.published_specs == []
+    investigation = history_store.list_recent(limit=1)[0]
+    assert investigation["status"] == "failed"
+    assert "usage audit could not be persisted" in investigation["error"]
+
+
+@pytest.mark.e2e
+async def test_governed_ranking_fails_closed_when_final_snapshot_is_unavailable(
+    isolated_learning_runtime,
+    monkeypatch,
+):
+    signal_store, history_store, feedback_store, archetypes_path, _quarantine_path = isolated_learning_runtime
+    runtime_settings = signal_store.runtime_settings
+    _install_taught_latency_archetype(archetypes_path)
+    backend = CapturingBackend(
+        catalog=[
+            MetricEntry(
+                name="http_request_duration_seconds_bucket",
                 datasource_uid="prom-e2e",
                 datasource_name="Prometheus E2E",
                 datasource_type="prometheus",
                 query_language="promql",
                 dimensions=['service="checkout-api"', "le={0.1,0.5,1,5}"],
             )
-        ]
+        ],
+        runtime_settings=runtime_settings,
     )
-    monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
     monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
 
     async def fake_classify_intent(prompt: str):
@@ -215,15 +430,82 @@ archetypes:
 
     monkeypatch.setattr(pipeline_mod, "classify_intent", fake_classify_intent)
 
-    response = await pipeline_mod.run_pipeline(
-        DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="manual-teach")
+    class RankingKnowledgeService:
+        runtime_ownership = signal_store.runtime_ownership
+
+        def create_snapshot(self, scope):
+            return (
+                KnowledgeSnapshot(
+                    id="knowledge_snapshot_before_ranking",
+                    tenant_id=scope.tenant_id,
+                    fingerprint="sha256:before-ranking",
+                ),
+                [
+                    KnowledgeUsage(
+                        tenant_id=scope.tenant_id,
+                        knowledge_ref="knowledge_ranked_dependency",
+                        knowledge_revision=1,
+                        disposition=KnowledgeUsageDisposition.CONSIDERED_NOT_APPLIED,
+                    )
+                ],
+            )
+
+        def apply_stage_usage(self, usage, _stage_uses):
+            return usage
+
+        def apply_compilation_usage(self, usage, _revision_refs):
+            return usage
+
+        def apply_evidence_usage(self, usage, _revision_refs, _refs_by_requirement):
+            return usage
+
+        def reconcile_live_observations(self, usage, _observations):
+            return usage
+
+        def apply_to_ranking(self, ranking, usage):
+            candidate = CulpritCandidate(
+                rank=1,
+                suspect="redis-session",
+                suspect_type="datastore",
+                score=0.08,
+                contextual_reasons=["Governed dependency context"],
+            )
+            return (
+                ranking.model_copy(update={"candidates": [candidate, *ranking.candidates]}),
+                [
+                    usage[0].model_copy(
+                        update={
+                            "disposition": KnowledgeUsageDisposition.APPLIED,
+                            "used_for": ["candidate_generation", "ranking"],
+                            "score_delta": 0.08,
+                        }
+                    )
+                ],
+            )
+
+        def snapshot_from_usage(self, _tenant_id, _usage):
+            raise OSError("final knowledge snapshot unavailable")
+
+    knowledge_service = RankingKnowledgeService()
+    deps = build_pipeline_dependencies(
+        runtime_settings,
+        backend_factory=lambda: [backend],
+        history_store_factory=lambda: history_store,
+        feedback_store_factory=lambda: feedback_store,
+        signal_store_factory=lambda: signal_store,
+        knowledge_service_factory=lambda: knowledge_service,
     )
 
-    assert response.dashboard_uid
-    assert backend.published_specs
-    found = {query.expr for panel in backend.published_specs[-1].panels for query in panel.queries}
-    assert any("acme_checkout_latency_seconds_bucket" in expr for expr in found)
-    assert all("http_request_duration_seconds" not in expr for expr in found)
+    with pytest.raises(FatalPipelineError, match="usage audit could not be persisted"):
+        await pipeline_mod.run_pipeline(
+            DashRequest(prompt="checkout-api p95 latency is high", user_id="e2e", channel_id="ranking-audit"),
+            deps,
+        )
+
+    assert backend.published_specs == []
+    investigation = history_store.list_recent(limit=1)[0]
+    assert investigation["status"] == "failed"
+    assert "usage audit could not be persisted" in investigation["error"]
 
 
 @pytest.mark.e2e
@@ -266,7 +548,7 @@ async def test_pipeline_returns_helpful_no_metrics_response_without_publishing(
     isolated_learning_runtime,
     monkeypatch,
 ):
-    _signal_store, _history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
+    _signal_store, history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
     backend = CapturingBackend(catalog=[])
     monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [backend])
     monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
@@ -296,4 +578,10 @@ async def test_pipeline_returns_helpful_no_metrics_response_without_publishing(
     assert response.dashboard_url == ""
     assert response.panel_count == 0
     assert "No metrics found" in response.summary
+    assert response.investigation_id
+    assert response.investigation_run_id
+    assert response.investigation_status == "failed"
+    assert history_store.get(response.investigation_id) is not None
+    assert history_store.list_runs(response.investigation_id)[-1]["run_id"] == response.investigation_run_id
+    assert history_store.list_runs(response.investigation_id)[-1]["status"] == "failed"
     assert backend.published_specs == []

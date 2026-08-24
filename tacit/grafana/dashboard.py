@@ -4,9 +4,10 @@ from typing import Any
 
 import structlog
 
-from tacit.config import Settings, settings
+from tacit.config import Settings
 from tacit.grafana.client import GrafanaClient
 from tacit.models.schemas import DashboardSpec, PanelSpec
+from tacit.runtime_ownership import resolve_remote_runtime_settings
 
 logger = structlog.get_logger()
 
@@ -165,7 +166,12 @@ async def publish_dashboard(
     runtime_settings: Settings | None = None,
 ) -> tuple[str, str]:
     """Create / update a Grafana dashboard. Returns (dashboard_url, dashboard_uid)."""
-    config = runtime_settings or settings
+    config = resolve_remote_runtime_settings(
+        boundary="grafana_dashboard_publication",
+        owner=client,
+        provider="grafana",
+        explicit_settings=runtime_settings,
+    )
     folder = await client.get_or_create_folder(config.tacit_dashboard_folder)
     folder_uid = folder.get("uid", "")
 

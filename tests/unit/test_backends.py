@@ -7,7 +7,10 @@ GrafanaBackend, SignalFxBackend, and the registry must satisfy.
 import asyncio
 import os
 import sys
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -65,14 +68,433 @@ def _make_spec(query_lang="promql", ds_type="prometheus") -> DashboardSpec:
     )
 
 
-def _configure_backend_settings(mock_settings, *, grafana: bool, signalfx: bool, token: str = "") -> None:
-    mock_settings.grafana_enabled = grafana
-    mock_settings.grafana_url = "http://grafana.test"
-    mock_settings.grafana_api_key = ""
-    mock_settings.grafana_org_id = 1
-    mock_settings.signalfx_enabled = signalfx
-    mock_settings.signalfx_api_token = token
-    mock_settings.signalfx_realm = "us1"
+def _backend_settings(*, grafana: bool, signalfx: bool, token: str = ""):
+    from tacit.config import Settings
+
+    return Settings(
+        _env_file=None,
+        grafana_enabled=grafana,
+        grafana_url="http://grafana.test",
+        grafana_api_key="",
+        grafana_org_id=1,
+        signalfx_enabled=signalfx,
+        signalfx_api_token=token,
+        signalfx_realm="us1",
+    )
+
+
+def _owned_mock_client(provider: str) -> AsyncMock:
+    from tacit.config import Settings
+    from tacit.runtime_ownership import (
+        RuntimeRemoteIdentity,
+        adapt_third_party_runtime_owner,
+        credential_fingerprint,
+    )
+
+    runtime_settings = Settings(
+        _env_file=None,
+        grafana_url="https://grafana.test",
+        grafana_api_key="",
+        grafana_org_id=1,
+        signalfx_realm="us1",
+        signalfx_api_token="",
+    )
+    if provider == "grafana":
+        remote = RuntimeRemoteIdentity(
+            provider="grafana",
+            endpoint=runtime_settings.grafana_url,
+            account=str(runtime_settings.grafana_org_id),
+            credential_fingerprint=credential_fingerprint(runtime_settings.grafana_api_key),
+        )
+    else:
+        remote = RuntimeRemoteIdentity(
+            provider="signalfx",
+            endpoint="https://api.us1.signalfx.com",
+            account="us1",
+            credential_fingerprint=credential_fingerprint(runtime_settings.signalfx_api_token),
+        )
+    client = AsyncMock()
+    client.runtime_settings = runtime_settings
+    client.runtime_ownership = adapt_third_party_runtime_owner(
+        component=f"test_{provider}_client",
+        owner=client,
+        runtime_settings=runtime_settings,
+        remote=remote,
+    )
+    return client
+
+
+@pytest.mark.parametrize(
+    ("backend_path", "provider", "other_provider"),
+    [
+        ("tacit.backends.grafana.GrafanaBackend", "grafana", "signalfx"),
+        ("tacit.backends.signalfx.SignalFxBackend", "signalfx", "grafana"),
+    ],
+)
+def test_backend_rejects_mixed_provider_descriptor(
+    backend_path,
+    provider,
+    other_provider,
+):
+    from importlib import import_module
+
+    from tacit.runtime_ownership import RuntimeOwnershipMismatchError, RuntimeRemoteIdentity
+
+    client = _owned_mock_client(provider)
+    expected = client.runtime_ownership.remotes[0]
+    client.runtime_ownership = replace(
+        client.runtime_ownership,
+        remotes=(
+            expected,
+            RuntimeRemoteIdentity(
+                provider=other_provider,
+                endpoint=(
+                    "https://api.us1.signalfx.com" if other_provider == "signalfx" else "https://grafana.other.test"
+                ),
+            ),
+        ),
+    )
+    module_name, class_name = backend_path.rsplit(".", 1)
+    backend_type = getattr(import_module(module_name), class_name)
+
+    with pytest.raises(RuntimeOwnershipMismatchError, match="sole provider"):
+        backend_type(client=client)
+
+
+@pytest.mark.parametrize(
+    ("backend_path", "provider", "discovery_patch"),
+    [
+        (
+            "tacit.backends.grafana.GrafanaBackend",
+            "grafana",
+            "tacit.backends.grafana.list_datasources",
+        ),
+        (
+            "tacit.backends.signalfx.SignalFxBackend",
+            "signalfx",
+            "tacit.backends.signalfx.sfx_discover",
+        ),
+    ],
+)
+def test_backend_discovery_propagates_authority_failures(
+    backend_path,
+    provider,
+    discovery_patch,
+):
+    from importlib import import_module
+
+    from tacit.errors import RuntimeOwnershipError
+
+    module_name, class_name = backend_path.rsplit(".", 1)
+    backend_type = getattr(import_module(module_name), class_name)
+    backend = backend_type(client=_owned_mock_client(provider))
+
+    with patch(discovery_patch, new_callable=AsyncMock) as discovery:
+        discovery.side_effect = RuntimeOwnershipError("sensitive owner detail")
+        with pytest.raises(RuntimeOwnershipError, match="sensitive owner detail"):
+            asyncio.run(backend.discover_metrics([], _make_intent()))
+
+
+def test_grafana_backend_passes_app_scoped_discovery_settings():
+    from tacit.backends.grafana import GrafanaBackend
+
+    client = _owned_mock_client("grafana")
+    runtime_settings = client.runtime_settings.model_copy(update={"max_metric_catalog_size": 1})
+    client.runtime_settings = runtime_settings
+    from tacit.runtime_ownership import runtime_descriptor_for_remote
+
+    client.runtime_ownership = runtime_descriptor_for_remote(
+        component="test_grafana_client",
+        runtime_settings=runtime_settings,
+        remote=client.runtime_ownership.remotes[0],
+    )
+    backend = GrafanaBackend(client=client)
+
+    with (
+        patch.object(backend, "_select_searchable_datasources", new_callable=AsyncMock) as select,
+        patch("tacit.backends.grafana.discover_all_metrics", new_callable=AsyncMock) as discover,
+    ):
+        select.return_value = ([MagicMock()], [MagicMock()])
+        discover.return_value = []
+        asyncio.run(backend.discover_metrics([], _make_intent()))
+
+    assert discover.call_args.kwargs["runtime_settings"].max_metric_catalog_size == 1
+
+
+@pytest.mark.parametrize(
+    ("backend_path", "client_method"),
+    [
+        ("tacit.backends.grafana.GrafanaBackend", "_get"),
+        ("tacit.backends.signalfx.SignalFxBackend", "search_metrics"),
+    ],
+)
+def test_injected_backend_rejects_ownerless_client_before_transport_use(backend_path, client_method):
+    from importlib import import_module
+
+    from tacit.runtime_ownership import RuntimeOwnershipError
+
+    class OwnerlessClient:
+        calls = 0
+
+        def __getattr__(self, name):
+            if name == client_method:
+                self.calls += 1
+            raise AttributeError(name)
+
+    module_name, class_name = backend_path.rsplit(".", 1)
+    backend_type = getattr(import_module(module_name), class_name)
+    client = OwnerlessClient()
+
+    with pytest.raises(RuntimeOwnershipError, match="public runtime ownership descriptor"):
+        backend_type(client=client)
+
+    assert client.calls == 0
+
+
+@pytest.mark.parametrize(
+    "backend_path",
+    [
+        "tacit.backends.grafana.GrafanaBackend",
+        "tacit.backends.signalfx.SignalFxBackend",
+    ],
+)
+def test_injected_backend_rejects_explicitly_unavailable_client_before_transport_use(backend_path):
+    from importlib import import_module
+
+    from tacit.runtime_ownership import RuntimeOwnershipDescriptor, RuntimeOwnershipError
+
+    class UnavailableClient:
+        runtime_ownership = RuntimeOwnershipDescriptor.unavailable(
+            component="third_party_client",
+            reason="adapter_unavailable",
+        )
+        calls = 0
+
+        def __getattr__(self, name):
+            self.calls += 1
+            raise AttributeError(name)
+
+    module_name, class_name = backend_path.rsplit(".", 1)
+    backend_type = getattr(import_module(module_name), class_name)
+    client = UnavailableClient()
+
+    with pytest.raises(RuntimeOwnershipError, match="explicitly unavailable"):
+        backend_type(client=client)
+
+    assert client.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("backend_path", "provider"),
+    [
+        ("tacit.backends.grafana.GrafanaBackend", "grafana"),
+        ("tacit.backends.signalfx.SignalFxBackend", "signalfx"),
+    ],
+)
+def test_injected_backend_rejects_descriptor_without_expected_remote(backend_path, provider):
+    from importlib import import_module
+
+    from tacit.runtime_ownership import RuntimeOwnershipDescriptor, RuntimeOwnershipMismatchError
+
+    class WrongRemoteClient:
+        runtime_ownership = RuntimeOwnershipDescriptor(
+            component=f"third_party_{provider}_client",
+            cache_namespace="unrelated-cache",
+        )
+
+    module_name, class_name = backend_path.rsplit(".", 1)
+    backend_type = getattr(import_module(module_name), class_name)
+
+    with pytest.raises(RuntimeOwnershipMismatchError, match="expected remote identity"):
+        backend_type(client=WrongRemoteClient())
+
+
+@pytest.mark.parametrize("provider", ["grafana", "signalfx"])
+def test_injected_backend_accepts_explicit_third_party_ownership_adapter(provider):
+    from tacit.backends.grafana import GrafanaBackend
+    from tacit.backends.signalfx import SignalFxBackend
+    from tacit.config import Settings
+    from tacit.runtime_ownership import (
+        RuntimeRemoteIdentity,
+        adapt_third_party_runtime_owner,
+        credential_fingerprint,
+    )
+
+    runtime_settings = Settings(
+        _env_file=None,
+        grafana_url="https://grafana.example.test",
+        grafana_api_key="grafana-secret",
+        grafana_org_id=7,
+        signalfx_realm="us1",
+        signalfx_api_token="signalfx-secret",
+    )
+    if provider == "grafana":
+        remote = RuntimeRemoteIdentity(
+            provider="grafana",
+            endpoint=runtime_settings.grafana_url,
+            account=str(runtime_settings.grafana_org_id),
+            credential_fingerprint=credential_fingerprint(runtime_settings.grafana_api_key),
+        )
+        backend_type = GrafanaBackend
+    else:
+        remote = RuntimeRemoteIdentity(
+            provider="signalfx",
+            endpoint="https://api.us1.signalfx.com",
+            account="us1",
+            credential_fingerprint=credential_fingerprint(runtime_settings.signalfx_api_token),
+        )
+        backend_type = SignalFxBackend
+
+    class AdaptedClient:
+        runtime_ownership = adapt_third_party_runtime_owner(
+            component=f"third_party_{provider}_client",
+            owner=object(),
+            runtime_settings=runtime_settings,
+            remote=remote,
+        )
+
+    backend = backend_type(client=AdaptedClient(), runtime_settings=runtime_settings)  # type: ignore[arg-type]
+
+    assert backend.runtime_ownership.remotes == (remote,)
+
+
+@pytest.mark.parametrize(
+    ("base_url", "error"),
+    [
+        ("", "remote endpoint is invalid"),
+        ("   ", "remote endpoint is invalid"),
+        ("grafana.example", "remote endpoint is invalid"),
+        (
+            "https://operator:secret@grafana.example",
+            "remote endpoint credentials are not allowed",
+        ),
+    ],
+)
+def test_grafana_client_rejects_explicit_invalid_base_url_before_http_client_construction(base_url, error):
+    from tacit.config import Settings
+    from tacit.grafana.client import GrafanaClient
+    from tacit.runtime_ownership import RuntimeOwnershipError
+
+    runtime_settings = Settings(_env_file=None, grafana_url="https://configured.grafana.example")
+
+    with patch("tacit.grafana.client.httpx.AsyncClient") as http_client:
+        with pytest.raises(RuntimeOwnershipError, match=error):
+            GrafanaClient(base_url=base_url, runtime_settings=runtime_settings)
+
+    http_client.assert_not_called()
+
+
+def test_grafana_client_uses_configured_base_url_when_override_is_none():
+    from tacit.config import Settings
+    from tacit.grafana.client import GrafanaClient
+
+    runtime_settings = Settings(_env_file=None, grafana_url="https://Configured.Grafana.Example:443/api/")
+
+    with patch("tacit.grafana.client.httpx.AsyncClient") as http_client:
+        client = GrafanaClient(base_url=None, runtime_settings=runtime_settings)
+        transport = client._client
+
+    assert client.base_url == "https://configured.grafana.example/api"
+    assert transport is http_client.return_value
+    assert http_client.call_args.kwargs["base_url"] == client.base_url
+
+
+def test_grafana_client_override_is_the_effective_sole_remote_owner():
+    from tacit.backends.grafana import GrafanaBackend
+    from tacit.config import Settings
+    from tacit.grafana.client import GrafanaClient
+    from tacit.runtime_ownership import credential_fingerprint
+
+    configured = Settings(
+        _env_file=None,
+        grafana_url="https://configured.grafana.example",
+        grafana_api_key="configured-key",
+        grafana_org_id=1,
+    )
+
+    with patch("tacit.grafana.client.httpx.AsyncClient") as http_client:
+        client = GrafanaClient(
+            base_url="https://Override.Grafana.Example:443/api/",
+            api_key="override-key",
+            org_id=42,
+            runtime_settings=configured,
+        )
+        backend = GrafanaBackend(client=client)
+
+    remote = backend.runtime_ownership.remotes[0]
+    assert remote.provider == "grafana"
+    assert remote.endpoint == "https://override.grafana.example/api"
+    assert remote.account == "42"
+    assert remote.credential_fingerprint == credential_fingerprint("override-key")
+    assert client.runtime_settings.grafana_url == remote.endpoint
+    assert client.runtime_settings.grafana_api_key == "override-key"
+    assert client.runtime_settings.grafana_org_id == 42
+    assert backend.runtime_settings == client.runtime_settings
+    http_client.assert_not_called()
+
+
+def test_grafana_backend_accepts_equivalent_explicit_second_owner():
+    from tacit.backends.grafana import GrafanaBackend
+    from tacit.config import Settings
+    from tacit.grafana.client import GrafanaClient
+
+    configured = Settings(
+        _env_file=None,
+        grafana_url="https://configured.grafana.example",
+        grafana_api_key="configured-key",
+        grafana_org_id=1,
+    )
+
+    with patch("tacit.grafana.client.httpx.AsyncClient"):
+        client = GrafanaClient(
+            base_url="https://effective.grafana.example",
+            api_key="effective-key",
+            org_id=7,
+            runtime_settings=configured,
+        )
+        backend = GrafanaBackend(client=client, runtime_settings=client.runtime_settings)
+
+    assert backend.runtime_ownership.remotes == client.runtime_ownership.remotes
+
+
+@pytest.mark.parametrize(
+    "settings_update",
+    [
+        {"grafana_url": "https://other.grafana.example"},
+        {"grafana_org_id": 99},
+        {"grafana_api_key": "other-key"},
+    ],
+)
+def test_grafana_backend_rejects_disagreeing_explicit_owner_before_network_io(settings_update):
+    from tacit.backends.grafana import GrafanaBackend
+    from tacit.config import Settings
+    from tacit.grafana.client import GrafanaClient
+    from tacit.runtime_ownership import RuntimeOwnershipMismatchError
+
+    effective = Settings(
+        _env_file=None,
+        grafana_url="https://configured.grafana.example",
+        grafana_api_key="configured-key",
+        grafana_org_id=1,
+    )
+
+    with patch("tacit.grafana.client.httpx.AsyncClient") as http_client:
+        client = GrafanaClient(
+            base_url="https://effective.grafana.example",
+            api_key="effective-key",
+            org_id=7,
+            runtime_settings=effective,
+        )
+        transport = http_client.return_value
+        with pytest.raises(RuntimeOwnershipMismatchError):
+            GrafanaBackend(
+                client=client,
+                runtime_settings=client.runtime_settings.model_copy(deep=True, update=settings_update),
+            )
+
+    transport.get.assert_not_called()
+    transport.post.assert_not_called()
+    http_client.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -141,7 +563,7 @@ def test_grafana_backend_properties():
 def test_grafana_backend_discover_metrics():
     from tacit.backends.grafana import GrafanaBackend
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("grafana")
     backend = GrafanaBackend(client=mock_client)
 
     fake_entries = [
@@ -184,7 +606,7 @@ def test_grafana_backend_discover_metrics():
 def test_grafana_backend_validate_queries():
     from tacit.backends.grafana import GrafanaBackend
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("grafana")
     backend = GrafanaBackend(client=mock_client)
 
     spec = _make_spec()
@@ -208,9 +630,25 @@ def test_grafana_backend_publish():
     from tacit.backends.base import PublishResult
     from tacit.backends.grafana import GrafanaBackend
     from tacit.config import Settings
+    from tacit.runtime_ownership import (
+        RuntimeRemoteIdentity,
+        credential_fingerprint,
+        runtime_descriptor_for_remote,
+    )
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("grafana")
     runtime_settings = Settings(grafana_url="http://runtime-grafana.test", tacit_dashboard_folder="Runtime")
+    mock_client.runtime_settings = runtime_settings
+    mock_client.runtime_ownership = runtime_descriptor_for_remote(
+        component="test_grafana_client",
+        runtime_settings=runtime_settings,
+        remote=RuntimeRemoteIdentity(
+            provider="grafana",
+            endpoint=runtime_settings.grafana_url,
+            account=str(runtime_settings.grafana_org_id),
+            credential_fingerprint=credential_fingerprint(runtime_settings.grafana_api_key),
+        ),
+    )
     backend = GrafanaBackend(client=mock_client, runtime_settings=runtime_settings)
 
     spec = _make_spec()
@@ -222,7 +660,7 @@ def test_grafana_backend_publish():
         assert result.url == "http://grafana/d/abc"
         assert result.uid == "abc"
         assert result.backend_name == "grafana"
-        mock_pub.assert_called_once_with(mock_client, spec, runtime_settings=runtime_settings)
+        mock_pub.assert_called_once_with(mock_client, spec, runtime_settings=backend.runtime_settings)
 
     print("[PASS] test_grafana_backend_publish")
 
@@ -249,7 +687,7 @@ def test_signalfx_backend_properties():
 def test_signalfx_backend_discover_metrics():
     from tacit.backends.signalfx import SignalFxBackend
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("signalfx")
     backend = SignalFxBackend(client=mock_client)
 
     fake_entries = [
@@ -268,7 +706,11 @@ def test_signalfx_backend_discover_metrics():
         result = asyncio.run(backend.discover_metrics(intent.keywords, intent))
         assert len(result) == 1
         assert result[0].datasource_type == "signalfx"
-        mock_disc.assert_called_once_with(mock_client, intent.keywords)
+        mock_disc.assert_called_once_with(
+            mock_client,
+            intent.keywords,
+            runtime_settings=backend.runtime_settings,
+        )
 
     print("[PASS] test_signalfx_backend_discover_metrics")
 
@@ -281,7 +723,7 @@ def test_signalfx_backend_discover_metrics():
 def test_signalfx_backend_validate_queries():
     from tacit.backends.signalfx import SignalFxBackend
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("signalfx")
     backend = SignalFxBackend(client=mock_client)
 
     spec = _make_spec(query_lang="signalflow", ds_type="signalfx")
@@ -305,9 +747,25 @@ def test_signalfx_backend_publish():
     from tacit.backends.base import PublishResult
     from tacit.backends.signalfx import SignalFxBackend
     from tacit.config import Settings
+    from tacit.runtime_ownership import (
+        RuntimeRemoteIdentity,
+        credential_fingerprint,
+        runtime_descriptor_for_remote,
+    )
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("signalfx")
     runtime_settings = Settings(signalfx_dashboard_group="Runtime Group")
+    mock_client.runtime_settings = runtime_settings
+    mock_client.runtime_ownership = runtime_descriptor_for_remote(
+        component="test_signalfx_client",
+        runtime_settings=runtime_settings,
+        remote=RuntimeRemoteIdentity(
+            provider="signalfx",
+            endpoint=f"https://api.{runtime_settings.signalfx_realm}.signalfx.com",
+            account=runtime_settings.signalfx_realm,
+            credential_fingerprint=credential_fingerprint(runtime_settings.signalfx_api_token),
+        ),
+    )
     backend = SignalFxBackend(client=mock_client, runtime_settings=runtime_settings)
 
     spec = _make_spec(query_lang="signalflow", ds_type="signalfx")
@@ -319,7 +777,12 @@ def test_signalfx_backend_publish():
         assert "signalfx.com" in result.url
         assert result.uid == "D123"
         assert result.backend_name == "signalfx"
-        mock_pub.assert_called_once_with(mock_client, spec, group_name="Runtime Group")
+        mock_pub.assert_called_once_with(
+            mock_client,
+            spec,
+            group_name="Runtime Group",
+            runtime_settings=backend.runtime_settings,
+        )
 
     print("[PASS] test_signalfx_backend_publish")
 
@@ -332,8 +795,7 @@ def test_signalfx_backend_publish():
 def test_registry_grafana_only():
     from tacit.backends import get_active_backends
 
-    with patch("tacit.backends.settings") as mock_settings:
-        _configure_backend_settings(mock_settings, grafana=True, signalfx=False)
+    with patch("tacit.backends.settings", _backend_settings(grafana=True, signalfx=False)):
         backends = get_active_backends()
         try:
             assert len(backends) == 1
@@ -348,8 +810,10 @@ def test_registry_grafana_only():
 def test_registry_signalfx_only():
     from tacit.backends import get_active_backends
 
-    with patch("tacit.backends.settings") as mock_settings:
-        _configure_backend_settings(mock_settings, grafana=False, signalfx=True, token="test-token")
+    with patch(
+        "tacit.backends.settings",
+        _backend_settings(grafana=False, signalfx=True, token="test-token"),
+    ):
         backends = get_active_backends()
         try:
             assert len(backends) == 1
@@ -364,8 +828,10 @@ def test_registry_signalfx_only():
 def test_registry_both_enabled():
     from tacit.backends import get_active_backends
 
-    with patch("tacit.backends.settings") as mock_settings:
-        _configure_backend_settings(mock_settings, grafana=True, signalfx=True, token="test-token")
+    with patch(
+        "tacit.backends.settings",
+        _backend_settings(grafana=True, signalfx=True, token="test-token"),
+    ):
         backends = get_active_backends()
         try:
             assert len(backends) == 2
@@ -381,8 +847,7 @@ def test_registry_both_enabled():
 def test_registry_none_enabled():
     from tacit.backends import get_active_backends
 
-    with patch("tacit.backends.settings") as mock_settings:
-        _configure_backend_settings(mock_settings, grafana=False, signalfx=False)
+    with patch("tacit.backends.settings", _backend_settings(grafana=False, signalfx=False)):
         backends = get_active_backends()
         assert len(backends) == 0
 
@@ -421,8 +886,10 @@ def test_registry_primary_is_first():
     """When both enabled, the primary backend (first) determines query language."""
     from tacit.backends import get_active_backends
 
-    with patch("tacit.backends.settings") as mock_settings:
-        _configure_backend_settings(mock_settings, grafana=True, signalfx=True, token="tok")
+    with patch(
+        "tacit.backends.settings",
+        _backend_settings(grafana=True, signalfx=True, token="tok"),
+    ):
         backends = get_active_backends()
         try:
             primary = backends[0]
@@ -444,7 +911,7 @@ def test_registry_primary_is_first():
 def test_grafana_backend_close():
     from tacit.backends.grafana import GrafanaBackend
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("grafana")
     backend = GrafanaBackend(client=mock_client)
     asyncio.run(backend.close())
     mock_client.close.assert_called_once()
@@ -454,7 +921,7 @@ def test_grafana_backend_close():
 def test_signalfx_backend_close():
     from tacit.backends.signalfx import SignalFxBackend
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("signalfx")
     backend = SignalFxBackend(client=mock_client)
     asyncio.run(backend.close())
     mock_client.close.assert_called_once()
@@ -464,7 +931,7 @@ def test_signalfx_backend_close():
 def test_signalfx_backend_list_dashboards_reads_dashboard_configs():
     from tacit.backends.signalfx import SignalFxBackend
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("signalfx")
     mock_client.list_dashboard_groups.return_value = {
         "results": [
             {
@@ -509,7 +976,7 @@ def test_signalfx_backend_list_dashboards_paginates_dashboard_groups():
         ]
     }
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("signalfx")
     mock_client.list_dashboard_groups.side_effect = [first_page, second_page]
     backend = SignalFxBackend(client=mock_client)
 
@@ -560,7 +1027,7 @@ def test_grafana_backend_list_dashboards_paginates_search_results():
         }
     ]
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("grafana")
     mock_client._get.side_effect = [first_page, second_page]
     backend = GrafanaBackend(client=mock_client)
 
@@ -594,6 +1061,26 @@ def test_grafana_backend_list_dashboards_paginates_search_results():
     print("[PASS] test_grafana_backend_list_dashboards_paginates_search_results")
 
 
+def test_grafana_dashboard_limit_does_not_claim_a_complete_crawl():
+    from tacit.backends.grafana import GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE, GrafanaBackend
+
+    first_page = [{"uid": f"dash-{index}"} for index in range(GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE)]
+    second_page = [{"uid": f"dash-{GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE + index}"} for index in range(200)]
+    mock_client = _owned_mock_client("grafana")
+    mock_client._get.side_effect = [first_page, second_page]
+    backend = GrafanaBackend(client=mock_client)
+
+    dashboards = asyncio.run(backend.list_dashboards(limit=600))
+
+    assert len(dashboards) == 600
+    assert backend.last_dashboard_list_complete is False
+    assert mock_client._get.call_args_list[1].kwargs["params"] == {
+        "type": "dash-db",
+        "limit": GRAFANA_DASHBOARD_SEARCH_PAGE_SIZE,
+        "page": 2,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 14. GrafanaBackend — discover returns empty when no searchable datasources
 # ═══════════════════════════════════════════════════════════════════════════
@@ -602,7 +1089,7 @@ def test_grafana_backend_list_dashboards_paginates_search_results():
 def test_grafana_backend_discover_no_datasources():
     from tacit.backends.grafana import GrafanaBackend
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("grafana")
     backend = GrafanaBackend(client=mock_client)
 
     with (
@@ -625,7 +1112,7 @@ def test_grafana_backend_discover_no_datasources():
 def test_grafana_backend_datasource_targets_when_metrics_absent():
     from tacit.backends.grafana import GrafanaBackend
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("grafana")
     backend = GrafanaBackend(client=mock_client)
     prom_ds = DatasourceInfo(
         uid="prom1",
@@ -659,7 +1146,7 @@ def test_grafana_backend_datasource_targets_when_metrics_absent():
 def test_grafana_backend_marks_connection_failure_unavailable():
     from tacit.backends.grafana import GrafanaBackend
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("grafana")
     backend = GrafanaBackend(client=mock_client)
 
     with patch("tacit.backends.grafana.list_datasources", new_callable=AsyncMock) as mock_list:
@@ -669,7 +1156,7 @@ def test_grafana_backend_marks_connection_failure_unavailable():
 
         assert result == []
         assert backend.last_discovery_status.available is False
-        assert "connection refused" in backend.last_discovery_status.error
+        assert backend.last_discovery_status.error == "grafana_discover_failed"
 
     print("[PASS] test_grafana_backend_marks_connection_failure_unavailable")
 
@@ -682,7 +1169,7 @@ def test_grafana_backend_marks_connection_failure_unavailable():
 def test_signalfx_backend_discover_error():
     from tacit.backends.signalfx import SignalFxBackend
 
-    mock_client = AsyncMock()
+    mock_client = _owned_mock_client("signalfx")
     backend = SignalFxBackend(client=mock_client)
 
     with patch("tacit.backends.signalfx.sfx_discover", new_callable=AsyncMock) as mock_disc:

@@ -8,7 +8,16 @@ it does NOT invent the dashboard structure.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+MAX_ARCHETYPE_REQUIRED_METRICS = 64
+MAX_ARCHETYPE_REQUIRED_SIGNALS = 64
+MAX_ARCHETYPE_SIGNAL_BINDINGS = 64
+MAX_ARCHETYPE_SIGNAL_REQUIREMENTS = 64
+MAX_ARCHETYPE_TAGS = 64
+MAX_ARCHETYPE_PANELS = 256
+MAX_ARCHETYPE_QUERIES_PER_PANEL = 1_024
+MAX_ARCHETYPE_TOTAL_QUERIES = 1_024
 
 
 class QueryTemplate(BaseModel):
@@ -35,7 +44,7 @@ class PanelTemplate(BaseModel):
     description: str = ""
     panel_type: str = "timeseries"
     row: str = Field(default="", description="Section/row grouping name")
-    queries: list[QueryTemplate]
+    queries: list[QueryTemplate] = Field(max_length=MAX_ARCHETYPE_QUERIES_PER_PANEL)
     unit: str = ""
 
 
@@ -55,23 +64,36 @@ class InvestigationArchetype(BaseModel):
     )
     required_metrics: list[str] = Field(
         default_factory=list,
+        max_length=MAX_ARCHETYPE_REQUIRED_METRICS,
         description="Literal metric names this archetype needs, "
         "e.g. ['http_requests_total', 'http_request_duration_seconds']",
     )
     required_signals: list[str] = Field(
         default_factory=list,
+        max_length=MAX_ARCHETYPE_REQUIRED_SIGNALS,
         description="Semantic signal types this archetype needs, "
         "e.g. ['request_latency', 'error_rate']. Resolved to actual "
         "metrics at compile time via the signal mapping store.",
     )
     signal_bindings: dict[str, str] = Field(
         default_factory=dict,
+        max_length=MAX_ARCHETYPE_SIGNAL_BINDINGS,
         description="Maps signal_type → default_metric_name used in query templates. "
         "When the default metric is missing from the catalog, the signal "
         "resolution engine finds the best alternative. "
         "e.g. {'request_latency': 'http_request_duration_seconds', "
         "'error_rate': 'http_requests_total'}",
     )
-    panels: list[PanelTemplate]
-    tags: list[str] = Field(default_factory=list)
+    panels: list[PanelTemplate] = Field(max_length=MAX_ARCHETYPE_PANELS)
+    tags: list[str] = Field(default_factory=list, max_length=MAX_ARCHETYPE_TAGS)
     default_timerange: str = "1h"
+
+    @model_validator(mode="after")
+    def bound_coverage_signal_requirements(self) -> InvestigationArchetype:
+        signal_requirements = set(self.required_signals) | set(self.signal_bindings)
+        if len(signal_requirements) > MAX_ARCHETYPE_SIGNAL_REQUIREMENTS:
+            raise ValueError("combined required_signals and signal_bindings exceed the archetype limit")
+        total_queries = sum(len(panel.queries) for panel in self.panels)
+        if total_queries > MAX_ARCHETYPE_TOTAL_QUERIES:
+            raise ValueError("combined panel queries exceed the archetype limit")
+        return self

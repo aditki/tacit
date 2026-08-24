@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import structlog
 
-from tacit.agents.metrics_discovery import discover_metrics
+from tacit import __version__
+from tacit.agents.metrics_discovery import SYSTEM_PROMPT, discover_metrics
 from tacit.agents.providers.base import TokenUsage
 from tacit.agents.query_builder import build_dashboard
 from tacit.dependencies import PipelineDependencies
@@ -19,6 +21,41 @@ from tacit.pipeline.recording import PipelineRecorder
 from tacit.ranking import prerank_metrics
 
 logger = structlog.get_logger()
+
+
+def _cache_identity(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return value
+    return str(value)
+
+
+def discovery_cache_parts(
+    *,
+    tenant_id: str,
+    intent: Intent,
+    ranked_catalog: list[MetricEntry],
+    context_chunks: list[Any],
+    runtime_identity: str = "",
+) -> tuple[str, ...]:
+    """Return the complete tenant-scoped identity for metric discovery."""
+    return (
+        "discovery",
+        runtime_identity,
+        tenant_id,
+        json.dumps(_cache_identity(intent), sort_keys=True, separators=(",", ":")),
+        json.dumps(
+            [_cache_identity(entry) for entry in ranked_catalog],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        json.dumps(
+            [_cache_identity(chunk) for chunk in context_chunks],
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -37,6 +74,7 @@ async def build_freeform_dashboard(
     recorder: PipelineRecorder,
     timings: dict[str, float],
     started_at: float,
+    tenant_id: str = "default",
 ) -> FreeformBuildResult:
     """Build a dashboard through LLM metric discovery and query generation."""
     if not metric_catalog:
@@ -58,6 +96,7 @@ async def build_freeform_dashboard(
         intent,
         metric_catalog,
         feedback_store_factory=deps.feedback_store_factory,
+        tenant_id=tenant_id,
     )
     stage_log(
         "metric_ranking",
@@ -67,10 +106,21 @@ async def build_freeform_dashboard(
     )
 
     discovery_cache_key = deps.cache_key_factory(
-        "discovery",
-        intent.summary,
-        ",".join(intent.keywords),
-        ",".join(e.name for e in ranked_catalog[:20]),
+        *discovery_cache_parts(
+            tenant_id=tenant_id,
+            intent=intent,
+            ranked_catalog=ranked_catalog,
+            context_chunks=context_chunks,
+            runtime_identity=deps.cache_key_factory(
+                __version__,
+                deps.settings.llm_provider,
+                deps.settings.llm_model,
+                deps.settings.llm_azure_deployment,
+                deps.settings.llm_bedrock_model_id,
+                deps.settings.llm_api_base,
+                SYSTEM_PROMPT,
+            ),
+        )
     )
     provider = deps.llm_provider_factory() if deps.llm_provider_factory else None
     cached_discovery = deps.llm_cache.get(discovery_cache_key)
@@ -94,6 +144,7 @@ async def build_freeform_dashboard(
         catalog_size=len(ranked_catalog),
         metrics_selected=len(discovery.metrics),
         cached=discovery_cached,
+        tenant_id=tenant_id,
     )
 
     if not discovery.metrics:

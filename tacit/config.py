@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 try:
     import truststore
@@ -12,10 +14,125 @@ except ImportError:
     pass  # truststore not installed; fall back to default SSL
 
 import yaml
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tacit.archetypes.generated.schema import ArchetypeRetrievalMode
+from tacit.sqlite_identity import inspect_sqlite_database_target, sqlite_database_path
+from tacit.tenancy import TenantBoundaryError, resolve_tenant_boundary
+
+if TYPE_CHECKING:
+    from tacit.runtime_ownership import RuntimeOwnershipDescriptor
+
+DEFAULT_HISTORY_DB_PATH = Path("data/tacit_history.db")
+DEFAULT_FEEDBACK_DB_PATH = Path("data/tacit_feedback.db")
+DEFAULT_SIGNALS_DB_PATH = Path("data/tacit_signals.db")
+SQLITE_DATABASE_ROLE_DEFAULTS = {
+    "history": DEFAULT_HISTORY_DB_PATH,
+    "feedback": DEFAULT_FEEDBACK_DB_PATH,
+    "signals": DEFAULT_SIGNALS_DB_PATH,
+}
+_SIGNALFX_REALM_RE = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+    re.ASCII | re.IGNORECASE,
+)
+_KNOWLEDGE_PERMISSION_RE = re.compile(r"[A-Za-z0-9_.:-]+", re.ASCII)
+
+
+def validate_distinct_sqlite_role_paths(
+    role_paths: Mapping[str, str | Path],
+) -> dict[str, Path]:
+    """Canonicalize roles and reject cross-role pathname or file reuse."""
+    unknown_roles = set(role_paths) - set(SQLITE_DATABASE_ROLE_DEFAULTS)
+    if unknown_roles:
+        raise ValueError("unsupported SQLite database role")
+
+    canonical = {role: sqlite_database_path(path) for role, path in role_paths.items()}
+    roles_by_path: dict[Path, list[str]] = {}
+    for role, path in canonical.items():
+        roles_by_path.setdefault(path, []).append(role)
+    collisions = [roles for roles in roles_by_path.values() if len(roles) > 1]
+    roles_by_file = _inspected_file_roles(canonical)
+    collisions.extend(roles for roles in roles_by_file.values() if len(roles) > 1)
+    if collisions:
+        roles = ", ".join(sorted(collisions[0]))
+        raise ValueError(f"SQLite database roles must use distinct files: {roles}")
+    return canonical
+
+
+def _inspected_file_roles(role_paths: Mapping[str, Path]) -> dict[tuple[int, int], list[str]]:
+    """Inspect existing role files without opening or following their targets."""
+    roles_by_file: dict[tuple[int, int], list[str]] = {}
+    for role, path in role_paths.items():
+        metadata = _sqlite_target_metadata(path)
+        if metadata is not None:
+            roles_by_file.setdefault((metadata.st_dev, metadata.st_ino), []).append(role)
+    return roles_by_file
+
+
+def _sqlite_target_metadata(path: Path) -> os.stat_result | None:
+    """Return target metadata without creating or opening the configured file."""
+    return inspect_sqlite_database_target(path)
+
+
+def canonical_sqlite_role_paths(
+    role_paths: Mapping[str, str | Path | None],
+) -> dict[str, Path]:
+    """Canonicalize and validate the complete effective SQLite role map."""
+    effective_paths = {
+        role: role_paths.get(role) or default_path for role, default_path in SQLITE_DATABASE_ROLE_DEFAULTS.items()
+    }
+    return validate_distinct_sqlite_role_paths(effective_paths)
+
+
+def canonical_signalfx_realm(value: str) -> str:
+    """Return one canonical, injection-safe SignalFx realm DNS label."""
+    raw = str(value or "")
+    if _SIGNALFX_REALM_RE.fullmatch(raw) is None:
+        raise ValueError("SignalFx realm is invalid")
+    return raw.casefold()
+
+
+def canonical_knowledge_tenant_id(value: object) -> str:
+    """Return the tenant identity used by settings, auth, and ownership."""
+    tenant_id = str(value or "").strip() or "default"
+    if tenant_id == "*":
+        return tenant_id
+    try:
+        return resolve_tenant_boundary(tenant_id, None)
+    except TenantBoundaryError as exc:
+        raise ValueError(exc.detail) from None
+
+
+def canonical_knowledge_permissions(value: object) -> str:
+    """Canonicalize permission-set syntax without changing token case."""
+    permissions: set[str] = set()
+    for candidate in str(value or "").split(","):
+        permission = candidate.strip()
+        if not permission:
+            continue
+        if _KNOWLEDGE_PERMISSION_RE.fullmatch(permission) is None:
+            raise ValueError("knowledge permission token is invalid")
+        permissions.add(permission)
+    return ",".join(sorted(permissions))
+
+
+def validated_knowledge_tenant_api_keys(
+    value: Mapping[str, str],
+) -> dict[str, str]:
+    """Validate tenant-key names exactly as wildcard lookup consumes them."""
+    validated: dict[str, str] = {}
+    for tenant, secret in value.items():
+        tenant_name = str(tenant)
+        try:
+            canonical_name = canonical_knowledge_tenant_id(tenant_name)
+        except ValueError:
+            raise ValueError("knowledge tenant key name is invalid") from None
+        if tenant_name != canonical_name or tenant_name == "*":
+            raise ValueError("knowledge tenant key name is invalid")
+        validated[tenant_name] = secret
+    return validated
+
 
 # ── Config file discovery ──────────────────────────────────────────────────
 # Priority: TACIT_CONFIG env var → ./tacit.yaml → ./tacit.yml → None
@@ -81,6 +198,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        validate_assignment=True,
     )
 
     # LLM
@@ -171,6 +289,61 @@ class Settings(BaseSettings):
     learned_archetypes_quarantine_path: str = "data/generated_archetypes/quarantine"
     learned_archetypes_generation_version: str = "generated-archetype-v1"
     learned_archetypes_tenant_id: str = "default"
+    learned_archetypes_retrieval_max_directory_entries: int = Field(default=1_024, ge=1, le=100_000)
+    learned_archetypes_retrieval_max_files: int = Field(default=256, ge=1, le=10_000)
+    learned_archetypes_retrieval_max_file_bytes: int = Field(
+        default=512 * 1_024,
+        ge=1_024,
+        le=64 * 1_024 * 1_024,
+    )
+    learned_archetypes_retrieval_max_total_bytes: int = Field(
+        default=8 * 1_024 * 1_024,
+        ge=1_024,
+        le=256 * 1_024 * 1_024,
+    )
+    learned_archetypes_retrieval_max_yaml_nodes: int = Field(default=12_000, ge=1, le=1_000_000)
+    learned_archetypes_retrieval_max_yaml_depth: int = Field(default=32, ge=1, le=256)
+    learned_archetypes_retrieval_max_yaml_scalars: int = Field(default=8_000, ge=1, le=1_000_000)
+    learned_archetypes_retrieval_max_yaml_scalar_bytes: int = Field(
+        default=64 * 1_024,
+        ge=1,
+        le=16 * 1_024 * 1_024,
+    )
+    learned_archetypes_retrieval_max_artifacts_per_file: int = Field(
+        default=64,
+        ge=1,
+        le=10_000,
+    )
+    learned_archetypes_retrieval_max_panels_per_file: int = Field(
+        default=256,
+        ge=1,
+        le=100_000,
+    )
+    learned_archetypes_retrieval_max_queries_per_file: int = Field(
+        default=1_024,
+        ge=1,
+        le=1_000_000,
+    )
+    learned_archetypes_retrieval_max_total_artifacts: int = Field(
+        default=256,
+        ge=1,
+        le=4_096,
+    )
+    learned_archetypes_retrieval_max_total_panels: int = Field(
+        default=1_024,
+        ge=1,
+        le=16_384,
+    )
+    learned_archetypes_retrieval_max_total_queries: int = Field(
+        default=4_096,
+        ge=1,
+        le=65_536,
+    )
+    learned_archetypes_retrieval_max_results: int = Field(
+        default=256,
+        ge=1,
+        le=4_096,
+    )
 
     # Deprecated compatibility input. It is intentionally ignored so an old
     # deployment cannot restore direct writes into TACIT_ARCHETYPES_PATH.
@@ -184,11 +357,33 @@ class Settings(BaseSettings):
     # HTTP API auth
     api_auth_enabled: bool = False  # set True to require API key
     api_auth_key: str = Field(default="", repr=False)
+    knowledge_tenant_id: str = "default"
+    knowledge_tenant_api_keys: dict[str, str] = Field(default_factory=dict, repr=False)
+    knowledge_permissions: str = (
+        "knowledge.read,knowledge.review,knowledge.trust,knowledge.reject,knowledge.correct,knowledge.apply,knowledge.export,"
+        "knowledge.override"
+    )
+    knowledge_snapshot_candidate_limit: int = Field(default=1_000, ge=1, le=100_000)
+    knowledge_snapshot_scan_limit: int = Field(default=10_000, ge=100, le=1_000_000)
+    knowledge_conflict_comparison_limit: int = Field(default=1_000, ge=10, le=10_000)
+    knowledge_source_atomic_candidate_limit: int = Field(default=1_000, ge=1, le=10_000)
+    artifact_learning_directory_file_limit: int = Field(default=10_000, ge=1, le=100_000)
+    signal_resolution_mapping_limit: int = Field(default=500, ge=10, le=5_000)
+    signal_resolution_catalog_limit: int = Field(default=5_000, ge=100, le=100_000)
+    signal_resolution_pattern_check_limit: int = Field(default=1_000_000, ge=100, le=50_000_000)
+    learning_approval_claim_ttl_seconds: int = Field(default=900, ge=30, le=86_400)
 
     # App
     log_level: str = "INFO"
     tacit_dashboard_folder: str = "Tacit"
     tacit_default_timerange: str = "1h"
+
+    @property
+    def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
+        """Return this configuration's side-effect-free composition identity."""
+        from tacit.runtime_ownership import runtime_descriptor_from_settings
+
+        return runtime_descriptor_from_settings(self, component="settings")
 
     @model_validator(mode="before")
     @classmethod
@@ -198,6 +393,51 @@ class Settings(BaseSettings):
         # YAML provides defaults; env vars / .env override
         merged = {**yaml_values, **{k: v for k, v in values.items() if v is not None}}
         return merged
+
+    @field_validator("signalfx_realm")
+    @classmethod
+    def _validate_signalfx_realm(cls, value: str) -> str:
+        return canonical_signalfx_realm(value)
+
+    @field_validator("knowledge_tenant_id", mode="before")
+    @classmethod
+    def _canonicalize_knowledge_tenant_id(cls, value: object) -> str:
+        return canonical_knowledge_tenant_id(value)
+
+    @field_validator("knowledge_permissions", mode="before")
+    @classmethod
+    def _canonicalize_knowledge_permissions(cls, value: object) -> str:
+        return canonical_knowledge_permissions(value)
+
+    @field_validator("knowledge_tenant_api_keys")
+    @classmethod
+    def _validate_knowledge_tenant_api_key_names(
+        cls,
+        value: dict[str, str],
+    ) -> dict[str, str]:
+        return validated_knowledge_tenant_api_keys(value)
+
+    @model_validator(mode="after")
+    def _validate_tenant_api_keys(self) -> Settings:
+        if self.knowledge_tenant_id != "*":
+            return self
+        if not self.api_auth_enabled:
+            raise ValueError("Wildcard knowledge tenancy requires API authentication")
+        non_empty_keys = [value for value in self.knowledge_tenant_api_keys.values() if value]
+        if len(non_empty_keys) != len(set(non_empty_keys)):
+            raise ValueError("knowledge_tenant_api_keys must use a unique non-empty key per tenant")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_sqlite_store_paths(self) -> Settings:
+        canonical_sqlite_role_paths(
+            {
+                "history": self.history_db_path,
+                "feedback": self.feedback_db_path,
+                "signals": self.signals_db_path,
+            }
+        )
+        return self
 
 
 def create_settings() -> Settings:

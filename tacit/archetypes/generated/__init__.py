@@ -1,6 +1,8 @@
 """Quarantined generated-archetype artifacts and explicit retrieval controls."""
 
 from tacit.archetypes.generated.schema import (
+    GENERATED_ARCHETYPE_ENVIRONMENT_SCOPE_REQUIRED,
+    GENERATED_ARCHETYPE_SERVICE_SCOPE_REQUIRED,
     ArchetypeRetrievalMode,
     GeneratedArchetype,
     GeneratedArchetypeOrigin,
@@ -20,6 +22,8 @@ from tacit.archetypes.generated.store import (
 
 __all__ = [
     "ArchetypeRetrievalMode",
+    "GENERATED_ARCHETYPE_ENVIRONMENT_SCOPE_REQUIRED",
+    "GENERATED_ARCHETYPE_SERVICE_SCOPE_REQUIRED",
     "GeneratedArchetype",
     "GeneratedArchetypeOrigin",
     "GeneratedArchetypeQuery",

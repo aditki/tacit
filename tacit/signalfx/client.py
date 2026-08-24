@@ -13,7 +13,17 @@ from typing import Any, cast
 import httpx
 import structlog
 
+from tacit.cache import make_cache_key
 from tacit.config import Settings, settings
+from tacit.runtime_ownership import (
+    RuntimeOwnershipDescriptor,
+    RuntimeRemoteIdentity,
+    canonical_signalfx_realm,
+    copy_runtime_settings,
+    credential_fingerprint,
+    runtime_descriptor_for_remote,
+    snapshot_runtime_settings,
+)
 
 logger = structlog.get_logger()
 
@@ -27,17 +37,79 @@ class SignalFxClient:
         realm: str | None = None,
         runtime_settings: Settings | None = None,
     ):
-        config = runtime_settings or settings
-        self.api_token = api_token if api_token is not None else config.signalfx_api_token
-        self.realm = realm or config.signalfx_realm
-        base_url = f"https://api.{self.realm}.signalfx.com"
+        configured_settings = snapshot_runtime_settings(runtime_settings or settings)
+        self._api_token = api_token if api_token is not None else configured_settings.signalfx_api_token
+        selected_realm = realm if realm is not None else configured_settings.signalfx_realm
+        self._realm = canonical_signalfx_realm(selected_realm)
+        self._base_url = f"https://api.{self.realm}.signalfx.com"
+        self._runtime_settings = snapshot_runtime_settings(
+            configured_settings.model_copy(
+                deep=True,
+                update={
+                    "signalfx_api_token": self._api_token,
+                    "signalfx_realm": self._realm,
+                },
+            )
+        )
+        self.cache_namespace = make_cache_key("signalfx", self.base_url, self.api_token)
 
-        self._client = httpx.AsyncClient(
-            base_url=base_url,
-            headers={
-                "X-SF-TOKEN": self.api_token,
-                "Content-Type": "application/json",
-            },
+        self._runtime_ownership = (
+            runtime_descriptor_for_remote(
+                component="signalfx_client",
+                runtime_settings=self._runtime_settings,
+                remote=RuntimeRemoteIdentity(
+                    provider="signalfx",
+                    endpoint=self.base_url,
+                    account=self.realm,
+                    credential_fingerprint=credential_fingerprint(self.api_token),
+                ),
+            )
+            if isinstance(self._runtime_settings, Settings)
+            else None
+        )
+        self._headers = {
+            "X-SF-TOKEN": self.api_token,
+            "Content-Type": "application/json",
+        }
+        self._http_client: httpx.AsyncClient | None = None
+        if api_token is None and realm is None:
+            self._http_client = self._new_http_client()
+
+    @property
+    def runtime_settings(self) -> Settings:
+        """Return a detached copy of the client's settings snapshot."""
+        return copy_runtime_settings(self._runtime_settings)
+
+    @property
+    def api_token(self) -> str:
+        return self._api_token
+
+    @property
+    def realm(self) -> str:
+        return self._realm
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @property
+    def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
+        """Return the effective SignalFx identity without exposing credentials."""
+        if self._runtime_ownership is None:
+            raise TypeError("SignalFx runtime settings must be a Settings instance")
+        return self._runtime_ownership
+
+    @property
+    def _client(self) -> httpx.AsyncClient:
+        """Create network state only after composition has accepted this owner."""
+        if self._http_client is None:
+            self._http_client = self._new_http_client()
+        return self._http_client
+
+    def _new_http_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self.base_url,
+            headers=self._headers,
             timeout=30.0,
         )
 
@@ -187,4 +259,7 @@ class SignalFxClient:
             return False
 
     async def close(self):
-        await self._client.aclose()
+        client = self._http_client
+        if client is not None:
+            self._http_client = None
+            await client.aclose()

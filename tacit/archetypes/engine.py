@@ -8,13 +8,32 @@ target backend. No LLM needed for query generation.
 from __future__ import annotations
 
 import re
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, NoReturn
 
 import structlog
 
-from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from tacit.archetypes.schema import (
+    MAX_ARCHETYPE_PANELS,
+    MAX_ARCHETYPE_QUERIES_PER_PANEL,
+    MAX_ARCHETYPE_REQUIRED_METRICS,
+    MAX_ARCHETYPE_REQUIRED_SIGNALS,
+    MAX_ARCHETYPE_SIGNAL_BINDINGS,
+    MAX_ARCHETYPE_SIGNAL_REQUIREMENTS,
+    MAX_ARCHETYPE_TAGS,
+    MAX_ARCHETYPE_TOTAL_QUERIES,
+    InvestigationArchetype,
+    PanelTemplate,
+    QueryTemplate,
+)
 from tacit.catalog import catalog_for_services, metric_matches_services
-from tacit.config import settings
+from tacit.errors import AUTHORITY_BOUNDARY_ERRORS, safe_failure_diagnostics
+from tacit.knowledge.usage import (
+    KnowledgeRevisionRef,
+    KnowledgeStageUse,
+    KnowledgeUsageEffect,
+    KnowledgeUsageStage,
+)
 from tacit.models.schemas import (
     DashboardSpec,
     Intent,
@@ -23,15 +42,508 @@ from tacit.models.schemas import (
     PanelSpec,
     QueryTarget,
 )
-from tacit.signals.availability import resolve_signal_store
+from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE, resolve_signal_store
+from tacit.signals.resolution import (
+    ResolutionInputTextLimits,
+    ResolutionInputWorkLimitError,
+    SignalResolutionWorkBudget,
+    SignalResolutionWorkLimitError,
+    admit_resolution_input_text,
+)
 
 logger = structlog.get_logger()
 
 _PROMETHEUS_HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
+_ARCHETYPE_SIGNAL_RESOLUTION_FAILED = "archetype_signal_resolution_failed"
+_ARCHETYPE_COVERAGE_SIGNAL_RESOLUTION_FAILED = "archetype_coverage_signal_resolution_failed"
+_ARCHETYPE_COVERAGE_WORK_LIMIT_EXCEEDED = "archetype_coverage_work_limit_exceeded"
 
 # Characters that are special in RE2 (used by PromQL) and need escaping.
 # Note: dash `-` is NOT special in RE2 outside character classes.
 _RE2_SPECIAL = frozenset(r"\.+*?()[]{}|^$")
+
+
+@dataclass(frozen=True)
+class ArchetypeCoverageWorkLimits:
+    """Hard bounds for coverage ranking and exact knowledge attribution."""
+
+    max_candidates: int = 64
+    max_catalog_entries: int = 5_000
+    max_dimensions_per_catalog_entry: int = 128
+    max_total_catalog_dimensions: int = 100_000
+    max_services: int = 64
+    max_environments: int = 64
+    max_intent_archetypes: int = 64
+    max_keywords: int = 256
+    max_keyword_evidence: int = 64
+    max_keyword_evidence_fields: int = 8
+    max_required_signals_per_archetype: int = MAX_ARCHETYPE_REQUIRED_SIGNALS
+    max_signal_bindings_per_archetype: int = MAX_ARCHETYPE_SIGNAL_BINDINGS
+    max_signal_requirements_per_archetype: int = MAX_ARCHETYPE_SIGNAL_REQUIREMENTS
+    max_required_metrics_per_archetype: int = MAX_ARCHETYPE_REQUIRED_METRICS
+    max_tags_per_archetype: int = MAX_ARCHETYPE_TAGS
+    max_problem_types_per_archetype: int = 256
+    max_panels_per_archetype: int = MAX_ARCHETYPE_PANELS
+    max_queries_per_panel: int = MAX_ARCHETYPE_QUERIES_PER_PANEL
+    max_total_queries_per_archetype: int = MAX_ARCHETYPE_TOTAL_QUERIES
+    max_cloudwatch_dimensions_per_query: int = 128
+    max_cloudwatch_dimension_values_per_query: int = 128
+    max_total_cloudwatch_dimension_values_per_archetype: int = 4_096
+    max_scalar_characters: int = 65_536
+    max_scalar_utf8_bytes: int = 262_144
+    max_total_input_characters: int = 2_000_000
+    max_total_input_utf8_bytes: int = 8_000_000
+    max_unique_revisions: int = 64
+    max_counterfactual_candidate_scores: int = 1024
+    max_total_resolver_calls: int = 8192
+    max_total_catalog_comparisons: int = 8_000_000
+    max_total_resolution_results: int = 100_000
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "max_candidates",
+            "max_catalog_entries",
+            "max_dimensions_per_catalog_entry",
+            "max_total_catalog_dimensions",
+            "max_services",
+            "max_environments",
+            "max_intent_archetypes",
+            "max_keywords",
+            "max_keyword_evidence",
+            "max_keyword_evidence_fields",
+            "max_required_signals_per_archetype",
+            "max_signal_bindings_per_archetype",
+            "max_signal_requirements_per_archetype",
+            "max_required_metrics_per_archetype",
+            "max_tags_per_archetype",
+            "max_problem_types_per_archetype",
+            "max_panels_per_archetype",
+            "max_queries_per_panel",
+            "max_total_queries_per_archetype",
+            "max_cloudwatch_dimensions_per_query",
+            "max_cloudwatch_dimension_values_per_query",
+            "max_total_cloudwatch_dimension_values_per_archetype",
+            "max_scalar_characters",
+            "max_scalar_utf8_bytes",
+            "max_total_input_characters",
+            "max_total_input_utf8_bytes",
+            "max_unique_revisions",
+            "max_counterfactual_candidate_scores",
+            "max_total_resolver_calls",
+            "max_total_catalog_comparisons",
+            "max_total_resolution_results",
+        ):
+            if getattr(self, field_name) < 1:
+                raise ValueError(f"{field_name} must be positive")
+
+
+class ArchetypeCoverageWorkLimitError(RuntimeError):
+    """Coverage ranking exceeded a stable, payload-free work dimension."""
+
+    reason_code = _ARCHETYPE_COVERAGE_WORK_LIMIT_EXCEEDED
+
+    def __init__(self, dimension: str, observed: int, limit: int) -> None:
+        self.dimension = dimension
+        self.observed = observed
+        self.limit = limit
+        super().__init__(f"{self.reason_code}: {dimension} exceeds {limit}")
+
+
+def _raise_archetype_coverage_work_limit(
+    dimension: str,
+    observed: int,
+    limit: int,
+) -> NoReturn:
+    logger.warning(
+        _ARCHETYPE_COVERAGE_WORK_LIMIT_EXCEEDED,
+        reason_code=_ARCHETYPE_COVERAGE_WORK_LIMIT_EXCEEDED,
+        dimension=dimension,
+        observed=min(max(observed, 0), 100_000_000),
+        limit=min(max(limit, 0), 100_000_000),
+    )
+    raise ArchetypeCoverageWorkLimitError(dimension, observed, limit)
+
+
+def _resolve_archetype_signal_store(signal_store: Any | None) -> Any | None:
+    """Resolve the optional store without hiding authority acquisition failures."""
+    from tacit.signals import get_signal_store
+
+    if signal_store is None:
+        return get_signal_store()
+    return resolve_signal_store(signal_store, get_signal_store)
+
+
+def _signal_resolution_work_kwargs(
+    store: Any,
+    work_budget: SignalResolutionWorkBudget | None,
+) -> dict[str, SignalResolutionWorkBudget]:
+    """Pass aggregate work only to the explicit first-party resolver contract."""
+    if work_budget is None or not bool(getattr(store, "supports_signal_resolution_work_budget", False)):
+        return {}
+    return {"work_budget": work_budget}
+
+
+def _new_signal_resolution_work_budget(
+    store: Any,
+    *,
+    max_calls: int,
+    max_mapping_catalog_comparisons: int | None = None,
+    max_results: int | None = None,
+) -> SignalResolutionWorkBudget | None:
+    """Create one operation budget only for a first-party store."""
+    factory = getattr(store, "new_signal_resolution_work_budget", None)
+    if not bool(getattr(store, "supports_signal_resolution_work_budget", False)) or not callable(factory):
+        return None
+    return factory(
+        max_calls=max(1, max_calls),
+        max_mapping_catalog_comparisons=max_mapping_catalog_comparisons,
+        max_results=max_results,
+    )
+
+
+def _resolution_input_text_limits(
+    limits: ArchetypeCoverageWorkLimits,
+) -> ResolutionInputTextLimits:
+    return ResolutionInputTextLimits(
+        max_scalar_characters=limits.max_scalar_characters,
+        max_scalar_utf8_bytes=limits.max_scalar_utf8_bytes,
+        max_total_characters=limits.max_total_input_characters,
+        max_total_utf8_bytes=limits.max_total_input_utf8_bytes,
+    )
+
+
+def _admit_archetype_text(
+    values: list[object],
+    limits: ArchetypeCoverageWorkLimits,
+) -> dict[str, int]:
+    try:
+        return admit_resolution_input_text(
+            values,
+            limits=_resolution_input_text_limits(limits),
+        )
+    except ResolutionInputWorkLimitError as exc:
+        _raise_archetype_coverage_work_limit(
+            exc.dimension,
+            exc.observed,
+            exc.limit,
+        )
+
+
+def admit_intent_resolution_inputs(
+    intent: Intent,
+    *,
+    work_limits: ArchetypeCoverageWorkLimits | None = None,
+) -> dict[str, int]:
+    """Admit intent text before retrieval, normalization, or matching."""
+    limits = work_limits or ArchetypeCoverageWorkLimits()
+    dimensions = (
+        ("services", len(intent.services), limits.max_services),
+        ("environments", len(intent.environments), limits.max_environments),
+        ("intent_archetypes", len(intent.archetypes), limits.max_intent_archetypes),
+        ("keywords", len(intent.keywords), limits.max_keywords),
+        ("keyword_evidence", len(intent.keyword_evidence), limits.max_keyword_evidence),
+    )
+    for dimension, observed, limit in dimensions:
+        if observed > limit:
+            _raise_archetype_coverage_work_limit(dimension, observed, limit)
+    for evidence in intent.keyword_evidence:
+        if not isinstance(evidence, dict):
+            _raise_archetype_coverage_work_limit("keyword_evidence_shape", 1, 0)
+        if len(evidence) > limits.max_keyword_evidence_fields:
+            _raise_archetype_coverage_work_limit(
+                "keyword_evidence_fields",
+                len(evidence),
+                limits.max_keyword_evidence_fields,
+            )
+
+    values: list[object] = [
+        intent.summary,
+        intent.domain,
+        intent.timerange,
+        intent.problem_type,
+        *intent.services,
+        *intent.environments,
+        *intent.keywords,
+        *(getattr(match, "type", None) for match in intent.archetypes),
+    ]
+    for evidence in intent.keyword_evidence:
+        values.extend(
+            (
+                evidence.get("keyword", ""),
+                evidence.get("tier", ""),
+                evidence.get("source", ""),
+            )
+        )
+    return _admit_archetype_text(values, limits)
+
+
+def _metric_entry_text_values(entry: MetricEntry) -> list[object]:
+    return [
+        entry.name,
+        entry.datasource_uid,
+        entry.datasource_name,
+        entry.datasource_type,
+        entry.query_language,
+        entry.namespace,
+        *entry.dimensions,
+        entry.unit,
+        entry.metric_type,
+    ]
+
+
+def _archetype_text_values(archetype: InvestigationArchetype) -> list[object]:
+    values: list[object] = [
+        archetype.id,
+        archetype.name,
+        archetype.description,
+        archetype.default_timerange,
+        *archetype.problem_types,
+        *archetype.required_metrics,
+        *archetype.required_signals,
+        *archetype.signal_bindings.keys(),
+        *archetype.signal_bindings.values(),
+        *archetype.tags,
+    ]
+    for panel in archetype.panels:
+        values.extend(
+            (
+                panel.title,
+                panel.description,
+                panel.panel_type,
+                panel.row,
+                panel.unit,
+            )
+        )
+        for query in panel.queries:
+            values.extend(
+                (
+                    query.expr,
+                    query.legend_format,
+                    query.query_language,
+                    query.datasource_type,
+                    query.cloudwatch_namespace,
+                    query.cloudwatch_stat,
+                    query.cloudwatch_region,
+                )
+            )
+            for key, raw_value in query.cloudwatch_dimensions.items():
+                values.append(key)
+                if isinstance(raw_value, list):
+                    values.extend(raw_value)
+                else:
+                    values.append(raw_value)
+    return values
+
+
+def admit_archetype_resolution_inputs(
+    archetypes: list[InvestigationArchetype],
+    catalog: list[MetricEntry],
+    *,
+    services: list[str] | None = None,
+    work_limits: ArchetypeCoverageWorkLimits | None = None,
+) -> dict[str, int]:
+    """Bound collection shape, then text, before semantic engine work."""
+    limits = work_limits or ArchetypeCoverageWorkLimits()
+    top_level_dimensions = (
+        ("candidate_count", len(archetypes), limits.max_candidates),
+        ("catalog_entries", len(catalog), limits.max_catalog_entries),
+        ("services", len(services or ()), limits.max_services),
+    )
+    for dimension, observed, limit in top_level_dimensions:
+        if observed > limit:
+            _raise_archetype_coverage_work_limit(dimension, observed, limit)
+
+    total_catalog_dimensions = 0
+    for entry in catalog:
+        if not isinstance(entry.dimensions, list):
+            _raise_archetype_coverage_work_limit("catalog_dimensions_shape", 1, 0)
+        dimension_count = len(entry.dimensions)
+        if dimension_count > limits.max_dimensions_per_catalog_entry:
+            _raise_archetype_coverage_work_limit(
+                "dimensions_per_catalog_entry",
+                dimension_count,
+                limits.max_dimensions_per_catalog_entry,
+            )
+        total_catalog_dimensions += dimension_count
+        if total_catalog_dimensions > limits.max_total_catalog_dimensions:
+            _raise_archetype_coverage_work_limit(
+                "total_catalog_dimensions",
+                total_catalog_dimensions,
+                limits.max_total_catalog_dimensions,
+            )
+
+    for archetype in archetypes:
+        raw_dimensions = (
+            (
+                "problem_types_per_archetype",
+                len(archetype.problem_types),
+                limits.max_problem_types_per_archetype,
+            ),
+            (
+                "required_signals_per_archetype",
+                len(archetype.required_signals),
+                limits.max_required_signals_per_archetype,
+            ),
+            (
+                "signal_bindings_per_archetype",
+                len(archetype.signal_bindings),
+                limits.max_signal_bindings_per_archetype,
+            ),
+            (
+                "required_metrics_per_archetype",
+                len(archetype.required_metrics),
+                limits.max_required_metrics_per_archetype,
+            ),
+            ("tags_per_archetype", len(archetype.tags), limits.max_tags_per_archetype),
+            ("panels_per_archetype", len(archetype.panels), limits.max_panels_per_archetype),
+        )
+        for dimension, observed, limit in raw_dimensions:
+            if observed > limit:
+                _raise_archetype_coverage_work_limit(dimension, observed, limit)
+        if not isinstance(archetype.signal_bindings, dict):
+            _raise_archetype_coverage_work_limit("signal_bindings_shape", 1, 0)
+
+        total_query_count = 0
+        total_cloudwatch_dimension_values = 0
+        for panel in archetype.panels:
+            query_count = len(panel.queries)
+            if query_count > limits.max_queries_per_panel:
+                _raise_archetype_coverage_work_limit(
+                    "queries_per_panel",
+                    query_count,
+                    limits.max_queries_per_panel,
+                )
+            total_query_count += query_count
+            if total_query_count > limits.max_total_queries_per_archetype:
+                _raise_archetype_coverage_work_limit(
+                    "total_queries_per_archetype",
+                    total_query_count,
+                    limits.max_total_queries_per_archetype,
+                )
+            for query in panel.queries:
+                if not isinstance(query.cloudwatch_dimensions, dict):
+                    _raise_archetype_coverage_work_limit(
+                        "cloudwatch_dimensions_shape",
+                        1,
+                        0,
+                    )
+                dimension_count = len(query.cloudwatch_dimensions)
+                if dimension_count > limits.max_cloudwatch_dimensions_per_query:
+                    _raise_archetype_coverage_work_limit(
+                        "cloudwatch_dimensions_per_query",
+                        dimension_count,
+                        limits.max_cloudwatch_dimensions_per_query,
+                    )
+                query_value_count = 0
+                for raw_value in query.cloudwatch_dimensions.values():
+                    value_count = len(raw_value) if isinstance(raw_value, list) else 1
+                    if value_count > limits.max_cloudwatch_dimension_values_per_query:
+                        _raise_archetype_coverage_work_limit(
+                            "cloudwatch_dimension_values_per_query",
+                            value_count,
+                            limits.max_cloudwatch_dimension_values_per_query,
+                        )
+                    query_value_count += value_count
+                total_cloudwatch_dimension_values += query_value_count
+                if total_cloudwatch_dimension_values > limits.max_total_cloudwatch_dimension_values_per_archetype:
+                    _raise_archetype_coverage_work_limit(
+                        "total_cloudwatch_dimension_values_per_archetype",
+                        total_cloudwatch_dimension_values,
+                        limits.max_total_cloudwatch_dimension_values_per_archetype,
+                    )
+
+    text_values: list[object] = list(services or ())
+    for entry in catalog:
+        text_values.extend(_metric_entry_text_values(entry))
+    for archetype in archetypes:
+        text_values.extend(_archetype_text_values(archetype))
+    counters = _admit_archetype_text(text_values, limits)
+    counters["catalog_dimension_count"] = total_catalog_dimensions
+    return counters
+
+
+@dataclass(frozen=True)
+class KnowledgeQueryUse:
+    """One governed mapping's contribution to a compiled query."""
+
+    knowledge_ref: str
+    knowledge_revision: int
+    source_archetype: str
+    panel_title: str
+    query_expr: str
+    datasource_uid: str
+    datasource_type: str
+    query_language: str
+    requirement_id: str = ""
+
+    @classmethod
+    def from_query(
+        cls,
+        knowledge_ref: str | KnowledgeRevisionRef,
+        panel: PanelSpec,
+        query: PanelQuery,
+        *,
+        knowledge_revision: int = 0,
+        requirement_id: str = "",
+    ) -> KnowledgeQueryUse:
+        if isinstance(knowledge_ref, KnowledgeRevisionRef):
+            knowledge_revision = knowledge_ref.knowledge_revision
+            raw_ref = knowledge_ref.knowledge_ref
+        else:
+            raw_ref = knowledge_ref
+        return cls(
+            knowledge_ref=raw_ref,
+            knowledge_revision=knowledge_revision,
+            source_archetype=panel.source_archetype,
+            panel_title=panel.title,
+            query_expr=query.expr,
+            datasource_uid=query.datasource_uid,
+            datasource_type=query.datasource_type,
+            query_language=query.query_language,
+            requirement_id=requirement_id,
+        )
+
+    def query_identity(self) -> tuple[str, str, str, str, str, str]:
+        return (
+            self.source_archetype,
+            self.panel_title,
+            self.query_expr,
+            self.datasource_uid,
+            self.datasource_type,
+            self.query_language,
+        )
+
+
+def dashboard_query_identities(dashboard_spec: DashboardSpec) -> set[tuple[str, str, str, str, str, str]]:
+    return {
+        (
+            panel.source_archetype,
+            panel.title,
+            query.expr,
+            query.datasource_uid,
+            query.datasource_type,
+            query.query_language,
+        )
+        for panel in dashboard_spec.panels
+        for query in panel.queries
+    }
+
+
+def _query_references_metric(query_expr: str, metric: str) -> bool:
+    """Match one exact metric token across supported query syntaxes."""
+    token_character = r"a-zA-Z0-9_:./-"
+    return (
+        re.search(
+            rf"(?<![{token_character}]){re.escape(metric)}(?![{token_character}])",
+            query_expr,
+        )
+        is not None
+    )
+
+
+def _query_changes_under_metric_substitution(query_expr: str, old_metric: str, new_metric: str) -> bool:
+    """Use the compiler's substitution semantics to attribute a query change."""
+    return _suffix_aware_replace(query_expr, old_metric, new_metric) != query_expr
 
 
 def _re2_escape(s: str) -> str:
@@ -618,15 +1130,18 @@ def _apply_metric_substitutions(
     )
 
 
-def _legacy_metric_signal(
+def _legacy_metric_signal_details(
     store,
     default_metric: str,
     catalog: list[MetricEntry],
     target_language: str,
-) -> str:
+    tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    resolution_work_budget: SignalResolutionWorkBudget | None = None,
+) -> tuple[str, KnowledgeRevisionRef | None]:
     """Infer the taxonomy signal represented by a legacy required metric."""
     if not catalog:
-        return ""
+        return "", None
     exemplar = catalog[0]
     pseudo = MetricEntry(
         name=default_metric,
@@ -635,20 +1150,41 @@ def _legacy_metric_signal(
         datasource_type=exemplar.datasource_type,
         query_language=target_language or exemplar.query_language,
     )
-    candidates: list[tuple[str, float]] = []
-    for signal in store.list_signal_types():
-        signal_type = str(signal.get("signal_type", ""))
-        if not signal_type:
-            continue
-        matches = store.resolve_signal(
-            signal_type,
+    candidates = [
+        (match.signal_type, match.confidence, match.knowledge_revision_ref)
+        for match in store.resolve_metric_signal_details(
             [pseudo],
+            context_datasource_type=exemplar.datasource_type,
             target_query_language=target_language,
+            tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
+            **_signal_resolution_work_kwargs(store, resolution_work_budget),
         )
-        if matches:
-            candidates.append((signal_type, matches[0][1]))
+    ]
     candidates.sort(key=lambda item: item[1], reverse=True)
-    return candidates[0][0] if candidates else ""
+    return (candidates[0][0], candidates[0][2]) if candidates else ("", None)
+
+
+def _legacy_metric_signal(
+    store,
+    default_metric: str,
+    catalog: list[MetricEntry],
+    target_language: str,
+    tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    resolution_work_budget: SignalResolutionWorkBudget | None = None,
+) -> str:
+    """Infer the taxonomy signal represented by a legacy required metric."""
+    signal_type, _ = _legacy_metric_signal_details(
+        store,
+        default_metric,
+        catalog,
+        target_language,
+        tenant_id,
+        knowledge_scope,
+        resolution_work_budget,
+    )
+    return signal_type
 
 
 def _substitution_shape_compatible(
@@ -702,6 +1238,10 @@ def _resolve_legacy_required_metrics(
     catalog: list[MetricEntry],
     intent: Intent,
     target_language: str,
+    tenant_id: str = "default",
+    governance_refs_by_default_metric: dict[str, set[KnowledgeRevisionRef]] | None = None,
+    knowledge_scope: Any | None = None,
+    resolution_work_budget: SignalResolutionWorkBudget | None = None,
 ) -> dict[str, str]:
     """Resolve legacy required_metrics through the semantic taxonomy."""
     target_datasource_type = _datasource_type_for_language(target_language)
@@ -717,17 +1257,30 @@ def _resolve_legacy_required_metrics(
     for default_metric in archetype.required_metrics:
         if default_metric in catalog_names:
             continue
-        signal_type = _legacy_metric_signal(store, default_metric, target_catalog, target_language)
+        signal_type, inferred_by = _legacy_metric_signal_details(
+            store,
+            default_metric,
+            target_catalog,
+            target_language,
+            tenant_id,
+            knowledge_scope,
+            resolution_work_budget,
+        )
         if not signal_type:
             continue
-        resolved = store.resolve_signal(
+        resolved_details = store.resolve_signal_details(
             signal_type,
             resolution_catalog,
             context_service=intent.services[0] if intent.services else "",
             context_datasource_type=target_datasource_type,
             context_archetype=archetype.id,
+            context_environment=intent.environments[0] if intent.environments else "",
             target_query_language=target_language,
+            tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
+            **_signal_resolution_work_kwargs(store, resolution_work_budget),
         )
+        resolved = [(match.entry, match.confidence) for match in resolved_details]
         selected = _unambiguous_legacy_candidate(resolved, archetype, default_metric)
         if selected is None:
             if resolved:
@@ -741,6 +1294,16 @@ def _resolve_legacy_required_metrics(
             continue
         candidate, confidence = selected
         substitutions[default_metric] = candidate.name
+        if governance_refs_by_default_metric is not None:
+            refs = governance_refs_by_default_metric.setdefault(default_metric, set())
+            if inferred_by:
+                refs.add(inferred_by)
+            selected_match = next(
+                (match for match in resolved_details if match.entry == candidate and match.confidence == confidence),
+                None,
+            )
+            if selected_match is not None and selected_match.knowledge_revision_ref is not None:
+                refs.add(selected_match.knowledge_revision_ref)
         logger.info(
             "legacy_metric_signal_resolved",
             archetype=archetype.id,
@@ -758,6 +1321,10 @@ def _resolve_archetype_signals(
     intent: Intent,
     target_language: str = "promql",
     signal_store: Any | None = None,
+    tenant_id: str = "default",
+    governance_refs_by_template_query: dict[tuple[int, int], set[KnowledgeRevisionRef]] | None = None,
+    knowledge_scope: Any | None = None,
+    resolution_work_budget: SignalResolutionWorkBudget | None = None,
 ) -> InvestigationArchetype:
     """Resolve signal bindings and substitute metrics if needed.
 
@@ -771,18 +1338,26 @@ def _resolve_archetype_signals(
         return archetype
 
     try:
-        from tacit.signals import get_signal_store
-
-        store = resolve_signal_store(signal_store, get_signal_store)
+        store = _resolve_archetype_signal_store(signal_store)
         if store is None:
             return archetype
+        active_work_budget = resolution_work_budget or _new_signal_resolution_work_budget(
+            store,
+            max_calls=(len(archetype.signal_bindings) + (2 * len(archetype.required_metrics)) + 1),
+        )
+        refs_by_default_metric: dict[str, set[KnowledgeRevisionRef]] = {}
         substitutions = store.resolve_signals_for_archetype(
             signal_bindings=archetype.signal_bindings,
             catalog=catalog,
             context_service=intent.services[0] if intent.services else "",
             context_datasource_type=_datasource_type_for_language(target_language),
             context_archetype=archetype.id,
+            context_environment=intent.environments[0] if intent.environments else "",
             target_query_language=target_language,
+            tenant_id=tenant_id,
+            knowledge_scope=knowledge_scope,
+            governance_revision_refs_by_default_metric=refs_by_default_metric,
+            **_signal_resolution_work_kwargs(store, active_work_budget),
         )
         legacy_substitutions = _resolve_legacy_required_metrics(
             archetype,
@@ -790,6 +1365,10 @@ def _resolve_archetype_signals(
             catalog,
             intent,
             target_language,
+            tenant_id,
+            refs_by_default_metric,
+            knowledge_scope,
+            active_work_budget,
         )
         for default_metric, resolved_metric in legacy_substitutions.items():
             substitutions.setdefault(default_metric, resolved_metric)
@@ -799,9 +1378,40 @@ def _resolve_archetype_signals(
                 archetype=archetype.id,
                 substitutions=substitutions,
             )
-            return _apply_metric_substitutions(archetype, substitutions)
-    except Exception:
-        logger.warning("signal_resolution_failed", archetype=archetype.id, exc_info=True)
+            if governance_refs_by_template_query is not None:
+                for panel_index, panel in enumerate(archetype.panels):
+                    for query_index, query in enumerate(panel.queries):
+                        refs = {
+                            revision_ref
+                            for default_metric, resolved_metric in substitutions.items()
+                            if _query_changes_under_metric_substitution(
+                                query.expr,
+                                default_metric,
+                                resolved_metric,
+                            )
+                            for revision_ref in refs_by_default_metric.get(default_metric, set())
+                        }
+                        if refs:
+                            governance_refs_by_template_query[(panel_index, query_index)] = refs
+            resolved_archetype = _apply_metric_substitutions(archetype, substitutions)
+            return resolved_archetype
+    except SignalResolutionWorkLimitError:
+        raise
+    except AUTHORITY_BOUNDARY_ERRORS:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "signal_resolution_failed",
+            reason_code=_ARCHETYPE_SIGNAL_RESOLUTION_FAILED,
+            **safe_failure_diagnostics(
+                exc,
+                reason_code=_ARCHETYPE_SIGNAL_RESOLUTION_FAILED,
+                counters={
+                    "signal_count": len(set(archetype.required_signals) | set(archetype.signal_bindings)),
+                    "required_metric_count": len(archetype.required_metrics),
+                },
+            ),
+        )
 
     return archetype
 
@@ -812,6 +1422,11 @@ def compile_archetype(
     catalog: list[MetricEntry],
     target_language: str = "promql",
     signal_store: Any | None = None,
+    tenant_id: str = "default",
+    knowledge_query_uses: list[KnowledgeQueryUse] | None = None,
+    knowledge_scope: Any | None = None,
+    resolution_work_budget: SignalResolutionWorkBudget | None = None,
+    work_limits: ArchetypeCoverageWorkLimits | None = None,
 ) -> DashboardSpec:
     """Compile an archetype template into a concrete DashboardSpec.
 
@@ -824,13 +1439,27 @@ def compile_archetype(
 
     target_language: 'promql' (default) or 'signalflow'
     """
+    limits = work_limits or ArchetypeCoverageWorkLimits()
+    admit_intent_resolution_inputs(intent, work_limits=limits)
+    admit_archetype_resolution_inputs(
+        [archetype],
+        catalog,
+        services=intent.services,
+        work_limits=limits,
+    )
+
     # Resolve signals → actual metrics before compiling templates
+    governance_refs_by_template_query: dict[tuple[int, int], set[KnowledgeRevisionRef]] = {}
     archetype = _resolve_archetype_signals(
         archetype,
         catalog,
         intent,
         target_language,
         signal_store,
+        tenant_id,
+        governance_refs_by_template_query,
+        knowledge_scope,
+        resolution_work_budget,
     )
 
     rate_interval = _resolve_rate_interval(intent)
@@ -858,9 +1487,10 @@ def compile_archetype(
     panels: list[PanelSpec] = []
     skipped = 0
 
-    for pt in archetype.panels:
+    for panel_index, pt in enumerate(archetype.panels):
         panel_queries: list[PanelQuery] = []
-        for qt in pt.queries:
+        query_uses: list[tuple[PanelQuery, set[KnowledgeRevisionRef]]] = []
+        for query_index, qt in enumerate(pt.queries):
             # Determine whether this query is PromQL. An explicit non-PromQL
             # query_language (signalflow/logql/cloudwatch/…) — or a SignalFx
             # datasource tag — marks it as a native query to honor verbatim.
@@ -901,17 +1531,22 @@ def compile_archetype(
                     native_metric_names,
                 )
 
-            panel_queries.append(
-                PanelQuery(
-                    expr=expr,
-                    legend_format=qt.legend_format,
-                    datasource_uid=query_target.datasource_uid,
-                    datasource_type=query_target.datasource_type,
-                    query_language=query_target.query_language,
-                    cloudwatch_namespace=qt.cloudwatch_namespace,
-                    cloudwatch_stat=qt.cloudwatch_stat,
-                    cloudwatch_dimensions=qt.cloudwatch_dimensions,
-                    cloudwatch_region=qt.cloudwatch_region,
+            compiled_query = PanelQuery(
+                expr=expr,
+                legend_format=qt.legend_format,
+                datasource_uid=query_target.datasource_uid,
+                datasource_type=query_target.datasource_type,
+                query_language=query_target.query_language,
+                cloudwatch_namespace=qt.cloudwatch_namespace,
+                cloudwatch_stat=qt.cloudwatch_stat,
+                cloudwatch_dimensions=qt.cloudwatch_dimensions,
+                cloudwatch_region=qt.cloudwatch_region,
+            )
+            panel_queries.append(compiled_query)
+            query_uses.append(
+                (
+                    compiled_query,
+                    governance_refs_by_template_query.get((panel_index, query_index), set()),
                 )
             )
 
@@ -919,17 +1554,21 @@ def compile_archetype(
             skipped += 1
             continue
 
-        panels.append(
-            PanelSpec(
-                title=pt.title,
-                description=pt.description,
-                panel_type=pt.panel_type,
-                row=pt.row,
-                source_archetype=archetype.id,
-                queries=panel_queries,
-                unit=pt.unit,
-            )
+        compiled_panel = PanelSpec(
+            title=pt.title,
+            description=pt.description,
+            panel_type=pt.panel_type,
+            row=pt.row,
+            source_archetype=archetype.id,
+            queries=panel_queries,
+            unit=pt.unit,
         )
+        panels.append(compiled_panel)
+        if knowledge_query_uses is not None:
+            for query, refs in query_uses:
+                knowledge_query_uses.extend(
+                    KnowledgeQueryUse.from_query(revision_ref, compiled_panel, query) for revision_ref in sorted(refs)
+                )
 
     # Build title from archetype name + service
     service_name = intent.services[0] if intent.services else "Service"
@@ -941,7 +1580,6 @@ def compile_archetype(
         timerange=intent.timerange or archetype.default_timerange,
         panels=panels,
     )
-
     logger.info(
         "archetype_compiled",
         archetype=archetype.id,
@@ -992,6 +1630,11 @@ def _archetype_live_coverage(
     target_language: str = "promql",
     services: list[str] | None = None,
     signal_store: Any | None = None,
+    tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    knowledge_stage_uses: list[KnowledgeStageUse] | None = None,
+    excluded_knowledge_refs: set[KnowledgeRevisionRef] | None = None,
+    resolution_work_budget: SignalResolutionWorkBudget | None = None,
 ) -> float | None:
     """Fraction of an archetype's declared evidence covered by the live catalog.
 
@@ -1014,9 +1657,19 @@ def _archetype_live_coverage(
     if not catalog_names:
         return 0.0
 
-    from tacit.signals import get_signal_store
-
-    store = resolve_signal_store(signal_store, get_signal_store)
+    resolution_failure_count = 0
+    first_resolution_failure: dict[str, str | int] | None = None
+    try:
+        store = _resolve_archetype_signal_store(signal_store)
+    except AUTHORITY_BOUNDARY_ERRORS:
+        raise
+    except Exception as exc:
+        store = None
+        resolution_failure_count = 1
+        first_resolution_failure = safe_failure_diagnostics(
+            exc,
+            reason_code=_ARCHETYPE_COVERAGE_SIGNAL_RESOLUTION_FAILED,
+        )
 
     resolved = 0
     for sig in signals:
@@ -1026,14 +1679,56 @@ def _archetype_live_coverage(
             continue
         if store is not None:
             try:
-                if store.resolve_signal(
+                resolve_details = getattr(store, "resolve_signal_details", None)
+                matches = (
+                    resolve_details(
+                        sig,
+                        coverage_catalog,
+                        context_service=services[0] if services else "",
+                        context_datasource_type=_datasource_type_for_language(target_language),
+                        context_archetype=archetype.id,
+                        tenant_id=tenant_id,
+                        knowledge_scope=knowledge_scope,
+                        **({"excluded_knowledge_refs": excluded_knowledge_refs} if excluded_knowledge_refs else {}),
+                        **_signal_resolution_work_kwargs(store, resolution_work_budget),
+                    )
+                    if callable(resolve_details)
+                    else []
+                )
+                if matches:
+                    resolved += 1
+                    revision_ref = matches[0].knowledge_revision_ref
+                    if knowledge_stage_uses is not None and revision_ref is not None:
+                        knowledge_stage_uses.append(
+                            KnowledgeStageUse(
+                                revision_ref=revision_ref,
+                                stage=KnowledgeUsageStage.ARCHETYPE_SELECTION,
+                                effect=KnowledgeUsageEffect.ARCHETYPE_SELECTED_BY_LIVE_COVERAGE,
+                                target_ref=f"archetype:{archetype.id}",
+                            )
+                        )
+                elif not callable(resolve_details) and store.resolve_signal(
                     sig,
                     coverage_catalog,
                     context_service=services[0] if services else "",
+                    context_datasource_type=_datasource_type_for_language(target_language),
+                    context_archetype=archetype.id,
+                    tenant_id=tenant_id,
+                    knowledge_scope=knowledge_scope,
+                    **_signal_resolution_work_kwargs(store, resolution_work_budget),
                 ):
                     resolved += 1
-            except Exception:
-                pass
+            except SignalResolutionWorkLimitError:
+                raise
+            except AUTHORITY_BOUNDARY_ERRORS:
+                raise
+            except Exception as exc:
+                resolution_failure_count += 1
+                if first_resolution_failure is None:
+                    first_resolution_failure = safe_failure_diagnostics(
+                        exc,
+                        reason_code=_ARCHETYPE_COVERAGE_SIGNAL_RESOLUTION_FAILED,
+                    )
     for required_metric in required_metrics:
         if any(
             name == required_metric
@@ -1044,6 +1739,14 @@ def _archetype_live_coverage(
             for name in catalog_names
         ):
             resolved += 1
+
+    if first_resolution_failure is not None:
+        logger.warning(
+            "archetype_coverage_signal_resolution_failed",
+            reason_code=_ARCHETYPE_COVERAGE_SIGNAL_RESOLUTION_FAILED,
+            resolution_failure_count=min(resolution_failure_count, 1_000_000),
+            **first_resolution_failure,
+        )
 
     return resolved / (len(signals) + len(required_metrics))
 
@@ -1056,7 +1759,14 @@ def rank_archetypes_by_coverage(
     services: list[str] | None = None,
     max_archetypes: int | None = None,
     min_secondary_coverage: float = 0.0,
+    learned_archetype_min_coverage: float = 0.75,
+    learned_archetype_boost: float = 0.15,
     signal_store: Any | None = None,
+    tenant_id: str = "default",
+    knowledge_scope: Any | None = None,
+    knowledge_stage_uses: list[KnowledgeStageUse] | None = None,
+    work_limits: ArchetypeCoverageWorkLimits | None = None,
+    resolution_work_budget: SignalResolutionWorkBudget | None = None,
 ) -> list[tuple[InvestigationArchetype, float]]:
     """Re-rank archetypes by classifier_confidence × live signal coverage.
 
@@ -1064,45 +1774,248 @@ def rank_archetypes_by_coverage(
     generic templates whose signals are absent from the environment, then caps
     the list so blending cannot explode into many loosely-matched archetypes.
     The primary archetype (rank 0 after re-sort) is always kept; secondaries
-    below ``min_secondary_coverage`` are dropped.
+    below ``min_secondary_coverage`` are dropped. Coverage and exact
+    knowledge-attribution work are bounded before resolver or counterfactual
+    calls. Exceeding a bound fails closed instead of returning an unaudited
+    knowledge-influenced selection.
     """
     if not ranked_archetypes:
         return ranked_archetypes
 
-    scored: list[tuple[InvestigationArchetype, float, float, float]] = []
-    for arch, confidence in ranked_archetypes:
+    limits = work_limits or ArchetypeCoverageWorkLimits()
+    candidate_count = len(ranked_archetypes)
+    if candidate_count > limits.max_candidates:
+        _raise_archetype_coverage_work_limit(
+            "candidate_count",
+            candidate_count,
+            limits.max_candidates,
+        )
+    catalog_count = len(catalog)
+    service_count = len(services or ())
+    admission = admit_archetype_resolution_inputs(
+        [archetype for archetype, _ in ranked_archetypes],
+        catalog,
+        services=services,
+        work_limits=limits,
+    )
+    total_catalog_dimensions = admission["catalog_dimension_count"]
+
+    signals_by_candidate: list[frozenset[str]] = []
+    catalog_comparisons_by_candidate: list[int] = []
+    for archetype, _ in ranked_archetypes:
+        signals = frozenset(archetype.required_signals) | frozenset(archetype.signal_bindings.keys())
+        required_metrics = frozenset(archetype.required_metrics)
+        if len(signals) > limits.max_signal_requirements_per_archetype:
+            _raise_archetype_coverage_work_limit(
+                "signal_requirements_per_archetype",
+                len(signals),
+                limits.max_signal_requirements_per_archetype,
+            )
+        signals_by_candidate.append(signals)
+        catalog_comparisons_by_candidate.append(
+            catalog_count * (4 + (2 * service_count) + len(signals) + (4 * len(required_metrics)))
+            + (2 * total_catalog_dimensions if service_count else 0)
+        )
+
+    base_resolver_call_upper_bound = sum(len(signals) for signals in signals_by_candidate)
+    if base_resolver_call_upper_bound > limits.max_total_resolver_calls:
+        _raise_archetype_coverage_work_limit(
+            "total_resolver_calls",
+            base_resolver_call_upper_bound,
+            limits.max_total_resolver_calls,
+        )
+    base_catalog_comparison_upper_bound = sum(catalog_comparisons_by_candidate)
+    if base_catalog_comparison_upper_bound > limits.max_total_catalog_comparisons:
+        _raise_archetype_coverage_work_limit(
+            "total_catalog_comparisons",
+            base_catalog_comparison_upper_bound,
+            limits.max_total_catalog_comparisons,
+        )
+
+    try:
+        resolved_signal_store = _resolve_archetype_signal_store(signal_store)
+        operation_signal_store = resolved_signal_store if resolved_signal_store is not None else signal_store
+    except AUTHORITY_BOUNDARY_ERRORS:
+        raise
+    except Exception as exc:
+        resolved_signal_store = None
+        operation_signal_store = SIGNAL_STORE_UNAVAILABLE
+        logger.warning(
+            "archetype_coverage_signal_resolution_failed",
+            reason_code=_ARCHETYPE_COVERAGE_SIGNAL_RESOLUTION_FAILED,
+            resolution_failure_count=1,
+            **safe_failure_diagnostics(
+                exc,
+                reason_code=_ARCHETYPE_COVERAGE_SIGNAL_RESOLUTION_FAILED,
+            ),
+        )
+    active_resolution_work_budget = resolution_work_budget or _new_signal_resolution_work_budget(
+        resolved_signal_store,
+        max_calls=limits.max_total_resolver_calls,
+        max_mapping_catalog_comparisons=limits.max_total_catalog_comparisons,
+        max_results=limits.max_total_resolution_results,
+    )
+
+    ScoredArchetype = tuple[
+        int,
+        InvestigationArchetype,
+        float,
+        float,
+        float,
+        tuple[KnowledgeStageUse, ...],
+    ]
+
+    def effective_score(arch: InvestigationArchetype, confidence: float, coverage: float | None) -> float:
+        effective = confidence if coverage is None else confidence * coverage
+        is_learned = bool({"learned", "auto-generated"} & set(arch.tags))
+        if is_learned and coverage is not None and coverage >= learned_archetype_min_coverage:
+            effective += learned_archetype_boost * coverage
+        return effective
+
+    def score_candidate(
+        candidate_index: int,
+        excluded_refs: set[KnowledgeRevisionRef] | None = None,
+    ) -> ScoredArchetype:
+        arch, confidence = ranked_archetypes[candidate_index]
+        candidate_knowledge_uses: list[KnowledgeStageUse] = []
         coverage = _archetype_live_coverage(
             arch,
             catalog,
             target_language,
             services,
-            signal_store,
+            operation_signal_store,
+            tenant_id,
+            knowledge_scope,
+            candidate_knowledge_uses,
+            excluded_refs,
+            active_resolution_work_budget,
         )
-        # Unknown coverage (no declared signals) keeps the classifier confidence.
-        effective = confidence if coverage is None else confidence * coverage
-        is_learned = bool({"learned", "auto-generated"} & set(arch.tags))
-        if is_learned and coverage is not None and coverage >= settings.learned_archetype_min_coverage:
-            # Learned and classifier retrieval scores are not calibrated on
-            # the same scale. Prefer learned context only with strong live
-            # evidence, and keep the adjustment deliberately bounded.
-            effective += settings.learned_archetype_boost * coverage
-        scored.append((arch, confidence, coverage if coverage is not None else -1.0, effective))
+        return (
+            candidate_index,
+            arch,
+            confidence,
+            coverage if coverage is not None else -1.0,
+            effective_score(arch, confidence, coverage),
+            tuple(candidate_knowledge_uses),
+        )
 
-    scored.sort(key=lambda x: x[3], reverse=True)
+    def sorted_scores(
+        scores_by_index: dict[int, ScoredArchetype],
+    ) -> list[ScoredArchetype]:
+        return sorted(
+            (scores_by_index[index] for index in range(candidate_count)),
+            key=lambda item: item[4],
+            reverse=True,
+        )
 
-    kept: list[tuple[InvestigationArchetype, float]] = []
-    for rank, (arch, confidence, coverage, effective) in enumerate(scored):
-        if rank > 0 and coverage >= 0.0 and coverage < min_secondary_coverage:
-            logger.info(
-                "archetype_dropped_low_coverage",
-                archetype=arch.id,
-                confidence=confidence,
-                coverage=round(coverage, 3),
+    def select(
+        scored_candidates: list[ScoredArchetype],
+        *,
+        emit_diagnostics: bool,
+    ) -> list[ScoredArchetype]:
+        selected: list[ScoredArchetype] = []
+        for rank, candidate in enumerate(scored_candidates):
+            _, arch, confidence, coverage, _, _ = candidate
+            if rank > 0 and coverage >= 0.0 and coverage < min_secondary_coverage:
+                if emit_diagnostics:
+                    logger.info(
+                        "archetype_dropped_low_coverage",
+                        archetype=arch.id,
+                        confidence=confidence,
+                        coverage=round(coverage, 3),
+                    )
+                continue
+            selected.append(candidate)
+            if max_archetypes is not None and len(selected) >= max_archetypes:
+                break
+        return selected
+
+    base_scores_by_index = {
+        candidate_index: score_candidate(candidate_index) for candidate_index in range(candidate_count)
+    }
+    selected = select(sorted_scores(base_scores_by_index), emit_diagnostics=True)
+    kept = [(arch, confidence) for _, arch, confidence, _, _, _ in selected]
+    selected_knowledge_uses = [use for _, _, _, _, _, uses in selected for use in uses]
+    if knowledge_stage_uses is not None and selected_knowledge_uses:
+        selected_ids = [arch.id for _, arch, _, _, _, _ in selected]
+        selected_positions = {archetype_id: index for index, archetype_id in enumerate(selected_ids)}
+        revision_refs = sorted({use.revision_ref for use in selected_knowledge_uses})
+        if len(revision_refs) > limits.max_unique_revisions:
+            _raise_archetype_coverage_work_limit(
+                "unique_knowledge_revisions",
+                len(revision_refs),
+                limits.max_unique_revisions,
             )
-            continue
-        kept.append((arch, confidence))
-        if max_archetypes is not None and len(kept) >= max_archetypes:
-            break
+
+        affected_indexes_by_revision: dict[KnowledgeRevisionRef, set[int]] = {
+            revision_ref: set() for revision_ref in revision_refs
+        }
+        # Excluding a revision can change only candidates whose base resolution
+        # selected that revision. Unaffected base scores remain exact and reusable.
+        for candidate_index, _, _, _, _, uses in base_scores_by_index.values():
+            for revision_ref in {use.revision_ref for use in uses}:
+                if revision_ref in affected_indexes_by_revision:
+                    affected_indexes_by_revision[revision_ref].add(candidate_index)
+
+        counterfactual_candidate_scores = sum(
+            len(affected_indexes_by_revision[revision_ref]) for revision_ref in revision_refs
+        )
+        if counterfactual_candidate_scores > limits.max_counterfactual_candidate_scores:
+            _raise_archetype_coverage_work_limit(
+                "counterfactual_candidate_scores",
+                counterfactual_candidate_scores,
+                limits.max_counterfactual_candidate_scores,
+            )
+
+        counterfactual_resolver_call_upper_bound = sum(
+            len(signals_by_candidate[candidate_index])
+            for revision_ref in revision_refs
+            for candidate_index in affected_indexes_by_revision[revision_ref]
+        )
+        total_resolver_call_upper_bound = base_resolver_call_upper_bound + counterfactual_resolver_call_upper_bound
+        if total_resolver_call_upper_bound > limits.max_total_resolver_calls:
+            _raise_archetype_coverage_work_limit(
+                "total_resolver_calls",
+                total_resolver_call_upper_bound,
+                limits.max_total_resolver_calls,
+            )
+        counterfactual_catalog_comparison_upper_bound = sum(
+            catalog_comparisons_by_candidate[candidate_index]
+            for revision_ref in revision_refs
+            for candidate_index in affected_indexes_by_revision[revision_ref]
+        )
+        total_catalog_comparison_upper_bound = (
+            base_catalog_comparison_upper_bound + counterfactual_catalog_comparison_upper_bound
+        )
+        if total_catalog_comparison_upper_bound > limits.max_total_catalog_comparisons:
+            _raise_archetype_coverage_work_limit(
+                "total_catalog_comparisons",
+                total_catalog_comparison_upper_bound,
+                limits.max_total_catalog_comparisons,
+            )
+
+        causal_targets: dict[KnowledgeRevisionRef, set[str]] = {}
+        for revision_ref in revision_refs:
+            counterfactual_scores = dict(base_scores_by_index)
+            for candidate_index in affected_indexes_by_revision[revision_ref]:
+                counterfactual_scores[candidate_index] = score_candidate(
+                    candidate_index,
+                    {revision_ref},
+                )
+            counterfactual = select(
+                sorted_scores(counterfactual_scores),
+                emit_diagnostics=False,
+            )
+            counterfactual_positions = {arch.id: index for index, (_, arch, _, _, _, _) in enumerate(counterfactual)}
+            causal_targets[revision_ref] = {
+                archetype_id
+                for archetype_id, selected_position in selected_positions.items()
+                if counterfactual_positions.get(archetype_id) != selected_position
+            }
+        for use in selected_knowledge_uses:
+            target_archetype = use.target_ref.removeprefix("archetype:")
+            if target_archetype in causal_targets.get(use.revision_ref, set()) and use not in knowledge_stage_uses:
+                knowledge_stage_uses.append(use)
 
     return kept
 
@@ -1129,6 +2042,14 @@ def blend_archetypes(
     secondary_min_confidence: float = 0.4,
     target_language: str = "promql",
     signal_store: Any | None = None,
+    tenant_id: str = "default",
+    knowledge_query_uses: list[KnowledgeQueryUse] | None = None,
+    knowledge_scope: Any | None = None,
+    max_archetypes: int | None = 3,
+    min_secondary_coverage: float = 0.25,
+    learned_archetype_min_coverage: float = 0.75,
+    learned_archetype_boost: float = 0.15,
+    max_dashboard_panels: int = 10,
 ) -> DashboardSpec:
     """Blend panels from multiple archetypes into a single dashboard.
 
@@ -1159,19 +2080,27 @@ def blend_archetypes(
         catalog,
         target_language=target_language,
         services=intent.services,
-        max_archetypes=settings.max_blended_archetypes,
-        min_secondary_coverage=settings.min_secondary_coverage,
+        max_archetypes=max_archetypes,
+        min_secondary_coverage=min_secondary_coverage,
+        learned_archetype_min_coverage=learned_archetype_min_coverage,
+        learned_archetype_boost=learned_archetype_boost,
         signal_store=signal_store,
+        tenant_id=tenant_id,
+        knowledge_scope=knowledge_scope,
     )
-    max_panels = settings.max_dashboard_panels
+    max_panels = max_dashboard_panels
 
     primary_arch, primary_conf = ranked_archetypes[0]
+    compiled_query_uses: list[KnowledgeQueryUse] = []
     primary_spec = compile_archetype(
         primary_arch,
         intent,
         catalog,
         target_language=target_language,
         signal_store=signal_store,
+        tenant_id=tenant_id,
+        knowledge_query_uses=compiled_query_uses,
+        knowledge_scope=knowledge_scope,
     )
 
     # De-dup on the panel's *query signature* (the set of normalized query
@@ -1196,6 +2125,9 @@ def blend_archetypes(
             catalog,
             target_language=target_language,
             signal_store=signal_store,
+            tenant_id=tenant_id,
+            knowledge_query_uses=compiled_query_uses,
+            knowledge_scope=knowledge_scope,
         )
         added = 0
         for panel in secondary_spec.panels:
@@ -1229,6 +2161,9 @@ def blend_archetypes(
         timerange=intent.timerange or primary_arch.default_timerange,
         panels=blended_panels[:max_panels],
     )
+    if knowledge_query_uses is not None:
+        surviving_query_ids = dashboard_query_identities(spec)
+        knowledge_query_uses.extend(use for use in compiled_query_uses if use.query_identity() in surviving_query_ids)
 
     logger.info(
         "archetype_blend_complete",
