@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sqlite3
 from dataclasses import replace
 from types import SimpleNamespace
@@ -9,7 +10,7 @@ from click.testing import CliRunner
 
 from tacit.cli import cli
 from tacit.config import Settings
-from tacit.dependencies import build_pipeline_dependencies
+from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies, declare_backend_factory
 from tacit.errors import RuntimeOwnershipError
 from tacit.feedback import FeedbackStore
 from tacit.history import InvestigationStore
@@ -20,9 +21,49 @@ from tacit.runtime_ownership import (
     RuntimeOwnershipDescriptor,
     RuntimeOwnershipMismatchError,
     RuntimeRemoteIdentity,
+    declare_runtime_factory,
+    runtime_descriptor_for_store,
+    runtime_descriptor_from_settings,
 )
 from tacit.runtime_stores import RuntimeStores
 from tacit.signals.store import SignalStore
+
+
+def _owned_store_factory(factory, runtime_settings: Settings, role: str):
+    settings_owner = runtime_descriptor_from_settings(
+        runtime_settings,
+        component="runtime_store_test_settings",
+    )
+    database_path = next(item.path for item in settings_owner.databases if item.role == role)
+    return declare_runtime_factory(
+        factory,
+        ownership=runtime_descriptor_for_store(
+            component=f"runtime_store_test_{role}_factory",
+            runtime_settings=runtime_settings,
+            database_role=role,
+            database_path=database_path,
+        ),
+        factory_kind=f"store:{role}",
+    )
+
+
+def _owned_fallback_factory(factory, *, role: str, paths: dict[str, object]):
+    runtime_settings = Settings(
+        _env_file=None,
+        history_db_path=str(paths["history"]),
+        feedback_db_path=str(paths["feedback"]),
+        signals_db_path=str(paths["signals"]),
+    )
+    return declare_runtime_factory(
+        factory,
+        ownership=runtime_descriptor_for_store(
+            component=f"runtime_store_test_{role}_fallback",
+            runtime_settings=runtime_settings,
+            database_role=role,
+            database_path=paths[role],
+        ),
+        factory_kind=f"store:{role}",
+    )
 
 
 def _unexpected_global_store():
@@ -87,6 +128,104 @@ def test_configured_runtime_owns_and_reuses_all_stores(tmp_path):
     assert stores.knowledge()._signal_store() is stores.signals()
 
 
+def test_dependency_bundles_share_their_runtime_admission_controller(tmp_path):
+    runtime_settings = Settings(
+        _env_file=None,
+        pipeline_max_concurrent=2,
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    stores = RuntimeStores(runtime_settings)
+
+    first = build_pipeline_dependencies(runtime_settings, stores=stores)
+    second = build_pipeline_dependencies(runtime_settings, stores=stores)
+
+    assert first.pipeline_admission is second.pipeline_admission
+    assert first.pipeline_admission.limit == 2
+
+
+def test_wildcard_runtime_admission_reserves_queue_capacity_per_tenant(tmp_path):
+    runtime_settings = Settings(
+        _env_file=None,
+        api_auth_enabled=True,
+        knowledge_tenant_id="*",
+        knowledge_tenant_api_keys={"tenant-a": "secret-a", "tenant-b": "secret-b"},
+        pipeline_max_queued=40,
+        pipeline_max_queued_per_tenant=7,
+        pipeline_max_concurrent=5,
+        pipeline_max_concurrent_per_tenant=3,
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+
+    admission = RuntimeStores(runtime_settings).pipeline_admission()
+
+    assert admission.max_queued == 40
+    assert admission.max_queued_per_partition == 7
+    assert admission.max_in_flight_per_partition == 3
+
+
+def test_pinned_runtime_uses_the_global_queue_limit_for_its_single_tenant(tmp_path):
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-a",
+        pipeline_max_queued=40,
+        pipeline_max_queued_per_tenant=7,
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+
+    admission = RuntimeStores(runtime_settings).pipeline_admission()
+
+    assert admission.max_queued == 40
+    assert admission.max_queued_per_partition == 40
+    assert admission.max_in_flight_per_partition == runtime_settings.pipeline_max_concurrent
+
+
+def test_pipeline_builder_does_not_accept_an_ownerless_admission_controller():
+    assert "pipeline_admission" not in inspect.signature(build_pipeline_dependencies).parameters
+
+
+def test_direct_dependency_construction_requires_deliberate_isolated_admission():
+    runtime_settings = Settings(_env_file=None)
+    values = {
+        "settings": runtime_settings,
+        "backend_factory": declare_backend_factory(
+            lambda: [],
+            runtime_settings=runtime_settings,
+            component="isolated_runtime_store_test_backends",
+        ),
+        "history_store_factory": _owned_store_factory(lambda: object(), runtime_settings, "history"),
+        "feedback_store_factory": _owned_store_factory(lambda: object(), runtime_settings, "feedback"),
+        "llm_cache": {},
+        "cache_key_factory": lambda *parts: ":".join(parts),
+    }
+
+    with pytest.raises(ValueError, match="runtime-owned pipeline admission"):
+        PipelineDependencies(**values)
+
+    isolated = PipelineDependencies.isolated(**values)
+
+    assert isolated.pipeline_admission.limit == runtime_settings.pipeline_max_concurrent
+
+
+def test_runtime_owner_revalidates_copied_admission_settings_before_construction():
+    invalid = Settings(_env_file=None).model_copy(update={"pipeline_max_concurrent": 0})
+
+    with pytest.raises(ValueError, match="pipeline_max_concurrent"):
+        RuntimeStores(invalid).pipeline_admission()
+
+
+def test_public_default_dependencies_share_process_admission_controller():
+    first = PipelineDependencies.defaults()
+    second = PipelineDependencies.defaults()
+
+    assert first.pipeline_admission is second.pipeline_admission
+
+
 def test_pipeline_dependency_construction_rejects_split_runtime_before_resource_initialization():
     runtime_settings = Settings(_env_file=None, knowledge_tenant_id="tenant-a")
 
@@ -98,6 +237,54 @@ def test_pipeline_dependency_construction_rejects_split_runtime_before_resource_
 
     with pytest.raises(ValueError, match="runtime settings must match"):
         build_pipeline_dependencies(runtime_settings, stores=SplitRuntimeStores())  # type: ignore[arg-type]
+
+
+def test_runtime_stores_rejects_ownerless_used_fallback_before_invocation(tmp_path, monkeypatch):
+    monkeypatch.setattr("tacit.signals.store._DEFAULT_DB_PATH", tmp_path / "signals.db")
+    calls = 0
+
+    def ownerless_fallback():
+        nonlocal calls
+        calls += 1
+        raise AssertionError("ownerless fallback was invoked")
+
+    with pytest.raises(RuntimeOwnershipError, match="declared runtime owner"):
+        RuntimeStores(Settings(_env_file=None), signal_fallback=ownerless_fallback)
+
+    assert calls == 0
+    assert not (tmp_path / "signals.db").exists()
+
+
+def test_runtime_stores_rejects_foreign_fallback_declaration_before_invocation(tmp_path, monkeypatch):
+    active_path = tmp_path / "active-signals.db"
+    foreign_path = tmp_path / "foreign-signals.db"
+    monkeypatch.setattr("tacit.signals.store._DEFAULT_DB_PATH", active_path)
+    active = Settings(_env_file=None)
+    foreign = Settings(_env_file=None, signals_db_path=str(foreign_path))
+    calls = 0
+
+    def foreign_fallback():
+        nonlocal calls
+        calls += 1
+        foreign_path.touch()
+        raise AssertionError("foreign fallback was invoked")
+
+    declared = declare_runtime_factory(
+        foreign_fallback,
+        ownership=runtime_descriptor_for_store(
+            component="foreign_runtime_signal_fallback",
+            runtime_settings=foreign,
+            database_role="signals",
+            database_path=foreign_path,
+        ),
+        factory_kind="store:signals",
+    )
+
+    with pytest.raises(RuntimeOwnershipError, match="runtime ownership mismatch"):
+        RuntimeStores(active, signal_fallback=declared)
+
+    assert calls == 0
+    assert not foreign_path.exists()
 
 
 def test_default_paths_still_use_runtime_settings_instead_of_global_fallbacks(tmp_path, monkeypatch):
@@ -420,7 +607,13 @@ def test_runtime_stores_rejects_mismatched_realized_compatibility_store(
 
     stores = RuntimeStores(
         Settings(_env_file=None),
-        **{fallback_name: compatibility_factory},
+        **{
+            fallback_name: _owned_fallback_factory(
+                compatibility_factory,
+                role=role,
+                paths=expected_paths,
+            )
+        },
     )
     actual_descriptor = replace(
         stores.runtime_ownership,
@@ -466,7 +659,13 @@ def test_runtime_stores_accepts_same_owner_compatibility_store(
 
     stores = RuntimeStores(
         Settings(_env_file=None),
-        **{fallback_name: lambda: candidate_holder["store"]},
+        **{
+            fallback_name: _owned_fallback_factory(
+                lambda: candidate_holder["store"],
+                role=role,
+                paths=expected_paths,
+            )
+        },
     )
     expected_database = next(database for database in stores.runtime_ownership.databases if database.role == role)
     candidate = _DescriptorOnlyStore(
@@ -501,7 +700,13 @@ def test_runtime_stores_rejects_database_only_compatibility_store(
     candidate_holder = {}
     stores = RuntimeStores(
         Settings(_env_file=None),
-        **{fallback_name: lambda: candidate_holder["store"]},
+        **{
+            fallback_name: _owned_fallback_factory(
+                lambda: candidate_holder["store"],
+                role=role,
+                paths=expected_paths,
+            )
+        },
     )
     candidate = _DescriptorOnlyStore(
         RuntimeOwnershipDescriptor(
@@ -536,7 +741,11 @@ def test_signal_store_rejects_conflicting_complete_owner_before_bootstrap(
     candidate_holder = {}
     stores = RuntimeStores(
         Settings(_env_file=None),
-        signal_fallback=lambda: candidate_holder["store"],
+        signal_fallback=_owned_fallback_factory(
+            lambda: candidate_holder["store"],
+            role="signals",
+            paths=paths,
+        ),
     )
     expected_database = next(database for database in stores.runtime_ownership.databases if database.role == "signals")
     updates = {"databases": (RuntimeDatabaseIdentity(role="signals", path=tmp_path / "conflicting" / "signals.db"),)}
@@ -707,14 +916,16 @@ def test_cli_history_uses_the_same_settings_backed_store_owner(tmp_path, monkeyp
 
 
 def test_injected_signal_store_also_scopes_operational_knowledge(tmp_path):
-    runtime_settings = Settings(_env_file=None)
+    signal_path = tmp_path / "injected-signals.db"
+    runtime_settings = Settings(_env_file=None, signals_db_path=str(signal_path))
     injected = SignalStore(
-        tmp_path / "injected-signals.db",
+        signal_path,
         runtime_settings=runtime_settings,
     )
     dependencies = build_pipeline_dependencies(
         runtime_settings,
-        signal_store_factory=lambda: injected,
+        stores=RuntimeStores(runtime_settings),
+        signal_store_factory=_owned_store_factory(lambda: injected, runtime_settings, "signals"),
     )
 
     assert dependencies.knowledge_service_factory is not None
@@ -755,9 +966,16 @@ def test_custom_history_factory_is_lazy_and_used_for_correction_validation(tmp_p
         history_db_path=str(tmp_path / "unused-runtime-history.db"),
         signals_db_path=str(tmp_path / "signals.db"),
     )
+    injected_history.runtime_ownership = runtime_descriptor_for_store(
+        component="scoped_history",
+        runtime_settings=runtime_settings,
+        database_role="history",
+        database_path=runtime_settings.history_db_path,
+    )
     dependencies = build_pipeline_dependencies(
         runtime_settings,
-        history_store_factory=lambda: injected_history,
+        stores=RuntimeStores(runtime_settings),
+        history_store_factory=_owned_store_factory(lambda: injected_history, runtime_settings, "history"),
     )
     assert dependencies.knowledge_service_factory is not None
 

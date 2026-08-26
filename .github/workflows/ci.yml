@@ -8,14 +8,23 @@ on:
 permissions:
   contents: read
 
+# The one-time full reachable-history Gitleaks baseline was scanned clean with
+# the pinned image below before incremental event ranges were enabled.
+env:
+  GITLEAKS_HISTORY_BASELINE_SHA: "4085160a63125ae764cc2f0e6aa170f4ac0dd4d1"
+
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          python-version: "3.12"
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.12.1"
+          checksum: "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
+          python-version: "3.12.13"
       - run: uv sync --all-extras --dev
       - name: Ruff
         run: uv run ruff check .
@@ -25,24 +34,32 @@ jobs:
         run: uv run mypy tacit
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          python-version: "3.12"
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.12.1"
+          checksum: "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
+          python-version: "3.12.13"
       - run: uv sync --all-extras --dev
       - name: Hermetic test suite
         run: uv run pytest -vv
 
   integration:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: test
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          python-version: "3.12"
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.12.1"
+          checksum: "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
+          python-version: "3.12.13"
       - run: uv sync --all-extras --dev
       - name: Hermetic vendor contract tests
         run: uv run pytest tests/integration -m integration -vv
@@ -59,13 +76,17 @@ jobs:
           fi
 
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: test
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          python-version: "3.12"
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.12.1"
+          checksum: "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
+          python-version: "3.12.13"
       - run: uv sync --all-extras --dev
       - name: Install browser runtime
         run: uv run playwright install --with-deps chromium
@@ -73,32 +94,76 @@ jobs:
         run: uv run pytest -q -m e2e tests/e2e
 
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Build Docker image
         run: docker build -t tacit:ci .
 
   secret-scan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - name: Gitleaks
-        uses: docker://zricethezav/gitleaks:v8.24.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          args: detect --source /github/workspace --no-git --redact --verbose
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Select committed-history scan range
+        id: gitleaks_range
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          BASELINE_SHA: ${{ env.GITLEAKS_HISTORY_BASELINE_SHA }}
+          BEFORE_SHA: ${{ github.event.before || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python .github/scripts/gitleaks_range.py \
+            --repository "$GITHUB_WORKSPACE" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$BASE_SHA" \
+            --before-sha "$BEFORE_SHA" \
+            --baseline-sha "$BASELINE_SHA" \
+            --output "$GITHUB_OUTPUT"
+      - name: Prepare current-tree scan without Git objects
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mkdir .gitleaks-worktree
+          git archive --format=tar "$HEAD_SHA" | tar -xf - -C .gitleaks-worktree
+      - name: Gitleaks committed history
+        uses: docker://zricethezav/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: /github/workspace
+        with:
+          args: detect --source /github/workspace --log-opts=${{ steps.gitleaks_range.outputs.log_opts }} --redact --verbose
+      - name: Gitleaks current tree
+        uses: docker://zricethezav/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
+        with:
+          args: detect --source /github/workspace/.gitleaks-worktree --no-git --redact --verbose
 
   fresh-install:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-24.04
+            uv_checksum: 90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb
+          - os: macos-15
+            uv_checksum: 77d2906988e8074fd43f2f329ec452ebbf9b0c257ba1c66451c71de70a6baf42
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          python-version: "3.12"
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.12.1"
+          checksum: ${{ matrix.uv_checksum }}
+          python-version: "3.12.13"
       - name: Install package in clean environment
         run: |
           uv venv .fresh-venv

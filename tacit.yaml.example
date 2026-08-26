@@ -55,6 +55,9 @@ context:
 # ── Pipeline Tuning ──────────────────────────────────────────────────────────
 pipeline:
   max_concurrent: 5            # max simultaneous pipeline runs
+  max_concurrent_per_tenant: 0 # wildcard mode: 0 reserves one active slot automatically
+  max_queued: 100              # bounded waiters before overload rejection
+  max_queued_per_tenant: 25    # wildcard mode: bounded waiters per tenant
   timeout_seconds: 120         # overall pipeline timeout
 
 # ── Datasource Adapters ─────────────────────────────────────────────────────
@@ -89,6 +92,8 @@ learned_archetypes:
 api:
   auth_enabled: false          # set true to require X-API-Key header
   # auth_key: use API_AUTH_KEY env var
+  # cors_allowed_origins: https://console.example,https://ops.example
+  max_request_body_bytes: 2097152  # 2 MiB; enforced before request parsing
 
 # ── App ──────────────────────────────────────────────────────────────────────
 log_level: INFO

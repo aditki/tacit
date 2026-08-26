@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -17,11 +16,18 @@ from tacit.backends import get_active_backends
 from tacit.config import Settings, settings
 from tacit.context.enrichment import enrich_context
 from tacit.culprit_ranking import rank_culprits
-from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies, resolve_knowledge_service
+from tacit.dependencies import (
+    PipelineDependencies,
+    build_pipeline_dependencies,
+    declare_backend_factory,
+    resolve_knowledge_service,
+)
 from tacit.errors import (
     AUTHORITY_BOUNDARY_ERRORS,
     FatalPipelineError,
+    PipelineAdmissionRejected,
     PipelineExecutionError,
+    RuntimeOwnershipError,
     safe_failure_detail,
     safe_failure_diagnostics,
 )
@@ -41,7 +47,9 @@ from tacit.pipeline.discovery import (
 )
 
 if TYPE_CHECKING:
+    from tacit.backends.base import DashboardBackend
     from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
+    from tacit.pipeline_admission import PipelineSideEffectFence
 from tacit.pipeline.failures import PipelineFailureFactory, handle_empty_catalog
 from tacit.pipeline.recording import (
     PipelineRecorder,
@@ -49,7 +57,7 @@ from tacit.pipeline.recording import (
     history_archetypes,
     history_signals,
 )
-from tacit.pipeline.side_effects import safe_close_backends
+from tacit.pipeline.side_effects import cancel_task_with_grace, safe_close_backends
 from tacit.pipeline.stages.archetypes import (
     compile_selected_archetypes,
     new_investigation_signal_resolution_work_budget,
@@ -61,7 +69,7 @@ from tacit.pipeline.stages.freeform import build_freeform_dashboard
 from tacit.pipeline.stages.intent import run_intent_stage
 from tacit.pipeline.stages.publish import preflight_publish_backends
 from tacit.pipeline.validation import validate_dashboard_and_evidence
-from tacit.runtime_stores import RuntimeStores
+from tacit.runtime_stores import get_process_runtime_stores
 from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE
 
 logger = structlog.get_logger()
@@ -105,11 +113,6 @@ def _initial_knowledge_archetype_ids(intent: Any) -> set[str]:
     }
 
 
-# Concurrency gate — prevents thundering-herd on LLM + Grafana APIs
-_pipeline_semaphore: asyncio.Semaphore | None = None
-_pipeline_semaphore_limit: int | None = None
-
-
 @dataclass
 class _PipelineCancellation:
     status: str = "cancelled"
@@ -126,20 +129,64 @@ def _default_dependencies() -> PipelineDependencies:
     cold isolated runtime. Keeping the default lookup here preserves that
     behavior while the core runner still accepts explicit dependencies.
     """
-    stores = RuntimeStores(settings, history_fallback=get_investigation_store)
+    stores = get_process_runtime_stores(
+        settings,
+        history_fallback=get_investigation_store,
+    )
     return build_pipeline_dependencies(
         settings,
         stores=stores,
-        backend_factory=get_active_backends,
+        backend_factory=declare_backend_factory(
+            get_active_backends,
+            runtime_settings=settings,
+            component="default_pipeline_backend_factory",
+        ),
     )
 
 
-def _get_semaphore(max_concurrent: int) -> asyncio.Semaphore:
-    global _pipeline_semaphore, _pipeline_semaphore_limit
-    if _pipeline_semaphore is None or _pipeline_semaphore_limit != max_concurrent:
-        _pipeline_semaphore = asyncio.Semaphore(max_concurrent)
-        _pipeline_semaphore_limit = max_concurrent
-    return _pipeline_semaphore
+async def _cleanup_pipeline_resources(
+    deps: PipelineDependencies,
+    backends: list[DashboardBackend],
+) -> None:
+    """Release per-run backends and shared provider leases concurrently."""
+    backend_cleanup = asyncio.create_task(
+        safe_close_backends(
+            backends,
+            grace_seconds=deps.cleanup_grace_seconds,
+            lifecycle=deps.pipeline_admission,
+        ),
+        name="tacit-pipeline-backend-cleanup",
+    )
+    try:
+        await deps.close_resources()
+    except asyncio.CancelledError:
+        backend_cleanup.cancel()
+        await asyncio.gather(backend_cleanup, return_exceptions=True)
+        raise
+    except BaseException as exc:
+        logger.warning(
+            "pipeline_resource_cleanup_failed",
+            reason_code="pipeline_resource_cleanup_failed",
+            error_type=type(exc).__name__,
+        )
+    try:
+        await backend_cleanup
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        logger.warning(
+            "pipeline_resource_cleanup_failed",
+            reason_code="pipeline_resource_cleanup_failed",
+            error_type=type(exc).__name__,
+        )
+
+
+def _activate_empty_governed_mapping_pin(signal_store: Any, *, tenant_id: str) -> Any:
+    """Fail closed when knowledge is unavailable but the resolver remains live."""
+    activate_pin = getattr(signal_store, "activate_pinned_governed_mappings", None)
+    if activate_pin is None:
+        raise RuntimeOwnershipError("Signal store cannot install an empty governed-mapping pin")
+    return activate_pin(tenant_id=tenant_id, mappings=[])
 
 
 def _applied_stage_knowledge_refs(usage: list[KnowledgeUsage]) -> set[str]:
@@ -254,8 +301,7 @@ async def run_pipeline(
     base_revision: int | None = None,
 ) -> DashResponse:
     """End-to-end: natural language → Grafana dashboard URL."""
-    deps = deps or _default_dependencies()
-    runtime_settings = deps.settings
+    runtime_settings = deps.settings if deps is not None else settings
     enforce_knowledge_action(runtime_settings, KnowledgeAction.READ)
     enforce_knowledge_action(runtime_settings, KnowledgeAction.APPLY)
     from tacit.tenancy import resolve_tenant_boundary
@@ -263,10 +309,35 @@ async def run_pipeline(
     configured_tenant = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
     tenant_id = resolve_tenant_boundary(configured_tenant, request.tenant_id)
     request = request.model_copy(update={"tenant_id": tenant_id})
+    deps = deps or _default_dependencies()
     bind_request_id()
-    sem = _get_semaphore(runtime_settings.pipeline_max_concurrent)
+    admission = deps.pipeline_admission
+    if admission is None:
+        raise RuntimeError("Pipeline admission controller is unavailable")
+    timeout_seconds = float(runtime_settings.pipeline_timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds
+    admitted = False
     try:
-        async with sem:
+        async with admission.slot(
+            timeout_seconds=timeout_seconds,
+            partition_key=tenant_id,
+        ) as lease:
+            admitted = True
+            logger.info(
+                "pipeline_admission_acquired",
+                reason_code="pipeline_admission_acquired",
+                wait_ms=round(lease.wait_seconds * 1000, 3),
+                queue_depth_at_entry=lease.queue_depth_at_entry,
+                partition_queue_depth_at_entry=lease.partition_queue_depth_at_entry,
+                concurrency_limit=admission.limit,
+                partition_concurrency_limit=admission.max_in_flight_per_partition,
+                active_pipeline_count=admission.in_flight,
+                active_partition_pipeline_count=admission.in_flight_for(tenant_id),
+                partition_queue_limit=admission.max_queued_per_partition,
+            )
+            remaining_seconds = max(deadline - time.monotonic(), 0.0)
+            if remaining_seconds <= 0:
+                raise PipelineAdmissionRejected("pipeline_admission_wait_timeout")
             cancellation = _PipelineCancellation()
             pipeline_task = asyncio.create_task(
                 _run_pipeline_inner(
@@ -276,12 +347,13 @@ async def run_pipeline(
                     run_type=run_type,
                     base_revision=base_revision,
                     cancellation=cancellation,
+                    lifecycle=lease.fence,
                 )
             )
             try:
                 done, _ = await asyncio.wait(
                     {pipeline_task},
-                    timeout=runtime_settings.pipeline_timeout_seconds,
+                    timeout=remaining_seconds,
                 )
                 if pipeline_task in done:
                     try:
@@ -300,19 +372,25 @@ async def run_pipeline(
 
                 cancellation.status = "timeout"
                 cancellation.error = "Pipeline timed out"
-                pipeline_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await pipeline_task
+                lease.fence.close("pipeline_timeout")
+                await cancel_task_with_grace(
+                    pipeline_task,
+                    grace_seconds=deps.cleanup_grace_seconds,
+                    reason_code="pipeline_timeout_cleanup_grace_exceeded",
+                    lifecycle=admission,
+                    lease=lease,
+                )
                 logger.error(
                     "pipeline_timeout",
                     user=request.user_id,
-                    timeout=runtime_settings.pipeline_timeout_seconds,
+                    timeout=timeout_seconds,
                 )
+                timeout_label = f"{timeout_seconds:g}"
                 return DashResponse(
                     dashboard_url="",
                     dashboard_uid="",
                     panel_count=0,
-                    summary=f"Pipeline timed out after {runtime_settings.pipeline_timeout_seconds}s. "
+                    summary=f"Pipeline timed out after {timeout_label}s. "
                     "Try a more specific query or check datasource connectivity.",
                     investigation_id=cancellation.investigation_id,
                     investigation_run_id=cancellation.run_id,
@@ -322,11 +400,38 @@ async def run_pipeline(
             except asyncio.CancelledError:
                 cancellation.status = "cancelled"
                 cancellation.error = "Pipeline cancelled by caller"
-                if not pipeline_task.done():
-                    pipeline_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await pipeline_task
+                lease.fence.close("pipeline_cancelled")
+                await cancel_task_with_grace(
+                    pipeline_task,
+                    grace_seconds=deps.cleanup_grace_seconds,
+                    reason_code="pipeline_cancellation_cleanup_grace_exceeded",
+                    lifecycle=admission,
+                    lease=lease,
+                )
                 raise
+    except PipelineAdmissionRejected as exc:
+        logger.warning(
+            "pipeline_admission_rejected",
+            reason_code=exc.reason_code,
+            queue_depth=admission.queued,
+            queue_limit=admission.max_queued,
+            partition_queue_depth=admission.queued_for(tenant_id),
+            partition_queue_limit=admission.max_queued_per_partition,
+            concurrency_limit=admission.limit,
+        )
+        raise
+    except asyncio.CancelledError:
+        if not admitted:
+            logger.info(
+                "pipeline_admission_cancelled",
+                reason_code="pipeline_admission_cancelled",
+                queue_depth=admission.queued,
+                queue_limit=admission.max_queued,
+                partition_queue_depth=admission.queued_for(tenant_id),
+                partition_queue_limit=admission.max_queued_per_partition,
+                concurrency_limit=admission.limit,
+            )
+        raise
     finally:
         unbind_request_id()
 
@@ -335,6 +440,7 @@ async def _run_pipeline_inner(
     request: DashRequest,
     deps: PipelineDependencies,
     *,
+    lifecycle: PipelineSideEffectFence,
     investigation_id: str | None = None,
     run_type: InvestigationRunType = InvestigationRunType.INITIAL,
     base_revision: int | None = None,
@@ -349,10 +455,14 @@ async def _run_pipeline_inner(
     runtime_settings = deps.settings
     t_start = time.monotonic()
     timings: dict[str, float] = {}
+    backends: list[DashboardBackend] = []
     try:
         history = deps.history_store_factory()
+    except asyncio.CancelledError:
+        await _cleanup_pipeline_resources(deps, backends)
+        raise
     except Exception as exc:
-        await deps.close_resources()
+        await _cleanup_pipeline_resources(deps, backends)
         raise PipelineExecutionError(
             "Investigation audit storage is unavailable",
             investigation_id=investigation_id or "",
@@ -361,29 +471,35 @@ async def _run_pipeline_inner(
     current_contract = None
     if investigation_id:
         if not hasattr(history, "get_contract"):
-            await deps.close_resources()
+            await _cleanup_pipeline_resources(deps, backends)
             raise ValueError("existing investigations require a tenant-aware history store")
         try:
             current_contract = history.get_contract(
                 investigation_id,
                 tenant_id=request.tenant_id,
             )
+        except asyncio.CancelledError:
+            await _cleanup_pipeline_resources(deps, backends)
+            raise
         except Exception as exc:
-            await deps.close_resources()
+            await _cleanup_pipeline_resources(deps, backends)
             raise PipelineExecutionError(
                 "Investigation audit storage is unavailable",
                 investigation_id=investigation_id,
                 audit_status="run_unavailable",
             ) from exc
         if current_contract is None:
-            await deps.close_resources()
+            await _cleanup_pipeline_resources(deps, backends)
             raise ValueError("investigation not found for the selected tenant")
         inv_id = investigation_id
     else:
         try:
             tenant_aware_history = "tenant_id" in inspect.signature(history.start).parameters
+        except asyncio.CancelledError:
+            await _cleanup_pipeline_resources(deps, backends)
+            raise
         except Exception as exc:
-            await deps.close_resources()
+            await _cleanup_pipeline_resources(deps, backends)
             raise PipelineExecutionError(
                 "Investigation audit storage is unavailable",
                 audit_status="run_unavailable",
@@ -396,8 +512,11 @@ async def _run_pipeline_inner(
                     request.channel_id or "",
                     tenant_id=request.tenant_id,
                 )
+            except asyncio.CancelledError:
+                await _cleanup_pipeline_resources(deps, backends)
+                raise
             except Exception as exc:
-                await deps.close_resources()
+                await _cleanup_pipeline_resources(deps, backends)
                 raise PipelineExecutionError(
                     "Investigation audit storage is unavailable",
                     audit_status="run_unavailable",
@@ -405,12 +524,15 @@ async def _run_pipeline_inner(
         else:
             configured_tenant = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
             if configured_tenant != "default":
-                await deps.close_resources()
+                await _cleanup_pipeline_resources(deps, backends)
                 raise ValueError("non-default tenant pipelines require a tenant-aware history store")
             try:
                 inv_id = history.start(request.prompt, request.user_id or "", request.channel_id or "")
+            except asyncio.CancelledError:
+                await _cleanup_pipeline_resources(deps, backends)
+                raise
             except Exception as exc:
-                await deps.close_resources()
+                await _cleanup_pipeline_resources(deps, backends)
                 raise PipelineExecutionError(
                     "Investigation audit storage is unavailable",
                     audit_status="run_unavailable",
@@ -430,6 +552,24 @@ async def _run_pipeline_inner(
             if "lease_seconds" in inspect.signature(history.start_run).parameters:
                 run_kwargs["lease_seconds"] = float(runtime_settings.pipeline_timeout_seconds) + 60.0
             run_id = history.start_run(inv_id, **run_kwargs)
+        except asyncio.CancelledError:
+            cancellation = cancellation or _PipelineCancellation()
+            recorder = PipelineRecorder(
+                history,
+                inv_id,
+                run_id=None,
+                tenant_id=request.tenant_id,
+                record_investigation_updates=investigation_id is None,
+            )
+            recorder.finish(
+                status=cancellation.status,
+                error=cancellation.error,
+                timings=timings,
+                total_time=time.monotonic() - t_start,
+            )
+            cancellation.audit_status = recorder.audit_status
+            await _cleanup_pipeline_resources(deps, backends)
+            raise
         except Exception as exc:
             error_detail, diagnostics = _safe_pipeline_failure(
                 exc,
@@ -454,7 +594,7 @@ async def _run_pipeline_inner(
                 timings=timings,
                 total_time=time.monotonic() - t_start,
             )
-            await deps.close_resources()
+            await _cleanup_pipeline_resources(deps, backends)
             raise PipelineExecutionError(
                 "Investigation run audit could not be started",
                 investigation_id=inv_id,
@@ -473,14 +613,27 @@ async def _run_pipeline_inner(
         cancellation.audit_status = recorder.audit_status
     try:
         backends = deps.backend_factory()
+    except asyncio.CancelledError:
+        cancellation = cancellation or _PipelineCancellation()
+        recorder.finish(
+            status=cancellation.status,
+            error=cancellation.error,
+            timings=timings,
+            total_time=time.monotonic() - t_start,
+        )
+        cancellation.audit_status = recorder.audit_status
+        await _cleanup_pipeline_resources(deps, backends)
+        raise
     except Exception as exc:
+        backend_error: BaseException = exc
+        if exc.__cause__ is not None and isinstance(exc, RuntimeOwnershipError):
+            backend_error = exc.__cause__
         error_detail, diagnostics = _safe_pipeline_failure(
-            exc,
+            backend_error,
             reason_code="backend_construction_failed",
         )
         logger.error(
             "backend_construction_failed",
-            investigation_id=inv_id,
             reason_code="backend_construction_failed",
             **diagnostics,
         )
@@ -492,13 +645,13 @@ async def _run_pipeline_inner(
         )
         if cancellation is not None:
             cancellation.audit_status = audit_status
-        await deps.close_resources()
+        await _cleanup_pipeline_resources(deps, backends)
         raise PipelineExecutionError(
             "Dashboard backend initialization failed",
             investigation_id=inv_id,
             investigation_run_id=run_id or "",
             audit_status=audit_status,
-        ) from exc
+        ) from backend_error
     if not backends:
         recorder.finish(
             status="failed",
@@ -508,7 +661,7 @@ async def _run_pipeline_inner(
         )
         if cancellation is not None:
             cancellation.audit_status = recorder.audit_status
-        await deps.close_resources()
+        await _cleanup_pipeline_resources(deps, backends)
         return PipelineFailureFactory.no_backends(recorder=recorder)
 
     primary = backends[0]  # determines query language for compilation
@@ -529,12 +682,38 @@ async def _run_pipeline_inner(
     knowledge_snapshot: KnowledgeSnapshot | None = None
     knowledge_usage: list[KnowledgeUsage] = []
     knowledge_pin_token: Any | None = None
+    knowledge_preflight_diagnostics: dict[str, str | int] | None = None
 
     try:
         if isinstance(runtime_settings, Settings):
             preflight_publish_backends(backends, runtime_settings)
         signal_store = _initialize_signal_store(deps, runtime.recorder, runtime.timings)
         signal_resolution_work_budget = new_investigation_signal_resolution_work_budget(signal_store)
+        if signal_store is not SIGNAL_STORE_UNAVAILABLE:
+            try:
+                enforce_knowledge_action(runtime.settings, KnowledgeAction.APPLY)
+                knowledge_service = resolve_knowledge_service(deps, signal_store=signal_store)
+            except AUTHORITY_BOUNDARY_ERRORS:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _, knowledge_preflight_diagnostics = _safe_pipeline_failure(
+                    exc,
+                    reason_code="knowledge_snapshot_unavailable",
+                )
+                logger.warning(
+                    "operational_knowledge_preflight_failed",
+                    reason_code="knowledge_snapshot_unavailable",
+                    **knowledge_preflight_diagnostics,
+                )
+                knowledge_pin_token = _activate_empty_governed_mapping_pin(
+                    signal_store,
+                    tenant_id=request.tenant_id,
+                )
+
+        await deps.acquire_resources()
+        lifecycle.ensure_side_effects_allowed()
 
         # ── 1. Intent Agent ──────────────────────────────────────────
         llm_provider_factory = runtime.deps.llm_provider_factory
@@ -549,6 +728,7 @@ async def _run_pipeline_inner(
             context_provider_factory=context_provider_factory,
             timings=runtime.timings,
         )
+        lifecycle.ensure_side_effects_allowed()
         intent = intent_stage.intent
         context_chunks = intent_stage.context_chunks
         runtime.add_tokens(intent_stage.token_usage)
@@ -561,11 +741,9 @@ async def _run_pipeline_inner(
             services=intent.services,
             archetype_ids=_initial_knowledge_archetype_ids(intent),
         )
-        if signal_store is not SIGNAL_STORE_UNAVAILABLE:
+        if signal_store is not SIGNAL_STORE_UNAVAILABLE and knowledge_service is not None:
             pin_started_at = time.monotonic()
             try:
-                enforce_knowledge_action(runtime.settings, KnowledgeAction.APPLY)
-                knowledge_service = resolve_knowledge_service(deps, signal_store=signal_store)
                 pin_snapshot = getattr(knowledge_service, "pin_snapshot", knowledge_service.create_snapshot)
                 knowledge_snapshot, knowledge_usage = pin_snapshot(knowledge_scope)
                 mapping_loader = getattr(knowledge_service, "signal_mappings_for_snapshot", None)
@@ -622,15 +800,23 @@ async def _run_pipeline_inner(
                 knowledge_service = None
                 knowledge_snapshot = None
                 knowledge_usage = []
-                activate_pin = getattr(signal_store, "activate_pinned_governed_mappings", None)
-                if activate_pin is not None:
-                    knowledge_pin_token = activate_pin(tenant_id=request.tenant_id, mappings=[])
+                knowledge_pin_token = _activate_empty_governed_mapping_pin(
+                    signal_store,
+                    tenant_id=request.tenant_id,
+                )
                 runtime.recorder.stage(
                     "knowledge_snapshot",
                     "skipped",
                     "knowledge_snapshot_unavailable",
                     **diagnostics,
                 )
+        elif signal_store is not SIGNAL_STORE_UNAVAILABLE and knowledge_preflight_diagnostics is not None:
+            runtime.recorder.stage(
+                "knowledge_snapshot",
+                "skipped",
+                "knowledge_snapshot_unavailable",
+                **knowledge_preflight_diagnostics,
+            )
 
         # ── 3. Metric discovery — each backend contributes ───────────
         discovery_stage = await run_discovery_stage(
@@ -644,6 +830,7 @@ async def _run_pipeline_inner(
             knowledge_scope=knowledge_scope,
             signal_resolution_work_budget=signal_resolution_work_budget,
         )
+        lifecycle.ensure_side_effects_allowed()
         catalog_discovery = discovery_stage.discovery
         metric_catalog = catalog_discovery.metric_catalog
         datasource_catalog = catalog_discovery.datasource_catalog
@@ -853,6 +1040,7 @@ async def _run_pipeline_inner(
                 started_at=runtime.started_at,
                 tenant_id=request.tenant_id,
             )
+            lifecycle.ensure_side_effects_allowed()
             runtime.add_tokens(freeform.token_usage)
             if freeform.failure is not None:
                 return freeform.failure
@@ -919,6 +1107,7 @@ async def _run_pipeline_inner(
             evidence_work_budget=evidence_stage.work_budget,
             signal_resolution_work_budget=signal_resolution_work_budget,
         )
+        lifecycle.ensure_side_effects_allowed()
         dashboard_spec = validation_result.dashboard_spec
         validation_warnings = validation_result.validation_warnings
         panels_before = validation_result.panels_before
@@ -1074,6 +1263,7 @@ async def _run_pipeline_inner(
                 culprit_ranking=culprit_ranking,
             )
 
+        lifecycle.ensure_side_effects_allowed()
         return await complete_pipeline(
             request=runtime.request,
             deps=runtime.deps,
@@ -1152,5 +1342,4 @@ async def _run_pipeline_inner(
                         reason_code="operational_knowledge_pin_reset_failed",
                         **diagnostics,
                     )
-        await safe_close_backends(backends)
-        await deps.close_resources()
+        await _cleanup_pipeline_resources(deps, backends)

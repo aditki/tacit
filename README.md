@@ -277,6 +277,26 @@ API_AUTH_ENABLED=true
 API_AUTH_KEY=<strong-token>
 ```
 
+All deployments deny cross-origin browser requests by default. If a separate
+web origin must call Tacit, configure exact origins. Authenticated deployments
+never permit `*`:
+
+```bash
+API_CORS_ALLOWED_ORIGINS=https://console.example,https://ops.example
+```
+
+The built-in UI needs no CORS entry when it is served by the Tacit API itself.
+Its API-key field is session-scoped: the browser keeps the value in
+`sessionStorage`, clears it when that browser session closes, and does not write
+it to Tacit's persistent application storage.
+
+Tacit rejects oversized HTTP bodies before JSON parsing. The default limit is
+2 MiB and can be changed with `API_MAX_REQUEST_BODY_BYTES` (1 KiB to 64 MiB).
+
+For an unauthenticated local deployment only, `API_CORS_ALLOWED_ORIGINS=*` is
+an explicit insecure opt-in that lets any website read and invoke the API from
+the browser. Do not use it on a shared or network-accessible deployment.
+
 For a wildcard multi-tenant runtime, bind each API key to one tenant and send
 that tenant in `X-Tacit-Tenant`:
 
@@ -315,6 +335,13 @@ Tacit supports:
 
 AWS Bedrock uses IAM instead of an API key. See the configuration examples in
 [tacit.yaml.example](tacit.yaml.example).
+
+For runtime-owned investigations, Bedrock accepts explicit access keys, static
+AWS credential/config profiles, frozen web identity, and one-level assume-role
+profiles backed by a static source profile. Credential-process, SSO/login,
+container-metadata, and instance-metadata providers currently fail closed
+because their executable or remote authority is not yet modeled in Tacit's
+runtime ownership contract.
 
 ## How It Works
 

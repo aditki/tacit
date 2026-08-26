@@ -11,7 +11,7 @@ from fastapi import Depends, Request
 
 import tacit.pipeline as pipeline_mod
 from tacit.config import Settings, settings
-from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies
+from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies, declare_backend_factory
 from tacit.runtime_stores import RuntimeStores
 
 _APP_STORE_LOCK = threading.Lock()
@@ -91,7 +91,11 @@ def _backend_factory_for(runtime_settings: Settings) -> Callable[[], Any]:
             return factory(runtime_settings)
         return factory()
 
-    return build_backends
+    return declare_backend_factory(
+        build_backends,
+        runtime_settings=runtime_settings,
+        component="api_dashboard_backend_factory",
+    )
 
 
 def get_pipeline_dependencies(request: Request) -> PipelineDependencies:

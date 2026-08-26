@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
 from tacit.agents.providers.base import TokenUsage
@@ -9,6 +8,7 @@ from tacit.main import app
 from tacit.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
 from tests.e2e.framework import CapturingBackend, build_grafana_dashboard, load_scenario
 from tests.e2e.test_dashboard_upload_learning import SCENARIO_PATH, _no_context
+from tests.http_client import TestClient
 
 
 @pytest.mark.e2e
@@ -61,6 +61,23 @@ def test_browser_ui_uses_one_captured_tenant_context_for_scoped_requests():
         "history": "loadHistory()",
     }.items():
         assert f"if (activeTab === '{tab}') {loader};" in reload_section
+
+
+@pytest.mark.e2e
+def test_browser_ui_requires_tacit_http_origin_without_file_api_fallback():
+    html = TestClient(app).get("/").text
+
+    assert "const IS_TACIT_HTTP_ORIGIN = ['http:', 'https:'].includes(window.location.protocol);" in html
+    assert "const BASE = IS_TACIT_HTTP_ORIGIN ? window.location.origin : '';" in html
+    assert "function requireTacitHttpOrigin()" in html
+    assert "function renderDirectFileError()" in html
+    assert "Run tacit serve, then open the web address it provides." in html
+    assert html.count("requireTacitHttpOrigin();") >= 2
+
+    assert "LOCAL_API_BASE" not in html
+    assert "http://127.0.0.1:8000" not in html
+    assert "window.location.protocol === 'file:' ?" not in html
+    assert "Unable to reach Tacit API at ${BASE}" not in html
 
 
 @pytest.mark.e2e

@@ -2,7 +2,7 @@
 
 Status: mandatory implementation and review guidance
 
-Last reviewed: 2026-08-18
+Last reviewed: 2026-08-25
 
 This document turns Tacit's recurring cross-cutting failures into a test-first
 engineering contract. It applies to humans and coding agents. The living
@@ -116,9 +116,26 @@ or history side effects, identify and compare all supplied owners:
 | Factory returns an owner different from its descriptor | Fail closed | Returned dependency is never consumed |
 | Ownerless injected factory/store/service/backend | Fail closed | No fallback to a global owner |
 | Injected dependency is unavailable | Preserve explicit unavailable state | No global retry or fallback |
+| Production pipeline dependencies omit their runtime store owner | Fail construction; use the explicitly named isolated builder only for isolated graphs | No store, cache, provider, or admission controller is constructed |
+| History or feedback factory realizes an owner with missing, wrong-role, or mismatched identity | Fail at realization before the store is returned to a pipeline stage | No history start, provenance write, or other store method is called |
+| Direct or isolated pipeline omits an LLM/context capability | Install settings-bound owned factories through the isolated builder, with disabled context represented by a factory returning `None` | No process-global provider lookup |
+| Provider factory realizes an owner with missing or mismatched settings/configuration | Fail before the provider is returned to an agent stage | No prompt, context query, cache write, or remote call |
+| Injected store or provider factory lacks a declared owner, or its declaration conflicts with the runtime | Reject the declaration before invoking the factory | Factory call count remains zero; no database, SDK session, client, model discovery, or remote call occurs |
+| A declared factory realizes an owner different from its declaration | Reject the realized object before returning it | No store method, prompt, context query, cache write, or downstream stage consumes the object |
+| A provider product is rejected after construction | Retain it under the runtime cleanup owner and close it within the same bounded lifecycle as accepted products | Repeated ownership mismatches do not leak clients, file descriptors, tasks, or credential-bearing objects |
+| A backend factory declares multiple remotes | Realize exactly one backend for every declared remote identity, with no omissions or duplicates | A mismatched set performs no publication and every constructed backend is cleaned up |
+| One dependency bundle serves concurrent pipeline runs | Provider lifetime is leased per run or reference counted across active runs | One run cannot close a provider still used by another; initialization and final close occur once without leaks |
+| SDKs support ambient endpoint or account overrides | Pass the settings-derived canonical endpoint/account explicitly and include the effective remote in ownership | Ambient endpoint/account variables cannot redirect a client or alter its owner identity |
+| An SDK supports an ambient credential chain | Resolve one credential/account snapshot before ownership admission and bind client construction to that snapshot | Profile, environment, metadata, or process changes after admission cannot change the effective principal |
+| A credential chain contains a provider whose local execution or remote authority is not represented by the admitted plan | Reject the complete plan before constructing the SDK session, executing a process, reading an SSO cache, or contacting container/instance metadata; provider-selector keys are presence-sensitive, including blank values | Credential-process, MFA, SSO, login, container, and instance-metadata probes have zero side effects unless their exact capability is explicitly modeled and admitted |
+| A credential selector implies secondary remotes such as STS role assumption | Model the SDK's complete provider order, environment-name precedence and presence semantics; freeze the selected environment and local credential/config source identities; preserve separate static-credential providers; then synthesize one explicit private profile for the winning source | A valid role-assuming profile is admitted exactly once; profile/environment collisions, split static fields, conflicting credential/config fields, token paths, missing HOME with explicit files, source mutation, or environment mutation cannot make the SDK select a different principal, source profile, token, or remote set |
+| Signal or knowledge authority is injected into a pipeline | Preflight and realize its ownership before any LLM or context stage | A foreign authority owner causes zero provider constructions, prompts, context queries, or remote calls |
 
 Required tests must include construction-time and realization-time disagreement.
 A factory can be valid while the object it returns is not.
+Factory ownership failures emit only a stable phase, capability, reason code,
+and mismatch-dimension set. Paths, tenant identifiers, prompts, endpoints,
+accounts, and credential material are never observability fields.
 
 ## SQLite protected-path matrix
 
@@ -146,14 +163,16 @@ connection, WAL/SHM generations, checkpoints, and close lifecycle.
 | Owner admission observes a live WAL that changes during inspection | Retry the complete admission callback under one bounded deadline; never weaken source-stability validation | Concurrent first-open converges, retries are observable without paths or tenant values, and timeout fails closed |
 | A live-WAL snapshot grows while main and WAL files are copied | Enforce the aggregate byte cap against bytes actually read, reserving each chunk before writing it | Source growth cannot exceed the cap on disk; the isolated copy is removed and authority files remain unchanged |
 | Snapshot copy, SQLite inspection, or the trusted callback consumes the admission deadline | Share one absolute deadline across copy, query, callback, source verification, and retries | SQLite work is interrupted cooperatively; a trusted Python callback that returns late is rejected and never authorizes mutation |
-| Owner admission observes a live rollback journal | Fail closed until rollback recovery completes under a trusted writer | Journal and database bytes remain exact; no pre-trust recovery is attempted |
+| A benchmark snapshots a live SQLite database | Copy admitted main/WAL state without opening the authority database, then open only the disposable snapshot | Source directory entries, bytes, modes, and timestamps remain unchanged, including when the source directory is read-only |
+| A benchmark snapshots multiple SQLite roles | Verify the complete source-set identity before and after all role copies and retry or fail if any role generation moves | One report never combines history, feedback, and signals from different source generations |
+| Owner admission observes a live rollback journal | Fail closed until rollback recovery completes under a trusted writer; the high-level admission operation may retry within its existing absolute deadline without performing recovery itself | Journal and database bytes remain exact; transient first-open journals converge, persistent journals time out closed, and no pre-trust recovery is attempted |
 | First-open role identity or structural schema setup fails | Roll back the structural writer transaction together | Fault injection after every structural statement reopens without a role/schema split |
 | A pre-tenant schema needs a potentially large table rebuild | Keep the legacy table authoritative, prepare an empty shadow atomically, copy with durable keyset batches, then swap only after the complete copy | More than one batch, interruption after a committed batch, atomic final-swap failure, exact row preservation, and no current-schema marker before the swap |
 | A bounded legacy tenant-owner backfill batch fails | Roll back only that batch while preserving prior completed batches and their durable cursor | Restart resumes at the last committed cursor and no final completion marker exists early |
 | A keyset migration accepts zero, negative, sparse, or empty-string keys | Represent “not started” outside the legal key domain and copy every legal key exactly once, including an all-empty composite key | Boundary-key fixtures survive interruption and finalization without omission or retry loops |
 | A migration preserves a source key that runtime scans or cursors also consume | Use the same legal domain end to end; runtime pagination, audit, quarantine, forward lookup, and reverse lookup may not reintroduce a narrower sentinel | Negative, zero, sparse, boundary, and empty-string fixtures remain reachable after migration and use indexed bounded plans |
 | An optional SQLite capability such as FTS is unavailable | Persist a stable degraded capability decision or fail closed | Reopening twice converges without replaying schema and audit work indefinitely |
-| Two processes race first-open | Revalidate role and tenant ownership as the first action after each structural `BEGIN IMMEDIATE`; equivalent owners converge and conflicting owners produce one winner | No loser schema, marker, tenant row, partial migration, or split identity |
+| Two processes race first-open | Revalidate role and tenant ownership as the first action after each structural `BEGIN IMMEDIATE`, and durably claim the tenant-owner migration in the first structural transaction before copying any tenant-specific row; equivalent owners converge and conflicting owners produce one winner | No loser schema, marker, tenant row, partial migration, or split identity, including across the gap between schema-copy completion and bounded owner backfill |
 | Knowledge and signal stores share one database | Require the knowledge repository to prove the signal role and durable tenant owner at construction and after every acquired write lock | Pinned mismatch, bound transaction, and real concurrent first-open tests leave the losing owner with zero schema, marker, or data writes |
 | Store uses execute, cursor, transaction, context-manager, or close APIs | Preserve ordinary stdlib `sqlite3` behavior | No custom connection/cursor subtype, guard descriptor, poison state, CPython layout access, or override-dependent assertion |
 | Cooperating processes open, write, reopen, checkpoint, and last-close a WAL database | Succeed under SQLite's normal sidecar lifecycle | Real subprocess test completes with exact committed rows and bounded timeouts |
@@ -218,6 +237,11 @@ errors exit nonzero; the exact command and output are review evidence.
 | Wildcard with auth disabled | Any request | Reject configuration at startup |
 | Legacy ownerless data under pinned migration | No recorded tenant | Assign the explicit pinned migration owner |
 | Legacy ownerless data under wildcard migration | No recorded tenant | Fail before schema mutation |
+
+Public pipeline entry points resolve the effective settings, semantic action,
+and tenant boundary before constructing default dependencies. Every denial case
+must prove zero store/schema initialization, credential-source access, provider
+construction, and remote calls.
 
 For each semantic action, test the complete permission tuple at API, CLI, and
 public service boundaries:
@@ -299,6 +323,12 @@ For every read-check-write sequence, test:
 | Process failure after each transaction boundary | No split authoritative state |
 | Retry after partial optional work | Idempotent result without duplicate revision or usage |
 | Parallel crawls | Runtime-wide admission bound is preserved |
+| Multiple dependency bundles share one runtime | One explicit runtime-owned admission controller enforces the aggregate limit |
+| One wildcard tenant saturates active work | Per-tenant active capacity preserves at least one slot for another tenant |
+| Large cross-loop waiter handoff | Selected-waiter maintenance is amortized, bounded, and does not poll idle queues |
+| Timeout or caller cancellation leaves underlying provider work alive | Keep a strong reference to that work inside the runtime's effective-work budget until its completion callback runs, fence late side effects, and fail closed once bounded quarantine is full | Garbage collection cannot destroy a pending task and permanently strand admission capacity; repeated timeouts cannot make active SDK calls, retained tasks, clients, or provider generations exceed the configured bound |
+| Timeout or caller cancellation enters dependency cleanup | Run synchronous cleanup off the event loop, bound cleanup by an explicit grace period, and detach resistant cleanup without an unbounded post-cancel wait while preserving effective-work accounting | A blocking or cancellation-resistant close method cannot retain a request forever, wedge future generations, or grow retained cleanup state without bound |
+| One admission lease retains more than one work category | Centralize completion and release only after the union of retained tasks, threads, and future work categories is empty | Completion of one category cannot release capacity while another category still performs effective work; the lease is released exactly once after the last survivor exits |
 
 Inject faults after each durable statement or transaction phase, not merely at
 function entry. Validate database state after reopening a new connection.
@@ -352,7 +382,7 @@ Every collection or background operation needs a documented bound.
 
 | Dimension | Required test |
 |---|---|
-| Input size | At limit succeeds; limit plus one fails before partial writes |
+| Input size | At limit succeeds; limit plus one fails before partial writes; HTTP bodies are bounded in the ASGI receive path before framework buffering or decoding |
 | Directory traversal | Entry, file, and byte budgets; no symlink escape or path reopen race |
 | Structured document | Node, depth, alias, scalar, and result-cardinality limits; one file validates atomically |
 | Database rows | Query is keyset-paged and uses the exact intended index |
@@ -362,7 +392,9 @@ Every collection or background operation needs a documented bound.
 | Pattern matching | Aggregate scan and comparison budgets fail closed |
 | Multi-stage resolution | One investigation-owned budget spans discovery, selection, compilation, evidence, and rescue |
 | Object composition | Aggregate panels, queries, nested nodes, scalar characters, and bytes are admitted before allocation |
-| Concurrent requests | Runtime-wide bound, not only per-request semaphore |
+| Concurrent requests | Runtime-wide bound shared by API, Slack, CLI, benchmark, and direct defaults; different runtime owners remain isolated |
+| Admission queue | Global and wildcard-tenant partition lengths are bounded; one tenant cannot fill the global queue; partitions are scheduled fairly; capacity-eligible partitions are indexed separately from capped partitions; blocked full queues cannot strand spare capacity from a newly eligible tenant; queue wait consumes the overall pipeline deadline; stopped or closed event loops cannot retain permits; at-limit and limit-plus-one tests exercise the supported maximum with deterministic operation-count assertions and without full-queue rescans |
+| Active admission | Wildcard tenants cannot consume every slot when multiple slots exist; a lease's controller, token, and partition are validated before active state is removed; cross-controller and other forged releases leave the legitimate lease releasable; direct dependency graphs choose an explicit runtime owner or isolated owner |
 | Task creation | Worker or batch count is bounded; no gather over unbounded input |
 | Source crawl | Completeness is true only when every source was retained |
 | Long-lived learned state | Quality and latency compared with clean state |
@@ -377,18 +409,90 @@ work limit.
 
 - Browser requests carry the selected tenant on every tenant-aware tab and
   fallback request. Actions are bound to the tenant that rendered the row.
+- Authenticated APIs default to same-origin browser access. Any CORS allowlist
+  contains exact HTTP(S) origins and never `*`, and admits the API-key and tenant
+  headers explicitly. App construction revalidates copied or mutated settings;
+  model construction is not the final security boundary.
+- HTTP request-size enforcement wraps the ASGI receive channel. It rejects a
+  declared oversize before reading the body and counts streamed chunks when a
+  length is absent, invalid, or dishonest; model validation is not a memory
+  admission boundary.
+- Direct `file://` UI use is rejected locally; browser clients are served from
+  Tacit's HTTP(S) origin and never synthesize cross-origin localhost fallbacks.
+- API tests use a supported ASGI transport boundary rather than a deprecated
+  framework compatibility adapter; repository invariants prevent its return.
+  A synchronous helper preserves ASGI lifespan state and cookie deletion as
+  well as one-shot request behavior. Startup and shutdown failure messages and
+  original task exceptions retain their identity while failed lifespan tasks
+  are observed and cleaned up without waiting for an extra protocol message.
 - Paginated UIs expose continuation and discard stale responses after tenant
   changes.
 - Expected validation and concurrency errors map to stable API and CLI outcomes.
 - New schemas, corpora, and data files are present in built wheels.
 - Documented commands exist and are exercised in CI.
 - Runtime manifests report the package version actually shipped.
-- Success, degraded success, cancellation, timeout, stale conflict, and failure
-  are distinguishable in structured events and metrics.
+- The PyPI/GHCR release tag exactly matches a supported package version before
+  builds start, resolves to the exact checked-out SHA, is reachable from a
+  freshly fetched `origin/main`, and has a successful completed main CI run for
+  that same SHA before publication. Installed metadata, runtime version, and
+  CLI output agree semantically. The `v*` namespace and the `ghcr` and `pypi`
+  deployment environments are protected repository controls. Publication
+  actions use immutable commit identities; downloaded tools and privileged
+  images use explicit versions and immutable digests where available. Release
+  checkouts do not persist credentials, and emulation is enabled only where
+  required.
+- Container architectures are built once into portable artifacts, scanned as
+  verified disposable copies, and promoted without rebuilding. The
+  authoritative archive and checksum are uploaded before scanner execution;
+  publication downloads that pre-scan artifact, never scanner workspace bytes.
+  Current-run architecture archives are published to checksum-bound staging
+  references and pinned by digest before an existing full-version tag can be
+  reused. Retry reuse requires its exact child digests to equal those current
+  build digests; labels alone are not authority. Stable channel aliases move
+  only to newer semantic versions, and cross-tag publication uses a
+  non-cancelling queue. Every `v*` publisher shares this graph. Distribution and
+  platform-binary smoke tests and read-only registry preflight finish before the
+  first registry mutation. The final multi-architecture GHCR version precedes
+  PyPI publication, and only the protected GitHub-release job receives
+  repository write permission.
+- Release retries pin the scanned architecture and index digests through alias
+  publication. Binary archives are reproducible, existing release assets are
+  name- and size-preflighted before bounded streaming digest verification and
+  are never overwritten. Binary packaging uses no-follow open plus descriptor
+  identity checks and rejects symlinks, path swaps, non-regular, empty, or
+  oversized inputs before archive creation. It streams both archive creation
+  and hashing under explicit input/output bounds. PyPI metadata is content-length
+  checked and byte-bounded before JSON decoding in preflight and postflight;
+  local distribution digests are streamed in bounded chunks in both paths.
+  Downloader-managed scanners run only in jobs without registry write
+  permission and receive only a verified disposable artifact copy. Downloaded
+  privileged tooling is checksum-verified before registry login, every action
+  in the CI workflow that authorizes release is immutable, and every release job
+  has a bounded timeout.
+- Cross-registry publication ordering and residual failure states are documented.
+  Tests must not claim transactional rollback across independent registries.
+- Success, degraded success, admission overload, queued cancellation, timeout,
+  stale conflict, and failure are distinguishable in structured events and
+  metrics.
 - Expected degraded events expose stable reason codes and bounded counters, not
   tracebacks, raw payloads, query text, tenant data, credentials, or local paths.
 - Benchmarks used as gates exit nonzero on execution errors, empty corpora, or
-  threshold failure.
+  threshold failure. Provider exceptions can never be normalized into a passing
+  prediction, and required positive/negative populations must both be nonempty.
+  Live API modes carry only the evaluation state's configured credentials and tenant,
+  and clean versus representative long-lived state is explicit, isolated, and
+  reported rather than inferred from the caller's mutable files.
+- Offline evaluation gates create no network capability. Live destructive
+  harnesses accept only explicit local endpoints, require a destructive-action
+  acknowledgement, and fail before filesystem or network access. Isolated
+  model runs use only their dependency-owned provider and scrub ambient SDK
+  credentials and uppercase/lowercase proxy variables while process-global
+  state is held under one serialized owner. Evaluation-owned local HTTP clients
+  disable environment proxy discovery; the isolation boundary restores the
+  caller's environment exactly on exit.
+- Committed-history secret scanning has one explicit full reachable-history
+  baseline before incremental event ranges are accepted. Current-tree scanning
+  uses a Git-object-free export; neither mode silently substitutes for the other.
 
 ## Quality gates
 
@@ -398,6 +502,7 @@ work limit.
 | Intent, retrieval, signal resolution, archetypes, ranking | 100-prompt clean and representative long-lived state |
 | Browser or API workflow | Hermetic E2E and browser security tests |
 | Migration, package data, CLI command | Built-wheel smoke test |
+| Release workflow | Exact tag/version and main-ancestry tests, exact-SHA CI authorization, immutable dependencies in both CI and release, pre-scan authoritative artifact upload, disposable read-only scanning, bounded image/binary and remote-metadata I/O, reproducible same-SHA OCI child digests, current-build child-digest equality on retry, committed-history secret scanning, protected publication boundaries, and publication dependency graph |
 | Query/index or crawl scaling | Production query plan and limit-plus-one test |
 | Concurrency or transactions | Parallel race and crash/fault-injection test |
 | SQLite path, connection, or migration | Protected-path matrix, real subprocess WAL lifecycle, transactional fault injection, and benchmark artifact |

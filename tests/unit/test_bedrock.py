@@ -14,8 +14,15 @@ Covers:
 import asyncio
 import os
 import sys
-from datetime import UTC
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from structlog.testing import capture_logs
+
+from tacit.config import Settings
+from tacit.errors import RuntimeOwnershipError
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -24,28 +31,48 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _make_bedrock_provider(mock_client, mock_settings_overrides=None):
-    """Helper to construct a BedrockProvider with a mocked client."""
-    mock_boto3 = MagicMock()
-    mock_session = MagicMock()
-    mock_session.client.return_value = mock_client
-    mock_boto3.Session.return_value = mock_session
+    """Construct a provider with a captured session and inject its runtime client."""
 
-    with (
-        patch.dict("sys.modules", {"boto3": mock_boto3}),
-        patch("tacit.agents.providers.bedrock.settings") as mock_settings,
+    settings_values: dict[str, object] = {
+        "llm_bedrock_region": "us-east-1",
+        "llm_aws_access_key_id": "AKIATESTFIXTURE",
+        "llm_aws_secret_access_key": "test-fixture-secret",
+        "llm_bedrock_role_arn": "",
+        "llm_bedrock_model_id": "",
+        "llm_model": "claude-sonnet-4-20250514",
+    }
+    settings_values.update(mock_settings_overrides or {})
+    runtime_settings = Settings.model_validate(settings_values)
+    from tacit.agents.providers.bedrock import BedrockProvider
+
+    with patch(
+        "tacit.agents.providers.bedrock._build_boto3_session",
+        return_value=MagicMock(),
     ):
-        mock_settings.llm_bedrock_region = "us-east-1"
-        mock_settings.llm_aws_access_key_id = ""
-        mock_settings.llm_aws_secret_access_key = ""
-        mock_settings.llm_bedrock_role_arn = ""
-        mock_settings.llm_bedrock_model_id = ""
-        mock_settings.llm_model = "claude-sonnet-4-20250514"
-        if mock_settings_overrides:
-            for k, v in mock_settings_overrides.items():
-                setattr(mock_settings, k, v)
-        from tacit.agents.providers.bedrock import BedrockProvider
+        provider = BedrockProvider(runtime_settings)
+    provider._client = mock_client
+    return provider, runtime_settings
 
-        return BedrockProvider(), mock_settings
+
+def _assert_frozen_discovery_session(
+    mock_boto3: MagicMock,
+    *,
+    profile: str | None,
+    region: str,
+) -> None:
+    discovery_kwargs = mock_boto3.Session.call_args_list[0].kwargs
+    assert set(discovery_kwargs) == {"botocore_session"}
+    core_session = discovery_kwargs["botocore_session"]
+    assert core_session.get_config_variable("profile") == profile
+    assert core_session.get_config_variable("region") == region
+    credentials_path = Path(core_session.get_config_variable("credentials_file"))
+    config_path = Path(core_session.get_config_variable("config_file"))
+    assert credentials_path.name == "credentials"
+    assert config_path.name == "config"
+    assert credentials_path.parent == config_path.parent
+    assert "env" not in {
+        str(getattr(provider, "METHOD", "")) for provider in core_session.get_component("credential_provider").providers
+    }
 
 
 # ── _build_boto3_session tests ─────────────────────────────────────────────
@@ -57,116 +84,516 @@ def test_bedrock_session_explicit_keys():
     mock_session = MagicMock()
     mock_boto3.Session.return_value = mock_session
 
-    with (
-        patch.dict("sys.modules", {"boto3": mock_boto3}),
-        patch("tacit.agents.providers.bedrock.settings") as mock_settings,
-    ):
-        mock_settings.llm_bedrock_region = "us-west-2"
-        mock_settings.llm_aws_access_key_id = "AKIAIOSFODNN7EXAMPLE"
-        mock_settings.llm_aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-        mock_settings.llm_bedrock_role_arn = ""
+    runtime_settings = Settings(
+        _env_file=None,
+        llm_provider="bedrock",
+        llm_bedrock_region="us-west-2",
+        llm_aws_access_key_id="AKIAIOSFODNN7EXAMPLE",
+        llm_aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    )
 
+    with patch.dict("sys.modules", {"boto3": mock_boto3}):
         from tacit.agents.providers.bedrock import _build_boto3_session
 
-        session = _build_boto3_session()
+        resolved = _build_boto3_session(runtime_settings)
 
         mock_boto3.Session.assert_called_once_with(
             region_name="us-west-2",
             aws_access_key_id="AKIAIOSFODNN7EXAMPLE",
             aws_secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
         )
-        assert session == mock_session
+        assert resolved.session == mock_session
+        assert "AKIAIOSFODNN7EXAMPLE" not in repr(resolved)
+        assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" not in repr(resolved)
 
     print("[PASS] test_bedrock_session_explicit_keys")
 
 
-def test_bedrock_session_default_chain():
-    """Strategy 3: no explicit keys → default boto3 chain."""
+def test_bedrock_session_default_chain(monkeypatch, tmp_path):
+    """Strategy 3: default boto3 credentials are copied into a pinned session."""
     mock_boto3 = MagicMock()
-    mock_session = MagicMock()
-    mock_boto3.Session.return_value = mock_session
+    discovery_session = MagicMock()
+    credentials = MagicMock(method="shared-credentials-file")
+    credentials.get_frozen_credentials.return_value = SimpleNamespace(
+        access_key="AKIADEFAULT",
+        secret_key="default-secret",
+        token="default-token",
+    )
+    discovery_session.get_credentials.return_value = credentials
+    pinned_session = MagicMock()
+    mock_boto3.Session.side_effect = [discovery_session, pinned_session]
 
-    with (
-        patch.dict("sys.modules", {"boto3": mock_boto3}),
-        patch("tacit.agents.providers.bedrock.settings") as mock_settings,
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_ACCESS_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SECRET_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_ROLE_ARN",
     ):
-        mock_settings.llm_bedrock_region = "eu-west-1"
-        mock_settings.llm_aws_access_key_id = ""
-        mock_settings.llm_aws_secret_access_key = ""
-        mock_settings.llm_bedrock_role_arn = ""
+        monkeypatch.delenv(name, raising=False)
+    credentials_path = tmp_path / "credentials"
+    credentials_path.write_text(
+        "[default]\n" "aws_access_key_id = AKIADEFAULT\n" "aws_secret_access_key = default-secret\n"
+    )
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials_path))
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "missing-config"))
+    runtime_settings = Settings(
+        _env_file=None,
+        llm_provider="bedrock",
+        llm_bedrock_region="eu-west-1",
+    )
 
+    with patch.dict("sys.modules", {"boto3": mock_boto3}):
         from tacit.agents.providers.bedrock import _build_boto3_session
 
-        session = _build_boto3_session()
+        resolved = _build_boto3_session(runtime_settings)
 
-        mock_boto3.Session.assert_called_once_with(region_name="eu-west-1")
-        assert session == mock_session
+        _assert_frozen_discovery_session(
+            mock_boto3,
+            profile="default",
+            region="eu-west-1",
+        )
+        assert mock_boto3.Session.call_args_list[1].kwargs == {
+            "region_name": "eu-west-1",
+            "aws_access_key_id": "AKIADEFAULT",
+            "aws_secret_access_key": "default-secret",
+            "aws_session_token": "default-token",
+        }
+        credentials.get_frozen_credentials.assert_called_once_with()
+        assert resolved.session == pinned_session
 
     print("[PASS] test_bedrock_session_default_chain")
 
 
-def test_bedrock_session_assume_role():
-    """Strategy 2: assume-role uses RefreshableCredentials via botocore."""
+@pytest.mark.parametrize(
+    ("credential_method", "profile_name"),
+    [
+        ("shared-credentials-file", "owner-a"),
+        ("shared-credentials-file", ""),
+    ],
+    ids=("profile", "default"),
+)
+def test_bedrock_freezes_ambient_credentials_before_client_creation(
+    monkeypatch,
+    tmp_path,
+    credential_method,
+    profile_name,
+):
+    """Ambient chains may rotate, but one admitted provider may not."""
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_ACCESS_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SECRET_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    if profile_name:
+        monkeypatch.setenv("AWS_PROFILE", profile_name)
+    credentials_path = tmp_path / "credentials"
+    config_path = tmp_path / "config"
+    selected_profile = profile_name or "default"
+    credentials_path.write_text(
+        f"[{selected_profile}]\n" "aws_access_key_id = AKIAFROZEN\n" "aws_secret_access_key = frozen-secret-material\n"
+    )
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials_path))
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config_path))
+
+    source_credentials = MagicMock(method=credential_method)
+    source_credentials.get_frozen_credentials.side_effect = [
+        SimpleNamespace(
+            access_key="AKIAFROZEN",
+            secret_key="frozen-secret-material",
+            token="frozen-session-token",
+        ),
+        SimpleNamespace(
+            access_key="AKIAMUTATED",
+            secret_key="mutated-secret-material",
+            token="mutated-session-token",
+        ),
+    ]
+    discovery_session = MagicMock()
+    discovery_session.get_credentials.return_value = source_credentials
+    pinned_session = MagicMock()
+    runtime_client = MagicMock()
+    pinned_session.client.return_value = runtime_client
+    mock_boto3 = MagicMock()
+    mock_boto3.Session.side_effect = [discovery_session, pinned_session]
+    runtime_settings = Settings(
+        _env_file=None,
+        llm_provider="bedrock",
+        llm_bedrock_region="us-east-1",
+        llm_bedrock_model_id="anthropic.claude-sonnet-4-20250514-v1:0",
+    )
+
+    with patch.dict("sys.modules", {"boto3": mock_boto3}), capture_logs() as logs:
+        from tacit.agents.providers.bedrock import BedrockProvider
+
+        provider = BedrockProvider(runtime_settings)
+        source_credentials.get_frozen_credentials.return_value = SimpleNamespace(
+            access_key="AKIAMUTATED",
+            secret_key="mutated-secret-material",
+            token="mutated-session-token",
+        )
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAAMBIENTMUTATION")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ambient-mutated-secret")
+        assert provider._ensure_client() is runtime_client
+
+    _assert_frozen_discovery_session(
+        mock_boto3,
+        profile=profile_name or "default",
+        region="us-east-1",
+    )
+    assert mock_boto3.Session.call_args_list[1].kwargs == {
+        "region_name": "us-east-1",
+        "aws_access_key_id": "AKIAFROZEN",
+        "aws_secret_access_key": "frozen-secret-material",
+        "aws_session_token": "frozen-session-token",
+    }
+    source_credentials.get_frozen_credentials.assert_called_once_with()
+    pinned_session.client.assert_called_once_with(
+        "bedrock-runtime",
+        endpoint_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+    )
+    serialized_owner = repr(provider.runtime_ownership)
+    serialized_logs = repr(logs)
+    remote = next(item for item in provider.runtime_ownership.remotes if item.provider == "llm:bedrock")
+    from tacit.runtime_ownership import credential_fingerprint
+
+    assert remote.credential_fingerprint == credential_fingerprint(
+        "AKIAFROZEN\0frozen-secret-material\0frozen-session-token"
+    )
+    assert "AKIAFROZEN" not in serialized_owner
+    assert "frozen-secret-material" not in serialized_owner
+    assert "frozen-session-token" not in serialized_owner
+    assert "AKIAFROZEN" not in serialized_logs
+    assert "frozen-secret-material" not in serialized_logs
+    assert "frozen-session-token" not in serialized_logs
+    if profile_name:
+        assert profile_name not in serialized_owner
+        assert profile_name not in serialized_logs
+
+
+@pytest.mark.parametrize("source", ["settings", "environment"])
+def test_bedrock_rejects_partial_credential_pairs(monkeypatch, source):
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    values = {
+        "_env_file": None,
+        "llm_provider": "bedrock",
+        "llm_bedrock_region": "us-east-1",
+    }
+    if source == "settings":
+        values["llm_aws_access_key_id"] = "AKIAPARTIAL"
+    else:
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAPARTIAL")
+    runtime_settings = Settings(**values)
+
+    from tacit.runtime_ownership import runtime_descriptor_for_provider
+
+    with pytest.raises(RuntimeOwnershipError, match="both access key and secret key"):
+        runtime_descriptor_for_provider(
+            component="partial_bedrock_credentials",
+            runtime_settings=runtime_settings,
+            capability="llm",
+        )
+
+
+def test_bedrock_provider_pins_profile_and_ignores_ambient_endpoint(monkeypatch, tmp_path):
+    """Provider ownership and clients must retain the accepted AWS profile."""
+    mock_boto3 = MagicMock()
+    discovery_session = MagicMock()
+    credentials = MagicMock(method="shared-credentials-file")
+    credentials.get_frozen_credentials.return_value = SimpleNamespace(
+        access_key="AKIAPROFILEA",
+        secret_key="profile-a-secret",
+        token="profile-a-token",
+    )
+    discovery_session.get_credentials.return_value = credentials
+    pinned_session = MagicMock()
+    pinned_session.client.return_value = MagicMock()
+    mock_boto3.Session.side_effect = [discovery_session, pinned_session]
+    monkeypatch.setenv("AWS_PROFILE", "owner-a")
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "https://attacker.invalid")
+    monkeypatch.setenv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "https://runtime-attacker.invalid")
+    monkeypatch.delenv("AWS_DEFAULT_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    credentials_path = tmp_path / "credentials"
+    credentials_path.write_text(
+        "[owner-a]\n" "aws_access_key_id = AKIAPROFILEA\n" "aws_secret_access_key = profile-a-secret\n"
+    )
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials_path))
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "missing-config"))
+    runtime_settings = Settings(
+        _env_file=None,
+        llm_provider="bedrock",
+        llm_bedrock_region="us-east-1",
+        llm_bedrock_model_id="anthropic.claude-sonnet-4-20250514-v1:0",
+    )
+
+    with patch.dict("sys.modules", {"boto3": mock_boto3}):
+        from tacit.agents.providers.bedrock import BedrockProvider
+
+        provider = BedrockProvider(runtime_settings)
+        pinned_session.client.assert_not_called()
+        monkeypatch.setenv("AWS_PROFILE", "owner-b")
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAOWNERB")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "owner-b-secret")
+        provider._ensure_client()
+
+    _assert_frozen_discovery_session(
+        mock_boto3,
+        profile="owner-a",
+        region="us-east-1",
+    )
+    assert mock_boto3.Session.call_args_list[1].kwargs == {
+        "region_name": "us-east-1",
+        "aws_access_key_id": "AKIAPROFILEA",
+        "aws_secret_access_key": "profile-a-secret",
+        "aws_session_token": "profile-a-token",
+    }
+    pinned_session.client.assert_called_once_with(
+        "bedrock-runtime",
+        endpoint_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+    )
+    remotes = {remote.provider: remote for remote in provider.runtime_ownership.remotes}
+    assert remotes["llm:bedrock"].account.startswith("access-key:sha256:")
+    assert "owner-a" not in repr(provider.runtime_ownership)
+    assert remotes["llm:bedrock"].endpoint == "https://bedrock-runtime.us-east-1.amazonaws.com"
+    assert "llm:bedrock:control" not in remotes
+
+
+def test_bedrock_provider_uses_one_ambient_identity_snapshot(monkeypatch, tmp_path):
+    session = MagicMock()
+    session.client.return_value = MagicMock()
+    observed_environment: dict[str, str] = {}
+    monkeypatch.setenv("AWS_PROFILE", "owner-a")
+    monkeypatch.delenv("AWS_DEFAULT_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    credentials_path = tmp_path / "credentials"
+    credentials_path.write_text(
+        "[owner-a]\n" "aws_access_key_id = AKIAOWNERA\n" "aws_secret_access_key = owner-a-secret\n"
+    )
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials_path))
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "missing-config"))
+    runtime_settings = Settings(
+        _env_file=None,
+        llm_provider="bedrock",
+        llm_bedrock_region="us-east-1",
+        llm_bedrock_model_id="anthropic.claude-sonnet-4-20250514-v1:0",
+    )
+
+    def build_session(*, credential_plan):
+        observed_environment.update(credential_plan.environment)
+        monkeypatch.setenv("AWS_PROFILE", "owner-b")
+        return session
+
+    with patch(
+        "tacit.agents.providers.bedrock._build_boto3_session",
+        side_effect=build_session,
+    ):
+        from tacit.agents.providers.bedrock import BedrockProvider
+
+        provider = BedrockProvider(runtime_settings)
+
+    remotes = {remote.provider: remote for remote in provider.runtime_ownership.remotes}
+    assert observed_environment["AWS_PROFILE"] == "owner-a"
+    assert remotes["llm:bedrock"].account == "profile:owner-a"
+
+
+def test_bedrock_role_declares_sts_and_uses_canonical_endpoint(monkeypatch):
+    runtime_settings = Settings(
+        _env_file=None,
+        llm_provider="bedrock",
+        llm_bedrock_region="us-west-2",
+        llm_aws_access_key_id="AKIABASE",
+        llm_aws_secret_access_key="base-secret",
+        llm_bedrock_role_arn="arn:aws:iam::123456789012:role/TacitRuntime",
+        llm_bedrock_model_id="anthropic.claude-sonnet-4-20250514-v1:0",
+    )
+    monkeypatch.setenv("AWS_ENDPOINT_URL_STS", "https://attacker.invalid")
+
+    from tacit.runtime_ownership import runtime_descriptor_for_provider
+
+    descriptor = runtime_descriptor_for_provider(
+        component="bedrock_role_test",
+        runtime_settings=runtime_settings,
+        capability="llm",
+    )
+    remotes = {remote.provider: remote for remote in descriptor.remotes}
+    assert remotes["llm:bedrock"].account == "arn:aws:iam::123456789012:role/tacitruntime"
+    assert remotes["llm:bedrock:sts"].endpoint == "https://sts.us-west-2.amazonaws.com"
+
+
+def test_bedrock_ambient_web_identity_declares_sts(monkeypatch, tmp_path):
+    token_path = tmp_path / "web-identity-token"
+    token_path.write_text("test-token")
+    monkeypatch.setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/AmbientRuntime")
+    monkeypatch.setenv("AWS_WEB_IDENTITY_TOKEN_FILE", str(token_path))
+    runtime_settings = Settings(
+        _env_file=None,
+        llm_provider="bedrock",
+        llm_bedrock_region="us-east-2",
+        llm_bedrock_model_id="anthropic.claude-sonnet-4-20250514-v1:0",
+    )
+
+    with patch(
+        "tacit.agents.providers.bedrock._build_boto3_session",
+        return_value=MagicMock(),
+    ):
+        from tacit.agents.providers.bedrock import BedrockProvider
+
+        provider = BedrockProvider(runtime_settings)
+
+    remotes = {remote.provider: remote for remote in provider.runtime_ownership.remotes}
+    assert remotes["llm:bedrock:sts"].endpoint == "https://sts.us-east-2.amazonaws.com"
+    assert remotes["llm:bedrock:sts"].account == "arn:aws:iam::123456789012:role/ambientruntime"
+
+
+def test_bedrock_explicit_keys_ignore_unselected_ambient_role(monkeypatch):
+    monkeypatch.setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/Unselected")
+    monkeypatch.setenv("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/secrets/aws/token")
+    runtime_settings = Settings(
+        _env_file=None,
+        llm_provider="bedrock",
+        llm_bedrock_region="us-east-1",
+        llm_aws_access_key_id="AKIAEXPLICIT",
+        llm_aws_secret_access_key="explicit-secret",
+    )
+    mock_boto3 = MagicMock()
+    pinned_session = MagicMock()
+    mock_boto3.Session.return_value = pinned_session
+
+    with patch.dict("sys.modules", {"boto3": mock_boto3}):
+        from tacit.agents.providers.bedrock import BedrockProvider
+
+        provider = BedrockProvider(runtime_settings)
+
+    remotes = {remote.provider: remote for remote in provider.runtime_ownership.remotes}
+    assert remotes["llm:bedrock"].account.startswith("access-key:sha256:")
+    assert "llm:bedrock:sts" not in remotes
+
+
+def test_bedrock_ambient_web_identity_rejects_sts_endpoint_override(monkeypatch):
+    monkeypatch.setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/AmbientRuntime")
+    monkeypatch.setenv("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/secrets/aws/token")
+    monkeypatch.setenv("AWS_ENDPOINT_URL_STS", "https://sts-attacker.invalid")
+    runtime_settings = Settings(
+        _env_file=None,
+        llm_provider="bedrock",
+        llm_bedrock_region="us-east-1",
+    )
+
+    build_session = MagicMock()
+    with (
+        patch(
+            "tacit.agents.providers.bedrock._build_boto3_session",
+            build_session,
+        ),
+        pytest.raises(RuntimeOwnershipError, match="AWS STS endpoint overrides"),
+    ):
+        from tacit.agents.providers.bedrock import BedrockProvider
+
+        BedrockProvider(runtime_settings)
+
+    build_session.assert_not_called()
+
+
+def test_bedrock_role_closes_runtime_and_sts_clients():
+    runtime_settings = Settings(
+        _env_file=None,
+        llm_provider="bedrock",
+        llm_bedrock_region="us-east-1",
+        llm_aws_access_key_id="AKIABASE",
+        llm_aws_secret_access_key="base-secret",
+        llm_bedrock_role_arn="arn:aws:iam::123456789012:role/TacitRuntime",
+        llm_bedrock_model_id="anthropic.claude-sonnet-4-20250514-v1:0",
+    )
+    base_session = MagicMock()
+    role_session = MagicMock()
+    runtime_client = MagicMock()
+    sts_client = MagicMock()
+    sts_client.assume_role.return_value = {
+        "Credentials": {
+            "AccessKeyId": "ASIAASSUMED",
+            "SecretAccessKey": "assumed-secret",
+            "SessionToken": "assumed-token",
+        }
+    }
+    base_session.client.return_value = sts_client
+    role_session.client.return_value = runtime_client
+    mock_boto3 = MagicMock()
+    mock_boto3.Session.side_effect = [base_session, role_session]
+
+    with patch.dict("sys.modules", {"boto3": mock_boto3}):
+        from tacit.agents.providers.bedrock import BedrockProvider
+
+        provider = BedrockProvider(runtime_settings)
+        assert provider._ensure_client() is runtime_client
+        asyncio.run(provider.close())
+
+    runtime_client.close.assert_called_once_with()
+    sts_client.close.assert_called_once_with()
+
+
+def test_bedrock_session_assume_role(monkeypatch):
+    """Strategy 2: assume-role is frozen into one explicit session."""
+    monkeypatch.setenv("AWS_ENDPOINT_URL_STS", "https://sts-attacker.invalid")
     mock_boto3 = MagicMock()
     base_session = MagicMock()
-    refreshed_session = MagicMock()
+    assumed_session = MagicMock()
 
     mock_sts_client = MagicMock()
-    from datetime import datetime, timedelta
-
-    future = datetime.now(UTC) + timedelta(hours=1)
     mock_sts_client.assume_role.return_value = {
         "Credentials": {
             "AccessKeyId": "ASIAEXAMPLE",
             "SecretAccessKey": "secretexample",
             "SessionToken": "tokenexample",
-            "Expiration": future,
         }
     }
     base_session.client.return_value = mock_sts_client
+    mock_boto3.Session.side_effect = [base_session, assumed_session]
 
-    mock_boto3.Session.side_effect = [base_session, refreshed_session]
-
-    mock_botocore_session = MagicMock()
-    mock_refreshable = MagicMock()
-    mock_botocore_creds_mod = MagicMock()
-    mock_botocore_creds_mod.RefreshableCredentials.create_from_metadata.return_value = mock_refreshable
-    mock_botocore_sess_mod = MagicMock()
-    mock_botocore_sess_mod.get_session.return_value = mock_botocore_session
-
-    with (
-        patch.dict(
-            "sys.modules",
-            {
-                "boto3": mock_boto3,
-                "botocore": MagicMock(),
-                "botocore.credentials": mock_botocore_creds_mod,
-                "botocore.session": mock_botocore_sess_mod,
-            },
-        ),
-        patch("tacit.agents.providers.bedrock.settings") as mock_settings,
-    ):
-        mock_settings.llm_bedrock_region = "us-east-1"
-        mock_settings.llm_aws_access_key_id = ""
-        mock_settings.llm_aws_secret_access_key = ""
-        mock_settings.llm_bedrock_role_arn = "arn:aws:iam::123456789012:role/TestRole"
-
+    with patch.dict("sys.modules", {"boto3": mock_boto3}):
+        runtime_settings = Settings(
+            _env_file=None,
+            llm_bedrock_region="us-east-1",
+            llm_aws_access_key_id="AKIABASE",
+            llm_aws_secret_access_key="base-secret",
+            llm_bedrock_role_arn="arn:aws:iam::123456789012:role/TestRole",
+        )
         from tacit.agents.providers.bedrock import _build_boto3_session
 
-        _build_boto3_session()
+        resolved = _build_boto3_session(runtime_settings)
 
+        base_session.client.assert_called_once_with(
+            "sts",
+            endpoint_url="https://sts.us-east-1.amazonaws.com",
+        )
         mock_sts_client.assume_role.assert_called_once_with(
             RoleArn="arn:aws:iam::123456789012:role/TestRole",
             RoleSessionName="tacit-bedrock",
             DurationSeconds=3600,
         )
-        rc_cls = mock_botocore_creds_mod.RefreshableCredentials
-        rc_cls.create_from_metadata.assert_called_once()
-        call_kwargs = rc_cls.create_from_metadata.call_args[1]
-        assert call_kwargs["method"] == "sts-assume-role"
-        assert callable(call_kwargs["refresh_using"])
-        last_session_kwargs = mock_boto3.Session.call_args_list[-1][1]
-        assert "botocore_session" in last_session_kwargs
+        assert mock_boto3.Session.call_args_list[-1].kwargs == {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "ASIAEXAMPLE",
+            "aws_secret_access_key": "secretexample",
+            "aws_session_token": "tokenexample",
+        }
+        assert resolved.session is assumed_session
+        assert resolved.credential_clients == (mock_sts_client,)
 
     print("[PASS] test_bedrock_session_assume_role")
 
@@ -184,7 +611,14 @@ def test_bedrock_session_no_boto3_raises():
 
     with patch("builtins.__import__", side_effect=mock_import):
         try:
-            _build_boto3_session()
+            _build_boto3_session(
+                Settings(
+                    _env_file=None,
+                    llm_provider="bedrock",
+                    llm_aws_access_key_id="AKIATESTFIXTURE",
+                    llm_aws_secret_access_key="test-fixture-secret",
+                )
+            )
             assert False, "Should have raised ImportError"
         except ImportError as exc:
             assert "boto3" in str(exc)
@@ -192,67 +626,47 @@ def test_bedrock_session_no_boto3_raises():
     print("[PASS] test_bedrock_session_no_boto3_raises")
 
 
-def test_bedrock_assume_role_uses_refreshable_credentials():
-    """The refresh callback must be callable to re-assume before expiry."""
+def test_bedrock_assume_role_does_not_refresh_within_generation():
+    """Credential rotation requires a newly resolved and admitted provider."""
     mock_boto3 = MagicMock()
     base_session = MagicMock()
-    refreshed_session = MagicMock()
+    assumed_session = MagicMock()
 
     mock_sts = MagicMock()
-    from datetime import datetime, timedelta
-
-    future = datetime.now(UTC) + timedelta(hours=1)
     mock_sts.assume_role.return_value = {
         "Credentials": {
             "AccessKeyId": "ASIAEXAMPLE",
             "SecretAccessKey": "secret",
             "SessionToken": "token",
-            "Expiration": future,
         }
     }
     base_session.client.return_value = mock_sts
-    mock_boto3.Session.side_effect = [base_session, refreshed_session]
+    runtime_client = MagicMock()
+    assumed_session.client.return_value = runtime_client
+    mock_boto3.Session.side_effect = [base_session, assumed_session]
 
-    mock_botocore_session = MagicMock()
-    mock_refreshable = MagicMock()
-    mock_botocore_creds_mod = MagicMock()
-    mock_botocore_creds_mod.RefreshableCredentials.create_from_metadata.return_value = mock_refreshable
-    mock_botocore_sess_mod = MagicMock()
-    mock_botocore_sess_mod.get_session.return_value = mock_botocore_session
+    with patch.dict("sys.modules", {"boto3": mock_boto3}):
+        runtime_settings = Settings(
+            _env_file=None,
+            llm_provider="bedrock",
+            llm_bedrock_region="us-east-1",
+            llm_aws_access_key_id="AKIABASE",
+            llm_aws_secret_access_key="base-secret",
+            llm_bedrock_role_arn="arn:aws:iam::123456789012:role/TestRole",
+        )
+        from tacit.agents.providers.bedrock import BedrockProvider
 
-    with (
-        patch.dict(
-            "sys.modules",
-            {
-                "boto3": mock_boto3,
-                "botocore": MagicMock(),
-                "botocore.credentials": mock_botocore_creds_mod,
-                "botocore.session": mock_botocore_sess_mod,
-            },
-        ),
-        patch("tacit.agents.providers.bedrock.settings") as mock_settings,
-    ):
-        mock_settings.llm_bedrock_region = "us-east-1"
-        mock_settings.llm_aws_access_key_id = ""
-        mock_settings.llm_aws_secret_access_key = ""
-        mock_settings.llm_bedrock_role_arn = "arn:aws:iam::123456789012:role/TestRole"
+        provider = BedrockProvider(runtime_settings)
+        assert provider._ensure_client() is runtime_client
+        assert provider._ensure_client() is runtime_client
 
-        from tacit.agents.providers.bedrock import _build_boto3_session
+    mock_sts.assume_role.assert_called_once()
+    assumed_session.client.assert_called_once_with(
+        "bedrock-runtime",
+        endpoint_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+    )
 
-        _build_boto3_session()
-
-        rc_cls = mock_botocore_creds_mod.RefreshableCredentials
-        rc_cls.create_from_metadata.assert_called_once()
-        call_kwargs = rc_cls.create_from_metadata.call_args[1]
-        refresh_fn = call_kwargs["refresh_using"]
-        assert callable(refresh_fn)
-
-        result = refresh_fn()
-        assert result["access_key"] == "ASIAEXAMPLE"
-        assert result["token"] == "token"
-        assert mock_sts.assume_role.call_count == 2  # initial + refresh
-
-    print("[PASS] test_bedrock_assume_role_uses_refreshable_credentials")
+    print("[PASS] test_bedrock_assume_role_does_not_refresh_within_generation")
 
 
 # ── BedrockProvider._converse tests ────────────────────────────────────────

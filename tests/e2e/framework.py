@@ -22,7 +22,7 @@ from tacit.backends.base import DashboardFeatures, DiscoveryStatus, PublishResul
 from tacit.config import Settings, settings
 from tacit.dashboard_ingest import extract_metrics_from_promql
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
-from tacit.runtime_ownership import RuntimeOwnershipDescriptor, runtime_descriptor_from_settings
+from tacit.runtime_ownership import RuntimeOwnershipDescriptor, runtime_descriptor_for_backends
 
 
 @dataclass(frozen=True)
@@ -82,9 +82,9 @@ class CapturingBackend:
     @property
     def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
         active_settings = self.runtime_settings or settings
-        return runtime_descriptor_from_settings(
-            active_settings,
+        return runtime_descriptor_for_backends(
             component="e2e_capturing_backend",
+            runtime_settings=active_settings,
         )
 
     async def discover_metrics(self, keywords: list[str], intent: Intent) -> list[MetricEntry]:
@@ -123,7 +123,15 @@ class CapturingBackend:
 class IncidentFixtureProvider(LLMProvider):
     """Deterministic LLM substitute bounded to approved fixture metrics."""
 
-    def __init__(self, catalog: list[MetricEntry], approved_metrics: set[str], service: str):
+    def __init__(
+        self,
+        catalog: list[MetricEntry],
+        approved_metrics: set[str],
+        service: str,
+        *,
+        runtime_settings: Settings,
+    ):
+        super().__init__(runtime_settings, component="e2e_incident_fixture_provider")
         self._catalog = [entry for entry in catalog if entry.name in approved_metrics]
         self._service = service
 

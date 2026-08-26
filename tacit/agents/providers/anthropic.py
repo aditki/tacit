@@ -10,6 +10,8 @@ from tacit.config import Settings, settings
 
 logger = structlog.get_logger()
 
+_ANTHROPIC_API_ENDPOINT = "https://api.anthropic.com"
+
 JSON_PREAMBLE = "Respond ONLY with a valid JSON object. No markdown, no explanation."
 
 # Newer Claude models (Opus 4.8+) reject the `temperature` parameter. We discover
@@ -33,8 +35,12 @@ def _is_temperature_unsupported(exc: Exception) -> bool:
 
 class AnthropicProvider(LLMProvider):
     def __init__(self, runtime_settings: Settings | None = None):
-        self._settings = runtime_settings or settings
-        self._client = anthropic.AsyncAnthropic(api_key=self._settings.llm_api_key)
+        super().__init__(runtime_settings or settings, component="anthropic_llm_provider")
+        self._settings = self.runtime_settings
+        self._client = anthropic.AsyncAnthropic(
+            api_key=self._settings.llm_api_key,
+            base_url=self._settings.llm_api_base or _ANTHROPIC_API_ENDPOINT,
+        )
 
     @property
     def is_configured(self) -> bool:

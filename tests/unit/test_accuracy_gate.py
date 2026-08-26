@@ -1375,9 +1375,19 @@ def test_blending_enforces_archetype_and_panel_caps():
 
 def test_offline_gate_reports_semantic_and_selection_regressions():
     report = {
-        "classification": [{"dataset": "regressed", "precision": 0.89, "recall": 0.79, "coverage": 0.79}],
-        "cold_resolution": [{"dataset": "regressed", "recall": 0.74}],
-        "learned_resolution": [{"dataset": "regressed", "recall": 0.89}],
+        "classification": [
+            {
+                "dataset": "regressed",
+                "precision": 0.89,
+                "recall": 0.79,
+                "coverage": 0.79,
+                "labeled_signal_metrics": 1,
+                "tn": 1,
+                "fp": 0,
+            }
+        ],
+        "cold_resolution": [{"dataset": "regressed", "recall": 0.74, "total": 1}],
+        "learned_resolution": [{"dataset": "regressed", "recall": 0.89, "total": 1}],
         "learned_selection": [{"dataset": "regressed", "selected": "generic", "expected": "learned", "passed": False}],
     }
 

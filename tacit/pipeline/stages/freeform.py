@@ -14,6 +14,7 @@ from tacit.agents.metrics_discovery import SYSTEM_PROMPT, discover_metrics
 from tacit.agents.providers.base import TokenUsage
 from tacit.agents.query_builder import build_dashboard
 from tacit.dependencies import PipelineDependencies
+from tacit.errors import RuntimeOwnershipError
 from tacit.logging import stage_log
 from tacit.models.schemas import DashboardSpec, DashResponse, Intent, MetricEntry
 from tacit.pipeline.failures import PipelineFailureFactory
@@ -122,7 +123,9 @@ async def build_freeform_dashboard(
             ),
         )
     )
-    provider = deps.llm_provider_factory() if deps.llm_provider_factory else None
+    if deps.llm_provider_factory is None:
+        raise RuntimeOwnershipError("Pipeline freeform stage requires an owned LLM provider factory")
+    provider = deps.llm_provider_factory()
     cached_discovery = deps.llm_cache.get(discovery_cache_key)
     discovery_usage = TokenUsage()
     total_usage = TokenUsage()

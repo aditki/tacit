@@ -5,6 +5,14 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from tacit.config import Settings
+from tacit.runtime_ownership import (
+    RuntimeOwnershipDescriptor,
+    copy_runtime_settings,
+    runtime_descriptor_for_provider,
+    snapshot_runtime_settings,
+)
+
 
 @dataclass
 class TokenUsage:
@@ -32,6 +40,33 @@ class LLMResult:
 
 class LLMProvider(ABC):
     """Interface every LLM backend must implement."""
+
+    def __init__(self, runtime_settings: Settings | None = None, *, component: str = "llm_provider") -> None:
+        if runtime_settings is None:
+            return
+        self._runtime_settings = snapshot_runtime_settings(runtime_settings)
+        self._runtime_ownership = runtime_descriptor_for_provider(
+            component=component,
+            runtime_settings=self._runtime_settings,
+            capability="llm",
+        )
+
+    @property
+    def runtime_settings(self) -> Settings:
+        """Return the immutable configuration identity used by this provider."""
+        try:
+            runtime_settings = self._runtime_settings
+        except AttributeError as exc:
+            raise RuntimeError("LLM provider has no runtime ownership") from exc
+        return copy_runtime_settings(runtime_settings)
+
+    @property
+    def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
+        """Return the provider's public runtime ownership descriptor."""
+        try:
+            return self._runtime_ownership
+        except AttributeError as exc:
+            raise RuntimeError("LLM provider has no runtime ownership") from exc
 
     @property
     def is_configured(self) -> bool:

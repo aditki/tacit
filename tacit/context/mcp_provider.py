@@ -26,7 +26,8 @@ class MCPProvider(ContextProvider):
         return "mcp"
 
     def __init__(self, runtime_settings: Settings | None = None):
-        self._settings = runtime_settings or settings
+        super().__init__(runtime_settings or settings, component="mcp_context_provider")
+        self._settings = self.runtime_settings
         runtime_settings = self._settings
         self._server_url = runtime_settings.context_mcp_server_url.rstrip("/")
         headers: dict[str, str] = {"Content-Type": "application/json"}

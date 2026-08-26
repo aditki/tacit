@@ -12,6 +12,7 @@ from tacit.agents.intent_fallback import zero_key_mode
 from tacit.agents.providers.base import LLMProvider, TokenUsage
 from tacit.context.base import ContextProvider
 from tacit.dependencies import PipelineDependencies
+from tacit.errors import RuntimeOwnershipError
 from tacit.logging import stage_log
 from tacit.models.schemas import Intent
 
@@ -26,9 +27,6 @@ class _ZeroKeyProvider(LLMProvider):
 
     async def chat_text(self, system_prompt: str, user_prompt: str, temperature: float = 0.3):
         raise RuntimeError("zero-key fallback provider must not be called")
-
-
-_ZERO_KEY_PROVIDER = _ZeroKeyProvider()
 
 
 @dataclass(frozen=True)
@@ -55,9 +53,11 @@ async def run_intent_stage(
     if "provider" in classify_parameters:
         classify_provider: LLMProvider | None
         if deps.settings.intent_fallback_enabled and zero_key_mode(deps.settings):
-            classify_provider = _ZERO_KEY_PROVIDER
+            classify_provider = _ZeroKeyProvider(deps.settings, component="zero_key_llm_provider")
         else:
-            classify_provider = classify_provider_factory() if classify_provider_factory else None
+            if classify_provider_factory is None:
+                raise RuntimeOwnershipError("Pipeline intent stage requires an owned LLM provider factory")
+            classify_provider = classify_provider_factory()
         classify_kwargs: dict[str, Any] = {"provider": classify_provider}
         if "runtime_settings" in classify_parameters:
             classify_kwargs["runtime_settings"] = deps.settings
@@ -80,7 +80,9 @@ async def run_intent_stage(
     enrich_kwargs: dict[str, Any] = {}
     if "max_chunks" in enrich_parameters:
         enrich_kwargs["max_chunks"] = deps.settings.context_max_chunks
-    if "provider" in enrich_parameters and context_provider_factory is not None:
+    if "provider" in enrich_parameters:
+        if context_provider_factory is None:
+            raise RuntimeOwnershipError("Pipeline context stage requires an explicit context provider factory")
         enrich_kwargs["provider"] = context_provider_factory()
     context_chunks = await enrich(intent, **enrich_kwargs)
     timings["context"] = time.monotonic() - t0

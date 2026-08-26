@@ -85,11 +85,23 @@ Useful settings include:
 - `SIGNALS_DB_PATH`
 - `API_AUTH_ENABLED`
 - `API_AUTH_KEY`
+- `API_CORS_ALLOWED_ORIGINS`
+- `API_MAX_REQUEST_BODY_BYTES`
 - `KNOWLEDGE_TENANT_ID`
 - `KNOWLEDGE_TENANT_API_KEYS`
 - `LEARNING_APPROVAL_CLAIM_TTL_SECONDS`
 
 Wildcard tenancy requires API authentication with a distinct key per tenant.
+All deployments deny cross-origin browser requests unless
+`API_CORS_ALLOWED_ORIGINS` contains a comma-separated list of exact HTTP(S)
+origins. Authenticated deployments reject wildcard CORS. Same-origin use of the
+built-in UI does not need an allowlist entry. The UI stores a manually entered
+API key only in browser `sessionStorage`, so it is scoped to that browser
+session rather than Tacit's persistent application storage. An unauthenticated
+local runtime may explicitly set `API_CORS_ALLOWED_ORIGINS=*`, but that insecure
+opt-in must not be used on shared or network-accessible deployments.
+HTTP request bodies are limited to 2 MiB by default before JSON parsing;
+`API_MAX_REQUEST_BODY_BYTES` accepts values from 1 KiB through 64 MiB.
 `HISTORY_DB_PATH`, `FEEDBACK_DB_PATH`, and `SIGNALS_DB_PATH` must each reference
 a different SQLite file. Tacit rejects shared paths and cross-role database
 identities before initializing the stores.

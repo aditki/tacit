@@ -3,20 +3,21 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 import tacit.archetypes.templates as templates
 import tacit.pipeline as pipeline_mod
 from tacit.agents.providers import registry as provider_registry
 from tacit.agents.providers.base import TokenUsage
 from tacit.config import settings
-from tacit.dependencies import build_pipeline_dependencies
+from tacit.dependencies import build_pipeline_dependencies, declare_backend_factory
 from tacit.errors import FatalPipelineError
 from tacit.knowledge.enums import KnowledgeUsageDisposition
 from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
 from tacit.knowledge.service import KnowledgeService
 from tacit.main import app
 from tacit.models.schemas import ArchetypeMatch, CulpritCandidate, DashRequest, Intent, MetricEntry, SignalType
+from tacit.runtime_ownership import declare_runtime_factory
+from tacit.runtime_stores import RuntimeStores
 from tests.e2e.framework import (
     CapturingBackend,
     IncidentFixtureProvider,
@@ -27,6 +28,7 @@ from tests.e2e.framework import (
     load_scenario,
     scenario_catalog,
 )
+from tests.http_client import TestClient
 
 SCENARIO_PATH = Path(__file__).parent / "scenarios" / "checkout_upload_incident.yaml"
 TAUGHT_LATENCY_ARCHETYPE = """
@@ -224,7 +226,12 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
     }
     assert resolved_metrics
     assert resolved_metrics <= inferred_metrics
-    fixture_provider = IncidentFixtureProvider(catalog, resolved_metrics, service=current_service)
+    fixture_provider = IncidentFixtureProvider(
+        catalog,
+        resolved_metrics,
+        service=current_service,
+        runtime_settings=settings,
+    )
     monkeypatch.setattr(provider_registry, "create_provider", lambda _settings: fixture_provider)
 
     monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
@@ -489,11 +496,32 @@ async def test_governed_ranking_fails_closed_when_final_snapshot_is_unavailable(
     knowledge_service = RankingKnowledgeService()
     deps = build_pipeline_dependencies(
         runtime_settings,
-        backend_factory=lambda: [backend],
-        history_store_factory=lambda: history_store,
-        feedback_store_factory=lambda: feedback_store,
-        signal_store_factory=lambda: signal_store,
-        knowledge_service_factory=lambda: knowledge_service,
+        stores=RuntimeStores(runtime_settings),
+        backend_factory=declare_backend_factory(
+            lambda: [backend],
+            runtime_settings=runtime_settings,
+            component="e2e_ranking_backend_factory",
+        ),
+        history_store_factory=declare_runtime_factory(
+            lambda: history_store,
+            ownership=history_store.runtime_ownership,
+            factory_kind="store:history",
+        ),
+        feedback_store_factory=declare_runtime_factory(
+            lambda: feedback_store,
+            ownership=feedback_store.runtime_ownership,
+            factory_kind="store:feedback",
+        ),
+        signal_store_factory=declare_runtime_factory(
+            lambda: signal_store,
+            ownership=signal_store.runtime_ownership,
+            factory_kind="store:signals",
+        ),
+        knowledge_service_factory=declare_runtime_factory(
+            lambda: knowledge_service,
+            ownership=knowledge_service.runtime_ownership,
+            factory_kind="knowledge:signals",
+        ),
     )
 
     with pytest.raises(FatalPipelineError, match="usage audit could not be persisted"):
