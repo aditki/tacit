@@ -2,7 +2,7 @@
 
 Status: living implementation guidance
 
-Last reviewed: 2026-08-18
+Last reviewed: 2026-08-25
 
 This document records recurring engineering lessons and refactor signals found
 while building Tacit's Investigation Contract, Operational Knowledge, learning,
@@ -42,6 +42,66 @@ The app and CLI must not develop separate heads. A capability available through
 both surfaces should share the same service method, policy checks, tenant
 resolution, transaction semantics, and projections.
 
+Runtime-wide admission control belongs to that composition root, not to a
+request dependency bundle or a module-global singleton. Every dependency bundle
+from one `RuntimeStores` owner shares one controller; different runtime owners
+remain isolated even when their configured limits differ. The controller must
+remain safe when synchronous ASGI tests or embeddings drive one app through
+multiple event loops. API, Slack, public defaults, and evaluation harnesses must
+reuse their composition owner's controller rather than constructing one per
+request. Bound both in-flight and queued work, count admission wait against the
+overall pipeline deadline, and reclaim waiters whose loop closes or stops while
+holding a selected permit. Wildcard runtimes partition the bounded queue by
+tenant, cap each partition below the global queue bound, and schedule ready
+partitions round-robin so one tenant cannot starve another. Queue maintenance
+uses event notification and bounded selected-permit checks rather than rescanning
+every waiter on each release. The scheduler indexes only partitions whose queue
+head is ready and whose partition has capacity; capped partitions re-enter that
+index in constant time when their own active lease or selected reservation is
+released. Maximum-scale tests count scheduler examinations instead of relying
+on wall-clock thresholds. After reserving older eligible queue heads, blocked
+partition queues do not strand spare global capacity from a newly eligible
+partition; an arrival never bypasses an older waiter in its own partition.
+Wildcard runtimes also cap active work per tenant below the global limit when at
+least two slots exist; a single-slot runtime can only provide round-robin
+progress. Admission leases carry an opaque controller identity and their
+partition, and must be validated as a controller-token-partition tuple before
+any active state is removed, so a cross-controller or otherwise forged release
+cannot consume the legitimate lease. Record queue
+wait, global and partition depth, active counts, configured limits, overload
+rejection, and queued cancellation with stable reason codes.
+
+Evaluation isolation is a capability boundary, not just a temporary database.
+Offline gates receive no network capability. Live harnesses opt into explicit
+loopback endpoints and use the isolated dependency graph rather than global
+providers or credentials. Any destructive fixture replacement requires a
+separate acknowledgement after endpoint validation, before files, clients, or
+network calls are created. Contexts that temporarily mutate process-wide
+environment or archetype state serialize across threads and fail closed on
+overlapping asynchronous tasks. Evaluation-owned local HTTP clients set
+`trust_env=False`; cold isolation also removes and restores the standard
+uppercase and lowercase HTTP, HTTPS, and all-proxy variables. Production HTTP
+clients retain their normal environment-proxy behavior unless their owner
+explicitly selects the evaluation-safe construction path.
+
+Pipeline dependency bundles are capability manifests, not bags of optional
+callables. The production builder requires one explicit `RuntimeStores` owner;
+only the deliberately named isolated builder may synthesize an isolated owner.
+History and feedback factories are checked again when they realize a store,
+including settings, tenant policy, semantic permissions, role, and exact
+database identity, before the store reaches a pipeline stage. LLM and context
+factories are always present and settings-bound; disabled context is a factory
+that explicitly returns `None`. A missing factory never means "consult the
+process singleton." Provider realizations carry a public ownership descriptor
+and are rejected before agent or network use when their settings identity does
+not match the dependency graph.
+
+Backend factories follow the same declaration-before-invocation contract as
+stores and providers. An SDK with an ambient credential chain resolves a stable
+credential/account snapshot before ownership admission and constructs every
+lazy client from that snapshot. Ambient endpoint, profile, organization, and
+project variables cannot add undeclared remotes or identities after admission.
+
 ### Tenant isolation is end to end
 
 Tenant selection is a data boundary, not request decoration.
@@ -56,6 +116,25 @@ Tenant selection is a data boundary, not request decoration.
   lookup is not enough if the lookup itself leaks another tenant's data.
 - Browser requests must send the selected tenant consistently across Generate,
   Learning, Knowledge, Signals, and History views.
+- Authenticated browser deployments deny cross-origin requests unless exact
+  HTTP(S) origins are configured. Wildcard CORS is never compatible with an API
+  key held by the browser; same-origin remains the default. Revalidate this at
+  app construction because unvalidated model copies and failed assignment
+  validation can leave a settings object in an invalid state.
+- A UI opened from `file://` is not a supported API origin. It shows the local
+  serve instruction and makes no `Origin: null` request or hard-coded localhost
+  fallback.
+- Request-body admission wraps the ASGI receive channel before framework
+  buffering and decoding. Declared oversize bodies are rejected without a body
+  read; missing, duplicate, invalid, or dishonest lengths remain subject to the
+  same streamed byte count.
+- HTTP test helpers are compatibility boundaries. A supported ASGI transport
+  must preserve lifespan startup/shutdown, lifespan state, cookie persistence
+  and deletion, exception behavior, and ordinary one-shot requests. A
+  `lifespan.*.failed` response is already terminal evidence: preserve its exact
+  message or the app's original task exception, observe and cancel unfinished
+  lifespan work, and never wait for an additional protocol message that may not
+  arrive.
 - Legacy migrations inherit the configured pinned tenant. A wildcard runtime
   must fail before schema mutation when pre-tenant user data has no explicit
   owner; migrate once under a pinned owner before enabling wildcard tenancy.
@@ -266,6 +345,95 @@ layer is warranted.
 - A run row and its corresponding start or terminal lifecycle event are one
   transaction. Neither side may become visible without the other.
 - Client cancellation is cancellation, not timeout.
+- Timeout and caller-cancellation cleanup has a separate bounded grace period.
+  Admission release is unconditional; a dependency close that never completes
+  is observed and abandoned without extending the request deadline forever.
+
+### Release publication is a staged external commit
+
+PyPI and GHCR do not provide one cross-registry transaction or a reliable
+rollback primitive. The release workflow must describe and test the ordering it
+can guarantee instead of claiming strict atomic publication.
+
+- Every `v*` publisher belongs to one validated workflow. Python distributions,
+  container images, and platform binaries may not have independent tag paths
+  that bypass the shared gates. A release tag exactly equals `v` plus the package
+  version before any build or publication starts. Supported versions are
+  three-part stable or prerelease versions; post releases and local versions are
+  rejected until their image-channel semantics are explicitly designed. The
+  tagged SHA is checked out explicitly by every source-consuming release job,
+  must remain reachable from a freshly fetched `origin/main`, and must have a
+  successful completed main CI run for that exact commit. This authorization is
+  downstream of all read-only release gates and upstream of the first registry
+  mutation.
+- The wheel smoke test compares the validated version with installed package
+  metadata, the runtime module version, and CLI output using PEP 440 semantic
+  equality from an isolated environment rather than the source checkout.
+  Publication actions are pinned to reviewed commit identities. Downloaded tools
+  and privileged helper images use explicit versions and immutable checksums or
+  digests where available, and release checkouts do not persist credentials.
+- Build each architecture image once into a portable archive. Bound and
+  checksum it, then upload that authoritative archive before invoking any
+  downloader-managed scanner. A separate read-only job verifies the checksum,
+  scans a disposable copy, and cannot replace the authoritative archive or its
+  checksum. Publication downloads and verifies the original pre-scan artifact
+  and loads it without a second image build.
+- OCI layers use the tagged commit time as `SOURCE_DATE_EPOCH` and BuildKit
+  timestamp rewriting so clean builds of one authorized SHA produce the same
+  child digests. Portable image archives are regular, nonempty, and bounded
+  before upload and after every download.
+- Complete package and binary build/smoke tests, every architecture scan, and a
+  read-only PyPI and GitHub-release digest preflight before the first registry
+  write. Release-asset preflight rejects duplicate or unexpected names and
+  invalid declared sizes before downloading any asset body, then stream-hashes
+  only expected assets under an enforced byte limit. Binary archives use fixed
+  metadata and timestamps; retries refuse to overwrite an existing asset with
+  different bytes.
+- Architecture staging references include the transferred archive checksum.
+  Every run publishes its current local architecture images to those staging
+  references and captures their exact digests. A full-version
+  multi-architecture tag is create-once: retries verify its source revision,
+  package-version annotation, platforms, child labels, and exact child digest
+  set, then require those children to equal the current build digests before
+  reusing the pinned index digest. Self-asserted image labels are never enough
+  to authorize reuse. Stable aliases are created from that pinned digest, never
+  by re-resolving a mutable tag.
+- Stable releases update major/minor and `latest` aliases only when the candidate
+  version is newer than the current stable target. Publication runs share one
+  repository-wide concurrency group with a non-cancelling queue so a third tag
+  cannot evict a pending release or race that read/compare/write transition.
+  Prereleases retain only their full-version tag.
+- Publish the immutable multi-architecture GHCR version and any eligible channel
+  aliases before starting PyPI publication.
+- Repository administration is part of the release boundary: protect the `v*`
+  tag namespace, restrict tag creation to the release role, and configure
+  `ghcr`, `pypi`, and `github-release` as protected environments that permit
+  deployment only from protected release tags. Only the final GitHub release
+  job receives `contents: write`. Workflow checks are defense in depth and
+  cannot make a tag trustworthy when an arbitrary writer may create or redefine
+  it.
+- A GHCR success followed by a PyPI failure remains possible. The workflow keeps
+  PyPI from publishing first, leaves the successful container artifact available
+  for a verified retry, compares any pre-existing PyPI files by digest, and does
+  not pretend it can roll back an external registry atomically. Registry tags
+  have no cross-client compare-and-swap, so protected environments and tightly
+  scoped publication credentials remain required controls.
+- Every release job has a bounded timeout. Privileged jobs install downloaded
+  tooling only after verifying a fixed checksum, before registry login. A
+  downloader-managed vulnerability scanner may run only in a build job without
+  registry credentials or a pre-publication job with read-only package access;
+  it never executes in a registry-write-capable job and never owns publication
+  bytes. Platform-binary packaging stats and rejects invalid or oversized input
+  before opening it, streams archive construction and hashing, and bounds the
+  resulting package before its checksum is accepted. Remote PyPI and GitHub
+  metadata is byte-bounded before decoding, and local distribution artifacts
+  are stream-hashed in bounded chunks in both PyPI preflight and postflight.
+  Because successful main CI is a
+  release authorization input, CI actions, setup tools, and scanner containers
+  use immutable identities and fixed checksums just like the release workflow.
+  Secret scanning has a separate committed-history pass over the event's
+  reachable range; a clean current worktree cannot hide a credential retained
+  in an earlier commit.
 
 ### Entity and scope normalization is symmetric
 
@@ -379,7 +547,11 @@ mechanics, tenant predicates, and transaction ownership in repositories.
   remaining legacy rows as durable progress: governed rows are archived and
   removed in the same batch transaction, retargetable rows move in bounded
   batches, the intended owner is pinned in a progress marker across restarts,
-  and the owner marker is terminal rather than aspirational.
+  and the owner marker is terminal rather than aspirational. The progress
+  marker is claimed in the first structural writer transaction before any
+  tenant-specific schema row is copied; it cannot be deferred until the later
+  owner-backfill loop, because a competing opener could otherwise claim the
+  terminal owner after schema copy completed under a different tenant.
 - In-memory caches have capacity bounds as well as TTLs; ordinary writes prune
   expired keys. Metric caches also carry a total item-weight budget and refuse
   to retain one oversized catalog; a key-count limit alone does not bound
@@ -690,6 +862,10 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   persistence failure in run status and metrics.
 - Benchmark reports identify clean versus long-lived state and include latency
   percentiles, recall, signal-to-noise, and zero-match cases.
+- A benchmark called a gate owns explicit quality floors and error ceilings,
+  exits nonzero when either fails, and carries API authentication and concrete
+  tenant identity. Clean state is disposable; long-lived state is evaluated
+  from SQLite backup snapshots and never mutated in place.
 - Failed chart runs should expose a run identifier and terminal status even when
   validation drops every panel and no investigation revision is produced. The
   same identity travels with unexpected API and streaming failures; if the run
@@ -779,6 +955,11 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   Larger live-WAL databases fail closed until checkpoint/last-close makes the
   constant-space immutable path available. A live rollback journal also fails
   closed; recovery is a trusted-writer operation, not an admission side effect.
+  The enclosing bounded admission operation may retry a transient journal. If
+  immutable SQLite inspection fails while the protected main/WAL/journal state
+  demonstrably changed, the attempt is classified as source movement and the
+  complete callback is retried. An unchanged malformed database is never
+  reclassified or admitted.
 - Migration cursors encode the not-started state outside the source key's legal
   domain. SQLite row IDs and application IDs may be negative, zero, positive,
   sparse, empty text, or at their integer bounds; none of those values, nor an
@@ -798,6 +979,36 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   `runtime_ownership`, `database_path`, or the public projection store, but may
   not infer ownership from `_db_path`, `_runtime_settings`, `_settings`, or
   `_signal_store`. A descriptor-only adapter is a required regression fixture.
+- Lazy dependency factories have two ownership gates. An immutable declared
+  descriptor is checked before invocation, and the realized store or provider
+  is checked again before any method, bootstrap, prompt, context query, cache
+  write, or remote call. Injected factories without declarations fail closed;
+  runtime-owned defaults declare themselves at composition time.
+- Provider lifetime belongs to active pipeline runs, not callers that happen to
+  share a dependency object. A shared provider bundle uses synchronized leases
+  and closes only after the final active run releases it. SDK endpoint and
+  account defaults are explicit settings-derived values, never ambient process
+  variables that can silently change the effective remote owner.
+- Credential-chain names are not credential identities. Profile, process,
+  metadata, SSO, and web-identity sources are resolved to one frozen,
+  non-secretly fingerprinted snapshot before ownership admission, and the SDK
+  client is constructed only from that snapshot. Potentially blocking chain
+  resolution runs outside the event loop; a later refresh is a new generation
+  that must be admitted again.
+- Request completion and effective-work completion are separate lifecycle
+  events. Cancellation may return a response after a bounded grace period, but
+  non-cancellable SDK work keeps consuming the runtime-owned work budget until
+  it actually ends. Resistant cleanup is re-cancelled and moved into a bounded
+  quarantine; it cannot wedge the active generation or grow retained tasks and
+  clients without bound. Rejected factory products enter the same cleanup owner
+  instead of being discarded.
+- Declared backend ownership is a set contract as well as a per-object
+  contract. Realization produces exactly one backend for each declared remote,
+  with neither omission nor duplication, before any publisher receives work.
+- Factory preflight and realization failures emit only the phase, capability,
+  stable reason code, and mismatch dimensions. Component names, paths, tenant
+  identifiers, prompts, endpoints, account identifiers, and credentials are
+  excluded from these events.
 - Sharing a physical SQLite database does not imply sharing authority. The
   knowledge repository must prove the signal-store role and durable tenant
   owner through that public capability at construction and again immediately
@@ -837,6 +1048,46 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   ownership-preflighted before remote I/O, the run records a required commit
   marker before the first write, and cancellation is deferred through backend
   fan-out, contract persistence, and terminal audit completion.
+- Representative evaluation state is copied without opening the authority
+  SQLite files. The benchmark snapshots admitted main/WAL components into
+  disposable storage, verifies the complete history/feedback/signals source
+  set before and after the copy, and retries or rejects movement. This keeps
+  read-only benchmark sources byte-for-byte and directory-entry immutable and
+  prevents one report from mixing role generations.
+- Evaluation credentials belong to the selected evaluation state, never the
+  process-global runtime. Local benchmark HTTP clients disable ambient proxy
+  discovery, and classifier/provider failures cannot be normalized into a
+  passing label. Gate corpora must contain the required cases and both required
+  polarity populations before rates are defined.
+- Release input identity is descriptor-bound. Binary packaging rejects
+  symlinks and non-regular files with `lstat`, opens with no-follow semantics,
+  and revalidates identity and size with `fstat` before streaming. Incremental
+  secret ranges are accepted only after an explicit full reachable-history
+  baseline; the Git-object-free current-tree scan remains a separate control.
+- Bedrock credential discovery is an allowlisted ownership boundary. The
+  current runtime admits explicit keys, static credential/config profiles,
+  frozen web identity, and one-level assume-role profiles backed by a static
+  source profile. Credential-process, SSO/login, container metadata, instance
+  metadata, and other unmodeled providers fail before Botocore construction or
+  external side effects. Classification follows Botocore's complete provider
+  order, environment-name precedence, file precedence, and presence-sensitive
+  provider keys. Blank or edge-padded credential controls fail closed instead
+  of falling through to a different profile, file, token, or principal. After
+  selecting the winner, web identity is represented by one synthesized private
+  profile and token copy.
+  Static credentials remain separated by provider file, and all admitted file
+  discovery is rebound to an explicit private profile so ambient providers
+  cannot re-enter after admission. Supporting another provider later requires
+  an explicit local/remote identity, mutation tests, and lifecycle ownership.
+- Three independent runtime/release improvements remain deliberately separate:
+  rotate admitted Bedrock generations before temporary credentials expire,
+  replace provider-initialization polling with a notification primitive,
+  reserve cleanup capacity before off-lease product construction, and run a
+  mandatory second clean same-SHA OCI build in CI. These require focused
+  lifecycle or release changes and must not be hidden inside credential-source
+  or cleanup fixes. Until cleanup reservation exists, runtime-owned product
+  construction must remain inside an admission lease; saturated off-lease
+  cleanup fails closed rather than creating unbounded maintenance work.
 - When debugging exposes missing telemetry, call it out and add focused
   instrumentation when it is in scope.
 

@@ -10,6 +10,8 @@ from tacit.config import Settings, settings
 
 logger = structlog.get_logger()
 
+_OPENAI_API_ENDPOINT = "https://api.openai.com/v1"
+
 
 def _extract_openai_usage(response) -> TokenUsage:
     usage = getattr(response, "usage", None)
@@ -22,14 +24,20 @@ def _extract_openai_usage(response) -> TokenUsage:
 
 class OpenAIProvider(LLMProvider):
     def __init__(self, runtime_settings: Settings | None = None):
-        self._settings = runtime_settings or settings
+        super().__init__(runtime_settings or settings, component="openai_llm_provider")
+        self._settings = self.runtime_settings
         runtime_settings = self._settings
         self._client = None
         if not runtime_settings.llm_api_key and not runtime_settings.llm_api_base:
             return
-        kwargs: dict = {"api_key": runtime_settings.llm_api_key or "tacit-local-openai-compatible"}
-        if runtime_settings.llm_api_base:
-            kwargs["base_url"] = runtime_settings.llm_api_base
+        kwargs: dict = {
+            "api_key": runtime_settings.llm_api_key or "tacit-local-openai-compatible",
+            "base_url": runtime_settings.llm_api_base or _OPENAI_API_ENDPOINT,
+            # Explicit empty values prevent the SDK from consulting ambient
+            # OPENAI_ORG_ID and OPENAI_PROJECT_ID.
+            "organization": "",
+            "project": "",
+        }
         self._client = openai.AsyncOpenAI(**kwargs)
 
     @property
@@ -91,7 +99,8 @@ class AzureOpenAIProvider(LLMProvider):
     """
 
     def __init__(self, runtime_settings: Settings | None = None):
-        self._settings = runtime_settings or settings
+        super().__init__(runtime_settings or settings, component="azure_llm_provider")
+        self._settings = self.runtime_settings
         runtime_settings = self._settings
         self._client = None
         if not runtime_settings.llm_api_base:
@@ -111,6 +120,11 @@ class AzureOpenAIProvider(LLMProvider):
             azure_endpoint=runtime_settings.llm_api_base,
             api_version=runtime_settings.llm_azure_api_version,
             azure_deployment=self._deployment,
+            # Azure clients inherit the OpenAI SDK's ambient account fields.
+            # Pin empty values so OPENAI_ORG_ID/OPENAI_PROJECT_ID cannot alter
+            # the accepted runtime owner.
+            organization="",
+            project="",
         )
         logger.info(
             "azure_openai_init",

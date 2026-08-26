@@ -15,7 +15,7 @@ import stat
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
@@ -810,14 +810,24 @@ class SQLiteDatabaseTarget:
                     )
             return
 
-        with _readonly_connection(
-            self.path,
-            timeout_ms=timeout_ms,
-            immutable=True,
-            deadline=deadline,
-            rejection_hook=self._rejection_hook,
-        ) as connection:
-            yield connection
+        try:
+            with _readonly_connection(
+                self.path,
+                timeout_ms=timeout_ms,
+                immutable=True,
+                deadline=deadline,
+                rejection_hook=self._rejection_hook,
+            ) as connection:
+                yield connection
+        except sqlite3.DatabaseError as exc:
+            if _readonly_source_state(self.path) != source_state:
+                _reject(
+                    SQLiteIdentityRejectionReason.FILE_REPLACED,
+                    "SQLite database changed during read-only admission",
+                    rejection_hook=self._rejection_hook,
+                    cause=exc,
+                )
+            raise
         _require_admission_deadline(deadline, rejection_hook=self._rejection_hook)
         if _readonly_source_state(self.path) != source_state:
             _reject(
@@ -847,7 +857,11 @@ class SQLiteDatabaseTarget:
                         return None
                     return reader(connection)
             except SQLiteIdentityError as exc:
-                if exc.reason is not SQLiteIdentityRejectionReason.FILE_REPLACED or time.monotonic() >= deadline:
+                retryable_reasons = {
+                    SQLiteIdentityRejectionReason.FILE_REPLACED,
+                    SQLiteIdentityRejectionReason.ADMISSION_RECOVERY_REQUIRED,
+                }
+                if exc.reason not in retryable_reasons or time.monotonic() >= deadline:
                     raise
                 attempt += 1
                 delay = min(0.005 * (2 ** min(attempt - 1, 5)), 0.1, max(deadline - time.monotonic(), 0))
@@ -866,6 +880,141 @@ class SQLiteDatabaseTarget:
             path=self.path,
             rejection_hook=self._rejection_hook,
         )
+
+
+def _snapshot_sqlite_database(
+    target: SQLiteDatabaseTarget,
+    destination: Path,
+    *,
+    deadline: float,
+    rejection_hook: SQLiteIdentityRejectionHook | None,
+) -> None:
+    """Materialize one admitted source into a disposable SQLite database."""
+    remaining_ms = max(1, int((deadline - time.monotonic()) * 1_000))
+    with target.connect_existing_readonly(timeout_ms=remaining_ms, _deadline=deadline) as source:
+        if source is None:
+            _reject(
+                SQLiteIdentityRejectionReason.FILE_REPLACED,
+                "SQLite snapshot source disappeared during admission",
+                rejection_hook=rejection_hook,
+            )
+        destination_connection: sqlite3.Connection | None = None
+        try:
+            destination_connection = sqlite3.connect(destination)
+
+            def require_backup_deadline(_status: int, _remaining: int, _total: int) -> None:
+                _require_admission_deadline(deadline, rejection_hook=rejection_hook)
+
+            source.backup(
+                destination_connection,
+                pages=256,
+                progress=require_backup_deadline,
+                sleep=0.001,
+            )
+            _require_admission_deadline(deadline, rejection_hook=rejection_hook)
+        finally:
+            if destination_connection is not None:
+                destination_connection.close()
+
+
+def _sqlite_source_set_state(
+    targets: Sequence[SQLiteDatabaseTarget],
+) -> tuple[tuple[Path, tuple[tuple[str, _ReadOnlyFileState], ...]], ...]:
+    return tuple((target.path, tuple(sorted(_readonly_source_state(target.path).items()))) for target in targets)
+
+
+def snapshot_sqlite_database_set(
+    sources: Sequence[str | Path],
+    destination_dir: str | Path,
+    *,
+    timeout_ms: int = 30_000,
+    rejection_hook: SQLiteIdentityRejectionHook | None = None,
+) -> dict[Path, Path]:
+    """Snapshot one stable generation of a protected SQLite source set.
+
+    Source databases are opened only through the nonmutating admission path.
+    If any main/WAL generation moves while the set is copied, every disposable
+    copy is discarded and the complete set is retried under one deadline.
+    """
+    if not sources:
+        raise ValueError("SQLite snapshot source set must not be empty")
+    destination_root = Path(destination_dir)
+    if destination_root.is_symlink() or not destination_root.is_dir():
+        raise ValueError("SQLite snapshot destination must be a real directory")
+
+    targets = tuple(SQLiteDatabaseTarget(source, rejection_hook=rejection_hook) for source in sources)
+    source_paths = tuple(target.path for target in targets)
+    if len(set(source_paths)) != len(source_paths):
+        raise ValueError("SQLite snapshot source paths must be unique")
+    destination_names = tuple(path.name for path in source_paths)
+    if len(set(destination_names)) != len(destination_names):
+        raise ValueError("SQLite snapshot source filenames must be unique")
+    destinations = {source_path: destination_root / source_path.name for source_path in source_paths}
+    if any(destination.exists() or destination.is_symlink() for destination in destinations.values()):
+        raise ValueError("SQLite snapshot destinations must not already exist")
+
+    deadline = time.monotonic() + max(timeout_ms, 1) / 1_000
+    attempt = 0
+    while True:
+        _require_admission_deadline(deadline, rejection_hook=rejection_hook)
+        try:
+            for target in targets:
+                inspect_sqlite_database_target(target.path, rejection_hook=rejection_hook)
+            source_state = _sqlite_source_set_state(targets)
+            if any(not state for _path, state in source_state):
+                _reject(
+                    SQLiteIdentityRejectionReason.FILE_REPLACED,
+                    "SQLite snapshot source set is incomplete",
+                    rejection_hook=rejection_hook,
+                )
+
+            with tempfile.TemporaryDirectory(
+                prefix=".tacit-sqlite-snapshot-",
+                dir=destination_root,
+            ) as attempt_directory:
+                attempt_root = Path(attempt_directory)
+                for target in targets:
+                    _snapshot_sqlite_database(
+                        target,
+                        attempt_root / target.path.name,
+                        deadline=deadline,
+                        rejection_hook=rejection_hook,
+                    )
+                _require_admission_deadline(deadline, rejection_hook=rejection_hook)
+                if _sqlite_source_set_state(targets) != source_state:
+                    _reject(
+                        SQLiteIdentityRejectionReason.FILE_REPLACED,
+                        "SQLite source set changed while snapshots were copied",
+                        rejection_hook=rejection_hook,
+                    )
+
+                published: list[Path] = []
+                try:
+                    for target in targets:
+                        destination = destinations[target.path]
+                        os.replace(attempt_root / target.path.name, destination)
+                        published.append(destination)
+                except Exception:
+                    for destination in published:
+                        destination.unlink(missing_ok=True)
+                    raise
+            return destinations
+        except SQLiteIdentityError as exc:
+            retryable_reasons = {
+                SQLiteIdentityRejectionReason.FILE_REPLACED,
+                SQLiteIdentityRejectionReason.ADMISSION_RECOVERY_REQUIRED,
+            }
+            if exc.reason not in retryable_reasons or time.monotonic() >= deadline:
+                raise
+            attempt += 1
+            delay = min(0.005 * (2 ** min(attempt - 1, 5)), 0.1, max(deadline - time.monotonic(), 0))
+            logger.info(
+                "sqlite_snapshot_source_set_retry",
+                reason_code=exc.reason_code,
+                attempt=attempt,
+            )
+            if delay > 0:
+                time.sleep(delay)
 
 
 def connect_sqlite_database(

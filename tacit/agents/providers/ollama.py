@@ -12,11 +12,12 @@ logger = structlog.get_logger()
 
 
 class OllamaProvider(LLMProvider):
-    def __init__(self, runtime_settings: Settings | None = None):
-        self._settings = runtime_settings or settings
+    def __init__(self, runtime_settings: Settings | None = None, *, trust_env: bool = True):
+        super().__init__(runtime_settings or settings, component="ollama_llm_provider")
+        self._settings = self.runtime_settings
         base = self._settings.llm_api_base or "http://localhost:11434"
         self._base_url = base.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=120.0)
+        self._client = httpx.AsyncClient(timeout=120.0, trust_env=trust_env)
 
     @staticmethod
     def _extract_usage(data: dict) -> TokenUsage:

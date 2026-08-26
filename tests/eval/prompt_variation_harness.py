@@ -20,46 +20,86 @@ from pathlib import Path
 from typing import Any
 
 from tacit.agents.intent import classify_intent
-from tacit.cache import llm_cache
-from tacit.config import settings
-from tests.eval.cold_isolation import cold_isolation
+from tests.eval.cold_isolation import LocalEvaluationEndpoints, cold_isolation, require_local_endpoint
 from tests.eval.prompt_scoring import evaluate as _evaluate
 from tests.eval.prompt_scoring import is_negative as _is_negative
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 DEFAULT_CORPUS = FIXTURES_DIR / "clickstack_prompts.json"
+DEFAULT_LOCAL_LLM_URL = "http://127.0.0.1:11434"
+DEFAULT_LOCAL_MODEL = "qwen3-coder:30b"
 
 
-async def run(trials: int, corpus_path: Path) -> dict[str, Any]:
+async def run(
+    trials: int,
+    corpus_path: Path,
+    *,
+    endpoints: LocalEvaluationEndpoints | None = None,
+) -> dict[str, Any]:
+    if endpoints is None:
+        selected = _local_llm_endpoints(
+            provider="ollama",
+            model=DEFAULT_LOCAL_MODEL,
+            api_key="",
+            api_base=DEFAULT_LOCAL_LLM_URL,
+        )
+    else:
+        selected = _local_llm_endpoints(
+            provider="ollama",
+            model=endpoints.llm_model,
+            api_key="",
+            api_base=endpoints.llm_api_base or "",
+        )
+    if trials < 1:
+        raise ValueError("prompt variation evaluation requires at least one trial")
     fixture = json.loads(corpus_path.read_text())
+    prompts = fixture.get("prompts") if isinstance(fixture, dict) else None
+    if not isinstance(prompts, list):
+        raise ValueError("prompt variation corpus must contain a prompts list")
+    positive_count = sum(1 for item in prompts if isinstance(item, dict) and not _is_negative(item))
+    negative_count = sum(1 for item in prompts if isinstance(item, dict) and _is_negative(item))
+    if positive_count == 0 or negative_count == 0:
+        raise ValueError("prompt variation corpus requires nonempty positive and negative populations")
     rows: list[dict[str, Any]] = []
-    with cold_isolation():
-        for prompt_index, item in enumerate(fixture["prompts"]):
-            outcomes: list[bool] = []
-            failures: list[dict[str, Any]] = []
-            for trial in range(trials):
-                llm_cache.invalidate()
-                try:
-                    intent, _ = await classify_intent(item["text"])
-                    useful, evidence = _evaluate(intent, item)
-                except Exception as exc:
-                    useful = False
-                    evidence = {"error": f"{type(exc).__name__}: {exc}"}
-                outcomes.append(useful)
-                if not useful:
-                    failures.append({"trial": trial + 1, **evidence})
-            rows.append(
-                {
-                    "prompt_index": prompt_index + 1,
-                    "class": item["class"],
-                    "polarity": "negative" if _is_negative(item) else "positive",
-                    "prompt": item["text"],
-                    "passed": sum(outcomes),
-                    "trials": trials,
-                    "rate": round(sum(outcomes) / trials, 4),
-                    "failures": failures,
-                }
-            )
+    with cold_isolation(endpoints=selected) as state:
+        if state.dependencies.llm_provider_factory is None:
+            raise RuntimeError("isolated prompt evaluation has no LLM provider factory")
+        provider = state.dependencies.llm_provider_factory()
+        try:
+            for prompt_index, item in enumerate(prompts):
+                outcomes: list[bool] = []
+                failures: list[dict[str, Any]] = []
+                for trial in range(trials):
+                    state.dependencies.llm_cache.invalidate()
+                    try:
+                        intent, _ = await classify_intent(
+                            item["text"],
+                            provider=provider,
+                            runtime_settings=state.settings,
+                        )
+                        useful, evidence = _evaluate(intent, item)
+                    except Exception as exc:
+                        useful = False
+                        evidence = {"error": f"{type(exc).__name__}: {exc}"}
+                    outcomes.append(useful)
+                    if not useful:
+                        failures.append({"trial": trial + 1, **evidence})
+                rows.append(
+                    {
+                        "prompt_index": prompt_index + 1,
+                        "class": item["class"],
+                        "polarity": "negative" if _is_negative(item) else "positive",
+                        "prompt": item["text"],
+                        "passed": sum(outcomes),
+                        "trials": trials,
+                        "rate": round(sum(outcomes) / trials, 4),
+                        "failures": failures,
+                    }
+                )
+            provider_name = state.settings.llm_provider
+            model_name = state.settings.llm_model
+        finally:
+            await state.dependencies.close_resources()
 
     by_class: dict[str, list[bool]] = defaultdict(list)
     for row in rows:
@@ -70,21 +110,21 @@ async def run(trials: int, corpus_path: Path) -> dict[str, Any]:
     # Split positive useful-rate (the gate) from negative false-positive rate.
     pos = [r for r in rows if r["polarity"] == "positive"]
     neg = [r for r in rows if r["polarity"] == "negative"]
-    pos_overall = (sum(r["passed"] for r in pos) / sum(r["trials"] for r in pos)) if pos else 1.0
-    neg_correct = (sum(r["passed"] for r in neg) / sum(r["trials"] for r in neg)) if neg else 1.0
+    pos_overall = sum(r["passed"] for r in pos) / sum(r["trials"] for r in pos)
+    neg_correct = sum(r["passed"] for r in neg) / sum(r["trials"] for r in neg)
     rates = [row["rate"] for row in rows]
     return {
         "corpus": corpus_path.name,
         "role": fixture.get("role", "unspecified"),
-        "provider": settings.llm_provider,
-        "model": settings.llm_model,
+        "provider": provider_name,
+        "model": model_name,
         "prompts": len(rows),
         "trials_per_prompt": trials,
         "positive_useful_rate": round(pos_overall, 4),
         "negative_correct_rate": round(neg_correct, 4),
-        "prompt_rate_mean": round(statistics.mean(rates), 4) if rates else 1.0,
+        "prompt_rate_mean": round(statistics.mean(rates), 4),
         "prompt_rate_stddev": round(statistics.pstdev(rates), 4) if rates else 0.0,
-        "worst_prompt_rate": round(min(rates), 4) if rates else 1.0,
+        "worst_prompt_rate": round(min(rates), 4),
         "class_rates": class_rates,
         "gate": 0.85,
         "passed": pos_overall >= 0.85 and neg_correct >= 0.85,
@@ -112,26 +152,24 @@ def _resolve_corpus(name: str) -> Path:
     raise SystemExit(f"corpus not found: {name}")
 
 
-def _apply_model_overrides(provider: str, model: str, api_key: str, api_base: str) -> None:
-    """Point the pipeline at a chosen provider/model for this run.
-
-    Resets the cached provider singleton so a new provider/model/key takes effect
-    even though ``get_provider()`` memoizes.
-    """
-    if provider:
-        settings.llm_provider = provider
-    if model:
-        settings.llm_model = model
+def _local_llm_endpoints(
+    *,
+    provider: str,
+    model: str,
+    api_key: str,
+    api_base: str,
+) -> LocalEvaluationEndpoints:
+    """Validate the sole provider shape allowed by the isolated harness."""
+    if provider.casefold() != "ollama":
+        raise ValueError("prompt variation evaluation requires the local Ollama provider")
     if api_key:
-        settings.llm_api_key = api_key
-    if api_base:
-        settings.llm_api_base = api_base
-    try:
-        import tacit.agents.providers.registry as _registry
-
-        _registry._provider = None  # force rebuild with the new settings
-    except Exception:
-        pass
+        raise ValueError("prompt variation evaluation does not accept API credentials")
+    if not model:
+        raise ValueError("prompt variation evaluation requires an explicit local model")
+    return LocalEvaluationEndpoints(
+        llm_api_base=require_local_endpoint(api_base, "Prompt variation LLM URL"),
+        llm_model=model,
+    )
 
 
 def main() -> int:
@@ -139,16 +177,24 @@ def main() -> int:
     parser.add_argument("--trials", type=int, default=5)
     parser.add_argument("--corpus", default="dev", help="'dev', 'holdout', a fixture name, or a path.")
     parser.add_argument("--json", default="")
-    parser.add_argument("--provider", default="", help="LLM provider: anthropic | openai | ollama | bedrock | azure.")
-    parser.add_argument("--model", default="", help="Model string, e.g. 'claude-opus-4-8' or 'qwen3-coder:30b'.")
-    parser.add_argument("--api-key", default="", help="API key for the provider (or set via env/.env).")
-    parser.add_argument("--api-base", default="", help="Override the LLM API base (e.g. local Ollama).")
+    parser.add_argument("--provider", default="ollama", help="Local provider (only ollama is accepted).")
+    parser.add_argument("--model", default=DEFAULT_LOCAL_MODEL, help="Local Ollama model name.")
+    parser.add_argument("--api-key", default="", help="Rejected: isolated evaluations do not accept credentials.")
+    parser.add_argument("--api-base", default=DEFAULT_LOCAL_LLM_URL, help="Explicit local Ollama endpoint.")
     args = parser.parse_args()
     if args.trials < 1:
         parser.error("--trials must be at least 1")
-    _apply_model_overrides(args.provider, args.model, args.api_key, args.api_base)
+    try:
+        endpoints = _local_llm_endpoints(
+            provider=args.provider,
+            model=args.model,
+            api_key=args.api_key,
+            api_base=args.api_base,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     corpus_path = _resolve_corpus(args.corpus)
-    report = asyncio.run(run(args.trials, corpus_path))
+    report = asyncio.run(run(args.trials, corpus_path, endpoints=endpoints))
     if report.get("role") == "holdout":
         print("NOTE: holdout — run ONCE and do not tune the synonym layer from its failures.\n")
     print(json.dumps({key: value for key, value in report.items() if key != "results"}, indent=2))

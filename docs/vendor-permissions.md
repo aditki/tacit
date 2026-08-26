@@ -147,6 +147,13 @@ to the configured model or deployment.
 | AWS Bedrock | `LLM_PROVIDER=bedrock`, region/model settings, optional role ARN | `bedrock:Converse` for the configured model or inference profile; `bedrock:ListFoundationModels` if relying on model-name auto-resolution; `sts:AssumeRole` when `LLM_BEDROCK_ROLE_ARN` is set |
 | Ollama | `LLM_PROVIDER=ollama`, optional `LLM_API_BASE` | network access to the local or private Ollama `/api/chat` endpoint |
 
+Bedrock runtime ownership currently admits explicit keys, static AWS
+credential/config profiles, frozen web identity, and one-level assume-role
+profiles with a static source profile. Credential-process, SSO/login,
+container-metadata, instance-metadata, and other unmodeled providers are
+rejected before SDK construction so they cannot introduce undeclared local or
+remote authority.
+
 For `tacit doctor` with Bedrock, the current check also calls AWS STS
 `GetCallerIdentity`. Grant `sts:GetCallerIdentity` to the checking principal if
 you want the doctor check to pass.

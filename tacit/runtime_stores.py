@@ -10,13 +10,17 @@ from typing import Any
 
 from tacit.config import Settings, canonical_sqlite_role_paths
 from tacit.errors import RuntimeOwnershipError
+from tacit.pipeline_admission import PipelineAdmissionController, pipeline_admission_limits
 from tacit.runtime_ownership import (
     RuntimeDatabaseIdentity,
     RuntimeOwnershipDescriptor,
-    RuntimeOwnershipMismatchError,
     copy_runtime_settings,
-    get_runtime_ownership,
-    require_compatible_runtime_ownership,
+    declare_runtime_factory,
+    observe_runtime_factory_failure,
+    observe_runtime_factory_realization,
+    require_runtime_factory_ownership,
+    require_runtime_store_ownership,
+    runtime_descriptor_for_store,
     runtime_descriptor_from_settings,
     snapshot_runtime_settings,
 )
@@ -107,15 +111,28 @@ class RuntimeStores:
                 RuntimeDatabaseIdentity(role="signals", path=self._signal_path),
             ),
         )
-        self._history_fallback = history_fallback
-        self._feedback_fallback = feedback_fallback
-        self._signal_fallback = signal_fallback
+        self._history_fallback = self._validated_fallback_declaration(
+            history_fallback,
+            role="history",
+            enabled=self._history_uses_fallback,
+        )
+        self._feedback_fallback = self._validated_fallback_declaration(
+            feedback_fallback,
+            role="feedback",
+            enabled=self._feedback_uses_fallback,
+        )
+        self._signal_fallback = self._validated_fallback_declaration(
+            signal_fallback,
+            role="signals",
+            enabled=self._signal_uses_fallback,
+        )
         self._history_store: Any | None = None
         self._feedback_store: Any | None = None
         self._signal_store: Any | None = None
         self._knowledge_repository: Any | None = None
         self._knowledge_service: Any | None = None
         self._llm_cache: Any | None = None
+        self._pipeline_admission: PipelineAdmissionController | None = None
         self._lock = threading.RLock()
 
     @property
@@ -154,47 +171,56 @@ class RuntimeStores:
         except ValueError as exc:
             raise RuntimeOwnershipError(str(exc)) from exc
 
-    def _validated_store(self, store: Any, *, role: str) -> Any:
-        expected_databases = tuple(database for database in self._runtime_ownership.databases if database.role == role)
-        if len(expected_databases) != 1:
-            raise RuntimeOwnershipMismatchError(
-                "runtime store realization",
-                {"database"},
-                (self._runtime_ownership.component,),
-            )
-        expected = replace(
-            self._runtime_ownership,
-            component=f"runtime_stores_{role}",
-            databases=expected_databases,
-        )
-        actual = get_runtime_ownership(store, component=f"realized_{role}_store")
-        missing_dimensions: set[str] = set()
-        if actual.settings_identity is None:
-            missing_dimensions.add("settings")
-        if actual.tenant_policy is None:
-            missing_dimensions.update(("tenant", "permission"))
-        if missing_dimensions:
-            raise RuntimeOwnershipMismatchError(
-                f"runtime {role} store realization",
-                missing_dimensions,
-                (expected.component, actual.component),
-            )
-        require_compatible_runtime_ownership(
+    def validate_store(self, store: Any, *, role: str) -> Any:
+        """Validate a realized store against this composition owner."""
+        require_runtime_store_ownership(
             boundary=f"runtime {role} store realization",
-            descriptors=(expected, actual),
+            expected=self._runtime_ownership,
+            store=store,
+            database_role=role,
         )
-        if expected_databases[0] not in actual.databases:
-            raise RuntimeOwnershipMismatchError(
-                f"runtime {role} store realization",
-                {"database"},
-                (expected.component, actual.component),
-            )
         return store
+
+    def _validated_fallback_declaration(
+        self,
+        factory: StoreFactory | None,
+        *,
+        role: str,
+        enabled: bool,
+    ) -> StoreFactory | None:
+        """Preflight a used compatibility factory without invoking it."""
+        if factory is None or not enabled:
+            return factory
+        require_runtime_factory_ownership(
+            boundary=f"runtime {role} fallback factory preflight",
+            factory=factory,
+            expected=self._runtime_ownership,
+            factory_kind=f"store:{role}",
+        )
+        return factory
+
+    def _realize_fallback(self, factory: StoreFactory, *, role: str) -> Any:
+        """Validate a fallback product before any of its methods are used."""
+        with observe_runtime_factory_realization(f"store:{role}"):
+            store = factory()
+        try:
+            return self.validate_store(store, role=role)
+        except RuntimeOwnershipError as exc:
+            dimensions: frozenset[str] = getattr(exc, "dimensions", frozenset())
+            observe_runtime_factory_failure(
+                phase="realization",
+                factory_kind=f"store:{role}",
+                reason_code=(
+                    "runtime_factory_realization_mismatch" if dimensions else "runtime_factory_realization_invalid"
+                ),
+                dimensions=dimensions,
+            )
+            raise
 
     def history(self) -> Any:
         """Return the history store for this runtime."""
         if self._history_uses_fallback and self._history_fallback is not None:
-            return self._validated_store(self._history_fallback(), role="history")
+            return self._realize_fallback(self._history_fallback, role="history")
         if self._history_store is None:
             with self._lock:
                 if self._history_store is None:
@@ -204,13 +230,13 @@ class RuntimeStores:
                     path = self._configured_path(self._history_path)
                     self._revalidate_database_role_files()
                     store = InvestigationStore(path, runtime_settings=self._settings)
-                    self._history_store = self._validated_store(store, role="history")
-        return self._validated_store(self._history_store, role="history")
+                    self._history_store = self.validate_store(store, role="history")
+        return self.validate_store(self._history_store, role="history")
 
     def feedback(self) -> Any:
         """Return the feedback store for this runtime."""
         if self._feedback_uses_fallback and self._feedback_fallback is not None:
-            return self._validated_store(self._feedback_fallback(), role="feedback")
+            return self._realize_fallback(self._feedback_fallback, role="feedback")
         if self._feedback_store is None:
             with self._lock:
                 if self._feedback_store is None:
@@ -220,13 +246,13 @@ class RuntimeStores:
                     path = self._configured_path(self._feedback_path)
                     self._revalidate_database_role_files()
                     store = FeedbackStore(path, runtime_settings=self._settings)
-                    self._feedback_store = self._validated_store(store, role="feedback")
-        return self._validated_store(self._feedback_store, role="feedback")
+                    self._feedback_store = self.validate_store(store, role="feedback")
+        return self.validate_store(self._feedback_store, role="feedback")
 
     def signals(self) -> Any:
         """Return the bootstrapped signal store for this runtime."""
         if self._signal_uses_fallback and self._signal_fallback is not None:
-            return self._validated_store(self._signal_fallback(), role="signals")
+            return self._realize_fallback(self._signal_fallback, role="signals")
         if self._signal_store is None:
             with self._lock:
                 if self._signal_store is None:
@@ -236,10 +262,10 @@ class RuntimeStores:
                     path = self._configured_path(self._signal_path)
                     self._revalidate_database_role_files()
                     store = SignalStore(path, runtime_settings=self._settings)
-                    store = self._validated_store(store, role="signals")
+                    store = self.validate_store(store, role="signals")
                     store.load_from_yaml(only_if_changed=True)
                     self._signal_store = store
-        return self._validated_store(self._signal_store, role="signals")
+        return self.validate_store(self._signal_store, role="signals")
 
     def knowledge_repository(self) -> Any:
         """Return the Operational Knowledge repository beside the signal store."""
@@ -282,3 +308,63 @@ class RuntimeStores:
 
                     self._llm_cache = TTLCache(default_ttl=600)
         return self._llm_cache
+
+    def pipeline_admission(self) -> PipelineAdmissionController:
+        """Return the concurrency gate owned by this runtime graph."""
+        if self._pipeline_admission is None:
+            with self._lock:
+                if self._pipeline_admission is None:
+                    limits = pipeline_admission_limits(self._settings)
+                    self._pipeline_admission = PipelineAdmissionController(
+                        limits.concurrent,
+                        max_queued=limits.queued,
+                        max_queued_per_partition=limits.queued_per_partition,
+                        max_in_flight_per_partition=limits.concurrent_per_partition,
+                    )
+        return self._pipeline_admission
+
+
+_process_runtime_lock = threading.Lock()
+_process_runtime_settings: Settings | None = None
+_process_runtime_history_fallback: StoreFactory | None = None
+_process_runtime_stores: RuntimeStores | None = None
+
+
+def get_process_runtime_stores(
+    runtime_settings: Settings,
+    *,
+    history_fallback: StoreFactory,
+) -> RuntimeStores:
+    """Return the single owner graph for process-default pipeline callers."""
+    global _process_runtime_history_fallback
+    global _process_runtime_settings
+    global _process_runtime_stores
+
+    selected_settings = copy_runtime_settings(runtime_settings)
+    with _process_runtime_lock:
+        if (
+            _process_runtime_stores is None
+            or _process_runtime_settings != selected_settings
+            or _process_runtime_history_fallback is not history_fallback
+        ):
+            _process_runtime_settings = selected_settings
+            _process_runtime_history_fallback = history_fallback
+            owner_probe = RuntimeStores(selected_settings)
+            history_database = next(
+                database for database in owner_probe.runtime_ownership.databases if database.role == "history"
+            )
+            declared_history_fallback = declare_runtime_factory(
+                history_fallback,
+                ownership=runtime_descriptor_for_store(
+                    component="process_history_fallback",
+                    runtime_settings=owner_probe.runtime_settings,
+                    database_role="history",
+                    database_path=history_database.path,
+                ),
+                factory_kind="store:history",
+            )
+            _process_runtime_stores = RuntimeStores(
+                selected_settings,
+                history_fallback=declared_history_fallback,
+            )
+        return _process_runtime_stores

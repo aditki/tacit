@@ -437,8 +437,9 @@
   </div>
 
   <script>
-    const LOCAL_API_BASE = 'http://127.0.0.1:8000';
-    const BASE = window.location.protocol === 'file:' ? LOCAL_API_BASE : window.location.origin;
+    const IS_TACIT_HTTP_ORIGIN = ['http:', 'https:'].includes(window.location.protocol);
+    const BASE = IS_TACIT_HTTP_ORIGIN ? window.location.origin : '';
+    const DIRECT_FILE_UI_ERROR = 'Run tacit serve, then open the web address it provides.';
     const KNOWLEDGE_TENANT_KEY = 'tacit.knowledgeTenant';
     const API_KEY_SESSION_KEY = 'tacit.apiKey';
     let lastDashboardUid = null;
@@ -502,7 +503,29 @@
       return headers;
     }
 
+    function requireTacitHttpOrigin() {
+      if (!IS_TACIT_HTTP_ORIGIN) throw new Error(DIRECT_FILE_UI_ERROR);
+    }
+
+    function renderDirectFileError() {
+      if (IS_TACIT_HTTP_ORIGIN) return;
+      const result = document.getElementById('result');
+      result.innerHTML = `
+        <div class="result-card error">
+          <div class="result-label">Tacit server required</div>
+          <div class="result-meta" style="color:#fca5a5">${DIRECT_FILE_UI_ERROR}</div>
+        </div>`;
+      document.querySelectorAll('button, input, textarea, select').forEach(control => {
+        control.disabled = true;
+      });
+      document.querySelectorAll('.tab, .example-chip, .toggle').forEach(control => {
+        control.style.pointerEvents = 'none';
+        control.setAttribute('aria-disabled', 'true');
+      });
+    }
+
     async function fetchTenantJson(url, options = {}, request) {
+      requireTacitHttpOrigin();
       requireCurrentTenantRequest(request);
       const response = await fetch(url, {
         ...options,
@@ -597,6 +620,7 @@
     }
 
     async function streamChart(payload, onStage, request) {
+      requireTacitHttpOrigin();
       requireCurrentTenantRequest(request);
       const resp = await fetch(`${BASE}/api/v1/chart/stream`, {
         method: 'POST',
@@ -1570,11 +1594,8 @@
         renderKnowledgeQueue(request);
       } catch (error) {
         if (isStaleTenantResponse(error)) return;
-        const detail = window.location.protocol === 'file:' && error instanceof TypeError
-          ? `Unable to reach Tacit API at ${BASE}. Start the local server or open ${BASE}/.`
-          : error.message;
         status.textContent = 'Knowledge queue unavailable';
-        content.innerHTML = `<div class="status" style="color:#ef4444">${esc(detail)}</div>`;
+        content.innerHTML = `<div class="status" style="color:#ef4444">${esc(error.message)}</div>`;
       }
     }
 
@@ -1986,6 +2007,8 @@
       if (value) sessionStorage.setItem(API_KEY_SESSION_KEY, value);
       else sessionStorage.removeItem(API_KEY_SESSION_KEY);
     });
+
+    renderDirectFileError();
 
     // Submit on Ctrl+Enter
     document.getElementById('prompt').addEventListener('keydown', (e) => {

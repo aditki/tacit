@@ -8,7 +8,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from tacit import __version__
-from tacit.config import Settings
+from tacit.api.request_body_limit import RequestBodyLimitMiddleware
+from tacit.config import (
+    API_MAX_REQUEST_BODY_BYTES_MAX,
+    API_MAX_REQUEST_BODY_BYTES_MIN,
+    DEFAULT_API_MAX_REQUEST_BODY_BYTES,
+    Settings,
+    canonical_cors_allowed_origins,
+)
 from tacit.config import settings as default_settings
 from tacit.runtime_stores import RuntimeStores
 
@@ -83,10 +90,36 @@ DESCRIPTION = (
 )
 
 
-def _validate_api_runtime_settings(runtime_settings: Any) -> None:
+def _validate_api_runtime_settings(runtime_settings: Any) -> tuple[list[str], int]:
     configured_tenant = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
     if configured_tenant == "*" and not bool(getattr(runtime_settings, "api_auth_enabled", False)):
         raise ValueError("Wildcard knowledge tenancy requires API authentication")
+    return _cors_origins(runtime_settings), _request_body_limit(runtime_settings)
+
+
+def _cors_origins(runtime_settings: Any) -> list[str]:
+    configured_value = canonical_cors_allowed_origins(getattr(runtime_settings, "api_cors_allowed_origins", ""))
+    configured = [origin for origin in configured_value.split(",") if origin]
+    auth_enabled = bool(getattr(runtime_settings, "api_auth_enabled", False))
+    if auth_enabled and "*" in configured:
+        raise ValueError("Authenticated API deployments cannot use wildcard CORS")
+    if configured:
+        return configured
+    return []
+
+
+def _request_body_limit(runtime_settings: Any) -> int:
+    value = getattr(
+        runtime_settings,
+        "api_max_request_body_bytes",
+        DEFAULT_API_MAX_REQUEST_BODY_BYTES,
+    )
+    if type(value) is not int or value < API_MAX_REQUEST_BODY_BYTES_MIN or value > API_MAX_REQUEST_BODY_BYTES_MAX:
+        raise ValueError(
+            "api_max_request_body_bytes must be an integer between "
+            f"{API_MAX_REQUEST_BODY_BYTES_MIN} and {API_MAX_REQUEST_BODY_BYTES_MAX}"
+        )
+    return value
 
 
 def create_app(
@@ -101,7 +134,7 @@ def create_app(
     construction here separates app metadata/middleware from route business
     logic and gives tests a small factory to exercise.
     """
-    _validate_api_runtime_settings(runtime_settings)
+    cors_origins, max_request_body_bytes = _validate_api_runtime_settings(runtime_settings)
     app = FastAPI(
         title="Tacit",
         description=DESCRIPTION,
@@ -112,10 +145,14 @@ def create_app(
     app.state.settings = runtime_settings
     app.state.runtime_stores = RuntimeStores(runtime_settings)
     app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_body_bytes=max_request_body_bytes,
+    )
+    app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=cors_origins,
+        allow_methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "X-API-Key", "X-Tacit-Tenant"],
     )
     if include_default_routes:
         from tacit.api.routes import include_routes

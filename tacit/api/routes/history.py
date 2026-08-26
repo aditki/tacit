@@ -22,7 +22,7 @@ from tacit.api.security import (
 )
 from tacit.config import settings
 from tacit.dependencies import PipelineDependencies
-from tacit.errors import PipelineExecutionError
+from tacit.errors import PipelineAdmissionRejected, PipelineExecutionError
 from tacit.investigation_bundle import build_investigation_bundle
 from tacit.investigation_contract import InvestigationRunType
 from tacit.investigation_replay import CounterfactualChanges, ReplayMode
@@ -518,6 +518,8 @@ async def refresh_investigation(
             run_type=InvestigationRunType.REFRESH,
             base_revision=contract.investigation.revision,
         )
+    except PipelineAdmissionRejected as exc:
+        return JSONResponse(status_code=503, content=exc.public_payload())
     except PipelineExecutionError as exc:
         return JSONResponse(
             status_code=500,

@@ -9087,10 +9087,9 @@ def test_manual_signal_teaching_rolls_back_the_complete_pattern_batch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from fastapi.testclient import TestClient
-
     from tacit.api.app import create_app
     from tacit.knowledge import migration as migration_module
+    from tests.http_client import TestClient
 
     db_path = tmp_path / "atomic-teach.db"
     app = create_app(
@@ -9141,9 +9140,8 @@ def test_manual_signal_teaching_rolls_back_the_complete_pattern_batch(
 
 
 def test_signal_taxonomy_api_uses_keyset_pages(tmp_path: Path):
-    from fastapi.testclient import TestClient
-
     from tacit.api.app import create_app
+    from tests.http_client import TestClient
 
     app = create_app(
         runtime_settings=Settings(
@@ -9177,9 +9175,8 @@ def test_signal_taxonomy_api_uses_keyset_pages(tmp_path: Path):
 
 
 def test_signal_taxonomy_api_continues_after_empty_signal_name(tmp_path: Path):
-    from fastapi.testclient import TestClient
-
     from tacit.api.app import create_app
+    from tests.http_client import TestClient
 
     app = create_app(
         runtime_settings=Settings(
@@ -9214,9 +9211,8 @@ def test_signal_taxonomy_api_continues_after_empty_signal_name(tmp_path: Path):
 
 
 def test_signal_mapping_api_cursor_accepts_zero_negative_and_sparse_ids(tmp_path: Path):
-    from fastapi.testclient import TestClient
-
     from tacit.api.app import create_app
+    from tests.http_client import TestClient
 
     app = create_app(
         runtime_settings=Settings(
@@ -9260,9 +9256,8 @@ def test_signal_mapping_api_cursor_accepts_zero_negative_and_sparse_ids(tmp_path
 
 
 def test_dashboard_and_alert_api_cursors_round_trip_full_sqlite_integer_domain(tmp_path: Path):
-    from fastapi.testclient import TestClient
-
     from tacit.api.app import create_app
+    from tests.http_client import TestClient
 
     app = create_app(
         runtime_settings=Settings(
@@ -9461,9 +9456,8 @@ def test_learning_api_cursors_accept_zero_and_negative_ids(
     key_column: str,
     record_kind: str,
 ):
-    from fastapi.testclient import TestClient
-
     from tacit.api.app import create_app
+    from tests.http_client import TestClient
 
     app = create_app(
         runtime_settings=Settings(

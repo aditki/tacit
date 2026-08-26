@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException, Request
-from fastapi.testclient import TestClient
 
 import tacit.pipeline as pipeline_mod
+from tacit.agents.providers.base import LLMProvider
 from tacit.api.app import create_app
 from tacit.api.dependencies import (
     get_feedback_store,
@@ -26,11 +27,83 @@ from tacit.api.security import (
 )
 from tacit.backends.base import DashboardFeatures
 from tacit.config import Settings
+from tacit.context.base import ContextProvider
 from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies, resolve_knowledge_service
-from tacit.errors import PipelineExecutionError, RuntimeOwnershipError, SemanticAuthorizationError
+from tacit.errors import (
+    PipelineAdmissionRejected,
+    PipelineExecutionError,
+    RuntimeOwnershipError,
+    SemanticAuthorizationError,
+)
 from tacit.models.schemas import DashRequest, DashResponse
-from tacit.runtime_ownership import RuntimeOwnershipDescriptor, runtime_descriptor_for_store
+from tacit.runtime_ownership import (
+    RuntimeDatabaseIdentity,
+    RuntimeOwnershipDescriptor,
+    declare_runtime_factory,
+    get_runtime_factory_ownership,
+    runtime_descriptor_for_backends,
+    runtime_descriptor_for_provider,
+    runtime_descriptor_for_store,
+    runtime_descriptor_from_settings,
+)
 from tacit.signals import SignalStore
+from tests.http_client import TestClient
+
+
+def _owned_test_factory(
+    factory,
+    *,
+    runtime_settings: Settings,
+    factory_kind: str,
+):
+    if getattr(factory, "factory_kind", None) == factory_kind:
+        return factory
+    category, capability = factory_kind.split(":", 1)
+    if category in {"store", "knowledge"}:
+        settings_owner = runtime_descriptor_from_settings(
+            runtime_settings,
+            component="test_factory_settings",
+        )
+        database_path = next(item.path for item in settings_owner.databases if item.role == capability)
+        ownership = runtime_descriptor_for_store(
+            component=f"test_{factory_kind}_factory",
+            runtime_settings=runtime_settings,
+            database_role=capability,
+            database_path=database_path,
+        )
+    elif category == "provider":
+        ownership = runtime_descriptor_for_provider(
+            component=f"test_{factory_kind}_factory",
+            runtime_settings=runtime_settings,
+            capability=capability,
+        )
+    else:
+        ownership = runtime_descriptor_for_backends(
+            component=f"test_{factory_kind}_factory",
+            runtime_settings=runtime_settings,
+        )
+    return declare_runtime_factory(factory, ownership=ownership, factory_kind=factory_kind)
+
+
+def _isolated_dependencies(**values) -> PipelineDependencies:
+    runtime_settings = values["settings"]
+    for field, kind in (
+        ("backend_factory", "backend:dashboard"),
+        ("history_store_factory", "store:history"),
+        ("feedback_store_factory", "store:feedback"),
+        ("signal_store_factory", "store:signals"),
+        ("knowledge_service_factory", "knowledge:signals"),
+        ("llm_provider_factory", "provider:llm"),
+        ("context_provider_factory", "provider:context"),
+    ):
+        factory = values.get(field)
+        if factory is not None:
+            values[field] = _owned_test_factory(
+                factory,
+                runtime_settings=runtime_settings,
+                factory_kind=kind,
+            )
+    return PipelineDependencies.isolated(**values)
 
 
 def _security_request(runtime_settings: Settings, tenant_id: str | None = None) -> Request:
@@ -42,6 +115,216 @@ def _security_request(runtime_settings: Settings, tenant_id: str | None = None) 
             "headers": headers,
         }
     )
+
+
+def test_auth_enabled_disables_cross_origin_requests_without_an_allowlist() -> None:
+    app = create_app(runtime_settings=Settings(_env_file=None, api_auth_enabled=True, api_auth_key="secret"))
+
+    response = TestClient(app).options(
+        "/api/v1/signals",
+        headers={
+            "Origin": "https://console.example",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "X-API-Key,X-Tacit-Tenant",
+        },
+    )
+
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_default_unauthenticated_api_is_same_origin_only() -> None:
+    app = create_app(runtime_settings=Settings(_env_file=None))
+
+    preflight = TestClient(app).options(
+        "/api/v1/signals",
+        headers={
+            "Origin": "https://hostile.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "Content-Type",
+        },
+    )
+    response = TestClient(app).get(
+        "/healthz",
+        headers={"Origin": "https://hostile.example"},
+    )
+
+    assert "access-control-allow-origin" not in preflight.headers
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_unauthenticated_wildcard_cors_requires_explicit_opt_in() -> None:
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            api_cors_allowed_origins="*",
+        )
+    )
+
+    response = TestClient(app).get(
+        "/healthz",
+        headers={"Origin": "https://console.example"},
+    )
+
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
+@pytest.mark.parametrize("api_auth_enabled", [False, True])
+def test_default_cors_denies_hostile_browser_origins(api_auth_enabled: bool) -> None:
+    runtime_settings = Settings(
+        _env_file=None,
+        api_auth_enabled=api_auth_enabled,
+        api_auth_key="secret" if api_auth_enabled else "",
+    )
+    client = TestClient(create_app(runtime_settings=runtime_settings))
+
+    get_response = client.get(
+        "/healthz",
+        headers={"Origin": "https://hostile.example"},
+    )
+    preflight_response = client.options(
+        "/api/v1/chart",
+        headers={
+            "Origin": "https://hostile.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "Content-Type",
+        },
+    )
+
+    assert "access-control-allow-origin" not in get_response.headers
+    assert "access-control-allow-origin" not in preflight_response.headers
+
+
+def test_admission_rejection_normalizes_unknown_public_reason_codes() -> None:
+    rejection = PipelineAdmissionRejected("database-hostname-or-other-sensitive-context")
+
+    assert rejection.public_payload() == {
+        "detail": "Pipeline capacity is temporarily unavailable",
+        "reason_code": "pipeline_admission_rejected",
+    }
+
+
+def test_unauthenticated_cors_wildcard_requires_explicit_configuration() -> None:
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            api_auth_enabled=False,
+            api_cors_allowed_origins="*",
+        )
+    )
+
+    response = TestClient(app).options(
+        "/api/v1/chart",
+        headers={
+            "Origin": "https://console.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "Content-Type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
+def test_auth_enabled_uses_the_configured_cors_allowlist() -> None:
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            api_auth_enabled=True,
+            api_auth_key="secret",
+            api_cors_allowed_origins="https://console.example, https://ops.example",
+        )
+    )
+
+    response = TestClient(app).options(
+        "/api/v1/signals",
+        headers={
+            "Origin": "https://console.example",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "X-API-Key,X-Tacit-Tenant",
+        },
+    )
+
+    assert response.headers["access-control-allow-origin"] == "https://console.example"
+    allowed_headers = response.headers["access-control-allow-headers"].casefold()
+    assert "x-api-key" in allowed_headers
+    assert "x-tacit-tenant" in allowed_headers
+
+
+def test_auth_enabled_rejects_a_wildcard_cors_allowlist() -> None:
+    with pytest.raises(ValueError, match="wildcard CORS"):
+        Settings(
+            _env_file=None,
+            api_auth_enabled=True,
+            api_auth_key="secret",
+            api_cors_allowed_origins="*",
+        )
+
+
+@pytest.mark.parametrize("mutation", ["model_copy", "failed_assignment"])
+def test_app_factory_rejects_mutated_authenticated_wildcard_cors(mutation: str) -> None:
+    runtime_settings = Settings(_env_file=None, api_auth_enabled=True, api_auth_key="secret")
+    if mutation == "model_copy":
+        runtime_settings = runtime_settings.model_copy(update={"api_cors_allowed_origins": "*"})
+    else:
+        with pytest.raises(ValueError, match="wildcard CORS"):
+            runtime_settings.api_cors_allowed_origins = "*"
+
+    with pytest.raises(ValueError, match="wildcard CORS"):
+        create_app(runtime_settings=runtime_settings)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://example.com:notaport",
+        "https://example.com:65536",
+        "https://exa%6dple.com",
+        "https://bad_host.example",
+        "https://-bad.example",
+        "https://example..com",
+        "https://bücher.example",
+        "https://[2001:db8::1",
+    ],
+)
+def test_cors_origins_reject_browser_unrepresentable_hosts(origin: str) -> None:
+    with pytest.raises(ValueError, match="CORS origins"):
+        Settings(_env_file=None, api_cors_allowed_origins=origin)
+
+
+def test_cors_origins_are_canonical_browser_origins() -> None:
+    runtime_settings = Settings(
+        _env_file=None,
+        api_cors_allowed_origins=(
+            "HTTPS://XN--BCHER-KVA.Example:443/, http://LOCALHOST:80, https://[2001:0DB8::1]:8443"
+        ),
+    )
+
+    assert runtime_settings.api_cors_allowed_origins == (
+        "https://xn--bcher-kva.example,http://localhost,https://[2001:db8::1]:8443"
+    )
+
+
+def test_cors_preflight_allows_head_requests() -> None:
+    app = create_app(
+        runtime_settings=Settings(
+            _env_file=None,
+            api_auth_enabled=True,
+            api_auth_key="secret",
+            api_cors_allowed_origins="https://console.example",
+        )
+    )
+
+    response = TestClient(app).options(
+        "/api/v1/signals",
+        headers={
+            "Origin": "https://console.example",
+            "Access-Control-Request-Method": "HEAD",
+            "Access-Control-Request-Headers": "X-API-Key",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://console.example"
 
 
 @pytest.mark.parametrize(
@@ -316,7 +599,11 @@ def test_resource_tenant_access_matrix(configured, selected, resource_tenant, st
 
 
 def test_chart_route_uses_app_scoped_pipeline_settings(monkeypatch):
-    runtime_settings = Settings(pipeline_timeout_seconds=3, pipeline_max_concurrent=1)
+    runtime_settings = Settings(
+        pipeline_timeout_seconds=3,
+        pipeline_max_concurrent=1,
+        grafana_enabled=False,
+    )
     app = create_app(runtime_settings=runtime_settings)
     seen_settings: list[Settings] = []
     seen_backend_settings: list[Settings] = []
@@ -347,6 +634,36 @@ def test_chart_route_uses_app_scoped_pipeline_settings(monkeypatch):
     assert len(seen_backend_settings) == 1
     assert seen_backend_settings[0].pipeline_timeout_seconds == runtime_settings.pipeline_timeout_seconds
     assert seen_backend_settings[0].pipeline_max_concurrent == runtime_settings.pipeline_max_concurrent
+
+
+def test_api_backend_factory_is_declared_and_lazy(monkeypatch, tmp_path):
+    runtime_settings = Settings(
+        _env_file=None,
+        grafana_enabled=False,
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    app = create_app(runtime_settings=runtime_settings)
+    calls: list[Settings] = []
+
+    def fake_get_active_backends(settings_arg: Settings):
+        calls.append(settings_arg)
+        return []
+
+    monkeypatch.setattr(pipeline_mod, "get_active_backends", fake_get_active_backends)
+    request = Request({"type": "http", "app": app, "headers": []})
+
+    dependencies = get_pipeline_dependencies(request)
+
+    assert calls == []
+    ownership = get_runtime_factory_ownership(
+        dependencies.backend_factory,
+        expected_kind="backend:dashboard",
+    )
+    assert ownership.settings_identity == dependencies.runtime_ownership.settings_identity
+    assert dependencies.backend_factory() == []
+    assert calls == [runtime_settings]
 
 
 @pytest.mark.parametrize("endpoint", ["/api/v1/chart", "/api/v1/chart/stream"])
@@ -403,9 +720,28 @@ def test_chart_exception_exposes_persisted_run_identity(endpoint, monkeypatch):
     }
 
 
+@pytest.mark.parametrize("endpoint", ["/api/v1/chart", "/api/v1/chart/stream"])
+def test_chart_admission_rejection_has_a_stable_overload_response(endpoint, monkeypatch):
+    app = create_app(runtime_settings=Settings(_env_file=None))
+
+    async def reject_overload(_request, _deps):
+        raise PipelineAdmissionRejected("pipeline_admission_queue_full")
+
+    monkeypatch.setattr("tacit.api.routes.dashboard.run_pipeline", reject_overload)
+    response = TestClient(app).post(endpoint, json={"prompt": "checkout latency"})
+
+    expected_status = 503 if endpoint.endswith("/chart") else 200
+    assert response.status_code == expected_status
+    if endpoint.endswith("/stream"):
+        payload = json.loads(response.text.split("data: ", 1)[1].split("\n\n", 1)[0])
+    else:
+        payload = response.json()
+    assert payload == PipelineAdmissionRejected("pipeline_admission_queue_full").public_payload()
+
+
 def test_ownerless_injected_signal_store_cannot_fall_back_globally():
     injected_store = object()
-    deps = PipelineDependencies(
+    deps = _isolated_dependencies(
         settings=Settings(),
         backend_factory=lambda: [],
         history_store_factory=lambda: object(),
@@ -417,6 +753,367 @@ def test_ownerless_injected_signal_store_cannot_fall_back_globally():
 
     with pytest.raises(RuntimeOwnershipError, match="public runtime ownership descriptor"):
         resolve_knowledge_service(deps, signal_store=injected_store)
+
+
+def test_production_pipeline_builder_requires_an_explicit_runtime_store_owner(tmp_path):
+    runtime_settings = Settings(
+        _env_file=None,
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    factory_calls = 0
+
+    def history_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        raise AssertionError("history factory ran without a composition owner")
+
+    with pytest.raises(RuntimeOwnershipError, match="explicit RuntimeStores owner"):
+        build_pipeline_dependencies(
+            runtime_settings,
+            history_store_factory=history_factory,
+        )
+
+    assert factory_calls == 0
+    assert not tmp_path.joinpath("history.db").exists()
+    assert not tmp_path.joinpath("feedback.db").exists()
+    assert not tmp_path.joinpath("signals.db").exists()
+
+
+@pytest.mark.parametrize(
+    ("role", "factory_field"),
+    [
+        ("history", "history_store_factory"),
+        ("feedback", "feedback_store_factory"),
+    ],
+)
+@pytest.mark.parametrize(
+    "mismatch",
+    ["settings", "tenant", "permission", "database", "role"],
+)
+def test_realized_pipeline_store_must_match_settings_tenant_role_and_database(
+    tmp_path,
+    role: str,
+    factory_field: str,
+    mismatch: str,
+):
+    from tacit.runtime_stores import RuntimeStores
+
+    active_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-a",
+        history_db_path=str(tmp_path / "active-history.db"),
+        feedback_db_path=str(tmp_path / "active-feedback.db"),
+        signals_db_path=str(tmp_path / "active-signals.db"),
+    )
+    updates: dict[str, str] = {}
+    if mismatch == "settings":
+        updates["llm_model"] = "foreign-model"
+    elif mismatch == "tenant":
+        updates["knowledge_tenant_id"] = "tenant-b"
+    elif mismatch == "permission":
+        updates["knowledge_permissions"] = "knowledge.read"
+    elif mismatch == "database":
+        updates[f"{role}_db_path"] = str(tmp_path / f"foreign-{role}.db")
+    foreign_settings = active_settings.model_copy(update=updates)
+    descriptor = runtime_descriptor_for_store(
+        component=f"foreign_{role}_store",
+        runtime_settings=foreign_settings,
+        database_role=role,
+        database_path=getattr(foreign_settings, f"{role}_db_path"),
+    )
+    if mismatch == "role":
+        wrong_role = "feedback" if role == "history" else "history"
+        descriptor = replace(
+            descriptor,
+            databases=(
+                RuntimeDatabaseIdentity(
+                    role=wrong_role,
+                    path=getattr(active_settings, f"{role}_db_path"),
+                ),
+            ),
+        )
+
+    class StoreProbe:
+        runtime_ownership = descriptor
+
+        def __init__(self) -> None:
+            self.method_calls = 0
+
+        def start(self, *_args, **_kwargs):
+            self.method_calls += 1
+            raise AssertionError("mismatched store reached pipeline use")
+
+        def record_provenance(self, **_kwargs):
+            self.method_calls += 1
+            raise AssertionError("mismatched store reached pipeline use")
+
+    probe = StoreProbe()
+    declared_factory = _owned_test_factory(
+        lambda: probe,
+        runtime_settings=active_settings,
+        factory_kind=f"store:{role}",
+    )
+    dependencies = build_pipeline_dependencies(
+        active_settings,
+        stores=RuntimeStores(active_settings),
+        **{factory_field: declared_factory},
+    )
+
+    with pytest.raises(RuntimeOwnershipError, match="runtime ownership mismatch"):
+        getattr(dependencies, factory_field)()
+
+    assert probe.method_calls == 0
+
+
+@pytest.mark.parametrize("role", ["history", "feedback"])
+def test_ownerless_realized_pipeline_store_fails_before_use(tmp_path, role: str):
+    from tacit.runtime_stores import RuntimeStores
+
+    runtime_settings = Settings(
+        _env_file=None,
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    field = f"{role}_store_factory"
+    declared_factory = _owned_test_factory(
+        lambda: object(),
+        runtime_settings=runtime_settings,
+        factory_kind=f"store:{role}",
+    )
+    dependencies = build_pipeline_dependencies(
+        runtime_settings,
+        stores=RuntimeStores(runtime_settings),
+        **{field: declared_factory},
+    )
+
+    with pytest.raises(RuntimeOwnershipError, match="public runtime ownership descriptor"):
+        getattr(dependencies, field)()
+
+
+def test_isolated_dependencies_install_explicit_settings_bound_provider_factories(tmp_path, monkeypatch):
+    def forbidden_context_registry(_settings):
+        raise AssertionError("disabled context consulted the provider registry")
+
+    monkeypatch.setattr("tacit.context.registry.create_context_provider", forbidden_context_registry)
+    dependencies = _isolated_dependencies(
+        settings=Settings(
+            _env_file=None,
+            context_provider="none",
+            history_db_path=str(tmp_path / "history.db"),
+            feedback_db_path=str(tmp_path / "feedback.db"),
+            signals_db_path=str(tmp_path / "signals.db"),
+        ),
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    assert dependencies.llm_provider_factory is not None
+    assert dependencies.context_provider_factory is not None
+    assert dependencies.context_provider_factory() is None
+
+
+@pytest.mark.parametrize(
+    ("missing_capability", "message"),
+    [
+        ("llm", "explicit LLM provider factory"),
+        ("context", "explicit context provider factory"),
+    ],
+)
+def test_direct_dependencies_require_explicit_provider_capabilities(
+    tmp_path,
+    missing_capability: str,
+    message: str,
+):
+    from tacit.runtime_stores import RuntimeStores
+
+    runtime_settings = Settings(
+        _env_file=None,
+        context_provider="none",
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    stores = RuntimeStores(runtime_settings)
+
+    class ProviderProbe(LLMProvider):
+        def __init__(self) -> None:
+            super().__init__(runtime_settings, component="direct_test_llm_provider")
+
+        async def chat_json(self, *_args, **_kwargs):
+            raise AssertionError("provider should not be used during construction")
+
+        async def chat_text(self, *_args, **_kwargs):
+            raise AssertionError("provider should not be used during construction")
+
+    values = {
+        "settings": runtime_settings,
+        "backend_factory": _owned_test_factory(
+            lambda: [],
+            runtime_settings=runtime_settings,
+            factory_kind="backend:dashboard",
+        ),
+        "history_store_factory": _owned_test_factory(
+            stores.history,
+            runtime_settings=runtime_settings,
+            factory_kind="store:history",
+        ),
+        "feedback_store_factory": _owned_test_factory(
+            stores.feedback,
+            runtime_settings=runtime_settings,
+            factory_kind="store:feedback",
+        ),
+        "llm_cache": stores.llm_cache(),
+        "cache_key_factory": lambda *parts: ":".join(parts),
+        "pipeline_admission": stores.pipeline_admission(),
+        "runtime_ownership": stores.runtime_ownership,
+        "llm_provider_factory": (
+            None
+            if missing_capability == "llm"
+            else _owned_test_factory(
+                ProviderProbe,
+                runtime_settings=runtime_settings,
+                factory_kind="provider:llm",
+            )
+        ),
+        "context_provider_factory": (
+            None
+            if missing_capability == "context"
+            else _owned_test_factory(
+                lambda: None,
+                runtime_settings=runtime_settings,
+                factory_kind="provider:context",
+            )
+        ),
+    }
+
+    with pytest.raises(RuntimeOwnershipError, match=message):
+        PipelineDependencies(**values)
+
+
+@pytest.mark.asyncio
+async def test_isolated_dependency_rejects_a_mismatched_llm_provider_before_agent_use(tmp_path):
+    active_settings = Settings(
+        _env_file=None,
+        llm_provider="ollama",
+        llm_api_base="http://127.0.0.1:11434",
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    foreign_settings = active_settings.model_copy(update={"llm_api_base": "http://127.0.0.1:11435"})
+
+    class ProviderProbe(LLMProvider):
+        def __init__(self) -> None:
+            super().__init__(foreign_settings, component="foreign_llm_provider")
+            self.calls = 0
+
+        async def chat_json(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("mismatched provider reached agent use")
+
+        async def chat_text(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("mismatched provider reached agent use")
+
+        async def close(self):
+            return None
+
+    probe = ProviderProbe()
+    dependencies = _isolated_dependencies(
+        settings=active_settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+        llm_provider_factory=lambda: probe,
+        context_provider_factory=lambda: None,
+    )
+
+    assert dependencies.llm_provider_factory is not None
+    with pytest.raises(RuntimeOwnershipError, match="runtime ownership mismatch"):
+        await dependencies.acquire_resources()
+
+    assert probe.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_isolated_dependency_rejects_an_ownerless_llm_provider_before_agent_use(tmp_path):
+    class OwnerlessProvider(LLMProvider):
+        async def chat_json(self, *_args, **_kwargs):
+            raise AssertionError("ownerless provider reached agent use")
+
+        async def chat_text(self, *_args, **_kwargs):
+            raise AssertionError("ownerless provider reached agent use")
+
+    runtime_settings = Settings(
+        _env_file=None,
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    dependencies = _isolated_dependencies(
+        settings=runtime_settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+        llm_provider_factory=OwnerlessProvider,
+        context_provider_factory=lambda: None,
+    )
+
+    assert dependencies.llm_provider_factory is not None
+    with pytest.raises(RuntimeOwnershipError, match="public runtime ownership descriptor"):
+        await dependencies.acquire_resources()
+
+
+def test_isolated_dependency_rejects_a_mismatched_context_provider_before_query(tmp_path):
+    active_settings = Settings(
+        _env_file=None,
+        context_provider="mcp",
+        context_mcp_server_url="http://127.0.0.1:8765",
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    foreign_settings = active_settings.model_copy(update={"context_mcp_server_url": "http://127.0.0.1:9876"})
+
+    class ContextProbe(ContextProvider):
+        def __init__(self) -> None:
+            super().__init__(foreign_settings, component="foreign_context_provider")
+            self.calls = 0
+
+        @property
+        def name(self) -> str:
+            return "probe"
+
+        async def query(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("mismatched context provider reached query")
+
+    probe = ContextProbe()
+    dependencies = _isolated_dependencies(
+        settings=active_settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+        context_provider_factory=lambda: probe,
+    )
+
+    assert dependencies.context_provider_factory is not None
+    with pytest.raises(RuntimeOwnershipError, match="runtime ownership mismatch"):
+        dependencies.context_provider_factory()
+
+    assert probe.calls == 0
 
 
 def test_pipeline_knowledge_uses_descriptor_only_signal_store_without_global_fallback(
@@ -455,14 +1152,21 @@ def test_pipeline_knowledge_uses_descriptor_only_signal_store_without_global_fal
         raise AssertionError("descriptor-owned dependency consulted the process-global signal store")
 
     monkeypatch.setattr("tacit.signals.get_signal_store", forbidden_global_store)
+    from tacit.runtime_stores import RuntimeStores
+
     dependencies = build_pipeline_dependencies(
         runtime_settings,
-        signal_store_factory=lambda: injected,
+        stores=RuntimeStores(runtime_settings),
+        signal_store_factory=_owned_test_factory(
+            lambda: injected,
+            runtime_settings=runtime_settings,
+            factory_kind="store:signals",
+        ),
     )
     assert dependencies.knowledge_service_factory is not None
 
     factory_service = dependencies.knowledge_service_factory()
-    direct_dependencies = PipelineDependencies(
+    direct_dependencies = _isolated_dependencies(
         settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: object(),
@@ -498,7 +1202,7 @@ def test_pipeline_knowledge_preserves_explicit_unavailable_store_without_global_
         raise AssertionError("explicitly unavailable dependency consulted the process-global signal store")
 
     monkeypatch.setattr("tacit.signals.get_signal_store", forbidden_global_store)
-    dependencies = PipelineDependencies(
+    dependencies = _isolated_dependencies(
         settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: object(),
@@ -811,7 +1515,7 @@ def test_replay_route_uses_app_scoped_runtime_settings(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert seen_settings == [runtime_settings]
+    assert seen_settings == [app.state.runtime_stores.settings]
 
 
 @pytest.mark.parametrize(

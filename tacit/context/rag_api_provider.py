@@ -30,7 +30,8 @@ class RAGAPIProvider(ContextProvider):
         return "rag_api"
 
     def __init__(self, runtime_settings: Settings | None = None):
-        runtime_settings = runtime_settings or settings
+        super().__init__(runtime_settings or settings, component="rag_api_context_provider")
+        runtime_settings = self.runtime_settings
         self._base_url = runtime_settings.context_rag_api_url.rstrip("/")
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if runtime_settings.context_api_key:

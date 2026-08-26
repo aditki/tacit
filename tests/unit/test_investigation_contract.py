@@ -14,7 +14,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from structlog.testing import capture_logs
 
@@ -29,7 +28,7 @@ from tacit.api.dependencies import (
 from tacit.backends.base import PublishResult
 from tacit.config import Settings
 from tacit.dependencies import PipelineDependencies
-from tacit.errors import PipelineExecutionError
+from tacit.errors import PipelineAdmissionRejected, PipelineExecutionError
 from tacit.grounding_benchmark import (
     _contract_for_case,
     load_grounding_corpus,
@@ -85,7 +84,101 @@ from tacit.models.schemas import (
 from tacit.pipeline.completion import complete_pipeline
 from tacit.pipeline.recording import PipelineRecorder
 from tacit.pipeline.runner import _applied_stage_knowledge_refs
-from tacit.runtime_ownership import runtime_descriptor_from_settings
+from tacit.runtime_ownership import (
+    declare_runtime_factory,
+    runtime_descriptor_for_backends,
+    runtime_descriptor_for_provider,
+    runtime_descriptor_for_store,
+    runtime_descriptor_from_settings,
+)
+from tests.http_client import TestClient
+
+
+def _pipeline_settings(**values) -> Settings:
+    """Build complete validated settings for direct pipeline fixtures."""
+    values.setdefault("_env_file", None)
+    if values.get("knowledge_tenant_id") == "*":
+        values.setdefault("api_auth_enabled", True)
+    return Settings(**values)
+
+
+def _own_pipeline_store(store, runtime_settings: Settings, role: str):
+    """Bind a test double to the same runtime owner as the dependency graph."""
+    settings_owner = runtime_descriptor_from_settings(
+        runtime_settings,
+        component=f"{role}_test_settings",
+    )
+    database = next(item for item in settings_owner.databases if item.role == role)
+    store.runtime_ownership = runtime_descriptor_for_store(
+        component=f"{role}_test_store",
+        runtime_settings=runtime_settings,
+        database_role=role,
+        database_path=database.path,
+    )
+    return store
+
+
+def _owned_pipeline_factory(factory, *, runtime_settings: Settings, factory_kind: str):
+    """Declare a fixture factory without invoking its test double."""
+    if getattr(factory, "factory_kind", None) == factory_kind:
+        return factory
+    category, capability = factory_kind.split(":", 1)
+    if category in {"store", "knowledge"}:
+        settings_owner = runtime_descriptor_from_settings(
+            runtime_settings,
+            component="investigation_contract_test_settings",
+        )
+        database_path = next(item.path for item in settings_owner.databases if item.role == capability)
+        ownership = runtime_descriptor_for_store(
+            component=f"investigation_contract_{factory_kind}_factory",
+            runtime_settings=runtime_settings,
+            database_role=capability,
+            database_path=database_path,
+        )
+    elif category == "provider":
+        ownership = runtime_descriptor_for_provider(
+            component=f"investigation_contract_{factory_kind}_factory",
+            runtime_settings=runtime_settings,
+            capability=capability,
+        )
+    else:
+        ownership = runtime_descriptor_for_backends(
+            component=f"investigation_contract_{factory_kind}_factory",
+            runtime_settings=runtime_settings,
+        )
+    return declare_runtime_factory(
+        factory,
+        ownership=ownership,
+        factory_kind=factory_kind,
+    )
+
+
+def _isolated_dependencies(**values) -> PipelineDependencies:
+    """Build an isolated graph whose lazy fixtures declare runtime ownership."""
+    runtime_settings = values["settings"]
+    for field, kind in (
+        ("backend_factory", "backend:dashboard"),
+        ("history_store_factory", "store:history"),
+        ("feedback_store_factory", "store:feedback"),
+        ("signal_store_factory", "store:signals"),
+        ("knowledge_service_factory", "knowledge:signals"),
+        ("llm_provider_factory", "provider:llm"),
+        ("context_provider_factory", "provider:context"),
+    ):
+        factory = values.get(field)
+        if factory is not None:
+            values[field] = _owned_pipeline_factory(
+                factory,
+                runtime_settings=runtime_settings,
+                factory_kind=kind,
+            )
+    return PipelineDependencies.isolated(**values)
+
+
+def _owned_history_store(db_path: Path, **settings_values) -> tuple[Settings, InvestigationStore]:
+    """Create a direct-pipeline history fixture from one settings owner."""
+    runtime_settings = _pipeline_settings(history_db_path=str(db_path), **settings_values)
+    return runtime_settings, InvestigationStore(db_path=db_path, runtime_settings=runtime_settings)
 
 
 def _draft_contract(
@@ -489,7 +582,7 @@ def test_chart_route_requires_header_tenant_for_wildcard_configuration(monkeypat
         )
     )
     app.dependency_overrides[get_pipeline_dependencies] = lambda: SimpleNamespace(
-        settings=SimpleNamespace(knowledge_tenant_id="*")
+        settings=_pipeline_settings(knowledge_tenant_id="*")
     )
     client = TestClient(app)
 
@@ -524,8 +617,8 @@ async def test_direct_pipeline_rejects_configured_tenant_mismatch(monkeypatch):
         return DashResponse(dashboard_url="", dashboard_uid="", panel_count=0, summary="ok")
 
     monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", fake_inner)
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
+    deps = _isolated_dependencies(
+        settings=_pipeline_settings(
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_tenant_id="tenant-a",
@@ -554,8 +647,8 @@ async def test_direct_pipeline_resolves_pinned_tenant_before_inner_pipeline(monk
         return DashResponse(dashboard_url="", dashboard_uid="", panel_count=0, summary="ok")
 
     monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", fake_inner)
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
+    deps = _isolated_dependencies(
+        settings=_pipeline_settings(
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_tenant_id="tenant-a",
@@ -594,14 +687,15 @@ async def test_non_default_pipeline_rejects_tenant_blind_history_store(
             self.started = True
             return "unsafe-history-id"
 
-    history = TenantBlindHistory()
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
-            pipeline_max_concurrent=1,
-            pipeline_timeout_seconds=5,
-            knowledge_tenant_id=configured_tenant,
-            knowledge_permissions="knowledge.read,knowledge.apply",
-        ),
+    runtime_settings = _pipeline_settings(
+        pipeline_max_concurrent=1,
+        pipeline_timeout_seconds=5,
+        knowledge_tenant_id=configured_tenant,
+        knowledge_permissions="knowledge.read,knowledge.apply",
+    )
+    history = _own_pipeline_store(TenantBlindHistory(), runtime_settings, "history")
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: history,
         feedback_store_factory=lambda: object(),
@@ -629,8 +723,8 @@ async def test_direct_pipeline_requires_tenant_for_wildcard_configuration(monkey
         return DashResponse(dashboard_url="", dashboard_uid="", panel_count=0, summary="unexpected")
 
     monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", fake_inner)
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
+    deps = _isolated_dependencies(
+        settings=_pipeline_settings(
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_tenant_id="*",
@@ -661,8 +755,8 @@ async def test_direct_pipeline_rejects_invalid_wildcard_tenants(monkeypatch, ten
         return DashResponse(dashboard_url="", dashboard_uid="", panel_count=0, summary="unexpected")
 
     monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", fake_inner)
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
+    deps = _isolated_dependencies(
+        settings=_pipeline_settings(
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_tenant_id="*",
@@ -2569,7 +2663,14 @@ def test_failed_knowledge_audit_guard_includes_applied_ranking_usage():
 
 
 async def test_failed_refresh_does_not_overwrite_current_investigation_row(tmp_path):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
+    runtime_settings, store = _owned_history_store(
+        tmp_path / "history.db",
+        pipeline_max_concurrent=1,
+        pipeline_timeout_seconds=5,
+        knowledge_permissions="knowledge.read,knowledge.apply",
+        grafana_enabled=False,
+        signalfx_enabled=False,
+    )
     investigation_id = store.start("Why did checkout latency increase?", user_id="api")
     store.persist_contract_revision(_draft_contract(investigation_id))
     store.finish(
@@ -2578,12 +2679,8 @@ async def test_failed_refresh_does_not_overwrite_current_investigation_row(tmp_p
         dashboard_uid="current",
         dashboard_url="http://grafana/current",
     )
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
-            pipeline_max_concurrent=1,
-            pipeline_timeout_seconds=5,
-            knowledge_permissions="knowledge.read,knowledge.apply",
-        ),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -2612,9 +2709,12 @@ async def test_failed_refresh_does_not_overwrite_current_investigation_row(tmp_p
 
 @pytest.mark.asyncio
 async def test_direct_refresh_rejects_a_cross_tenant_investigation_before_starting_a_run(tmp_path):
-    store = InvestigationStore(
-        db_path=tmp_path / "history.db",
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="*", api_auth_enabled=True),
+    runtime_settings, store = _owned_history_store(
+        tmp_path / "history.db",
+        pipeline_max_concurrent=1,
+        pipeline_timeout_seconds=5,
+        knowledge_tenant_id="*",
+        knowledge_permissions="knowledge.read,knowledge.apply",
     )
     investigation_id = store.start("Tenant B investigation", tenant_id="tenant-b")
     draft = _draft_contract(investigation_id)
@@ -2627,13 +2727,8 @@ async def test_direct_refresh_rejects_a_cross_tenant_investigation_before_starti
     )
     store.persist_contract_revision(draft)
     runs_before = store.list_runs(investigation_id, tenant_id="tenant-b")
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
-            pipeline_max_concurrent=1,
-            pipeline_timeout_seconds=5,
-            knowledge_tenant_id="*",
-            knowledge_permissions="knowledge.read,knowledge.apply",
-        ),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -2664,8 +2759,8 @@ async def test_pipeline_preserves_a_caller_supplied_base_revision(monkeypatch):
         return DashResponse(dashboard_url="", dashboard_uid="", panel_count=0, summary="pinned")
 
     monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", fake_inner)
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
+    deps = _isolated_dependencies(
+        settings=_pipeline_settings(
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_permissions="knowledge.read,knowledge.apply",
@@ -2711,8 +2806,8 @@ async def test_direct_refresh_authorizes_before_history_or_backend_access(
         accessed.append("backend")
         raise AssertionError("backends must not be opened before authorization")
 
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
+    deps = _isolated_dependencies(
+        settings=_pipeline_settings(
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_permissions=permissions,
@@ -2758,8 +2853,8 @@ async def test_direct_initial_pipeline_authorizes_before_history_or_backend_acce
         accessed.append("backend")
         raise AssertionError("backends must not be opened before authorization")
 
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
+    deps = _isolated_dependencies(
+        settings=_pipeline_settings(
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_permissions=permissions,
@@ -2781,7 +2876,12 @@ async def test_direct_initial_pipeline_authorizes_before_history_or_backend_acce
 
 
 async def test_backend_factory_failure_completes_the_pipeline_run(tmp_path):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
+    runtime_settings, store = _owned_history_store(
+        tmp_path / "history.db",
+        pipeline_max_concurrent=1,
+        pipeline_timeout_seconds=5,
+        knowledge_permissions="knowledge.read,knowledge.apply",
+    )
     resources_closed = False
     sensitive_detail = "api_key=backend-secret path=/private/runtime/backend.json"
 
@@ -2792,12 +2892,8 @@ async def test_backend_factory_failure_completes_the_pipeline_run(tmp_path):
         nonlocal resources_closed
         resources_closed = True
 
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
-            pipeline_max_concurrent=1,
-            pipeline_timeout_seconds=5,
-            knowledge_permissions="knowledge.read,knowledge.apply",
-        ),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=failing_backend_factory,
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -2843,7 +2939,7 @@ def test_chart_routes_do_not_traceback_log_hidden_pipeline_causes(
     monkeypatch,
 ):
     runtime_settings = Settings(_env_file=None)
-    deps = PipelineDependencies(
+    deps = _isolated_dependencies(
         settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: object(),
@@ -2882,7 +2978,12 @@ def test_chart_routes_do_not_traceback_log_hidden_pipeline_causes(
 
 
 async def test_run_start_failure_fails_closed_with_explicit_audit_state(tmp_path, monkeypatch):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
+    runtime_settings, store = _owned_history_store(
+        tmp_path / "history.db",
+        pipeline_max_concurrent=1,
+        pipeline_timeout_seconds=5,
+        knowledge_permissions="knowledge.read,knowledge.apply",
+    )
     resources_closed = False
     backends_created = False
 
@@ -2901,12 +3002,8 @@ async def test_run_start_failure_fails_closed_with_explicit_audit_state(tmp_path
         resources_closed = True
 
     monkeypatch.setattr(store, "start_run", fail_start_run)
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
-            pipeline_max_concurrent=1,
-            pipeline_timeout_seconds=5,
-            knowledge_permissions="knowledge.read,knowledge.apply",
-        ),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=backend_factory,
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -2946,8 +3043,8 @@ async def test_history_store_initialization_failure_has_explicit_unavailable_aud
         nonlocal resources_closed
         resources_closed = True
 
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
+    deps = _isolated_dependencies(
+        settings=_pipeline_settings(
             pipeline_max_concurrent=1,
             pipeline_timeout_seconds=5,
             knowledge_permissions="knowledge.read,knowledge.apply",
@@ -2973,7 +3070,13 @@ async def test_history_store_initialization_failure_has_explicit_unavailable_aud
 
 
 async def test_existing_investigation_lookup_failure_has_explicit_unavailable_audit_state(tmp_path, monkeypatch):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
+    runtime_settings, store = _owned_history_store(
+        tmp_path / "history.db",
+        pipeline_max_concurrent=1,
+        pipeline_timeout_seconds=5,
+        knowledge_permissions="knowledge.read,knowledge.apply",
+        knowledge_tenant_id="default",
+    )
     resources_closed = False
     backends_created = False
 
@@ -2990,13 +3093,8 @@ async def test_existing_investigation_lookup_failure_has_explicit_unavailable_au
         resources_closed = True
 
     monkeypatch.setattr(store, "get_contract", fail_contract_lookup)
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
-            pipeline_max_concurrent=1,
-            pipeline_timeout_seconds=5,
-            knowledge_permissions="knowledge.read,knowledge.apply",
-            knowledge_tenant_id="default",
-        ),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=backend_factory,
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -3032,15 +3130,17 @@ async def test_initial_history_write_failure_has_explicit_unavailable_audit_stat
         nonlocal resources_closed
         resources_closed = True
 
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
-            pipeline_max_concurrent=1,
-            pipeline_timeout_seconds=5,
-            knowledge_permissions="knowledge.read,knowledge.apply",
-            knowledge_tenant_id="default",
-        ),
+    runtime_settings = _pipeline_settings(
+        pipeline_max_concurrent=1,
+        pipeline_timeout_seconds=5,
+        knowledge_permissions="knowledge.read,knowledge.apply",
+        knowledge_tenant_id="default",
+    )
+    history = _own_pipeline_store(FailingHistory(), runtime_settings, "history")
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [],
-        history_store_factory=FailingHistory,
+        history_store_factory=lambda: history,
         feedback_store_factory=lambda: object(),
         llm_cache={},
         cache_key_factory=lambda *parts: ":".join(parts),
@@ -3058,20 +3158,21 @@ async def test_initial_history_write_failure_has_explicit_unavailable_audit_stat
 
 
 async def test_terminal_audit_failure_is_disclosed_and_expired_run_is_recovered(tmp_path, monkeypatch):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
+    runtime_settings, store = _owned_history_store(
+        tmp_path / "history.db",
+        pipeline_max_concurrent=1,
+        pipeline_timeout_seconds=5,
+        knowledge_permissions="knowledge.read,knowledge.apply",
+        knowledge_tenant_id="default",
+    )
     complete_run = store.complete_run
 
     def fail_complete_run(*_args, **_kwargs):
         raise sqlite3.OperationalError("terminal audit unavailable")
 
     monkeypatch.setattr(store, "complete_run", fail_complete_run)
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
-            pipeline_max_concurrent=1,
-            pipeline_timeout_seconds=5,
-            knowledge_permissions="knowledge.read,knowledge.apply",
-            knowledge_tenant_id="default",
-        ),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: (_ for _ in ()).throw(RuntimeError("backend failed")),
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -3333,9 +3434,20 @@ def test_public_events_cannot_follow_terminal_or_expired_runs(tmp_path):
 
 
 async def test_caller_cancellation_records_cancelled_not_timeout(tmp_path, monkeypatch):
+    runtime_settings, store = _owned_history_store(
+        tmp_path / "history.db",
+        pipeline_max_concurrent=1,
+        pipeline_timeout_seconds=5,
+        knowledge_permissions="knowledge.read,knowledge.apply",
+    )
+
     class WaitingBackend:
         name = "grafana"
         query_language = "promql"
+        runtime_ownership = runtime_descriptor_for_backends(
+            component="cancellation_test_backend",
+            runtime_settings=runtime_settings,
+        )
 
         async def close(self):
             return None
@@ -3347,13 +3459,8 @@ async def test_caller_cancellation_records_cancelled_not_timeout(tmp_path, monke
         await asyncio.Event().wait()
 
     monkeypatch.setattr("tacit.pipeline.classify_intent", waiting_classify)
-    store = InvestigationStore(db_path=tmp_path / "history.db")
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
-            pipeline_max_concurrent=1,
-            pipeline_timeout_seconds=5,
-            knowledge_permissions="knowledge.read,knowledge.apply",
-        ),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [WaitingBackend()],
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -3381,7 +3488,7 @@ async def test_caller_cancellation_records_cancelled_not_timeout(tmp_path, monke
 
 
 async def test_cancellation_after_publication_commit_finishes_authoritative_audit(tmp_path):
-    runtime_settings = Settings(_env_file=None)
+    runtime_settings, store = _owned_history_store(tmp_path / "history.db")
     owner = runtime_descriptor_from_settings(
         runtime_settings,
         component="publication_commit_test_backend",
@@ -3423,7 +3530,6 @@ async def test_cancellation_after_publication_commit_finishes_authoritative_audi
         def record_provenance(self, **kwargs):
             return None
 
-    store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Investigate checkout", user_id="api")
     run_id = store.start_run(investigation_id, run_type=InvestigationRunType.INITIAL)
     recorder = PipelineRecorder(
@@ -3436,11 +3542,12 @@ async def test_cancellation_after_publication_commit_finishes_authoritative_audi
         title="Committed dashboard",
         panels=[PanelSpec(title="Traffic", queries=[PanelQuery(expr="up", datasource_uid="prom")])],
     )
-    deps = PipelineDependencies(
+    feedback_store = _own_pipeline_store(FeedbackStore(), runtime_settings, "feedback")
+    deps = _isolated_dependencies(
         settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
-        feedback_store_factory=FeedbackStore,
+        feedback_store_factory=lambda: feedback_store,
         llm_cache={},
         cache_key_factory=lambda *parts: ":".join(parts),
     )
@@ -3489,9 +3596,20 @@ async def test_cancellation_after_publication_commit_finishes_authoritative_audi
 
 
 async def test_pipeline_deadline_still_records_timeout(tmp_path, monkeypatch):
+    runtime_settings, store = _owned_history_store(
+        tmp_path / "history.db",
+        pipeline_max_concurrent=1,
+        pipeline_timeout_seconds=0.01,
+        knowledge_permissions="knowledge.read,knowledge.apply",
+    )
+
     class WaitingBackend:
         name = "grafana"
         query_language = "promql"
+        runtime_ownership = runtime_descriptor_for_backends(
+            component="deadline_test_backend",
+            runtime_settings=runtime_settings,
+        )
 
         async def close(self):
             return None
@@ -3500,13 +3618,8 @@ async def test_pipeline_deadline_still_records_timeout(tmp_path, monkeypatch):
         await asyncio.Event().wait()
 
     monkeypatch.setattr("tacit.pipeline.classify_intent", waiting_classify)
-    store = InvestigationStore(db_path=tmp_path / "history.db")
-    deps = PipelineDependencies(
-        settings=SimpleNamespace(
-            pipeline_max_concurrent=1,
-            pipeline_timeout_seconds=0.01,
-            knowledge_permissions="knowledge.read,knowledge.apply",
-        ),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [WaitingBackend()],
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -3527,9 +3640,15 @@ async def test_pipeline_deadline_still_records_timeout(tmp_path, monkeypatch):
 
 
 async def test_successful_refresh_only_advances_the_legacy_row_revision_pointer(tmp_path):
+    runtime_settings, store = _owned_history_store(tmp_path / "history.db")
+
     class PublishedBackend:
         name = "grafana"
         query_language = "promql"
+        runtime_ownership = runtime_descriptor_from_settings(
+            runtime_settings,
+            component="refresh_publish_backend",
+        )
 
         async def publish(self, dashboard_spec):
             return PublishResult(url="http://grafana/refreshed", uid="refreshed", backend_name=self.name)
@@ -3538,7 +3657,6 @@ async def test_successful_refresh_only_advances_the_legacy_row_revision_pointer(
         def record_provenance(self, **kwargs):
             return None
 
-    store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Original prompt", user_id="api")
     store.record_intent(investigation_id, summary="Original intent", services=["legacy-service"])
     store.record_queries(
@@ -3567,11 +3685,12 @@ async def test_successful_refresh_only_advances_the_legacy_row_revision_pointer(
         title="Refreshed dashboard",
         panels=[PanelSpec(title="New traffic", queries=[PanelQuery(expr="new_metric", datasource_uid="prom")])],
     )
-    deps = PipelineDependencies(
-        settings=object(),
+    feedback_store = _own_pipeline_store(FeedbackStore(), runtime_settings, "feedback")
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
-        feedback_store_factory=FeedbackStore,
+        feedback_store_factory=lambda: feedback_store,
         llm_cache={},
         cache_key_factory=lambda *parts: ":".join(parts),
     )
@@ -3613,9 +3732,15 @@ async def test_successful_refresh_only_advances_the_legacy_row_revision_pointer(
 
 
 async def test_refresh_persistence_rejects_a_base_that_advanced_during_the_run(tmp_path):
+    runtime_settings, store = _owned_history_store(tmp_path / "history.db")
+
     class PublishedBackend:
         name = "grafana"
         query_language = "promql"
+        runtime_ownership = runtime_descriptor_from_settings(
+            runtime_settings,
+            component="stale_refresh_publish_backend",
+        )
 
         async def publish(self, dashboard_spec):
             return PublishResult(url="http://grafana/stale-refresh", uid="stale-refresh", backend_name=self.name)
@@ -3624,7 +3749,6 @@ async def test_refresh_persistence_rejects_a_base_that_advanced_during_the_run(t
         def record_provenance(self, **kwargs):
             return None
 
-    store = InvestigationStore(db_path=tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="api")
     store.persist_contract_revision(_draft_contract(investigation_id))
     store.finish(
@@ -3650,11 +3774,12 @@ async def test_refresh_persistence_rejects_a_base_that_advanced_during_the_run(t
         title="Refresh",
         panels=[PanelSpec(title="Traffic", queries=[PanelQuery(expr="up", datasource_uid="prom")])],
     )
-    deps = PipelineDependencies(
-        settings=object(),
+    feedback_store = _own_pipeline_store(FeedbackStore(), runtime_settings, "feedback")
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
-        feedback_store_factory=FeedbackStore,
+        feedback_store_factory=lambda: feedback_store,
         llm_cache={},
         cache_key_factory=lambda *parts: ":".join(parts),
     )
@@ -4102,9 +4227,15 @@ def test_wheel_configuration_includes_the_grounding_benchmark_corpus():
 
 
 async def test_published_dashboard_succeeds_when_contract_persistence_fails():
+    runtime_settings = Settings(_env_file=None)
+
     class PublishedBackend:
         name = "grafana"
         query_language = "promql"
+        runtime_ownership = runtime_descriptor_from_settings(
+            runtime_settings,
+            component="published_dashboard_backend",
+        )
 
         async def publish(self, dashboard_spec):
             return PublishResult(url="http://grafana/d/published", uid="published", backend_name=self.name)
@@ -4145,8 +4276,8 @@ async def test_published_dashboard_succeeds_when_contract_persistence_fails():
         title="Published dashboard",
         panels=[PanelSpec(title="Traffic", queries=[PanelQuery(expr="up", datasource_uid="prom")])],
     )
-    deps = PipelineDependencies(
-        settings=object(),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: history,
         feedback_store_factory=FeedbackStore,
@@ -4596,9 +4727,14 @@ def test_history_store_replay_and_migration_enforce_domain_permissions(tmp_path)
 
 
 def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch):
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-a",
+        history_db_path=str(tmp_path / "history.db"),
+    )
     store = InvestigationStore(
         db_path=tmp_path / "history.db",
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+        runtime_settings=runtime_settings,
     )
     investigation_id = store.start("Why did checkout latency increase?", user_id="api", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
@@ -4610,8 +4746,8 @@ def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch
     class FeedbackStore:
         pass
 
-    deps = PipelineDependencies(
-        settings=Settings(knowledge_tenant_id="tenant-a"),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
         feedback_store_factory=FeedbackStore,
@@ -4651,9 +4787,14 @@ def test_refresh_uses_request_scoped_pipeline_dependencies(tmp_path, monkeypatch
 
 def test_refresh_rejects_investigation_outside_configured_tenant(tmp_path, monkeypatch):
     db_path = tmp_path / "history.db"
+    seed_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-a",
+        history_db_path=str(db_path),
+    )
     seed_store = InvestigationStore(
         db_path=db_path,
-        runtime_settings=Settings(_env_file=None, knowledge_tenant_id="tenant-a"),
+        runtime_settings=seed_settings,
     )
     investigation_id = seed_store.start("Why did checkout latency increase?", user_id="api", tenant_id="tenant-a")
     draft = _draft_contract(investigation_id)
@@ -4661,9 +4802,13 @@ def test_refresh_rejects_investigation_outside_configured_tenant(tmp_path, monke
         update={"scope": draft.request.scope.model_copy(update={"tenant_id": "tenant-a"})}
     )
     seed_store.persist_contract_revision(draft.model_copy(update={"request": tenant_request}))
-    runtime_settings = Settings(_env_file=None, knowledge_tenant_id="tenant-b")
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-b",
+        history_db_path=str(db_path),
+    )
     store = InvestigationStore(db_path=db_path, runtime_settings=runtime_settings)
-    deps = PipelineDependencies(
+    deps = _isolated_dependencies(
         settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
@@ -4695,6 +4840,7 @@ def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, mo
         knowledge_tenant_id="*",
         api_auth_enabled=True,
         knowledge_tenant_api_keys={"tenant-a": "tenant-a-secret", "tenant-b": "tenant-b-secret"},
+        history_db_path=str(tmp_path / "history.db"),
     )
     store = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=settings)
     investigation_id = store.start("Why did checkout latency increase?", user_id="api", tenant_id="tenant-a")
@@ -4708,7 +4854,7 @@ def test_wildcard_history_mutations_require_matching_request_tenant(tmp_path, mo
             update={"request": _snapshot_for(draft).request.model_copy(update={"tenant_id": "tenant-a"})}
         ),
     )
-    deps = PipelineDependencies(
+    deps = _isolated_dependencies(
         settings=settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
@@ -4958,16 +5104,18 @@ def test_legacy_history_backfill_uses_configured_pinned_tenant(tmp_path, monkeyp
         conn.execute("DROP TABLE investigation_tenant_assignments")
         conn.execute("ALTER TABLE investigations DROP COLUMN tenant_id")
 
-    migrated = InvestigationStore(
-        db_path=db_path,
-        runtime_settings=Settings(knowledge_tenant_id="tenant-a"),
-    )
     knowledge_path = tmp_path / "knowledge.db"
     runtime_settings = Settings(
+        _env_file=None,
         knowledge_tenant_id="tenant-a",
+        history_db_path=str(db_path),
         signals_db_path=str(knowledge_path),
     )
-    deps = PipelineDependencies(
+    migrated = InvestigationStore(
+        db_path=db_path,
+        runtime_settings=runtime_settings,
+    )
+    deps = _isolated_dependencies(
         settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: migrated,
@@ -5127,11 +5275,11 @@ def test_wildcard_history_stats_require_and_filter_by_tenant(tmp_path):
 
 
 def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp_path, monkeypatch):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
+    runtime_settings, store = _owned_history_store(tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="api")
     store.persist_contract_revision(_draft_contract(investigation_id))
-    deps = PipelineDependencies(
-        settings=object(),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -5153,7 +5301,7 @@ def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp
         )
 
     monkeypatch.setattr("tacit.api.routes.history.run_pipeline", failed_refresh)
-    app = create_app()
+    app = create_app(runtime_settings=runtime_settings)
     app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
 
     response = TestClient(app).post(f"/api/v1/investigations/{investigation_id}/refresh")
@@ -5169,11 +5317,11 @@ def test_refresh_returns_conflict_when_authoritative_revision_is_not_created(tmp
 
 
 def test_refresh_pipeline_exception_preserves_run_identity(tmp_path, monkeypatch):
-    store = InvestigationStore(db_path=tmp_path / "history.db")
+    runtime_settings, store = _owned_history_store(tmp_path / "history.db")
     investigation_id = store.start("Why did checkout latency increase?", user_id="api")
     store.persist_contract_revision(_draft_contract(investigation_id))
-    deps = PipelineDependencies(
-        settings=Settings(_env_file=None),
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=lambda: store,
         feedback_store_factory=lambda: object(),
@@ -5205,6 +5353,32 @@ def test_refresh_pipeline_exception_preserves_run_identity(tmp_path, monkeypatch
     }
 
 
+def test_refresh_admission_rejection_uses_stable_overload_response(tmp_path, monkeypatch):
+    runtime_settings, store = _owned_history_store(tmp_path / "history.db")
+    investigation_id = store.start("Why did checkout latency increase?", user_id="api")
+    store.persist_contract_revision(_draft_contract(investigation_id))
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: store,
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+    )
+
+    async def reject_refresh(_request, _supplied_deps=None, **_kwargs):
+        raise PipelineAdmissionRejected("pipeline_admission_queue_full")
+
+    monkeypatch.setattr("tacit.api.routes.history.run_pipeline", reject_refresh)
+    app = create_app(runtime_settings=deps.settings)
+    app.dependency_overrides[get_pipeline_dependencies] = lambda: deps
+
+    response = TestClient(app).post(f"/api/v1/investigations/{investigation_id}/refresh")
+
+    assert response.status_code == 503
+    assert response.json() == PipelineAdmissionRejected("pipeline_admission_queue_full").public_payload()
+
+
 def test_refresh_history_preflight_failure_preserves_investigation_identity():
     resources_closed = False
 
@@ -5216,7 +5390,7 @@ def test_refresh_history_preflight_failure_preserves_investigation_identity():
         resources_closed = True
 
     runtime_settings = Settings(_env_file=None)
-    deps = PipelineDependencies(
+    deps = _isolated_dependencies(
         settings=runtime_settings,
         backend_factory=lambda: [],
         history_store_factory=fail_history_store,

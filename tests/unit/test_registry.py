@@ -9,6 +9,8 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+from tacit.config import Settings
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -24,14 +26,18 @@ def test_registry_routes_bedrock():
     mock_session.client.return_value = mock_client
     mock_boto3.Session.return_value = mock_session
 
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), patch.object(reg, "settings") as mock_settings:
-        mock_settings.llm_provider = "bedrock"
-        mock_settings.llm_bedrock_region = "us-east-1"
-        mock_settings.llm_aws_access_key_id = ""
-        mock_settings.llm_aws_secret_access_key = ""
-        mock_settings.llm_bedrock_role_arn = ""
-        mock_settings.llm_bedrock_model_id = "anthropic.claude-sonnet-4-20250514-v1:0"
-        mock_settings.llm_model = "claude-sonnet-4-20250514"
+    runtime_settings = Settings.model_validate(
+        {
+            "llm_provider": "bedrock",
+            "llm_bedrock_region": "us-east-1",
+            "llm_aws_access_key_id": "AKIAREGISTRY",
+            "llm_aws_secret_access_key": "registry-secret",
+            "llm_bedrock_role_arn": "",
+            "llm_bedrock_model_id": "anthropic.claude-sonnet-4-20250514-v1:0",
+            "llm_model": "claude-sonnet-4-20250514",
+        }
+    )
+    with patch.dict("sys.modules", {"boto3": mock_boto3}), patch.object(reg, "settings", runtime_settings):
 
         provider = reg.get_provider()
 
@@ -50,8 +56,8 @@ def test_registry_unknown_provider_includes_bedrock_in_error():
 
     reg._provider = None
 
-    with patch.object(reg, "settings") as mock_settings:
-        mock_settings.llm_provider = "nonexistent"
+    runtime_settings = Settings.model_validate({"llm_provider": "nonexistent"})
+    with patch.object(reg, "settings", runtime_settings):
         try:
             reg.get_provider()
             assert False, "Should have raised ValueError"

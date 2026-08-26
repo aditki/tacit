@@ -4,7 +4,6 @@ from pathlib import Path
 from threading import Event, Lock
 
 import pytest
-from fastapi.testclient import TestClient
 from structlog.testing import capture_logs
 
 import tacit.feedback as feedback_module
@@ -13,6 +12,7 @@ from tacit.config import Settings
 from tacit.feedback import FeedbackStore
 from tacit.models.schemas import Intent, MetricEntry
 from tacit.ranking import prerank_metrics
+from tests.http_client import TestClient
 
 
 def test_empty_feedback_stats_match_api_response_model(tmp_path):
@@ -631,7 +631,7 @@ def test_feedback_pre_tenant_migration_final_swap_is_atomic(tmp_path, monkeypatc
     assert len(resumed.get_feedback("legacy-1", tenant_id="tenant-a")) == 1
 
 
-def test_feedback_migration_rechecks_schema_after_acquiring_writer_lock(tmp_path, monkeypatch):
+def test_feedback_migration_rejects_a_conflicting_owner_after_the_writer_race(tmp_path, monkeypatch):
     db_path = tmp_path / "concurrent-legacy-feedback.db"
     with sqlite3.connect(db_path) as conn:
         conn.executescript("""CREATE TABLE dashboard_provenance (
@@ -690,7 +690,7 @@ def test_feedback_migration_rechecks_schema_after_acquiring_writer_lock(tmp_path
         assert first_migration_started.wait(timeout=2)
         conflicting = pool.submit(FeedbackStore, db_path, runtime_settings=conflicting_settings)
         owner.result(timeout=5)
-        with pytest.raises(RuntimeError, match="pinned_owner_mismatch"):
+        with pytest.raises(RuntimeError, match="(?:migration_owner_mismatch|pinned_owner_mismatch)"):
             conflicting.result(timeout=5)
 
     with sqlite3.connect(db_path) as conn:

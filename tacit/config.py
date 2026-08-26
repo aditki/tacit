@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping
+from ipaddress import IPv6Address, ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 try:
     import truststore
@@ -37,6 +39,11 @@ _SIGNALFX_REALM_RE = re.compile(
     re.ASCII | re.IGNORECASE,
 )
 _KNOWLEDGE_PERMISSION_RE = re.compile(r"[A-Za-z0-9_.:-]+", re.ASCII)
+_CORS_HOST_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
+
+API_MAX_REQUEST_BODY_BYTES_MIN = 1_024
+API_MAX_REQUEST_BODY_BYTES_MAX = 64 * 1_024 * 1_024
+DEFAULT_API_MAX_REQUEST_BODY_BYTES = 2 * 1_024 * 1_024
 
 
 def validate_distinct_sqlite_role_paths(
@@ -132,6 +139,77 @@ def validated_knowledge_tenant_api_keys(
             raise ValueError("knowledge tenant key name is invalid")
         validated[tenant_name] = secret
     return validated
+
+
+def canonical_cors_allowed_origins(value: object) -> str:
+    """Canonicalize a comma-separated list of exact browser origins."""
+    origins: list[str] = []
+    for candidate in str(value or "").split(","):
+        origin = candidate.strip()
+        if not origin:
+            continue
+        if origin == "*":
+            origins.append(origin)
+            continue
+        try:
+            parsed = urlsplit(origin)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            raise ValueError("CORS origins must be exact http(s) origins") from None
+        if (
+            parsed.scheme.casefold() not in {"http", "https"}
+            or not parsed.netloc
+            or hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or parsed.netloc.endswith(":")
+            or "%" in parsed.netloc
+            or "\\" in parsed.netloc
+            or any(
+                character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F for character in parsed.netloc
+            )
+        ):
+            raise ValueError("CORS origins must be exact http(s) origins")
+        canonical_host = _canonical_cors_host(hostname)
+        scheme = parsed.scheme.casefold()
+        default_port = 80 if scheme == "http" else 443
+        authority = canonical_host if port in {None, default_port} else f"{canonical_host}:{port}"
+        origins.append(f"{scheme}://{authority}")
+    return ",".join(dict.fromkeys(origins))
+
+
+def _canonical_cors_host(hostname: str) -> str:
+    """Return a browser-compatible DNS or IP host without parser ambiguity."""
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        if ":" in hostname:
+            raise ValueError("CORS origins must be exact http(s) origins") from None
+        if not hostname.isascii():
+            raise ValueError("CORS origins must be exact http(s) origins") from None
+        canonical = hostname.casefold()
+        labels = canonical.split(".")
+        final_label = labels[-1] if labels else ""
+        browser_numeric_host = final_label.isdigit() or (
+            final_label.startswith("0x")
+            and len(final_label) > 2
+            and all(character in "0123456789abcdef" for character in final_label[2:])
+        )
+        if (
+            not canonical
+            or len(canonical) > 253
+            or browser_numeric_host
+            or any(_CORS_HOST_LABEL_RE.fullmatch(label) is None for label in labels)
+        ):
+            raise ValueError("CORS origins must be exact http(s) origins")
+        return canonical
+    if isinstance(address, IPv6Address):
+        return f"[{address.compressed}]"
+    return address.compressed
 
 
 # ── Config file discovery ──────────────────────────────────────────────────
@@ -257,8 +335,12 @@ class Settings(BaseSettings):
     context_max_chunks: int = 10  # max context chunks per query
 
     # Concurrency & timeouts
-    pipeline_max_concurrent: int = 5  # max simultaneous pipeline runs
-    pipeline_timeout_seconds: int = 120  # overall pipeline timeout
+    pipeline_max_concurrent: int = Field(default=5, ge=1, le=1_000)
+    # Zero selects the wildcard-safe default of global concurrency minus one.
+    pipeline_max_concurrent_per_tenant: int = Field(default=0, ge=0, le=1_000)
+    pipeline_max_queued: int = Field(default=100, ge=0, le=1_000)
+    pipeline_max_queued_per_tenant: int = Field(default=25, ge=0, le=1_000)
+    pipeline_timeout_seconds: float = Field(default=120, gt=0, le=86_400)
     adapter_max_concurrent: int = 5  # max simultaneous datasource adapter calls
     adapter_timeout_seconds: int = 30  # per-adapter timeout
     max_metric_catalog_size: int = 300  # total metrics across all datasources sent to LLM
@@ -357,6 +439,12 @@ class Settings(BaseSettings):
     # HTTP API auth
     api_auth_enabled: bool = False  # set True to require API key
     api_auth_key: str = Field(default="", repr=False)
+    api_cors_allowed_origins: str = ""
+    api_max_request_body_bytes: int = Field(
+        default=DEFAULT_API_MAX_REQUEST_BODY_BYTES,
+        ge=API_MAX_REQUEST_BODY_BYTES_MIN,
+        le=API_MAX_REQUEST_BODY_BYTES_MAX,
+    )
     knowledge_tenant_id: str = "default"
     knowledge_tenant_api_keys: dict[str, str] = Field(default_factory=dict, repr=False)
     knowledge_permissions: str = (
@@ -417,6 +505,17 @@ class Settings(BaseSettings):
     ) -> dict[str, str]:
         return validated_knowledge_tenant_api_keys(value)
 
+    @field_validator("api_cors_allowed_origins", mode="before")
+    @classmethod
+    def _canonicalize_api_cors_allowed_origins(cls, value: object) -> str:
+        return canonical_cors_allowed_origins(value)
+
+    @model_validator(mode="after")
+    def _validate_authenticated_cors(self) -> Settings:
+        if self.api_auth_enabled and "*" in self.api_cors_allowed_origins.split(","):
+            raise ValueError("Authenticated API deployments cannot use wildcard CORS")
+        return self
+
     @model_validator(mode="after")
     def _validate_tenant_api_keys(self) -> Settings:
         if self.knowledge_tenant_id != "*":
@@ -426,6 +525,17 @@ class Settings(BaseSettings):
         non_empty_keys = [value for value in self.knowledge_tenant_api_keys.values() if value]
         if len(non_empty_keys) != len(set(non_empty_keys)):
             raise ValueError("knowledge_tenant_api_keys must use a unique non-empty key per tenant")
+        active_per_tenant = self.pipeline_max_concurrent_per_tenant or max(1, self.pipeline_max_concurrent - 1)
+        if active_per_tenant > self.pipeline_max_concurrent or (
+            self.pipeline_max_concurrent > 1 and active_per_tenant == self.pipeline_max_concurrent
+        ):
+            raise ValueError(
+                "pipeline_max_concurrent_per_tenant must be lower than " "pipeline_max_concurrent for wildcard tenancy"
+            )
+        if self.pipeline_max_queued > 0 and self.pipeline_max_queued_per_tenant >= self.pipeline_max_queued:
+            raise ValueError(
+                "pipeline_max_queued_per_tenant must be lower than pipeline_max_queued " "for wildcard tenancy"
+            )
         return self
 
     @model_validator(mode="after")

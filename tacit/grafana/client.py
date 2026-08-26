@@ -29,6 +29,8 @@ class GrafanaClient:
         api_key: str | None = None,
         org_id: int | None = None,
         runtime_settings: Settings | None = None,
+        *,
+        trust_env: bool = True,
     ):
         configured_settings = snapshot_runtime_settings(runtime_settings or settings)
         effective_base_url = configured_settings.grafana_url if base_url is None else base_url
@@ -74,7 +76,8 @@ class GrafanaClient:
         self._headers = headers
         self._http_client: httpx.AsyncClient | None = None
         if base_url is None and api_key is None and org_id is None:
-            self._http_client = self._new_http_client()
+            self._http_client = self._new_http_client(trust_env=trust_env)
+        self._trust_env = trust_env
 
     @property
     def runtime_settings(self) -> Settings:
@@ -104,14 +107,15 @@ class GrafanaClient:
     def _client(self) -> httpx.AsyncClient:
         """Create network state only after composition has accepted this owner."""
         if self._http_client is None:
-            self._http_client = self._new_http_client()
+            self._http_client = self._new_http_client(trust_env=self._trust_env)
         return self._http_client
 
-    def _new_http_client(self) -> httpx.AsyncClient:
+    def _new_http_client(self, *, trust_env: bool) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             base_url=self.base_url,
             headers=self._headers,
             timeout=30.0,
+            trust_env=trust_env,
         )
 
     # ── Low-level helpers ────────────────────────────────────────────────

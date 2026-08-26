@@ -197,7 +197,7 @@ def _teach_fixture(fixture: dict[str, Any], signal_store: Any) -> None:
         )
 
 
-def evaluate_learned_selection(fixture: dict[str, Any]) -> LearnedSelectionResult:
+def evaluate_learned_selection(fixture: dict[str, Any], signal_store: Any) -> LearnedSelectionResult:
     """Verify strong learned context beats a higher-confidence generic match."""
     critical = fixture["critical_signals"]
     learned_id = f"learned_{fixture['dataset']}_incident"
@@ -233,6 +233,7 @@ def evaluate_learned_selection(fixture: dict[str, Any]) -> LearnedSelectionResul
         _catalog(fixture),
         target_language=fixture["query_language"],
         max_archetypes=2,
+        signal_store=signal_store,
     )
     selected = ranked[0][0].id
     return LearnedSelectionResult(
@@ -263,7 +264,7 @@ def run() -> dict[str, Any]:
         with cold_isolation() as state:
             _teach_fixture(f, state.signal_store)
             learned_resolutions.append(resolve_critical(f, state.signal_store))
-            learned_selections.append(evaluate_learned_selection(f))
+            learned_selections.append(evaluate_learned_selection(f, state.signal_store))
 
     return {
         "classification": [asdict(c) for c in classifications],
@@ -280,8 +281,29 @@ def _aggregate(rows: list[dict[str, Any]], keys: list[str]) -> dict[str, int]:
 def gate_failures(report: dict[str, Any]) -> list[str]:
     """Return explicit gate failures; an empty list means the offline gate passes."""
     failures: list[str] = []
-    for row in report["classification"]:
+    classifications = report.get("classification")
+    cold_resolutions = report.get("cold_resolution")
+    learned_resolutions = report.get("learned_resolution")
+    learned_selections = report.get("learned_selection")
+    if not isinstance(classifications, list) or not classifications:
+        failures.append("classification corpus is empty after fixture filtering")
+        classifications = []
+    if not isinstance(cold_resolutions, list) or not cold_resolutions:
+        failures.append("cold resolution corpus is empty after fixture filtering")
+        cold_resolutions = []
+    if not isinstance(learned_resolutions, list) or not learned_resolutions:
+        failures.append("learned resolution corpus is empty after fixture filtering")
+        learned_resolutions = []
+    if not isinstance(learned_selections, list) or not learned_selections:
+        failures.append("learned selection corpus is empty after fixture filtering")
+        learned_selections = []
+
+    for row in classifications:
         dataset = row["dataset"]
+        if int(row.get("labeled_signal_metrics", 0)) <= 0:
+            failures.append(f"{dataset} semantic positive population is empty")
+        if int(row.get("tn", 0)) + int(row.get("fp", 0)) <= 0:
+            failures.append(f"{dataset} semantic negative population is empty")
         for metric, threshold in (
             ("precision", MIN_SEMANTIC_PRECISION),
             ("recall", MIN_SEMANTIC_RECALL),
@@ -289,13 +311,19 @@ def gate_failures(report: dict[str, Any]) -> list[str]:
         ):
             if row[metric] < threshold:
                 failures.append(f"{dataset} semantic {metric} {row[metric]:.4f} < {threshold:.2f}")
-    for row in report["cold_resolution"]:
+    for row in cold_resolutions:
+        if int(row.get("total", 0)) <= 0:
+            failures.append(f"{row['dataset']} cold resolution population is empty")
+            continue
         if row["recall"] < MIN_COLD_RESOLUTION:
             failures.append(f"{row['dataset']} cold resolution {row['recall']:.4f} < {MIN_COLD_RESOLUTION:.2f}")
-    for row in report["learned_resolution"]:
+    for row in learned_resolutions:
+        if int(row.get("total", 0)) <= 0:
+            failures.append(f"{row['dataset']} learned resolution population is empty")
+            continue
         if row["recall"] < MIN_LEARNED_RESOLUTION:
             failures.append(f"{row['dataset']} learned resolution {row['recall']:.4f} < {MIN_LEARNED_RESOLUTION:.2f}")
-    for row in report["learned_selection"]:
+    for row in learned_selections:
         if not row["passed"]:
             failures.append(f"{row['dataset']} learned selection chose {row['selected']} instead of {row['expected']}")
     return failures

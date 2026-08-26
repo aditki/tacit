@@ -14,7 +14,6 @@ from typing import Any
 import pytest
 from click import ClickException
 from click.testing import CliRunner
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from structlog.testing import capture_logs
 
@@ -93,6 +92,7 @@ from tacit.operational_learning_benchmark import (
 )
 from tacit.pagination import MAX_COMPATIBILITY_OFFSET, encode_cursor
 from tacit.tenancy import TenantBoundaryError
+from tests.http_client import TestClient
 
 
 class _TestHistoryStore:

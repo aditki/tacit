@@ -8,8 +8,10 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,7 @@ from tacit.sqlite_identity import (
     inspect_sqlite_database_target,
     require_sqlite_connection_path,
     require_sqlite_database_identity,
+    snapshot_sqlite_database_set,
     sqlite_database_path,
 )
 
@@ -673,6 +676,45 @@ def test_readonly_preflight_fails_closed_without_touching_live_rollback_journal(
         writer.close()
 
 
+def test_readonly_admission_retries_a_transient_rollback_journal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "transient-rollback.db"
+    writer = sqlite3.connect(database_path)
+    original_sleep = sqlite_identity.time.sleep
+    retry_delays: list[float] = []
+    try:
+        writer.execute("CREATE TABLE canary (value TEXT NOT NULL)")
+        writer.execute("INSERT INTO canary VALUES ('committed')")
+        writer.commit()
+        assert writer.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("UPDATE canary SET value='uncommitted'")
+
+        def complete_recovery(delay: float) -> None:
+            retry_delays.append(delay)
+            writer.rollback()
+            original_sleep(0)
+
+        monkeypatch.setattr(sqlite_identity.time, "sleep", complete_recovery)
+
+        with capture_logs() as logs:
+            value = SQLiteDatabaseTarget(database_path).read_existing_readonly(
+                lambda connection: str(connection.execute("SELECT value FROM canary").fetchone()[0]),
+                timeout_ms=1_000,
+            )
+
+        assert value == "committed"
+        assert len(retry_delays) == 1
+        retry = next(log for log in logs if log.get("event") == "sqlite_readonly_admission_retry")
+        assert retry["reason_code"] == SQLiteIdentityRejectionReason.ADMISSION_RECOVERY_REQUIRED.value
+        assert retry["attempt"] == 1
+    finally:
+        writer.rollback()
+        writer.close()
+
+
 def test_readonly_preflight_does_not_create_closed_wal_sidecars(tmp_path: Path) -> None:
     database_path = tmp_path / "closed-wal.db"
     connection = sqlite3.connect(database_path)
@@ -718,6 +760,102 @@ def test_readonly_preflight_preserves_live_wal_sidecars(tmp_path: Path) -> None:
         assert "path" not in event
     finally:
         writer.close()
+
+
+def _source_directory_state(directory: Path) -> dict[str, tuple[bytes, int, int, int]]:
+    state: dict[str, tuple[bytes, int, int, int]] = {}
+    for path in sorted(directory.iterdir()):
+        metadata = path.lstat()
+        state[path.name] = (
+            path.read_bytes(),
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+    return state
+
+
+def test_public_snapshot_preserves_live_wal_and_shm_in_readonly_source_directory(tmp_path: Path) -> None:
+    source_dir = tmp_path / "authority"
+    source_dir.mkdir(mode=0o700)
+    database_path = source_dir / "history.db"
+    destination_dir = tmp_path / "snapshots"
+    destination_dir.mkdir(mode=0o700)
+    writer = sqlite3.connect(database_path)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE generation (value TEXT NOT NULL)")
+        writer.execute("INSERT INTO generation VALUES ('stable-live-wal')")
+        writer.commit()
+        assert Path(f"{database_path}-wal").exists()
+        assert Path(f"{database_path}-shm").exists()
+        source_dir.chmod(0o500)
+        before = _source_directory_state(source_dir)
+
+        snapshots = snapshot_sqlite_database_set([database_path], destination_dir, timeout_ms=2_000)
+
+        after = _source_directory_state(source_dir)
+        assert after == before
+        assert set(snapshots) == {database_path}
+        with sqlite3.connect(snapshots[database_path]) as snapshot:
+            assert snapshot.execute("SELECT value FROM generation").fetchone() == ("stable-live-wal",)
+    finally:
+        source_dir.chmod(0o700)
+        writer.close()
+
+
+def test_public_snapshot_retries_complete_source_set_after_writer_interleaves(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_dir = tmp_path / "authority"
+    source_dir.mkdir(mode=0o700)
+    destination_dir = tmp_path / "snapshots"
+    destination_dir.mkdir(mode=0o700)
+    sources = [source_dir / name for name in ("history.db", "feedback.db", "signals.db")]
+    for source in sources:
+        with sqlite3.connect(source) as connection:
+            connection.execute("CREATE TABLE generation (value INTEGER NOT NULL)")
+            connection.execute("INSERT INTO generation VALUES (1)")
+
+    original_snapshot = sqlite_identity._snapshot_sqlite_database
+    first_copy_finished = threading.Event()
+    writer_finished = threading.Event()
+    copy_count = 0
+
+    def writer() -> None:
+        assert first_copy_finished.wait(timeout=5)
+        for source in sources:
+            with sqlite3.connect(source) as connection:
+                connection.execute("UPDATE generation SET value=2")
+        writer_finished.set()
+
+    writer_thread = threading.Thread(target=writer)
+    writer_thread.start()
+
+    def interleaved_snapshot(*args, **kwargs):
+        nonlocal copy_count
+        original_snapshot(*args, **kwargs)
+        copy_count += 1
+        if copy_count == 1:
+            first_copy_finished.set()
+            assert writer_finished.wait(timeout=5)
+
+    monkeypatch.setattr(sqlite_identity, "_snapshot_sqlite_database", interleaved_snapshot)
+    try:
+        snapshots = snapshot_sqlite_database_set(sources, destination_dir, timeout_ms=2_000)
+    finally:
+        first_copy_finished.set()
+        writer_thread.join(timeout=5)
+
+    assert not writer_thread.is_alive()
+    assert copy_count >= len(sources) + 1
+    observed_generations = set()
+    for snapshot_path in snapshots.values():
+        with sqlite3.connect(snapshot_path) as connection:
+            observed_generations.add(connection.execute("SELECT value FROM generation").fetchone()[0])
+    assert observed_generations == {2}
 
 
 def test_readonly_preflight_fails_closed_above_live_wal_snapshot_bound(tmp_path: Path, monkeypatch) -> None:
@@ -885,6 +1023,45 @@ def test_readonly_admission_retries_complete_callback_after_source_change(tmp_pa
         assert "path" not in retry
     finally:
         writer.close()
+
+
+def test_readonly_admission_retries_database_error_only_after_source_change(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "database-error-source-change.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE canary (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO canary VALUES ('stable')")
+        connection.commit()
+
+    original_readonly_connection = sqlite_identity._readonly_connection
+    attempts = 0
+
+    @contextmanager
+    def fail_during_first_snapshot(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            with sqlite3.connect(database_path) as writer:
+                writer.execute("CREATE TABLE concurrent_change (id INTEGER)")
+                writer.commit()
+            raise sqlite3.DatabaseError("transient snapshot failure")
+        with original_readonly_connection(*args, **kwargs) as connection:
+            yield connection
+
+    monkeypatch.setattr(sqlite_identity, "_readonly_connection", fail_during_first_snapshot)
+
+    with capture_logs() as logs:
+        value = SQLiteDatabaseTarget(database_path).read_existing_readonly(
+            lambda connection: str(connection.execute("SELECT value FROM canary").fetchone()[0]),
+            timeout_ms=1_000,
+        )
+
+    assert value == "stable"
+    assert attempts == 2
+    retry = next(log for log in logs if log.get("event") == "sqlite_readonly_admission_retry")
+    assert retry["reason_code"] == SQLiteIdentityRejectionReason.FILE_REPLACED.value
 
 
 @pytest.mark.skipif(os.name != "posix", reason="hard-link behavior is POSIX-specific")

@@ -11,10 +11,33 @@ from slack_bolt.async_app import AsyncApp
 
 from tacit.config import Settings, settings
 from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies
+from tacit.errors import PipelineAdmissionRejected
 from tacit.models.schemas import DashRequest
 from tacit.pipeline import run_pipeline
+from tacit.runtime_ownership import (
+    get_runtime_ownership,
+    require_compatible_runtime_ownership,
+    runtime_descriptor_from_settings,
+)
+from tacit.runtime_stores import RuntimeStores
 
 logger = structlog.get_logger()
+
+
+def _validated_slack_runtime_stores(
+    runtime_settings: Settings,
+    stores: RuntimeStores | None,
+) -> RuntimeStores:
+    """Resolve one Slack runtime owner before constructing Slack clients."""
+    runtime_stores = stores or RuntimeStores(runtime_settings)
+    require_compatible_runtime_ownership(
+        boundary="Slack runtime",
+        descriptors=(
+            runtime_descriptor_from_settings(runtime_settings, component="slack_settings"),
+            get_runtime_ownership(runtime_stores, component="runtime_stores"),
+        ),
+    )
+    return runtime_stores
 
 
 def _strip_mention(text: str) -> str:
@@ -139,6 +162,8 @@ async def handle_mention(
         else:
             await say(text=f"⚠️ {response.summary}", thread_ts=thread_ts)
 
+    except PipelineAdmissionRejected as exc:
+        await say(text=exc.public_message(), thread_ts=thread_ts)
     except Exception:
         logger.exception("pipeline_error")
         await say(
@@ -193,20 +218,27 @@ async def handle_slash_command(
         else:
             await say(text=f"⚠️ {response.summary}")
 
+    except PipelineAdmissionRejected as exc:
+        await say(text=exc.public_message())
     except Exception:
         logger.exception("slash_command_error")
         await say(text="❌ Something went wrong building the dashboard.")
 
 
-def create_slack_app(runtime_settings: Settings = settings) -> AsyncApp:
+def create_slack_app(
+    runtime_settings: Settings = settings,
+    *,
+    stores: RuntimeStores | None = None,
+) -> AsyncApp:
     """Create a Slack app bound to one runtime settings object."""
+    runtime_stores = _validated_slack_runtime_stores(runtime_settings, stores)
     slack_app = AsyncApp(
         token=runtime_settings.slack_bot_token,
         signing_secret=runtime_settings.slack_signing_secret,
     )
 
     def deps_factory() -> PipelineDependencies:
-        return build_pipeline_dependencies(runtime_settings)
+        return build_pipeline_dependencies(runtime_settings, stores=runtime_stores)
 
     async def runtime_handle_mention(event: dict, say) -> None:
         await handle_mention(event, say, deps_factory=deps_factory)
@@ -219,9 +251,13 @@ def create_slack_app(runtime_settings: Settings = settings) -> AsyncApp:
     return slack_app
 
 
-async def start_slack_bot(runtime_settings: Settings = settings):
+async def start_slack_bot(
+    runtime_settings: Settings = settings,
+    *,
+    stores: RuntimeStores | None = None,
+):
     """Start the Slack bot in Socket Mode."""
-    slack_app = create_slack_app(runtime_settings)
+    slack_app = create_slack_app(runtime_settings, stores=stores)
     handler = AsyncSocketModeHandler(slack_app, runtime_settings.slack_app_token)
     logger.info("slack_bot_starting")
     await handler.start_async()

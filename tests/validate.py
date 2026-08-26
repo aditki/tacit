@@ -21,14 +21,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import csv
+import hashlib
 import json
 import os
 import re
 import sys
+import tempfile
 import time
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Iterator
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 # ── Project bootstrap ───────────────────────────────────────────────────────
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -62,6 +67,7 @@ class ArchetypeResult:
     all_archetypes: list[dict] = field(default_factory=list)  # [{type, confidence}]
     any_match: bool = False  # True if expected matches ANY returned archetype
     top_confidence: float = 0.0
+    error: str = ""
 
 
 @dataclass
@@ -86,6 +92,62 @@ class PipelineResult:
     critical_recall: float = 0.0
     weighted_recall: float = 0.0
     signal_to_noise: float = 0.0  # relevant / (relevant + irrelevant)
+
+
+@dataclass(frozen=True)
+class ValidationThresholds:
+    """Release-quality floors for the public validation suite."""
+
+    min_archetype_accuracy: float = 0.85
+    min_archetype_soft_accuracy: float = 0.90
+    min_metric_recall: float = 0.75
+    min_critical_recall: float = 0.80
+    min_weighted_recall: float = 0.78
+    min_signal_to_noise: float = 0.65
+    max_errors: int = 0
+    max_error_rate: float = 0.0
+
+    def __post_init__(self) -> None:
+        rates = (
+            self.min_archetype_accuracy,
+            self.min_archetype_soft_accuracy,
+            self.min_metric_recall,
+            self.min_critical_recall,
+            self.min_weighted_recall,
+            self.min_signal_to_noise,
+            self.max_error_rate,
+        )
+        if any(rate < 0 or rate > 1 for rate in rates):
+            raise ValueError("Validation rate thresholds must be between 0 and 1")
+        if self.max_errors < 0:
+            raise ValueError("Validation max_errors must be non-negative")
+
+
+@dataclass(frozen=True)
+class ValidationGateResult:
+    passed: bool
+    failures: tuple[str, ...]
+    thresholds: ValidationThresholds
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "passed": self.passed,
+            "failures": list(self.failures),
+            "thresholds": asdict(self.thresholds),
+        }
+
+
+@dataclass(frozen=True)
+class SelectedEvaluationState:
+    """One named benchmark state and its disposable runtime, when applicable."""
+
+    mode: str
+    fingerprint: str
+    isolated_state: Any | None = None
+
+
+LONG_LIVED_STATE_DATABASES = ("signals.db", "history.db", "feedback.db")
+_CLEAN_STATE_FINGERPRINT_INPUT = b"tacit-validation-state-v1:clean"
 
 
 # ── Archetype alias resolution ──────────────────────────────────────────────
@@ -125,6 +187,94 @@ def grafana_request_headers(api_key: str, org_id: int) -> dict[str, str]:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
+
+
+def tacit_request_headers(api_key: str, tenant_id: str) -> tuple[dict[str, str], str]:
+    """Build authenticated headers around one concrete tenant boundary."""
+    from tacit.config import canonical_knowledge_tenant_id
+
+    concrete_tenant = canonical_knowledge_tenant_id(tenant_id)
+    if concrete_tenant == "*":
+        raise ValueError("Pipeline validation requires a concrete tenant")
+    headers = {"X-Tacit-Tenant": concrete_tenant}
+    if api_key:
+        headers["X-API-Key"] = api_key
+    return headers, concrete_tenant
+
+
+def _hash_file(hasher: Any, path: Path) -> None:
+    hasher.update(path.name.encode("utf-8"))
+    hasher.update(path.stat().st_size.to_bytes(8, "big"))
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            hasher.update(chunk)
+
+
+def _long_lived_state_sources(source_dir: Path) -> tuple[Path, ...]:
+    if not source_dir.is_dir() or source_dir.is_symlink():
+        raise ValueError("Long-lived state directory must be a real directory")
+    sources = tuple(source_dir / name for name in LONG_LIVED_STATE_DATABASES)
+    for source in sources:
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"Long-lived state is missing regular database {source.name}")
+    return sources
+
+
+def _state_fingerprint(sources: tuple[Path, ...]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"tacit-validation-state-v1:long-lived\0")
+    for source in sources:
+        _hash_file(digest, source)
+    return digest.hexdigest()
+
+
+@contextlib.contextmanager
+def evaluation_state(
+    mode: str,
+    source_dir: str | os.PathLike[str] | None = None,
+    *,
+    endpoints: Any | None = None,
+    tenant_id: str = "default",
+) -> Iterator[SelectedEvaluationState]:
+    """Yield an external marker or a disposable clean/long-lived runtime."""
+    from tacit.sqlite_identity import snapshot_sqlite_database_set
+    from tests.eval.cold_isolation import (
+        cold_isolation,
+        validate_evaluation_tenant,
+        validate_local_evaluation_endpoints,
+    )
+
+    if mode not in {"external", "clean", "long-lived"}:
+        raise ValueError(f"Unsupported evaluation state: {mode}")
+    if mode == "external":
+        if source_dir is not None:
+            raise ValueError("External evaluation state does not accept a state directory")
+        yield SelectedEvaluationState(
+            mode="external",
+            fingerprint=hashlib.sha256(b"tacit-validation-state-v1:external-unpinned").hexdigest(),
+        )
+        return
+
+    selected_endpoints = validate_local_evaluation_endpoints(endpoints)
+    concrete_tenant = validate_evaluation_tenant(tenant_id)
+    sources: tuple[Path, ...] = ()
+    if mode == "long-lived":
+        if source_dir is None:
+            raise ValueError("Long-lived evaluation requires --state-dir")
+        sources = _long_lived_state_sources(Path(source_dir))
+    else:
+        if source_dir is not None:
+            raise ValueError("Clean evaluation does not accept a state directory")
+        fingerprint = hashlib.sha256(_CLEAN_STATE_FINGERPRINT_INPUT).hexdigest()
+
+    with tempfile.TemporaryDirectory(prefix=f"tacit-validation-{mode}-") as temporary:
+        workdir = Path(temporary)
+        if sources:
+            snapshot_sqlite_database_set(sources, workdir)
+        if mode == "long-lived":
+            fingerprint = _state_fingerprint(tuple(workdir / source.name for source in sources))
+        with cold_isolation(workdir, endpoints=selected_endpoints, tenant_id=concrete_tenant) as isolated:
+            yield SelectedEvaluationState(mode=mode, fingerprint=fingerprint, isolated_state=isolated)
 
 
 # ── CSV loader ──────────────────────────────────────────────────────────────
@@ -290,7 +440,12 @@ def fuzzy_metric_match(expected: set[str], found: set[str]) -> set[str]:
 # ── Archetype validation ───────────────────────────────────────────────────
 
 
-async def run_archetype_validation(cases: list[TestCase]) -> list[ArchetypeResult]:
+async def run_archetype_validation(
+    cases: list[TestCase],
+    *,
+    provider: Any | None = None,
+    runtime_settings: Any | None = None,
+) -> list[ArchetypeResult]:
     """Test intent agent problem_type classification accuracy.
 
     Evaluates both strict (top-1) and soft (any-match) accuracy using
@@ -304,17 +459,26 @@ async def run_archetype_validation(cases: list[TestCase]) -> list[ArchetypeResul
     for i, case in enumerate(cases, 1):
         t0 = time.monotonic()
         all_archetypes: list[dict] = []
+        error = ""
         try:
-            intent, _usage = await classify_intent(case.prompt)
+            if provider is None and runtime_settings is None:
+                intent, _usage = await classify_intent(case.prompt)
+            else:
+                intent, _usage = await classify_intent(
+                    case.prompt,
+                    provider=provider,
+                    runtime_settings=runtime_settings,
+                )
             actual = intent.problem_type
             all_archetypes = [{"type": a.type, "confidence": a.confidence} for a in intent.archetypes]
         except Exception as e:
             actual = f"ERROR:{e}"
+            error = str(e)
         elapsed = (time.monotonic() - t0) * 1000
 
         expected_norm = normalize_archetype(case.expected_archetype)
         actual_norm = normalize_archetype(actual)
-        passed = expected_norm == actual_norm
+        passed = not error and expected_norm == actual_norm
 
         # Soft match: does expected match ANY returned archetype?
         any_match = passed
@@ -336,6 +500,7 @@ async def run_archetype_validation(cases: list[TestCase]) -> list[ArchetypeResul
                 all_archetypes=all_archetypes,
                 any_match=any_match,
                 top_confidence=top_confidence,
+                error=error,
             )
         )
 
@@ -359,49 +524,76 @@ async def run_pipeline_validation(
     cases: list[TestCase],
     api_url: str,
     grafana_url: str,
+    *,
+    api_key: str = "",
+    tenant_id: str = "default",
+    grafana_api_key: str | None = None,
+    grafana_org_id: int | None = None,
+    pipeline_runner: Callable[[TestCase], Awaitable[Any]] | None = None,
 ) -> list[PipelineResult]:
     """Test full pipeline: metric selection + archetype via the running API."""
     import httpx
 
-    from tacit.config import settings
+    api_headers, concrete_tenant = tacit_request_headers(api_key, tenant_id)
+    if grafana_api_key is None or grafana_org_id is None:
+        from tacit.config import settings
 
+        if grafana_api_key is None:
+            grafana_api_key = settings.grafana_api_key
+        if grafana_org_id is None:
+            grafana_org_id = settings.grafana_org_id
     results: list[PipelineResult] = []
     total = len(cases)
 
-    async with httpx.AsyncClient(timeout=180) as client:
-        grafana_headers = grafana_request_headers(settings.grafana_api_key, settings.grafana_org_id)
+    async with httpx.AsyncClient(timeout=180, trust_env=False) as client:
+        grafana_headers = grafana_request_headers(grafana_api_key, grafana_org_id)
 
         for i, case in enumerate(cases, 1):
             t0 = time.monotonic()
             try:
-                resp = await client.post(
-                    f"{api_url}/api/v1/chart",
-                    json={"prompt": case.prompt, "user_id": "validation", "channel_id": "test"},
-                )
-                elapsed = (time.monotonic() - t0) * 1000
+                if pipeline_runner is None:
+                    resp = await client.post(
+                        f"{api_url}/api/v1/chart",
+                        json={
+                            "prompt": case.prompt,
+                            "user_id": "validation",
+                            "channel_id": "test",
+                            "tenant_id": concrete_tenant,
+                        },
+                        headers=api_headers,
+                    )
+                    elapsed = (time.monotonic() - t0) * 1000
 
-                if resp.status_code != 200:
-                    results.append(
-                        PipelineResult(
-                            prompt_id=case.prompt_id,
-                            expected_metrics=case.expected_metrics,
-                            found_metrics=[],
-                            missing_metrics=case.expected_metrics,
-                            extra_metrics=[],
-                            metric_recall=0.0,
-                            dashboard_url="",
-                            panel_count=0,
-                            latency_ms=elapsed,
-                            error=f"HTTP {resp.status_code}: {resp.text[:200]}",
+                    if resp.status_code != 200:
+                        results.append(
+                            PipelineResult(
+                                prompt_id=case.prompt_id,
+                                expected_metrics=case.expected_metrics,
+                                found_metrics=[],
+                                missing_metrics=case.expected_metrics,
+                                extra_metrics=[],
+                                metric_recall=0.0,
+                                dashboard_url="",
+                                panel_count=0,
+                                latency_ms=elapsed,
+                                error=f"HTTP {resp.status_code}: {resp.text[:200]}",
+                            )
                         )
-                    )
-                    print(
-                        f"  [{i:3d}/{total}] \u2717 {case.prompt_id}: "
-                        f"API error {resp.status_code} ({elapsed:.0f}ms)"
-                    )
-                    continue
-
-                data = resp.json()
+                        print(
+                            f"  [{i:3d}/{total}] \u2717 {case.prompt_id}: "
+                            f"API error {resp.status_code} ({elapsed:.0f}ms)"
+                        )
+                        continue
+                    data = resp.json()
+                else:
+                    response = await pipeline_runner(case)
+                    elapsed = (time.monotonic() - t0) * 1000
+                    if hasattr(response, "model_dump"):
+                        data = response.model_dump(mode="json")
+                    elif isinstance(response, dict):
+                        data = response
+                    else:
+                        raise TypeError("Pipeline runner returned an unsupported response")
                 dashboard_uid = data.get("dashboard_uid", "")
                 dashboard_url = data.get("dashboard_url", "")
                 panel_count = data.get("panel_count", 0)
@@ -710,6 +902,90 @@ def print_pipeline_report(
     return avg_recall
 
 
+def evaluate_validation_gate(
+    report: dict[str, Any],
+    thresholds: ValidationThresholds,
+) -> ValidationGateResult:
+    """Evaluate every reported mode against explicit quality and error bounds."""
+    failures: list[str] = []
+
+    def minimum(section: dict[str, Any], key: str, threshold: float, label: str) -> None:
+        actual = float(section.get(key, 0.0))
+        if actual < threshold:
+            failures.append(f"{label} {actual:.1%} is below {threshold:.1%}")
+
+    def errors(section_name: str, section: dict[str, Any]) -> None:
+        total = int(section.get("total", 0))
+        count = int(section.get("errors", 0))
+        if total <= 0:
+            failures.append(f"{section_name} produced no results")
+            return
+        rate = count / total
+        if count > thresholds.max_errors:
+            failures.append(f"{section_name} errors {count} exceed {thresholds.max_errors}")
+        if rate > thresholds.max_error_rate:
+            failures.append(f"{section_name} error rate {rate:.1%} exceeds {thresholds.max_error_rate:.1%}")
+
+    archetype = report.get("archetype")
+    if isinstance(archetype, dict):
+        minimum(
+            archetype,
+            "strict_accuracy",
+            thresholds.min_archetype_accuracy,
+            "Archetype strict accuracy",
+        )
+        minimum(
+            archetype,
+            "soft_accuracy",
+            thresholds.min_archetype_soft_accuracy,
+            "Archetype soft accuracy",
+        )
+        errors("Archetype", archetype)
+
+    pipeline = report.get("pipeline")
+    if isinstance(pipeline, dict):
+        minimum(pipeline, "avg_metric_recall", thresholds.min_metric_recall, "Metric recall")
+        if int(pipeline.get("critical_cases", 1)) > 0:
+            minimum(
+                pipeline,
+                "avg_critical_recall",
+                thresholds.min_critical_recall,
+                "Critical recall",
+            )
+        minimum(
+            pipeline,
+            "avg_weighted_recall",
+            thresholds.min_weighted_recall,
+            "Weighted recall",
+        )
+        minimum(
+            pipeline,
+            "avg_signal_to_noise",
+            thresholds.min_signal_to_noise,
+            "Signal-to-noise",
+        )
+        errors("Pipeline", pipeline)
+
+    if not isinstance(archetype, dict) and not isinstance(pipeline, dict):
+        failures.append("Validation produced no scored mode")
+    return ValidationGateResult(
+        passed=not failures,
+        failures=tuple(failures),
+        thresholds=thresholds,
+    )
+
+
+def print_gate_report(result: ValidationGateResult) -> None:
+    print(f"\n{'=' * 72}")
+    print(f"  VALIDATION GATE: {'PASS' if result.passed else 'FAIL'}")
+    print(f"{'=' * 72}")
+    if result.failures:
+        for failure in result.failures:
+            print(f"  - {failure}")
+    else:
+        print("  All configured quality and error thresholds passed.")
+
+
 def _bar(filled: int, total: int, width: int = 20) -> str:
     """Render a simple text progress bar."""
     if total == 0:
@@ -851,7 +1127,182 @@ def print_review_report(reviews: list[dict]) -> None:
 # ── Main ───────────────────────────────────────────────────────────────────
 
 
-async def main() -> None:
+async def _execute_validation(
+    args: argparse.Namespace,
+    cases: list[TestCase],
+    selected_state: SelectedEvaluationState,
+) -> tuple[dict[str, Any], ValidationGateResult]:
+    output: dict[str, Any] = {
+        "dataset": args.csv,
+        "prompt_count": len(cases),
+        "mode": args.mode,
+        "state": {
+            "mode": selected_state.mode,
+            "fingerprint": selected_state.fingerprint,
+        },
+    }
+    isolated = selected_state.isolated_state
+    dependencies = isolated.dependencies if isolated is not None else None
+    provider = None
+    if dependencies is not None and args.mode in ("archetype", "all"):
+        if dependencies.llm_provider_factory is None:
+            raise RuntimeError("Isolated evaluation has no LLM provider")
+        provider = dependencies.llm_provider_factory()
+
+    pipe_results: list[PipelineResult] = []
+    try:
+        if args.mode in ("archetype", "all"):
+            print(f"\n{'─' * 72}")
+            print("  Running archetype classification validation ...")
+            print(f"{'─' * 72}")
+            arch_results = await run_archetype_validation(
+                cases,
+                provider=provider,
+                runtime_settings=isolated.settings if isolated is not None else None,
+            )
+            arch_accuracy = print_archetype_report(arch_results, cases)
+            soft_passed = sum(1 for result in arch_results if result.any_match)
+            output["archetype"] = {
+                "strict_accuracy": round(arch_accuracy, 4),
+                "soft_accuracy": round(soft_passed / len(arch_results), 4) if arch_results else 0,
+                "total": len(arch_results),
+                "strict_passed": sum(1 for result in arch_results if result.passed),
+                "soft_passed": soft_passed,
+                "failed": sum(1 for result in arch_results if not result.passed),
+                "errors": sum(1 for result in arch_results if result.error),
+                "avg_latency_ms": (
+                    round(sum(result.latency_ms for result in arch_results) / len(arch_results), 1)
+                    if arch_results
+                    else 0
+                ),
+                "avg_top_confidence": round(
+                    sum(result.top_confidence for result in arch_results) / max(1, len(arch_results)),
+                    3,
+                ),
+                "details": [
+                    {
+                        "prompt_id": result.prompt_id,
+                        "expected": result.expected,
+                        "actual": result.actual,
+                        "passed": result.passed,
+                        "any_match": result.any_match,
+                        "top_confidence": round(result.top_confidence, 3),
+                        "archetypes": result.all_archetypes,
+                        "latency_ms": round(result.latency_ms, 1),
+                        "error": result.error,
+                    }
+                    for result in arch_results
+                ],
+            }
+
+        if args.mode in ("pipeline", "all"):
+            print(f"\n{'─' * 72}")
+            print("  Running pipeline metric selection validation ...")
+            print(f"{'─' * 72}")
+            pipeline_runner: Callable[[TestCase], Awaitable[Any]] | None = None
+            if dependencies is not None:
+                from tacit.models.schemas import DashRequest
+                from tacit.pipeline import run_pipeline
+
+                async def run_isolated_pipeline(case: TestCase) -> Any:
+                    request = DashRequest(
+                        prompt=case.prompt,
+                        user_id="validation",
+                        channel_id="test",
+                        tenant_id=args.tenant,
+                    )
+                    return await run_pipeline(request, dependencies)
+
+                pipeline_runner = run_isolated_pipeline
+            pipe_results = await run_pipeline_validation(
+                cases,
+                args.api_url,
+                args.grafana_url,
+                api_key=args.api_key,
+                tenant_id=args.tenant,
+                grafana_api_key=(isolated.settings.grafana_api_key if isolated is not None else None),
+                grafana_org_id=(isolated.settings.grafana_org_id if isolated is not None else None),
+                pipeline_runner=pipeline_runner,
+            )
+            pipe_recall = print_pipeline_report(pipe_results, cases)
+            pipe_valid = [result for result in pipe_results if not result.error]
+            critical_results = [result for result in pipe_valid if result.critical_metrics_expected]
+            output["pipeline"] = {
+                "avg_metric_recall": round(pipe_recall, 4),
+                "avg_critical_recall": (
+                    round(
+                        sum(result.critical_recall for result in critical_results) / len(critical_results),
+                        4,
+                    )
+                    if critical_results
+                    else 0
+                ),
+                "avg_weighted_recall": (
+                    round(sum(result.weighted_recall for result in pipe_valid) / len(pipe_valid), 4)
+                    if pipe_valid
+                    else 0
+                ),
+                "avg_signal_to_noise": (
+                    round(sum(result.signal_to_noise for result in pipe_valid) / len(pipe_valid), 4)
+                    if pipe_valid
+                    else 0
+                ),
+                "total": len(pipe_results),
+                "critical_cases": len(critical_results),
+                "succeeded": len(pipe_valid),
+                "errors": sum(1 for result in pipe_results if result.error),
+                "avg_latency_ms": (
+                    round(sum(result.latency_ms for result in pipe_results) / len(pipe_results), 1)
+                    if pipe_results
+                    else 0
+                ),
+                "details": [
+                    {
+                        "prompt_id": result.prompt_id,
+                        "metric_recall": round(result.metric_recall, 4),
+                        "critical_recall": round(result.critical_recall, 4),
+                        "weighted_recall": round(result.weighted_recall, 4),
+                        "signal_to_noise": round(result.signal_to_noise, 4),
+                        "found_metrics": result.found_metrics,
+                        "missing_metrics": result.missing_metrics,
+                        "extra_metrics": result.extra_metrics,
+                        "critical_metrics_expected": result.critical_metrics_expected,
+                        "critical_metrics_found": result.critical_metrics_found,
+                        "critical_metrics_missing": result.critical_metrics_missing,
+                        "panel_count": result.panel_count,
+                        "dashboard_url": result.dashboard_url,
+                        "latency_ms": round(result.latency_ms, 1),
+                        "error": result.error,
+                    }
+                    for result in pipe_results
+                ],
+            }
+
+        if args.review and args.mode in ("pipeline", "all") and "pipeline" in output:
+            reviews = collect_human_reviews(pipe_results, cases)
+            if reviews:
+                print_review_report(reviews)
+                output["human_reviews"] = reviews
+    finally:
+        if dependencies is not None:
+            await dependencies.close_resources()
+
+    thresholds = ValidationThresholds(
+        min_archetype_accuracy=args.min_archetype_accuracy,
+        min_archetype_soft_accuracy=args.min_archetype_soft_accuracy,
+        min_metric_recall=args.min_metric_recall,
+        min_critical_recall=args.min_critical_recall,
+        min_weighted_recall=args.min_weighted_recall,
+        min_signal_to_noise=args.min_signal_to_noise,
+        max_errors=args.max_errors,
+        max_error_rate=args.max_error_rate,
+    )
+    gate = evaluate_validation_gate(output, thresholds)
+    output["gate"] = gate.as_dict()
+    return output, gate
+
+
+async def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Tacit Validation Suite — test archetype and metric accuracy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -879,6 +1330,37 @@ async def main() -> None:
         help="Grafana base URL (default: http://localhost:3000)",
     )
     parser.add_argument(
+        "--api-key",
+        default=os.environ.get("TACIT_API_KEY", ""),
+        help="Tacit API key for pipeline mode (defaults to TACIT_API_KEY)",
+    )
+    parser.add_argument(
+        "--tenant",
+        default="default",
+        help="Concrete Tacit tenant sent by pipeline validation (default: default)",
+    )
+    parser.add_argument(
+        "--state",
+        choices=["external", "clean", "long-lived"],
+        default="external",
+        help="Evaluation state: existing API, disposable clean state, or copied long-lived state",
+    )
+    parser.add_argument(
+        "--state-dir",
+        type=Path,
+        help="Read-only source directory containing signals.db, history.db, and feedback.db for long-lived state",
+    )
+    parser.add_argument(
+        "--llm-url",
+        default="",
+        help="Explicit local Ollama URL required for clean and long-lived states",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default="",
+        help="Explicit local Ollama model required for clean and long-lived states",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=0,
@@ -894,7 +1376,16 @@ async def main() -> None:
         help="Interactive human review mode — after each pipeline result, "
         "prompt the reviewer to rate the dashboard on multiple dimensions",
     )
-    args = parser.parse_args()
+    defaults = ValidationThresholds()
+    parser.add_argument("--min-archetype-accuracy", type=float, default=defaults.min_archetype_accuracy)
+    parser.add_argument("--min-archetype-soft-accuracy", type=float, default=defaults.min_archetype_soft_accuracy)
+    parser.add_argument("--min-metric-recall", type=float, default=defaults.min_metric_recall)
+    parser.add_argument("--min-critical-recall", type=float, default=defaults.min_critical_recall)
+    parser.add_argument("--min-weighted-recall", type=float, default=defaults.min_weighted_recall)
+    parser.add_argument("--min-signal-to-noise", type=float, default=defaults.min_signal_to_noise)
+    parser.add_argument("--max-errors", type=int, default=defaults.max_errors)
+    parser.add_argument("--max-error-rate", type=float, default=defaults.max_error_rate)
+    args = parser.parse_args(argv)
 
     # Load dataset
     cases = load_test_cases(args.csv)
@@ -905,98 +1396,26 @@ async def main() -> None:
     print(f"Dataset  : {args.csv}")
     print(f"Prompts  : {len(cases)}")
     print(f"Mode     : {args.mode}")
-
-    output: dict = {"dataset": args.csv, "prompt_count": len(cases), "mode": args.mode}
-
-    # ── Archetype validation ────────────────────────────────────────────
-    if args.mode in ("archetype", "all"):
-        print(f"\n{'─' * 72}")
-        print("  Running archetype classification validation ...")
-        print(f"{'─' * 72}")
-        arch_results = await run_archetype_validation(cases)
-        arch_accuracy = print_archetype_report(arch_results, cases)
-        soft_passed = sum(1 for r in arch_results if r.any_match)
-        output["archetype"] = {
-            "strict_accuracy": round(arch_accuracy, 4),
-            "soft_accuracy": round(soft_passed / len(arch_results), 4) if arch_results else 0,
-            "total": len(arch_results),
-            "strict_passed": sum(1 for r in arch_results if r.passed),
-            "soft_passed": soft_passed,
-            "failed": sum(1 for r in arch_results if not r.passed),
-            "avg_latency_ms": round(sum(r.latency_ms for r in arch_results) / len(arch_results), 1),
-            "avg_top_confidence": round(sum(r.top_confidence for r in arch_results) / max(1, len(arch_results)), 3),
-            "details": [
-                {
-                    "prompt_id": r.prompt_id,
-                    "expected": r.expected,
-                    "actual": r.actual,
-                    "passed": r.passed,
-                    "any_match": r.any_match,
-                    "top_confidence": round(r.top_confidence, 3),
-                    "archetypes": r.all_archetypes,
-                    "latency_ms": round(r.latency_ms, 1),
-                }
-                for r in arch_results
-            ],
-        }
-
-    # ── Pipeline validation ─────────────────────────────────────────────
+    if args.state != "external" and (not args.llm_url or not args.llm_model):
+        raise ValueError("Clean and long-lived validation require --llm-url and --llm-model")
     if args.mode in ("pipeline", "all"):
-        print(f"\n{'─' * 72}")
-        print("  Running pipeline metric selection validation ...")
-        print(f"{'─' * 72}")
-        pipe_results = await run_pipeline_validation(cases, args.api_url, args.grafana_url)
-        pipe_recall = print_pipeline_report(pipe_results, cases)
-        pipe_valid = [r for r in pipe_results if not r.error]
-        output["pipeline"] = {
-            "avg_metric_recall": round(pipe_recall, 4),
-            "avg_critical_recall": (
-                round(sum(r.critical_recall for r in pipe_valid) / len(pipe_valid), 4) if pipe_valid else 0
-            ),
-            "avg_weighted_recall": (
-                round(sum(r.weighted_recall for r in pipe_valid) / len(pipe_valid), 4) if pipe_valid else 0
-            ),
-            "avg_signal_to_noise": (
-                round(sum(r.signal_to_noise for r in pipe_valid) / len(pipe_valid), 4) if pipe_valid else 0
-            ),
-            "total": len(pipe_results),
-            "succeeded": len(pipe_valid),
-            "errors": sum(1 for r in pipe_results if r.error),
-            "avg_latency_ms": (
-                round(sum(r.latency_ms for r in pipe_results) / len(pipe_results), 1) if pipe_results else 0
-            ),
-            "details": [
-                {
-                    "prompt_id": r.prompt_id,
-                    "metric_recall": round(r.metric_recall, 4),
-                    "critical_recall": round(r.critical_recall, 4),
-                    "weighted_recall": round(r.weighted_recall, 4),
-                    "signal_to_noise": round(r.signal_to_noise, 4),
-                    "found_metrics": r.found_metrics,
-                    "missing_metrics": r.missing_metrics,
-                    "extra_metrics": r.extra_metrics,
-                    "critical_metrics_expected": r.critical_metrics_expected,
-                    "critical_metrics_found": r.critical_metrics_found,
-                    "critical_metrics_missing": r.critical_metrics_missing,
-                    "panel_count": r.panel_count,
-                    "dashboard_url": r.dashboard_url,
-                    "latency_ms": round(r.latency_ms, 1),
-                    "error": r.error,
-                }
-                for r in pipe_results
-            ],
-        }
+        _, args.tenant = tacit_request_headers(args.api_key, args.tenant)
 
-    # ── Human review (interactive) ────────────────────────────────────
-    if args.review and args.mode in ("pipeline", "all") and "pipeline" in output:
-        reviews = collect_human_reviews(pipe_results, cases)
-        if reviews:
-            print_review_report(reviews)
-            output["human_reviews"] = reviews
+    from tests.eval.cold_isolation import LocalEvaluationEndpoints
 
-    # ── Save results ────────────────────────────────────────────────────
+    endpoints = None
+    if args.state != "external":
+        endpoints = LocalEvaluationEndpoints(
+            grafana_url=args.grafana_url,
+            llm_api_base=args.llm_url,
+            llm_model=args.llm_model,
+        )
+    with evaluation_state(args.state, args.state_dir, endpoints=endpoints, tenant_id=args.tenant) as selected_state:
+        print(f"State    : {selected_state.mode} ({selected_state.fingerprint[:12]})")
+        output, gate = await _execute_validation(args, cases, selected_state)
+
     if args.output:
-        with open(args.output, "w") as f:
+        with open(args.output, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2)
         print(f"  Results saved to {args.output}")
 
@@ -1025,7 +1444,22 @@ async def main() -> None:
         if useful:
             print(f"  Human useful rate  : {sum(useful)}/{len(useful)} ({sum(useful)/len(useful):.0%})")
     print(f"{'=' * 72}\n")
+    print_gate_report(gate)
+    print()
+    return 0 if gate.passed else 1
+
+
+def cli(argv: list[str] | None = None) -> int:
+    """Run the validation gate with stable nonzero outcomes."""
+    try:
+        return asyncio.run(main(argv))
+    except KeyboardInterrupt:
+        print("VALIDATION ERROR: interrupted", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"VALIDATION ERROR: {type(exc).__name__}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(cli())

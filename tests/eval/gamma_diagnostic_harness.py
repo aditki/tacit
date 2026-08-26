@@ -6,7 +6,8 @@ name representation, then records the pipeline's reason-coded stage outcomes.
 
 Run with the isolated GAMMA Grafana and VictoriaMetrics stack available:
 
-    python -m tests.eval.gamma_diagnostic_harness --json data/gamma/prefix-baseline.json
+    python -m tests.eval.gamma_diagnostic_harness \
+        --replace-all-series --json data/gamma/prefix-baseline.json
 """
 
 from __future__ import annotations
@@ -18,18 +19,17 @@ import json
 import re
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from demo.gamma_pilot import DEFAULT_ARCHIVE, DEFAULT_SCENARIO, build
-from tacit.agents.providers import registry as provider_registry
-from tacit.cache import llm_cache, metric_cache
-from tacit.config import settings
+from tacit.cache import metric_cache
 from tacit.models.schemas import DashRequest
 from tacit.pipeline import run_pipeline
-from tests.eval.cold_isolation import cold_isolation
+from tests.eval.cold_isolation import LocalEvaluationEndpoints, cold_isolation, require_local_endpoint
 
 PROTOCOL_PATH = Path(__file__).parent / "fixtures" / "gamma_diagnostic_protocol.json"
 PROTOCOL = json.loads(PROTOCOL_PATH.read_text())
@@ -59,22 +59,39 @@ ISOLATED_VM_SERIES_SELECTOR = '{__name__=~".+"}'
 PREDICTED_OUTCOMES = PROTOCOL["expected_outcomes"]
 
 
+@dataclass(frozen=True)
+class LiveRunConfiguration:
+    """Validated capabilities for one destructive live diagnostic run."""
+
+    vm_url: str
+    endpoints: LocalEvaluationEndpoints
+
+
 @contextmanager
 def _evaluation_settings(grafana_url: str, ollama_url: str, model: str):
-    names = ("grafana_url", "grafana_api_key", "llm_provider", "llm_api_base", "llm_model")
-    previous = {name: getattr(settings, name) for name in names}
-    settings.grafana_url = grafana_url
-    settings.grafana_api_key = ""
-    settings.llm_provider = "ollama"
-    settings.llm_api_base = ollama_url
-    settings.llm_model = model
-    provider_registry._provider = None
-    try:
-        yield
-    finally:
-        for name, value in previous.items():
-            setattr(settings, name, value)
-        provider_registry._provider = None
+    """Return validated local capabilities without mutating global settings."""
+    yield LocalEvaluationEndpoints(
+        grafana_url=require_local_endpoint(grafana_url, "GAMMA Grafana URL"),
+        llm_api_base=require_local_endpoint(ollama_url, "GAMMA LLM URL"),
+        llm_model=model,
+    )
+
+
+def _validate_live_run(args: argparse.Namespace) -> LiveRunConfiguration:
+    """Fail before side effects unless the destructive local run is explicit."""
+    vm_url = require_local_endpoint(args.vm_url, "GAMMA VictoriaMetrics URL")
+    grafana_url = require_local_endpoint(args.grafana_url, "GAMMA Grafana URL")
+    ollama_url = require_local_endpoint(args.ollama_url, "GAMMA LLM URL")
+    if not bool(getattr(args, "replace_all_series", False)):
+        raise ValueError("GAMMA diagnostics require --replace-all-series acknowledgment")
+    return LiveRunConfiguration(
+        vm_url=vm_url,
+        endpoints=LocalEvaluationEndpoints(
+            grafana_url=grafana_url,
+            llm_api_base=ollama_url,
+            llm_model=args.model,
+        ),
+    )
 
 
 def _first_metric(metrics_path: Path) -> str:
@@ -160,41 +177,47 @@ def _detect_cause_assertion(summary: str, generated_queries: list[dict[str, Any]
     return {"asserted": bool(matches), "matches": matches}
 
 
-def _reset_and_snapshot_caches() -> None:
+def _reset_and_snapshot_caches(state: Any) -> None:
+    scoped_llm_cache = state.dependencies.llm_cache
     metric_cache.invalidate()
-    llm_cache.invalidate()
+    scoped_llm_cache.invalidate()
     metric_cache.reset_stats()
-    llm_cache.reset_stats()
+    scoped_llm_cache.reset_stats()
 
 
-def _cache_stats() -> dict[str, dict[str, int]]:
-    return {"metric": metric_cache.stats, "llm": llm_cache.stats}
+def _cache_stats(state: Any) -> dict[str, dict[str, int]]:
+    return {"metric": metric_cache.stats, "llm": state.dependencies.llm_cache.stats}
 
 
-async def _run_arm(arm: str) -> dict[str, Any]:
+async def _run_arm(arm: str, endpoints: LocalEvaluationEndpoints) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
-    with cold_isolation() as state:
-        for index, prompt in enumerate(PROMPTS, start=1):
-            _reset_and_snapshot_caches()
-            provider_registry._provider = None
-            user_id = f"gamma-diagnostic-{arm}-{index}"
-            response = await run_pipeline(DashRequest(prompt=prompt, user_id=user_id))
-            record = state.history_store.list_recent(limit=1, user_id=user_id)[0]
-            generated_queries = record["generated_queries"]
-            rows.append(
-                {
-                    "prompt": prompt,
-                    "dashboard_created": bool(response.dashboard_uid),
-                    "panel_count": response.panel_count,
-                    "status": record["status"],
-                    "problem_type": record["problem_type"],
-                    "archetypes": record["archetypes"],
-                    "stages": record["stage_outcomes"],
-                    "evidence_signals": _evidence_signals(generated_queries),
-                    "cause_assertion": _detect_cause_assertion(response.summary, generated_queries),
-                    "cache_stats": _cache_stats(),
-                }
-            )
+    with cold_isolation(endpoints=endpoints) as state:
+        try:
+            for index, prompt in enumerate(PROMPTS, start=1):
+                _reset_and_snapshot_caches(state)
+                user_id = f"gamma-diagnostic-{arm}-{index}"
+                response = await run_pipeline(
+                    DashRequest(prompt=prompt, user_id=user_id),
+                    state.dependencies,
+                )
+                record = state.history_store.list_recent(limit=1, user_id=user_id)[0]
+                generated_queries = record["generated_queries"]
+                rows.append(
+                    {
+                        "prompt": prompt,
+                        "dashboard_created": bool(response.dashboard_uid),
+                        "panel_count": response.panel_count,
+                        "status": record["status"],
+                        "problem_type": record["problem_type"],
+                        "archetypes": record["archetypes"],
+                        "stages": record["stage_outcomes"],
+                        "evidence_signals": _evidence_signals(generated_queries),
+                        "cause_assertion": _detect_cause_assertion(response.summary, generated_queries),
+                        "cache_stats": _cache_stats(state),
+                    }
+                )
+        finally:
+            await state.dependencies.close_resources()
     return {
         "arm": arm,
         "description": ARMS[arm],
@@ -219,13 +242,19 @@ def _healthy_slice(metrics_path: Path, manifest_path: Path, output_dir: Path) ->
     return output
 
 
-async def _run_control(case: dict[str, str]) -> dict[str, Any]:
-    _reset_and_snapshot_caches()
-    provider_registry._provider = None
+async def _run_control(case: dict[str, str], endpoints: LocalEvaluationEndpoints) -> dict[str, Any]:
     user_id = f"gamma-control-{case['id']}"
-    with cold_isolation() as state:
-        response = await run_pipeline(DashRequest(prompt=case["prompt"], user_id=user_id))
-        record = state.history_store.list_recent(limit=1, user_id=user_id)[0]
+    with cold_isolation(endpoints=endpoints) as state:
+        try:
+            _reset_and_snapshot_caches(state)
+            response = await run_pipeline(
+                DashRequest(prompt=case["prompt"], user_id=user_id),
+                state.dependencies,
+            )
+            record = state.history_store.list_recent(limit=1, user_id=user_id)[0]
+            cache_stats = _cache_stats(state)
+        finally:
+            await state.dependencies.close_resources()
     generated_queries = record["generated_queries"]
     cause_assertion = _detect_cause_assertion(response.summary, generated_queries)
     return {
@@ -240,7 +269,7 @@ async def _run_control(case: dict[str, str]) -> dict[str, Any]:
         "evidence_signals": _evidence_signals(generated_queries),
         "cause_assertion": cause_assertion,
         "unsupported_cause_asserted": cause_assertion["asserted"],
-        "cache_stats": _cache_stats(),
+        "cache_stats": cache_stats,
     }
 
 
@@ -359,6 +388,7 @@ def _evaluate_predictions(arms: dict[str, dict[str, Any]], expectation: str = "p
 
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
+    live = _validate_live_run(args)
     output_dir = args.workdir
     output_dir.mkdir(parents=True, exist_ok=True)
     arms: dict[str, dict[str, Any]] = {}
@@ -371,8 +401,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 output_dir,
                 naming=arm,
             )
-            _replace_gamma_metrics(client, args.vm_url, metrics_path)
-            arm_result = await _run_arm(arm)
+            _replace_gamma_metrics(client, live.vm_url, metrics_path)
+            arm_result = await _run_arm(arm, live.endpoints)
             arm_result["manifest"] = str(manifest_path)
             arms[arm] = arm_result
 
@@ -395,8 +425,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     "application",
                     case_dir,
                 )
-            _replace_gamma_metrics(client, args.vm_url, metrics_path)
-            controls[case["id"]] = await _run_control(case)
+            _replace_gamma_metrics(client, live.vm_url, metrics_path)
+            controls[case["id"]] = await _run_control(case, live.endpoints)
 
     evaluation = _evaluate_predictions(arms, args.expect)
     control_evaluation = _evaluate_controls(controls)
@@ -422,11 +452,18 @@ def main() -> int:
     parser.add_argument("--vm-url", default="http://127.0.0.1:8428")
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--model", default="qwen3-coder:30b-a3b-q4_K_M")
+    parser.add_argument(
+        "--replace-all-series",
+        action="store_true",
+        help="Acknowledge replacement of every series in the validated local VictoriaMetrics instance.",
+    )
     parser.add_argument("--json", type=Path)
     parser.add_argument("--expect", choices=("pre-fix", "post-fix"), default=DEFAULT_EXPECTATION)
     args = parser.parse_args()
-    with _evaluation_settings(args.grafana_url, args.ollama_url, args.model):
+    try:
         report = asyncio.run(run(args))
+    except ValueError as exc:
+        parser.error(str(exc))
     summary = {
         "model": report["model"],
         "cache_policy": report["cache_policy"],
