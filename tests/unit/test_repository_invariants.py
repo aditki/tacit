@@ -579,14 +579,36 @@ def test_ci_gitleaks_scans_explicit_history_range_and_gitless_snapshot() -> None
     workflow = _ci_workflow()
     baseline = workflow["env"]["GITLEAKS_HISTORY_BASELINE_SHA"]
     assert re.fullmatch(r"[0-9a-f]{40}", baseline)
-    assert (
+    baseline_present = (
         subprocess.run(
-            ["git", "merge-base", "--is-ancestor", baseline, "HEAD"],
+            ["git", "cat-file", "-e", f"{baseline}^{{commit}}"],
             cwd=REPOSITORY_ROOT,
             check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         ).returncode
         == 0
     )
+    if baseline_present:
+        assert (
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", baseline, "HEAD"],
+                cwd=REPOSITORY_ROOT,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode
+            == 0
+        )
+    else:
+        shallow = subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert shallow == "true"
     secret_scan = workflow["jobs"]["secret-scan"]
     checkout = next(step for step in secret_scan["steps"] if step.get("uses", "").startswith("actions/checkout@"))
     assert checkout["with"] == {
