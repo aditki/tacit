@@ -605,7 +605,13 @@ def test_ci_gitleaks_scans_explicit_history_range_and_gitless_snapshot() -> None
     assert "git archive" in snapshot
     assert ".gitleaks-worktree" in snapshot
 
-    history = _step(secret_scan, "Gitleaks committed history")["with"]["args"]
+    history_step = _step(secret_scan, "Gitleaks committed history")
+    assert history_step["env"] == {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": "/github/workspace",
+    }
+    history = history_step["with"]["args"]
     assert "--log-opts=${{ steps.gitleaks_range.outputs.log_opts }}" in history
     assert "--no-git" not in history
     assert "--all" not in history
