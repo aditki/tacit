@@ -37,6 +37,7 @@ class A2AProvider(ContextProvider):
         self._client = httpx.AsyncClient(
             headers=headers,
             timeout=30.0,
+            trust_env=False,
         )
 
     async def query(

@@ -30,8 +30,10 @@ class GrafanaClient:
         org_id: int | None = None,
         runtime_settings: Settings | None = None,
         *,
-        trust_env: bool = True,
+        trust_env: bool = False,
     ):
+        if trust_env:
+            raise ValueError("GrafanaClient does not permit ambient proxy discovery")
         configured_settings = snapshot_runtime_settings(runtime_settings or settings)
         effective_base_url = configured_settings.grafana_url if base_url is None else base_url
         self._base_url = canonical_remote_endpoint(effective_base_url)

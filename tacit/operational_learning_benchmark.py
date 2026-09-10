@@ -23,8 +23,8 @@ from tacit.knowledge.enums import (
 )
 from tacit.knowledge.models import Entity, EntityAlias, KnowledgeEvidenceReference, KnowledgeScope
 from tacit.knowledge.normalization import PropositionNormalizer
-from tacit.knowledge.repository import KnowledgeRepository
 from tacit.knowledge.service import KnowledgeService
+from tacit.signals.store import SignalStore
 
 _BENCHMARK_PERMISSIONS = ",".join(
     sorted(
@@ -57,8 +57,9 @@ def run_operational_learning_benchmark() -> dict[str, Any]:
                     "signals_db_path": str(case_path),
                 }
             )
+            signal_store = SignalStore(case_path, runtime_settings=benchmark_settings)
             service = KnowledgeService(
-                KnowledgeRepository(case_path, runtime_settings=benchmark_settings),
+                signal_store=signal_store,
                 runtime_settings=benchmark_settings,
             )
             _seed_entities(service)

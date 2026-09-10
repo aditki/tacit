@@ -8,23 +8,29 @@ Requires `boto3` to be installed (optional dependency).
 
 from __future__ import annotations
 
-import asyncio
 import configparser
 import io
 import os
 import tempfile
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Never, Protocol, cast
 
 import structlog
 
 from tacit.agents.providers.base import LLMProvider, LLMResult, TokenUsage
 from tacit.config import Settings, settings
 from tacit.errors import RuntimeOwnershipError
+from tacit.pipeline.side_effects import LifecycleOwnedBlockingWork, terminal_cleanup_failure
+from tacit.pipeline_admission import (
+    PipelineAdmissionController,
+    current_pipeline_execution_deadline,
+    runtime_admission_controller,
+)
 from tacit.runtime_ownership import (
     BedrockCredentialIdentity,
     BedrockCredentialPlan,
@@ -52,8 +58,6 @@ _ANTHROPIC_TO_BEDROCK: dict[str, str] = {
     "claude-3-haiku-20240307": "anthropic.claude-3-haiku-20240307-v1:0",
 }
 
-_BEDROCK_DEFAULT_MODEL = "anthropic.claude-sonnet-4-20250514-v1:0"
-
 # Known Bedrock provider prefixes — if llm_model starts with one of these,
 # it's already a valid Bedrock model ID and should be used as-is.
 # Includes regional/global inference profile prefixes (us., eu., ap., etc.).
@@ -68,6 +72,7 @@ _BEDROCK_PROVIDER_PREFIXES = (
     # Regional and cross-region inference profile prefixes
     "us.",
     "eu.",
+    "apac.",
     "ap.",
     "sa.",
     "me.",
@@ -76,37 +81,48 @@ _BEDROCK_PROVIDER_PREFIXES = (
     "global.",
 )
 
-# Map AWS region prefix to inference profile prefix.
-# Only us. and eu. have documented geo-specific inference profiles;
-# all other regions (ap, sa, me, ca, af) use the global. profile.
+# Map AWS region prefix to geography-preserving inference profile prefixes.
+# Global routing is never derived from a regional endpoint; callers must
+# configure a global profile ID explicitly when that wider routing is intended.
 _REGION_INFERENCE_PREFIX: dict[str, str] = {
     "us": "us",
     "eu": "eu",
+    "ap": "apac",
 }
 
 # Prefixes that indicate a model ID is already an inference profile
-_INFERENCE_PROFILE_PREFIXES = ("us.", "eu.", "ap.", "sa.", "me.", "ca.", "af.", "global.")
+_INFERENCE_PROFILE_PREFIXES = ("us.", "eu.", "apac.", "ap.", "sa.", "me.", "ca.", "af.", "global.")
+_ON_DEMAND_THROUGHPUT_REASON = "on-demand throughput"
+_INFERENCE_PROFILE_REASON = "inference profile"
 
 
-def _inference_profile_id(bare_model_id: str, region: str) -> str:
-    """Prefix a bare model ID with the region's inference profile prefix.
+def _inference_profile_id(bare_model_id: str, region: str) -> str | None:
+    """Return a geography-preserving profile ID when the region declares one.
 
-    Uses ``us.`` / ``eu.`` for those geo regions and ``global.`` for
-    everything else (ap-*, sa-*, me-*, etc.), matching AWS's documented
-    inference profile availability.
+    Uses ``us.``, ``eu.``, or ``apac.`` for their documented geographies.
+    Other regions return ``None`` instead of silently widening to ``global.``.
 
     Example: ('anthropic.claude-sonnet-4-20250514-v1:0', 'us-east-1')
              -> 'us.anthropic.claude-sonnet-4-20250514-v1:0'
     Example: ('anthropic.claude-sonnet-4-20250514-v1:0', 'ap-northeast-1')
-             -> 'global.anthropic.claude-sonnet-4-20250514-v1:0'
+             -> 'apac.anthropic.claude-sonnet-4-20250514-v1:0'
     """
     region_prefix = region.split("-")[0]  # "us-east-1" -> "us"
-    prefix = _REGION_INFERENCE_PREFIX.get(region_prefix, "global")
+    prefix = _REGION_INFERENCE_PREFIX.get(region_prefix)
+    if prefix is None:
+        return None
     return f"{prefix}.{bare_model_id}"
 
 
-# Cache for resolved model IDs — avoids repeated ListFoundationModels calls
-_resolve_cache: dict[str, str] = {}
+def _validation_error_message(exc: Exception) -> str:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error")
+        if isinstance(error, dict):
+            message = error.get("Message")
+            if isinstance(message, str):
+                return message
+    return str(exc)
 
 
 class _Boto3Session(Protocol):
@@ -145,11 +161,25 @@ class _FrozenBedrockCredentials:
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedBedrockRuntime:
-    """Private credential snapshot and clients retained by one provider generation."""
+    """Private credential snapshot and clients owned by one blocking operation."""
 
     session: _Boto3Session = field(repr=False)
     credential_identity: BedrockCredentialIdentity
     credential_clients: tuple[object, ...] = field(default=(), repr=False)
+
+
+def _direct_bedrock_lifecycle(credential_plan: BedrockCredentialPlan) -> PipelineAdmissionController:
+    """Return one bounded admission owner shared by direct callers in a runtime."""
+    declaration = credential_plan.ownership(component="direct_bedrock_runtime")
+    identity = declaration.admission_namespace or (
+        f"runtime-admission:{declaration.settings_identity}" if declaration.settings_identity else None
+    )
+    if not identity:
+        raise RuntimeOwnershipError("AWS Bedrock direct runtime has no admission identity")
+    return runtime_admission_controller(
+        credential_plan.runtime_settings,
+        runtime_identity=identity,
+    )
 
 
 def _write_private_snapshot(path: Path, content: bytes) -> None:
@@ -235,6 +265,7 @@ def _frozen_file_discovery_session(
         core_session.set_config_variable("sts_regional_endpoints", "regional")
         core_session.set_config_variable("use_fips_endpoint", False)
         core_session.set_config_variable("use_dualstack_endpoint", False)
+        core_session.set_default_client_config(_bedrock_client_config(credential_plan.runtime_settings))
         credential_resolver = core_session.get_component("credential_provider")
         allowed_methods = frozenset(credential_plan.discovery_methods)
         credential_resolver.providers[:] = [
@@ -247,45 +278,63 @@ def _frozen_file_discovery_session(
         yield cast(_Boto3Session, boto3_module.Session(botocore_session=core_session))
 
 
-def _resolve_bedrock_model_id(anthropic_model_name: str, bedrock_client) -> str:
-    """Resolve an Anthropic API model name to a Bedrock model ID.
+def _remaining_operation_timeout(runtime_settings: Settings, deadline: float | None) -> float:
+    configured = float(runtime_settings.pipeline_timeout_seconds)
+    if deadline is None:
+        return configured
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("AWS Bedrock operation deadline expired")
+    return min(configured, remaining)
 
-    Strategy:
-    0. If already provider-prefixed (e.g. meta.llama3-*), use as-is
-    1. Check cache
-    2. Call ListFoundationModels API to find a matching model ID
-    3. Fall back to static _ANTHROPIC_TO_BEDROCK map
-    4. Fall back to _BEDROCK_DEFAULT_MODEL
-    """
-    # Already a valid Bedrock model ID — pass through
-    if anthropic_model_name.startswith(_BEDROCK_PROVIDER_PREFIXES):
-        logger.info(
-            "bedrock_model_resolved", source="passthrough", input=anthropic_model_name, resolved=anthropic_model_name
-        )
-        return anthropic_model_name
 
-    if anthropic_model_name in _resolve_cache:
-        return _resolve_cache[anthropic_model_name]
-
-    # Try runtime resolution via ListFoundationModels
+def _bedrock_client_config(
+    runtime_settings: Settings,
+    *,
+    deadline: float | None = None,
+    unsigned: bool = False,
+) -> Any:
+    """Return bounded Botocore transport settings for one blocking operation."""
     try:
-        resp = bedrock_client.list_foundation_models()
-        for model in resp.get("modelSummaries", []):
-            model_id = model.get("modelId", "")
-            if anthropic_model_name in model_id:
-                _resolve_cache[anthropic_model_name] = model_id
-                logger.info("bedrock_model_resolved", source="api", input=anthropic_model_name, resolved=model_id)
-                return model_id
-    except Exception as exc:
-        logger.debug("bedrock_list_models_failed", error=str(exc))
+        from botocore.config import Config
+    except ImportError as exc:  # pragma: no cover - boto3 always installs botocore
+        raise ImportError("AWS Bedrock provider requires botocore") from exc
 
-    # Fall back to static map, then default.
-    # Returns the bare foundation model ID; _converse() will auto-retry
-    # with an inference profile prefix if invocation fails.
-    resolved = _ANTHROPIC_TO_BEDROCK.get(anthropic_model_name, _BEDROCK_DEFAULT_MODEL)
-    _resolve_cache[anthropic_model_name] = resolved
-    logger.info("bedrock_model_resolved", source="static_map", input=anthropic_model_name, resolved=resolved)
-    return resolved
+    operation_timeout = _remaining_operation_timeout(runtime_settings, deadline)
+    kwargs: dict[str, Any] = {
+        "connect_timeout": min(10.0, operation_timeout),
+        "read_timeout": operation_timeout,
+        "retries": {"mode": "standard", "total_max_attempts": 1},
+        "tcp_keepalive": True,
+        "proxies": {},
+    }
+    if unsigned:
+        from botocore import UNSIGNED
+
+        kwargs["signature_version"] = UNSIGNED
+    return Config(
+        **kwargs,
+    )
+
+
+def _credential_cleanup_failure(
+    primary_error: BaseException,
+    resources: tuple[object, ...],
+) -> RuntimeOwnershipError | None:
+    """Return a stable terminal error when credential cleanup is incomplete."""
+    cleanup_error = BedrockProvider._close_resources(
+        resources,
+        event="bedrock_credential_cleanup_failed",
+    )
+    if cleanup_error is None:
+        return None
+    return terminal_cleanup_failure(
+        primary_error,
+        cleanup_error,
+        reason_code="bedrock_credential_cleanup_failed",
+        message="AWS Bedrock credential cleanup failed",
+        retain_capacity=True,
+    )
 
 
 def _build_boto3_session(
@@ -293,6 +342,7 @@ def _build_boto3_session(
     *,
     environment: dict[str, str] | None = None,
     credential_plan: BedrockCredentialPlan | None = None,
+    deadline: float | None = None,
 ) -> _ResolvedBedrockRuntime:
     """Resolve and pin one credential snapshot for a provider generation."""
     if credential_plan is None:
@@ -304,25 +354,42 @@ def _build_boto3_session(
         raise RuntimeOwnershipError("AWS Bedrock credential plan must be the sole credential input")
     credential_plan.verify_unchanged()
     runtime_settings = credential_plan.runtime_settings
+    _remaining_operation_timeout(runtime_settings, deadline)
     environment = credential_plan.environment
     try:
         import boto3
     except ImportError as exc:
-        raise ImportError("AWS Bedrock provider requires boto3. " "Install it with: pip install boto3") from exc
+        raise ImportError(
+            "AWS Bedrock provider requires the pinned Bedrock extra. "
+            "Install it with: pip install 'tacit-ai[bedrock]'"
+        ) from exc
 
     profile_name = credential_plan.profile
     ambient_access_key = str(environment.get("AWS_ACCESS_KEY_ID") or "")
     ambient_secret_key = str(environment.get("AWS_SECRET_ACCESS_KEY") or "")
     ambient_session_token = str(environment.get("AWS_SECURITY_TOKEN") or environment.get("AWS_SESSION_TOKEN") or "")
 
+    def pinned_session(credentials: _FrozenBedrockCredentials) -> _Boto3Session:
+        kwargs = {
+            "region_name": runtime_settings.llm_bedrock_region,
+            "aws_access_key_id": credentials.access_key,
+            "aws_secret_access_key": credentials.secret_key,
+        }
+        if credentials.token:
+            kwargs["aws_session_token"] = credentials.token
+        return boto3.Session(**kwargs)
+
     auth_method: str
     selected_source_sts = False
+    credential_clients: tuple[object, ...] = ()
+    sts: Any | None = None
     if runtime_settings.llm_aws_access_key_id or runtime_settings.llm_aws_secret_access_key:
         if not runtime_settings.llm_aws_access_key_id or not runtime_settings.llm_aws_secret_access_key:
             raise RuntimeOwnershipError("AWS credentials must include both access key and secret key")
         frozen = _FrozenBedrockCredentials(
             access_key=runtime_settings.llm_aws_access_key_id,
             secret_key=runtime_settings.llm_aws_secret_access_key,
+            token=runtime_settings.llm_aws_session_token,
         )
         auth_method = "explicit_keys"
     elif ambient_access_key or ambient_secret_key:
@@ -334,6 +401,71 @@ def _build_boto3_session(
             token=ambient_session_token,
         )
         auth_method = "environment_keys"
+    elif credential_plan.discovery_methods == ("assume-role",):
+        access_key, secret_key, token = credential_plan.role_source_credentials()
+        source_credentials = _FrozenBedrockCredentials(access_key=access_key, secret_key=secret_key, token=token)
+        sts = pinned_session(source_credentials).client(
+            "sts",
+            endpoint_url=canonical_aws_sts_endpoint(runtime_settings.llm_bedrock_region),
+            config=_bedrock_client_config(runtime_settings, deadline=deadline),
+            verify=True,
+        )
+        try:
+            assumed = sts.assume_role(
+                RoleArn=credential_plan.source_role_arn,
+                RoleSessionName=credential_plan.source_role_session_name or "tacit-bedrock",
+                DurationSeconds=3600,
+            )
+            creds = assumed["Credentials"]
+            frozen = _FrozenBedrockCredentials(
+                access_key=creds["AccessKeyId"],
+                secret_key=creds["SecretAccessKey"],
+                token=creds["SessionToken"],
+            )
+        except BaseException as exc:
+            cleanup_failure = _credential_cleanup_failure(exc, (sts,))
+            if cleanup_failure is not None:
+                raise cleanup_failure from exc
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise RuntimeOwnershipError(f"AWS Bedrock credential realization failed ({type(exc).__name__})") from None
+        credential_clients = (sts,)
+        selected_source_sts = True
+        auth_method = "profile_assume_role"
+    elif credential_plan.discovery_methods == ("assume-role-with-web-identity",):
+        unsigned_session = boto3.Session(region_name=runtime_settings.llm_bedrock_region)
+        sts = unsigned_session.client(
+            "sts",
+            endpoint_url=canonical_aws_sts_endpoint(runtime_settings.llm_bedrock_region),
+            config=_bedrock_client_config(runtime_settings, deadline=deadline, unsigned=True),
+            verify=True,
+        )
+        try:
+            token = credential_plan.source_content("web_identity_token").decode("utf-8").strip()
+            if not token:
+                raise RuntimeOwnershipError("AWS web identity token is unavailable")
+            assumed = sts.assume_role_with_web_identity(
+                RoleArn=credential_plan.web_identity_role_arn,
+                RoleSessionName=credential_plan.web_identity_role_session_name or "tacit-bedrock",
+                WebIdentityToken=token,
+                DurationSeconds=3600,
+            )
+            creds = assumed["Credentials"]
+            frozen = _FrozenBedrockCredentials(
+                access_key=creds["AccessKeyId"],
+                secret_key=creds["SecretAccessKey"],
+                token=creds["SessionToken"],
+            )
+        except BaseException as exc:
+            cleanup_failure = _credential_cleanup_failure(exc, (sts,))
+            if cleanup_failure is not None:
+                raise cleanup_failure from exc
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise RuntimeOwnershipError(f"AWS Bedrock credential realization failed ({type(exc).__name__})") from None
+        credential_clients = (sts,)
+        selected_source_sts = True
+        auth_method = "web_identity"
     else:
 
         def resolve_discovery_credentials(discovery_session: _Boto3Session) -> _FrozenBedrockCredentials:
@@ -364,160 +496,215 @@ def _build_boto3_session(
             frozen = resolve_discovery_credentials(discovery_session)
         auth_method = "profile" if profile_name else "default_chain"
 
-    def pinned_session(credentials: _FrozenBedrockCredentials) -> _Boto3Session:
-        kwargs = {
-            "region_name": runtime_settings.llm_bedrock_region,
-            "aws_access_key_id": credentials.access_key,
-            "aws_secret_access_key": credentials.secret_key,
-        }
-        if credentials.token:
-            kwargs["aws_session_token"] = credentials.token
-        return boto3.Session(**kwargs)
+    try:
+        if runtime_settings.llm_bedrock_role_arn:
+            sts = pinned_session(frozen).client(
+                "sts",
+                endpoint_url=canonical_aws_sts_endpoint(runtime_settings.llm_bedrock_region),
+                config=_bedrock_client_config(runtime_settings, deadline=deadline),
+                verify=True,
+            )
+            assumed = sts.assume_role(
+                RoleArn=runtime_settings.llm_bedrock_role_arn,
+                RoleSessionName="tacit-bedrock",
+                DurationSeconds=3600,
+            )
+            creds = assumed["Credentials"]
+            frozen = _FrozenBedrockCredentials(
+                access_key=creds["AccessKeyId"],
+                secret_key=creds["SecretAccessKey"],
+                token=creds["SessionToken"],
+            )
+            credential_clients = (sts,)
+            auth_method = "assume_role"
 
-    credential_clients: tuple[object, ...] = ()
-    if runtime_settings.llm_bedrock_role_arn:
-        sts = pinned_session(frozen).client(
-            "sts",
-            endpoint_url=canonical_aws_sts_endpoint(runtime_settings.llm_bedrock_region),
-        )
-        assumed = sts.assume_role(
-            RoleArn=runtime_settings.llm_bedrock_role_arn,
-            RoleSessionName="tacit-bedrock",
-            DurationSeconds=3600,
-        )
-        creds = assumed["Credentials"]
-        frozen = _FrozenBedrockCredentials(
-            access_key=creds["AccessKeyId"],
-            secret_key=creds["SecretAccessKey"],
-            token=creds["SessionToken"],
-        )
-        credential_clients = (sts,)
-        auth_method = "assume_role"
-
-    session = pinned_session(frozen)
-    logger.info("bedrock_auth", method=auth_method, region=runtime_settings.llm_bedrock_region)
-    return _ResolvedBedrockRuntime(
-        session=session,
-        credential_identity=credential_plan.realized_identity(
+        _remaining_operation_timeout(runtime_settings, deadline)
+        session = pinned_session(frozen)
+        credential_identity = credential_plan.realized_identity(
             fallback_account=frozen.account,
             credential_fingerprint_value=frozen.fingerprint,
             source_uses_sts=selected_source_sts,
-        ),
+        )
+    except BaseException as exc:
+        cleanup_failure = _credential_cleanup_failure(exc, (sts,))
+        if cleanup_failure is not None:
+            raise cleanup_failure from exc
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise RuntimeOwnershipError(f"AWS Bedrock credential realization failed ({type(exc).__name__})") from None
+
+    logger.info("bedrock_auth", method=auth_method, region=runtime_settings.llm_bedrock_region)
+    return _ResolvedBedrockRuntime(
+        session=session,
+        credential_identity=credential_identity,
         credential_clients=credential_clients,
     )
 
 
 class BedrockProvider(LLMProvider):
-    """AWS Bedrock LLM provider.
+    """Operation-scoped compatibility bridge for Botocore's blocking API."""
 
-    Uses the Bedrock Runtime `converse` API which provides a unified
-    interface across all Bedrock foundation models (Claude, Llama, Mistral, etc.).
-    """
+    _NO_SYSTEM_PREFIXES = ("mistral.",)
 
     def __init__(
         self,
         runtime_settings: Settings | None = None,
         *,
         credential_plan: BedrockCredentialPlan | None = None,
-    ):
+    ) -> None:
         if credential_plan is None:
             credential_plan = BedrockCredentialPlan.capture(runtime_settings or settings)
         elif runtime_settings is not None:
             supplied_settings = snapshot_runtime_settings(runtime_settings)
             if supplied_settings != credential_plan.runtime_settings:
                 raise RuntimeOwnershipError("AWS Bedrock credential plan settings do not match")
+        credential_plan = credential_plan.as_cross_generation_declaration()
         self._credential_plan = credential_plan
         self._runtime_settings = credential_plan.runtime_settings
         self._settings = self.runtime_settings
-        resolved_runtime = _build_boto3_session(credential_plan=credential_plan)
-        if isinstance(resolved_runtime, _ResolvedBedrockRuntime):
-            self._session = resolved_runtime.session
-            bedrock_credential_identity = resolved_runtime.credential_identity
-            self._credential_clients = list(resolved_runtime.credential_clients)
-        else:
-            # Test doubles predating credential snapshots remain usable, while
-            # production construction always returns _ResolvedBedrockRuntime.
-            self._session = cast(_Boto3Session, resolved_runtime)
-            bedrock_credential_identity = None
-            self._credential_clients = []
-        self._bedrock_credential_identity = bedrock_credential_identity
-        self._runtime_ownership = credential_plan.ownership(
-            component="bedrock_llm_provider",
-            credential_identity=bedrock_credential_identity,
-        )
-        self._client = None
-        self._client_lock = threading.Lock()
-        self._configured_model = self._settings.llm_model
+        self._runtime_ownership = credential_plan.ownership(component="bedrock_llm_provider")
+        self._blocking_work = LifecycleOwnedBlockingWork()
+        self._lifecycle_lock = threading.Lock()
+        self._pipeline_lifecycle: PipelineAdmissionController | None = None
+        self._direct_lifecycle: PipelineAdmissionController | None = None
+        self._closed = threading.Event()
+        self._model_lock = threading.Lock()
+        configured_model = self._settings.llm_model
         if self._settings.llm_bedrock_model_id:
             self._model_id = self._settings.llm_bedrock_model_id
-        elif self._configured_model.startswith(_BEDROCK_PROVIDER_PREFIXES):
-            self._model_id = self._configured_model
+        elif configured_model.startswith(_BEDROCK_PROVIDER_PREFIXES):
+            self._model_id = configured_model
+        elif configured_model in _ANTHROPIC_TO_BEDROCK:
+            self._model_id = _ANTHROPIC_TO_BEDROCK[configured_model]
         else:
-            self._model_id = _ANTHROPIC_TO_BEDROCK.get(self._configured_model, _BEDROCK_DEFAULT_MODEL)
+            raise RuntimeOwnershipError("Unknown Bedrock model; configure LLM_BEDROCK_MODEL_ID explicitly")
         logger.info(
             "bedrock_configured",
             model_id=self._model_id,
             region=self._settings.llm_bedrock_region,
+            resource_scope="operation",
         )
 
     @property
-    def bedrock_credential_identity(self) -> BedrockCredentialIdentity | None:
-        """Return the non-secret credential identity realized from this plan."""
-        return self._bedrock_credential_identity
+    def bedrock_credential_identity(self) -> None:
+        """The bridge deliberately retains no realized credential generation."""
+        return None
 
     def bedrock_ownership_declarations(
         self,
         *,
         component: str,
-    ) -> tuple[RuntimeOwnershipDescriptor, RuntimeOwnershipDescriptor] | None:
-        """Return non-secret planned and realized ownership for admission."""
-        if self._bedrock_credential_identity is None:
-            return None
-        return (
-            self._credential_plan.ownership(component=component),
-            self._credential_plan.ownership(
-                component=component,
-                credential_identity=self._bedrock_credential_identity,
-            ),
+    ) -> tuple[RuntimeOwnershipDescriptor, RuntimeOwnershipDescriptor]:
+        """Use the stable plan as both provider and cross-generation expectation."""
+        planned = self._credential_plan.ownership(component=component)
+        return planned, planned
+
+    def realize_blocking(self) -> None:
+        """Compatibility preflight that performs no SDK construction or I/O."""
+        if self._closed.is_set():
+            raise RuntimeOwnershipError("AWS Bedrock provider is closed")
+
+    def bind_pipeline_lifecycle(self, lifecycle: PipelineAdmissionController) -> bool:
+        """Bind this provider to the composition root's admission controller."""
+        return self._bind_lifecycle(lifecycle, direct=False)
+
+    def claim_abandoned_cleanup(self, lifecycle: PipelineAdmissionController) -> bool:
+        """Accept compatible abandonment; no SDK resource needs retirement."""
+        try:
+            self._bind_lifecycle(lifecycle, direct=False)
+        except RuntimeOwnershipError:
+            return False
+        self.close_blocking()
+        return True
+
+    def _bind_lifecycle(
+        self,
+        lifecycle: PipelineAdmissionController,
+        *,
+        direct: bool,
+    ) -> bool:
+        declaration = self._credential_plan.ownership(component="bedrock_lifecycle_binding")
+        runtime_identity = declaration.admission_namespace or (
+            f"runtime-admission:{declaration.settings_identity}" if declaration.settings_identity else None
         )
+        if runtime_identity is None:
+            raise RuntimeOwnershipError("AWS Bedrock credential plan has no admission identity")
+        lifecycle.bind_runtime_settings_identity(runtime_identity)
+        with self._lifecycle_lock:
+            if self._pipeline_lifecycle is lifecycle:
+                if not direct and self._direct_lifecycle is lifecycle:
+                    self._direct_lifecycle = None
+                return False
+            if self._pipeline_lifecycle is not None:
+                raise RuntimeOwnershipError("AWS Bedrock provider belongs to another runtime lifecycle")
+            try:
+                self._blocking_work.bind(lifecycle)
+            except ValueError as exc:
+                raise RuntimeOwnershipError("AWS Bedrock provider belongs to another runtime lifecycle") from exc
+            self._pipeline_lifecycle = lifecycle
+            if direct:
+                self._direct_lifecycle = lifecycle
+            else:
+                self._direct_lifecycle = None
+        return True
 
-    def _ensure_client(self):
-        """Create the pinned runtime client only on first use."""
-        if self._client is not None:
-            return self._client
-        with self._client_lock:
-            if self._client is not None:
-                return self._client
-            self._client = self._session.client(
-                "bedrock-runtime",
-                endpoint_url=canonical_bedrock_runtime_endpoint(self._settings.llm_bedrock_region),
-            )
-            logger.info(
-                "bedrock_initialized",
-                model_id=self._model_id,
-                region=self._settings.llm_bedrock_region,
-            )
-            return self._client
+    def _execution_lifecycle(self) -> tuple[PipelineAdmissionController, bool]:
+        """Resolve the injected owner or bind direct use to its shared runtime."""
+        with self._lifecycle_lock:
+            lifecycle = self._pipeline_lifecycle
+            if lifecycle is not None:
+                return lifecycle, lifecycle is self._direct_lifecycle
+        direct_lifecycle = _direct_bedrock_lifecycle(self._credential_plan)
+        try:
+            self._bind_lifecycle(direct_lifecycle, direct=True)
+        except RuntimeOwnershipError:
+            with self._lifecycle_lock:
+                lifecycle = self._pipeline_lifecycle
+                if lifecycle is None:
+                    raise
+                return lifecycle, lifecycle is self._direct_lifecycle
+        return direct_lifecycle, True
 
-    # Model families that do NOT support the Converse ``system`` parameter.
-    # For these, we fold the system prompt into the first user message.
-    _NO_SYSTEM_PREFIXES = ("mistral.",)
+    async def _run_owned[Result](
+        self,
+        function: Callable[[], Result],
+        *,
+        reason_code: str,
+        deadline: float,
+    ) -> Result:
+        lifecycle, manages_slot = self._execution_lifecycle()
+        timeout_seconds = _remaining_operation_timeout(self._settings, deadline)
+        if not manages_slot:
+            return await self._blocking_work.run(
+                function,
+                reason_code=reason_code,
+                timeout_seconds=timeout_seconds,
+            )
+        async with lifecycle.slot(timeout_seconds=timeout_seconds):
+            return await self._blocking_work.run(
+                function,
+                reason_code=reason_code,
+                timeout_seconds=_remaining_operation_timeout(self._settings, deadline),
+            )
+
+    async def retire_rejected(self, *, reason_code: str) -> bool:
+        """Reject future calls; operation-scoped SDK resources cannot survive."""
+        del reason_code
+        self.close_blocking()
+        return True
 
     def _build_converse_kwargs(
         self,
         system_prompt: str,
         user_prompt: str,
         temperature: float,
-    ) -> dict:
-        """Build kwargs for client.converse(), handling model-family quirks.
-
-        Mistral AI Instruct models accept Converse but reject the ``system``
-        field (AWS model-feature table), so the system prompt is folded into
-        the user message for those families.
-        """
-        model_id = self._model_id
-
-        # Mistral (and any future no-system families): fold system into user msg
+        *,
+        model_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Build one Converse request while handling model-family quirks."""
+        if model_id is None:
+            with self._model_lock:
+                model_id = self._model_id
         if model_id.startswith(self._NO_SYSTEM_PREFIXES):
             merged_user = f"{system_prompt}\n\n{user_prompt}"
             return {
@@ -525,7 +712,6 @@ class BedrockProvider(LLMProvider):
                 "messages": [{"role": "user", "content": [{"text": merged_user}]}],
                 "inferenceConfig": {"temperature": temperature, "maxTokens": 4096},
             }
-
         return {
             "modelId": model_id,
             "system": [{"text": system_prompt}],
@@ -534,58 +720,262 @@ class BedrockProvider(LLMProvider):
         }
 
     @staticmethod
-    def _extract_usage(response: dict) -> TokenUsage:
+    def _extract_usage(response: dict[str, Any]) -> TokenUsage:
         usage = response.get("usage", {})
         inp = usage.get("inputTokens", 0) or 0
         out = usage.get("outputTokens", 0) or 0
         return TokenUsage(prompt_tokens=inp, completion_tokens=out, total_tokens=inp + out)
 
-    def _converse(
+    def _validate_runtime_generation(
+        self,
+        resolved_runtime: object,
+        *,
+        operation_plan: BedrockCredentialPlan,
+    ) -> _ResolvedBedrockRuntime:
+        if not isinstance(resolved_runtime, _ResolvedBedrockRuntime):
+            self._reject_runtime_generation(
+                (resolved_runtime,),
+                RuntimeOwnershipError("AWS Bedrock provider has no realized credential identity"),
+            )
+        if not isinstance(resolved_runtime.credential_identity, BedrockCredentialIdentity):
+            self._reject_runtime_generation(
+                (*resolved_runtime.credential_clients, resolved_runtime.session),
+                RuntimeOwnershipError("AWS Bedrock provider has no realized credential identity"),
+            )
+        planned = self._credential_plan.ownership(component="bedrock_operation_plan")
+        realized = operation_plan.ownership(
+            component="bedrock_operation_generation",
+            credential_identity=resolved_runtime.credential_identity,
+        )
+        planned_remotes = {remote.provider: remote for remote in planned.remotes}
+        realized_remotes = {remote.provider: remote for remote in realized.remotes}
+        mismatch: set[str] = set()
+        if set(planned_remotes) != set(realized_remotes):
+            mismatch.add("remote")
+        for provider, planned_remote in planned_remotes.items():
+            realized_remote = realized_remotes.get(provider)
+            if realized_remote is None:
+                continue
+            if realized_remote.endpoint != planned_remote.endpoint:
+                mismatch.add("endpoint")
+            selector_refines = planned_remote.account == "default-chain" or planned_remote.account.startswith(
+                "profile:"
+            )
+            if not selector_refines and realized_remote.account != planned_remote.account:
+                mismatch.add("account")
+            if realized_remote.credential_fingerprint == "none":
+                mismatch.add("credential")
+        if mismatch:
+            joined = ", ".join(sorted(mismatch))
+            self._reject_runtime_generation(
+                (*resolved_runtime.credential_clients, resolved_runtime.session),
+                RuntimeOwnershipError(f"AWS Bedrock credential realization mismatch: {joined}"),
+            )
+        return resolved_runtime
+
+    def _reject_runtime_generation(
+        self,
+        resources: tuple[object, ...],
+        primary_error: RuntimeOwnershipError,
+    ) -> Never:
+        cleanup_error = self._close_resources(
+            resources,
+            event="bedrock_rejected_runtime_cleanup_failed",
+        )
+        if cleanup_error is not None:
+            raise terminal_cleanup_failure(
+                primary_error,
+                cleanup_error,
+                reason_code="bedrock_rejected_runtime_cleanup_failed",
+                message="AWS Bedrock rejected runtime cleanup failed",
+                retain_capacity=True,
+            ) from primary_error
+        raise primary_error
+
+    @staticmethod
+    def _observe_phase(phase: str, started: float, *, error: BaseException | None = None) -> None:
+        fields: dict[str, Any] = {
+            "phase": phase,
+            "duration_ms": round((time.monotonic() - started) * 1000, 3),
+            "status": "failed" if error is not None else "completed",
+        }
+        if error is not None:
+            fields["error_type"] = type(error).__name__
+        logger.info("bedrock_blocking_phase", **fields)
+
+    @staticmethod
+    def _close_resources(resources: tuple[object, ...], *, event: str) -> str | None:
+        first_error: str | None = None
+        unique = {id(resource): resource for resource in resources if resource is not None}
+        for resource in unique.values():
+            close = getattr(resource, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = type(exc).__name__
+                logger.warning(event, error_type=type(exc).__name__)
+        return first_error
+
+    def _converse_with_client(
+        self,
+        client: Any,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        *,
+        deadline: float | None = None,
+        retry_client_factory: Callable[[], Any] | None = None,
+    ) -> LLMResult:
+        with self._model_lock:
+            model_id = self._model_id
+        kwargs = self._build_converse_kwargs(
+            system_prompt,
+            user_prompt,
+            temperature,
+            model_id=model_id,
+        )
+        _remaining_operation_timeout(self._settings, deadline)
+        profile_id: str | None = None
+        try:
+            response = client.converse(**kwargs)
+        except Exception as exc:
+            profile_id = self._profile_retry_id(exc, model_id=model_id)
+            if profile_id is None or retry_client_factory is None:
+                raise
+            _remaining_operation_timeout(self._settings, deadline)
+            logger.warning("bedrock_model_retry_with_profile", bare=model_id, profile=profile_id)
+            kwargs["modelId"] = profile_id
+            response = retry_client_factory().converse(**kwargs)
+        _remaining_operation_timeout(self._settings, deadline)
+        if profile_id is not None:
+            with self._model_lock:
+                if self._model_id == model_id:
+                    self._model_id = profile_id
+            logger.info("bedrock_model_updated", model_id=profile_id)
+        output = response.get("output", {})
+        message = output.get("message", {})
+        content_blocks = message.get("content", [])
+        text_parts = [block["text"] for block in content_blocks if "text" in block]
+        result = LLMResult(text="".join(text_parts), usage=self._extract_usage(response))
+        _remaining_operation_timeout(self._settings, deadline)
+        return result
+
+    def _profile_retry_id(self, exc: Exception, *, model_id: str | None = None) -> str | None:
+        if type(exc).__name__ != "ValidationException":
+            return None
+        if model_id is None:
+            with self._model_lock:
+                model_id = self._model_id
+        if model_id.startswith(_INFERENCE_PROFILE_PREFIXES):
+            return None
+        reason = _validation_error_message(exc).casefold()
+        if _ON_DEMAND_THROUGHPUT_REASON not in reason or _INFERENCE_PROFILE_REASON not in reason:
+            return None
+        return _inference_profile_id(model_id, self._settings.llm_bedrock_region)
+
+    def _should_retry_with_profile(self, exc: Exception, *, model_id: str | None = None) -> bool:
+        return self._profile_retry_id(exc, model_id=model_id) is not None
+
+    def _execute_converse_operation(
         self,
         system_prompt: str,
         user_prompt: str,
         temperature: float,
+        *,
+        deadline: float,
     ) -> LLMResult:
-        """Call Bedrock Converse API (sync — wrapped async by callers).
-
-        If the bare model ID fails with a ValidationException (common for
-        models that require inference profiles, e.g. Sonnet 4 in us-east-1),
-        automatically retries with a region-appropriate inference profile ID
-        and caches the working ID for subsequent calls.
-        """
-        client = self._ensure_client()
-        kwargs = self._build_converse_kwargs(system_prompt, user_prompt, temperature)
-
+        resolved_runtime: _ResolvedBedrockRuntime | None = None
+        clients: list[object] = []
+        operation_error: BaseException | None = None
         try:
-            response = client.converse(**kwargs)
-        except Exception as exc:
-            if not self._should_retry_with_profile(exc):
+            phase_started = time.monotonic()
+            try:
+                operation_plan = self._credential_plan.capture_operation_generation()
+                resolved_runtime = self._validate_runtime_generation(
+                    _build_boto3_session(
+                        credential_plan=operation_plan,
+                        deadline=deadline,
+                    ),
+                    operation_plan=operation_plan,
+                )
+            except BaseException as exc:
+                self._observe_phase("credential_realization", phase_started, error=exc)
                 raise
-            # Retry with inference profile
-            profile_id = _inference_profile_id(self._model_id, self._settings.llm_bedrock_region)
-            logger.warning("bedrock_model_retry_with_profile", bare=self._model_id, profile=profile_id)
-            kwargs["modelId"] = profile_id
-            response = client.converse(**kwargs)
-            # Success — cache the working profile ID for future calls
-            self._model_id = profile_id
-            logger.info("bedrock_model_updated", model_id=profile_id)
+            self._observe_phase("credential_realization", phase_started)
 
-        # Extract text from the response
-        output = response.get("output", {})
-        message = output.get("message", {})
-        content_blocks = message.get("content", [])
-        text_parts = [b["text"] for b in content_blocks if "text" in b]
-        return LLMResult(text="".join(text_parts), usage=self._extract_usage(response))
+            phase_started = time.monotonic()
+            try:
+                client = resolved_runtime.session.client(
+                    "bedrock-runtime",
+                    endpoint_url=canonical_bedrock_runtime_endpoint(self._settings.llm_bedrock_region),
+                    config=_bedrock_client_config(self._settings, deadline=deadline),
+                    verify=True,
+                )
+                clients.append(client)
+            except BaseException as exc:
+                self._observe_phase("client_construction", phase_started, error=exc)
+                raise
+            self._observe_phase("client_construction", phase_started)
 
-    def _should_retry_with_profile(self, exc: Exception) -> bool:
-        """Return True if the exception indicates the model needs an inference
-        profile and the current model ID is a bare (non-prefixed) ID."""
-        if type(exc).__name__ != "ValidationException":
-            return False
-        # Already an inference profile ID — don't double-prefix
-        if self._model_id.startswith(_INFERENCE_PROFILE_PREFIXES):
-            return False
-        return True
+            def build_retry_client() -> object:
+                retry_started = time.monotonic()
+                try:
+                    retry_client = resolved_runtime.session.client(
+                        "bedrock-runtime",
+                        endpoint_url=canonical_bedrock_runtime_endpoint(self._settings.llm_bedrock_region),
+                        config=_bedrock_client_config(self._settings, deadline=deadline),
+                        verify=True,
+                    )
+                    clients.append(retry_client)
+                except BaseException as exc:
+                    self._observe_phase("client_reconstruction", retry_started, error=exc)
+                    raise
+                self._observe_phase("client_reconstruction", retry_started)
+                return retry_client
+
+            phase_started = time.monotonic()
+            try:
+                result = self._converse_with_client(
+                    client,
+                    system_prompt,
+                    user_prompt,
+                    temperature,
+                    deadline=deadline,
+                    retry_client_factory=build_retry_client,
+                )
+            except BaseException as exc:
+                self._observe_phase("converse", phase_started, error=exc)
+                raise
+            self._observe_phase("converse", phase_started)
+            return result
+        except BaseException as exc:
+            operation_error = exc
+            raise
+        finally:
+            cleanup_started = time.monotonic()
+            credential_clients = resolved_runtime.credential_clients if resolved_runtime is not None else ()
+            session = resolved_runtime.session if resolved_runtime is not None else None
+            cleanup_error = self._close_resources(
+                (*clients, *credential_clients, session),
+                event="bedrock_operation_cleanup_failed",
+            )
+            cleanup_exception = (
+                terminal_cleanup_failure(
+                    operation_error,
+                    cleanup_error,
+                    reason_code="bedrock_operation_cleanup_failed",
+                    message="AWS Bedrock operation cleanup failed",
+                    retain_capacity=True,
+                )
+                if cleanup_error is not None
+                else None
+            )
+            self._observe_phase("cleanup", cleanup_started, error=cleanup_exception)
+            if cleanup_exception is not None:
+                raise cleanup_exception
 
     async def chat_json(
         self,
@@ -594,7 +984,7 @@ class BedrockProvider(LLMProvider):
         temperature: float = 0.2,
     ) -> LLMResult:
         system = f"{system_prompt}\n\n" "Respond ONLY with a valid JSON object. No markdown, no explanation."
-        result = await asyncio.to_thread(self._converse, system, user_prompt, temperature)
+        result = await self._run_converse(system, user_prompt, temperature)
         logger.debug("bedrock_raw", raw=result.text[:500])
         return result
 
@@ -604,28 +994,36 @@ class BedrockProvider(LLMProvider):
         user_prompt: str,
         temperature: float = 0.3,
     ) -> LLMResult:
-        return await asyncio.to_thread(self._converse, system_prompt, user_prompt, temperature)
+        return await self._run_converse(system_prompt, user_prompt, temperature)
+
+    async def _run_converse(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+    ) -> LLMResult:
+        if self._closed.is_set():
+            raise RuntimeOwnershipError("AWS Bedrock provider is closed")
+        deadline = current_pipeline_execution_deadline()
+        if deadline is None:
+            deadline = time.monotonic() + float(self._settings.pipeline_timeout_seconds)
+        return await self._run_owned(
+            lambda: self._execute_converse_operation(
+                system_prompt,
+                user_prompt,
+                temperature,
+                deadline=deadline,
+            ),
+            reason_code="bedrock_request_worker_retained",
+            deadline=deadline,
+        )
 
     async def close(self) -> None:
-        with self._client_lock:
-            client = self._client
-            self._client = None
-            resources = [client, *self._credential_clients]
-            self._credential_clients = []
+        """Reject future calls; in-flight workers own their own cleanup."""
+        self._closed.set()
 
-        async def close_resource(resource: object) -> BaseException | None:
-            close = getattr(resource, "close", None)
-            if close is None:
-                return None
-            try:
-                await asyncio.to_thread(close)
-            except BaseException as exc:
-                return exc
-            return None
-
-        results = await asyncio.gather(
-            *(close_resource(resource) for resource in resources if resource is not None),
-        )
-        for result in results:
-            if result is not None:
-                raise result
+    def close_blocking(self) -> None:
+        """Close an unmanaged provider without bypassing a bound runtime owner."""
+        if getattr(self, "_lifecycle_invocation_owner", None) is not None:
+            raise RuntimeOwnershipError("Managed LLM providers can only be closed by their runtime owner")
+        self._closed.set()

@@ -11,7 +11,10 @@ permissions:
 # The one-time full reachable-history Gitleaks baseline was scanned clean with
 # the pinned image below before incremental event ranges were enabled.
 env:
+  ACTIONLINT_VERSION: "1.7.12"
+  ACTIONLINT_LINUX_AMD64_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
   GITLEAKS_HISTORY_BASELINE_SHA: "4085160a63125ae764cc2f0e6aa170f4ac0dd4d1"
+  MAX_RELEASE_IMAGE_ARCHIVE_BYTES: "1073741824"
 
 jobs:
   lint:
@@ -25,7 +28,22 @@ jobs:
           version: "0.12.1"
           checksum: "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
           python-version: "3.12.13"
-      - run: uv sync --all-extras --dev
+      - name: Actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_LINUX_AMD64_SHA256" "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          # GitHub supports concurrency.queue, but actionlint 1.7.12 has not
+          # added that schema key yet. Keep this exception exact and singular.
+          "$RUNNER_TEMP/actionlint" \
+            -ignore 'unexpected key "queue" for "concurrency" section' \
+            .github/workflows/*.yml
+      - run: uv sync --locked --all-extras --dev
       - name: Ruff
         run: uv run ruff check .
       - name: Black
@@ -44,9 +62,35 @@ jobs:
           version: "0.12.1"
           checksum: "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
           python-version: "3.12.13"
-      - run: uv sync --all-extras --dev
+      - run: uv sync --locked --all-extras --dev
       - name: Hermetic test suite
         run: uv run pytest -vv
+
+  provider-sdk-lower-bounds:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.12.1"
+          checksum: "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
+          python-version: "3.12.13"
+      - name: Exercise declared provider SDK floors
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --locked --all-extras --dev
+          uv pip install \
+            --python .venv/bin/python \
+            --no-deps \
+            --only-binary :all: \
+            "anthropic==0.100.0" \
+            "openai==2.34.0"
+          TACIT_SDK_LOWER_BOUND_CONTRACT=1 \
+            .venv/bin/python -m pytest -q tests/unit/test_provider_sdk_lower_bounds.py
 
   integration:
     runs-on: ubuntu-24.04
@@ -60,7 +104,7 @@ jobs:
           version: "0.12.1"
           checksum: "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
           python-version: "3.12.13"
-      - run: uv sync --all-extras --dev
+      - run: uv sync --locked --all-extras --dev
       - name: Hermetic vendor contract tests
         run: uv run pytest tests/integration -m integration -vv
       - name: Generated vendor contract smoke test
@@ -87,7 +131,7 @@ jobs:
           version: "0.12.1"
           checksum: "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
           python-version: "3.12.13"
-      - run: uv sync --all-extras --dev
+      - run: uv sync --locked --all-extras --dev
       - name: Install browser runtime
         run: uv run playwright install --with-deps chromium
       - name: Hermetic end-to-end workflows
@@ -95,12 +139,68 @@ jobs:
 
   docker:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
+    env:
+      IMAGE_ARCHIVE: /tmp/tacit-ci-${{ matrix.arch }}.tar
+      IMAGE_REF: tacit:ci-${{ github.sha }}-${{ matrix.arch }}
+      PLATFORM: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Build Docker image
-        run: docker build -t tacit:ci .
+      - if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          image: tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+      - name: Create pinned BuildKit builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx create \
+            --name "tacit-ci-builder-${{ matrix.arch }}" \
+            --driver docker-container \
+            --driver-opt image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8 \
+            --use
+          docker buildx inspect --bootstrap
+      - name: Build bounded ${{ matrix.platform }} image archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --pull \
+            --platform "$PLATFORM" \
+            --tag "$IMAGE_REF" \
+            --output "type=docker,dest=${IMAGE_ARCHIVE}" \
+            .
+          python .github/scripts/release_image_archive.py write \
+            --archive "$IMAGE_ARCHIVE" \
+            --checksum "${IMAGE_ARCHIVE}.sha256" \
+            --max-bytes "$MAX_RELEASE_IMAGE_ARCHIVE_BYTES"
+      - name: Execute ${{ matrix.platform }} image archive
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          python .github/scripts/smoke_release_image.py \
+            --archive "$IMAGE_ARCHIVE" \
+            --checksum "${IMAGE_ARCHIVE}.sha256" \
+            --image "$IMAGE_REF" \
+            --platform "$PLATFORM" \
+            --expected-version "$package_version" \
+            --max-archive-bytes "$MAX_RELEASE_IMAGE_ARCHIVE_BYTES" \
+            --command-timeout 45 \
+            --startup-timeout 60 \
+            --cleanup-timeout 15
 
   secret-scan:
     runs-on: ubuntu-24.04

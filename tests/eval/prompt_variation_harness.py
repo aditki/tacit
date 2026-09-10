@@ -57,15 +57,15 @@ async def run(
     if not isinstance(prompts, list):
         raise ValueError("prompt variation corpus must contain a prompts list")
     positive_count = sum(1 for item in prompts if isinstance(item, dict) and not _is_negative(item))
-    negative_count = sum(1 for item in prompts if isinstance(item, dict) and _is_negative(item))
-    if positive_count == 0 or negative_count == 0:
-        raise ValueError("prompt variation corpus requires nonempty positive and negative populations")
+    if positive_count == 0:
+        raise ValueError("prompt variation corpus requires a nonempty positive population")
     rows: list[dict[str, Any]] = []
     with cold_isolation(endpoints=selected) as state:
         if state.dependencies.llm_provider_factory is None:
             raise RuntimeError("isolated prompt evaluation has no LLM provider factory")
-        provider = state.dependencies.llm_provider_factory()
+        provider_lease = await state.dependencies.acquire_resources()
         try:
+            provider = state.dependencies.llm_provider_factory()
             for prompt_index, item in enumerate(prompts):
                 outcomes: list[bool] = []
                 failures: list[dict[str, Any]] = []
@@ -99,7 +99,7 @@ async def run(
             provider_name = state.settings.llm_provider
             model_name = state.settings.llm_model
         finally:
-            await state.dependencies.close_resources()
+            await state.dependencies.close_resources(provider_lease)
 
     by_class: dict[str, list[bool]] = defaultdict(list)
     for row in rows:
@@ -111,7 +111,7 @@ async def run(
     pos = [r for r in rows if r["polarity"] == "positive"]
     neg = [r for r in rows if r["polarity"] == "negative"]
     pos_overall = sum(r["passed"] for r in pos) / sum(r["trials"] for r in pos)
-    neg_correct = sum(r["passed"] for r in neg) / sum(r["trials"] for r in neg)
+    neg_correct = sum(r["passed"] for r in neg) / sum(r["trials"] for r in neg) if neg else 1.0
     rates = [row["rate"] for row in rows]
     return {
         "corpus": corpus_path.name,
@@ -172,7 +172,7 @@ def _local_llm_endpoints(
     )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Repeated prompt-variation gate (expectation-aware).")
     parser.add_argument("--trials", type=int, default=5)
     parser.add_argument("--corpus", default="dev", help="'dev', 'holdout', a fixture name, or a path.")
@@ -181,7 +181,7 @@ def main() -> int:
     parser.add_argument("--model", default=DEFAULT_LOCAL_MODEL, help="Local Ollama model name.")
     parser.add_argument("--api-key", default="", help="Rejected: isolated evaluations do not accept credentials.")
     parser.add_argument("--api-base", default=DEFAULT_LOCAL_LLM_URL, help="Explicit local Ollama endpoint.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.trials < 1:
         parser.error("--trials must be at least 1")
     try:

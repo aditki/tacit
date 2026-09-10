@@ -144,7 +144,7 @@ to the configured model or deployment.
 | Anthropic | `LLM_PROVIDER=anthropic`, `LLM_API_KEY`, `LLM_MODEL` | API key allowed to call the configured model via Messages API |
 | OpenAI | `LLM_PROVIDER=openai`, `LLM_API_KEY`, `LLM_MODEL`, optional `LLM_API_BASE` | project/API key allowed to call the configured chat model |
 | Azure OpenAI | `LLM_PROVIDER=azure`, `LLM_API_KEY`, `LLM_API_BASE`, `LLM_AZURE_DEPLOYMENT`, `LLM_AZURE_API_VERSION` | Azure OpenAI resource key with inference access to the configured deployment |
-| AWS Bedrock | `LLM_PROVIDER=bedrock`, region/model settings, optional role ARN | `bedrock:Converse` for the configured model or inference profile; `bedrock:ListFoundationModels` if relying on model-name auto-resolution; `sts:AssumeRole` when `LLM_BEDROCK_ROLE_ARN` is set |
+| AWS Bedrock | `LLM_PROVIDER=bedrock`, region/model settings, optional role ARN | `bedrock:InvokeModel` for the configured model or inference profile; `sts:AssumeRole` when `LLM_BEDROCK_ROLE_ARN` is set |
 | Ollama | `LLM_PROVIDER=ollama`, optional `LLM_API_BASE` | network access to the local or private Ollama `/api/chat` endpoint |
 
 Bedrock runtime ownership currently admits explicit keys, static AWS
@@ -154,9 +154,17 @@ container-metadata, instance-metadata, and other unmodeled providers are
 rejected before SDK construction so they cannot introduce undeclared local or
 remote authority.
 
-For `tacit doctor` with Bedrock, the current check also calls AWS STS
-`GetCallerIdentity`. Grant `sts:GetCallerIdentity` to the checking principal if
-you want the doctor check to pass.
+For `tacit doctor` with Bedrock, Tacit sends one real, bounded `Converse`
+request to the configured model. The SDK uses a 15-second best-effort operation
+deadline, but a non-interruptible transport call or its cleanup may take longer
+to settle. The check may incur a small inference charge and requires the same
+model access and `bedrock:InvokeModel` permission as production. It does not call STS
+`GetCallerIdentity`; `sts:AssumeRole` is required only when the configured
+credential plan assumes a role.
+
+Bedrock authorizes the non-streaming `Converse` API with
+`bedrock:InvokeModel`. A future streaming integration using `ConverseStream`
+would additionally require `bedrock:InvokeModelWithResponseStream`.
 
 ## Optional context providers
 

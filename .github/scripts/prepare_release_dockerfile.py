@@ -12,10 +12,11 @@ MAX_DOCKERFILE_BYTES = 1024 * 1024
 UV_SYNC = "RUN uv sync"
 DETERMINISTIC_UV_SYNC = "RUN UV_NO_CACHE=1 UV_LINK_MODE=copy uv sync"
 FINAL_PROJECT_SYNC = (
-    "RUN uv sync --frozen --no-dev \\\n" "    && find /app -type d -name __pycache__ -prune -exec rm -rf {} +\n"
+    "RUN uv sync --locked --no-dev --extra bedrock \\\n"
+    "    && find /app -type d -name __pycache__ -prune -exec rm -rf {} +\n"
 )
 DETERMINISTIC_FINAL_PROJECT_SYNC = (
-    "RUN uv sync --frozen --no-dev \\\n"
+    "RUN uv sync --locked --no-dev --extra bedrock \\\n"
     "    && find /app/.venv -type f -path "
     "'*/tacit_ai-*.dist-info/RECORD' -exec sed -i '/uv_cache\\.json,/d' {} + \\\n"
     "    && find /app/.venv -type f -path "

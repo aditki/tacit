@@ -319,24 +319,23 @@ def spec_metrics(spec: DashboardSpec) -> set[str]:
 
 
 def fuzzy_match(expected: set[str], found: set[str]) -> set[str]:
-    matched: set[str] = set()
-    for exp in expected:
-        for fnd in found:
-            if exp == fnd or exp in fnd or fnd in exp:
-                matched.add(exp)
-                break
-    return matched
+    from tests.eval.metric_matching import match_metric_sets
+
+    return set(match_metric_sets(expected, found))
 
 
 def evaluate_incident(spec: DashboardSpec, case: IncidentPromptCase) -> IncidentEvaluation:
+    from tests.eval.metric_matching import match_metric_sets
+
     found = spec_metrics(spec)
     expected = set(case.expected_metrics)
     critical = set(case.critical_metrics)
-    matched = fuzzy_match(expected, found)
+    metric_matches = match_metric_sets(expected, found)
+    matched = set(metric_matches)
     critical_found = fuzzy_match(critical, found)
     metric_recall = len(matched) / len(expected) if expected else 1.0
     critical_recall = len(critical_found) / len(critical) if critical else metric_recall
-    signal_to_noise = len(matched) / len(found) if found else 0.0
+    signal_to_noise = len(set(metric_matches.values())) / len(found) if found else 0.0
     panel_score = min(len(spec.panels) / 6, 1.0)
     usefulness_score = (
         (0.45 * critical_recall) + (0.30 * metric_recall) + (0.15 * signal_to_noise) + (0.10 * panel_score)

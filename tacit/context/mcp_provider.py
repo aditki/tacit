@@ -37,6 +37,7 @@ class MCPProvider(ContextProvider):
             base_url=self._server_url,
             headers=headers,
             timeout=30.0,
+            trust_env=False,
         )
 
     async def query(

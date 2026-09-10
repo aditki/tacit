@@ -13,9 +13,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Never
+from typing import TYPE_CHECKING, Any, Never
 
 import structlog
+
+if TYPE_CHECKING:
+    from tacit.signals.store import SignalStore
 
 from tacit.config import Settings, settings
 from tacit.errors import RuntimeOwnershipError, safe_failure_diagnostics
@@ -47,6 +50,8 @@ from tacit.pagination import decode_cursor, encode_cursor
 from tacit.runtime_ownership import (
     RuntimeDatabaseIdentity,
     RuntimeOwnershipDescriptor,
+    require_compatible_runtime_ownership,
+    runtime_descriptor_for_store,
     runtime_descriptor_from_settings,
     snapshot_runtime_settings,
 )
@@ -62,10 +67,12 @@ from tacit.signals.migrations import (
 )
 from tacit.signals.schema import SQLITE_BUSY_TIMEOUT_MS
 from tacit.sqlite_identity import (
+    SQLiteAuthorityReadinessAdmission,
     SQLiteDatabaseTarget,
     activate_sqlite_wal,
     claim_sqlite_database_identity,
     require_sqlite_database_identity,
+    runtime_sqlite_snapshot_max_bytes,
     sqlite_database_path,
 )
 
@@ -730,10 +737,46 @@ class KnowledgeRepository:
         db_path: Path | None = None,
         *,
         runtime_settings: Settings | None = None,
+        sqlite_snapshot_max_bytes: int | None = None,
+        signal_store: SignalStore | None = None,
     ):
-        selected_path = db_path if db_path is not None else _db_path()
+        settings_owner = runtime_settings or (signal_store.runtime_settings if signal_store is not None else settings)
+        selected_path = (
+            db_path if db_path is not None else signal_store.database_path if signal_store is not None else _db_path()
+        )
         self._db_path = sqlite_database_path(selected_path)
-        self._sqlite_target = SQLiteDatabaseTarget(self._db_path)
+        configured_snapshot_max_bytes = runtime_sqlite_snapshot_max_bytes(
+            settings_owner,
+            sqlite_snapshot_max_bytes,
+        )
+        configured_owner = str(settings_owner.knowledge_tenant_id or "default")
+        shared_admission: SQLiteAuthorityReadinessAdmission | None = None
+        if signal_store is not None:
+            expected_store_owner = runtime_descriptor_for_store(
+                component="knowledge_repository_expected_signal_store",
+                runtime_settings=settings_owner,
+                database_role="signals",
+                database_path=self._db_path,
+            )
+            require_compatible_runtime_ownership(
+                boundary="knowledge repository signal readiness admission",
+                descriptors=(expected_store_owner, signal_store.runtime_ownership),
+            )
+            shared_admission = signal_store.sqlite_readiness_admission
+            self._sqlite_target = shared_admission.require_target(
+                path=self._db_path,
+                role="signals",
+                tenant_owner=configured_owner,
+            )
+            if self._sqlite_target.snapshot_max_bytes != configured_snapshot_max_bytes:
+                raise RuntimeOwnershipError("SQLite readiness admission capacity mismatch")
+        else:
+            self._sqlite_target = SQLiteDatabaseTarget(
+                self._db_path,
+                admission_role="knowledge",
+                snapshot_max_bytes=configured_snapshot_max_bytes,
+            )
+        self._sqlite_readiness_admission = shared_admission
         self._transaction_connection: ContextVar[sqlite3.Connection | None] = ContextVar(
             f"knowledge_transaction_{id(self)}",
             default=None,
@@ -742,10 +785,13 @@ class KnowledgeRepository:
             f"knowledge_write_lock_{id(self)}",
             default=False,
         )
-        self._database_id: str | None = None
-        self._database_had_schema = False
-        configured_owner = str(runtime_settings.knowledge_tenant_id or "default") if runtime_settings else "default"
-        recorded_owner = self._read_existing_tenant_owner(configured_owner)
+        self._database_id: str | None = shared_admission.database_id if shared_admission is not None else None
+        self._database_had_schema = shared_admission is not None
+        recorded_owner = (
+            shared_admission.tenant_owner
+            if shared_admission is not None
+            else self._read_existing_tenant_owner(configured_owner)
+        )
         if runtime_settings is not None and recorded_owner is not None and recorded_owner != configured_owner:
             self._reject_owner(
                 reason_code="pinned_owner_mismatch",
@@ -753,12 +799,16 @@ class KnowledgeRepository:
                 recorded_owner=recorded_owner,
             )
         self._tenant_owner = recorded_owner or configured_owner
-        owner_settings = runtime_settings or settings.model_copy(
-            update={
-                "knowledge_tenant_id": self._tenant_owner,
-                "api_auth_enabled": bool(settings.api_auth_enabled or self._tenant_owner == "*"),
-                "signals_db_path": str(self._db_path),
-            }
+        owner_settings = (
+            settings_owner
+            if runtime_settings is not None or signal_store is not None
+            else settings.model_copy(
+                update={
+                    "knowledge_tenant_id": self._tenant_owner,
+                    "api_auth_enabled": bool(settings.api_auth_enabled or self._tenant_owner == "*"),
+                    "signals_db_path": str(self._db_path),
+                }
+            )
         )
         if str(owner_settings.knowledge_tenant_id or "default") != self._tenant_owner:
             owner_settings = owner_settings.model_copy(
@@ -772,7 +822,9 @@ class KnowledgeRepository:
             database_role="signals",
             database_path=self._db_path,
         )
-        if recorded_owner is None and not self._database_had_schema:
+        if shared_admission is not None:
+            self._ensure_schema()
+        elif recorded_owner is None and not self._database_had_schema:
             self._initialize_pristine_schema()
         else:
             self._initialize_signal_owner(owner_settings)
@@ -814,6 +866,11 @@ class KnowledgeRepository:
     def tenant_owner(self) -> str:
         """Return the immutable signal-database tenant owner capability."""
         return self._tenant_owner
+
+    @property
+    def sqlite_readiness_admission(self) -> SQLiteAuthorityReadinessAdmission | None:
+        """Return the reused Signals admission when this repository is runtime composed."""
+        return self._sqlite_readiness_admission
 
     @property
     def runtime_ownership(self) -> RuntimeOwnershipDescriptor:

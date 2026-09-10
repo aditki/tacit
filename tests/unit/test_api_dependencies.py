@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from fastapi import HTTPException, Request
@@ -893,7 +895,8 @@ def test_ownerless_realized_pipeline_store_fails_before_use(tmp_path, role: str)
         getattr(dependencies, field)()
 
 
-def test_isolated_dependencies_install_explicit_settings_bound_provider_factories(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_isolated_dependencies_install_explicit_settings_bound_provider_factories(tmp_path, monkeypatch):
     def forbidden_context_registry(_settings):
         raise AssertionError("disabled context consulted the provider registry")
 
@@ -913,9 +916,52 @@ def test_isolated_dependencies_install_explicit_settings_bound_provider_factorie
         cache_key_factory=lambda *parts: ":".join(parts),
     )
 
-    assert dependencies.llm_provider_factory is not None
-    assert dependencies.context_provider_factory is not None
-    assert dependencies.context_provider_factory() is None
+    try:
+        assert dependencies.llm_provider_factory is not None
+        assert dependencies.context_provider_factory is not None
+        assert dependencies.context_provider_factory() is None
+    finally:
+        assert dependencies.resource_cleanup is not None
+        await dependencies.resource_cleanup()
+
+
+def test_api_request_bundles_share_the_runtime_provider_resource(tmp_path) -> None:
+    from tacit.runtime_stores import RuntimeStores
+
+    runtime_settings = Settings(
+        _env_file=None,
+        llm_provider="ollama",
+        llm_api_base="http://127.0.0.1:11434",
+        context_provider="none",
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    stores = RuntimeStores(runtime_settings)
+    request = Request(
+        {
+            "type": "http",
+            "app": SimpleNamespace(
+                state=SimpleNamespace(
+                    settings=runtime_settings,
+                    runtime_stores=stores,
+                )
+            ),
+            "headers": [],
+        }
+    )
+
+    first = get_pipeline_dependencies(request)
+    second = get_pipeline_dependencies(request)
+
+    assert first is not second
+    assert first.pipeline_admission is second.pipeline_admission
+    assert first.resource_acquire is not None
+    assert second.resource_acquire is not None
+    assert first.resource_acquire.__self__ is second.resource_acquire.__self__
+    assert first.resource_cleanup is not None
+    assert second.resource_cleanup is not None
+    assert first.resource_cleanup.__self__ is second.resource_cleanup.__self__
 
 
 @pytest.mark.parametrize(
@@ -1074,7 +1120,8 @@ async def test_isolated_dependency_rejects_an_ownerless_llm_provider_before_agen
         await dependencies.acquire_resources()
 
 
-def test_isolated_dependency_rejects_a_mismatched_context_provider_before_query(tmp_path):
+@pytest.mark.asyncio
+async def test_isolated_dependency_rejects_a_mismatched_context_provider_before_query(tmp_path):
     active_settings = Settings(
         _env_file=None,
         context_provider="mcp",
@@ -1109,11 +1156,14 @@ def test_isolated_dependency_rejects_a_mismatched_context_provider_before_query(
         context_provider_factory=lambda: probe,
     )
 
-    assert dependencies.context_provider_factory is not None
-    with pytest.raises(RuntimeOwnershipError, match="runtime ownership mismatch"):
-        dependencies.context_provider_factory()
+    try:
+        assert dependencies.context_provider_factory is not None
+        with pytest.raises(RuntimeOwnershipError, match="runtime ownership mismatch"):
+            await asyncio.to_thread(dependencies.context_provider_factory)
 
-    assert probe.calls == 0
+        assert probe.calls == 0
+    finally:
+        await dependencies.resource_cleanup()
 
 
 def test_pipeline_knowledge_uses_descriptor_only_signal_store_without_global_fallback(
@@ -1130,13 +1180,12 @@ def test_pipeline_knowledge_uses_descriptor_only_signal_store_without_global_fal
 
     class DescriptorOnlySignalStore:
         def __init__(self):
-            self.runtime_settings = runtime_settings
-            self.runtime_ownership = runtime_descriptor_for_store(
-                component="descriptor-only-signal-store",
-                runtime_settings=runtime_settings,
-                database_role="signals",
-                database_path=database_path,
-            )
+            from tacit.signals.store import SignalStore
+
+            self.delegate = SignalStore(database_path, runtime_settings=runtime_settings)
+            self.runtime_settings = self.delegate.runtime_settings
+            self.runtime_ownership = self.delegate.runtime_ownership
+            self.sqlite_readiness_admission = self.delegate.sqlite_readiness_admission
 
         def __getattr__(self, name: str):
             if name == "database_path":
@@ -1144,7 +1193,7 @@ def test_pipeline_knowledge_uses_descriptor_only_signal_store_without_global_fal
             if name.startswith("_"):
                 private_accesses.append(name)
                 raise AssertionError(f"private ownership probe: {name}")
-            raise AttributeError(name)
+            return getattr(self.delegate, name)
 
     injected = DescriptorOnlySignalStore()
 
@@ -1166,15 +1215,14 @@ def test_pipeline_knowledge_uses_descriptor_only_signal_store_without_global_fal
     assert dependencies.knowledge_service_factory is not None
 
     factory_service = dependencies.knowledge_service_factory()
-    direct_dependencies = _isolated_dependencies(
-        settings=runtime_settings,
-        backend_factory=lambda: [],
-        history_store_factory=lambda: object(),
-        feedback_store_factory=lambda: object(),
-        signal_store_factory=lambda: injected,
-        knowledge_service_factory=None,
-        llm_cache={},
-        cache_key_factory=lambda *parts: ":".join(parts),
+    direct_dependencies = cast(
+        PipelineDependencies,
+        SimpleNamespace(
+            settings=runtime_settings,
+            history_store_factory=lambda: object(),
+            signal_store_factory=lambda: injected,
+            knowledge_service_factory=None,
+        ),
     )
     direct_service = resolve_knowledge_service(direct_dependencies, signal_store=injected)
 

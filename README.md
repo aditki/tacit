@@ -80,8 +80,8 @@ uv run tacit demo
 
 `tacit demo` boots the local Grafana + Prometheus + fake checkout-metrics
 stack, teaches Tacit from a known-good incident dashboard, generates a fresh
-investigation dashboard from a plain-English incident prompt, and opens it in
-your browser.
+investigation dashboard from a plain-English incident prompt, and opens both
+the authenticated Tacit UI and dashboard in your browser.
 
 No LLM API key is required: in zero-key mode Tacit classifies the incident
 deterministically and compiles the dashboard through the archetype engine.
@@ -103,8 +103,16 @@ Start the API and Web UI:
 uv run tacit serve
 ```
 
-No uv? `pip install -e .` works too, and prebuilt binaries ship with each
+No uv? `pip install -e .` works too.
+Only the Linux x86_64 frozen binary is published with each
 [release](https://github.com/aditki/tacit/releases).
+That generic binary supports glibc-based Linux distributions with glibc 2.35
+or newer; it is built and smoke-tested on Ubuntu 22.04, the minimum supported
+baseline. Alpine and other musl-based systems should use the wheel, source, or
+container image instead.
+macOS users install with `pip` or from source until a dedicated Developer ID
+signing and notarization release gate lands. Windows binaries are not published
+while protected runtime storage requires POSIX filesystem controls.
 
 Open:
 
@@ -144,11 +152,17 @@ first), `--json` for machine-readable output, and share results safely with
 Run Tacit with the local Grafana, Prometheus, and fake checkout metrics stack:
 
 ```bash
+export API_AUTH_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 docker compose -f docker-compose.dev.yml up -d
 ```
 
 The demo stack is local-only. It intentionally uses unsafe Grafana defaults so
-the demo works without setup friction. Do not expose it outside your machine.
+the demo works without setup friction. Tacit itself is authenticated, its host
+port is published on loopback, and `tacit demo` creates an ephemeral API key
+automatically. The command hands that key to the loopback UI without printing it
+or placing it in the browser URL; the UI keeps it only for that browser session.
+Direct Compose users must provide `API_AUTH_KEY` and enter it in the Web UI.
+Do not expose the stack outside your machine.
 
 ## Connect Grafana
 
@@ -275,7 +289,18 @@ For non-local deployments, enable Tacit's API key auth:
 ```bash
 API_AUTH_ENABLED=true
 API_AUTH_KEY=<strong-token>
+API_ALLOWED_HOSTS=tacit.example.com
+tacit serve --host 0.0.0.0
 ```
+
+`tacit serve` and `python -m tacit.main` bind to loopback by default. A
+non-loopback `--host` is rejected unless authentication is enabled and
+`API_ALLOWED_HOSTS` was explicitly configured with a compatible exact host or
+subdomain pattern. The Docker image uses that same CLI boundary and fails safe
+when its required runtime key or Host policy is missing.
+Its readiness probe connects over loopback while sending a Host value selected
+from `API_ALLOWED_HOSTS`, so an external-only allowlist does not require a
+loopback exception.
 
 All deployments deny cross-origin browser requests by default. If a separate
 web origin must call Tacit, configure exact origins. Authenticated deployments
@@ -292,6 +317,24 @@ it to Tacit's persistent application storage.
 
 Tacit rejects oversized HTTP bodies before JSON parsing. The default limit is
 2 MiB and can be changed with `API_MAX_REQUEST_BODY_BYTES` (1 KiB to 64 MiB).
+`API_REQUEST_BODY_MAX_CONCURRENT` (16 by default) and
+`API_REQUEST_BODY_MAX_BUFFERED_BYTES` (512 MiB by default) bound aggregate
+authenticated request and decode memory. Wildcard runtimes additionally use
+`API_REQUEST_BODY_TENANT_MAX_CONCURRENT` and
+`API_REQUEST_BODY_TENANT_MAX_BUFFERED_BYTES`; pinned runtimes retain the full
+global capacity. `API_REQUEST_BODY_MEMORY_AMPLIFICATION_FACTOR` and
+`API_REQUEST_BODY_MEMORY_FLOOR_BYTES` control conservative memory accounting,
+while `API_REQUEST_BODY_READ_TIMEOUT_SECONDS` (15 seconds by default) bounds
+the complete body read. Invalid credentials and tenant headers are rejected
+before body bytes are received or capacity is reserved.
+
+Tacit prepares history, feedback, signals/bootstrap, and Operational Knowledge
+SQLite schemas before the API accepts traffic. Protected read-only admission
+uses a 1 GiB cap per physical database by default; within one database the cap
+is shared across its main/WAL copies and retries. Set
+`SQLITE_SNAPSHOT_MAX_BYTES` to a larger positive value for an admitted database
+that has grown beyond it. A runtime with separate history, feedback, and signals
+files can therefore copy at most three times this value during complete startup.
 
 For an unauthenticated local deployment only, `API_CORS_ALLOWED_ORIGINS=*` is
 an explicit insecure opt-in that lets any website read and invoke the API from
@@ -336,12 +379,64 @@ Tacit supports:
 AWS Bedrock uses IAM instead of an API key. See the configuration examples in
 [tacit.yaml.example](tacit.yaml.example).
 
-For runtime-owned investigations, Bedrock accepts explicit access keys, static
-AWS credential/config profiles, frozen web identity, and one-level assume-role
-profiles backed by a static source profile. Credential-process, SSO/login,
-container-metadata, and instance-metadata providers currently fail closed
-because their executable or remote authority is not yet modeled in Tacit's
-runtime ownership contract.
+Install Tacit's pinned Bedrock SDK support with either:
+
+```bash
+pip install 'tacit-ai[bedrock]'
+# Source checkout:
+uv sync --extra bedrock
+```
+
+Bedrock currently runs through a temporary, operation-scoped Boto3 compatibility
+bridge. It accepts:
+
+- explicit access keys and optional session tokens from Tacit settings or the
+  corresponding AWS environment variables;
+- static AWS credential/config profiles;
+- one-level assume-role profiles backed by a static source profile;
+- a web-identity token that is read and frozen independently for each admitted
+  operation; and
+- one configured role assumption over an accepted base credential source.
+
+Credential-source files are opened without following symlinks and must be
+regular files. Symlink-backed Kubernetes or IRSA projected-token paths may
+therefore fail closed under this temporary bridge. Tacit does not weaken that
+containment boundary by following them.
+
+Credential-process, SSO/login, ECS/container-metadata, and EC2
+instance-metadata providers fail closed because their executable or remote
+authority is not yet modeled in Tacit's runtime ownership contract. An unknown
+`llm_model` value also fails unless `LLM_BEDROCK_MODEL_ID` explicitly names the
+Bedrock model; Tacit does not silently route it to a default Claude model.
+
+Each call creates and disposes its Boto3 session, Bedrock client, and any needed
+STS clients. This avoids sharing blocking SDK resources across async runtimes,
+but it also means extra setup work, no connection pooling, and lower throughput.
+While this bridge is active, `PIPELINE_MAX_CONCURRENT` is capped at 32 per
+runtime identity, so one runtime cannot create an unbounded population of
+blocking SDK workers. A process-wide worker cardinality owner remains a
+separate follow-up in
+[`docs/sync-async-boundary-roadmap.md`](docs/sync-async-boundary-roadmap.md).
+Botocore connect and read timeouts are best effort: Tacit rejects a result that
+arrives after the operation deadline, but keeps admission charged until the
+worker-owned SDK call and cleanup return. The cap bounds worker population, not
+the lifetime of an uninterruptible call. It is a containment bridge rather than
+the target high-throughput design.
+
+The surrounding provider lifecycle is runtime-owned: independently constructed
+API, Slack, CLI, and direct dependency bundles for one runtime share a single
+provider manager and service loop. Explicit leases are reference counted, calls
+drain before final close, application shutdown drains the manager, and cleanup
+failure revokes the generation rather than leaving live capacity behind. This
+does not make noncooperative third-party code force-cancellable or extend the
+same guarantee to stores and backends.
+
+The next changeset replaces the Bedrock bridge with `aiobotocore`, attaching its
+session/client lifecycle to that runtime graph before or while validating
+non-streaming `converse`, then adding `converse_stream`; its
+acceptance criteria and the separately deferred generic-factory, SQLite,
+filesystem/YAML/CPU, cross-loop, and observability/guardrail debt are recorded in
+[ADR-023](docs/adr/023-contain-blocking-bedrock-before-native-async.md).
 
 ## How It Works
 

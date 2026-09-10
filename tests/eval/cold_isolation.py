@@ -29,9 +29,10 @@ import argparse
 import asyncio
 import contextlib
 import os
+import shutil
 import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
@@ -39,11 +40,19 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from tacit.archetypes.generated.schema import ArchetypeRetrievalMode
+from tacit.pipeline_admission import (
+    _LifecycleOwnerStartupError,
+    _start_lifecycle_owner_thread,
+    fence_runtime_root_after_transport_failure,
+    release_runtime_root_with_startup_retry,
+)
 
 DISABLED_LOCAL_ENDPOINT = "http://127.0.0.1:9"
 _COLD_ISOLATION_LOCK = threading.RLock()
 _COLD_ISOLATION_OWNER: tuple[int, int | None] | None = None
 _COLD_ISOLATION_DEPTH = 0
+_COLD_RUNTIME_TRANSPORT_START_ATTEMPTS = 2
+_COLD_RUNTIME_TRANSPORT_COMPLETION_TIMEOUT_SECONDS = 30.0
 
 COLD_ENV_CREDENTIAL_NAMES = (
     "ANTHROPIC_API_KEY",
@@ -208,18 +217,15 @@ def _restore_global_caches(states: tuple[_CacheState, _CacheState]) -> None:
 
 def _reset_caches(scoped_llm_cache: Any | None = None) -> None:
     """Clear metric, compatibility LLM, and optional runtime-owned caches."""
-    try:
-        from tacit.cache import llm_cache, metric_cache
+    from tacit.cache import llm_cache, metric_cache
 
-        metric_cache.invalidate()
-        metric_cache.reset_stats()
-        llm_cache.invalidate()
-        llm_cache.reset_stats()
-        if scoped_llm_cache is not None and scoped_llm_cache is not llm_cache:
-            scoped_llm_cache.invalidate()
-            scoped_llm_cache.reset_stats()
-    except Exception:
-        pass
+    metric_cache.invalidate()
+    metric_cache.reset_stats()
+    llm_cache.invalidate()
+    llm_cache.reset_stats()
+    if scoped_llm_cache is not None and scoped_llm_cache is not llm_cache:
+        scoped_llm_cache.invalidate()
+        scoped_llm_cache.reset_stats()
 
 
 def _default_settings_values(settings_type: Any) -> dict[str, Any]:
@@ -341,7 +347,7 @@ def _evaluation_dependencies(runtime_settings: Any, runtime_stores: Any) -> Any:
     from tacit.runtime_ownership import declare_runtime_factory, runtime_descriptor_for_provider
 
     def local_llm_provider() -> OllamaProvider:
-        return OllamaProvider(runtime_settings=runtime_settings, trust_env=False)
+        return OllamaProvider(runtime_settings=runtime_settings)
 
     def local_backends() -> list[Any]:
         if not runtime_settings.grafana_enabled:
@@ -377,6 +383,112 @@ def _cold_isolation_owner() -> tuple[int, int | None]:
     except RuntimeError:
         task = None
     return threading.get_ident(), id(task) if task is not None else None
+
+
+def _cold_runtime_execution_is_impossible(runtime_stores: Any) -> bool:
+    """Return whether the runtime reached closed terminal zero."""
+    admission = runtime_stores.pipeline_admission()
+    graph = admission.execution_graph
+    return bool(
+        graph.root_state == "closed"
+        and graph.root_owner_count == 0
+        and admission.in_flight == 0
+        and admission.retained == 0
+        # Cleanup permits are included in the blocking authority count.
+        and admission.blocking_in_flight == 0
+        and admission.service_owner_in_flight == 0
+        and graph.provider_manager_count == 0
+    )
+
+
+def _cold_runtime_at_terminal_zero(runtime_stores: Any) -> bool:
+    """Return whether normal runtime drainage completed cleanly."""
+    return _cold_runtime_execution_is_impossible(runtime_stores)
+
+
+def _run_cold_shutdown_transport(
+    target: Callable[[], None],
+    *,
+    on_startup_exhaustion: Callable[[BaseException], None],
+) -> None:
+    """Run one bounded transport without duplicating an ambiguous owner."""
+    startup_failure: BaseException | None = None
+    for _attempt in range(_COLD_RUNTIME_TRANSPORT_START_ATTEMPTS):
+        aborted = threading.Event()
+        claimed = threading.Event()
+        finished = threading.Event()
+        ready = threading.Event()
+        failures: list[BaseException] = []
+
+        def claimed_target() -> None:
+            claimed.set()
+            ready.set()
+            try:
+                if not aborted.is_set():
+                    target()
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                finished.set()
+
+        try:
+            thread = _start_lifecycle_owner_thread(
+                target=claimed_target,
+                name="tacit-cold-runtime-shutdown",
+                abort=aborted.set,
+                ready=ready,
+                finished=finished,
+            )
+        except _LifecycleOwnerStartupError as exc:
+            startup_failure = exc.cause
+            if exc.thread_alive or claimed.is_set():
+                raise startup_failure
+            continue
+
+        if not finished.wait(timeout=_COLD_RUNTIME_TRANSPORT_COMPLETION_TIMEOUT_SECONDS):
+            raise TimeoutError("Cold runtime shutdown transport did not complete within its bounded deadline")
+        thread.join(timeout=0)
+        if failures:
+            raise failures[0]
+        return
+    else:
+        if startup_failure is not None:
+            try:
+                on_startup_exhaustion(startup_failure)
+            except BaseException as fence_error:
+                startup_failure.add_note(
+                    "The runtime execution graph could not retain authority after cleanup transport failure."
+                )
+                raise startup_failure from fence_error
+            raise startup_failure
+        else:  # pragma: no cover - the fixed positive attempt count makes this unreachable
+            raise RuntimeError("Cold runtime shutdown transport did not start")
+
+
+def _shutdown_cold_runtime(runtime_stores: Any, root_handle: Any) -> None:
+    """Drain the eval root without nesting an event loop in synchronous callers."""
+    admission = runtime_stores.pipeline_admission()
+    if admission.in_flight or admission.retained or admission.blocking_in_flight:
+        raise RuntimeError("Cold isolation exited while admitted runtime work was still active")
+
+    async def shutdown() -> None:
+        await release_runtime_root_with_startup_retry(
+            runtime_stores.shutdown_runtime_services,
+            root_handle,
+        )
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(shutdown())
+    else:
+        _run_cold_shutdown_transport(
+            lambda: asyncio.run(shutdown()),
+            on_startup_exhaustion=lambda error: fence_runtime_root_after_transport_failure(root_handle, error),
+        )
+
+    if not _cold_runtime_at_terminal_zero(runtime_stores):
+        raise RuntimeError("Cold isolation runtime did not reach terminal zero")
 
 
 @contextlib.contextmanager
@@ -416,10 +528,9 @@ def _cold_isolation_unlocked(
     from tacit.runtime_stores import RuntimeStores
 
     prior_cache_state = _capture_global_caches()
-    tmp_ctx: tempfile.TemporaryDirectory[str] | None = None
+    owned_workdir = workdir is None
     if workdir is None:
-        tmp_ctx = tempfile.TemporaryDirectory(prefix="tacit-cold-")
-        base = Path(tmp_ctx.name)
+        base = Path(tempfile.mkdtemp(prefix="tacit-cold-"))
     else:
         base = Path(workdir)
         base.mkdir(parents=True, exist_ok=True)
@@ -429,9 +540,12 @@ def _cold_isolation_unlocked(
     prior_arch_path = os.environ.get("TACIT_ARCHETYPES_PATH")
     dependencies: Any | None = None
     templates: Any | None = None
+    runtime_stores: Any | None = None
+    root_handle: Any | None = None
     try:
         isolated_settings = _isolated_settings(settings, Settings, base, endpoints, tenant_id)
         runtime_stores = RuntimeStores(isolated_settings)
+        root_handle = runtime_stores.start_runtime_services()
         signal_store = runtime_stores.signals()
         history_store = runtime_stores.history()
         feedback_store = runtime_stores.feedback()
@@ -459,26 +573,50 @@ def _cold_isolation_unlocked(
         )
         yield state
     finally:
+        cleanup_failure: BaseException | None = None
         try:
-            if prior_arch_path is None:
-                os.environ.pop("TACIT_ARCHETYPES_PATH", None)
-            else:
-                os.environ["TACIT_ARCHETYPES_PATH"] = prior_arch_path
-            if templates is not None:
-                templates.reload_archetypes()
             if dependencies is not None:
                 dependencies.llm_cache.invalidate()
                 dependencies.llm_cache.reset_stats()
-        finally:
+        except BaseException as exc:
+            cleanup_failure = exc
+        try:
+            if runtime_stores is not None and root_handle is not None:
+                _shutdown_cold_runtime(runtime_stores, root_handle)
+        except BaseException as exc:
+            if cleanup_failure is None:
+                cleanup_failure = exc
+
+        runtime_execution_is_impossible = root_handle is None or (
+            runtime_stores is not None and _cold_runtime_execution_is_impossible(runtime_stores)
+        )
+        if runtime_execution_is_impossible:
             try:
+                if prior_arch_path is None:
+                    os.environ.pop("TACIT_ARCHETYPES_PATH", None)
+                else:
+                    os.environ["TACIT_ARCHETYPES_PATH"] = prior_arch_path
+                if templates is not None:
+                    templates.reload_archetypes()
                 _restore_ambient_proxies(prior_proxies)
-            finally:
+            except BaseException as exc:
+                if cleanup_failure is None:
+                    cleanup_failure = exc
+            try:
+                _restore_ambient_credentials(prior_credentials)
+                _restore_global_caches(prior_cache_state)
+            except BaseException as exc:
+                if cleanup_failure is None:
+                    cleanup_failure = exc
+            if owned_workdir:
                 try:
-                    _restore_ambient_credentials(prior_credentials)
-                    _restore_global_caches(prior_cache_state)
-                finally:
-                    if tmp_ctx is not None:
-                        tmp_ctx.cleanup()
+                    shutil.rmtree(base)
+                except BaseException as exc:
+                    if cleanup_failure is None:
+                        cleanup_failure = exc
+
+        if cleanup_failure is not None:
+            raise cleanup_failure
 
 
 @contextlib.contextmanager

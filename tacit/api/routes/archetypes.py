@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from tacit.api.security import verify_api_key
+from tacit.api.security import require_knowledge_action, verify_api_key
+from tacit.knowledge.authorization import KnowledgeAction
 from tacit.models.schemas import ArchetypeListResponse, ArchetypeReloadResponse
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
@@ -16,6 +17,10 @@ router = APIRouter(dependencies=[Depends(verify_api_key)])
     summary="Reload curated archetypes from YAML",
     response_model=ArchetypeReloadResponse,
     response_description="Confirmation with count and summary of loaded curated archetypes",
+    dependencies=[
+        Depends(require_knowledge_action(KnowledgeAction.READ)),
+        Depends(require_knowledge_action(KnowledgeAction.OVERRIDE)),
+    ],
 )
 async def reload_archetypes_endpoint():
     """Hot-reload curated, operator-authored templates without server restart."""
@@ -37,6 +42,7 @@ async def reload_archetypes_endpoint():
     summary="List all archetypes",
     response_model=ArchetypeListResponse,
     response_description="All loaded investigation archetypes with their panels and problem types",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.READ))],
 )
 async def list_archetypes():
     """List all currently loaded investigation archetypes."""

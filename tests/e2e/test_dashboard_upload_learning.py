@@ -226,13 +226,16 @@ async def test_uploaded_dashboard_teaches_signals_and_prompt_matrix_scores_usefu
     }
     assert resolved_metrics
     assert resolved_metrics <= inferred_metrics
-    fixture_provider = IncidentFixtureProvider(
-        catalog,
-        resolved_metrics,
-        service=current_service,
-        runtime_settings=settings,
-    )
-    monkeypatch.setattr(provider_registry, "create_provider", lambda _settings: fixture_provider)
+
+    def create_fixture_provider(runtime_settings):
+        return IncidentFixtureProvider(
+            catalog,
+            resolved_metrics,
+            service=current_service,
+            runtime_settings=runtime_settings,
+        )
+
+    monkeypatch.setattr(provider_registry, "create_provider", create_fixture_provider)
 
     monkeypatch.setattr(pipeline_mod, "enrich_context", _no_context)
 
@@ -439,6 +442,7 @@ async def test_governed_ranking_fails_closed_when_final_snapshot_is_unavailable(
 
     class RankingKnowledgeService:
         runtime_ownership = signal_store.runtime_ownership
+        sqlite_readiness_admission = signal_store.sqlite_readiness_admission
 
         def create_snapshot(self, scope):
             return (

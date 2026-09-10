@@ -20,6 +20,7 @@ from structlog.testing import capture_logs
 from tacit.api.app import create_app
 from tacit.cli import _knowledge_tenant, cli
 from tacit.config import Settings
+from tacit.errors import RuntimeOwnershipError
 from tacit.knowledge.enums import (
     ConflictKind,
     ConflictResolutionStatus,
@@ -91,6 +92,7 @@ from tacit.operational_learning_benchmark import (
     run_operational_learning_benchmark,
 )
 from tacit.pagination import MAX_COMPATIBILITY_OFFSET, encode_cursor
+from tacit.signals.store import SignalStore
 from tacit.tenancy import TenantBoundaryError
 from tests.http_client import TestClient
 
@@ -137,17 +139,22 @@ class _TestHistoryStore:
 
 
 def _service(tmp_path: Path, tenant_id: str = "default") -> KnowledgeService:
+    database_path = tmp_path / "knowledge.db"
     runtime_settings = Settings(
         _env_file=None,
         knowledge_tenant_id=tenant_id,
         api_auth_enabled=tenant_id == "*",
+        signals_db_path=str(database_path),
     )
+    signal_store = SignalStore(database_path, runtime_settings=runtime_settings)
     repository = KnowledgeRepository(
-        tmp_path / "knowledge.db",
+        database_path,
         runtime_settings=runtime_settings,
+        signal_store=signal_store,
     )
     service = KnowledgeService(
         repository,
+        signal_store=signal_store,
         history_store=_TestHistoryStore(repository),
         runtime_settings=runtime_settings,
     )
@@ -172,6 +179,115 @@ def _service(tmp_path: Path, tenant_id: str = "default") -> KnowledgeService:
     ):
         service.register_entity(entity)
     return service
+
+
+def test_injected_signal_readiness_proof_rejects_replaced_database_generation(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "signals.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-a",
+        signals_db_path=str(database_path),
+    )
+    admitted_store = SignalStore(database_path, runtime_settings=runtime_settings)
+    admitted_proof = admitted_store.sqlite_readiness_admission
+    original_path = tmp_path / "signals-original.db"
+    database_path.rename(original_path)
+    replacement_store = SignalStore(database_path, runtime_settings=runtime_settings)
+
+    assert replacement_store.sqlite_readiness_admission.database_id != admitted_proof.database_id
+    with pytest.raises(RuntimeOwnershipError, match="generation|identity"):
+        KnowledgeRepository(
+            runtime_settings=runtime_settings,
+            signal_store=admitted_store,
+        )
+
+
+def test_injected_signal_store_owner_disagreement_fails_before_copy_or_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "signals.db"
+    owner_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-a",
+        signals_db_path=str(database_path),
+    )
+    foreign_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-b",
+        signals_db_path=str(database_path),
+    )
+    signal_store = SignalStore(database_path, runtime_settings=owner_settings)
+    with sqlite3.connect(database_path) as connection:
+        before_tables = {
+            str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+
+    def unexpected_copy(*_args, **_kwargs):
+        raise AssertionError("incompatible injected store triggered a readiness copy")
+
+    monkeypatch.setattr("tacit.sqlite_identity._copy_snapshot_component", unexpected_copy)
+
+    with pytest.raises(RuntimeOwnershipError):
+        KnowledgeRepository(
+            runtime_settings=foreign_settings,
+            signal_store=signal_store,
+        )
+
+    with sqlite3.connect(database_path) as connection:
+        after_tables = {
+            str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+    assert after_tables == before_tables
+
+
+def test_injected_signal_store_path_disagreement_fails_without_creating_foreign_storage(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "signals.db"
+    foreign_path = tmp_path / "foreign" / "signals.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-a",
+        signals_db_path=str(database_path),
+    )
+    signal_store = SignalStore(database_path, runtime_settings=runtime_settings)
+
+    with pytest.raises(RuntimeOwnershipError):
+        KnowledgeRepository(
+            foreign_path,
+            runtime_settings=runtime_settings,
+            signal_store=signal_store,
+        )
+
+    assert not foreign_path.parent.exists()
+
+
+def test_injected_signal_readiness_does_not_construct_a_temporary_signal_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "signals.db"
+    runtime_settings = Settings(
+        _env_file=None,
+        knowledge_tenant_id="tenant-a",
+        signals_db_path=str(database_path),
+    )
+    signal_store = SignalStore(database_path, runtime_settings=runtime_settings)
+
+    def unexpected_signal_store(*_args, **_kwargs):
+        raise AssertionError("knowledge readiness constructed a second SignalStore owner")
+
+    monkeypatch.setattr("tacit.signals.store.SignalStore", unexpected_signal_store)
+
+    repository = KnowledgeRepository(
+        runtime_settings=runtime_settings,
+        signal_store=signal_store,
+    )
+
+    assert repository.sqlite_readiness_admission is signal_store.sqlite_readiness_admission
 
 
 def test_knowledge_service_derives_repository_from_runtime_settings(tmp_path: Path):
@@ -8854,7 +8970,12 @@ def test_global_knowledge_repository_uses_active_signal_store_path(tmp_path: Pat
             "source_type": "dashboard_ingest",
             "source_refs": ["dashboard:isolated"],
         },
-        service=KnowledgeService(KnowledgeRepository(signal_store._db_path)),
+        service=KnowledgeService(
+            KnowledgeRepository(
+                signal_store=signal_store,
+            ),
+            signal_store=signal_store,
+        ),
     )
 
     active_repository = repository_module.get_knowledge_repository()
@@ -11536,7 +11657,21 @@ def test_cli_resolves_tenants_from_active_runtime_settings(tmp_path: Path, monke
     ],
 )
 def test_cli_pipeline_failure_responses_exit_nonzero(command, monkeypatch: pytest.MonkeyPatch):
-    stores = SimpleNamespace(settings=Settings(_env_file=None))
+    root_handle = object()
+    lifecycle_events: list[tuple[str, object | None]] = []
+
+    def start_runtime_services():
+        lifecycle_events.append(("started", root_handle))
+        return root_handle
+
+    async def shutdown_runtime_services(handle):
+        lifecycle_events.append(("stopped", handle))
+
+    stores = SimpleNamespace(
+        settings=Settings(_env_file=None),
+        start_runtime_services=start_runtime_services,
+        shutdown_runtime_services=shutdown_runtime_services,
+    )
 
     async def failed_pipeline(*_args, **_kwargs):
         return DashResponse(
@@ -11556,10 +11691,25 @@ def test_cli_pipeline_failure_responses_exit_nonzero(command, monkeypatch: pytes
 
     assert result.exit_code != 0
     assert "failed" in result.output.lower()
+    assert lifecycle_events == [("started", root_handle), ("stopped", root_handle)]
 
 
 def test_cli_test_pipeline_exception_exits_nonzero(monkeypatch: pytest.MonkeyPatch):
-    stores = SimpleNamespace(settings=Settings(_env_file=None))
+    root_handle = object()
+    lifecycle_events: list[tuple[str, object | None]] = []
+
+    def start_runtime_services():
+        lifecycle_events.append(("started", root_handle))
+        return root_handle
+
+    async def shutdown_runtime_services(handle):
+        lifecycle_events.append(("stopped", handle))
+
+    stores = SimpleNamespace(
+        settings=Settings(_env_file=None),
+        start_runtime_services=start_runtime_services,
+        shutdown_runtime_services=shutdown_runtime_services,
+    )
 
     async def failed_pipeline(*_args, **_kwargs):
         raise RuntimeError("backend unavailable")
@@ -11572,6 +11722,7 @@ def test_cli_test_pipeline_exception_exits_nonzero(monkeypatch: pytest.MonkeyPat
 
     assert result.exit_code != 0
     assert "backend unavailable" in result.output
+    assert lifecycle_events == [("started", root_handle), ("stopped", root_handle)]
 
 
 def test_operational_learning_benchmark_is_packaged_and_safe():

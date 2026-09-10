@@ -32,7 +32,7 @@ from tacit.api.routes.signals import get_signal, list_signals, signal_stats, tea
 from tacit.api.routes.system import healthz, web_ui
 from tacit.api.security import MAX_PROMPT_LENGTH as _MAX_PROMPT_LENGTH
 from tacit.api.security import sanitize_prompt
-from tacit.config import settings
+from tacit.config import settings, validate_api_server_bind
 from tacit.feedback import get_feedback_store
 
 # Backward-compatible aliases for tests/importers that used the old entrypoint-local helpers.
@@ -85,9 +85,10 @@ app = create_app(runtime_settings=settings, lifespan=lifespan)
 
 
 def main():
+    host = validate_api_server_bind(settings, "127.0.0.1")
     uvicorn.run(
         "tacit.main:app",
-        host="0.0.0.0",
+        host=host,
         port=8000,
         reload=False,
         log_level=settings.log_level.lower(),

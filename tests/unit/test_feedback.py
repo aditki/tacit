@@ -1022,8 +1022,12 @@ def test_feedback_owner_mismatch_is_read_only_and_redacts_diagnostics(tmp_path):
         assert rejected[0]["configured_owner_class"] == "pinned"
         assert len(str(rejected[0]["recorded_owner_fingerprint"])) == 16
         assert len(str(rejected[0]["configured_owner_fingerprint"])) == 16
-    assert attempts[0][1][0]["recorded_owner_fingerprint"] == attempts[1][1][0]["recorded_owner_fingerprint"]
-    assert attempts[0][1][0]["configured_owner_fingerprint"] == attempts[1][1][0]["configured_owner_fingerprint"]
+    rejection_logs = [
+        next(log for log in logs if log.get("event") == "feedback_owner_preflight_rejected")
+        for _message, logs in attempts
+    ]
+    assert rejection_logs[0]["recorded_owner_fingerprint"] == rejection_logs[1]["recorded_owner_fingerprint"]
+    assert rejection_logs[0]["configured_owner_fingerprint"] == rejection_logs[1]["configured_owner_fingerprint"]
 
 
 def test_feedback_owner_migration_pages_use_tenant_id_indexes(tmp_path):

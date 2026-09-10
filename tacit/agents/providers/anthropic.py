@@ -6,7 +6,15 @@ import anthropic
 import structlog
 
 from tacit.agents.providers.base import LLMProvider, LLMResult, TokenUsage
+from tacit.agents.providers.http_transport import (
+    LLMSDKHTTPClientCloseGuard,
+    LLMSDKHTTPClientConstruction,
+    create_llm_sdk_http_client,
+    isolate_llm_sdk_ambient_credentials,
+    isolate_llm_sdk_custom_headers,
+)
 from tacit.config import Settings, settings
+from tacit.runtime_ownership import canonical_remote_endpoint
 
 logger = structlog.get_logger()
 
@@ -37,10 +45,41 @@ class AnthropicProvider(LLMProvider):
     def __init__(self, runtime_settings: Settings | None = None):
         super().__init__(runtime_settings or settings, component="anthropic_llm_provider")
         self._settings = self.runtime_settings
-        self._client = anthropic.AsyncAnthropic(
-            api_key=self._settings.llm_api_key,
-            base_url=self._settings.llm_api_base or _ANTHROPIC_API_ENDPOINT,
-        )
+        construction = LLMSDKHTTPClientConstruction.begin()
+        endpoint = canonical_remote_endpoint(self._settings.llm_api_base or _ANTHROPIC_API_ENDPOINT)
+        with construction:
+            http_client = construction.create_http_client(
+                lambda: create_llm_sdk_http_client(
+                    self._settings,
+                    endpoint=endpoint,
+                )
+            )
+            client = construction.create_sdk_client(
+                lambda: anthropic.AsyncAnthropic(
+                    api_key=self._settings.llm_api_key,
+                    auth_token=None,
+                    credentials=None,
+                    config=None,
+                    profile=None,
+                    webhook_key="",
+                    base_url=endpoint,
+                    default_headers={},
+                    http_client=http_client,
+                )
+            )
+            isolate_llm_sdk_ambient_credentials(
+                client,
+                expected_fields=(
+                    ("api_key", self._settings.llm_api_key),
+                    ("auth_token", None),
+                    ("credentials", None),
+                    ("webhook_key", ""),
+                ),
+            )
+            isolate_llm_sdk_custom_headers(client)
+            self._http_client = http_client
+            self._client = client
+            self._close_guard: LLMSDKHTTPClientCloseGuard = construction.commit()
 
     @property
     def is_configured(self) -> bool:
@@ -109,4 +148,4 @@ class AnthropicProvider(LLMProvider):
         return LLMResult(text=_response_text(response), usage=self._extract_usage(response))
 
     async def close(self) -> None:
-        await self._client.close()
+        await self._close_guard.close(self._client.close)

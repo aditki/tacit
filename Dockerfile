@@ -2,7 +2,7 @@
 
 FROM ghcr.io/astral-sh/uv:0.5.31@sha256:7bff3c3776ec467fc1437960f2c469d8beb30f536a6465a3350c647ccd260ec2 AS uv
 
-FROM python:3.12.13-alpine3.22@sha256:a190708a2dec1bd18b1decb539f8e8f5407abaa9bf39cacda583f7f8c11db322 AS runtime
+FROM python:3.12.14-alpine3.24@sha256:1887c114801a8c82a4ec01daa52cfe7fc3f63573640e2247320289807ac1c3bb AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -23,10 +23,15 @@ RUN addgroup -S -g "${TACIT_GID}" tacit \
     && chown -R "${TACIT_UID}:${TACIT_GID}" /app
 
 COPY --chown=${TACIT_UID}:${TACIT_GID} pyproject.toml uv.lock* ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv sync --locked --link-mode=copy --no-dev --extra bedrock --no-install-project
 
 COPY --chown=${TACIT_UID}:${TACIT_GID} . .
-RUN uv sync --frozen --no-dev \
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv sync --locked --link-mode=copy --no-dev --extra bedrock \
+    && find /app/.venv -type f -path '*/tacit_ai-*.dist-info/RECORD' \
+        -exec sed -i '/uv_cache\.json,/d' {} + \
+    && find /app/.venv -type f -path '*/tacit_ai-*.dist-info/uv_cache.json' -delete \
     && find /app -type d -name __pycache__ -prune -exec rm -rf {} +
 
 USER tacit
@@ -34,6 +39,6 @@ USER tacit
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).read()"
+    CMD ["python", "/app/tacit/api/routes/system.py"]
 
 CMD ["tacit", "serve", "--host", "0.0.0.0", "--port", "8000", "--no-slack"]

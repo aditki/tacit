@@ -15,10 +15,15 @@
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
 llm:
-  provider: openai            # anthropic | openai | azure | ollama
+  provider: openai            # anthropic | openai | azure | bedrock | ollama
   model: gpt-4o               # model name (provider-specific)
   api_base: ""                 # custom endpoint (Azure, Ollama, vLLM, etc.)
   # api_key: use LLM_API_KEY env var
+  bedrock_region: us-east-1    # only used when provider is bedrock
+  bedrock_model_id: ""         # optional exact model/inference-profile ID; empty uses model
+  bedrock_role_arn: ""         # optional IAM role to assume
+  # Put LLM_AWS_ACCESS_KEY_ID, LLM_AWS_SECRET_ACCESS_KEY, and the optional
+  # LLM_AWS_SESSION_TOKEN in the environment, never in this YAML file.
 
 # ── Grafana ──────────────────────────────────────────────────────────────────
 grafana:
@@ -69,6 +74,8 @@ adapter:
 max_metric_catalog_size: 300   # total metrics across all datasources sent to LLM
 
 # ── SQLite Storage ───────────────────────────────────────────────────────────
+sqlite:
+  snapshot_max_bytes: 1073741824  # per-database cap across main/WAL/retries (1 GiB)
 history:
   db_path: data/tacit_history.db
 feedback:
@@ -92,8 +99,16 @@ learned_archetypes:
 api:
   auth_enabled: false          # set true to require X-API-Key header
   # auth_key: use API_AUTH_KEY env var
+  allowed_hosts: "localhost,127.0.0.1,[::1]"  # exact Host-header names; no unrestricted wildcard
   # cors_allowed_origins: https://console.example,https://ops.example
   max_request_body_bytes: 2097152  # 2 MiB; enforced before request parsing
+  request_body_max_concurrent: 16  # app-wide authenticated body slots
+  request_body_tenant_max_concurrent: 4  # per-tenant body slots
+  request_body_max_buffered_bytes: 536870912  # app-wide accounted memory (512 MiB)
+  request_body_tenant_max_buffered_bytes: 134217728  # per-tenant accounted memory (128 MiB)
+  request_body_memory_amplification_factor: 8  # generic body envelope; structured JSON has a fixed 64x floor
+  request_body_memory_floor_bytes: 4194304  # minimum memory charge per request
+  request_body_read_timeout_seconds: 15  # total body-read deadline
 
 # ── App ──────────────────────────────────────────────────────────────────────
 log_level: INFO

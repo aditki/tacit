@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
+from fastapi import FastAPI
 from structlog.testing import capture_logs
 
 from tacit.agents.providers.base import LLMProvider, LLMResult, TokenUsage
+from tacit.api.lifespan import create_lifespan
 from tacit.archetypes.engine import (
     KnowledgeQueryUse,
     _query_changes_under_metric_substitution,
@@ -15,13 +18,14 @@ from tacit.backends.base import PublishResult
 from tacit.config import Settings
 from tacit.context.base import ContextProvider
 from tacit.context.enrichment import enrich_context
-from tacit.dependencies import PipelineDependencies, build_pipeline_dependencies
+from tacit.dependencies import PipelineDependencies, ProviderLeaseHandle, build_pipeline_dependencies
 from tacit.errors import (
     PipelineAdmissionRejected,
     PipelineExecutionError,
     RuntimeOwnershipError,
     SemanticAuthorizationError,
 )
+from tacit.feedback import FeedbackStore
 from tacit.history import InvestigationStore
 from tacit.models.schemas import (
     ArchetypeMatch,
@@ -35,9 +39,11 @@ from tacit.models.schemas import (
     PanelSpec,
     SignalType,
 )
+from tacit.pipeline import run_pipeline as run_public_pipeline
 from tacit.pipeline.completion import _rounded_timings
 from tacit.pipeline.failures import PipelineFailureFactory
 from tacit.pipeline.runner import (
+    _complete_after_provider_release,
     _initial_knowledge_archetype_ids,
     _initialize_signal_store,
     run_pipeline,
@@ -47,6 +53,7 @@ from tacit.pipeline.stages.archetypes import ArchetypeCompilation
 from tacit.pipeline.stages.freeform import build_freeform_dashboard, discovery_cache_parts
 from tacit.pipeline.stages.intent import IntentStageResult, run_intent_stage
 from tacit.pipeline.stages.publish import PublicationState, publish_dashboard
+from tacit.pipeline_admission import PipelineAdmissionController, RuntimeRootDrainStartupError
 from tacit.runtime_ownership import (
     declare_runtime_factory,
     runtime_descriptor_for_backends,
@@ -56,6 +63,7 @@ from tacit.runtime_ownership import (
 )
 from tacit.runtime_stores import RuntimeStores
 from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE, resolve_signal_store
+from tacit.signals.store import SignalStore
 from tacit.tenancy import TenantBoundaryError
 
 
@@ -75,6 +83,32 @@ def _owned_test_factory(factory, *, runtime_settings: Settings, factory_kind: st
             database_role=capability,
             database_path=database_path,
         )
+        if category == "store":
+            unadapted_factory = factory
+
+            def factory():
+                product = unadapted_factory()
+                if product is None:
+                    return product
+                existing_ownership = getattr(product, "runtime_ownership", None)
+                existing_admission = getattr(product, "sqlite_readiness_admission", None)
+                if existing_ownership is not None and existing_admission is not None:
+                    return product
+                backing_store = {
+                    "history": InvestigationStore,
+                    "feedback": FeedbackStore,
+                    "signals": SignalStore,
+                }[
+                    capability
+                ](database_path, runtime_settings=runtime_settings)
+                try:
+                    if existing_ownership is None:
+                        product.runtime_ownership = backing_store.runtime_ownership
+                    product.sqlite_readiness_admission = backing_store.sqlite_readiness_admission
+                except (AttributeError, TypeError):
+                    return product
+                return product
+
     elif category == "provider":
         ownership = runtime_descriptor_for_provider(
             component=f"pipeline_helper_{factory_kind}_factory",
@@ -170,11 +204,13 @@ class BlockingCloseBackend(FakeBackend):
         super().__init__()
         self.release = release
         self.close_started = asyncio.Event()
+        self.close_finished = asyncio.Event()
 
     async def close(self):
         self.close_started.set()
         await self.release.wait()
         self.closed = True
+        self.close_finished.set()
 
 
 class EmptyDiscoveryBackend(FakeBackend):
@@ -261,13 +297,23 @@ class FakeContextProvider(ContextProvider):
 
 
 class FailingCloseProvider(FakeProvider):
+    def __init__(self, runtime_settings: Settings | None = None):
+        super().__init__(runtime_settings)
+        self.close_calls = 0
+
     async def close(self) -> None:
+        self.close_calls += 1
         self.closed = True
         raise RuntimeError("close failed")
 
 
 class FailingCloseContextProvider(FakeContextProvider):
+    def __init__(self, runtime_settings: Settings | None = None):
+        super().__init__(runtime_settings)
+        self.close_calls = 0
+
     async def close(self) -> None:
+        self.close_calls += 1
         self.closed = True
         raise RuntimeError("context close failed")
 
@@ -301,6 +347,58 @@ def _own_store(store, runtime_settings: Settings, role: str):
 
 def _request() -> DashRequest:
     return DashRequest(prompt="checkout latency", user_id="u1", channel_id="c1")
+
+
+def _runtime_lifecycle_dependencies(tmp_path):
+    runtime_settings = Settings(
+        _env_file=None,
+        context_provider="none",
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    stores = RuntimeStores(runtime_settings)
+    dependencies = build_pipeline_dependencies(runtime_settings, stores=stores)
+    return runtime_settings, stores, dependencies
+
+
+def _track_runtime_root_drains(monkeypatch, admission):
+    started: list[int] = []
+    finished: list[int] = []
+    original_begin = admission.begin_root_drain
+    original_finish = admission.finish_root_drain
+
+    def begin(generation: int) -> bool:
+        started.append(generation)
+        return original_begin(generation)
+
+    def finish(generation: int) -> None:
+        finished.append(generation)
+        original_finish(generation)
+
+    monkeypatch.setattr(admission, "begin_root_drain", begin)
+    monkeypatch.setattr(admission, "finish_root_drain", finish)
+    return started, finished
+
+
+def _runtime_app(runtime_settings: Settings, stores: RuntimeStores) -> FastAPI:
+    app = FastAPI()
+    app.state.settings = runtime_settings
+    app.state.runtime_stores = stores
+    return app
+
+
+def _assert_runtime_generation_drained(dependencies: PipelineDependencies) -> None:
+    admission = dependencies.pipeline_admission
+    assert admission is not None
+    graph = admission.execution_graph
+    assert graph.root_owner_count == 0
+    assert graph.root_state == "closed"
+    assert admission.runtime_root_state == "closed"
+    assert admission.in_flight == 0
+    assert admission.retained == 0
+    assert admission.blocking_in_flight == 0
+    assert admission.service_owner_in_flight == 0
 
 
 def test_initial_knowledge_scope_includes_concrete_curated_archetype_ids():
@@ -365,12 +463,9 @@ async def test_pipeline_preflights_backend_owner_before_discovery(tmp_path):
             super().__init__(mismatched_settings)
 
     backend = MismatchedDiscoveryBackend()
-    history = _own_store(FakeHistoryStore(), runtime_settings, "history")
     deps = _isolated_dependencies(
         settings=runtime_settings,
         backend_factory=lambda: [backend],
-        history_store_factory=lambda: history,
-        feedback_store_factory=FakeFeedbackStore,
         llm_cache={},
         cache_key_factory=lambda *parts: ":".join(parts),
     )
@@ -729,9 +824,12 @@ async def test_knowledge_pin_runtime_owner_mismatch_fails_closed_without_sensiti
     runtime_settings = Settings(
         _env_file=None,
         history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
         knowledge_permissions="knowledge.read,knowledge.apply",
     )
     history = InvestigationStore(db_path=tmp_path / "history.db", runtime_settings=runtime_settings)
+    signal_store = SignalStore(tmp_path / "signals.db", runtime_settings=runtime_settings)
     backend = EmptyDiscoveryBackend(runtime_settings)
     sensitive_detail = "owner mismatch token=secret path=/private/runtime/signals.db"
 
@@ -747,8 +845,7 @@ async def test_knowledge_pin_runtime_owner_mismatch_fails_closed_without_sensiti
         settings=runtime_settings,
         backend_factory=lambda: [backend],
         history_store_factory=lambda: history,
-        feedback_store_factory=FakeFeedbackStore,
-        signal_store_factory=object,
+        signal_store_factory=lambda: signal_store,
         llm_cache={},
         cache_key_factory=lambda *parts: ":".join(parts),
     )
@@ -797,15 +894,12 @@ async def test_ordinary_knowledge_pin_failure_degrades_without_sensitive_diagnos
         if database.role == "signals"
     )
 
-    class OwnedSignalStore:
+    class OwnedSignalStore(SignalStore):
         pin_calls: list[tuple[str, tuple]] = []
         reset_calls: list[object] = []
-        runtime_ownership = runtime_descriptor_for_store(
-            component="ordinary_failure_signal_store",
-            runtime_settings=runtime_settings,
-            database_role="signals",
-            database_path=signal_database_path,
-        )
+
+        def __init__(self) -> None:
+            super().__init__(signal_database_path, runtime_settings=runtime_settings)
 
         def activate_pinned_governed_mappings(self, *, tenant_id, mappings):
             token = object()
@@ -821,7 +915,6 @@ async def test_ordinary_knowledge_pin_failure_degrades_without_sensitive_diagnos
         settings=runtime_settings,
         backend_factory=lambda: [backend],
         history_store_factory=lambda: history,
-        feedback_store_factory=FakeFeedbackStore,
         signal_store_factory=OwnedSignalStore,
         llm_cache={},
         cache_key_factory=lambda *parts: ":".join(parts),
@@ -1063,19 +1156,32 @@ async def test_intent_stage_does_not_skip_provider_construction_for_ollama_witho
     assert calls == 1
 
 
-async def test_pipeline_dependencies_cache_and_close_runtime_providers(monkeypatch):
+async def test_pipeline_dependencies_cache_and_close_runtime_providers(monkeypatch, tmp_path):
     runtime_settings = Settings(
         _env_file=None,
         context_provider="mcp",
         context_mcp_server_url="http://127.0.0.1:8765",
+        history_db_path=str(tmp_path / "cache-history.db"),
+        feedback_db_path=str(tmp_path / "cache-feedback.db"),
+        signals_db_path=str(tmp_path / "cache-signals.db"),
     )
-    providers = [FakeProvider(runtime_settings), FakeProvider(runtime_settings)]
-    context_providers = [FakeContextProvider(runtime_settings), FakeContextProvider(runtime_settings)]
+    providers: list[FailingCloseProvider] = []
+    context_providers: list[FailingCloseContextProvider] = []
 
-    monkeypatch.setattr("tacit.agents.providers.registry.create_provider", lambda settings: providers.pop(0))
+    def create_provider(settings: Settings) -> FakeProvider:
+        provider = FakeProvider(settings)
+        providers.append(provider)
+        return provider
+
+    def create_context_provider(settings: Settings) -> FakeContextProvider:
+        provider = FakeContextProvider(settings)
+        context_providers.append(provider)
+        return provider
+
+    monkeypatch.setattr("tacit.agents.providers.registry.create_provider", create_provider)
     monkeypatch.setattr(
         "tacit.context.registry.create_context_provider",
-        lambda settings: context_providers.pop(0),
+        create_context_provider,
     )
 
     deps = build_pipeline_dependencies(runtime_settings, stores=RuntimeStores(runtime_settings))
@@ -1083,15 +1189,16 @@ async def test_pipeline_dependencies_cache_and_close_runtime_providers(monkeypat
     assert deps.llm_provider_factory is not None
     assert deps.context_provider_factory is not None
     await deps.acquire_resources()
-    first_provider = deps.llm_provider_factory()
-    first_context_provider = deps.context_provider_factory()
+    first_provider = providers[0]
+    first_context_provider = context_providers[0]
+    assert deps.llm_provider_factory() is first_provider
+    assert deps.context_provider_factory() is first_context_provider
     assert deps.llm_provider_factory() is first_provider
     assert deps.context_provider_factory() is first_context_provider
 
     await deps.close_resources()
 
     assert first_provider.closed is True
-    assert first_context_provider is not None
     assert first_context_provider.closed is True
 
     await deps.acquire_resources()
@@ -1105,19 +1212,111 @@ async def test_pipeline_dependencies_cache_and_close_runtime_providers(monkeypat
     await deps.close_resources()
 
 
-async def test_pipeline_dependencies_cleanup_is_best_effort_and_resets_cache(monkeypatch):
+async def test_provider_release_failure_prevents_pipeline_completion() -> None:
+    calls: list[str] = []
+    lease = ProviderLeaseHandle(graph_nonce="runtime", generation_epoch=1, lease_id=1)
+
+    class FailingReleaseDependencies:
+        async def close_resources(self, handle: ProviderLeaseHandle | None = None) -> None:
+            assert handle == lease
+            calls.append("release")
+            raise RuntimeOwnershipError("provider cleanup failed")
+
+    async def complete() -> DashResponse:
+        calls.append("complete")
+        return DashResponse(dashboard_uid="unreachable")
+
+    with pytest.raises(RuntimeOwnershipError, match="provider cleanup failed"):
+        await _complete_after_provider_release(
+            FailingReleaseDependencies(),  # type: ignore[arg-type]
+            lease,
+            complete,
+        )
+
+    assert calls == ["release"]
+
+
+async def test_isolated_cleanup_runs_once_before_provider_generation_exists() -> None:
+    cleanup_calls = 0
+
+    async def cleanup() -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+
+    runtime_settings = Settings(_env_file=None)
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+        resource_cleanup=cleanup,
+    )
+
+    await deps.close_resources()
+    await deps.close_resources()
+
+    assert cleanup_calls == 1
+
+
+async def test_isolated_cleanup_rearms_per_generation_without_finalizer_duplication() -> None:
+    cleanup_calls = 0
+
+    async def cleanup() -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+
+    runtime_settings = Settings(_env_file=None, context_provider="none")
+    deps = _isolated_dependencies(
+        settings=runtime_settings,
+        backend_factory=lambda: [],
+        history_store_factory=lambda: object(),
+        feedback_store_factory=lambda: object(),
+        llm_cache={},
+        cache_key_factory=lambda *parts: ":".join(parts),
+        llm_provider_factory=lambda: FakeProvider(runtime_settings),
+        context_provider_factory=lambda: None,
+        resource_cleanup=cleanup,
+    )
+
+    first = await deps.acquire_resources()
+    await deps.close_resources(first)
+    await deps.close_resources()
+    assert cleanup_calls == 1
+
+    second = await deps.acquire_resources()
+    await deps.close_resources(second)
+    await deps.close_resources()
+    assert cleanup_calls == 2
+
+
+async def test_pipeline_dependencies_cleanup_failure_trips_runtime_fatal_circuit(monkeypatch, tmp_path):
     runtime_settings = Settings(
         _env_file=None,
         context_provider="mcp",
         context_mcp_server_url="http://127.0.0.1:8765",
+        history_db_path=str(tmp_path / "fatal-history.db"),
+        feedback_db_path=str(tmp_path / "fatal-feedback.db"),
+        signals_db_path=str(tmp_path / "fatal-signals.db"),
     )
-    providers = [FailingCloseProvider(runtime_settings), FakeProvider(runtime_settings)]
-    context_providers = [FailingCloseContextProvider(runtime_settings), FakeContextProvider(runtime_settings)]
+    providers: list[FakeProvider] = []
+    context_providers: list[FakeContextProvider] = []
 
-    monkeypatch.setattr("tacit.agents.providers.registry.create_provider", lambda settings: providers.pop(0))
+    def create_provider(settings: Settings) -> FakeProvider:
+        provider = FailingCloseProvider(settings)
+        providers.append(provider)
+        return provider
+
+    def create_context_provider(settings: Settings) -> FakeContextProvider:
+        provider = FailingCloseContextProvider(settings)
+        context_providers.append(provider)
+        return provider
+
+    monkeypatch.setattr("tacit.agents.providers.registry.create_provider", create_provider)
     monkeypatch.setattr(
         "tacit.context.registry.create_context_provider",
-        lambda settings: context_providers.pop(0),
+        create_context_provider,
     )
 
     deps = build_pipeline_dependencies(runtime_settings, stores=RuntimeStores(runtime_settings))
@@ -1128,31 +1327,94 @@ async def test_pipeline_dependencies_cleanup_is_best_effort_and_resets_cache(mon
     first_provider = deps.llm_provider_factory()
     first_context_provider = deps.context_provider_factory()
 
-    await deps.close_resources()
+    with pytest.raises(RuntimeOwnershipError, match="generation cleanup failed"):
+        await deps.close_resources()
 
     assert first_provider.closed is True
+    assert first_provider.close_calls == 2
     assert first_context_provider is not None
     assert first_context_provider.closed is True
-    await deps.acquire_resources()
-    assert deps.llm_provider_factory() is not first_provider
-    assert deps.context_provider_factory() is not first_context_provider
-    await deps.close_resources()
+    assert first_context_provider.close_calls == 2
+    assert deps.pipeline_admission is not None
+    assert deps.pipeline_admission.in_flight == 0
+    assert deps.pipeline_admission.queued == 0
+    assert deps.pipeline_admission.retained == 0
+    assert deps.pipeline_admission.blocking_in_flight == 0
+    assert deps.pipeline_admission.service_owner_in_flight == 0
+    assert deps.pipeline_admission.execution_graph.root_owner_count == 0
+
+    with pytest.raises(RuntimeOwnershipError, match="generation cleanup failed"):
+        await deps.acquire_resources()
+    assert providers == [first_provider]
+    assert context_providers == [first_context_provider]
+    with pytest.raises(RuntimeOwnershipError, match="generation is no longer active"):
+        await first_provider.chat_text("system", "user")
+    with pytest.raises(RuntimeOwnershipError, match="generation is no longer active"):
+        await first_context_provider.query(_intent())
+    assert deps.pipeline_admission.service_owner_in_flight == 0
+
+
+@pytest.mark.parametrize("fatal_first", [True, False], ids=["fatal-first", "healthy-first"])
+async def test_runtime_fatal_circuit_isolated_by_tmp_runtime_identity(tmp_path, fatal_first: bool) -> None:
+    def runtime_settings(name: str) -> Settings:
+        return Settings(
+            _env_file=None,
+            history_db_path=str(tmp_path / f"{name}-history.db"),
+            feedback_db_path=str(tmp_path / f"{name}-feedback.db"),
+            signals_db_path=str(tmp_path / f"{name}-signals.db"),
+        )
+
+    fatal_settings = runtime_settings("fatal")
+    healthy_settings = runtime_settings("healthy")
+
+    def trip_fatal_runtime() -> PipelineAdmissionController:
+        controller = RuntimeStores(fatal_settings).pipeline_admission()
+        failure = RuntimeOwnershipError("synthetic runtime cleanup failure")
+        setattr(failure, "cleanup_reason_code", "runtime_cleanup_failed")
+        controller.fence_runtime_fatal(failure)
+        return controller
+
+    async def exercise_healthy_runtime() -> PipelineAdmissionController:
+        controller = RuntimeStores(healthy_settings).pipeline_admission()
+        lease = await controller.acquire(timeout_seconds=0.1)
+        controller.release(lease)
+        return controller
+
+    if fatal_first:
+        fatal = trip_fatal_runtime()
+        healthy = await exercise_healthy_runtime()
+    else:
+        healthy = await exercise_healthy_runtime()
+        fatal = trip_fatal_runtime()
+
+    with pytest.raises(RuntimeOwnershipError, match="cleanup failed"):
+        await fatal.acquire(timeout_seconds=0.1)
+    retry = await healthy.acquire(timeout_seconds=0.1)
+    healthy.release(retry)
+    assert fatal.in_flight == 0
+    assert healthy.in_flight == 0
 
 
 @pytest.mark.asyncio
 async def test_backend_cleanup_is_bounded_by_runtime_grace():
     release = asyncio.Event()
     backend = BlockingCloseBackend(release)
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
 
-    await asyncio.wait_for(
-        safe_close_backends([backend], grace_seconds=0.01),
-        timeout=0.2,
-    )
+    async with lifecycle.slot():
+        await asyncio.wait_for(
+            safe_close_backends(
+                [backend],
+                grace_seconds=0.01,
+                lifecycle=lifecycle,
+            ),
+            timeout=0.2,
+        )
 
     assert backend.close_started.is_set()
     assert backend.closed is False
     release.set()
-    await asyncio.sleep(0)
+    await asyncio.wait_for(backend.close_finished.wait(), timeout=1)
 
 
 async def test_intent_stage_honors_explicit_disabled_context_provider(monkeypatch):
@@ -1192,7 +1454,13 @@ async def test_isolated_intent_stage_never_consults_process_global_providers(mon
         llm_api_base="http://127.0.0.1:11434",
         context_provider="none",
     )
-    owned_provider = FakeProvider(runtime_settings)
+    owned_providers: list[FakeProvider] = []
+
+    def owned_provider_factory() -> FakeProvider:
+        provider = FakeProvider(runtime_settings)
+        owned_providers.append(provider)
+        return provider
+
     dependencies = _isolated_dependencies(
         settings=runtime_settings,
         backend_factory=lambda: [],
@@ -1200,7 +1468,7 @@ async def test_isolated_intent_stage_never_consults_process_global_providers(mon
         feedback_store_factory=lambda: FakeFeedbackStore(),
         llm_cache={},
         cache_key_factory=lambda *parts: ":".join(parts),
-        llm_provider_factory=lambda: owned_provider,
+        llm_provider_factory=owned_provider_factory,
         context_provider_factory=lambda: None,
     )
 
@@ -1211,7 +1479,7 @@ async def test_isolated_intent_stage_never_consults_process_global_providers(mon
     monkeypatch.setattr("tacit.context.enrichment.get_context_provider", forbidden_global_provider)
 
     async def classify(_prompt: str, *, provider=None, runtime_settings=None):
-        assert provider is owned_provider
+        assert provider is owned_providers[0]
         assert runtime_settings == dependencies.settings
         return _intent(), TokenUsage()
 
@@ -1236,7 +1504,7 @@ async def test_isolated_intent_stage_never_consults_process_global_providers(mon
     assert result.context_chunks == []
 
 
-async def test_pipeline_admission_is_isolated_per_runtime(monkeypatch):
+async def test_pipeline_admission_is_isolated_per_runtime(monkeypatch, tmp_path):
     active = {"runtime-a": 0, "runtime-b": 0}
     maximum = {"runtime-a": 0, "runtime-b": 0}
     admitted = {"runtime-a": asyncio.Event(), "runtime-b": asyncio.Event()}
@@ -1262,10 +1530,14 @@ async def test_pipeline_admission_is_isolated_per_runtime(monkeypatch):
 
     def dependencies(runtime: str, limit: int) -> PipelineDependencies:
         return _isolated_dependencies(
-            settings=Settings(_env_file=None, pipeline_max_concurrent=limit),
+            settings=Settings(
+                _env_file=None,
+                pipeline_max_concurrent=limit,
+                history_db_path=str(tmp_path / runtime / "history.db"),
+                feedback_db_path=str(tmp_path / runtime / "feedback.db"),
+                signals_db_path=str(tmp_path / runtime / "signals.db"),
+            ),
             backend_factory=lambda: [],
-            history_store_factory=lambda: FakeHistoryStore(),
-            feedback_store_factory=lambda: FakeFeedbackStore(),
             llm_cache={},
             cache_key_factory=lambda *parts: ":".join(parts),
         )
@@ -1294,6 +1566,260 @@ async def test_pipeline_admission_is_isolated_per_runtime(monkeypatch):
     await asyncio.gather(*tasks)
 
     assert maximum == {"runtime-a": 1, "runtime-b": 2}
+
+
+async def test_public_direct_pipeline_reopens_after_same_runtime_app_shutdown(
+    monkeypatch,
+    tmp_path,
+):
+    runtime_settings, stores, dependencies = _runtime_lifecycle_dependencies(tmp_path)
+    admission = dependencies.pipeline_admission
+    assert admission is not None
+    graph = admission.execution_graph
+    drain_started, drain_finished = _track_runtime_root_drains(monkeypatch, admission)
+    observed_direct_root_counts: list[int] = []
+
+    async def successful_inner(*_args, **_kwargs):
+        observed_direct_root_counts.append(graph.root_owner_count)
+        return DashResponse(
+            dashboard_url="https://dashboards.example/direct",
+            dashboard_uid="direct-dashboard",
+            panel_count=1,
+            summary="direct",
+        )
+
+    monkeypatch.setattr("tacit.logging.configure_logging", lambda _level: None)
+    monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", successful_inner)
+
+    async with create_lifespan(runtime_settings)(_runtime_app(runtime_settings, stores)):
+        assert graph.root_owner_count == 1
+        assert graph.root_state == "active"
+
+    assert drain_started == [1]
+    assert drain_finished == [1]
+    _assert_runtime_generation_drained(dependencies)
+
+    response = await run_public_pipeline(_request(), dependencies)
+
+    assert response.dashboard_uid == "direct-dashboard"
+    assert observed_direct_root_counts == [1]
+    assert drain_started == [1, 2]
+    assert drain_finished == [1, 2]
+    _assert_runtime_generation_drained(dependencies)
+
+
+async def test_public_direct_pipeline_final_drain_allows_same_runtime_app_startup(
+    monkeypatch,
+    tmp_path,
+):
+    runtime_settings, stores, dependencies = _runtime_lifecycle_dependencies(tmp_path)
+    admission = dependencies.pipeline_admission
+    assert admission is not None
+    graph = admission.execution_graph
+    drain_started, drain_finished = _track_runtime_root_drains(monkeypatch, admission)
+    observed_direct_root_counts: list[int] = []
+    observed_app_root_counts: list[int] = []
+
+    async def successful_inner(*_args, **_kwargs):
+        observed_direct_root_counts.append(graph.root_owner_count)
+        return DashResponse(
+            dashboard_url="https://dashboards.example/direct",
+            dashboard_uid="direct-dashboard",
+            panel_count=1,
+            summary="direct",
+        )
+
+    monkeypatch.setattr("tacit.logging.configure_logging", lambda _level: None)
+    monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", successful_inner)
+
+    response = await run_public_pipeline(_request(), dependencies)
+    async with create_lifespan(runtime_settings)(_runtime_app(runtime_settings, stores)):
+        observed_app_root_counts.append(graph.root_owner_count)
+
+    assert response.dashboard_uid == "direct-dashboard"
+    assert observed_direct_root_counts == [1]
+    assert observed_app_root_counts == [1]
+    assert drain_started == [1, 2]
+    assert drain_finished == [1, 2]
+    _assert_runtime_generation_drained(dependencies)
+
+
+async def test_public_direct_pipeline_overlaps_app_without_draining_sibling_root(
+    monkeypatch,
+    tmp_path,
+):
+    runtime_settings, stores, dependencies = _runtime_lifecycle_dependencies(tmp_path)
+    admission = dependencies.pipeline_admission
+    assert admission is not None
+    graph = admission.execution_graph
+    drain_started, drain_finished = _track_runtime_root_drains(monkeypatch, admission)
+    direct_started = asyncio.Event()
+    release_direct = asyncio.Event()
+    observed_direct_root_counts: list[int] = []
+
+    async def overlapping_inner(*_args, **_kwargs):
+        observed_direct_root_counts.append(graph.root_owner_count)
+        direct_started.set()
+        await release_direct.wait()
+        return DashResponse(
+            dashboard_url="https://dashboards.example/direct",
+            dashboard_uid="direct-dashboard",
+            panel_count=1,
+            summary="direct",
+        )
+
+    monkeypatch.setattr("tacit.logging.configure_logging", lambda _level: None)
+    monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", overlapping_inner)
+
+    direct_root_count = 0
+    app_root_count_after_direct = 0
+    async with create_lifespan(runtime_settings)(_runtime_app(runtime_settings, stores)):
+        direct_task = asyncio.create_task(run_public_pipeline(_request(), dependencies))
+        await asyncio.wait_for(direct_started.wait(), timeout=1)
+        direct_root_count = graph.root_owner_count
+        release_direct.set()
+        response = await asyncio.wait_for(direct_task, timeout=1)
+        app_root_count_after_direct = graph.root_owner_count
+        assert drain_started == []
+        assert drain_finished == []
+
+    assert response.dashboard_uid == "direct-dashboard"
+    assert observed_direct_root_counts == [1]
+    assert direct_root_count == 1
+    assert app_root_count_after_direct == 1
+    assert drain_started == [1]
+    assert drain_finished == [1]
+    _assert_runtime_generation_drained(dependencies)
+
+
+@pytest.mark.parametrize("terminal", ["cancelled", "failed"])
+async def test_public_direct_pipeline_terminal_path_releases_root_and_allows_next_generation(
+    terminal,
+    monkeypatch,
+    tmp_path,
+):
+    _runtime_settings, _stores, dependencies = _runtime_lifecycle_dependencies(tmp_path)
+    admission = dependencies.pipeline_admission
+    assert admission is not None
+    graph = admission.execution_graph
+    drain_started, drain_finished = _track_runtime_root_drains(monkeypatch, admission)
+    terminal_started = asyncio.Event()
+    observed_root_counts: list[int] = []
+
+    async def terminal_inner(*_args, **_kwargs):
+        observed_root_counts.append(graph.root_owner_count)
+        terminal_started.set()
+        if terminal == "failed":
+            raise RuntimeError("direct pipeline failed")
+        await asyncio.Event().wait()
+        raise AssertionError("cancelled direct pipeline resumed")
+
+    monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", terminal_inner)
+
+    if terminal == "cancelled":
+        task = asyncio.create_task(run_public_pipeline(_request(), dependencies))
+        await asyncio.wait_for(terminal_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(RuntimeError, match="direct pipeline failed"):
+            await run_public_pipeline(_request(), dependencies)
+
+    _assert_runtime_generation_drained(dependencies)
+    assert drain_started == [1]
+    assert drain_finished == [1]
+
+    async def recovery_inner(*_args, **_kwargs):
+        observed_root_counts.append(graph.root_owner_count)
+        return DashResponse(
+            dashboard_url="https://dashboards.example/recovery",
+            dashboard_uid="recovery-dashboard",
+            panel_count=1,
+            summary="recovery",
+        )
+
+    monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", recovery_inner)
+    response = await run_public_pipeline(_request(), dependencies)
+
+    assert response.dashboard_uid == "recovery-dashboard"
+    assert observed_root_counts == [1, 1]
+    assert drain_started == [1, 2]
+    assert drain_finished == [1, 2]
+    _assert_runtime_generation_drained(dependencies)
+
+
+async def test_public_pipeline_preserves_cancellation_after_recovery_owned_final_drain(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    runtime_settings = Settings(
+        _env_file=None,
+        context_provider="none",
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
+    )
+    stores = RuntimeStores(runtime_settings)
+    shutdown_calls = 0
+    shutdown_started = threading.Event()
+    allow_shutdown = threading.Event()
+
+    async def fail_borrowed_drain_startup_twice(_handle) -> None:
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+        raise RuntimeRootDrainStartupError(f"startup failed {shutdown_calls}")
+
+    monkeypatch.setattr(
+        stores,
+        "shutdown_runtime_services",
+        fail_borrowed_drain_startup_twice,
+    )
+    dependencies = build_pipeline_dependencies(runtime_settings, stores=stores)
+    admission = dependencies.pipeline_admission
+    assert admission is not None
+    graph = admission.execution_graph
+    response_produced = asyncio.Event()
+    manager = graph.provider_manager()
+    assert manager is not None
+
+    async def blocking_manager_shutdown() -> None:
+        shutdown_started.set()
+        while not allow_shutdown.is_set():
+            await asyncio.sleep(0.001)
+
+    monkeypatch.setattr(manager, "shutdown", blocking_manager_shutdown)
+
+    async def successful_inner(*_args, **_kwargs) -> DashResponse:
+        response_produced.set()
+        return DashResponse(
+            dashboard_url="https://dashboards.example/cancelled-recovery",
+            dashboard_uid="cancelled-recovery",
+            panel_count=1,
+            summary="response produced before final drain",
+        )
+
+    monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", successful_inner)
+
+    task = asyncio.create_task(run_public_pipeline(_request(), dependencies))
+    await asyncio.wait_for(response_produced.wait(), timeout=1)
+    assert await asyncio.to_thread(shutdown_started.wait, 1)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert task.done() is False
+    allow_shutdown.set()
+
+    outcome: BaseException | DashResponse
+    try:
+        outcome = await asyncio.wait_for(task, timeout=1)
+    except BaseException as exc:
+        outcome = exc
+
+    _assert_runtime_generation_drained(dependencies)
+    assert shutdown_calls == 2
+    assert not isinstance(outcome, DashResponse), "cancelled public pipeline returned its completed response"
+    assert isinstance(outcome, asyncio.CancelledError)
 
 
 @pytest.mark.asyncio
@@ -1347,11 +1873,16 @@ async def test_pipeline_cancellation_grace_returns_request_but_retains_effective
     finally:
         release_cleanup.set()
         for _ in range(100):
-            if dependencies.pipeline_admission.in_flight == 0:
+            if (
+                dependencies.pipeline_admission.in_flight == 0
+                and dependencies.pipeline_admission.execution_graph.root_state == "closed"
+            ):
                 break
             await asyncio.sleep(0)
     assert dependencies.pipeline_admission.in_flight == 0
     assert dependencies.pipeline_admission.retained == 0
+    assert dependencies.pipeline_admission.execution_graph.root_owner_count == 0
+    assert dependencies.pipeline_admission.execution_graph.root_state == "closed"
 
 
 @pytest.mark.asyncio
@@ -1427,34 +1958,37 @@ async def test_repeated_timeouts_are_fenced_and_cannot_exceed_effective_work_bud
         "backend_factory_audit_failure",
     ],
 )
-async def test_early_pipeline_cancellation_releases_provider_lease_and_admission(phase):
+async def test_early_pipeline_cancellation_before_provider_acquisition_releases_admission(phase):
     runtime_settings = Settings(
         _env_file=None,
         pipeline_max_concurrent=1,
         pipeline_timeout_seconds=30.0,
     )
-    provider = FakeProvider(runtime_settings)
+    provider_factory_calls = 0
     dependencies: PipelineDependencies
 
-    def activate_provider_then_cancel() -> None:
-        assert dependencies.llm_provider_factory is not None
-        assert dependencies.llm_provider_factory() is provider
+    def cancel_pipeline() -> None:
         raise asyncio.CancelledError
+
+    def provider_factory() -> FakeProvider:
+        nonlocal provider_factory_calls
+        provider_factory_calls += 1
+        return FakeProvider(runtime_settings)
 
     class CancellingHistory(FakeHistoryStore):
         def get_contract(self, *_args, **_kwargs):
             if phase == "contract_lookup":
-                activate_provider_then_cancel()
+                cancel_pipeline()
             raise AssertionError("contract lookup should cancel")
 
         def start(self, prompt, user_id, channel_id, tenant_id=None):
             if phase == "history_start":
-                activate_provider_then_cancel()
+                cancel_pipeline()
             return super().start(prompt, user_id, channel_id, tenant_id=tenant_id)
 
         def start_run(self, *_args, **_kwargs):
             if phase in {"run_start", "run_start_audit_failure"}:
-                activate_provider_then_cancel()
+                cancel_pipeline()
             return "run-1"
 
         def finish(self, *args, **kwargs):
@@ -1466,12 +2000,12 @@ async def test_early_pipeline_cancellation_releases_provider_lease_and_admission
 
     def history_factory():
         if phase == "history_factory":
-            activate_provider_then_cancel()
+            cancel_pipeline()
         return history
 
     def backend_factory():
         if phase in {"backend_factory", "backend_factory_audit_failure"}:
-            activate_provider_then_cancel()
+            cancel_pipeline()
         raise AssertionError("backend factory should cancel")
 
     dependencies = _isolated_dependencies(
@@ -1481,7 +2015,7 @@ async def test_early_pipeline_cancellation_releases_provider_lease_and_admission
         feedback_store_factory=lambda: FakeFeedbackStore(),
         llm_cache={},
         cache_key_factory=lambda *parts: ":".join(parts),
-        llm_provider_factory=lambda: provider,
+        llm_provider_factory=provider_factory,
     )
 
     with pytest.raises(asyncio.CancelledError):
@@ -1491,9 +2025,11 @@ async def test_early_pipeline_cancellation_releases_provider_lease_and_admission
             investigation_id="inv-existing" if phase == "contract_lookup" else None,
         )
 
-    assert provider.closed is True
+    assert provider_factory_calls == 0
     assert dependencies.pipeline_admission is not None
     assert dependencies.pipeline_admission.in_flight == 0
+    assert dependencies.pipeline_admission.blocking_in_flight == 0
+    assert dependencies.pipeline_admission.service_owner_in_flight == 0
 
 
 async def test_pipeline_deadline_includes_admission_wait(monkeypatch):
@@ -1511,17 +2047,25 @@ async def test_pipeline_deadline_includes_admission_wait(monkeypatch):
         cache_key_factory=lambda *parts: ":".join(parts),
     )
     assert deps.pipeline_admission is not None
+    root_handle = deps.start_runtime_root()
+    assert root_handle is not None
     active_lease = await deps.pipeline_admission.acquire()
 
     async def unexpected_inner(*_args, **_kwargs):
         raise AssertionError("pipeline started after its admission deadline")
 
     monkeypatch.setattr("tacit.pipeline.runner._run_pipeline_inner", unexpected_inner)
-    with pytest.raises(PipelineAdmissionRejected) as exc_info:
-        await run_pipeline(_request(), deps)
+    try:
+        with pytest.raises(PipelineAdmissionRejected) as exc_info:
+            await run_pipeline(_request(), deps)
+    finally:
+        deps.pipeline_admission.release(active_lease)
+        await deps.stop_runtime_root(root_handle)
 
     assert exc_info.value.reason_code == "pipeline_admission_wait_timeout"
-    deps.pipeline_admission.release(active_lease)
+    graph = deps.pipeline_admission.execution_graph
+    assert graph.root_state == "closed"
+    assert graph.root_owner_count == 0
 
 
 def test_pipeline_timing_diagnostics_preserve_sub_ten_millisecond_stages():
@@ -1559,7 +2103,7 @@ def test_safe_finish_timeout_history_swallows_noncritical_errors():
     )
 
 
-async def test_pipeline_threads_resolved_tenant_through_run_and_recorder_history_writes():
+async def test_pipeline_threads_resolved_tenant_through_run_and_recorder_history_writes(tmp_path):
     class TrackingHistory:
         def __init__(self):
             self.calls: list[tuple[str, str | None]] = []
@@ -1586,6 +2130,9 @@ async def test_pipeline_threads_resolved_tenant_through_run_and_recorder_history
         knowledge_tenant_id="*",
         api_auth_enabled=True,
         grafana_enabled=False,
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
     )
     _own_store(history, runtime_settings, "history")
     response = await run_pipeline(
@@ -1642,8 +2189,10 @@ def test_safe_record_provenance_swallows_noncritical_errors():
 async def test_safe_close_backends_closes_all_and_swallows_errors():
     good = FakeBackend()
     bad = FakeBackend(fail_close=True)
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
 
-    await safe_close_backends([bad, good])
+    async with lifecycle.slot():
+        await safe_close_backends([bad, good], lifecycle=lifecycle)
 
     assert bad.closed is True
     assert good.closed is True

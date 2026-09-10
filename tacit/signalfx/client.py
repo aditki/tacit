@@ -111,6 +111,7 @@ class SignalFxClient:
             base_url=self.base_url,
             headers=self._headers,
             timeout=30.0,
+            trust_env=False,
         )
 
     # ── Low-level helpers ────────────────────────────────────────────────

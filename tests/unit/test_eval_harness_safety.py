@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -165,11 +166,10 @@ def test_prompt_variation_uses_dependency_owned_provider_and_settings(tmp_path, 
     "prompts",
     [
         [],
-        [{"class": "positive", "text": "checkout latency"}],
         [{"class": "negative", "text": "database saturation"}],
     ],
 )
-def test_prompt_variation_rejects_empty_or_one_sided_corpus_before_provider_access(
+def test_prompt_variation_rejects_empty_or_negative_only_corpus_before_provider_access(
     tmp_path,
     monkeypatch,
     prompts,
@@ -184,7 +184,7 @@ def test_prompt_variation_rejects_empty_or_one_sided_corpus_before_provider_acce
 
     monkeypatch.setattr(prompt_variation_harness, "cold_isolation", forbidden_isolation)
 
-    with pytest.raises(ValueError, match="positive and negative populations"):
+    with pytest.raises(ValueError, match="positive population"):
         asyncio.run(
             prompt_variation_harness.run(
                 1,
@@ -197,6 +197,81 @@ def test_prompt_variation_rejects_empty_or_one_sided_corpus_before_provider_acce
         )
 
     assert provider_accesses == []
+
+
+def test_prompt_variation_allows_the_default_positive_development_corpus(monkeypatch) -> None:
+    observed: list[Path] = []
+
+    async def report(_trials, corpus_path, *, endpoints=None):
+        observed.append(corpus_path)
+        return {"role": "development", "passed": True, "results": []}
+
+    monkeypatch.setattr(prompt_variation_harness, "run", report)
+
+    assert prompt_variation_harness.main([]) == 0
+    assert observed == [prompt_variation_harness.DEFAULT_CORPUS]
+
+
+def test_prompt_variation_acquires_and_releases_exact_provider_lease(monkeypatch, tmp_path) -> None:
+    corpus = tmp_path / "prompt.json"
+    corpus.write_text(
+        json.dumps(
+            {
+                "role": "development",
+                "prompts": [{"class": "cache", "text": "checkout latency", "expected": {}}],
+            }
+        )
+    )
+    events: list[object] = []
+    lease = object()
+    provider = object()
+
+    class Dependencies:
+        llm_cache = SimpleNamespace(invalidate=lambda: None)
+
+        async def acquire_resources(self):
+            await asyncio.sleep(0)
+            events.append("acquired")
+            return lease
+
+        def llm_provider_factory(self):
+            assert events == ["acquired"]
+            events.append("realized")
+            return provider
+
+        async def close_resources(self, handle):
+            events.append(("closed", handle))
+
+    state = SimpleNamespace(
+        dependencies=Dependencies(),
+        settings=SimpleNamespace(llm_provider="ollama", llm_model="local-model"),
+    )
+
+    @contextlib.contextmanager
+    def isolated(**_kwargs):
+        yield state
+
+    async def classify(*_args, **kwargs):
+        assert kwargs["provider"] is provider
+        return SimpleNamespace(), SimpleNamespace()
+
+    monkeypatch.setattr(prompt_variation_harness, "cold_isolation", isolated)
+    monkeypatch.setattr(prompt_variation_harness, "classify_intent", classify)
+    monkeypatch.setattr(prompt_variation_harness, "_evaluate", lambda _intent, _item: (True, {}))
+
+    report = asyncio.run(
+        prompt_variation_harness.run(
+            1,
+            corpus,
+            endpoints=prompt_variation_harness.LocalEvaluationEndpoints(
+                llm_api_base="http://127.0.0.1:11434",
+                llm_model="local-model",
+            ),
+        )
+    )
+
+    assert report["passed"] is True
+    assert events == ["acquired", "realized", ("closed", lease)]
 
 
 def test_prompt_variation_classifier_errors_are_failed_trials(tmp_path, monkeypatch) -> None:

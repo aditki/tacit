@@ -175,7 +175,18 @@ def test_system_archetype_signal_and_auth_endpoints(isolated_learning_runtime, m
     signal_store, _history_store, _feedback_store, _archetypes_path, _quarantine_path = isolated_learning_runtime
     client = TestClient(app)
 
-    assert client.get("/healthz").json() == {"status": "ok"}
+    health = client.get("/healthz").json()
+    assert health["status"] == "ok"
+    admission = health["request_body_admission"]
+    assert admission["active_requests"] == 0
+    assert admission["reserved_bytes"] == 0
+    assert admission["active_tenant_partitions"] == 0
+    assert admission["rejections"] == {}
+    assert admission["max_concurrent"] > 0
+    assert admission["max_buffered_bytes"] > 0
+    # This client does not enter the app lifespan. A cold health probe must not
+    # create pipeline authority solely to report it.
+    assert "pipeline_admission" not in health
 
     archetypes = client.get("/api/v1/archetypes")
     assert archetypes.status_code == 200

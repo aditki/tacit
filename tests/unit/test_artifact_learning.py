@@ -154,7 +154,11 @@ def test_direct_artifact_learning_never_probes_injected_service_private_store(
     store = _DescriptorOnlySignalStore(real_store)
     service = _DescriptorOnlyKnowledgeService(
         KnowledgeService(
-            KnowledgeRepository(database_path),
+            KnowledgeRepository(
+                database_path,
+                runtime_settings=runtime_settings,
+                signal_store=real_store,
+            ),
             signal_store=real_store,
             runtime_settings=runtime_settings,
         )
@@ -1340,11 +1344,16 @@ def test_artifact_generation_rolls_back_when_governed_lifecycle_fails(tmp_path, 
         db_path=tmp_path / "signals.db",
         runtime_settings=runtime_settings,
     )
-    repository = KnowledgeRepository(store._db_path)
+    active_settings = store.runtime_settings
+    repository = KnowledgeRepository(
+        store._db_path,
+        runtime_settings=active_settings,
+        signal_store=store,
+    )
     service = KnowledgeService(
         repository,
         signal_store=store,
-        runtime_settings=runtime_settings,
+        runtime_settings=active_settings,
     )
     artifact = _artifact("## Checks\n- check redis_cache_misses_total")
 

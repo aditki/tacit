@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import errno
 import json
 import os
+import stat
+import tempfile
 import webbrowser
 from collections.abc import Callable
 from concurrent.futures import Future
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +21,81 @@ import yaml
 # ── Constants ────────────────────────────────────────────────────────────────
 TACIT_HOME = Path.home() / ".tacit"
 CONFIG_FILE = TACIT_HOME / "config.yaml"
+_BEDROCK_DOCTOR_TIMEOUT_SECONDS = 15.0
+_SECRET_FILE_MAX_BYTES = 1024 * 1024
+
+_BEDROCK_DOCTOR_REMEDIATION = {
+    "credentials": (
+        "LLM: bedrock validation failed (credentials). Check the admitted AWS credential source "
+        "and, when configured, the role trust policy."
+    ),
+    "role/trust": (
+        "LLM: bedrock validation failed (role/trust). Check the configured role ARN, role trust "
+        "policy, and STS assume-role permission."
+    ),
+    "model/access/configuration": (
+        "LLM: bedrock validation failed (model/access/configuration). Check LLM_BEDROCK_MODEL_ID, "
+        "LLM_BEDROCK_REGION, model access, and bedrock:InvokeModel permission."
+    ),
+    "timeout/unavailable": (
+        "LLM: bedrock validation failed (timeout/unavailable). Check network reachability and "
+        "Bedrock availability in the configured region, then retry."
+    ),
+}
+
+
+class SecretFileWriteOutcome(StrEnum):
+    """Observable publication state for one atomic secret-file replacement."""
+
+    DURABLE = "durable"
+    PUBLISHED_DURABILITY_UNCERTAIN = "published_durability_uncertain"
+
+
+def _bedrock_doctor_failure_message(exc: Exception) -> str:
+    """Return bounded remediation without rendering vendor-controlled details."""
+    error_name = type(exc).__name__.casefold()
+    response = getattr(exc, "response", None)
+    error = response.get("Error", {}) if isinstance(response, dict) else {}
+    code_value = error.get("Code", "") if isinstance(error, dict) else ""
+    error_code = code_value[:128].casefold() if isinstance(code_value, str) else ""
+    operation_value = getattr(exc, "operation_name", "")
+    operation_name = operation_value[:128].casefold() if isinstance(operation_value, str) else ""
+    detail = " ".join(argument[:256] for argument in exc.args[:2] if isinstance(argument, str)).casefold()
+
+    credential_markers = (
+        "credential",
+        "nocredentials",
+        "partialcredentials",
+        "expiredtoken",
+        "invalidclienttoken",
+        "unrecognizedclient",
+        "signaturedoesnotmatch",
+    )
+    unavailable_markers = (
+        "timeout",
+        "deadline",
+        "endpointconnection",
+        "connectionclosed",
+        "serviceunavailable",
+        "internalserver",
+        "throttl",
+    )
+    sts_role_operations = {"assumerole", "assumerolewithwebidentity"}
+    sts_role_error_codes = {
+        "accessdenied",
+        "accessdeniedexception",
+        "idprejectedclaim",
+        "invalididentitytoken",
+    }
+    if any(marker in error_name or marker in error_code or marker in detail for marker in credential_markers):
+        category = "credentials"
+    elif any(marker in error_name or marker in error_code or marker in detail for marker in unavailable_markers):
+        category = "timeout/unavailable"
+    elif operation_name in sts_role_operations and error_code in sts_role_error_codes:
+        category = "role/trust"
+    else:
+        category = "model/access/configuration"
+    return _BEDROCK_DOCTOR_REMEDIATION[category]
 
 
 def _get_version() -> str:
@@ -42,7 +122,13 @@ def _get_version() -> str:
                 return match.group(1)
     except Exception:
         pass
-    return "0.0.0-dev"
+    # 3. Frozen binaries do not carry distribution metadata or pyproject.toml.
+    try:
+        from tacit import __version__
+
+        return __version__
+    except Exception:
+        return "0.0.0-dev"
 
 
 VERSION = _get_version()
@@ -115,10 +201,142 @@ def _prompt(text: str, default: str = "") -> str:
     return click.prompt(f"  {text}", default=default)
 
 
+def _prompt_secret(text: str) -> str:
+    """Interactive secret prompt that never echoes credential material."""
+    if Prompt is not None:
+        return Prompt.ask(f"  {text}", password=True) or ""
+    return click.prompt(f"  {text}", default="", hide_input=True, show_default=False)
+
+
 def _confirm(text: str, default: bool = True) -> bool:
     if Confirm is not None:
         return Confirm.ask(f"  {text}", default=default)
     return click.confirm(f"  {text}", default=default)
+
+
+def _validate_secret_destination(path: Path) -> None:
+    """Reject destinations that could redirect or block secret-file access."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode):
+        raise click.ClickException(f"Refusing to access secret-file symlink: {path}")
+    if not stat.S_ISREG(mode):
+        raise click.ClickException(f"Refusing to access non-regular secret file: {path}")
+
+
+def _read_secret_file(path: Path) -> str:
+    """Read an existing secret file without following a destination symlink."""
+    _validate_secret_destination(path)
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise click.ClickException(f"Refusing to access secret-file symlink: {path}") from exc
+        raise
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise click.ClickException(f"Refusing to access non-regular secret file: {path}")
+        if metadata.st_size > _SECRET_FILE_MAX_BYTES:
+            raise click.ClickException("Secret file exceeds the supported size limit")
+        remaining = _SECRET_FILE_MAX_BYTES + 1
+        chunks: list[bytes] = []
+        while remaining > 0:
+            chunk = os.read(fd, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > _SECRET_FILE_MAX_BYTES:
+            raise click.ClickException("Secret file exceeds the supported size limit")
+        return payload.decode("utf-8")
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_secret_file(path: Path, content: str) -> SecretFileWriteOutcome:
+    """Atomically publish a secret file and report whether its directory synced."""
+    path = Path(path)
+    _validate_secret_destination(path)
+    payload = content.encode("utf-8")
+    if len(payload) > _SECRET_FILE_MAX_BYTES:
+        raise click.ClickException("Secret file exceeds the supported size limit")
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    replaced = False
+    try:
+        os.fchmod(fd, 0o600)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(fd, payload[offset:])
+            if written <= 0:
+                raise OSError("Secret-file write made no progress")
+            offset += written
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+
+        # A path swap to a symlink cannot redirect os.replace, but rejecting it
+        # preserves the CLI's explicit no-symlink contract.
+        _validate_secret_destination(path)
+        os.replace(temporary_path, path)
+        replaced = True
+
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = -1
+        directory_sync_failed = False
+        try:
+            directory_fd = os.open(path.parent, directory_flags)
+            os.fsync(directory_fd)
+        except OSError:
+            directory_sync_failed = True
+        finally:
+            if directory_fd >= 0:
+                try:
+                    os.close(directory_fd)
+                except OSError:
+                    directory_sync_failed = True
+        if directory_sync_failed:
+            return SecretFileWriteOutcome.PUBLISHED_DURABILITY_UNCERTAIN
+        return SecretFileWriteOutcome.DURABLE
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if not replaced:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _write_env_values(
+    path: Path,
+    values: dict[str, Any],
+    *,
+    header: str,
+) -> SecretFileWriteOutcome:
+    lines = [header, *(f"{key}={value}" for key, value in values.items())]
+    outcome = _atomic_write_secret_file(path, "\n".join(lines) + "\n")
+    if outcome is SecretFileWriteOutcome.PUBLISHED_DURABILITY_UNCERTAIN:
+        _warn(
+            f"Secret update is already visible at {path}, but parent-directory durability "
+            "could not be confirmed; do not retry automatically."
+        )
+    return outcome
 
 
 # ── CLI Group ────────────────────────────────────────────────────────────────
@@ -157,11 +375,11 @@ def init(non_interactive: bool):
         yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
 
     env_path = TACIT_HOME / ".env"
-    with open(env_path, "w") as f:
-        f.write("# Tacit secrets — generated by `tacit init`\n")
-        for k, v in secrets.items():
-            f.write(f"{k}={v}\n")
-    env_path.chmod(0o600)
+    _write_env_values(
+        env_path,
+        secrets,
+        header="# Tacit secrets — generated by `tacit init`",
+    )
 
     _success(f"Config written to {CONFIG_FILE}")
     _success(f"Secrets written to {env_path}")
@@ -220,10 +438,19 @@ def _interactive_setup() -> dict:
     elif config["llm_provider"] == "bedrock":
         config["llm_api_base"] = ""
         config["llm_bedrock_region"] = _prompt("AWS region", "us-east-1")
-        config["llm_bedrock_role_arn"] = _prompt("IAM role ARN to assume (leave empty for default chain)", "")
-        if _confirm("Use explicit AWS access keys? (No = use IAM role/instance profile)", default=False):
+        _info(
+            "Supported AWS credentials: explicit or environment credentials, a static profile, "
+            "a static-source assume-role profile, or web identity."
+        )
+        _info("AWS SSO, credential_process, ECS credentials, and instance metadata are not supported.")
+        config["llm_bedrock_role_arn"] = _prompt(
+            "Optional IAM role ARN to assume after resolving a supported base credential source",
+            "",
+        )
+        if _confirm("Use explicit AWS access keys? (No = use one of the supported external sources)", default=False):
             config["llm_aws_access_key_id"] = _prompt("AWS Access Key ID", "")
-            config["llm_aws_secret_access_key"] = _prompt("AWS Secret Access Key", "")
+            config["llm_aws_secret_access_key"] = _prompt_secret("AWS Secret Access Key")
+            config["llm_aws_session_token"] = _prompt_secret("AWS Session Token (leave empty for long-lived keys)")
     else:
         config["llm_api_base"] = ""
 
@@ -261,6 +488,7 @@ def _split_config(config: dict) -> tuple[dict, dict]:
         "signalfx_api_token": "SIGNALFX_API_TOKEN",
         "llm_aws_access_key_id": "LLM_AWS_ACCESS_KEY_ID",
         "llm_aws_secret_access_key": "LLM_AWS_SECRET_ACCESS_KEY",
+        "llm_aws_session_token": "LLM_AWS_SESSION_TOKEN",
     }
     yaml_config: dict = {}
     secrets: dict = {}
@@ -324,6 +552,7 @@ def doctor(tenant: str | None):
     _header("Tacit Doctor")
     _load_env()
     stores, selected_tenant = _cli_knowledge_read_context(tenant)
+    runtime_settings = stores.settings
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -362,20 +591,14 @@ def doctor(tenant: str | None):
 
     # ── Parallel network checks ───────────────────────────────────────
     # Run Grafana, LLM, and SignalFx checks concurrently to reduce wall time
-    sfx_enabled = False
-    try:
-        from tacit.config import settings as _sfx_settings
-
-        sfx_enabled = _sfx_settings.signalfx_enabled and bool(_sfx_settings.signalfx_api_token)
-    except Exception:
-        pass
+    sfx_enabled = runtime_settings.signalfx_enabled and bool(runtime_settings.signalfx_api_token)
 
     network_checks: dict[str, Callable[[], bool]] = {
-        "grafana": _check_grafana,
-        "llm": _check_llm,
+        "grafana": lambda: _check_grafana(runtime_settings),
+        "llm": lambda: _check_llm(runtime_settings),
     }
     if sfx_enabled:
-        network_checks["signalfx"] = _check_signalfx
+        network_checks["signalfx"] = lambda: _check_signalfx(runtime_settings)
 
     network_results: dict[str, bool] = {}
     with ThreadPoolExecutor(max_workers=len(network_checks)) as pool:
@@ -391,7 +614,7 @@ def doctor(tenant: str | None):
 
     # Zero-key mode downgrades a missing LLM key from fatal to warning:
     # deterministic intent + the archetype engine still produce dashboards.
-    llm_zero_key = _llm_zero_key_mode()
+    llm_zero_key = _llm_zero_key_mode(runtime_settings)
 
     checks_total += len(network_checks)
     for name, ok in network_results.items():
@@ -406,7 +629,7 @@ def doctor(tenant: str | None):
     ds_ok = False
     if grafana_ok:
         checks_total += 1
-        ds_ok = _check_datasources()
+        ds_ok = _check_datasources(runtime_settings)
         if ds_ok:
             checks_passed += 1
         else:
@@ -491,7 +714,10 @@ def doctor(tenant: str | None):
         if "signalfx" in fatal_failures:
             _info("Run `tacit connect signalfx` to fix SignalFx connection")
         if "llm" in fatal_failures:
-            _info("Check your LLM_API_KEY in ~/.tacit/.env")
+            if runtime_settings.llm_provider.casefold() == "bedrock":
+                _info("Configure one of the supported AWS credential sources shown by `tacit init`")
+            else:
+                _info("Check your LLM_API_KEY in ~/.tacit/.env")
     if warnings:
         _warn(f"Warnings: {', '.join(warnings)}")
 
@@ -532,32 +758,70 @@ def _require_cli_knowledge_action(action: Any, runtime_settings: Any) -> None:
         raise click.ClickException(str(exc).replace("Missing permission", "missing permission")) from exc
 
 
-def _llm_zero_key_mode() -> bool:
+def _llm_zero_key_mode(runtime_settings: Any) -> bool:
     """True only when deterministic fallback applies to a key-based provider."""
     try:
         from tacit.agents.intent_fallback import zero_key_mode
-        from tacit.config import settings
 
-        return settings.intent_fallback_enabled and zero_key_mode(settings)
+        return runtime_settings.intent_fallback_enabled and zero_key_mode(runtime_settings)
     except Exception:
         return False
 
 
-def _check_grafana() -> bool:
+def _credentialed_remote_get(
+    *,
+    base_url: str,
+    path: str,
+    headers: dict[str, str],
+    timeout: float,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    """Perform one credentialed CLI probe against a pinned remote origin."""
+    import httpx
+
+    from tacit.errors import RuntimeOwnershipError
+    from tacit.runtime_ownership import canonical_remote_endpoint
+
+    canonical_base = canonical_remote_endpoint(base_url)
+    if (
+        not path.startswith("/")
+        or path.startswith("//")
+        or "?" in path
+        or "#" in path
+        or any(character.isspace() or ord(character) < 32 for character in path)
+    ):
+        raise RuntimeOwnershipError("remote probe path is invalid")
+    endpoint = canonical_remote_endpoint(f"{canonical_base}{path}")
+    with httpx.Client(timeout=timeout, trust_env=False, follow_redirects=False) as client:
+        return client.get(endpoint, headers=headers, params=params)
+
+
+def _signalfx_api_base(realm: str) -> str:
+    """Return the fixed SignalFx API origin for one validated realm."""
+    from tacit.runtime_ownership import canonical_signalfx_realm
+
+    canonical_realm = canonical_signalfx_realm(realm)
+    return f"https://api.{canonical_realm}.signalfx.com"
+
+
+def _check_grafana(runtime_settings: Any) -> bool:
     try:
-        import httpx
+        from tacit.runtime_ownership import canonical_remote_endpoint
 
-        from tacit.config import settings
-
-        url = settings.grafana_url.rstrip("/")
-        api_key = settings.grafana_api_key
+        url = canonical_remote_endpoint(runtime_settings.grafana_url)
+        api_key = runtime_settings.grafana_api_key
 
         if not api_key:
             _warn("Grafana: no API key configured")
             return False
 
         headers = {"Authorization": f"Bearer {api_key}"}
-        resp = httpx.get(f"{url}/api/org", headers=headers, timeout=10)
+        resp = _credentialed_remote_get(
+            base_url=url,
+            path="/api/org",
+            headers=headers,
+            timeout=10.0,
+        )
         if resp.status_code == 200:
             org = resp.json()
             _success(f'Grafana: connected to "{org.get("name", "unknown")}" at {url}')
@@ -570,15 +834,18 @@ def _check_grafana() -> bool:
         return False
 
 
-def _check_datasources() -> bool:
+def _check_datasources(runtime_settings: Any) -> bool:
     try:
-        import httpx
+        from tacit.runtime_ownership import canonical_remote_endpoint
 
-        from tacit.config import settings
-
-        url = settings.grafana_url.rstrip("/")
-        headers = {"Authorization": f"Bearer {settings.grafana_api_key}"}
-        resp = httpx.get(f"{url}/api/datasources", headers=headers, timeout=10)
+        url = canonical_remote_endpoint(runtime_settings.grafana_url)
+        headers = {"Authorization": f"Bearer {runtime_settings.grafana_api_key}"}
+        resp = _credentialed_remote_get(
+            base_url=url,
+            path="/api/datasources",
+            headers=headers,
+            timeout=10.0,
+        )
         if resp.status_code == 200:
             ds_list = resp.json()
             types: dict[str, int] = {}
@@ -596,21 +863,19 @@ def _check_datasources() -> bool:
         return False
 
 
-def _check_llm() -> bool:
+def _check_llm(runtime_settings: Any) -> bool:
     try:
-        from tacit.config import settings
-
-        provider = settings.llm_provider.lower()
-        api_key = settings.llm_api_key
-        model = settings.llm_model
-        api_base = settings.llm_api_base
+        provider = runtime_settings.llm_provider.lower()
+        api_key = runtime_settings.llm_api_key
+        model = runtime_settings.llm_model
+        api_base = runtime_settings.llm_api_base
 
         if provider == "openai" and api_base:
             _success(f"LLM: {provider} / {model} at {api_base} (OpenAI-compatible endpoint configured)")
             return True
 
         if not api_key and provider not in ("ollama", "bedrock"):
-            if settings.intent_fallback_enabled:
+            if runtime_settings.intent_fallback_enabled:
                 _warn(
                     f"LLM: no API key for {provider} — zero-key mode active "
                     "(deterministic intent + archetype engine only)"
@@ -628,46 +893,62 @@ def _check_llm() -> bool:
             return True
         elif provider == "bedrock":
             try:
-                import boto3
+                import asyncio
+                import importlib.util
 
-                session_kwargs: dict = {"region_name": settings.llm_bedrock_region}
-                if settings.llm_aws_access_key_id:
-                    session_kwargs["aws_access_key_id"] = settings.llm_aws_access_key_id
-                    session_kwargs["aws_secret_access_key"] = settings.llm_aws_secret_access_key
-                session = boto3.Session(**session_kwargs)
-                # Mirror _build_boto3_session: assume role if configured
-                if settings.llm_bedrock_role_arn:
-                    sts = session.client("sts")
-                    assumed = sts.assume_role(
-                        RoleArn=settings.llm_bedrock_role_arn,
-                        RoleSessionName="tacit-bedrock",
-                        DurationSeconds=3600,
-                    )
-                    creds = assumed["Credentials"]
-                    session = boto3.Session(
-                        aws_access_key_id=creds["AccessKeyId"],
-                        aws_secret_access_key=creds["SecretAccessKey"],
-                        aws_session_token=creds["SessionToken"],
-                        region_name=settings.llm_bedrock_region,
-                    )
-                sts = session.client("sts")
-                identity = sts.get_caller_identity()
-                account = identity.get("Account", "?")
-                model_id = settings.llm_bedrock_model_id or model
-                _success(f"LLM: bedrock / {model_id} (AWS account {account}, region {settings.llm_bedrock_region})")
+                from tacit.agents.providers.bedrock import BedrockProvider
+                from tacit.runtime_ownership import BedrockCredentialPlan
+
+                diagnostic_settings = runtime_settings.model_copy(
+                    update={
+                        "pipeline_timeout_seconds": min(
+                            float(runtime_settings.pipeline_timeout_seconds),
+                            _BEDROCK_DOCTOR_TIMEOUT_SECONDS,
+                        )
+                    }
+                )
+                credential_plan = BedrockCredentialPlan.capture(diagnostic_settings).as_cross_generation_declaration()
+                if importlib.util.find_spec("boto3") is None:
+                    raise ImportError("boto3 is unavailable")
+                bedrock = BedrockProvider(credential_plan=credential_plan)
+
+                async def validate_bedrock() -> None:
+                    try:
+                        result = await bedrock.chat_text(
+                            "This is a bounded connectivity diagnostic. Reply with exactly OK.",
+                            "OK",
+                            temperature=0.0,
+                        )
+                        if not result.text.strip():
+                            raise RuntimeError("Bedrock returned an empty diagnostic response")
+                    finally:
+                        await bedrock.close()
+
+                asyncio.run(validate_bedrock())
+                model_id = runtime_settings.llm_bedrock_model_id or model
+                _success(
+                    f"LLM: bedrock / {model_id} "
+                    f"(credential plan and model access validated in {runtime_settings.llm_bedrock_region})"
+                )
                 return True
             except ImportError:
-                _fail("LLM: bedrock requires boto3 — uv sync --extra bedrock (or pip install 'tacit[bedrock]')")
+                _fail(
+                    "LLM: bedrock requires the pinned Bedrock extra — "
+                    "uv sync --extra bedrock (or pip install 'tacit-ai[bedrock]')"
+                )
                 return False
             except Exception as be:
-                _fail(f"LLM: bedrock AWS auth failed — {be}")
+                _fail(_bedrock_doctor_failure_message(be))
                 return False
         elif provider == "ollama":
-            import httpx
-
-            base = settings.llm_api_base or "http://localhost:11434"
+            base = runtime_settings.llm_api_base or "http://localhost:11434"
             try:
-                resp = httpx.get(f"{base}/api/tags", timeout=5)
+                resp = _credentialed_remote_get(
+                    base_url=base,
+                    path="/api/tags",
+                    headers={},
+                    timeout=5.0,
+                )
                 if resp.status_code == 200:
                     _success(f"LLM: ollama at {base} / {model}")
                     return True
@@ -695,23 +976,22 @@ def _check_archetypes() -> bool:
         return False
 
 
-def _check_signalfx() -> bool:
+def _check_signalfx(runtime_settings: Any) -> bool:
     try:
-        import httpx
+        from tacit.runtime_ownership import canonical_signalfx_realm
 
-        from tacit.config import settings
-
-        realm = settings.signalfx_realm
-        token = settings.signalfx_api_token
+        realm = canonical_signalfx_realm(runtime_settings.signalfx_realm)
+        token = runtime_settings.signalfx_api_token
         if not token:
             _warn("SignalFx: no API token configured")
             return False
 
-        resp = httpx.get(
-            f"https://api.{realm}.signalfx.com/v2/metric",
+        resp = _credentialed_remote_get(
+            base_url=_signalfx_api_base(realm),
+            path="/v2/metric",
             headers={"X-SF-TOKEN": token},
             params={"query": "*", "limit": 1},
-            timeout=10,
+            timeout=10.0,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -753,12 +1033,17 @@ def connect_grafana(url: str | None, api_key: str | None):
         _fail("API key is required")
         return
 
-    # Test connection
-    import httpx
-
     try:
+        from tacit.runtime_ownership import canonical_remote_endpoint
+
+        url = canonical_remote_endpoint(url)
         headers = {"Authorization": f"Bearer {api_key}"}
-        resp = httpx.get(f"{url.rstrip('/')}/api/org", headers=headers, timeout=10)
+        resp = _credentialed_remote_get(
+            base_url=url,
+            path="/api/org",
+            headers=headers,
+            timeout=10.0,
+        )
         if resp.status_code != 200:
             _fail(f"Connection failed: HTTP {resp.status_code}")
             return
@@ -770,7 +1055,12 @@ def connect_grafana(url: str | None, api_key: str | None):
 
     # Discover datasources
     try:
-        resp = httpx.get(f"{url.rstrip('/')}/api/datasources", headers=headers, timeout=10)
+        resp = _credentialed_remote_get(
+            base_url=url,
+            path="/api/datasources",
+            headers=headers,
+            timeout=10.0,
+        )
         if resp.status_code == 200:
             ds_list = resp.json()
             _success(f"Found {len(ds_list)} datasources:")
@@ -805,15 +1095,16 @@ def connect_signalfx(token: str | None, realm: str | None):
         _fail("API token is required")
         return
 
-    # Test connection
-    import httpx
-
     try:
-        resp = httpx.get(
-            f"https://api.{realm}.signalfx.com/v2/metric",
+        from tacit.runtime_ownership import canonical_signalfx_realm
+
+        realm = canonical_signalfx_realm(realm)
+        resp = _credentialed_remote_get(
+            base_url=_signalfx_api_base(realm),
+            path="/v2/metric",
             headers={"X-SF-TOKEN": token},
             params={"query": "*", "limit": 1},
-            timeout=10,
+            timeout=10.0,
         )
         if resp.status_code == 401:
             _fail("Authentication failed — check your API token")
@@ -869,18 +1160,13 @@ def _update_env(updates: dict):
     """Merge key=value pairs into ~/.tacit/.env."""
     env_path = TACIT_HOME / ".env"
     existing: dict = {}
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                existing[k.strip()] = v.strip()
+    for line in _read_secret_file(env_path).splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            existing[k.strip()] = v.strip()
     existing.update(updates)
-    with open(env_path, "w") as f:
-        f.write("# Tacit secrets\n")
-        for k, v in existing.items():
-            f.write(f"{k}={v}\n")
-    env_path.chmod(0o600)
+    _write_env_values(env_path, existing, header="# Tacit secrets")
 
 
 # ── tacit test ───────────────────────────────────────────────────────────
@@ -911,21 +1197,28 @@ def investigate(prompt: str | None, json_output: bool, open_browser: bool, tenan
 
     from tacit.dependencies import build_pipeline_dependencies
 
-    deps = build_pipeline_dependencies(stores.settings, stores=stores)
-
     async def _run():
         from tacit.models.schemas import DashRequest
         from tacit.pipeline import run_pipeline
+        from tacit.pipeline_admission import release_runtime_root_with_startup_retry
 
-        result = await run_pipeline(DashRequest(prompt=prompt, user_id="cli", tenant_id=tenant_id), deps)
-        contract = None
-        if result.investigation_id:
-            contract = stores.history().get_contract(
-                result.investigation_id,
-                result.investigation_revision,
-                tenant_id=tenant_id,
+        root_handle = stores.start_runtime_services()
+        try:
+            deps = build_pipeline_dependencies(stores.settings, stores=stores)
+            result = await run_pipeline(DashRequest(prompt=prompt, user_id="cli", tenant_id=tenant_id), deps)
+            contract = None
+            if result.investigation_id:
+                contract = stores.history().get_contract(
+                    result.investigation_id,
+                    result.investigation_revision,
+                    tenant_id=tenant_id,
+                )
+            return result, contract
+        finally:
+            await release_runtime_root_with_startup_retry(
+                stores.shutdown_runtime_services,
+                root_handle,
             )
-        return result, contract
 
     try:
         result, contract = asyncio.run(_run())
@@ -980,16 +1273,22 @@ def test_run(prompt: str | None, open_browser: bool, tenant: str | None):
 
     from tacit.dependencies import build_pipeline_dependencies
 
-    deps = build_pipeline_dependencies(stores.settings, stores=stores)
-
     async def _run():
         from tacit.models.schemas import DashRequest
         from tacit.pipeline import run_pipeline
+        from tacit.pipeline_admission import release_runtime_root_with_startup_retry
 
-        req = DashRequest(prompt=prompt, tenant_id=tenant_id)
-        _info("Running pipeline...")
-        result = await run_pipeline(req, deps)
-        return result
+        root_handle = stores.start_runtime_services()
+        try:
+            deps = build_pipeline_dependencies(stores.settings, stores=stores)
+            req = DashRequest(prompt=prompt, tenant_id=tenant_id)
+            _info("Running pipeline...")
+            return await run_pipeline(req, deps)
+        finally:
+            await release_runtime_root_with_startup_retry(
+                stores.shutdown_runtime_services,
+                root_handle,
+            )
 
     try:
         result = asyncio.run(_run())
@@ -1057,7 +1356,11 @@ def benchmark_learning():
 @click.option("--down", "tear_down", is_flag=True, help="Tear down the demo stack and exit")
 @click.option("--no-build", is_flag=True, help="Skip docker image rebuild (faster restarts)")
 @click.option("--skip-generate", is_flag=True, help="Run only the learning flow, skip dashboard generation")
-@click.option("--open-browser/--no-open-browser", default=True, help="Open the generated dashboard")
+@click.option(
+    "--open-browser/--no-open-browser",
+    default=True,
+    help="Open the authenticated Web UI and generated dashboard",
+)
 @click.option("--prompt", "-p", default=None, help="Custom incident prompt for generation")
 def demo(tear_down: bool, no_build: bool, skip_generate: bool, open_browser: bool, prompt: str | None):
     """Run the checkout-incident demo end to end with one command.
@@ -1080,7 +1383,11 @@ def demo(tear_down: bool, no_build: bool, skip_generate: bool, open_browser: boo
 
     if tear_down:
         _header("Tearing down demo stack")
-        demo_flow.compose_down(root, echo=_info)
+        try:
+            demo_flow.compose_down(root, echo=_info)
+        except demo_flow.DemoError as exc:
+            _fail(str(exc))
+            raise SystemExit(1)
         _success("Demo stack stopped")
         return
 
@@ -1106,6 +1413,11 @@ def demo(tear_down: bool, no_build: bool, skip_generate: bool, open_browser: boo
 
         if skip_generate:
             _header("Done (generation skipped)")
+            if open_browser:
+                demo_flow.open_authenticated_demo_ui(
+                    demo_flow.DEFAULT_API_URL,
+                    api_key=os.environ["API_AUTH_KEY"],
+                )
             _info(f"Web UI:  {demo_flow.DEFAULT_API_URL}")
             _info(f"Grafana: {demo_flow.DEFAULT_GRAFANA_URL}")
             return
@@ -1133,6 +1445,10 @@ def demo(tear_down: bool, no_build: bool, skip_generate: bool, open_browser: boo
         _info(f"History:   {demo_flow.DEFAULT_API_URL} → History tab")
         _info("Tear down anytime with: tacit demo --down")
         if open_browser:
+            demo_flow.open_authenticated_demo_ui(
+                demo_flow.DEFAULT_API_URL,
+                api_key=os.environ["API_AUTH_KEY"],
+            )
             webbrowser.open(dashboard_url)
 
     except demo_flow.DemoError as exc:
@@ -1155,6 +1471,9 @@ def assess(as_json: bool, with_llm: bool, tenant: str | None):
 
     Add --llm for an optional narrative (requires a configured LLM key).
     """
+    if as_json and with_llm:
+        raise click.UsageError("--json and --llm cannot be used together")
+
     _load_env()
     from tacit.assess import build_assessment
 
@@ -1228,21 +1547,30 @@ def assess(as_json: bool, with_llm: bool, tenant: str | None):
 
     if with_llm:
         from tacit.agents.intent_fallback import zero_key_mode
-        from tacit.config import settings as runtime_settings
 
+        runtime_settings = stores.settings
         if zero_key_mode(runtime_settings):
-            _warn("--llm requires a configured LLM API key; the deterministic report above is complete without it.")
-            return
+            raise click.ClickException("--llm requires a configured LLM provider")
         _header("LLM Narrative")
-        import asyncio
 
         from tacit.assess import narrate_assessment
+        from tacit.dependencies import managed_nonpipeline_llm_provider
 
         try:
-            narrative = asyncio.run(narrate_assessment(report))
+            with managed_nonpipeline_llm_provider(
+                runtime_settings,
+                runtime_stores=stores,
+            ) as provider:
+                narrative = asyncio.run(
+                    narrate_assessment(
+                        report,
+                        provider=provider,
+                    )
+                )
             console.print(f"  {narrative}")
         except Exception as exc:
-            _fail(f"LLM narrative failed: {exc}")
+            _fail(f"LLM narrative failed ({type(exc).__name__})")
+            raise click.ClickException("LLM narrative generation failed") from exc
 
 
 # ── tacit learn ──────────────────────────────────────────────────────────
@@ -1966,8 +2294,20 @@ def learn_service(service: str, approved_only: bool, limit: int, tenant: str | N
 
 
 # ── tacit serve ──────────────────────────────────────────────────────────
+_SLACK_ENVIRONMENT_KEYS = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")
+
+
+def _disable_slack_environment() -> None:
+    aliases = {name.casefold() for name in _SLACK_ENVIRONMENT_KEYS}
+    for name in tuple(os.environ):
+        if name.casefold() in aliases:
+            del os.environ[name]
+    for name in _SLACK_ENVIRONMENT_KEYS:
+        os.environ[name] = ""
+
+
 @cli.command()
-@click.option("--host", default="0.0.0.0", help="Bind host")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Bind host")
 @click.option("--port", "-p", default=8000, type=int, help="Bind port")
 @click.option("--reload", is_flag=True, help="Enable auto-reload (dev mode)")
 @click.option("--no-slack", is_flag=True, help="Disable Slack integration")
@@ -1975,38 +2315,60 @@ def serve(host: str, port: int, reload: bool, no_slack: bool):
     """Start the Tacit API server."""
     _load_env()
 
-    if no_slack:
-        os.environ["SLACK_BOT_TOKEN"] = ""
-        os.environ["SLACK_APP_TOKEN"] = ""
+    from tacit.config import create_settings, is_loopback_bind_host, validate_api_server_bind
 
+    if no_slack:
+        _disable_slack_environment()
+    active_settings = create_settings()
+    if no_slack:
+        active_settings = active_settings.model_copy(
+            update={
+                "slack_bot_token": "",
+                "slack_app_token": "",
+            }
+        )
+    try:
+        host = validate_api_server_bind(active_settings, host)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    if reload and not is_loopback_bind_host(host):
+        raise click.UsageError(
+            "Reload is limited to loopback serving because each reload worker re-imports runtime security settings"
+        )
     _header(f"Tacit Server — {host}:{port}")
 
     import uvicorn
 
-    from tacit.config import settings
     from tacit.logging import configure_logging
 
-    configure_logging(settings.log_level)
+    configure_logging(active_settings.log_level)
 
-    _info(f"LLM: {settings.llm_provider} / {settings.llm_model}")
-    _info(f"Grafana: {settings.grafana_url}")
-    _info(f"Log level: {settings.log_level}")
-    if settings.slack_bot_token:
+    _info(f"LLM: {active_settings.llm_provider} / {active_settings.llm_model}")
+    _info(f"Grafana: {active_settings.grafana_url}")
+    _info(f"Log level: {active_settings.log_level}")
+    if active_settings.slack_bot_token:
         _info("Slack: enabled")
     else:
         _info("Slack: disabled")
-    if settings.signalfx_enabled:
-        _info(f"SignalFx: enabled (realm={settings.signalfx_realm})")
+    if active_settings.signalfx_enabled:
+        _info(f"SignalFx: enabled (realm={active_settings.signalfx_realm})")
     else:
         _info("SignalFx: disabled")
     console.print()
 
+    from tacit.api.app import create_app
+
+    # Uvicorn reload must import the app in its child process. The environment
+    # was canonicalized before settings resolution, so the child sees the same
+    # integration opt-outs; ordinary serving retains the exact settings owner.
+    server_app = "tacit.main:app" if reload else create_app(runtime_settings=active_settings)
+
     uvicorn.run(
-        "tacit.main:app",
+        server_app,
         host=host,
         port=port,
         reload=reload,
-        log_level=settings.log_level.lower(),
+        log_level=active_settings.log_level.lower(),
     )
 
 

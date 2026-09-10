@@ -442,6 +442,329 @@
     const DIRECT_FILE_UI_ERROR = 'Run tacit serve, then open the web address it provides.';
     const KNOWLEDGE_TENANT_KEY = 'tacit.knowledgeTenant';
     const API_KEY_SESSION_KEY = 'tacit.apiKey';
+    const DEMO_AUTH_PENDING_SESSION_KEY = 'tacit.demoAuth.pending.v3';
+    const DEMO_AUTH_BOOTSTRAP_TYPE = 'tacit-demo-auth-bootstrap-v3';
+    const DEMO_AUTH_READY_TYPE = 'tacit-demo-auth-ready-v3';
+    const DEMO_AUTH_REDEEM_TYPE = 'tacit-demo-auth-redeem-v3';
+    const DEMO_AUTH_DELIVERY_TYPE = 'tacit-demo-auth-deliver-v3';
+    const DEMO_AUTH_ACCEPTED_TYPE = 'tacit-demo-auth-accepted-v3';
+    const DEMO_AUTH_COMMITTED_TYPE = 'tacit-demo-auth-committed-v3';
+    const DEMO_AUTH_ACTIVATED_TYPE = 'tacit-demo-auth-activated-v3';
+    const DEMO_AUTH_CONFIRMED_TYPE = 'tacit-demo-auth-confirmed-v3';
+    const DEMO_AUTH_FINALIZED_TYPE = 'tacit-demo-auth-finalized-v3';
+    const DEMO_AUTH_FAILED_TYPE = 'tacit-demo-auth-failed-v3';
+    const DEMO_AUTH_PENDING_TYPE = 'tacit-demo-auth-pending-v3';
+    const LOOPBACK_HOSTNAMES = ['localhost', '127.0.0.1', '::1'];
+
+    function normalizedLoopbackHostname(value) {
+      return value.toLowerCase().replace(/^\[|\]$/g, '');
+    }
+
+    function exactLoopbackOrigin(value, requireExplicitPort = true) {
+      try {
+        const parsed = new URL(value);
+        if (!['http:', 'https:'].includes(parsed.protocol)) return '';
+        if (!LOOPBACK_HOSTNAMES.includes(normalizedLoopbackHostname(parsed.hostname))) return '';
+        if ((requireExplicitPort && !parsed.port) || parsed.username || parsed.password) return '';
+        if (parsed.pathname !== '/' || parsed.search || parsed.hash) return '';
+        return parsed.origin;
+      } catch (_error) {
+        return '';
+      }
+    }
+
+    function loopbackReferrerOrigin() {
+      return exactLoopbackOrigin(document.referrer);
+    }
+
+    function validDemoHandoffEndpoint(value, bootstrapOrigin) {
+      try {
+        const parsed = new URL(value);
+        return parsed.origin === bootstrapOrigin &&
+          !parsed.username && !parsed.password && !parsed.search && !parsed.hash &&
+          /^\/[A-Za-z0-9_-]{32,128}$/.test(parsed.pathname);
+      } catch (_error) {
+        return false;
+      }
+    }
+
+    function validDemoApiKey(value) {
+      return typeof value === 'string' && Boolean(value) &&
+        !/[\u0000-\u001f\u007f]/.test(value) &&
+        new TextEncoder().encode(value).byteLength <= 8192;
+    }
+
+    function parsePendingDemoCredential(serialized) {
+      try {
+        const pending = JSON.parse(serialized || 'null');
+        if (!pending || typeof pending !== 'object' || Array.isArray(pending)) return null;
+        if (Object.keys(pending).sort().join(',') !== 'apiKey,expiresAtMs,nonce,previousApiKey,stage,type') {
+          return null;
+        }
+        if (
+          pending.type !== DEMO_AUTH_PENDING_TYPE ||
+          !/^[A-Za-z0-9_-]{32,128}$/.test(pending.nonce) ||
+          !Number.isSafeInteger(pending.expiresAtMs) ||
+          !['delivered', 'activating'].includes(pending.stage) ||
+          !validDemoApiKey(pending.apiKey) ||
+          !(pending.previousApiKey === null || validDemoApiKey(pending.previousApiKey))
+        ) return null;
+        return pending;
+      } catch (_error) {
+        return null;
+      }
+    }
+
+    function rollbackPendingDemoCredential() {
+      const serialized = sessionStorage.getItem(DEMO_AUTH_PENDING_SESSION_KEY);
+      if (serialized === null) return;
+      const pending = parsePendingDemoCredential(serialized);
+      if (!pending) {
+        sessionStorage.removeItem(API_KEY_SESSION_KEY);
+        sessionStorage.removeItem(DEMO_AUTH_PENDING_SESSION_KEY);
+        return;
+      }
+      if (
+        pending.stage === 'activating' &&
+        sessionStorage.getItem(API_KEY_SESSION_KEY) === pending.apiKey
+      ) {
+        if (pending.previousApiKey === null) sessionStorage.removeItem(API_KEY_SESSION_KEY);
+        else sessionStorage.setItem(API_KEY_SESSION_KEY, pending.previousApiKey);
+      }
+      sessionStorage.removeItem(DEMO_AUTH_PENDING_SESSION_KEY);
+    }
+
+    function activeDemoApiKeyFromSession() {
+      try {
+        const primary = sessionStorage.getItem(API_KEY_SESSION_KEY) || '';
+        const serialized = sessionStorage.getItem(DEMO_AUTH_PENDING_SESSION_KEY);
+        if (serialized === null) return primary;
+        const pending = parsePendingDemoCredential(serialized);
+        if (!pending) return '';
+        if (pending.stage === 'activating' && primary === pending.apiKey) {
+          return pending.previousApiKey || '';
+        }
+        return primary;
+      } catch (_error) {
+        return '';
+      }
+    }
+
+    function initializeDemoApiKeyHandoff() {
+      window.name = '';
+      try {
+        // A pending delivery is never credential authority and cannot survive reload.
+        rollbackPendingDemoCredential();
+      } catch (_error) {
+        return;
+      }
+      const handoffPrefix = '#tacit-demo-auth-v3=';
+      const handoffHash = window.location.hash;
+      if (!handoffHash.startsWith(handoffPrefix)) return;
+      try {
+        window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+      } catch (_error) {
+        return;
+      }
+      let serializedHandoff;
+      try {
+        serializedHandoff = decodeURIComponent(handoffHash.slice(handoffPrefix.length));
+      } catch (_error) {
+        return;
+      }
+      const hostname = normalizedLoopbackHostname(window.location.hostname);
+      if (!serializedHandoff || serializedHandoff.length > 4096) return;
+      if (!IS_TACIT_HTTP_ORIGIN || !LOOPBACK_HOSTNAMES.includes(hostname)) return;
+      if (window.location.pathname !== '/' || window.location.search || window.location.hash) return;
+
+      let descriptor;
+      try {
+        descriptor = JSON.parse(serializedHandoff);
+      } catch (_error) {
+        return;
+      }
+      if (!descriptor || typeof descriptor !== 'object' || Array.isArray(descriptor)) return;
+      const descriptorKeys = Object.keys(descriptor).sort().join(',');
+      if (descriptorKeys !== 'bootstrapOrigin,expiresAtMs,frameUrl,targetOrigin,type') return;
+      if (descriptor.type !== DEMO_AUTH_BOOTSTRAP_TYPE) return;
+
+      const bootstrapOrigin = loopbackReferrerOrigin();
+      if (!bootstrapOrigin || descriptor.bootstrapOrigin !== bootstrapOrigin) return;
+      if (descriptor.targetOrigin !== window.location.origin) return;
+      if (exactLoopbackOrigin(`${descriptor.targetOrigin}/`, false) !== window.location.origin) return;
+      if (!validDemoHandoffEndpoint(descriptor.frameUrl, bootstrapOrigin)) return;
+      const monotonicEpochMs = () => window.performance.timeOrigin + window.performance.now();
+      const serverDeadlineMs = descriptor.expiresAtMs;
+      if (!Number.isSafeInteger(serverDeadlineMs) || monotonicEpochMs() >= serverDeadlineMs) return;
+
+      let nonce;
+      try {
+        const nonceBytes = new Uint8Array(24);
+        window.crypto.getRandomValues(nonceBytes);
+        nonce = Array.from(nonceBytes, byte => byte.toString(16).padStart(2, '0')).join('');
+      } catch (_error) {
+        return;
+      }
+
+      const apiKeyInput = document.getElementById('api-key');
+      let settled = false;
+      let state = 'waiting';
+      let timeoutHandle = null;
+      const frame = document.createElement('iframe');
+      frame.hidden = true;
+      frame.setAttribute('aria-hidden', 'true');
+      frame.referrerPolicy = 'origin';
+
+      const refreshApiKeyInput = () => {
+        if (apiKeyInput) apiKeyInput.value = sessionStorage.getItem(API_KEY_SESSION_KEY) || '';
+      };
+      const rollbackPendingKey = () => {
+        rollbackPendingDemoCredential();
+        refreshApiKeyInput();
+      };
+      const handlePageExit = () => {
+        try {
+          rollbackPendingDemoCredential();
+        } catch (_error) {
+          // Session storage is destroyed with the tab when cleanup is unavailable.
+        }
+      };
+      const clearProtocol = () => {
+        if (timeoutHandle !== null) window.clearTimeout(timeoutHandle);
+        window.removeEventListener('message', receiveMessage);
+        window.removeEventListener('pagehide', handlePageExit);
+        frame.remove();
+      };
+      const failClosed = (notifyFrame = true) => {
+        if (settled) return;
+        settled = true;
+        try {
+          rollbackPendingKey();
+        } catch (_error) {
+          // Storage denial still leaves the protocol without publication authority.
+        }
+        if (notifyFrame && frame.contentWindow) {
+          try {
+            frame.contentWindow.postMessage({type: DEMO_AUTH_FAILED_TYPE, nonce}, bootstrapOrigin);
+          } catch (_error) {
+            // The Python-side deadline remains the final failure authority.
+          }
+        }
+        window.setTimeout(clearProtocol, 0);
+      };
+      const scheduleDeadline = () => {
+        const remainingMs = serverDeadlineMs - monotonicEpochMs();
+        if (remainingMs <= 0) {
+          failClosed();
+          return;
+        }
+        timeoutHandle = window.setTimeout(scheduleDeadline, Math.min(remainingMs, 2147483647));
+      };
+
+      function receiveMessage(event) {
+        if (settled || event.source !== frame.contentWindow || event.origin !== bootstrapOrigin) return;
+        const message = event.data;
+        if (!message || typeof message !== 'object') {
+          failClosed();
+          return;
+        }
+        if (message.type === DEMO_AUTH_READY_TYPE && state === 'waiting') {
+          state = 'redeeming';
+          frame.contentWindow.postMessage({type: DEMO_AUTH_REDEEM_TYPE, nonce}, bootstrapOrigin);
+          return;
+        }
+        if (message.type === DEMO_AUTH_FAILED_TYPE && (message.nonce === null || message.nonce === nonce)) {
+          failClosed(false);
+          return;
+        }
+        if (message.type === DEMO_AUTH_COMMITTED_TYPE && state === 'delivered' && message.nonce === nonce) {
+          try {
+            const serializedPending = sessionStorage.getItem(DEMO_AUTH_PENDING_SESSION_KEY);
+            const pending = parsePendingDemoCredential(serializedPending);
+            if (
+              !pending || pending.stage !== 'delivered' || pending.nonce !== nonce ||
+              pending.expiresAtMs !== serverDeadlineMs || monotonicEpochMs() >= serverDeadlineMs
+            ) throw new Error();
+            sessionStorage.setItem(DEMO_AUTH_PENDING_SESSION_KEY, JSON.stringify({...pending, stage: 'activating'}));
+            sessionStorage.setItem(API_KEY_SESSION_KEY, pending.apiKey);
+            if (apiKeyInput) apiKeyInput.value = pending.apiKey;
+            state = 'activating';
+            frame.contentWindow.postMessage({type: DEMO_AUTH_ACTIVATED_TYPE, nonce}, bootstrapOrigin);
+          } catch (_error) {
+            failClosed(false);
+          }
+          return;
+        }
+        if (message.type === DEMO_AUTH_CONFIRMED_TYPE && state === 'activating' && message.nonce === nonce) {
+          try {
+            const pending = parsePendingDemoCredential(sessionStorage.getItem(DEMO_AUTH_PENDING_SESSION_KEY));
+            if (
+              !pending || pending.stage !== 'activating' || pending.nonce !== nonce ||
+              pending.expiresAtMs !== serverDeadlineMs ||
+              sessionStorage.getItem(API_KEY_SESSION_KEY) !== pending.apiKey ||
+              monotonicEpochMs() >= serverDeadlineMs
+            ) throw new Error();
+            sessionStorage.removeItem(DEMO_AUTH_PENDING_SESSION_KEY);
+            state = 'finalizing';
+            frame.contentWindow.postMessage({type: DEMO_AUTH_FINALIZED_TYPE, nonce}, bootstrapOrigin);
+          } catch (_error) {
+            failClosed(false);
+          }
+          return;
+        }
+        if (message.type === DEMO_AUTH_FINALIZED_TYPE && state === 'finalizing' && message.nonce === nonce) {
+          try {
+            if (sessionStorage.getItem(DEMO_AUTH_PENDING_SESSION_KEY) !== null) throw new Error();
+            settled = true;
+            clearProtocol();
+          } catch (_error) {
+            failClosed(false);
+          }
+          return;
+        }
+        if (message.type !== DEMO_AUTH_DELIVERY_TYPE || state !== 'redeeming' || message.nonce !== nonce) {
+          failClosed();
+          return;
+        }
+        if (!Number.isSafeInteger(message.expiresAtMs) || message.expiresAtMs !== serverDeadlineMs) {
+          failClosed();
+          return;
+        }
+        if (monotonicEpochMs() >= serverDeadlineMs) {
+          failClosed();
+          return;
+        }
+        const apiKey = message.apiKey;
+        if (
+          !validDemoApiKey(apiKey)
+        ) {
+          failClosed();
+          return;
+        }
+        try {
+          sessionStorage.setItem(DEMO_AUTH_PENDING_SESSION_KEY, JSON.stringify({
+            type: DEMO_AUTH_PENDING_TYPE,
+            nonce,
+            apiKey,
+            previousApiKey: sessionStorage.getItem(API_KEY_SESSION_KEY),
+            expiresAtMs: serverDeadlineMs,
+            stage: 'delivered',
+          }));
+          state = 'delivered';
+          frame.contentWindow.postMessage({type: DEMO_AUTH_ACCEPTED_TYPE, nonce}, bootstrapOrigin);
+        } catch (_error) {
+          failClosed();
+        }
+      }
+
+      window.addEventListener('message', receiveMessage);
+      window.addEventListener('pagehide', handlePageExit);
+      scheduleDeadline();
+      frame.src = descriptor.frameUrl;
+      document.body.appendChild(frame);
+    }
+
+    initializeDemoApiKeyHandoff();
     let lastDashboardUid = null;
     let lastDashboardTenant = '';
     let tenantRequestGeneration = 0;
@@ -498,7 +821,16 @@
     function knowledgeHeaders(extra = {}, tenant = '') {
       const headers = { ...extra };
       if (tenant) headers['X-Tacit-Tenant'] = tenant;
-      const apiKey = document.getElementById('api-key')?.value || sessionStorage.getItem(API_KEY_SESSION_KEY) || '';
+      let apiKey = document.getElementById('api-key')?.value || '';
+      try {
+        if (sessionStorage.getItem(DEMO_AUTH_PENDING_SESSION_KEY) !== null) {
+          apiKey = activeDemoApiKeyFromSession();
+        } else if (!apiKey) {
+          apiKey = sessionStorage.getItem(API_KEY_SESSION_KEY) || '';
+        }
+      } catch (_error) {
+        apiKey = '';
+      }
       if (apiKey) headers['X-API-Key'] = apiKey;
       return headers;
     }

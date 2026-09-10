@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -13,6 +14,18 @@ import pytest
 from tacit.config import settings
 from tests import validate
 from tests.eval.cold_isolation import LocalEvaluationEndpoints
+from tests.eval.metric_matching import match_metric_sets
+
+RATE_THRESHOLD_OPTIONS = (
+    ("min_archetype_accuracy", "--min-archetype-accuracy"),
+    ("min_archetype_soft_accuracy", "--min-archetype-soft-accuracy"),
+    ("min_metric_recall", "--min-metric-recall"),
+    ("min_critical_recall", "--min-critical-recall"),
+    ("min_weighted_recall", "--min-weighted-recall"),
+    ("min_signal_to_noise", "--min-signal-to-noise"),
+    ("max_error_rate", "--max-error-rate"),
+)
+NON_FINITE_RATES = ("nan", "inf", "-inf")
 
 
 def _case(prompt_id: str = "DF-001") -> validate.TestCase:
@@ -30,6 +43,7 @@ def _case(prompt_id: str = "DF-001") -> validate.TestCase:
 
 def _pipeline_result(
     *,
+    prompt_id: str = "DF-001",
     recall: float = 0.9,
     critical_recall: float = 0.9,
     weighted_recall: float = 0.9,
@@ -37,7 +51,7 @@ def _pipeline_result(
     error: str = "",
 ) -> validate.PipelineResult:
     return validate.PipelineResult(
-        prompt_id="DF-001",
+        prompt_id=prompt_id,
         expected_metrics=["request_latency_seconds"],
         found_metrics=["request_latency_seconds"] if not error else [],
         missing_metrics=[] if not error else ["request_latency_seconds"],
@@ -53,6 +67,44 @@ def _pipeline_result(
         weighted_recall=weighted_recall,
         signal_to_noise=signal_to_noise,
         error=error,
+    )
+
+
+def _pipeline_gate_args(*, max_errors: int) -> argparse.Namespace:
+    return argparse.Namespace(
+        csv="cases.csv",
+        mode="pipeline",
+        review=False,
+        api_url="http://127.0.0.1:8000",
+        grafana_url="http://127.0.0.1:3000",
+        api_key="",
+        tenant="tenant-a",
+        min_archetype_accuracy=0.0,
+        min_archetype_soft_accuracy=0.0,
+        min_metric_recall=0.0,
+        min_critical_recall=0.75,
+        min_weighted_recall=0.0,
+        min_signal_to_noise=0.0,
+        max_errors=max_errors,
+        max_error_rate=1.0,
+    )
+
+
+def _critical_gate_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    results: list[validate.PipelineResult],
+) -> tuple[dict[str, object], validate.ValidationGateResult]:
+    async def pipeline_results(*_args, **_kwargs):
+        return results
+
+    monkeypatch.setattr(validate, "run_pipeline_validation", pipeline_results)
+    cases = [_case(result.prompt_id) for result in results]
+    return asyncio.run(
+        validate._execute_validation(
+            _pipeline_gate_args(max_errors=len(results)),
+            cases,
+            validate.SelectedEvaluationState(mode="external", fingerprint="external"),
+        )
     )
 
 
@@ -89,6 +141,72 @@ def test_validation_gate_enforces_quality_thresholds_and_error_limits() -> None:
     assert result.passed is False
     assert any("signal-to-noise" in failure.casefold() for failure in result.failures)
     assert any("errors" in failure.casefold() for failure in result.failures)
+
+
+def test_critical_gate_counts_all_errored_critical_cases_and_fails_floor(monkeypatch) -> None:
+    report, gate = _critical_gate_outcome(
+        monkeypatch,
+        [
+            _pipeline_result(prompt_id="DF-001", critical_recall=0.0, error="provider unavailable"),
+            _pipeline_result(prompt_id="DF-002", critical_recall=0.0, error="provider unavailable"),
+        ],
+    )
+    pipeline = report["pipeline"]
+    assert isinstance(pipeline, dict)
+
+    assert (
+        pipeline["critical_cases"],
+        pipeline["avg_critical_recall"],
+        gate.passed,
+        any("critical recall" in failure.casefold() for failure in gate.failures),
+    ) == (2, 0.0, False, True)
+
+
+def test_critical_gate_counts_mixed_success_and_error_in_critical_floor(monkeypatch) -> None:
+    report, gate = _critical_gate_outcome(
+        monkeypatch,
+        [
+            _pipeline_result(prompt_id="DF-001", critical_recall=1.0),
+            _pipeline_result(prompt_id="DF-002", critical_recall=0.0, error="provider unavailable"),
+        ],
+    )
+    pipeline = report["pipeline"]
+    assert isinstance(pipeline, dict)
+
+    assert (
+        pipeline["critical_cases"],
+        pipeline["avg_critical_recall"],
+        gate.passed,
+        any("critical recall" in failure.casefold() for failure in gate.failures),
+    ) == (2, 0.5, False, True)
+
+
+@pytest.mark.parametrize(("field_name", "_cli_option"), RATE_THRESHOLD_OPTIONS)
+@pytest.mark.parametrize("raw_rate", NON_FINITE_RATES)
+def test_validation_thresholds_reject_non_finite_rates(
+    field_name: str,
+    _cli_option: str,
+    raw_rate: str,
+) -> None:
+    with pytest.raises(ValueError, match="finite number between 0 and 1"):
+        validate.ValidationThresholds(**cast(Any, {field_name: float(raw_rate)}))
+
+
+@pytest.mark.parametrize(("_field_name", "cli_option"), RATE_THRESHOLD_OPTIONS)
+@pytest.mark.parametrize("raw_rate", NON_FINITE_RATES)
+def test_validation_cli_rejects_non_finite_rates_before_loading_the_dataset(
+    _field_name: str,
+    cli_option: str,
+    raw_rate: str,
+    capsys,
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        validate.main(["missing.csv", f"{cli_option}={raw_rate}"])
+
+    assert raised.value.code == 2
+    error = capsys.readouterr().err
+    assert cli_option in error
+    assert "finite number between 0 and 1" in error
 
 
 def test_pipeline_validation_sends_api_key_and_concrete_tenant(monkeypatch) -> None:
@@ -230,11 +348,75 @@ def test_classifier_exception_cannot_score_as_general_strict_or_soft_pass(monkey
 
     monkeypatch.setattr("tacit.agents.intent.classify_intent", fail_classification)
 
-    result = asyncio.run(validate.run_archetype_validation([case]))[0]
+    result = asyncio.run(validate.run_archetype_validation([case], provider=object()))[0]
 
     assert result.error == "provider unavailable"
     assert result.passed is False
     assert result.any_match is False
+
+
+@pytest.mark.parametrize("actual", ["", "unknown", "made_up_archetype", " general-ish "])
+def test_unknown_archetype_outputs_cannot_score_as_general(actual, monkeypatch) -> None:
+    case = _case()
+    case.expected_archetype = "general"
+
+    async def classify(*_args, **_kwargs):
+        archetype = type("Archetype", (), {"type": actual, "confidence": 0.99})()
+        intent = type("Intent", (), {"problem_type": actual, "archetypes": [archetype]})()
+        return intent, object()
+
+    monkeypatch.setattr("tacit.agents.intent.classify_intent", classify)
+
+    result = asyncio.run(validate.run_archetype_validation([case], provider=object()))[0]
+
+    assert result.error == ""
+    assert result.passed is False
+    assert result.any_match is False
+
+
+def test_direct_archetype_validation_requires_an_exact_provider_before_classification(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def classify(*_args, **_kwargs):
+        calls.append("classify")
+        raise AssertionError("classification must not start")
+
+    monkeypatch.setattr("tacit.agents.intent.classify_intent", classify)
+
+    with pytest.raises(RuntimeError, match="owner-managed LLM provider"):
+        asyncio.run(validate.run_archetype_validation([_case()]))
+
+    assert calls == []
+
+
+def test_metric_matching_is_one_to_one_and_prefers_exact_matches() -> None:
+    matches = match_metric_sets(
+        {"request_duration_seconds", "request_duration_seconds_bucket"},
+        {"request_duration_seconds_bucket"},
+    )
+
+    assert matches == {"request_duration_seconds_bucket": "request_duration_seconds_bucket"}
+
+
+def test_metric_matching_supports_only_explicit_histogram_suffixes() -> None:
+    assert match_metric_sets(
+        {"request_duration_seconds"},
+        {"request_duration_seconds_bucket"},
+    ) == {"request_duration_seconds": "request_duration_seconds_bucket"}
+    assert match_metric_sets({"request_duration_seconds"}, {"request_duration"}) == {}
+    assert match_metric_sets({"requests"}, {"requests_total"}) == {}
+
+
+def test_metric_matching_keeps_every_derived_rate_within_unit_bounds() -> None:
+    expected = {"request_duration_seconds", "request_duration_seconds_bucket"}
+    found = {"request_duration_seconds_bucket"}
+    matches = match_metric_sets(expected, found)
+
+    recall = len(matches) / len(expected)
+    signal_to_noise = len(set(matches.values())) / len(found)
+
+    assert 0.0 <= recall <= 1.0
+    assert 0.0 <= signal_to_noise <= 1.0
 
 
 @pytest.mark.parametrize(
@@ -261,9 +443,13 @@ def test_validation_gate_fails_closed_for_empty_scored_corpus(report) -> None:
 
 
 def _create_state_database(path: Path, marker: str) -> None:
-    with sqlite3.connect(path) as conn:
-        conn.execute("CREATE TABLE benchmark_marker(value TEXT NOT NULL)")
-        conn.execute("INSERT INTO benchmark_marker(value) VALUES (?)", (marker,))
+    conn = sqlite3.connect(path)
+    try:
+        with conn:
+            conn.execute("CREATE TABLE benchmark_marker(value TEXT NOT NULL)")
+            conn.execute("INSERT INTO benchmark_marker(value) VALUES (?)", (marker,))
+    finally:
+        conn.close()
 
 
 def test_long_lived_state_uses_a_disposable_copy_and_preserves_source(tmp_path) -> None:
@@ -282,8 +468,11 @@ def test_long_lived_state_uses_a_disposable_copy_and_preserves_source(tmp_path) 
         assert copied_workdir != source
         assert copied_workdir.exists()
         for name in validate.LONG_LIVED_STATE_DATABASES:
-            with sqlite3.connect(copied_workdir / name) as conn:
+            conn = sqlite3.connect(copied_workdir / name)
+            try:
                 marker = conn.execute("SELECT value FROM benchmark_marker").fetchone()[0]
+            finally:
+                conn.close()
             assert marker == name
 
     after = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in source.iterdir()}
@@ -343,6 +532,7 @@ def test_isolated_validation_never_forwards_process_global_grafana_credentials(
         tenant_id="tenant-a",
     ) as selected:
         asyncio.run(validate._execute_validation(args, [_case()], selected))
+        assert selected.isolated_state is not None
         expected_org_id = selected.isolated_state.settings.grafana_org_id
 
     assert observed == [("", expected_org_id)]
@@ -398,18 +588,16 @@ def test_validation_main_returns_nonzero_and_reports_state_on_gate_failure(tmp_p
         return [_pipeline_result(recall=0.1, critical_recall=0.1, weighted_recall=0.1, signal_to_noise=0.1)]
 
     monkeypatch.setattr(validate, "run_pipeline_validation", low_quality)
-    exit_code = asyncio.run(
-        validate.main(
-            [
-                str(csv_path),
-                "--mode",
-                "pipeline",
-                "--state",
-                "external",
-                "--output",
-                str(output_path),
-            ]
-        )
+    exit_code = validate.main(
+        [
+            str(csv_path),
+            "--mode",
+            "pipeline",
+            "--state",
+            "external",
+            "--output",
+            str(output_path),
+        ]
     )
 
     report = json.loads(output_path.read_text())
@@ -420,10 +608,27 @@ def test_validation_main_returns_nonzero_and_reports_state_on_gate_failure(tmp_p
 
 
 def test_validation_cli_returns_nonzero_on_unexpected_exception(monkeypatch, capsys) -> None:
-    async def fail(_argv=None):
+    def fail(_argv=None):
         raise RuntimeError("fixture exploded")
 
     monkeypatch.setattr(validate, "main", fail)
 
     assert validate.cli(["unused.csv"]) == 2
     assert "VALIDATION ERROR" in capsys.readouterr().err
+
+
+def test_negative_max_errors_is_rejected_before_dataset_or_runtime_access(monkeypatch, capsys) -> None:
+    accesses: list[str] = []
+
+    def forbidden_dataset(_path):
+        accesses.append("dataset")
+        raise AssertionError("dataset accessed")
+
+    monkeypatch.setattr(validate, "load_test_cases", forbidden_dataset)
+
+    with pytest.raises(SystemExit) as raised:
+        validate.main(["missing.csv", "--max-errors=-1"])
+
+    assert raised.value.code == 2
+    assert accesses == []
+    assert "--max-errors" in capsys.readouterr().err

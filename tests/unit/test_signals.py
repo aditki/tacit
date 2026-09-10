@@ -176,6 +176,19 @@ class _DescriptorOnlyKnowledgeServiceAdapter:
         return getattr(self._delegate, name)
 
 
+def _shared_knowledge_service(signal_store: SignalStore) -> KnowledgeService:
+    runtime_settings = signal_store.runtime_settings
+    return KnowledgeService(
+        KnowledgeRepository(
+            signal_store.database_path,
+            runtime_settings=runtime_settings,
+            signal_store=signal_store,
+        ),
+        signal_store=signal_store,
+        runtime_settings=runtime_settings,
+    )
+
+
 def _descriptor_learning_features(uid: str) -> DashboardFeatures:
     return DashboardFeatures(
         dashboard_uid=uid,
@@ -243,7 +256,11 @@ async def test_dashboard_learning_resolves_service_owner_without_private_store_o
     real_store = SignalStore(database_path, runtime_settings=runtime_settings)
     service = _DescriptorOnlyKnowledgeServiceAdapter(
         KnowledgeService(
-            KnowledgeRepository(database_path),
+            KnowledgeRepository(
+                database_path,
+                runtime_settings=runtime_settings,
+                signal_store=real_store,
+            ),
             signal_store=real_store,
             runtime_settings=runtime_settings,
         )
@@ -861,11 +878,7 @@ def test_signal_inference_preserves_and_enforces_panel_datasource_scope(signal_s
     assert taxonomy_match["datasource_types"] == ["cloudwatch"]
     assert taxonomy_match["query_languages"] == ["cloudwatch"]
 
-    knowledge_service = KnowledgeService(
-        KnowledgeRepository(signal_store._db_path),
-        signal_store=signal_store,
-        runtime_settings=signal_store._settings,
-    )
+    knowledge_service = _shared_knowledge_service(signal_store)
     persist_inferred_signal_review(
         store=signal_store,
         sig=taxonomy_match,
@@ -1609,9 +1622,11 @@ def test_mapping_schema_migrates_governed_projection_identity(tmp_path):
 
 
 def test_signal_mapping_activates_after_governed_corroboration(signal_store, monkeypatch):
-    monkeypatch.setattr("tacit.signals.store.settings.knowledge_tenant_id", "tenant-a")
-    signal_store = _pinned_store(signal_store, "tenant-a")
-    runtime_settings = Settings(knowledge_tenant_id="tenant-a")
+    runtime_settings = Settings(knowledge_tenant_id="*", api_auth_enabled=True)
+    signal_store = SignalStore(
+        db_path=signal_store._db_path.with_name("wildcard-governed-corroboration.db"),
+        runtime_settings=runtime_settings,
+    )
     first_persisted = persist_inferred_signal_review(
         store=signal_store,
         sig={
@@ -2530,10 +2545,10 @@ def test_wildcard_rejects_unconfirmed_default_owner_and_pinned_reopen_retargets_
 def test_startup_rejects_unprojectable_authority_without_certifying_it_clean(tmp_path, monkeypatch):
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.models import KnowledgeRevision, KnowledgeScope
-    from tacit.knowledge.service import KnowledgeService
 
     db_path = tmp_path / "governed-projection-backfill.db"
-    service = KnowledgeService(KnowledgeRepository(db_path))
+    store = SignalStore(db_path=db_path)
+    service = _shared_knowledge_service(store)
     candidate = service.create_candidate(
         kind=KnowledgeKind.SIGNAL_MAPPING,
         payload_ref="dashboard:checkout",
@@ -2798,11 +2813,7 @@ def test_later_projection_repair_batch_redacts_tenant_and_authority_ids(tmp_path
     tenant_id = "PRIVATE-PROJECTION-TENANT-CANARY"
     runtime_settings = Settings(_env_file=None, knowledge_tenant_id=tenant_id)
     store = SignalStore(db_path=db_path, runtime_settings=runtime_settings)
-    service = KnowledgeService(
-        KnowledgeRepository(db_path),
-        signal_store=store,
-        runtime_settings=runtime_settings,
-    )
+    service = _shared_knowledge_service(store)
     revisions = []
     for index in range(2):
         candidate = service.create_candidate(
@@ -2869,14 +2880,10 @@ def test_dirty_projection_audit_repairs_authority_in_bounded_batches(
 
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.models import KnowledgeScope
-    from tacit.knowledge.service import KnowledgeService
 
     db_path = tmp_path / "bounded-projection-repair.db"
     store = SignalStore(db_path=db_path)
-    service = KnowledgeService(
-        KnowledgeRepository(db_path),
-        signal_store=store,
-    )
+    service = _shared_knowledge_service(store)
     revisions = []
     for index in range(2):
         candidate = service.create_candidate(
@@ -2931,11 +2938,10 @@ def test_projection_audit_validation_pages_without_per_mapping_authority_queries
 
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.models import KnowledgeScope
-    from tacit.knowledge.service import KnowledgeService
 
     db_path = tmp_path / "paged-projection-validation.db"
     store = SignalStore(db_path=db_path)
-    service = KnowledgeService(KnowledgeRepository(db_path), signal_store=store)
+    service = _shared_knowledge_service(store)
     for index in range(2):
         candidate = service.create_candidate(
             kind=KnowledgeKind.SIGNAL_MAPPING,
@@ -2992,7 +2998,7 @@ def test_projection_audit_and_resolution_include_nonpositive_governed_mapping_id
 
     db_path = tmp_path / "nonpositive-governed-mapping-ids.db"
     store = SignalStore(db_path=db_path)
-    service = KnowledgeService(KnowledgeRepository(db_path), signal_store=store)
+    service = _shared_knowledge_service(store)
     revisions = []
     with monkeypatch.context() as promotion_patch:
         promotion_patch.setattr(store, "ensure_governed_projection_audit_current", lambda: None)
@@ -3096,11 +3102,10 @@ def test_projection_quarantine_resumes_across_negative_zero_and_sparse_ids(
 def test_projection_audit_rejects_a_partial_multi_pattern_projection(tmp_path):
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.models import KnowledgeScope
-    from tacit.knowledge.service import KnowledgeService
 
     db_path = tmp_path / "partial-projection.db"
     store = SignalStore(db_path=db_path)
-    service = KnowledgeService(KnowledgeRepository(db_path), signal_store=store)
+    service = _shared_knowledge_service(store)
     candidate = service.create_candidate(
         kind=KnowledgeKind.SIGNAL_MAPPING,
         payload_ref="dashboard:multi-pattern",
@@ -3168,11 +3173,10 @@ def test_projection_audit_rejects_a_partial_multi_pattern_projection(tmp_path):
 def test_governed_projection_preserves_datasource_scope_per_metric_pattern(tmp_path):
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.models import KnowledgeScope
-    from tacit.knowledge.service import KnowledgeService
 
     db_path = tmp_path / "pattern-datasource-projection.db"
     store = SignalStore(db_path=db_path)
-    service = KnowledgeService(KnowledgeRepository(db_path), signal_store=store)
+    service = _shared_knowledge_service(store)
     candidate = service.create_candidate(
         kind=KnowledgeKind.SIGNAL_MAPPING,
         payload_ref="dashboard:multi-datasource",
@@ -3252,11 +3256,10 @@ def test_governed_projection_preserves_datasource_scope_per_metric_pattern(tmp_p
 def test_governed_projection_preserves_same_pattern_datasource_variants(tmp_path):
     from tacit.knowledge.enums import EvidenceRole, KnowledgeKind, LineageKind, SourceFamily
     from tacit.knowledge.models import KnowledgeEvidenceReference, KnowledgeScope
-    from tacit.knowledge.service import KnowledgeService
 
     db_path = tmp_path / "same-pattern-datasource-projection.db"
     store = SignalStore(db_path=db_path)
-    service = KnowledgeService(KnowledgeRepository(db_path), signal_store=store)
+    service = _shared_knowledge_service(store)
     store.register_signal_type("shared_latency", description="Shared latency", category="latency")
     proposition = {
         "subject_ref": "concept:shared-latency",
@@ -3355,11 +3358,10 @@ def test_governed_projection_preserves_same_pattern_datasource_variants(tmp_path
 def test_projection_audit_converges_duplicate_legacy_variant_confidences(tmp_path):
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.models import KnowledgeScope
-    from tacit.knowledge.service import KnowledgeService
 
     db_path = tmp_path / "duplicate-legacy-variant.db"
     store = SignalStore(db_path=db_path)
-    service = KnowledgeService(KnowledgeRepository(db_path), signal_store=store)
+    service = _shared_knowledge_service(store)
     candidate = service.create_candidate(
         kind=KnowledgeKind.SIGNAL_MAPPING,
         payload_ref="dashboard:duplicate-legacy-variant",
@@ -3456,10 +3458,10 @@ def test_learning_index_reraises_rebuild_failures(tmp_path, monkeypatch):
 def test_startup_preserves_exact_projection_validated_by_immutable_revision(tmp_path):
     from tacit.knowledge.enums import KnowledgeKind
     from tacit.knowledge.models import KnowledgeScope
-    from tacit.knowledge.service import KnowledgeService
 
     db_path = tmp_path / "governed-projection-valid.db"
-    service = KnowledgeService(KnowledgeRepository(db_path))
+    store = SignalStore(db_path=db_path)
+    service = _shared_knowledge_service(store)
     candidate = service.create_candidate(
         kind=KnowledgeKind.SIGNAL_MAPPING,
         payload_ref="dashboard:checkout",
@@ -6108,10 +6110,7 @@ class TestIngestedDashboards:
                     (mapping_id,),
                 ).fetchone()
             )
-        service = KnowledgeService(
-            KnowledgeRepository(signal_store._db_path),
-            signal_store=signal_store,
-        )
+        service = _shared_knowledge_service(signal_store)
 
         def fail_lifecycle_after_resolver_cleanup(**_kwargs):
             raise RuntimeError("simulated approval-loss lifecycle failure")
@@ -6148,10 +6147,7 @@ class TestIngestedDashboards:
             signals_inferred=[],
             status="approved",
         )
-        service = KnowledgeService(
-            KnowledgeRepository(signal_store._db_path),
-            signal_store=signal_store,
-        )
+        service = _shared_knowledge_service(signal_store)
         candidate_id = migrate_signal_mapping(
             {
                 "id": "governed-rollback-a",
@@ -6326,10 +6322,7 @@ class TestIngestedDashboards:
             ],
         )
 
-        knowledge_service = KnowledgeService(
-            KnowledgeRepository(signal_store._db_path),
-            signal_store=signal_store,
-        )
+        knowledge_service = _shared_knowledge_service(signal_store)
 
         def idempotent_promotion(**kwargs):
             kwargs["store"].add_mapping(
@@ -6400,10 +6393,7 @@ class TestIngestedDashboards:
                 }
             ],
         )
-        knowledge_service = KnowledgeService(
-            KnowledgeRepository(signal_store._db_path),
-            signal_store=signal_store,
-        )
+        knowledge_service = _shared_knowledge_service(signal_store)
 
         def promote_governed_mapping(**kwargs):
             candidate_id = migrate_signal_mapping(
@@ -6495,10 +6485,7 @@ class TestIngestedDashboards:
             ],
         )
 
-        knowledge_service = KnowledgeService(
-            KnowledgeRepository(signal_store._db_path),
-            signal_store=signal_store,
-        )
+        knowledge_service = _shared_knowledge_service(signal_store)
 
         def reingest_then_promote_old_generation(**kwargs):
             kwargs["store"].record_ingested_dashboard(
@@ -8819,10 +8806,7 @@ async def test_auto_approved_dashboard_rolls_back_authority_when_indexing_fails(
             }
         ],
     )
-    knowledge_service = KnowledgeService(
-        KnowledgeRepository(signal_store._db_path),
-        signal_store=signal_store,
-    )
+    knowledge_service = _shared_knowledge_service(signal_store)
     repository = knowledge_service.repository
 
     def promote_governed_mapping(**kwargs):
@@ -8914,10 +8898,7 @@ async def test_changed_auto_approved_dashboard_preserves_prior_authority_when_pr
         ]
 
     monkeypatch.setattr("tacit.dashboard_ingest.service.infer_signals_from_metrics", inferred)
-    knowledge_service = KnowledgeService(
-        KnowledgeRepository(signal_store._db_path),
-        signal_store=signal_store,
-    )
+    knowledge_service = _shared_knowledge_service(signal_store)
 
     def promote_governed_mapping(**kwargs):
         metric = next(iter(kwargs["governed_pairs"]))[0] if kwargs["governed_pairs"] else None

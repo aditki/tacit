@@ -478,6 +478,7 @@ async def apply_correction_candidate(
     "/api/v1/investigations/{investigation_id}/refresh",
     tags=["History"],
     summary="Refresh an investigation from current external inputs",
+    dependencies=[Depends(require_knowledge_action(KnowledgeAction.APPLY))],
 )
 async def refresh_investigation(
     investigation_id: str,

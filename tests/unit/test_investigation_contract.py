@@ -29,6 +29,7 @@ from tacit.backends.base import PublishResult
 from tacit.config import Settings
 from tacit.dependencies import PipelineDependencies
 from tacit.errors import PipelineAdmissionRejected, PipelineExecutionError
+from tacit.feedback import FeedbackStore as RuntimeFeedbackStore
 from tacit.grounding_benchmark import (
     _contract_for_case,
     load_grounding_corpus,
@@ -91,7 +92,19 @@ from tacit.runtime_ownership import (
     runtime_descriptor_for_store,
     runtime_descriptor_from_settings,
 )
+from tacit.runtime_stores import RuntimeStoreReadinessError
+from tacit.signals.store import SignalStore
 from tests.http_client import TestClient
+
+
+class _ReadinessStoreDouble:
+    def __init__(self, target, *, runtime_ownership, sqlite_readiness_admission) -> None:
+        self._target = target
+        self.runtime_ownership = runtime_ownership
+        self.sqlite_readiness_admission = sqlite_readiness_admission
+
+    def __getattr__(self, name):
+        return getattr(self._target, name)
 
 
 def _pipeline_settings(**values) -> Settings:
@@ -135,6 +148,35 @@ def _owned_pipeline_factory(factory, *, runtime_settings: Settings, factory_kind
             database_role=capability,
             database_path=database_path,
         )
+        if category == "store":
+            unadapted_factory = factory
+
+            def factory():
+                product = unadapted_factory()
+                if product is None:
+                    return product
+                existing_ownership = getattr(product, "runtime_ownership", None)
+                existing_admission = getattr(product, "sqlite_readiness_admission", None)
+                if existing_ownership is not None and existing_admission is not None:
+                    return product
+                backing_store = {
+                    "history": InvestigationStore,
+                    "feedback": RuntimeFeedbackStore,
+                    "signals": SignalStore,
+                }[capability](database_path, runtime_settings=runtime_settings)
+                resolved_ownership = existing_ownership or backing_store.runtime_ownership
+                resolved_admission = backing_store.sqlite_readiness_admission
+                try:
+                    product.runtime_ownership = resolved_ownership
+                    product.sqlite_readiness_admission = resolved_admission
+                except (AttributeError, TypeError):
+                    return _ReadinessStoreDouble(
+                        product,
+                        runtime_ownership=resolved_ownership,
+                        sqlite_readiness_admission=resolved_admission,
+                    )
+                return product
+
     elif category == "provider":
         ownership = runtime_descriptor_for_provider(
             component=f"investigation_contract_{factory_kind}_factory",
@@ -177,6 +219,8 @@ def _isolated_dependencies(**values) -> PipelineDependencies:
 
 def _owned_history_store(db_path: Path, **settings_values) -> tuple[Settings, InvestigationStore]:
     """Create a direct-pipeline history fixture from one settings owner."""
+    settings_values.setdefault("feedback_db_path", str(db_path.with_name("feedback.db")))
+    settings_values.setdefault("signals_db_path", str(db_path.with_name("signals.db")))
     runtime_settings = _pipeline_settings(history_db_path=str(db_path), **settings_values)
     return runtime_settings, InvestigationStore(db_path=db_path, runtime_settings=runtime_settings)
 
@@ -637,7 +681,7 @@ async def test_direct_pipeline_rejects_configured_tenant_mismatch(monkeypatch):
     assert "request" not in captured
 
 
-async def test_direct_pipeline_resolves_pinned_tenant_before_inner_pipeline(monkeypatch):
+async def test_direct_pipeline_resolves_pinned_tenant_before_inner_pipeline(monkeypatch, tmp_path):
     from tacit.pipeline import run_pipeline
 
     captured: dict[str, DashRequest] = {}
@@ -653,6 +697,9 @@ async def test_direct_pipeline_resolves_pinned_tenant_before_inner_pipeline(monk
             pipeline_timeout_seconds=5,
             knowledge_tenant_id="tenant-a",
             knowledge_permissions="knowledge.read,knowledge.apply",
+            history_db_path=str(tmp_path / "history.db"),
+            feedback_db_path=str(tmp_path / "feedback.db"),
+            signals_db_path=str(tmp_path / "signals.db"),
         ),
         backend_factory=lambda: [],
         history_store_factory=lambda: object(),
@@ -677,6 +724,7 @@ async def test_direct_pipeline_resolves_pinned_tenant_before_inner_pipeline(monk
 async def test_non_default_pipeline_rejects_tenant_blind_history_store(
     configured_tenant,
     request_tenant,
+    tmp_path,
 ):
     from tacit.pipeline import run_pipeline
 
@@ -692,6 +740,9 @@ async def test_non_default_pipeline_rejects_tenant_blind_history_store(
         pipeline_timeout_seconds=5,
         knowledge_tenant_id=configured_tenant,
         knowledge_permissions="knowledge.read,knowledge.apply",
+        history_db_path=str(tmp_path / "history.db"),
+        feedback_db_path=str(tmp_path / "feedback.db"),
+        signals_db_path=str(tmp_path / "signals.db"),
     )
     history = _own_pipeline_store(TenantBlindHistory(), runtime_settings, "history")
     deps = _isolated_dependencies(
@@ -3033,7 +3084,7 @@ async def test_run_start_failure_fails_closed_with_explicit_audit_state(tmp_path
     assert resources_closed is True
 
 
-async def test_history_store_initialization_failure_has_explicit_unavailable_audit_state():
+async def test_isolated_history_store_initialization_failure_prevents_root_registration():
     resources_closed = False
 
     def fail_history_store():
@@ -3060,13 +3111,14 @@ async def test_history_store_initialization_failure_has_explicit_unavailable_aud
 
     from tacit.pipeline import run_pipeline
 
-    with pytest.raises(PipelineExecutionError, match="audit storage is unavailable") as exc_info:
+    with pytest.raises(RuntimeStoreReadinessError) as exc_info:
         await run_pipeline(DashRequest(prompt="Investigate checkout", user_id="api"), deps)
 
-    assert exc_info.value.investigation_id == ""
-    assert exc_info.value.investigation_run_id == ""
-    assert exc_info.value.audit_status == "run_unavailable"
-    assert resources_closed is True
+    assert exc_info.value.role == "history"
+    assert isinstance(exc_info.value.__cause__, sqlite3.OperationalError)
+    assert resources_closed is False
+    assert deps.pipeline_admission is not None
+    assert deps.pipeline_admission.execution_graph.root_owner_count == 0
 
 
 async def test_existing_investigation_lookup_failure_has_explicit_unavailable_audit_state(tmp_path, monkeypatch):

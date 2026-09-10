@@ -51,6 +51,7 @@ from tacit.signals.resolution import (
     SignalResolutionWorkLimitError,
 )
 from tacit.validation import validate_dashboard_queries
+from tests.e2e.framework import IncidentPromptCase, evaluate_incident
 from tests.eval.gate_harness import gate_failures
 
 
@@ -70,6 +71,26 @@ def _dashboard(*queries: PanelQuery) -> DashboardSpec:
 
 def _query(expr: str, uid: str = "real") -> PanelQuery:
     return PanelQuery(expr=expr, datasource_uid=uid, datasource_type="prometheus", query_language="promql")
+
+
+def test_incident_evaluation_does_not_reuse_one_metric_for_multiple_expectations():
+    case = IncidentPromptCase(
+        case_id="one-to-one-metric-matching",
+        prompt="Investigate latency",
+        service="checkout",
+        failure_mode="latency",
+        expected_metrics=["request_duration_seconds", "request_duration_seconds_bucket"],
+        critical_metrics=[],
+    )
+
+    evaluation = evaluate_incident(
+        _dashboard(_query("request_duration_seconds_bucket")),
+        case,
+    )
+
+    assert evaluation.matched_metrics == {"request_duration_seconds_bucket"}
+    assert evaluation.metric_recall == 0.5
+    assert evaluation.signal_to_noise == 1.0
 
 
 def test_clickstack_prompt_corpus_has_required_size_and_classes():

@@ -8,7 +8,6 @@ must never initialize a store or contact a remote service.
 
 from __future__ import annotations
 
-import asyncio
 import configparser
 import errno
 import hashlib
@@ -20,7 +19,7 @@ import stat
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -31,6 +30,7 @@ import structlog
 import tacit.config as config_module
 from tacit.config import (
     Settings,
+    canonical_aws_region,
     canonical_knowledge_permissions,
     canonical_knowledge_tenant_id,
     canonical_sqlite_role_paths,
@@ -128,6 +128,16 @@ _BEDROCK_IDENTITY_ENVIRONMENT_FIELDS = (
     "AWS_EC2_METADATA_SERVICE_ENDPOINT",
     "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
 )
+_BEDROCK_GENERATION_ENVIRONMENT_FIELDS = frozenset(
+    {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_ACCESS_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SECRET_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+    }
+)
 _BEDROCK_CREDENTIAL_SOURCE_MAX_BYTES = 4 * 1024 * 1024
 
 
@@ -144,16 +154,18 @@ def _aws_dns_suffix(region: str) -> str:
 
 
 def canonical_bedrock_runtime_endpoint(region: str) -> str:
-    normalized = str(region or "").strip().casefold()
-    if not normalized:
-        raise RuntimeOwnershipError("AWS Bedrock region is required")
+    try:
+        normalized = canonical_aws_region(region)
+    except ValueError as exc:
+        raise RuntimeOwnershipError(str(exc)) from None
     return f"https://bedrock-runtime.{normalized}.{_aws_dns_suffix(normalized)}"
 
 
 def canonical_aws_sts_endpoint(region: str) -> str:
-    normalized = str(region or "").strip().casefold()
-    if not normalized:
-        raise RuntimeOwnershipError("AWS STS region is required")
+    try:
+        normalized = canonical_aws_region(region)
+    except ValueError as exc:
+        raise RuntimeOwnershipError(str(exc)) from None
     return f"https://sts.{normalized}.{_aws_dns_suffix(normalized)}"
 
 
@@ -213,8 +225,9 @@ def bedrock_credential_selector(
     role_arn = str(runtime_settings.llm_bedrock_role_arn or "").strip()
     explicit_access_key = str(runtime_settings.llm_aws_access_key_id or "").strip()
     explicit_secret_key = str(runtime_settings.llm_aws_secret_access_key or "").strip()
+    explicit_session_token = str(runtime_settings.llm_aws_session_token or "").strip()
     profile = ""
-    if explicit_access_key or explicit_secret_key:
+    if explicit_access_key or explicit_secret_key or explicit_session_token:
         if not explicit_access_key or not explicit_secret_key:
             raise RuntimeOwnershipError("AWS credentials must include both access key and secret key")
         credential_identity = f"settings-access-key:{explicit_access_key}"
@@ -289,7 +302,7 @@ def _snapshot_bedrock_credential_source(
     kind: str,
     path: Path,
 ) -> tuple[_BedrockCredentialSourceIdentity, bytes]:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:
@@ -402,6 +415,21 @@ def _bedrock_static_profile_method(
     credentials_content: bytes,
     config_content: bytes,
 ) -> str | None:
+    selected = _bedrock_static_profile_credentials(
+        profile=profile,
+        credentials_content=credentials_content,
+        config_content=config_content,
+    )
+    return selected[0] if selected is not None else None
+
+
+def _bedrock_static_profile_credentials(
+    *,
+    profile: str,
+    credentials_content: bytes,
+    config_content: bytes,
+) -> tuple[str, dict[str, str]] | None:
+    """Return the first static provider Botocore would select for a profile."""
     selected_profile = profile or "default"
     config_section = "default" if selected_profile == "default" else f"profile {selected_profile}"
     # Botocore checks these as two providers in this order. It does not merge
@@ -417,8 +445,16 @@ def _bedrock_static_profile_method(
         secret_key = str(metadata.get("aws_secret_access_key") or "").strip()
         if not access_key or not secret_key:
             raise RuntimeOwnershipError("AWS profile credentials must include both access key and secret key")
-        return method
+        return method, metadata
     return None
+
+
+def _bedrock_profile_session_token(metadata: Mapping[str, str]) -> str:
+    """Mirror Botocore's legacy-first token lookup within one provider."""
+    for field_name in ("aws_security_token", "aws_session_token"):
+        if field_name in metadata:
+            return str(metadata[field_name]).strip()
+    return ""
 
 
 def _reject_unmodeled_bedrock_profile(metadata: Mapping[str, str]) -> None:
@@ -431,7 +467,7 @@ def _reject_unmodeled_bedrock_profile(metadata: Mapping[str, str]) -> None:
 
 @dataclass(frozen=True, slots=True)
 class BedrockCredentialPlan:
-    """Immutable selector, local-source, and remote plan for one provider generation."""
+    """Immutable selector, local-source, and remote plan for Bedrock credentials."""
 
     _runtime_settings: Settings = field(repr=False)
     _environment_items: tuple[tuple[str, str], ...] = field(repr=False)
@@ -443,6 +479,10 @@ class BedrockCredentialPlan:
     _source_uses_sts: bool
     _web_identity_role_arn: str
     _web_identity_role_session_name: str
+    _source_profile: str
+    _source_profile_credential_fingerprint: str
+    _source_role_arn: str
+    _source_role_session_name: str
     _discovery_methods: tuple[str, ...]
 
     @classmethod
@@ -460,7 +500,11 @@ class BedrockCredentialPlan:
             frozen_settings,
             environment=captured,
         )
-        explicit_settings = bool(frozen_settings.llm_aws_access_key_id or frozen_settings.llm_aws_secret_access_key)
+        explicit_settings = bool(
+            frozen_settings.llm_aws_access_key_id
+            or frozen_settings.llm_aws_secret_access_key
+            or frozen_settings.llm_aws_session_token
+        )
         explicit_environment = bool(str(frozen_environment.get("AWS_ACCESS_KEY_ID") or ""))
         if explicit_environment:
             for token_name in ("AWS_SECURITY_TOKEN", "AWS_SESSION_TOKEN"):
@@ -528,6 +572,8 @@ class BedrockCredentialPlan:
         source_profile = str(profile_metadata.get("source_profile") or "").strip()
         web_identity_role_arn = ""
         web_identity_role_session_name = ""
+        source_profile_credential_fingerprint = ""
+        source_role_session_name = ""
         if explicit_settings or explicit_environment:
             discovery_methods: tuple[str, ...] = ()
         elif profile_role_declared and not profile_web_identity_declared:
@@ -541,7 +587,7 @@ class BedrockCredentialPlan:
                 config_content=config_content,
             )
             _reject_unmodeled_bedrock_profile(source_metadata)
-            source_static_method = _bedrock_static_profile_method(
+            source_static_credentials = _bedrock_static_profile_credentials(
                 profile=source_profile,
                 credentials_content=credentials_content,
                 config_content=config_content,
@@ -549,14 +595,25 @@ class BedrockCredentialPlan:
             if (
                 "role_arn" in source_metadata
                 or "web_identity_token_file" in source_metadata
-                or source_static_method is None
+                or source_static_credentials is None
             ):
                 raise RuntimeOwnershipError("AWS Bedrock role source profile is unsupported by runtime ownership")
+            _source_static_method, source_credential_metadata = source_static_credentials
+            source_profile_credential_fingerprint = credential_fingerprint(
+                "\0".join(
+                    (
+                        str(source_credential_metadata.get("aws_access_key_id") or ""),
+                        str(source_credential_metadata.get("aws_secret_access_key") or ""),
+                        _bedrock_profile_session_token(source_credential_metadata),
+                    )
+                )
+            )
             if (
                 "role_session_name" in profile_metadata
                 and not str(profile_metadata.get("role_session_name") or "").strip()
             ):
                 raise RuntimeOwnershipError("AWS Bedrock role session name is invalid")
+            source_role_session_name = str(profile_metadata.get("role_session_name") or "").strip()
             discovery_methods = ("assume-role",)
         else:
             ambient_token_present = "AWS_WEB_IDENTITY_TOKEN_FILE" in environment_presence
@@ -635,6 +692,7 @@ class BedrockCredentialPlan:
                 (
                     str(frozen_settings.llm_aws_access_key_id or ""),
                     str(frozen_settings.llm_aws_secret_access_key or ""),
+                    str(frozen_settings.llm_aws_session_token or ""),
                 )
             )
         elif explicit_environment:
@@ -664,6 +722,10 @@ class BedrockCredentialPlan:
             _source_uses_sts=source_uses_sts,
             _web_identity_role_arn=web_identity_role_arn,
             _web_identity_role_session_name=web_identity_role_session_name,
+            _source_profile=source_profile,
+            _source_profile_credential_fingerprint=source_profile_credential_fingerprint,
+            _source_role_arn=profile_role_arn if discovery_methods == ("assume-role",) else "",
+            _source_role_session_name=source_role_session_name,
             _discovery_methods=discovery_methods,
         )
 
@@ -698,6 +760,26 @@ class BedrockCredentialPlan:
         """Return the effective optional session name for web identity."""
         return self._web_identity_role_session_name
 
+    @property
+    def source_profile(self) -> str:
+        """Return the static source profile for one admitted role profile."""
+        return self._source_profile
+
+    @property
+    def source_role_session_name(self) -> str:
+        """Return the optional session name from an admitted role profile."""
+        return self._source_role_session_name
+
+    @property
+    def source_role_arn(self) -> str:
+        """Return the exact role ARN from an admitted role profile."""
+        return self._source_role_arn
+
+    @property
+    def source_locations(self) -> tuple[tuple[str, Path], ...]:
+        """Return stable source kinds and paths without generation metadata."""
+        return tuple((source.kind, source.path) for source in self._source_identities)
+
     def has_source(self, kind: str) -> bool:
         """Return whether the plan captured one local source kind."""
         return any(source_kind == kind for source_kind, _content in self._source_contents)
@@ -713,6 +795,80 @@ class BedrockCredentialPlan:
             if source_kind == kind:
                 return bytes(content)
         return b""
+
+    def role_source_credentials(self) -> tuple[str, str, str]:
+        """Return static source-profile credentials for one admitted role operation."""
+        if self._discovery_methods != ("assume-role",) or not self._source_profile:
+            raise RuntimeOwnershipError("AWS Bedrock role source profile is unavailable")
+        selected = _bedrock_static_profile_credentials(
+            profile=self._source_profile,
+            credentials_content=self.source_content("shared_credentials"),
+            config_content=self.source_content("config"),
+        )
+        if selected is None:
+            raise RuntimeOwnershipError("AWS Bedrock role source credentials are unavailable")
+        _method, metadata = selected
+        access_key = str(metadata.get("aws_access_key_id") or "")
+        secret_key = str(metadata.get("aws_secret_access_key") or "")
+        token = _bedrock_profile_session_token(metadata)
+        if not access_key or not secret_key:
+            raise RuntimeOwnershipError("AWS Bedrock role source credentials are unavailable")
+        return access_key, secret_key, token
+
+    def as_cross_generation_declaration(self) -> BedrockCredentialPlan:
+        """Drop generation secrets while retaining the stable selector declaration."""
+        environment_items = tuple(
+            (name, value)
+            for name, value in self._environment_items
+            if name not in _BEDROCK_GENERATION_ENVIRONMENT_FIELDS
+        )
+        environment_presence = tuple(
+            name for name in self._environment_presence if name not in _BEDROCK_GENERATION_ENVIRONMENT_FIELDS
+        )
+        return replace(
+            self,
+            _environment_items=environment_items,
+            _environment_presence=environment_presence,
+            _source_contents=(),
+        )
+
+    def capture_operation_generation(self) -> BedrockCredentialPlan:
+        """Recapture one source generation and reject selector or owner drift."""
+        current = type(self).capture(self._runtime_settings)
+        stable_fields = (
+            "_runtime_settings",
+            "_profile",
+            "_source_uses_sts",
+            "_web_identity_role_arn",
+            "_web_identity_role_session_name",
+            "_source_profile",
+            "_source_profile_credential_fingerprint",
+            "_source_role_arn",
+            "_source_role_session_name",
+            "_discovery_methods",
+        )
+        if any(getattr(current, name) != getattr(self, name) for name in stable_fields):
+            raise RuntimeOwnershipError("AWS Bedrock credential selector changed after plan capture")
+        current_selector_environment = tuple(
+            (name, value)
+            for name, value in current._environment_items
+            if name not in _BEDROCK_GENERATION_ENVIRONMENT_FIELDS
+        )
+        current_selector_presence = tuple(
+            name for name in current._environment_presence if name not in _BEDROCK_GENERATION_ENVIRONMENT_FIELDS
+        )
+        if (
+            current_selector_environment != self._environment_items
+            or current_selector_presence != self._environment_presence
+            or current.source_locations != self.source_locations
+            or current.account != self.account
+            or (
+                not self._source_uses_sts
+                and current._declared_identity.credential_fingerprint != self._declared_identity.credential_fingerprint
+            )
+        ):
+            raise RuntimeOwnershipError("AWS Bedrock credential selector changed after plan capture")
+        return current
 
     @property
     def uses_sts(self) -> bool:
@@ -1054,13 +1210,6 @@ def declare_runtime_factory[FactoryResult](
         runtime_ownership=ownership,
         factory_kind=factory_kind,
     )
-
-
-async def realize_runtime_factory_async[FactoryResult](
-    factory: Callable[[], FactoryResult],
-) -> FactoryResult:
-    """Realize a synchronous dependency factory without blocking its event loop."""
-    return await asyncio.to_thread(factory)
 
 
 def get_runtime_factory_ownership(
@@ -2010,7 +2159,10 @@ def _llm_provider_remotes(
             ),
         )
     if provider == "bedrock":
-        region = str(runtime_settings.llm_bedrock_region or "").strip().casefold()
+        try:
+            region = canonical_aws_region(runtime_settings.llm_bedrock_region)
+        except ValueError as exc:
+            raise RuntimeOwnershipError(str(exc)) from None
         if bedrock_credential_identity is None:
             account, credential_identity, _profile = bedrock_credential_selector(
                 runtime_settings,

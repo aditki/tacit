@@ -12,6 +12,12 @@ import tempfile
 from pathlib import Path
 from typing import BinaryIO
 
+from release_payload_snapshot import (
+    ReleasePayloadError,
+    cleanup_private_directory,
+    copy_verified_payload,
+)
+
 READ_CHUNK_BYTES = 1024 * 1024
 MAX_CHECKSUM_BYTES = 1024
 SHA256_PATTERN = re.compile(r"([0-9a-f]{64})  ([^/\r\n]+)\n?\Z")
@@ -146,46 +152,15 @@ def copy_and_verify(
     destination: Path,
     maximum: int,
 ) -> str:
-    expected = verify_checksum(archive, checksum_path, maximum)
-    source, metadata = _open_regular_file(archive)
-    try:
-        source_size = _validated_size(archive, metadata, maximum)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=destination.parent,
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-        )
-        temporary = Path(temporary_name)
-        try:
-            copied_digest = hashlib.sha256()
-            remaining = source_size
-            with os.fdopen(descriptor, "wb") as copied_stream:
-                while remaining:
-                    chunk = source.read(min(READ_CHUNK_BYTES, remaining))
-                    if not chunk:
-                        raise ArchiveValidationError(f"archive shrank while copying: {archive}")
-                    remaining -= len(chunk)
-                    copied_digest.update(chunk)
-                    copied_stream.write(chunk)
-                if source.read(1):
-                    raise ArchiveValidationError(f"archive grew while copying: {archive}")
-                copied_stream.flush()
-                os.fsync(copied_stream.fileno())
-            copied = copied_digest.hexdigest()
-            if not hmac.compare_digest(copied, expected):
-                raise ArchiveValidationError(f"copied archive checksum mismatch: {archive} -> {destination}")
-            if not hmac.compare_digest(stream_sha256(temporary, maximum), expected):
-                raise ArchiveValidationError(f"temporary archive checksum mismatch: {temporary}")
-            os.replace(temporary, destination)
-            final = stream_sha256(destination, maximum)
-            if not hmac.compare_digest(final, expected):
-                raise ArchiveValidationError(f"destination archive checksum mismatch: {destination}")
-            return final
-        finally:
-            temporary.unlink(missing_ok=True)
-    finally:
-        source.close()
+    expected = _read_checksum(checksum_path, archive.name)
+    snapshot = copy_verified_payload(
+        archive,
+        destination,
+        maximum=maximum,
+        expected_digest=expected,
+        executable=False,
+    )
+    return snapshot.digest
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -198,6 +173,9 @@ def _parser() -> argparse.ArgumentParser:
         subparser.add_argument("--max-bytes", type=_positive_integer, required=True)
         if command == "copy":
             subparser.add_argument("--destination", type=Path, required=True)
+    cleanup = subparsers.add_parser("cleanup")
+    cleanup.add_argument("--directory", type=Path, required=True)
+    cleanup.add_argument("--expected-name", action="append", required=True)
     return parser
 
 
@@ -208,14 +186,17 @@ def main() -> int:
             digest = write_checksum(arguments.archive, arguments.checksum, arguments.max_bytes)
         elif arguments.command == "verify":
             digest = verify_checksum(arguments.archive, arguments.checksum, arguments.max_bytes)
-        else:
+        elif arguments.command == "copy":
             digest = copy_and_verify(
                 arguments.archive,
                 arguments.checksum,
                 arguments.destination,
                 arguments.max_bytes,
             )
-    except (ArchiveValidationError, OSError) as exc:
+        else:
+            cleanup_private_directory(arguments.directory, arguments.expected_name)
+            digest = "cleaned"
+    except (ArchiveValidationError, ReleasePayloadError, OSError) as exc:
         print(f"Release image archive validation failed: {exc}", file=sys.stderr)
         return 1
     print(digest)
