@@ -83,10 +83,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Gitleaks
-        uses: docker://zricethezav/gitleaks:v8.24.3
         with:
-          args: detect --source /github/workspace --no-git --redact --verbose
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare Git-object-free current tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir .gitleaks-worktree
+          git archive --format=tar HEAD | tar -xf - -C .gitleaks-worktree
+      - name: Gitleaks committed history
+        uses: docker://zricethezav/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: /github/workspace
+        with:
+          args: detect --source /github/workspace --log-opts=--all --redact --verbose
+      - name: Gitleaks current tree
+        uses: docker://zricethezav/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055
+        with:
+          args: detect --source /github/workspace/.gitleaks-worktree --no-git --redact --verbose
 
   fresh-install:
     strategy:

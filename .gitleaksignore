@@ -1,0 +1,19 @@
+# Historical SQL metadata keys misclassified by the generic-api-key rule.
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tacit/knowledge/repository.py:generic-api-key:1169
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tacit/knowledge/repository.py:generic-api-key:1174
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_feedback.py:generic-api-key:528
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_knowledge_repository_ownership.py:generic-api-key:240
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_knowledge_repository_ownership.py:generic-api-key:253
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_knowledge_repository_ownership.py:generic-api-key:279
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_knowledge_repository_ownership.py:generic-api-key:292
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_knowledge_repository_ownership.py:generic-api-key:332
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_knowledge_repository_ownership.py:generic-api-key:340
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_knowledge_repository_ownership.py:generic-api-key:355
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_signal_startup_invariants.py:generic-api-key:167
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_signal_startup_invariants.py:generic-api-key:178
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_signal_startup_invariants.py:generic-api-key:278
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_signal_schema_migrations.py:generic-api-key:314
+d4a2856ef1cd9a8d527b742de51024e43a2aa19d:tests/unit/test_signal_schema_migrations.py:generic-api-key:331
+3a047cd02a4c5a060bec52d7256a77f86ffc44f8:tacit/feedback.py:generic-api-key:179
+3a047cd02a4c5a060bec52d7256a77f86ffc44f8:tacit/feedback.py:generic-api-key:202
+3a047cd02a4c5a060bec52d7256a77f86ffc44f8:tests/unit/test_signals.py:generic-api-key:871

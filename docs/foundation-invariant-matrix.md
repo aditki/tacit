@@ -382,6 +382,10 @@ work limit.
 - Expected validation and concurrency errors map to stable API and CLI outcomes.
 - New schemas, corpora, and data files are present in built wheels.
 - Documented commands exist and are exercised in CI.
+- Secret scanning covers both full reachable committed history and a
+  Git-object-free export of the current tree. Containerized Git scanning
+  explicitly trusts only the mounted workspace; a partial or failed history
+  scan cannot be reported as success.
 - Runtime manifests report the package version actually shipped.
 - Success, degraded success, cancellation, timeout, stale conflict, and failure
   are distinguishable in structured events and metrics.
