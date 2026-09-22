@@ -114,6 +114,33 @@ class PipelineExecutionError(FatalPipelineError):
         }
 
 
+class PipelineAdmissionRejected(TacitError):
+    """Pipeline work rejected before an investigation run was started."""
+
+    PUBLIC_DETAIL = "Pipeline capacity is temporarily unavailable"
+    PUBLIC_REASON_CODES = frozenset(
+        {
+            "pipeline_admission_queue_full",
+            "pipeline_admission_wait_timeout",
+        }
+    )
+
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(self.PUBLIC_DETAIL)
+        self.reason_code = reason_code if reason_code in self.PUBLIC_REASON_CODES else "pipeline_admission_rejected"
+
+    def public_payload(self) -> dict[str, str]:
+        """Return the stable, non-sensitive capacity response for public entry points."""
+        return {
+            "detail": self.PUBLIC_DETAIL,
+            "reason_code": self.reason_code,
+        }
+
+    def public_message(self) -> str:
+        """Return the capacity message suitable for interactive clients."""
+        return self.PUBLIC_DETAIL
+
+
 class BackendUnavailable(RecoverableTacitError):
     """A dashboard backend or datasource is unavailable."""
 

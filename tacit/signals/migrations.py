@@ -260,6 +260,26 @@ def _bind_legacy_schema_owner(
         _record_migration_marker(conn, _LEGACY_SCHEMA_OWNER_MARKER, owner)
 
 
+def _bind_default_owner_migration(conn: sqlite3.Connection, *, owner: str) -> None:
+    """Claim the tenant migration before any tenant-specific schema copy."""
+    terminal = conn.execute(
+        "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+        (_DEFAULT_OWNER_MARKER,),
+    ).fetchone()
+    if terminal is not None:
+        if str(terminal["value"]) != owner:
+            raise RuntimeError("Signal database tenant owner does not match the configured tenant")
+        return
+    progress = conn.execute(
+        "SELECT value FROM signal_tenant_migration_metadata WHERE key=?",
+        (_DEFAULT_OWNER_PROGRESS_MARKER,),
+    ).fetchone()
+    if progress is not None and str(progress["value"]) != owner:
+        raise RuntimeError("Signal database tenant owner migration belongs to another tenant")
+    if progress is None:
+        _record_migration_marker(conn, _DEFAULT_OWNER_PROGRESS_MARKER, owner)
+
+
 def _prepare_legacy_schema_copy(
     conn: sqlite3.Connection,
     *,
@@ -508,6 +528,7 @@ def ensure_schema(
         )
     definition_scope_complete = _migration_marker_exists(conn, _SIGNAL_DEFINITION_SCOPE_MARKER)
     execute_script_statements(conn, SCHEMA_SQL)
+    _bind_default_owner_migration(conn, owner=legacy_tenant or "*")
     if not definition_scope_complete:
         if bootstrap_signal_definitions is not None:
             migrate_legacy_signal_definitions(

@@ -7,8 +7,28 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import structlog
+from structlog.testing import capture_logs
 
 from tacit.agents.providers.base import LLMResult, TokenUsage
+
+
+def test_configured_loggers_follow_later_capture_configuration() -> None:
+    """App startup must not pin module loggers to one global renderer."""
+    from tacit.logging import configure_logging
+
+    original_config = structlog.get_config()
+    configured_logger = structlog.get_logger("reconfiguration-regression")
+    try:
+        configure_logging("INFO")
+        configured_logger.info("before_capture")
+
+        with capture_logs() as logs:
+            configured_logger.info("inside_capture")
+
+        assert [entry["event"] for entry in logs] == ["inside_capture"]
+    finally:
+        structlog.configure(**original_config)
+
 
 # ── TokenUsage ────────────────────────────────────────────────────────────────
 

@@ -1,66 +1,501 @@
 name: Release (PyPI + ghcr)
 
-# Publishes on version tags (v0.2.0, v1.0.0, v0.2.0rc1, ...):
-#   1. sdist + wheel → PyPI, so `pip install tacit-ai` /
-#      `uvx --from tacit-ai tacit` work
-#   2. multi-arch Docker image → ghcr.io/<owner>/tacit, so the demo stack
-#      runs without a local build
-#
-# One-time setup:
-#   - PyPI: add a pending trusted publisher for project `tacit-ai` at
-#     https://pypi.org/manage/account/publishing/
-#     (no API token secret needed — uses OIDC).
-#   - ghcr: works out of the box with GITHUB_TOKEN; make the package public
-#     in the repo's Packages settings after the first push.
-
+# Release tags are the only publication boundary. The workflow validates the
+# tag, requires exact-commit CI plus clean and long-lived 100-prompt quality
+# evidence, builds and scans every artifact, then publishes in dependency order.
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: read
 
+# Registries cannot participate in one transaction. Serializing publication
+# keeps two tags from racing the mutable stable aliases.
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+  queue: max
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/tacit
+  BUILDX_VERSION: "0.36.1"
+  MAX_RELEASE_IMAGE_ARCHIVE_BYTES: "1073741824"
+
 jobs:
-  build-dist:
-    runs-on: ubuntu-latest
+  validate-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      package_version: ${{ steps.validate_version.outputs.package_version }}
+      is_stable: ${{ steps.validate_version.outputs.is_stable }}
+      release_series: ${{ steps.validate_version.outputs.release_series }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          python-version: "3.12"
-      - name: Build sdist and wheel
-        run: uv build
-      - name: Smoke-test the wheel
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12.13"
+      - name: Validate tag and package version
+        id: validate_version
+        shell: python
         run: |
-          uv venv .smoke-venv
-          uv pip install --python .smoke-venv/bin/python dist/*.whl
-          .smoke-venv/bin/tacit --version
-      - uses: actions/upload-artifact@v7
-        with:
-          name: dist
-          path: dist/
+          import os
+          from pathlib import Path
+          import re
+          import tomllib
 
-  publish-pypi:
-    needs: build-dist
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/project/tacit-ai/
-    permissions:
-      id-token: write  # OIDC trusted publishing
+          package_version = tomllib.loads(
+              Path("pyproject.toml").read_text(encoding="utf-8")
+          )["project"]["version"]
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          if tag != f"v{package_version}":
+              raise SystemExit(
+                  f"Release tag {tag!r} does not match package version "
+                  f"{package_version!r}"
+              )
+
+          release = r"(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)"
+          stable = re.fullmatch(release, package_version)
+          prerelease = re.fullmatch(
+              release + r"[-.]?(?:a|alpha|b|beta|c|rc|pre|preview|dev)[.-]?\d+",
+              package_version,
+              re.IGNORECASE,
+          )
+          parsed = stable or prerelease
+          if parsed is None:
+              raise SystemExit(
+                  f"Unsupported release version {package_version!r}; "
+                  "use a three-part stable or prerelease version"
+              )
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"package_version={package_version}\n")
+              output.write(f"is_stable={str(stable is not None).lower()}\n")
+              output.write(
+                  f"release_series={parsed.group('major')}.{parsed.group('minor')}\n"
+              )
+
+  build-dist:
+    needs: validate-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      wheel_name: ${{ steps.publication_payload.outputs.wheel_name }}
+      wheel_digest: ${{ steps.publication_payload.outputs.wheel_digest }}
+      sdist_name: ${{ steps.publication_payload.outputs.sdist_name }}
+      sdist_digest: ${{ steps.publication_payload.outputs.sdist_digest }}
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.12.1"
+          checksum: "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
+          python-version: "3.12.13"
+      - name: Verify release build dependency closure
+        run: |
+          set -euo pipefail
+          generated="$RUNNER_TEMP/release-build-constraints.txt"
+          uv export --locked \
+            --only-group release-build \
+            --no-emit-project \
+            --no-header \
+            --no-annotate \
+            --output-file "$generated"
+          if ! cmp --silent .github/requirements/release-build-constraints.txt "$generated"; then
+            diff --unified .github/requirements/release-build-constraints.txt "$generated" || true
+            echo "Release build constraints do not match the committed lock" >&2
+            exit 1
+          fi
+      - name: Build sdist and wheel
+        run: uv build --clear --build-constraints .github/requirements/release-build-constraints.txt --require-hashes
+      - name: Smoke-test the wheel
+        env:
+          EXPECTED_VERSION: ${{ needs.validate-release.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          uv venv .smoke-venv
+          runtime_requirements="$RUNNER_TEMP/tacit-runtime-requirements.txt"
+          uv export --locked \
+            --no-dev \
+            --no-emit-project \
+            --no-header \
+            --no-annotate \
+            --output-file "$runtime_requirements"
+          uv pip sync --python .smoke-venv/bin/python --require-hashes "$runtime_requirements"
+          uv pip install --python .smoke-venv/bin/python --no-deps dist/*.whl
+          .smoke-venv/bin/python -I - <<'PY'
+          import os
+          import subprocess
+          import sys
+          from importlib.metadata import version as distribution_version
+          from pathlib import Path
+
+          import tacit
+          from packaging.version import Version
+          from tacit.grounding_benchmark import load_acceptance_corpus, load_grounding_corpus
+          from tacit.operational_learning_benchmark import load_operational_learning_corpus
+
+          expected = Version(os.environ["EXPECTED_VERSION"])
+          installed = Version(distribution_version("tacit-ai"))
+          runtime = Version(tacit.__version__)
+          runtime_path = Path(tacit.__file__).resolve()
+          if not runtime_path.is_relative_to(Path(sys.prefix).resolve()):
+              raise SystemExit(f"Wheel smoke imported source checkout: {runtime_path}")
+
+          result = subprocess.run(
+              [".smoke-venv/bin/tacit", "--version"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.strip()
+          prefix = "tacit, version "
+          if not result.startswith(prefix):
+              raise SystemExit(f"Unexpected CLI version output: {result!r}")
+          cli = Version(result.removeprefix(prefix))
+          if (installed, runtime, cli) != (expected, expected, expected):
+              raise SystemExit(
+                  "Release version disagreement: "
+                  f"expected={expected}, distribution={installed}, "
+                  f"runtime={runtime}, cli={cli}"
+              )
+
+          # Load each shipped benchmark corpus through its installed-package API.
+          packaged_benchmarks = {
+              "grounding_benchmark_v1.json": load_grounding_corpus(),
+              "grounding_benchmark_v1.json/acceptance_cases": load_acceptance_corpus(),
+              "operational_learning_v1.json": load_operational_learning_corpus().get("cases", []),
+          }
+          empty = sorted(name for name, cases in packaged_benchmarks.items() if not cases)
+          if empty:
+              raise SystemExit(f"Release wheel has empty or missing benchmark corpora: {empty}")
+          PY
+      - name: Smoke-test the Bedrock wheel extra
+        run: |
+          set -euo pipefail
+          uv venv .bedrock-smoke-venv
+          bedrock_requirements="$RUNNER_TEMP/tacit-bedrock-requirements.txt"
+          uv export --locked \
+            --extra bedrock \
+            --no-dev \
+            --no-emit-project \
+            --no-header \
+            --no-annotate \
+            --output-file "$bedrock_requirements"
+          uv pip sync --python .bedrock-smoke-venv/bin/python --require-hashes "$bedrock_requirements"
+          uv pip install --python .bedrock-smoke-venv/bin/python --no-deps dist/*.whl
+          .bedrock-smoke-venv/bin/python -I - <<'PY'
+          from importlib.metadata import requires as distribution_requires
+          from importlib.metadata import version as distribution_version
+
+          # Import Tacit first so truststore initialization matches production.
+          from packaging.requirements import Requirement
+          from tacit.agents.providers.bedrock import _bedrock_client_config
+          from tacit.config import Settings
+          import botocore.session
+
+          expected_sdk = {
+              "boto3": "==1.43.16",
+              "botocore": "==1.43.16",
+          }
+          declared_sdk = {}
+          for raw_requirement in distribution_requires("tacit-ai") or ():
+              requirement = Requirement(raw_requirement)
+              name = requirement.name.casefold()
+              if name not in expected_sdk:
+                  continue
+              marker = requirement.marker
+              if marker is None or not marker.evaluate({"extra": "bedrock"}) or marker.evaluate({"extra": ""}):
+                  raise SystemExit(f"Built wheel exposes {name} outside the Bedrock extra")
+              declared_sdk[name] = str(requirement.specifier)
+          if declared_sdk != expected_sdk:
+              raise SystemExit(
+                  f"Built-wheel Bedrock metadata mismatch: expected={expected_sdk}, actual={declared_sdk}"
+              )
+
+          if distribution_version("boto3") != "1.43.16":
+              raise SystemExit("Built-wheel Bedrock smoke resolved an unapproved Boto3 version")
+          if distribution_version("botocore") != "1.43.16":
+              raise SystemExit("Built-wheel Bedrock smoke resolved an unapproved Botocore version")
+
+          core_session = botocore.session.Session()
+          resolver = core_session.get_component("credential_provider")
+          if not isinstance(resolver.providers, list) or not resolver.providers:
+              raise SystemExit("Pinned Botocore credential-provider contract is unavailable")
+
+          config = _bedrock_client_config(
+              Settings(llm_provider="bedrock", llm_bedrock_region="us-east-1")
+          )
+          if config.connect_timeout <= 0 or config.read_timeout <= 0:
+              raise SystemExit("Pinned Botocore transport configuration is invalid")
+          PY
+      - name: Describe PyPI publication payload
+        id: publication_payload
+        run: |
+          python .github/scripts/release_publication_snapshot.py describe \
+            --directory dist \
+            --selector 'wheel=tacit_ai-*.whl' \
+            --selector 'sdist=tacit_ai-*.tar.gz' \
+            --github-output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist
           path: dist/
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+          if-no-files-found: error
 
-  scan-ghcr-image:
-    needs: build-dist
-    runs-on: ubuntu-latest
+  build-binaries:
+    needs:
+      - validate-release
+      - build-dist
+    timeout-minutes: 60
+    outputs:
+      package_name: ${{ steps.publication_payload.outputs.package_name }}
+      package_digest: ${{ steps.publication_payload.outputs.package_digest }}
+      checksum_name: ${{ steps.publication_payload.outputs.checksum_name }}
+      checksum_digest: ${{ steps.publication_payload.outputs.checksum_digest }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            artifact: tacit-binary-linux-x86_64
+            binary: dist/tacit
+            package: tacit-linux-x86_64.tar.gz
+            glibc_baseline: "2.35"
+            uv_checksum: 90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb
+    runs-on: ${{ matrix.runner }}
+    env:
+      PRIMARY_SOURCE_ROOT: binary-build-primary/source
+      REPRO_SOURCE_ROOT: binary-build-repro/source
+      BINARY_PATH: binary-build-primary/source/${{ matrix.binary }}
+      REPRO_BINARY_PATH: binary-build-repro/source/${{ matrix.binary }}
+      PACKAGE_NAME: ${{ matrix.package }}
+      REPRO_PACKAGE_PATH: binary-build-repro/${{ matrix.package }}
+      PRIMARY_PYINSTALLER_CONFIG_DIR: binary-build-primary/pyinstaller-config
+      REPRO_PYINSTALLER_CONFIG_DIR: binary-build-repro/pyinstaller-config
+      PYTHONHASHSEED: "0"
+      SOURCE_DATE_EPOCH: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: binary-build-primary/source
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: binary-build-repro/source
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist
+          path: release-dist
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.12.1"
+          checksum: ${{ matrix.uv_checksum }}
+          python-version: "3.12.13"
+      - name: Verify Linux glibc baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(getconf GNU_LIBC_VERSION)"
+          expected="glibc ${{ matrix.glibc_baseline }}"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Expected release baseline ${expected}, found ${actual}" >&2
+            exit 1
+          fi
+      - name: Install locked binary build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel_files=(release-dist/tacit_ai-*.whl)
+          if [[ ${#wheel_files[@]} -ne 1 || ! -f "${wheel_files[0]}" ]]; then
+            echo "Expected exactly one Tacit wheel artifact" >&2
+            exit 1
+          fi
+          wheel_path="${wheel_files[0]}"
+          UV_CACHE_DIR="$RUNNER_TEMP/uv-cache-primary" \
+            uv sync --project "$PRIMARY_SOURCE_ROOT" --locked --no-dev --extra bedrock --group release-binary --no-install-project
+          UV_CACHE_DIR="$RUNNER_TEMP/uv-cache-primary" \
+            uv pip install --python "$PRIMARY_SOURCE_ROOT/.venv/bin/python" --no-deps "$wheel_path"
+          find "$PRIMARY_SOURCE_ROOT/.venv" -type f \
+            -path '*/tacit_ai-*.dist-info/uv_cache.json' -delete
+          UV_CACHE_DIR="$RUNNER_TEMP/uv-cache-repro" \
+            uv sync --project "$REPRO_SOURCE_ROOT" --locked --no-dev --extra bedrock --group release-binary --no-install-project
+          UV_CACHE_DIR="$RUNNER_TEMP/uv-cache-repro" \
+            uv pip install --python "$REPRO_SOURCE_ROOT/.venv/bin/python" --no-deps "$wheel_path"
+          find "$REPRO_SOURCE_ROOT/.venv" -type f \
+            -path '*/tacit_ai-*.dist-info/uv_cache.json' -delete
+      - name: Build binaries independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYINSTALLER_CONFIG_DIR="$PRIMARY_PYINSTALLER_CONFIG_DIR" \
+            uv run --project "$PRIMARY_SOURCE_ROOT" --no-sync pyinstaller \
+            "$PRIMARY_SOURCE_ROOT/tacit.spec" \
+            --clean --noconfirm \
+            --workpath "$PRIMARY_SOURCE_ROOT/build" \
+            --distpath "$PRIMARY_SOURCE_ROOT/dist"
+          PYINSTALLER_CONFIG_DIR="$REPRO_PYINSTALLER_CONFIG_DIR" \
+            uv run --project "$REPRO_SOURCE_ROOT" --no-sync pyinstaller \
+            "$REPRO_SOURCE_ROOT/tacit.spec" \
+            --clean --noconfirm \
+            --workpath "$REPRO_SOURCE_ROOT/build" \
+            --distpath "$REPRO_SOURCE_ROOT/dist"
+      - name: Audit frozen binary contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --project "$PRIMARY_SOURCE_ROOT" --no-sync python \
+            "$PRIMARY_SOURCE_ROOT/.github/scripts/inspect_release_binary.py" \
+            --binary "$BINARY_PATH"
+          uv run --project "$REPRO_SOURCE_ROOT" --no-sync python \
+            "$REPRO_SOURCE_ROOT/.github/scripts/inspect_release_binary.py" \
+            --binary "$REPRO_BINARY_PATH"
+      - name: Package binaries independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --project "$PRIMARY_SOURCE_ROOT" --no-sync python \
+            "$PRIMARY_SOURCE_ROOT/.github/scripts/package_release_binary.py" \
+            --source "$BINARY_PATH" \
+            --package "$PACKAGE_NAME" \
+            --max-binary-bytes 536870912 \
+            --max-package-bytes 536870912
+          uv run --project "$REPRO_SOURCE_ROOT" --no-sync python \
+            "$REPRO_SOURCE_ROOT/.github/scripts/package_release_binary.py" \
+            --source "$REPRO_BINARY_PATH" \
+            --package "$REPRO_PACKAGE_PATH" \
+            --max-binary-bytes 536870912 \
+            --max-package-bytes 536870912
+      - name: Verify reproducible binary packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp "$PACKAGE_NAME" "$REPRO_PACKAGE_PATH"
+          cmp "$PACKAGE_NAME.sha256" "$REPRO_PACKAGE_PATH.sha256"
+      - name: Smoke-test binary version
+        env:
+          EXPECTED_VERSION: ${{ needs.validate-release.outputs.package_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --project "$PRIMARY_SOURCE_ROOT" --no-sync python - <<'PY'
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          from packaging.version import Version
+
+          binary = Path(os.environ["BINARY_PATH"]).resolve()
+          smoke_script = (
+              Path(os.environ["PRIMARY_SOURCE_ROOT"])
+              / ".github"
+              / "scripts"
+              / "smoke_release_binary.py"
+          ).resolve()
+          result = subprocess.run(
+              [
+                  sys.executable,
+                  str(smoke_script),
+                  "--binary",
+                  str(binary),
+                  "--version-only",
+                  "--expected-version",
+                  os.environ["EXPECTED_VERSION"],
+                  "--command-timeout",
+                  "30",
+              ],
+              check=True,
+              capture_output=True,
+              text=True,
+              timeout=45,
+              start_new_session=True,
+          ).stdout.strip()
+          prefix = "tacit, version "
+          if not result.startswith(prefix):
+              raise SystemExit(f"Unexpected binary version output: {result!r}")
+          if Version(result.removeprefix(prefix)) != Version(os.environ["EXPECTED_VERSION"]):
+              raise SystemExit(
+                  f"Binary version {result.removeprefix(prefix)!r} does not match "
+                  f"{os.environ['EXPECTED_VERSION']!r}"
+              )
+          PY
+      - name: Smoke-test packaged binary on glibc baseline
+        shell: bash
+        timeout-minutes: 3
+        env:
+          EXPECTED_VERSION: ${{ needs.validate-release.outputs.package_version }}
+          EXPECTED_GLIBC_BASELINE: ${{ matrix.glibc_baseline }}
+        run: |
+          set -euo pipefail
+          actual_glibc="$(getconf GNU_LIBC_VERSION)"
+          expected_glibc="glibc ${EXPECTED_GLIBC_BASELINE}"
+          if [[ "$actual_glibc" != "$expected_glibc" ]]; then
+            echo "Expected release baseline ${expected_glibc}, found ${actual_glibc}" >&2
+            exit 1
+          fi
+          package_snapshot_root="$(mktemp -d)"
+          smoke_root="$(mktemp -d)"
+          trap 'rm -rf "$package_snapshot_root" "$smoke_root"' EXIT
+          private_package="${package_snapshot_root}/${PACKAGE_NAME}"
+          python "$PRIMARY_SOURCE_ROOT/.github/scripts/release_image_archive.py" copy \
+            --archive "$PACKAGE_NAME" \
+            --checksum "$PACKAGE_NAME.sha256" \
+            --destination "$private_package" \
+            --max-bytes 536870912
+          members="$(tar --list --gzip --file "$private_package")"
+          if [[ "$members" != "tacit" ]]; then
+            echo "Linux binary package must contain exactly tacit" >&2
+            exit 1
+          fi
+          tar --extract --gzip --file "$private_package" \
+            --directory "$smoke_root" \
+            --no-same-owner \
+            --no-same-permissions
+          test -f "$smoke_root/tacit"
+          test ! -L "$smoke_root/tacit"
+          test -x "$smoke_root/tacit"
+          smoke_script="$PRIMARY_SOURCE_ROOT/.github/scripts/smoke_release_binary.py"
+          uv run --project "$PRIMARY_SOURCE_ROOT" --no-sync python "$smoke_script" \
+            --binary "$smoke_root/tacit" \
+            --expected-version "$EXPECTED_VERSION" \
+            --command-timeout 30 \
+              --startup-timeout 30 \
+              --shutdown-timeout 15
+          python "$PRIMARY_SOURCE_ROOT/.github/scripts/release_image_archive.py" cleanup \
+            --directory "$package_snapshot_root" \
+            --expected-name "$PACKAGE_NAME"
+      - name: Describe GitHub release publication payload
+        id: publication_payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$PRIMARY_SOURCE_ROOT/.github/scripts/release_publication_snapshot.py" describe \
+            --directory . \
+            --selector "package=$PACKAGE_NAME" \
+            --selector "checksum=$PACKAGE_NAME.sha256" \
+            --github-output "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.package }}
+            ${{ matrix.package }}.sha256
+          if-no-files-found: error
+
+  build-release-images:
+    needs: validate-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -69,84 +504,1060 @@ jobs:
             arch: amd64
           - platform: linux/arm64
             arch: arm64
+    env:
+      IMAGE_ARCHIVE: /tmp/tacit-release-${{ matrix.arch }}.tar
+      REPRO_IMAGE_ARCHIVE: /tmp/tacit-release-repro-${{ matrix.arch }}.tar
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - name: Build ${{ matrix.platform }} image for vulnerability scan
-        uses: docker/build-push-action@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          image: tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+      - name: Install checksum-pinned Buildx
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$BUILDX_VERSION"
+          case "${RUNNER_OS}/${RUNNER_ARCH}" in
+            Linux/X64)
+              asset="buildx-v${version}.linux-amd64"
+              expected="48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778"
+              ;;
+            *)
+              echo "Unsupported Buildx runner: ${RUNNER_OS}/${RUNNER_ARCH}" >&2
+              exit 1
+              ;;
+          esac
+          download="$RUNNER_TEMP/$asset"
+          trap 'rm -f "$download"' EXIT
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            "https://github.com/docker/buildx/releases/download/v${version}/${asset}" \
+            --output "$download"
+          printf '%s  %s\n' "$expected" "$download" | sha256sum --check
+          test ! -e "$GITHUB_WORKSPACE/$asset"
+          mkdir -p "$HOME/.docker/cli-plugins"
+          install -m 0755 "$download" "$HOME/.docker/cli-plugins/docker-buildx"
+          docker buildx version
+      - name: Create pinned BuildKit builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx create \
+            --name tacit-release-builder \
+            --driver docker-container \
+            --driver-opt image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8 \
+            --use
+          docker buildx inspect --bootstrap
+      - name: Derive reproducible image timestamp
+        id: source_epoch
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          if [[ ! "$source_date_epoch" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Tagged commit has an invalid commit timestamp" >&2
+            exit 1
+          fi
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch" >> "$GITHUB_ENV"
+          printf 'source_date_epoch=%s\n' "$source_date_epoch" >> "$GITHUB_OUTPUT"
+      - name: Build ${{ matrix.platform }} release image
+        id: build_image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          builder: tacit-release-builder
           context: .
+          file: Dockerfile
           platforms: ${{ matrix.platform }}
-          outputs: type=docker,dest=/tmp/tacit-release-scan-${{ matrix.arch }}.tar
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Run Trivy vulnerability scan for ${{ matrix.platform }}
-        uses: aquasecurity/trivy-action@v0.36.0
+          push: false
+          pull: true
+          no-cache: true
+          build-args: SOURCE_DATE_EPOCH=${{ steps.source_epoch.outputs.source_date_epoch }}
+          tags: ${{ env.IMAGE_NAME }}:release-${{ github.sha }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.validate-release.outputs.package_version }}
+          outputs: type=docker,dest=${{ env.IMAGE_ARCHIVE }},rewrite-timestamp=true
+      - name: Create independent pinned BuildKit builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx create \
+            --name tacit-release-repro-builder \
+            --driver docker-container \
+            --driver-opt image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8 \
+            --use
+          docker buildx inspect --bootstrap
+      - name: Rebuild ${{ matrix.platform }} release image independently
+        id: reproduce_image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
-          input: /tmp/tacit-release-scan-${{ matrix.arch }}.tar
+          builder: tacit-release-repro-builder
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          pull: true
+          no-cache: true
+          build-args: SOURCE_DATE_EPOCH=${{ steps.source_epoch.outputs.source_date_epoch }}
+          tags: ${{ env.IMAGE_NAME }}:release-${{ github.sha }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.validate-release.outputs.package_version }}
+          outputs: type=docker,dest=${{ env.REPRO_IMAGE_ARCHIVE }},rewrite-timestamp=true
+      - name: Verify reproducible ${{ matrix.platform }} child digest
+        shell: bash
+        env:
+          AUTHORITATIVE_DIGEST: ${{ steps.build_image.outputs.digest }}
+          REPRODUCED_DIGEST: ${{ steps.reproduce_image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$AUTHORITATIVE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Authoritative build did not produce an architecture digest" >&2
+            exit 1
+          fi
+          if [[ ! "$REPRODUCED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Independent build did not produce an architecture digest" >&2
+            exit 1
+          fi
+          if [[ "$AUTHORITATIVE_DIGEST" != "$REPRODUCED_DIGEST" ]]; then
+            echo "Independent clean build produced a different architecture digest" >&2
+            exit 1
+          fi
+          printf '%s\n' "$AUTHORITATIVE_DIGEST" > "${IMAGE_ARCHIVE}.manifest-digest"
+      - name: Validate built image archive before upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/release_image_archive.py write \
+            --archive "$IMAGE_ARCHIVE" \
+            --checksum "${IMAGE_ARCHIVE}.sha256" \
+            --max-bytes "$MAX_RELEASE_IMAGE_ARCHIVE_BYTES"
+      - name: Execute authoritative ${{ matrix.platform }} release image
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/smoke_release_image.py \
+            --archive "$IMAGE_ARCHIVE" \
+            --checksum "${IMAGE_ARCHIVE}.sha256" \
+            --image "${IMAGE_NAME}:release-${GITHUB_SHA}-${{ matrix.arch }}" \
+            --platform "${{ matrix.platform }}" \
+            --expected-version "${{ needs.validate-release.outputs.package_version }}" \
+            --max-archive-bytes "$MAX_RELEASE_IMAGE_ARCHIVE_BYTES" \
+            --command-timeout 45 \
+            --startup-timeout 60 \
+            --cleanup-timeout 15
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-image-${{ matrix.arch }}
+          path: |
+            ${{ env.IMAGE_ARCHIVE }}
+            ${{ env.IMAGE_ARCHIVE }}.sha256
+            ${{ env.IMAGE_ARCHIVE }}.manifest-digest
+          if-no-files-found: error
+          compression-level: 0
+
+  scan-release-images:
+    needs: build-release-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
+    env:
+      AUTHORITATIVE_IMAGE_ARCHIVE: release-images/tacit-release-${{ matrix.arch }}.tar
+      SCAN_IMAGE_SNAPSHOT_DIR: /tmp/tacit-scan-image-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+      SCAN_IMAGE_ARCHIVE: /tmp/tacit-scan-image-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}/tacit-release-${{ matrix.arch }}.tar
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release-image-${{ matrix.arch }}
+          path: release-images
+      - name: Verify and isolate authoritative image archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          Path(os.environ["SCAN_IMAGE_SNAPSHOT_DIR"]).mkdir(mode=0o700)
+          PY
+          python .github/scripts/release_image_archive.py copy \
+            --archive "$AUTHORITATIVE_IMAGE_ARCHIVE" \
+            --checksum "${AUTHORITATIVE_IMAGE_ARCHIVE}.sha256" \
+            --destination "$SCAN_IMAGE_ARCHIVE" \
+            --max-bytes "$MAX_RELEASE_IMAGE_ARCHIVE_BYTES"
+      - name: Scan ${{ matrix.platform }} release image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.70.0
+          input: ${{ env.SCAN_IMAGE_ARCHIVE }}
           scanners: vuln
           format: table
           exit-code: "1"
           ignore-unfixed: true
           vuln-type: os,library
           severity: HIGH,CRITICAL
+      - name: Remove private image snapshot
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -e "$SCAN_IMAGE_SNAPSHOT_DIR" ]]; then
+            python .github/scripts/release_image_archive.py cleanup \
+              --directory "$SCAN_IMAGE_SNAPSHOT_DIR" \
+              --expected-name "tacit-release-${{ matrix.arch }}.tar"
+          fi
 
-  publish-ghcr:
+  pypi-preflight:
     needs:
+      - validate-release
       - build-dist
-      - scan-ghcr-image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      wheel_name: ${{ steps.pypi_preflight.outputs.wheel_name }}
+      wheel_digest: ${{ steps.pypi_preflight.outputs.wheel_digest }}
+      sdist_name: ${{ steps.pypi_preflight.outputs.sdist_name }}
+      sdist_digest: ${{ steps.pypi_preflight.outputs.sdist_digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Verify any existing PyPI files
+        id: pypi_preflight
+        env:
+          PACKAGE_VERSION: ${{ needs.validate-release.outputs.package_version }}
+          WHEEL_NAME: ${{ needs.build-dist.outputs.wheel_name }}
+          WHEEL_DIGEST: ${{ needs.build-dist.outputs.wheel_digest }}
+          SDIST_NAME: ${{ needs.build-dist.outputs.sdist_name }}
+          SDIST_DIGEST: ${{ needs.build-dist.outputs.sdist_digest }}
+        run: |
+          python .github/scripts/verify_pypi_release.py preflight \
+            --version "$PACKAGE_VERSION" \
+            --artifact "wheel=$WHEEL_NAME=$WHEEL_DIGEST" \
+            --artifact "sdist=$SDIST_NAME=$SDIST_DIGEST" \
+            --github-output "$GITHUB_OUTPUT"
+
+  github-release-preflight:
+    needs:
+      - validate-release
+      - build-binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: read
-      packages: write
+    outputs:
+      package_name: ${{ steps.publication_payload.outputs.package_name }}
+      package_digest: ${{ steps.publication_payload.outputs.package_digest }}
+      checksum_name: ${{ steps.publication_payload.outputs.checksum_name }}
+      checksum_digest: ${{ steps.publication_payload.outputs.checksum_digest }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - name: Log in to ghcr.io
-        uses: docker/login-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: tacit-binary-*
+          path: release-binaries
+          merge-multiple: true
+      - name: Verify any existing GitHub release assets
+        working-directory: release-binaries
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python ../.github/scripts/verify_github_release_assets.py --allow-absent-release
+      - name: Verify and carry GitHub release payload descriptors
+        id: publication_payload
+        env:
+          PACKAGE_NAME: ${{ needs.build-binaries.outputs.package_name }}
+          PACKAGE_DIGEST: ${{ needs.build-binaries.outputs.package_digest }}
+          CHECKSUM_NAME: ${{ needs.build-binaries.outputs.checksum_name }}
+          CHECKSUM_DIGEST: ${{ needs.build-binaries.outputs.checksum_digest }}
+        run: |
+          python .github/scripts/release_publication_snapshot.py verify \
+            --directory release-binaries \
+            --artifact "package=$PACKAGE_NAME=$PACKAGE_DIGEST" \
+            --artifact "checksum=$CHECKSUM_NAME=$CHECKSUM_DIGEST" \
+            --github-output "$GITHUB_OUTPUT"
+
+  ghcr-preflight:
+    needs:
+      - validate-release
+      - build-release-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      exists: ${{ steps.existing_version.outputs.exists }}
+      image_name: ${{ steps.image_refs.outputs.image_name }}
+      version_ref: ${{ steps.image_refs.outputs.version_ref }}
+      series_ref: ${{ steps.image_refs.outputs.series_ref }}
+      latest_ref: ${{ steps.image_refs.outputs.latest_ref }}
+      index_source: ${{ steps.existing_version.outputs.index_source }}
+      amd64_source: ${{ steps.existing_version.outputs.amd64_source }}
+      arm64_source: ${{ steps.existing_version.outputs.arm64_source }}
+    steps:
+      - name: Normalize image version
+        id: image_metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: latest=false
+          tags: type=pep440,pattern={{version}},value=${{ needs.validate-release.outputs.package_version }}
+      - name: Prepare image references
+        id: image_refs
+        shell: bash
+        env:
+          IMAGE_VERSION: ${{ steps.image_metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          image_name="${IMAGE_NAME,,}"
+          {
+            echo "image_name=${image_name}"
+            echo "version_ref=${image_name}:${IMAGE_VERSION}"
+            echo "series_ref=${image_name}:${{ needs.validate-release.outputs.release_series }}"
+            echo "latest_ref=${image_name}:latest"
+          } >> "$GITHUB_OUTPUT"
+      - name: Install checksum-pinned Buildx
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$BUILDX_VERSION"
+          case "${RUNNER_OS}/${RUNNER_ARCH}" in
+            Linux/X64)
+              asset="buildx-v${version}.linux-amd64"
+              expected="48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778"
+              ;;
+            *)
+              echo "Unsupported Buildx runner: ${RUNNER_OS}/${RUNNER_ARCH}" >&2
+              exit 1
+              ;;
+          esac
+          download="$RUNNER_TEMP/$asset"
+          trap 'rm -f "$download"' EXIT
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            "https://github.com/docker/buildx/releases/download/v${version}/${asset}" \
+            --output "$download"
+          printf '%s  %s\n' "$expected" "$download" | sha256sum --check
+          test ! -e "$GITHUB_WORKSPACE/$asset"
+          mkdir -p "$HOME/.docker/cli-plugins"
+          install -m 0755 "$download" "$HOME/.docker/cli-plugins/docker-buildx"
+          docker buildx version
+      - name: Log in to ghcr.io with read-only credentials
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Classify release tag
-        id: release_tag
-        shell: python
+      - name: Inspect an existing immutable version
+        id: existing_version
+        shell: bash
+        env:
+          IMAGE_NAME_LOWER: ${{ steps.image_refs.outputs.image_name }}
+          PACKAGE_VERSION: ${{ needs.validate-release.outputs.package_version }}
+          VERSION_REF: ${{ steps.image_refs.outputs.version_ref }}
         run: |
+          set -euo pipefail
+          error_file="$(mktemp)"
+          trap 'rm -f "$error_file"' EXIT
+          if resolved="$(docker buildx imagetools inspect "$VERSION_REF" --format '{{json .Manifest}}' 2>"$error_file")"; then
+            index_digest="$(jq -r '.digest // empty' <<< "$resolved")"
+            [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            index_source="${IMAGE_NAME_LOWER}@${index_digest}"
+            manifest="$(docker buildx imagetools inspect "$index_source" --raw)"
+            revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<< "$manifest")"
+            version="$(jq -r '.annotations["org.opencontainers.image.version"] // empty' <<< "$manifest")"
+            if [[ "$revision" != "$GITHUB_SHA" || "$version" != "$PACKAGE_VERSION" ]]; then
+              echo "Refusing to replace immutable version ${VERSION_REF}" >&2
+              exit 1
+            fi
+            platforms="$(jq -r '.manifests[]? | "\(.platform.os)/\(.platform.architecture)"' <<< "$manifest" | sort | paste -sd, -)"
+            if [[ "$platforms" != "linux/amd64,linux/arm64" ]]; then
+              echo "Immutable version has unexpected platforms: ${platforms:-none}" >&2
+              exit 1
+            fi
+            {
+              echo "exists=true"
+              echo "index_source=${index_source}"
+              for arch in amd64 arm64; do
+                digest="$(
+                  jq -er --arg arch "$arch" '
+                    [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)]
+                    | if length == 1 then .[0].digest else error("missing or duplicate architecture") end
+                  ' <<< "$manifest"
+                )"
+                [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+                echo "${arch}_source=${IMAGE_NAME_LOWER}@${digest}"
+              done
+            } >> "$GITHUB_OUTPUT"
+          elif grep -Eiq 'manifest unknown|not found' "$error_file"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            cat "$error_file" >&2
+            exit 1
+          fi
+  authorize-publication:
+    needs:
+      - validate-release
+      - build-dist
+      - build-release-images
+      - build-binaries
+      - pypi-preflight
+      - github-release-preflight
+      - ghcr-preflight
+      - scan-release-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Authorize release publication
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python .github/scripts/authorize_release_publication.py
+
+  publish-ghcr:
+    needs:
+      - validate-release
+      - build-dist
+      - build-release-images
+      - build-binaries
+      - pypi-preflight
+      - github-release-preflight
+      - ghcr-preflight
+      - scan-release-images
+      - authorize-publication
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment:
+      name: ghcr
+      url: https://github.com/${{ github.repository }}/pkgs/container/tacit
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    env:
+      PUBLISH_IMAGE_SNAPSHOT_DIR: /tmp/tacit-publish-images-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-image-*
+          path: release-images
+          merge-multiple: true
+      - name: Verify transferred image archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python - <<'PY'
           import os
+          from pathlib import Path
+
+          Path(os.environ["PUBLISH_IMAGE_SNAPSHOT_DIR"]).mkdir(mode=0o700)
+          PY
+          for archive in tacit-release-amd64.tar tacit-release-arm64.tar; do
+            python .github/scripts/release_image_archive.py copy \
+              --archive "release-images/${archive}" \
+              --checksum "release-images/${archive}.sha256" \
+              --destination "${PUBLISH_IMAGE_SNAPSHOT_DIR}/${archive}" \
+              --max-bytes "$MAX_RELEASE_IMAGE_ARCHIVE_BYTES"
+          done
+      - name: Install checksum-pinned Buildx
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$BUILDX_VERSION"
+          case "${RUNNER_OS}/${RUNNER_ARCH}" in
+            Linux/X64)
+              asset="buildx-v${version}.linux-amd64"
+              expected="48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778"
+              ;;
+            *)
+              echo "Unsupported Buildx runner: ${RUNNER_OS}/${RUNNER_ARCH}" >&2
+              exit 1
+              ;;
+          esac
+          download="$RUNNER_TEMP/$asset"
+          trap 'rm -f "$download"' EXIT
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            "https://github.com/docker/buildx/releases/download/v${version}/${asset}" \
+            --output "$download"
+          printf '%s  %s\n' "$expected" "$download" | sha256sum --check
+          test ! -e "$GITHUB_WORKSPACE/$asset"
+          mkdir -p "$HOME/.docker/cli-plugins"
+          install -m 0755 "$download" "$HOME/.docker/cli-plugins/docker-buildx"
+          docker buildx version
+      - name: Log in to ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify GHCR preflight state
+        id: existing_version
+        shell: bash
+        env:
+          EXPECTED_AMD64_SOURCE: ${{ needs.ghcr-preflight.outputs.amd64_source }}
+          EXPECTED_ARM64_SOURCE: ${{ needs.ghcr-preflight.outputs.arm64_source }}
+          EXPECTED_INDEX_SOURCE: ${{ needs.ghcr-preflight.outputs.index_source }}
+          IMAGE_NAME_LOWER: ${{ needs.ghcr-preflight.outputs.image_name }}
+          PACKAGE_VERSION: ${{ needs.validate-release.outputs.package_version }}
+          PRECHECK_EXISTS: ${{ needs.ghcr-preflight.outputs.exists }}
+          VERSION_REF: ${{ needs.ghcr-preflight.outputs.version_ref }}
+        run: |
+          set -euo pipefail
+          error_file="$(mktemp)"
+          trap 'rm -f "$error_file"' EXIT
+          if [[ "$PRECHECK_EXISTS" == "true" ]]; then
+            for source in "$EXPECTED_INDEX_SOURCE" "$EXPECTED_AMD64_SOURCE" "$EXPECTED_ARM64_SOURCE"; do
+              [[ "$source" =~ ^${IMAGE_NAME_LOWER}@sha256:[0-9a-f]{64}$ ]]
+            done
+            current_digest="$(
+              docker buildx imagetools inspect "$VERSION_REF" --format '{{json .Manifest}}' |
+                jq -r '.digest // empty'
+            )"
+            if [[ "$current_digest" != "${EXPECTED_INDEX_SOURCE##*@}" ]]; then
+              echo "Immutable version changed after read-only preflight" >&2
+              exit 1
+            fi
+            manifest="$(docker buildx imagetools inspect "$EXPECTED_INDEX_SOURCE" --raw)"
+            revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<< "$manifest")"
+            version="$(jq -r '.annotations["org.opencontainers.image.version"] // empty' <<< "$manifest")"
+            if [[ "$revision" != "$GITHUB_SHA" || "$version" != "$PACKAGE_VERSION" ]]; then
+              echo "Immutable version metadata changed after read-only preflight" >&2
+              exit 1
+            fi
+            platforms="$(jq -r '.manifests[]? | "\(.platform.os)/\(.platform.architecture)"' <<< "$manifest" | sort | paste -sd, -)"
+            if [[ "$platforms" != "linux/amd64,linux/arm64" ]]; then
+              echo "Immutable version has unexpected platforms: ${platforms:-none}" >&2
+              exit 1
+            fi
+            actual_amd64="$(
+              jq -er '
+                [.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")]
+                | if length == 1 then .[0].digest else error("missing or duplicate architecture") end
+              ' <<< "$manifest"
+            )"
+            actual_arm64="$(
+              jq -er '
+                [.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")]
+                | if length == 1 then .[0].digest else error("missing or duplicate architecture") end
+              ' <<< "$manifest"
+            )"
+            if [[ "$actual_amd64" != "${EXPECTED_AMD64_SOURCE##*@}" || "$actual_arm64" != "${EXPECTED_ARM64_SOURCE##*@}" ]]; then
+              echo "Immutable version children changed after read-only preflight" >&2
+              exit 1
+            fi
+            {
+              echo "exists=true"
+              echo "index_source=${EXPECTED_INDEX_SOURCE}"
+              echo "amd64_source=${EXPECTED_AMD64_SOURCE}"
+              echo "arm64_source=${EXPECTED_ARM64_SOURCE}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            if docker buildx imagetools inspect "$VERSION_REF" > /dev/null 2>"$error_file"; then
+              echo "Immutable version appeared after read-only preflight" >&2
+              exit 1
+            elif grep -Eiq 'manifest unknown|not found' "$error_file"; then
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+            else
+              cat "$error_file" >&2
+              exit 1
+            fi
+          fi
+      - name: Prepare scanned architecture images
+        id: prepare_arches
+        shell: bash
+        env:
+          IMAGE_NAME_LOWER: ${{ needs.ghcr-preflight.outputs.image_name }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for arch in amd64 arm64; do
+            archive="${PUBLISH_IMAGE_SNAPSHOT_DIR}/tacit-release-${arch}.tar"
+            checksum="$(sha256sum "$archive" | awk '{print $1}')"
+            [[ "$checksum" =~ ^[0-9a-f]{64}$ ]]
+            docker load --input "$archive"
+            local_ref="${IMAGE_NAME_LOWER}:release-${GITHUB_SHA}-${arch}"
+            staging_ref="${IMAGE_NAME_LOWER}:release-${GITHUB_SHA}-${arch}-${checksum}"
+            docker tag "$local_ref" "$staging_ref"
+            local_config="$(docker image inspect --format '{{.Id}}' "$staging_ref")"
+            [[ "$local_config" =~ ^sha256:[0-9a-f]{64}$ ]]
+            {
+              echo "${arch}_staging_ref=${staging_ref}"
+              echo "${arch}_local_config=${local_config}"
+            } >> "$GITHUB_OUTPUT"
+          done
+      - name: Publish scanned architecture images
+        id: publish_arches
+        shell: bash
+        env:
+          AMD64_LOCAL_CONFIG: ${{ steps.prepare_arches.outputs.amd64_local_config }}
+          AMD64_STAGING_REF: ${{ steps.prepare_arches.outputs.amd64_staging_ref }}
+          ARM64_LOCAL_CONFIG: ${{ steps.prepare_arches.outputs.arm64_local_config }}
+          ARM64_STAGING_REF: ${{ steps.prepare_arches.outputs.arm64_staging_ref }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME_LOWER: ${{ needs.ghcr-preflight.outputs.image_name }}
+        run: |
+          set -euo pipefail
+          release_authorization_token="$GITHUB_TOKEN"
+          unset GITHUB_TOKEN
+          for arch in amd64 arm64; do
+            if [[ "$arch" == "amd64" ]]; then
+              staging_ref="$AMD64_STAGING_REF"
+              local_config="$AMD64_LOCAL_CONFIG"
+            else
+              staging_ref="$ARM64_STAGING_REF"
+              local_config="$ARM64_LOCAL_CONFIG"
+            fi
+            GITHUB_TOKEN="$release_authorization_token" python .github/scripts/authorize_release_publication.py
+            docker push "$staging_ref"
+            remote_manifest="$(docker buildx imagetools inspect "$staging_ref" --raw)"
+            remote_config="$(jq -r '.config.digest // empty' <<< "$remote_manifest")"
+            if [[ "$remote_config" != "$local_config" ]]; then
+              echo "Published ${arch} image differs from the scanned archive" >&2
+              exit 1
+            fi
+            digest="$(docker buildx imagetools inspect "$staging_ref" --format '{{json .Manifest}}' | jq -r '.digest // empty')"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            approved_digest="$(cat "release-images/tacit-release-${arch}.tar.manifest-digest")"
+            if [[ "$digest" != "$approved_digest" ]]; then
+              echo "Published ${arch} manifest differs from the reproducibility-approved build" >&2
+              exit 1
+            fi
+            echo "${arch}_source=${IMAGE_NAME_LOWER}@${digest}" >> "$GITHUB_OUTPUT"
+          done
+      - name: Pin scanned architecture digests
+        id: scanned_images
+        shell: bash
+        env:
+          PUBLISHED_AMD64_SOURCE: ${{ steps.publish_arches.outputs.amd64_source }}
+          PUBLISHED_ARM64_SOURCE: ${{ steps.publish_arches.outputs.arm64_source }}
+        run: |
+          set -euo pipefail
+          amd64_source="$PUBLISHED_AMD64_SOURCE"
+          arm64_source="$PUBLISHED_ARM64_SOURCE"
+          if [[ ! "$amd64_source" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "Missing pinned amd64 image source" >&2
+            exit 1
+          fi
+          if [[ ! "$arm64_source" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "Missing pinned arm64 image source" >&2
+            exit 1
+          fi
+          {
+            echo "amd64_source=${amd64_source}"
+            echo "amd64_digest=${amd64_source##*@}"
+            echo "arm64_source=${arm64_source}"
+            echo "arm64_digest=${arm64_source##*@}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Compare current build with existing immutable version
+        if: steps.existing_version.outputs.exists == 'true'
+        shell: bash
+        env:
+          CURRENT_AMD64_SOURCE: ${{ steps.scanned_images.outputs.amd64_source }}
+          CURRENT_ARM64_SOURCE: ${{ steps.scanned_images.outputs.arm64_source }}
+          EXPECTED_AMD64_SOURCE: ${{ steps.existing_version.outputs.amd64_source }}
+          EXPECTED_ARM64_SOURCE: ${{ steps.existing_version.outputs.arm64_source }}
+        run: |
+          set -euo pipefail
+          if [[ "$CURRENT_AMD64_SOURCE" != "$EXPECTED_AMD64_SOURCE" ]]; then
+            echo "Existing immutable amd64 child does not match the current build" >&2
+            exit 1
+          fi
+          if [[ "$CURRENT_ARM64_SOURCE" != "$EXPECTED_ARM64_SOURCE" ]]; then
+            echo "Existing immutable arm64 child does not match the current build" >&2
+            exit 1
+          fi
+      - name: Publish immutable multi-architecture version
+        id: publish_version
+        if: steps.existing_version.outputs.exists != 'true'
+        env:
+          AMD64_SOURCE: ${{ steps.scanned_images.outputs.amd64_source }}
+          ARM64_SOURCE: ${{ steps.scanned_images.outputs.arm64_source }}
+          IMAGE_NAME_LOWER: ${{ needs.ghcr-preflight.outputs.image_name }}
+          PACKAGE_VERSION: ${{ needs.validate-release.outputs.package_version }}
+          VERSION_REF: ${{ needs.ghcr-preflight.outputs.version_ref }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_authorization_token="$GITHUB_TOKEN"
+          unset GITHUB_TOKEN
+          metadata_file="$(mktemp)"
+          trap 'rm -f "$metadata_file"' EXIT
+          GITHUB_TOKEN="$release_authorization_token" python .github/scripts/authorize_release_publication.py
+          docker buildx imagetools create \
+            --tag "$VERSION_REF" \
+            --metadata-file "$metadata_file" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "index:org.opencontainers.image.version=${PACKAGE_VERSION}" \
+            "$AMD64_SOURCE" "$ARM64_SOURCE"
+          digest="$(jq -er '."containerimage.descriptor".digest // empty' "$metadata_file")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "index_source=${IMAGE_NAME_LOWER}@${digest}" >> "$GITHUB_OUTPUT"
+      - name: Pin immutable version digest
+        id: pinned_version
+        shell: bash
+        env:
+          EXISTING: ${{ steps.existing_version.outputs.exists }}
+          EXISTING_INDEX_SOURCE: ${{ steps.existing_version.outputs.index_source }}
+          PUBLISHED_INDEX_SOURCE: ${{ steps.publish_version.outputs.index_source }}
+        run: |
+          set -euo pipefail
+          if [[ "$EXISTING" == "true" ]]; then
+            index_source="$EXISTING_INDEX_SOURCE"
+          else
+            index_source="$PUBLISHED_INDEX_SOURCE"
+          fi
+          if [[ ! "$index_source" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "Missing pinned immutable version digest" >&2
+            exit 1
+          fi
+          echo "index_source=${index_source}" >> "$GITHUB_OUTPUT"
+      - name: Verify pinned immutable version
+        id: immutable_version
+        shell: bash
+        env:
+          EXPECTED_AMD64_SOURCE: ${{ steps.scanned_images.outputs.amd64_source }}
+          EXPECTED_ARM64_SOURCE: ${{ steps.scanned_images.outputs.arm64_source }}
+          INDEX_SOURCE: ${{ steps.pinned_version.outputs.index_source }}
+          PACKAGE_VERSION: ${{ needs.validate-release.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          manifest="$(docker buildx imagetools inspect "$INDEX_SOURCE" --raw)"
+          revision="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<< "$manifest")"
+          version="$(jq -r '.annotations["org.opencontainers.image.version"] // empty' <<< "$manifest")"
+          platforms="$(jq -r '.manifests[]? | "\(.platform.os)/\(.platform.architecture)"' <<< "$manifest" | sort | paste -sd, -)"
+          if [[ "$revision" != "$GITHUB_SHA" || "$version" != "$PACKAGE_VERSION" ]]; then
+            echo "Immutable version metadata does not match this release" >&2
+            exit 1
+          fi
+          if [[ "$platforms" != "linux/amd64,linux/arm64" ]]; then
+            echo "Immutable version has unexpected platforms: ${platforms:-none}" >&2
+            exit 1
+          fi
+          actual_amd64_digest="$(
+            jq -er '
+              [.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")]
+              | if length == 1 then .[0].digest else error("missing or duplicate architecture") end
+            ' <<< "$manifest"
+          )"
+          actual_arm64_digest="$(
+            jq -er '
+              [.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64")]
+              | if length == 1 then .[0].digest else error("missing or duplicate architecture") end
+            ' <<< "$manifest"
+          )"
+          if [[ "$actual_amd64_digest" != "${EXPECTED_AMD64_SOURCE##*@}" ]]; then
+            echo "Immutable version child digest mismatch for amd64" >&2
+            exit 1
+          fi
+          if [[ "$actual_arm64_digest" != "${EXPECTED_ARM64_SOURCE##*@}" ]]; then
+            echo "Immutable version child digest mismatch for arm64" >&2
+            exit 1
+          fi
+          image_details="$(docker buildx imagetools inspect "$INDEX_SOURCE" --format '{{json .Image}}')"
+          jq -e \
+            --arg source "https://github.com/${GITHUB_REPOSITORY}" \
+            --arg revision "$GITHUB_SHA" \
+            --arg version "$PACKAGE_VERSION" \
+            '
+              (to_entries | length) == 2 and
+              all(
+                to_entries[];
+                .value.config.Labels["org.opencontainers.image.source"] == $source and
+                .value.config.Labels["org.opencontainers.image.revision"] == $revision and
+                .value.config.Labels["org.opencontainers.image.version"] == $version
+              )
+            ' <<< "$image_details" > /dev/null
+          {
+            echo "version_source=${INDEX_SOURCE}"
+            echo "amd64_digest=${EXPECTED_AMD64_SOURCE##*@}"
+            echo "arm64_digest=${EXPECTED_ARM64_SOURCE##*@}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Confirm immutable version tag still names pinned digest
+        shell: bash
+        env:
+          VERSION_REF: ${{ needs.ghcr-preflight.outputs.version_ref }}
+          VERSION_SOURCE: ${{ steps.immutable_version.outputs.version_source }}
+        run: |
+          set -euo pipefail
+          current_digest="$(
+            docker buildx imagetools inspect "$VERSION_REF" --format '{{json .Manifest}}' |
+              jq -r '.digest // empty'
+          )"
+          if [[ "$current_digest" != "${VERSION_SOURCE##*@}" ]]; then
+            echo "Immutable version tag changed after it was pinned" >&2
+            exit 1
+          fi
+      - name: Advance stable aliases monotonically
+        if: needs.validate-release.outputs.is_stable == 'true'
+        shell: bash
+        env:
+          CANDIDATE_VERSION: ${{ needs.validate-release.outputs.package_version }}
+          EXPECTED_AMD64_DIGEST: ${{ steps.immutable_version.outputs.amd64_digest }}
+          EXPECTED_ARM64_DIGEST: ${{ steps.immutable_version.outputs.arm64_digest }}
+          LATEST_REF: ${{ needs.ghcr-preflight.outputs.latest_ref }}
+          SERIES_REF: ${{ needs.ghcr-preflight.outputs.series_ref }}
+          VERSION_SOURCE: ${{ steps.immutable_version.outputs.version_source }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_authorization_token="$GITHUB_TOKEN"
+          unset GITHUB_TOKEN
+
+          version_key() {
+            python - "$1" <<'PY'
           import re
+          import sys
 
-          tag = os.environ.get("GITHUB_REF_NAME", "")
-          ref = os.environ.get("GITHUB_REF", "")
-          version = tag[1:] if tag.startswith("v") else tag
-          pep440_prerelease = re.compile(
-              r"(?:^|[0-9._-])(?:a|alpha|b|beta|c|rc|pre|preview|dev)\.?\d*",
-              re.IGNORECASE,
-          )
-          is_stable_tag = ref.startswith("refs/tags/v") and not pep440_prerelease.search(version)
+          match = re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", sys.argv[1])
+          if match is None:
+              raise SystemExit(f"Unsupported stable alias version {sys.argv[1]!r}")
+          print(".".join(f"{int(part):020d}" for part in match.groups()))
+          PY
+          }
 
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"is_stable_tag={str(is_stable_tag).lower()}\n")
-      - name: Extract image metadata
-        id: meta
-        uses: docker/metadata-action@v6
+          candidate_key="$(version_key "$CANDIDATE_VERSION")"
+          version_children="$(printf '%s\n%s\n' "$EXPECTED_AMD64_DIGEST" "$EXPECTED_ARM64_DIGEST" | sort)"
+          for alias_ref in "$SERIES_REF" "$LATEST_REF"; do
+            update=false
+            error_file="$(mktemp)"
+            if alias_manifest="$(docker buildx imagetools inspect "$alias_ref" --raw 2>"$error_file")"; then
+              current_version="$(jq -r '.annotations["org.opencontainers.image.version"] // empty' <<< "$alias_manifest")"
+              if [[ -z "$current_version" ]]; then
+                current_version="$(
+                  docker buildx imagetools inspect "$alias_ref" --format '{{json .Image}}' |
+                    jq -er '[to_entries[].value.config.Labels["org.opencontainers.image.version"] // empty] | unique | if length == 1 then .[0] else error("inconsistent legacy alias versions") end'
+                )"
+              fi
+              current_key="$(version_key "$current_version")"
+              if [[ "$candidate_key" > "$current_key" ]]; then
+                update=true
+              elif [[ "$candidate_key" == "$current_key" ]]; then
+                alias_children="$(jq -r '.manifests[]?.digest' <<< "$alias_manifest" | sort)"
+                if [[ "$alias_children" != "$version_children" ]]; then
+                  echo "Alias ${alias_ref} has the same version but different images" >&2
+                  exit 1
+                fi
+              fi
+            elif grep -Eiq 'manifest unknown|not found' "$error_file"; then
+              update=true
+            else
+              cat "$error_file" >&2
+              exit 1
+            fi
+            rm -f "$error_file"
+
+            if [[ "$update" == "true" ]]; then
+              GITHUB_TOKEN="$release_authorization_token" python .github/scripts/authorize_release_publication.py
+              docker buildx imagetools create --tag "$alias_ref" "$VERSION_SOURCE"
+            fi
+          done
+      - name: Remove private image snapshots
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -e "$PUBLISH_IMAGE_SNAPSHOT_DIR" ]]; then
+            python .github/scripts/release_image_archive.py cleanup \
+              --directory "$PUBLISH_IMAGE_SNAPSHOT_DIR" \
+              --expected-name tacit-release-amd64.tar \
+              --expected-name tacit-release-arm64.tar
+          fi
+
+  publish-pypi:
+    needs:
+      - validate-release
+      - build-dist
+      - pypi-preflight
+      - publish-ghcr
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYPI_PUBLICATION_SNAPSHOT_DIR: .tacit-pypi-publication-${{ github.run_id }}-${{ github.run_attempt }}
+      PYPI_PUBLICATION_BACKING_DIR: /var/lib/tacit-release-publication-pypi-${{ github.run_id }}-${{ github.run_attempt }}
+    environment:
+      name: pypi
+      url: https://pypi.org/project/tacit-ai/
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          images: ghcr.io/${{ github.repository_owner }}/tacit
-          flavor: |
-            latest=false
-          tags: |
-            type=pep440,pattern={{version}}
-            type=pep440,pattern={{major}}.{{minor}},enable=${{ steps.release_tag.outputs.is_stable_tag == 'true' }}
-            type=ref,event=branch,enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest,enable=${{ steps.release_tag.outputs.is_stable_tag == 'true' }}
-      - name: Build and push
-        uses: docker/build-push-action@v7
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          name: dist
+          path: dist/
+      - name: Prepare sealed PyPI publisher path
+        env:
+          WHEEL_NAME: ${{ needs.pypi-preflight.outputs.wheel_name }}
+          WHEEL_DIGEST: ${{ needs.pypi-preflight.outputs.wheel_digest }}
+          SDIST_NAME: ${{ needs.pypi-preflight.outputs.sdist_name }}
+          SDIST_DIGEST: ${{ needs.pypi-preflight.outputs.sdist_digest }}
+        run: |
+          sudo --non-interactive "$(command -v python)" .github/scripts/release_publication_snapshot.py seal \
+            --source-directory dist \
+            --destination-directory "$PYPI_PUBLICATION_SNAPSHOT_DIR" \
+            --backing-directory "$PYPI_PUBLICATION_BACKING_DIR" \
+            --artifact "wheel=$WHEEL_NAME=$WHEEL_DIGEST" \
+            --artifact "sdist=$SDIST_NAME=$SDIST_DIGEST"
+      - name: Re-authorize release before publication
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python .github/scripts/authorize_release_publication.py
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: ${{ env.PYPI_PUBLICATION_SNAPSHOT_DIR }}
+          skip-existing: true
+          # Provenance tradeoff: the action's attestations are sidecars written
+          # beside the distributions, but this directory is the exact sealed,
+          # read-only payload. Re-enable only with a separately authorized output.
+          attestations: false
+      - name: Verify published PyPI files
+        env:
+          PACKAGE_VERSION: ${{ needs.validate-release.outputs.package_version }}
+          WHEEL_NAME: ${{ needs.pypi-preflight.outputs.wheel_name }}
+          WHEEL_DIGEST: ${{ needs.pypi-preflight.outputs.wheel_digest }}
+          SDIST_NAME: ${{ needs.pypi-preflight.outputs.sdist_name }}
+          SDIST_DIGEST: ${{ needs.pypi-preflight.outputs.sdist_digest }}
+        run: |
+          python .github/scripts/verify_pypi_release.py postflight \
+            --version "$PACKAGE_VERSION" \
+            --artifact "wheel=$WHEEL_NAME=$WHEEL_DIGEST" \
+            --artifact "sdist=$SDIST_NAME=$SDIST_DIGEST"
+      - name: Remove sealed PyPI publisher path
+        if: always()
+        env:
+          WHEEL_NAME: ${{ needs.pypi-preflight.outputs.wheel_name }}
+          SDIST_NAME: ${{ needs.pypi-preflight.outputs.sdist_name }}
+        run: |
+          sudo --non-interactive "$(command -v python)" .github/scripts/release_publication_snapshot.py unseal \
+            --directory "$PYPI_PUBLICATION_SNAPSHOT_DIR" \
+            --backing-directory "$PYPI_PUBLICATION_BACKING_DIR" \
+            --artifact-name "$WHEEL_NAME" \
+            --artifact-name "$SDIST_NAME"
+
+  publish-github-release:
+    needs:
+      - validate-release
+      - build-binaries
+      - github-release-preflight
+      - publish-pypi
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR: .tacit-github-publication-${{ github.run_id }}-${{ github.run_attempt }}
+      GITHUB_RELEASE_PUBLICATION_BACKING_DIR: /var/lib/tacit-release-publication-github-${{ github.run_id }}-${{ github.run_attempt }}
+    environment:
+      name: github-release
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: tacit-binary-*
+          path: release-binaries
+          merge-multiple: true
+      - name: Verify binary packages and checksums
+        working-directory: release-binaries
+        run: |
+          set -euo pipefail
+          test -f tacit-linux-x86_64.tar.gz
+          sha256sum --check ./*.sha256
+      - name: Prepare sealed GitHub release publisher path
+        env:
+          PACKAGE_NAME: ${{ needs.github-release-preflight.outputs.package_name }}
+          PACKAGE_DIGEST: ${{ needs.github-release-preflight.outputs.package_digest }}
+          CHECKSUM_NAME: ${{ needs.github-release-preflight.outputs.checksum_name }}
+          CHECKSUM_DIGEST: ${{ needs.github-release-preflight.outputs.checksum_digest }}
+        run: |
+          sudo --non-interactive "$(command -v python)" .github/scripts/release_publication_snapshot.py seal \
+            --source-directory release-binaries \
+            --destination-directory "$GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR" \
+            --backing-directory "$GITHUB_RELEASE_PUBLICATION_BACKING_DIR" \
+            --artifact "package=$PACKAGE_NAME=$PACKAGE_DIGEST" \
+            --artifact "checksum=$CHECKSUM_NAME=$CHECKSUM_DIGEST"
+      - name: Verify GitHub release publication state
+        id: github-release-preflight
+        working-directory: ${{ env.GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python "$GITHUB_WORKSPACE/.github/scripts/verify_github_release_assets.py" --allow-absent-release
+      - name: Re-authorize release before publication
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python .github/scripts/authorize_release_publication.py
+      - name: Publish GitHub release binaries
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: ${{ env.GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR }}/*
+          generate_release_notes: ${{ steps.github-release-preflight.outputs.release_exists != 'true' }}
+          prerelease: ${{ needs.validate-release.outputs.is_stable != 'true' }}
+          make_latest: ${{ needs.validate-release.outputs.is_stable == 'true' && 'legacy' || 'false' }}
+          target_commitish: ${{ github.sha }}
+          overwrite_files: false
+      - name: Verify published GitHub release assets
+        working-directory: ${{ env.GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python "$GITHUB_WORKSPACE/.github/scripts/verify_github_release_assets.py" --require-release
+      - name: Remove sealed GitHub release publisher path
+        if: always()
+        env:
+          PACKAGE_NAME: ${{ needs.github-release-preflight.outputs.package_name }}
+          CHECKSUM_NAME: ${{ needs.github-release-preflight.outputs.checksum_name }}
+        run: |
+          sudo --non-interactive "$(command -v python)" .github/scripts/release_publication_snapshot.py unseal \
+            --directory "$GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR" \
+            --backing-directory "$GITHUB_RELEASE_PUBLICATION_BACKING_DIR" \
+            --artifact-name "$PACKAGE_NAME" \
+            --artifact-name "$CHECKSUM_NAME"

@@ -28,19 +28,22 @@ spending immediate cycles on multi-agent swarms, autonomous remediation, or comp
 
 ## Implementation Notes
 
-Implementation status: partially implemented.
+Implementation status: implemented for the local one-command demo; broader
+adoption evidence remains ongoing.
 
 Validated against:
 
 - `README.md`: includes early project warnings, quickstart, Docker dev stack, support matrix, and evaluation/doc links.
 - `docker-compose.dev.yml`: provides a local dev/demo stack with intentionally unsafe local Grafana defaults.
 - `tacit/cli.py`: supports setup/doctor/test/serve/history commands.
+- `tacit demo`: boots, learns, generates, and opens a loopback-authenticated UI
+  without exposing its ephemeral key in URLs or terminal output; teardown is
+  credential-independent and propagates Compose failures.
 - `docs/evaluation.md`: provides a public validation report.
 - `tests/e2e/`: contains opt-in E2E scenarios for learning and API surface.
 - `README.md` current focus still includes functional demo hardening.
 
 TODO:
 
-- Add a true `tacit demo` path or document the current local demo as a single repeatable recording flow.
-- Add README screenshots/GIFs for generated dashboard, learning/approval output, and evaluation results.
-
+- Keep the demo and learning loop covered by hermetic CLI and browser E2E gates
+  as the supported workflow evolves.

@@ -10,11 +10,14 @@ services:
   tacit:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     env_file:
       - path: .env
         required: false
     environment:
+      API_AUTH_ENABLED: "true"
+      API_AUTH_KEY: "${API_AUTH_KEY:?Set API_AUTH_KEY to a strong runtime secret}"
+      API_ALLOWED_HOSTS: "${API_ALLOWED_HOSTS:-localhost,127.0.0.1}"
       LEARNED_ARCHETYPES_GENERATION_ENABLED: "false"
       LEARNED_ARCHETYPES_AUTOMATIC_REGISTRATION_ENABLED: "false"
       LEARNED_ARCHETYPES_NORMAL_RETRIEVAL_ENABLED: "false"

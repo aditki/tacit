@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import time
 from pathlib import Path
 from typing import Any
 
@@ -523,6 +522,8 @@ def test_signal_store_persists_ingested_alert_context(tmp_path):
 
 
 async def test_alert_ingestion_is_idempotent_and_tracks_content_changes(tmp_path, monkeypatch):
+    clock = [1_700_000_000.0]
+    monkeypatch.setattr("tacit.signals.store.time.time", lambda: clock[0])
     store = SignalStore(db_path=tmp_path / "signals.db")
     monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
 
@@ -541,7 +542,7 @@ async def test_alert_ingestion_is_idempotent_and_tracks_content_changes(tmp_path
     )
     first_row = store.list_ingested_alerts()[0]
 
-    time.sleep(0.001)
+    clock[0] += 1
     second = await ingest_alert_features(
         AlertFeatures(
             alert_uid="checkout-latency",
@@ -557,7 +558,7 @@ async def test_alert_ingestion_is_idempotent_and_tracks_content_changes(tmp_path
     )
     second_row = store.list_ingested_alerts()[0]
 
-    time.sleep(0.001)
+    clock[0] += 1
     changed = await ingest_alert_features(
         AlertFeatures(
             alert_uid="checkout-latency",

@@ -2,7 +2,7 @@
 
 Status: living implementation guidance
 
-Last reviewed: 2026-08-18
+Last reviewed: 2026-09-07
 
 This document records recurring engineering lessons and refactor signals found
 while building Tacit's Investigation Contract, Operational Knowledge, learning,
@@ -37,10 +37,154 @@ paths must use the same resolved runtime settings and store graph.
   optional. Their failure must not select data from a different database.
 - Store caches must be scoped to the store identity, tenant, and relevant
   configuration.
+- A composition root resolves the selected history, feedback, Signals, and
+  Operational Knowledge products before it registers runtime ownership. Store
+  readiness admits those exact objects and generations, with Signals and
+  Knowledge sharing one admission. Dependency accessors return the pinned
+  products; they do not rerun injected or compatibility factories after the
+  root becomes active, and capability or generation rebinding fails closed.
 
 The app and CLI must not develop separate heads. A capability available through
 both surfaces should share the same service method, policy checks, tenant
 resolution, transaction semantics, and projections.
+
+Runtime-wide admission control belongs to that composition root, not to a
+request dependency bundle or a module-global singleton. Every dependency bundle
+from one `RuntimeStores` owner shares one controller; different runtime owners
+remain isolated even when their configured limits differ. The controller must
+remain safe when synchronous ASGI tests or embeddings drive one app through
+multiple event loops. API, Slack, public defaults, and evaluation harnesses must
+reuse their composition owner's controller rather than constructing one per
+request. Bound both in-flight and queued work, count admission wait against the
+overall pipeline deadline, and reclaim waiters whose loop closes or stops while
+holding a selected permit. Wildcard runtimes partition the bounded queue by
+tenant, cap each partition below the global queue bound, and schedule ready
+partitions round-robin so one tenant cannot starve another. Queue maintenance
+uses event notification and bounded selected-permit checks rather than rescanning
+every waiter on each release. The scheduler indexes only partitions whose queue
+head is ready and whose partition has capacity; capped partitions re-enter that
+index in constant time when their own active lease or selected reservation is
+released. Maximum-scale tests count scheduler examinations instead of relying
+on wall-clock thresholds. After reserving older eligible queue heads, blocked
+partition queues do not strand spare global capacity from a newly eligible
+partition; an arrival never bypasses an older waiter in its own partition.
+Wildcard runtimes also cap active work per tenant below the global limit when at
+least two slots exist; a single-slot runtime can only provide round-robin
+progress. Admission leases carry an opaque controller identity and their
+partition, and must be validated as a controller-token-partition tuple before
+any active state is removed, so a cross-controller or otherwise forged release
+cannot consume the legitimate lease. Record queue wait, global and partition
+depth, active counts, configured limits, overload
+rejection, and queued cancellation with stable reason codes.
+
+Lifecycle functions are capabilities, not interchangeable callbacks. A
+dependency bundle retains the explicit `RuntimeStores` root owner and provider
+lifecycle owner, then verifies that acquire/release, lease/cleanup, and admitted
+provider accessors are methods of those exact owners and use the bundle's
+admission graph. Missing, split, or foreign callback pairs fail during
+construction before store readiness, credential discovery, provider
+realization, or pipeline work.
+
+An admission namespace may be shared by multiple independently started roots,
+but its terminal lifecycle is reference-counted explicitly. API lifespans, CLI
+pipeline commands, and cold-evaluation contexts each register one
+generation-fenced root handle before constructing executable dependencies. A
+non-final exit releases only that handle. The final exit fences normal
+submissions, rejects queued work, waits for admitted and retained capacity,
+shuts down the provider generation, verifies service ownership is zero, and
+leaves the controller closed until a later root opens a new generation. A
+settings-keyed controller cache is therefore an identity registry, not a
+license for one app to shut down its siblings.
+
+Composition-root construction and recovery are also shared behavior. Apply
+integration opt-outs before resolving settings and pass that same resolved owner
+to the server or command. A development reload subprocess may re-import the app
+only after its inherited environment has been canonicalized to preserve those
+opt-outs and the child has re-proved the parent's bind/authentication policy.
+When that declaration cannot be transferred immutably, reload is loopback-only.
+API, Slack, CLI, direct-pipeline, and evaluation roots use one bounded
+lifecycle-start helper: retry the recoverable pre-drain owner-start failure
+exactly once, and do not retry unrelated failures. Evaluation teardown must
+finish that drain before ambient state is restored or disposable storage is
+removed. Retry exhaustion cannot restore a use token whose caller is about to
+discard it; terminal fencing or a durable recovery owner must retain authority.
+Likewise, a transport thread used to bridge a synchronous boundary has explicit
+startup rollback and a bounded retry. Test fixtures explicitly close SQLite
+connections; a transaction context does not close a `sqlite3.Connection`.
+
+The final owner installs the controller's normal-work fence synchronously while
+releasing its handle; scheduling the drain coroutine is not the fence. Work
+admitted before that transition may still finish provider realization, so the
+drain re-reads the graph's exact manager after admitted capacity reaches zero
+and performs an idempotent final shutdown pass. An initial manager snapshot is
+not sufficient authority for terminal cleanup.
+
+For blocking or background work, an async task is a requester and result
+transport, not the lifetime owner. The composition root owns one admission
+controller. A permit is acquired and worker startup is unambiguously committed
+before a factory can realize a product. The permit remains charged for the
+entire worker lifetime and is released by that worker in `finally`. Until atomic
+adoption, construction, validation, abandonment, and cleanup retain that same
+runtime identity. A rejected or abandoned product is cleaned by the realizing
+owner; cleanup cannot depend on the originating event loop being alive, and no
+fallback may manufacture another controller or uncharged thread. Before
+implementing such work, use the cross-runtime lifecycle design gate in the
+foundation matrix and test every cancellation and worker-start phase. If those
+tests cannot be written without inspecting private state across several owners,
+the ownership boundary is not ready for implementation.
+
+Do not claim that an already-started `asyncio.Task` can be moved off its event
+loop. Retaining such a task keeps its capacity charged and final root drain must
+wait until the loop runs it to a real terminal state. Work that must survive
+requester-loop loss is submitted only after a controller-owned permit and
+worker owner are established; that worker releases capacity in `finally`.
+Stopped-loop tests distinguish these cases instead of decrementing counters to
+make shutdown appear complete.
+
+Returning after cancellation grace does not immediately fence a generation
+that still owns retained work. Keep the generation active so unrelated requests
+may use only its remaining capacity, register one bounded request-idle callback,
+and transfer the final root to graph-owned drain authority when the last task or
+worker permit settles. Because that release can occur on a blocking worker
+thread, detached drain startup accepts no caller transport loop and must not call
+`asyncio.get_running_loop()`.
+
+Review findings are architecture feedback, not a patch queue. Two findings that
+share an ownership, authorization, tenancy, transaction, or lifecycle invariant
+trigger a design reset: inventory every owner and entry point, update the matrix,
+and replace the duplicated behavior through one boundary. Do not continue
+accumulating local guards while that reset is pending.
+
+Evaluation isolation is a capability boundary, not just a temporary database.
+Offline gates receive no network capability. Live harnesses opt into explicit
+loopback endpoints and use the isolated dependency graph rather than global
+providers or credentials. Any destructive fixture replacement requires a
+separate acknowledgement after endpoint validation, before files, clients, or
+network calls are created. Contexts that temporarily mutate process-wide
+environment or archetype state serialize across threads and fail closed on
+overlapping asynchronous tasks. Evaluation-owned local HTTP clients set
+`trust_env=False`; cold isolation also removes and restores the standard
+uppercase and lowercase HTTP, HTTPS, and all-proxy variables. Production HTTP
+clients retain their normal environment-proxy behavior unless their owner
+explicitly selects the evaluation-safe construction path.
+
+Pipeline dependency bundles are capability manifests, not bags of optional
+callables. The production builder requires one explicit `RuntimeStores` owner;
+only the deliberately named isolated builder may synthesize an isolated owner.
+History and feedback factories are checked again when they realize a store,
+including settings, tenant policy, semantic permissions, role, and exact
+database identity, before the store reaches a pipeline stage. LLM and context
+factories are always present and settings-bound; disabled context is a factory
+that explicitly returns `None`. A missing factory never means "consult the
+process singleton." Provider realizations carry a public ownership descriptor
+and are rejected before agent or network use when their settings identity does
+not match the dependency graph.
+
+Backend factories follow the same declaration-before-invocation contract as
+stores and providers. An SDK with an ambient credential chain resolves a stable
+credential/account snapshot before ownership admission and constructs every
+lazy client from that snapshot. Ambient endpoint, profile, organization, and
+project variables cannot add undeclared remotes or identities after admission.
 
 ### Tenant isolation is end to end
 
@@ -56,6 +200,147 @@ Tenant selection is a data boundary, not request decoration.
   lookup is not enough if the lookup itself leaks another tenant's data.
 - Browser requests must send the selected tenant consistently across Generate,
   Learning, Knowledge, Signals, and History views.
+- Authenticated browser deployments deny cross-origin requests unless exact
+  HTTP(S) origins are configured. Wildcard CORS is never compatible with an API
+  key held by the browser; same-origin remains the default. Revalidate this at
+  app construction because unvalidated model copies and failed assignment
+  validation can leave a settings object in an invalid state.
+- Server bind policy is one settings-owned boundary shared by CLI, direct
+  module execution, containers, and release images. Loopback is the default.
+  Non-loopback admission requires authentication plus an explicitly configured
+  compatible Host allowlist; container composition supplies configuration but
+  cannot bypass the validator or bake a credential into the image.
+- A container readiness probe connects to loopback but sends a Host selected
+  from that canonical allowlist. Exact external hosts are used directly and a
+  wildcard uses a matching synthetic subdomain, avoiding an operational
+  backdoor that forces public deployments to allow loopback Host headers.
+- A UI opened from `file://` is not a supported API origin. It shows the local
+  serve instruction and makes no `Origin: null` request or hard-coded localhost
+  fallback.
+- CORS is both a disclosure and mutation boundary for browser traffic. A
+  state-changing request carrying an explicit disallowed `Origin` is rejected
+  before route, body admission, store, pipeline, reload, or remote work. Merely
+  omitting `Access-Control-Allow-Origin` does not prevent a simple form or
+  `no-cors` request from executing. Requests without `Origin` remain available
+  to CLI and other non-browser clients.
+- Request-body admission wraps the ASGI receive channel before framework
+  buffering and decoding. Declared oversize bodies are rejected without a body
+  read; missing, duplicate, invalid, or dishonest lengths remain subject to the
+  same streamed byte count. A disconnected or incomplete stream is not a short
+  request body: do not invoke downstream code with partial bytes, and do not
+  attempt to send a rejection response after the client has disconnected.
+  One application-owned controller also bounds aggregate concurrent request
+  count and buffered bytes before allocation. Its lease remains charged through
+  framework consumption. The resulting pipeline request has strict limits on
+  every retained string and a conservative heap bound; maximum active plus queued
+  requests must fit inside the configured decoded-memory envelope at both model
+  validation and runtime admission. Direct Python entry points treat copied and
+  constructed Pydantic models as untrusted and revalidate the complete request
+  before tenant resolution, runtime-root acquisition, or queue admission.
+  Framework validation errors use a bounded sanitized representation that omits
+  attacker-controlled input and context, so deep invalid JSON remains a client
+  error rather than a recursive encoder failure. After eager buffering has transferred into
+  that bounded representation, response start is the disposal boundary: discard
+  any pending replay and release the ingress lease before a long-lived response
+  continues. One
+  absolute read deadline covers eager bodies plus lazy reads of unframed `GET`
+  and `HEAD` requests. Every
+  cancellation, timeout, disconnect, saturation, and downstream failure releases
+  exactly once and emits only bounded, payload-free reason telemetry. Arbitrary
+  transport fragmentation is coalesced into one bounded buffer and replayed as
+  one canonical ASGI request message; frame count cannot become retained object
+  count. JSON media types use a fixed measured decode-memory factor that ordinary
+  configuration cannot weaken. Wildcard tenant limits are strictly below their
+  global request and byte ceilings, while a pinned runtime may use the full
+  global envelope. Recompute and revalidate that effective envelope at app
+  construction: copied or mutated settings bypass model validators, and the
+  cross-field memory check must use the greater of the configurable factor and
+  the mandatory JSON factor before any admission controller is created.
+- In authenticated mode, anonymous HTTP access is an exact route policy: only
+  `GET` and `HEAD` for `/` and `/healthz` bypass credential parsing. These
+  requests never acquire shared request-body admission: a valid zero content
+  length remains lease-free, while positive or ambiguous body framing is
+  rejected before receive. Register explicit bodyless HEAD handlers so bootstrap
+  and health retain their GET status, including fatal health, even while shared
+  ingress is saturated. Path and method near-misses remain protected.
+  Disabled generated-documentation paths return 404 before credential handling
+  so the disabled surface remains indistinguishable from an absent route without
+  turning broader path prefixes into public API surface.
+- A middleware response that terminates an HTTP/1.x request before complete body
+  ownership must close the connection. This includes authentication, Host, CORS
+  preflight, disabled documentation, public-body rejection, declared oversize,
+  saturation, and pre-response framework failure. Leaving unread declared bytes
+  on keep-alive would move attacker-controlled socket lifetime outside the body
+  admission and read deadline; bounded draining is acceptable only when the same
+  ingress owner and deadline remain in force.
+- A response-first body failure keeps receiving and discarding transport frames
+  until the actual disconnect, so queued disconnect remains observable and no
+  request frame reaches the listener. If body ownership is incomplete when
+  response start is forwarded, replace any HTTP/1.x connection policy with
+  `Connection: close`; the socket cannot remain reusable while unread bytes are
+  still governed by ingress. A sequential responder that sent headers
+  and then reads in the same task gets one bounded disconnect-observation window,
+  starting before its first post-response receive, before a synthetic disconnect;
+  a concurrent response sender remains the cancellation owner only while it is
+  live so normal streaming output is not truncated; once it completes, is
+  cancelled, or fails, the receiver starts the same bounded fallback deadline.
+  Unframed body coalescing uses one timeout scope for all
+  frames, because per-frame timer handles would make memory grow with transport
+  fragmentation even when payload bytes remain bounded.
+- Health checks and other utility HTTP clients are separate security principals
+  from Tacit's authenticated API client. They default to anonymous requests,
+  disable ambient proxy discovery when probing local dependencies, reject
+  redirects, and pin the expected origin. This includes optional local runtime
+  probes such as Ollama; an anonymous probe is not permission to inherit ambient
+  proxy routing. Never build probe headers from the
+  application's API credential helper. Credential-bearing demo workflows use
+  the same proxy and redirect isolation; a local URL does not make ambient proxy
+  forwarding safe.
+- Local demo teardown does not load, generate, or forward a runtime credential.
+  If Compose interpolation requires a value even for `down`, pass a fixed
+  non-secret value only in that child environment and propagate a nonzero exit
+  before reporting success. Zero-config browser authentication uses a one-shot
+  loopback bootstrap whose unguessable URL contains no credential. Transfer the
+  key through transient browser state, accept it only on the loopback Tacit
+  origin, copy it into the UI's existing session-scoped key control, and clear
+  the transient value immediately. Never put generated keys in URLs, command
+  arguments, terminal output, persistent browser storage, or committed files.
+- Treat browser authentication as a nonce-bound same-tab and hidden-frame
+  protocol. Keep the API key out of bootstrap HTML, URLs, referrers, and
+  navigation state. Replace the bootstrap page with the exact target origin,
+  then require the hidden bootstrap-origin frame, exact source/origin checks,
+  and a fresh nonce for one-time redemption. Delivery may enter only a
+  non-authoritative session-scoped pending record; API clients must ignore it.
+  A preparation response may place the key provisionally in the normal session
+  slot, but the pending rollback marker must keep requests on the previous
+  credential through the server's activation response. The frame then confirms
+  promotion, the parent rechecks the absolute deadline, removes the pending
+  marker to activate browser authority, and sends a nonce-bound final
+  browser-commit acknowledgment through the frame. Only the resulting final
+  server POST completes the CLI; the activation response alone cannot report
+  success. CLI success waits for that post-promotion acknowledgment. Reload
+  startup and `pagehide` before browser commit restore the previous key and
+  purge pending state. After browser authority is committed, loss of the final
+  POST is an explicit indeterminate result, not ordinary failure; receipt of a
+  valid final POST is success even when the empty response is lost. This is the
+  bounded two-party commit boundary: another volatile acknowledgment would only
+  move the same uncertainty window.
+  Before browser commit, redirect, wrong-origin, malformed, replay, reload,
+  same-origin navigation, frame failure, and timeout paths retain no new
+  credential authority. The protocol does not depend on `window.open` or
+  new-window policy.
+- An authenticated browser surface disables generated documentation that loads
+  third-party scripts into the application origin, denies framing, and marks
+  sensitive responses `private, no-store`. Custom credential and tenant headers
+  are not an acceptable cache-partition assumption. Security headers wrap or
+  handle framework-generated failures as well as successful route responses.
+- HTTP test helpers are compatibility boundaries. A supported ASGI transport
+  must preserve lifespan startup/shutdown, lifespan state, cookie persistence
+  and deletion, exception behavior, and ordinary one-shot requests. A
+  `lifespan.*.failed` response is already terminal evidence: preserve its exact
+  message or the app's original task exception, observe and cancel unfinished
+  lifespan work, and never wait for an additional protocol message that may not
+  arrive.
 - Legacy migrations inherit the configured pinned tenant. A wildcard runtime
   must fail before schema mutation when pre-tenant user data has no explicit
   owner; migrate once under a pinned owner before enabling wildcard tenancy.
@@ -210,6 +495,10 @@ of adding more per-stage reference sets. A likely record contains:
   reading or persisting any source. Each accepted artifact still owns a bounded
   transaction; directory-wide write locks are prohibited.
 - Policy override inputs require their own privileged permission in API and CLI.
+- The curated archetype registry is process-global authority. Listing it
+  requires `knowledge.read`; hot-reloading it and returning the resulting list
+  requires both `knowledge.read` and `knowledge.override`, and denial runs before
+  importing or invoking the reload side effect.
 - Human-readable actor labels in request bodies are untrusted metadata. Audit
   ownership is derived from the authenticated credential slot (or explicitly
   recorded as local unauthenticated operation), so callers cannot impersonate
@@ -266,6 +555,169 @@ layer is warranted.
 - A run row and its corresponding start or terminal lifecycle event are one
   transaction. Neither side may become visible without the other.
 - Client cancellation is cancellation, not timeout.
+- Timeout and caller-cancellation cleanup has a separate bounded grace period.
+  Admission release is unconditional; a dependency close that never completes
+  is observed and abandoned without extending the request deadline forever.
+
+### Release publication is a staged external commit
+
+PyPI and GHCR do not provide one cross-registry transaction or a reliable
+rollback primitive. The release workflow must describe and test the ordering it
+can guarantee instead of claiming strict atomic publication.
+
+- Every `v*` publisher belongs to one validated workflow. Python distributions,
+  container images, and platform binaries may not have independent tag paths
+  that bypass the shared gates. A release tag exactly equals `v` plus the package
+  version before any build or publication starts. Supported versions are
+  three-part stable or prerelease versions; post releases and local versions are
+  rejected until their image-channel semantics are explicitly designed. The
+  tagged SHA is checked out explicitly by every source-consuming release job,
+  must equal the current tip of a freshly fetched `origin/main`, and must have a
+  successful completed main CI run for that exact commit. This authorization is
+  downstream of all read-only release gates and upstream of the first registry
+  mutation. Because protected-environment approval can delay each publisher,
+  every publication job repeats the protected-tag and current-main-tip
+  proof immediately before its first external write.
+- Public release quality evidence is generated separately for clean and
+  representative long-lived state on the exact current `origin/main` tip. The
+  publication authorizer recomputes every finite score and zero-error condition
+  from all 100 per-prompt measurements; self-reported aggregates and
+  `gate.passed` are informational. The protected job supplies one concrete
+  tenant and snapshots the representative SQLite state exactly once. Evaluation
+  and publication authorization bind the same logical snapshot fingerprint,
+  tenant, and fixed 2 GiB-per-database/4 GiB-aggregate size limits; callers do
+  not supply a separately computed raw-file fingerprint. Per-database and
+  aggregate budgets are enforced during source materialization and SQLite
+  backup, so a file that grows after preflight cannot consume the larger
+  aggregate cap. The two modes require at least 400 provider
+  calls and share one hard 500-request budget, including retries, repairs, and
+  freeform calls. Request 501 is refused before upstream contact. Evidence keeps
+  the corpus, state, model, endpoint, run, request-budget, and report digests for
+  90 days.
+- The quality job runs only on an isolated self-hosted Linux x64 runner carrying
+  the `release-quality` routing label and a protected environment of the same
+  name. The runner has no ambient cloud credentials and can reach only the
+  configured loopback model and Grafana fixture plus sanitized representative
+  state. Environment reviewers, no self-review or administrator bypass, and a
+  main-only deployment rule are repository controls; the label alone is not a
+  security boundary. If `main` advances before publication, discard the
+  evidence and tag, then evaluate and tag the new tip.
+- A workflow-step boundary is not sufficient freshness evidence when that step
+  performs substantial local work before mutation. Prepare GHCR archives and
+  local image identities first, then run shared authorization on the command
+  immediately preceding each architecture push, immutable-index creation, and
+  conditional alias move. Scope the Actions token to the helper command so
+  Docker and Buildx do not inherit repository credentials.
+- The wheel smoke test compares the validated version with installed package
+  metadata, the runtime module version, and CLI output using PEP 440 semantic
+  equality from an isolated environment rather than the source checkout.
+  Publication actions are pinned to reviewed commit identities. Downloaded tools
+  and privileged helper images use explicit versions and immutable checksums or
+  digests where available, and release checkouts do not persist credentials.
+- Build each architecture twice without cache on separate pinned BuildKit
+  builders and require their same-SHA child digests to match before any upload.
+  Bound and checksum the first portable archive, then upload that authoritative
+  archive before invoking any downloader-managed scanner. A separate read-only
+  job verifies the checksum, scans a disposable copy, and cannot replace the
+  authoritative archive or its checksum. Publication downloads and verifies the original pre-scan artifact
+  and loads it without a second image build. The complete architecture manifest
+  digest approved by both independent builds travels with that archive and must
+  equal the digest observed after the staging push; matching only the image
+  config digest is insufficient publication identity.
+- CI, container, binary, and package builds reject a stale `uv.lock`. The PEP
+  517 backend has a separately committed, hash-pinned closure generated from
+  that lock; wheel smoke tests install locked runtime dependencies before the
+  wheel itself with dependency resolution disabled.
+- OCI layers use the tagged commit time as `SOURCE_DATE_EPOCH` and BuildKit
+  timestamp rewriting so clean builds of one authorized SHA produce the same
+  child digests. uv download/build caches use disposable BuildKit cache mounts,
+  and installed environments copy out of those mounts, so build tooling and
+  cache archives are absent from runtime layers. Portable image archives are
+  regular, nonempty, and bounded before upload and after every download.
+- Complete package and binary build/smoke tests, every architecture scan, and a
+  read-only PyPI and GitHub-release digest preflight before the first registry
+  write. Release-asset preflight rejects duplicate or unexpected names and
+  invalid declared sizes before downloading any asset body, then stream-hashes
+  only expected assets under an enforced byte limit. Binary archives use fixed
+  metadata and timestamps; retries refuse to overwrite an existing asset with
+  different bytes. The final release job validates the exact local wildcard
+  upload set. Its immediate pre-upload remote check accepts only an absent
+  release or a matching subset, allowing a partial external write to converge
+  without overwrite; duplicates, unexpected names, size disagreements, and
+  digest mismatches fail closed. The post-upload check requires the exact remote
+  set and digests. Generate release notes only when preflight proves the release
+  is absent. A retry after a partial asset upload preserves the existing release
+  body and converges only the missing assets.
+- Frozen executables must reproduce across two independent exact-SHA checkout
+  and virtual-environment paths before their first upload. Both builds install
+  one already-built wheel from the same artifact path rather than copying
+  editable-install metadata from separate source roots. The release-only
+  packager uses an exact pin at or above the current maintainer
+  security-advisory floor; reproducibility does not authorize a binary produced
+  by a vulnerable packager. PyInstaller inputs
+  exclude installation-specific `.dist-info/RECORD` manifests and timestamped
+  build-tool cache sidecars, while retaining Tacit's canonical `METADATA` and
+  `entry_points.txt`. Archive inspection checks those files, and the executable
+  itself must resolve its version and console entry point through
+  `importlib.metadata`. Compare the packaged bytes, not merely version output or
+  source identity.
+- An immutable container pin is not permanently vulnerability-free. Refresh the
+  Python/Alpine version and multi-architecture index digest only after the same
+  fixed HIGH/CRITICAL Trivy policy passes for every published architecture, and
+  retain that current-database scan as a mandatory release authorization gate.
+- Architecture staging references include the transferred archive checksum.
+  Every run publishes its current local architecture images to those staging
+  references and captures their exact digests. A full-version
+  multi-architecture tag is create-once: retries verify its source revision,
+  package-version annotation, platforms, child labels, and exact child digest
+  set, then require those children to equal the current build digests before
+  reusing the pinned index digest. Self-asserted image labels are never enough
+  to authorize reuse. Stable aliases are created from that pinned digest, never
+  by re-resolving a mutable tag.
+- Stable releases update major/minor and `latest` aliases only when the candidate
+  version is newer than the current stable target. Publication runs share one
+  repository-wide concurrency group with GitHub's bounded `queue: max` mode so a
+  third tag cannot evict a pending release or race that read/compare/write transition.
+  Prereleases retain only their full-version tag.
+- Publish the immutable multi-architecture GHCR version and any eligible channel
+  aliases before starting PyPI publication.
+- Repository administration is part of the release boundary: protect the `v*`
+  tag namespace, restrict tag creation to the release role, and configure
+  `ghcr`, `pypi`, and `github-release` as protected environments that permit
+  deployment only from protected release tags. Only the final GitHub release
+  job receives `contents: write`. Workflow checks are defense in depth and
+  cannot make a tag trustworthy when an arbitrary writer may create or redefine
+  it.
+- A GHCR success followed by a PyPI failure remains possible. The workflow keeps
+  PyPI from publishing first, leaves the successful container artifact available
+  for a verified retry, compares any pre-existing PyPI files by digest, and does
+  not pretend it can roll back an external registry atomically. Registry tags
+  have no cross-client compare-and-swap, so protected environments and tightly
+  scoped publication credentials remain required controls.
+- Every release job has a bounded timeout. Privileged jobs install downloaded
+  tooling only after verifying a fixed checksum, before registry login. A
+  downloader-managed vulnerability scanner may run only in a build job without
+  registry credentials or a pre-publication job with read-only package access;
+  it never executes in a registry-write-capable job and never owns publication
+  bytes. Platform-binary packaging stats and rejects invalid or oversized input
+  before opening it, streams archive construction and hashing, and bounds the
+  resulting package before its checksum is accepted. Remote PyPI and GitHub
+  metadata is byte-bounded before decoding, and local distribution artifacts
+  are stream-hashed in bounded chunks in both PyPI preflight and postflight.
+  Because successful main CI is a
+  release authorization input, CI actions, setup tools, and scanner containers
+  use immutable identities and fixed checksums just like the release workflow.
+  Secret scanning has a separate committed-history pass over the event's
+  reachable range; a clean current worktree cannot hide a credential retained
+  in an earlier commit.
+- Binary publication follows the complete platform release contract, not
+  PyInstaller's ability to emit an executable.
+  Only the Linux x86_64 frozen binary is published in this changeset. macOS
+  remains a supported Python/source runtime, but its frozen artifact stays
+  absent until a dedicated Developer ID
+  signing and notarization gate signs the authoritative post-reproducibility
+  bytes and verifies the final download. Windows binaries remain unpublished
+  while protected storage lacks an equivalent platform authority model.
 
 ### Entity and scope normalization is symmetric
 
@@ -379,7 +831,11 @@ mechanics, tenant predicates, and transaction ownership in repositories.
   remaining legacy rows as durable progress: governed rows are archived and
   removed in the same batch transaction, retargetable rows move in bounded
   batches, the intended owner is pinned in a progress marker across restarts,
-  and the owner marker is terminal rather than aspirational.
+  and the owner marker is terminal rather than aspirational. The progress
+  marker is claimed in the first structural writer transaction before any
+  tenant-specific schema row is copied; it cannot be deferred until the later
+  owner-backfill loop, because a competing opener could otherwise claim the
+  terminal owner after schema copy completed under a different tenant.
 - In-memory caches have capacity bounds as well as TTLs; ordinary writes prune
   expired keys. Metric caches also carry a total item-weight budget and refuse
   to retain one oversized catalog; a key-count limit alone does not bound
@@ -690,6 +1146,10 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   persistence failure in run status and metrics.
 - Benchmark reports identify clean versus long-lived state and include latency
   percentiles, recall, signal-to-noise, and zero-match cases.
+- A benchmark called a gate owns explicit quality floors and error ceilings,
+  exits nonzero when either fails, and carries API authentication and concrete
+  tenant identity. Clean state is disposable; long-lived state is evaluated
+  from SQLite backup snapshots and never mutated in place.
 - Failed chart runs should expose a run identifier and terminal status even when
   validation drops every panel and no investigation revision is produced. The
   same identity travels with unexpected API and streaming failures; if the run
@@ -779,6 +1239,11 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   Larger live-WAL databases fail closed until checkpoint/last-close makes the
   constant-space immutable path available. A live rollback journal also fails
   closed; recovery is a trusted-writer operation, not an admission side effect.
+  The enclosing bounded admission operation may retry a transient journal. If
+  immutable SQLite inspection fails while the protected main/WAL/journal state
+  demonstrably changed, the attempt is classified as source movement and the
+  complete callback is retried. An unchanged malformed database is never
+  reclassified or admitted.
 - Migration cursors encode the not-started state outside the source key's legal
   domain. SQLite row IDs and application IDs may be negative, zero, positive,
   sparse, empty text, or at their integer bounds; none of those values, nor an
@@ -798,11 +1263,89 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   `runtime_ownership`, `database_path`, or the public projection store, but may
   not infer ownership from `_db_path`, `_runtime_settings`, `_settings`, or
   `_signal_store`. A descriptor-only adapter is a required regression fixture.
+- Lazy dependency factories have two ownership gates. An immutable declared
+  descriptor is checked before invocation, and the realized store or provider
+  is checked again before any method, bootstrap, prompt, context query, cache
+  write, or remote call. Injected factories without declarations fail closed;
+  runtime-owned defaults declare themselves at composition time.
+- Provider lifetime belongs to the admission namespace's runtime execution
+  graph, not to a request bundle or caller event loop. Independently constructed
+  bundles resolve one compatible provider manager. Settings-derived default
+  factory closures are semantic implementation details, not compatibility keys.
+  Directly injected LLM factories, context factories, and chained cleanup
+  callbacks are executable authorities and share only when the exact retained
+  declaration or callback object is reused. A different injection with an equal
+  ownership descriptor fails during dependency construction. Its process-local
+  identity guard is retained by the specification and never rendered in logs,
+  errors, fingerprints, or operator diagnostics. Leases carry graph/epoch/lease
+  identities plus the requester's actual task and loop. A completed task on a
+  stopped-open loop and a closed abandoned loop are reclaimable; a pending task
+  on a deliberately paused loop is not. Calls have a separate active-operation
+  count, and final release drains calls before closing on the graph's service
+  loop. Direct provider calls inherit a validated request admission or acquire
+  a standalone lease from the same controller, so API, CLI, Slack, and direct
+  Python never create a provider-local capacity authority. SDK endpoint and
+  account defaults are explicit settings-derived values, never ambient process
+  variables that can silently change the effective remote owner.
+- A managed provider object is a consumer proxy, not cleanup authority. Binding
+  it to a runtime replaces public `close()` with a stable ownership denial; only
+  the exact generation owner can invoke the captured implementation close. The
+  owner retries transient close failure within a fixed bound while its permit is
+  charged. A bounded permanent failure is runtime-fatal: revoke proxy methods,
+  remove every runtime strong reference, and ask pipeline admission to latch its
+  sole bounded process-lifetime registry entry for that runtime. The registry
+  keys a domain-separated digest of stable runtime identity and retains no raw
+  identity or executable authority. Release counters only after authority is
+  unreachable. Final root drain still reaches zero and reports bounded,
+  message-free cleanup metadata, but that runtime cannot realize another
+  provider before process restart.
+- Credential-chain names are not credential identities. Profile, process,
+  metadata, SSO, and web-identity sources are resolved to one frozen,
+  non-secretly fingerprinted snapshot before ownership admission, and the SDK
+  client is constructed only from that snapshot. Potentially blocking chain
+  resolution runs outside the event loop; a later refresh is a new generation
+  that must be admitted again.
+- Request completion and effective-work completion are separate lifecycle
+  events. Cancellation may return a response after a bounded grace period, but
+  non-cancellable SDK work keeps consuming the runtime-owned work budget until
+  it actually ends. Factory realization begins only after committed admission.
+  Before adoption, rejected or abandoned products remain with the realizing
+  worker for cleanup, so a caller-loop shutdown cannot detach the resource or
+  release its capacity early.
+- Declared backend ownership is a set contract as well as a per-object
+  contract. Realization produces exactly one backend for each declared remote,
+  with neither omission nor duplication, before any publisher receives work.
+- Factory preflight and realization failures emit only the phase, capability,
+  stable reason code, and mismatch dimensions. Component names, paths, tenant
+  identifiers, prompts, endpoints, account identifiers, and credentials are
+  excluded from these events.
 - Sharing a physical SQLite database does not imply sharing authority. The
   knowledge repository must prove the signal-store role and durable tenant
   owner through that public capability at construction and again immediately
   after every writer lock, including caller-bound transactions. A conflicting
   first-opener may leave no repository-specific schema, marker, or row behind.
+- Sharing a physical SQLite database also does not justify duplicate readiness
+  work. The signal store is the single protected-path admission owner for the
+  combined Signals and Operational Knowledge database. It issues one public,
+  role-bound readiness capability after one bounded source snapshot; the
+  knowledge repository consumes that exact capability and revalidates the
+  admitted database generation before schema use. Startup records exact copy
+  count, copied bytes, and admitted roles so a duplicate copy is observable.
+  Owner, path, capacity, role, or generation disagreement fails before a second
+  copy, migration, or user-data mutation.
+- Required-store readiness belongs to runtime-root activation, not only the API
+  lifespan. The shared `RuntimeStores.start_runtime_services()` boundary covers
+  API, CLI, direct pipelines, standalone integrations, and cold evaluation.
+  Each new root generation revalidates the exact retained readiness
+  capabilities and current byte capacity before registering an owner. Cached
+  readiness is therefore an admission plan, not permission to survive database
+  replacement or later limit-plus-one growth.
+- Raw readiness-capacity sampling can race a cooperating same-owner WAL writer
+  even after schema initialization. Treat `sqlite_file_replaced` and active
+  rollback recovery as bounded sampling retries, emit only the reason and
+  attempt, then still verify the durable role generation and final capacity
+  after acquiring the writer lock. A one-shot metadata comparison is not an
+  authority decision and must not make healthy concurrent first-open flaky.
 - Projection audits validate bounded key pages with an indexed relational join,
   never a generated `OR` predicate over the authority table. Query-plan tests
   exercise the exact production statement at representative long-lived-state
@@ -837,12 +1380,517 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   ownership-preflighted before remote I/O, the run records a required commit
   marker before the first write, and cancellation is deferred through backend
   fan-out, contract persistence, and terminal audit completion.
+- Representative evaluation state is copied without opening the authority
+  SQLite files, including clean and closed-WAL sources. The benchmark snapshots
+  admitted main/WAL components into disposable storage, verifies the complete
+  history/feedback/signals source set before and after the copy, and retries or rejects movement. This keeps
+  read-only benchmark sources byte-for-byte and directory-entry immutable and
+  prevents one report from mixing role generations. Source identity includes
+  inode, size, mtime, and ctime. Linux uses `O_NOATIME` when permitted; access
+  time is explicitly outside the portable integrity contract because macOS and
+  other POSIX platforms expose no equivalent standard read primitive.
+  Source sets are bounded both while materializing raw bytes and while writing
+  SQLite backups. Capacity is checked for the two-copy peak on the destination
+  filesystem, and storage exhaustion has a distinct stable rejection reason.
+- Evaluation credentials belong to the selected evaluation state, never the
+  process-global runtime. Local benchmark HTTP clients disable ambient proxy
+  discovery, and classifier/provider failures cannot be normalized into a
+  passing label. Gate corpora must contain the required cases and both required
+  polarity populations before rates are defined.
+- Release input identity is descriptor-bound. Binary packaging rejects
+  symlinks and non-regular files with `lstat`, opens with no-follow semantics,
+  and revalidates identity and size with `fstat` before streaming. Incremental
+  secret ranges are accepted only after an explicit full reachable-history
+  baseline; the Git-object-free current-tree scan remains a separate control.
+- Bedrock credential discovery is an allowlisted ownership boundary. The
+  current runtime admits explicit keys, static credential/config profiles,
+  frozen web identity, and one-level assume-role profiles backed by a static
+  source profile. Credential-process, SSO/login, container metadata, instance
+  metadata, and other unmodeled providers fail before Botocore construction or
+  external side effects. Classification follows Botocore's complete provider
+  order, environment-name precedence, file precedence, and presence-sensitive
+  provider keys. Blank or edge-padded credential controls fail closed instead
+  of falling through to a different profile, file, token, or principal. After
+  selecting the winner, web identity is represented by one synthesized private
+  profile and token copy.
+  Static credentials remain separated by provider file, and all admitted file
+  discovery is rebound to an explicit private profile so ambient providers
+  cannot re-enter after admission. Supporting another provider later requires
+  an explicit local/remote identity, mutation tests, and lifecycle ownership.
+- The captured Bedrock plan remains the provider resource's cross-generation
+  ownership declaration. It retains selectors and non-secret fingerprints, not
+  credential-file, web-token, or environment credential values. Temporary
+  credentials returned by assume-role and web-identity operations may rotate
+  between generations; each realized non-secret identity is checked only
+  against the current product and is never retained as the next generation's
+  expectation. Raw environment credentials and static source-profile
+  credentials used to perform assume-role remain pinned because the target role
+  selector cannot validate arbitrary source-principal rotation.
+- ADR-023 contains the blocking Bedrock adapter as an operation-scoped bridge.
+  The exact runtime controller reserves a permit before credential realization.
+  One worker owns realization, client construction, `converse`, parsing, and
+  cleanup, and releases capacity in `finally`. No Boto3 session, client, or
+  realized credential generation crosses the worker boundary. Caller
+  cancellation or loop loss may discard a result, but cannot own cleanup or
+  release capacity early. Botocore connect and read timeouts are best-effort
+  transport bounds, not a hard worker-lifetime guarantee. A response returned
+  after the operation deadline is rejected, while admission remains charged
+  until the worker-owned call and cleanup return. The Bedrock cap of 32 bounds
+  the population of such workers, not how long an uninterruptible SDK call may
+  live. Repeated construction and lost connection pooling are accepted temporary
+  costs, not reasons to add shared blocking-client state.
+- Credential files are opened with nonblocking, no-follow semantics and must be
+  regular files. Symlink-backed Kubernetes or IRSA projected-token files may
+  therefore be rejected by the compatibility bridge. This remains an explicit
+  compatibility limitation until the native async transport models that source;
+  containment is not weakened by following the symlink.
+- Background maintenance startup is a lifecycle phase, not an infallible
+  implementation detail. Clear failed thread registration and reclaim selected
+  work before retrying once. Persistent startup failure rejects and wakes the
+  bounded queue instead of retaining invisible capacity or retrying forever.
+- Lifecycle-thread construction, registration, start, and readiness form one
+  shared bounded transition. Provider generation owners, final-drain owners,
+  recovery owners, admission maintenance, and synchronous cleanup transports
+  must use that transition rather than implementing local thread startup. A
+  failed transition either restores the exact prior authority or installs a
+  process-fatal fence while the execution graph retains the unreachable
+  generation; caller tokens, selected claims, and service permits cannot be
+  discarded between those outcomes.
+- Lifecycle-owner exit is a direct state transition, not another blocking job.
+  The owner thread publishes one thread-safe completion from its outermost
+  `finally`; async shutdown shields and awaits that signal with a wall-clock
+  deadline, then performs only a nonblocking `join(0)`. Do not route thread
+  joins through the caller loop's default executor or replace notification with
+  polling, because unrelated executor saturation would then own provider
+  shutdown latency.
+- A process runtime identity is an admission authority, not a label. Only the
+  canonical controller factory claims an explicit identity. Direct controllers
+  start isolated and cannot coexist under that identity; replacement never
+  inspects provider state while holding registry or controller locks.
+- A fatal fence prevents future execution but is not proof that current
+  execution reached zero. Evaluation isolation restores ambient credentials,
+  caches, and disposable storage only after the runtime is closed and every
+  provider manager and permit class is drained. A fenced live owner retains its
+  state until process restart.
+- Multi-role SQLite snapshots use one owner-only completion manifest as the
+  atomic public commit point. Role files observed before that manifest are an
+  incomplete generation and must never be returned as a complete snapshot.
 - When debugging exposes missing telemetry, call it out and add focused
   instrumentation when it is in scope.
 
 The current compilation reconciliation emits a structured
 `signal_mapping_usage_disposition_mismatch` warning when the resolver reports a
 governed mapping that the selected snapshot cannot safely mark as applied.
+
+## Sync/async boundary roadmap
+
+### Guaranteed by this changeset
+
+- Factory realization covered by the compatibility boundary happens only after
+  the runtime's admission permit is reserved and worker startup has
+  unambiguously committed. A definite or ambiguous start failure aborts before
+  the factory runs; code must not invoke a thread body inline to guess whether
+  startup occurred.
+- Synchronous LLM and context provider construction runs in that real admitted
+  worker, never on the provider service loop. The worker owns an unadopted
+  product and its rejection cleanup through pure worker-side validation. It
+  keeps escrow and capacity until exactly one service-owner-thread adoption CAS
+  publishes cache/proxy authority. Adoption never runs on the worker/requester
+  and never holds a blocking lock on the service loop, so terminal monitoring,
+  cancellation, and final-root drain remain responsive. Once adopted, async
+  provider use, drain, and close are service-loop operations; this distinction
+  is part of the lifecycle contract.
+- A realized product remains in the worker's bounded handoff until atomic
+  adoption. Validation rejection, caller cancellation, or requester-loop loss
+  before adoption leaves cleanup with that same runtime and worker owner. Its
+  permit is released only after cleanup returns.
+- Adoption does not stop at the worker future. Accepted provider generations
+  transfer atomically into the runtime execution graph. API, Slack, CLI, and
+  direct bundles sharing an admission namespace resolve the same generation;
+  incompatible semantic specifications fail before factory execution.
+- Accepted async provider generations are service-loop resources. Callers on
+  other loops receive operation proxies; request-loop futures transport results
+  but do not own the resource, admission, or cleanup. Cancelling transport does
+  not decrement the generation's active-operation count until the owner-loop
+  operation actually settles.
+- Every accepted provider generation installs exactly one owner-local terminal
+  monitor before publishing readiness. Cross-thread submission, ambiguity
+  probes, cancellation, result publication, and owner-stop callbacks remain
+  transports only. If repeated dispatch fails, the monitor preserves the first
+  failure as the generation cause, lets ambiguously enqueued work declare
+  whether it started, settles only unstarted submissions, waits for started
+  operations, schedules cleanup directly on the owner loop, and stops that loop
+  without another controller or thread. Owner-stop transport is attempted at
+  most twice; the monitor uses a fixed 10 ms interval and terminates with its
+  generation, so recovery cardinality is one task per live generation. The
+  reason codes `provider_owner_dispatch_recovery_requested`,
+  `provider_generation_terminal_submissions_settled`,
+  `provider_generation_terminal_recovery_settled`,
+  `provider_owner_stop_transport_failed`, and
+  `provider_generation_result_transport_failed` distinguish recovery phases
+  without transferring release authority to a caller loop.
+- Provider-generation and final-drain thread creation/readiness use one
+  coalesced transition worker per generation. Delayed readiness never blocks an
+  async requester loop; synchronous entry points receive the same bounded
+  outcome. Startup failure, ambiguity, cancellation, rollback, and product
+  retirement remain with the generation owner and converge to terminal zero.
+- Provider shutdown fences generation creation at the locked owner boundary,
+  including acquisitions that entered before shutdown was requested. After
+  joining generation N, shutdown cannot return while an in-flight acquire
+  publishes generation N+1 or retains a new service-owner permit.
+- Provider construction is transactional before graph adoption. If SDK
+  construction or post-construction hardening fails, the constructor closes
+  the SDK wrapper and its owned HTTP transport before re-raising. Adoption
+  handoff mutation on the persistent service loop is nonblocking; mutex
+  contention rejects the handoff and leaves retirement with the admitted
+  worker instead of freezing terminal monitoring.
+- A non-pipeline command is not exempt from provider ownership. Validation,
+  assessment enrichment, demos, and administrative commands construct and
+  adopt their provider through the same runtime lifecycle owner before entering
+  a requester event loop, pass that exact provider into async work, and close it
+  through the owner. Requested LLM work fails the command when construction or
+  execution fails; printing a warning and exiting zero is not a successful gate.
+- The current provider adapter reads the controller's private admission context
+  only to distinguish an inherited active request from a direct call. Do not
+  copy that compatibility read. The typed-runtime-boundary follow-up must expose
+  one public, generation-validated query and add stale-context tests before
+  migrating another resource class.
+- Provider cleanup follows `EMPTY -> STARTING -> ACTIVE -> DRAINING -> EMPTY`,
+  with failure through `REVOKED -> EMPTY`. Terminal failure fences proxies,
+  joins cooperative owner work, releases executable authority, and retains only
+  bounded immutable metadata. Successful retirement may permit a later epoch;
+  permanent cleanup failure latches a process-lifetime runtime-fatal circuit,
+  and recovery requires process restart. Pipeline admission is the sole owner
+  of that bounded process-lifetime circuit. Provider and generic cleanup paths
+  report fatal state through admission and keep no competing process registry.
+- The blocking Bedrock bridge is narrower still: credential realization,
+  client construction, `converse`, parsing, and cleanup all occur in one worker,
+  and no SDK product is adopted by another loop.
+
+These guarantees contain the blocking compatibility path and establish the
+provider-specific async resource manager. They do not make arbitrary
+`asyncio.to_thread` calls owned or transfer the provider proof to stores and
+backends. Noncooperative third-party calls cannot be force-killed inside a
+Python thread; such resources require native async cancellation or subprocess
+isolation before they can be safely adopted.
+
+An async method is not itself an async lifecycle boundary. HTTPX and vendor SDK
+clients still own DNS/TLS work, connection pools, retry timers, response bodies,
+background tasks, and sometimes library-created threads. Slack Socket Mode owns
+a reconnecting socket and callback population. Those resources need the same
+declared runtime identity, typed lease, aggregate admission, absolute deadline,
+owner-loop close, and zero-state shutdown proof as any other adopted resource.
+Anthropic, OpenAI, and Azure OpenAI therefore use one shared HTTPX construction
+policy inside their existing provider-generation owner. The policy canonicalizes
+the settings-derived endpoint, disables redirects and ambient proxy discovery,
+bounds every timeout component, and derives connection and keepalive limits from
+the already-admitted pipeline concurrency. It creates no semaphore, worker,
+queue, retry authority, or second admission controller. The provider retains the
+HTTP client, passes it to the SDK, and closes it through the normal provider
+lifecycle. Cross-origin `307` and `308` tests assert that no redirected request,
+prompt body, or credential reaches another origin, while same-endpoint tests
+prove normal SDK request construction and close. An explicit proxy can be added
+only after proxy identity becomes part of the runtime ownership declaration;
+ambient process proxy variables are not an ownership contract.
+
+The same containment rule applies to the remaining credential-bearing clients
+before their full lifecycle roadmap lands. Grafana, SignalFx, PagerDuty,
+RAG/A2A/MCP, the blocking Bedrock client, and Slack Web API/Socket Mode disable
+or clear ambient proxy discovery during construction. Credentialed CLI doctor
+and connection probes first canonicalize their settings-derived destination,
+then use one proxy-disabled, redirect-disabled, deterministically closed
+transport; diagnostics are not allowed a weaker egress policy than production.
+This does not claim complete HTTP/SDK ownership: response admission, retry and
+callback bounds, connection lifecycle, and explicit proxy support remain the
+separate deferred rows below.
+
+This shared transport policy is containment for these three SDKs, not completion
+of the wider async HTTP roadmap. DNS/TLS implementation workers, response-size
+admission, SDK retry observability, and the remaining provider/backend/context
+clients still require their corresponding matrix gates.
+Admission before worker startup is its own lifecycle phase. If the final
+optional-integration subscriber exits before any worker starts, the final
+subscriber is the cleanup owner: it commits a cancelled terminal settlement,
+revokes subscribers, publishes completion, and releases registry capacity
+without waiting, creating a worker, or fencing a cooperative identity.
+Exception and cancellation between acquire and start must converge through this
+same transition, and repeated unstarted generations must leave registry
+cardinality unchanged.
+Likewise, moving a file read, parser, SQLite call, or compressor to
+`asyncio.to_thread` only changes where it blocks; it does not establish
+process-wide capacity, cancellation, publication, or cleanup ownership.
+
+### Deferred next changesets
+
+| Boundary | Deferred work and acceptance gate |
+|---|---|
+| Native Bedrock transport | First land runtime-scoped credential-plan composition. Then replace the bridge with `aiobotocore`, with the runtime execution graph as sole owner of session/client, credential refresh, and `AsyncExitStack`; composition roots own only generation-fenced handles. Inventory DNS/TLS/model-loading/default-executor work before adoption. Attach lifecycle before or with non-streaming `converse`; add `converse_stream` only after cancellation, shutdown, rotation, downstream-consumer bounds, saturation, and load tests are stable. Size connection pooling from the existing runtime admission authority |
+| Accepted non-provider event-loop affinity | Extend the provider execution-graph/lease/drain model to stores and backends. Reject unsupported cross-loop use until each resource type has its own lifecycle proof |
+| Closable store factories | Give history, feedback, signal, and knowledge stores an explicit composition-root readiness/lease/close contract. Remove implicit process-lifetime and private-global assumptions |
+| SQLite startup and migrations | Keep schema, migration, bootstrap, and cold-store readiness outside request execution. Measure readiness and preserve transactional role identity and restartability |
+| SQLite steady-state execution | Measure loop blocking and lock wait, then choose bounded offload or an async adapter after the process-wide worker owner exists. Preserve protected-path admission, exact transactions, busy deadlines, cancellation-before-start, and shutdown drain |
+| Structured-document I/O | Consolidate curated/bootstrap YAML and JSON into one bounded loader with byte, node, depth, alias, parse-time, and atomic last-known-good replacement guarantees. Parser offload waits for the process-wide worker owner |
+| General filesystem and archive I/O | Give artifact reads, directory traversal, generated-archetype quarantine, assessment/export bundles, evaluation artifacts, release archives, compression, temporary files, and atomic publication one descriptor-based bounded boundary. Limit files, bytes, depth, archive expansion/output, CPU, and aggregate memory; cancellation cannot publish a late result. Async offload waits for the process-wide worker owner |
+| Async HTTP, vendor SDK, and socket lifecycle | Give HTTPX, OpenAI/Azure/Anthropic/Ollama, Grafana, SignalFx, PagerDuty, A2A/MCP/RAG, and Slack Socket Mode typed runtime owners. Bound aggregate connections, retries, callback/reconnect queues, response disposal, and close; local adapter semaphores are not process admission |
+| Remote response decoding | Bound compressed and decoded bytes, JSON nodes/depth, decoding CPU, and aggregate in-flight memory before adapter result limits; migrate remote adapters through one contract |
+| Pipeline CPU work | Instrument selection, compilation, evidence, ranking, validation, hashing, and serialization. Add bounded thread/process ownership only for measured event-loop hotspots and prove output equivalence |
+| Fixed/shared worker-pool lifecycle | Decide application-lifespan construction, process-wide and per-runtime cardinality, aggregate sizing, queue bounds, broken-worker recovery, shutdown, and isolation between runtime owners. Include provider/service owners, admission maintenance, lifecycle cleanup workers, default-executor `to_thread` calls, CLI doctor workers, SDK/DNS helpers, and library-created pools. Provider-local executors remain prohibited |
+| Managed subprocess lifecycle | Inventory external commands and noncooperative SDKs. Runtime use requires allowlisted executable identity, shell-free typed arguments, minimal environment, bounded IPC/output, process/queue admission, process-group termination, descendant cleanup, and no retry after ambiguous side effects |
+| Cross-loop cleanup and admission | Extend the tested provider graph to remaining resource types. Event-loop futures may carry results but may not release capacity or be required for cleanup |
+| Observability and scaling gates | Add event-loop lag, admission and pool queue depth/wait, active/retained work, cleanup duration/failure, SQLite queue/lock wait, blocking-phase timings, saturation, and limit-plus-one/load gates before tuning concurrency |
+| Runtime-scoped Bedrock credential plans | Capture and validate the stable plan once for API, Slack, CLI, and direct-provider composition owners, not once per request/provider. Keep per-operation credential-generation capture inside admitted work, invalidate the plan explicitly when settings change, and prove rejected traffic performs no credential-source I/O |
+| Aggregate HTTP body admission | Add one application-owned byte/concurrency permit before request buffering and retain it through decode, model validation, and disposal. Share it across connections/tenant partitions, reject limit-plus-one aggregate load before allocation, and expose active/queued body bytes without logging payloads |
+| Generic async factory API | Remove or redesign helpers that can submit an arbitrary factory to a process executor without a runtime owner. Any replacement must require the declared owner, aggregate admission, atomic adoption, cancellation-safe retirement, and an explicit loop-affinity policy |
+| Observability delivery lifecycle | Inventory synchronous logging and every metrics/trace exporter. Give queued delivery one process owner, bounded bytes/cardinality, explicit backpressure or severity-aware drop policy, flush deadlines, secret-safe failure behavior, and deterministic shutdown. Any worker-backed exporter waits for the process-wide worker owner |
+
+Each row is a separate bounded changeset unless its design proves that two rows
+share one owner and must land atomically. Recording a row here is not evidence
+that it is implemented. Unsupported combinations fail closed until their matrix
+tests and whole-diff review pass.
+
+Delivery order is: move the stable Bedrock credential plan to runtime
+composition, attach native Bedrock resources solely to the established runtime
+execution graph, then implement and validate non-streaming `converse`, followed
+by `converse_stream` and measured connection-pool tuning.
+Typed accepted-resource ownership, aggregate HTTP ingress, SQLite cold
+readiness, and the filesystem, decoder, HTTP-client, and CPU inventories may
+proceed as bounded changesets. The process-wide worker/task owner lands before
+any of those changesets introduces offload, a library worker, or a subprocess;
+steady-state SQLite, parser/filesystem offload, runtime HTTP/SDK/socket clients,
+remote decoding, measured pipeline CPU isolation, and managed subprocesses then
+land behind their declared owners. Each step owns its telemetry and limit-plus-
+one tests. Do not fold later rows into the containment changeset, and do not
+treat the operation-scoped Boto3 bridge as the foundation for reusable blocking
+clients.
+
+One release-visible limit remains deliberate until its named changeset lands.
+The operation-scoped Bedrock bridge has no connection pooling; its worker
+population is bounded, but it is not the native async transport. Request-body
+admission now authenticates and resolves a concrete tenant before receive,
+charges a conservative wire-to-decode memory envelope, and enforces both an
+application-wide ceiling and fixed wildcard-tenant subcaps. Admission is
+fail-fast rather than queued, so an unverified tenant label can neither create
+capacity nor manufacture a scheduling partition.
+
+### Review-derived boundary checks
+
+- A dependency builder is a composition root even when it is named `isolated`
+  or used only by direct Python/tests. Public pipeline execution must acquire a
+  generation-fenced root through its `RuntimeStores` owner before work and
+  release it through the shared drain. Required-store readiness therefore has
+  no isolated-builder bypass; isolation changes identity sharing, not lifecycle
+  ownership.
+- Bedrock inference-profile fallback is a data-residency decision. Retry only
+  the AWS validation condition that requires a profile, preserve the request
+  geography by default, and require explicit configuration before widening to
+  a global profile.
+- Optional integration readiness follows a confirmed external handshake.
+  Scheduling a Slack Socket Mode task leaves it `starting`; blocked startup is
+  visible in health while the required API remains available. A post-connect
+  disconnect moves to `reconnecting` until a new probe confirms readiness. One
+  health probe may be active at a time; a non-cooperative probe is retained once
+  and stops further probes. The API composition runs Slack on one bounded daemon
+  event-loop thread per runtime identity rather than the application loop.
+  Overlapping API roots subscribe to that shared transport and only the final
+  subscriber stops it. API-hosted Slack borrows the already-owned API runtime
+  root; standalone Slack owns its own explicit root. This prevents both duplicate
+  Socket Mode clients and a hidden root that can survive API shutdown. Subscriber
+  admission, final-release commitment, and natural task completion are one
+  linearized execution-state transition. Only bounded membership and phase
+  mutation happen under that lock; lifecycle replay, cancellation, callbacks,
+  and completion waits happen afterward. A late subscriber is rejected with a
+  stable stopping reason instead of attaching to a generation whose callbacks
+  were already collected or whose final cancellation was already committed. A
+  definite owner-thread startup failure terminally settles every overlapping
+  subscriber and permits a replacement generation. A start-then-raise result is
+  treated as ambiguous: it settles subscribers, requests cancellation, and
+  keeps the runtime/integration identity fenced until the live owner exits.
+  Optional close has a shorter deadline than required API-root teardown, and
+  terminal shutdown revokes callback authority before detached SDK work can
+  publish a late state. A cancellation-resistant SDK call may retain that one
+  daemon until process exit; terminal result publication does not claim that
+  resource retirement completed. The identity is process-fenced, the owner loop
+  drains the live task, and registry capacity is released only after retirement.
+  The identity cannot create a replacement while the required runtime still
+  drains. Slack event dependencies also retain the exact runtime-root generation
+  borrowed at socket startup, so a late callback can fail but cannot reopen a
+  new application generation.
+- Required SQLite readiness is a startup boundary. History, feedback, signals,
+  signal bootstrap, and Operational Knowledge schema/migrations complete before
+  runtime services or optional integrations start. One positive per-runtime
+  per-physical-database snapshot-copy capacity is captured by every SQLite
+  owner and is cumulative across that database's main/WAL copies and retries.
+  The three distinct runtime database roles therefore have a fixed worst-case
+  startup copy bound of three times the configured value. Exact capacity is
+  accepted, limit-plus-one fails closed, and startup diagnostics expose only a
+  stable role and reason code. Steady-state SQLite execution remains separate
+  roadmap work. Capacity is rechecked after the authority writer lock is
+  acquired, so growth during lock contention cannot activate a root against a
+  stale pre-lock byte count.
+- SQLite snapshot trust extends through publication and consumer open. An
+  owner-only file is not protected when another identity can replace its parent
+  entry, so generation directories are owner-only, descriptor/identity pinned,
+  and rejected or isolated beneath writable caller destinations.
+- Release smoke tests load runtime resources through each actual artifact type.
+  Wheel inclusion does not prove PyInstaller inclusion; schemas, taxonomy, and
+  other package data are exercised from the frozen executable. Frozen archives
+  are built twice from independent exact-SHA roots and caches, compared before
+  upload, and inspected for required runtime providers and forbidden developer
+  modules. Immediately before GitHub publication, the protected tag is fetched
+  again and must still name the authorized SHA; prerelease and latest-channel
+  metadata are explicit.
+- Every checksum-verified authoritative OCI architecture is executed before it
+  can be uploaded or published. The smoke runs as the image's non-root user
+  with a read-only root, bounded tmpfs, and writable data volume; it checks the
+  packaged version/resources, starts the real server, and waits for Docker
+  readiness. Arm64 executes under pinned emulation. The generic Linux x86_64
+  frozen binary is built and run on Ubuntu 22.04, establishing glibc 2.35 as
+  its documented minimum; musl and older glibc systems use the wheel, source,
+  or container instead.
+- Release verification publishes and executes only descriptor-bound private
+  snapshots of the verified artifact generation. A rename/swap/restore of an
+  untrusted source pathname cannot change Docker, scanner, binary, or GHCR
+  input. Final publisher mounts pin every writable ancestor of the action-visible
+  workspace path up to a root-controlled boundary, and cleanup follows recorded
+  mount IDs rather than trusting the original path. Checksum-pinned Buildx and
+  other release installers stay outside the Docker context, while image smoke
+  rejects release tooling beneath `/app`. Every Docker probe has a deterministic name before submission;
+  ambiguous CLI outcomes trigger unconditional cleanup and absence checks for
+  all attempted containers and volumes. Cleanup failure fails the release. The
+  final GitHub publisher is pinned to a maintained Node 24 action and preserves
+  no-overwrite partial-retry behavior.
+- Process health reads the existing runtime admission controller without
+  constructing one. It reports only bounded aggregate capacity, active, queued,
+  retained, blocking/cleanup, service-owner, saturation, and fatal state; no
+  tenant, runtime, provider, or model identifier becomes a health label.
+  Canonical fatal fencing returns readiness HTTP 503 because the process cannot
+  admit another investigation until restart. Capacity saturation and optional
+  integration degradation remain HTTP 200 so ordinary backpressure or an
+  optional outage does not trigger process replacement.
+- The container readiness client loads the same effective YAML/environment
+  settings as the server without initializing persistent stores. It connects
+  only to fixed loopback, derives a canonical admitted Host, ignores ambient
+  proxies, does not follow redirects, and enforces one absolute deadline plus
+  bounded headers and body before accepting a 2xx JSON `status: ok` response.
+- An optional integration generation cannot survive without its startup owner.
+  If the primary subscriber exits before the transport starts, the shared
+  unstarted generation reaches one cancelled terminal settlement, revokes all
+  subscriber callback authority, releases its registry slot, and forces later
+  subscribers to acquire a fresh generation.
+- Each optional-integration subscriber loop has one pending transport wake-up.
+  Repeated publications to a stopped-but-open loop coalesce to the latest
+  snapshot, terminal state wins, and resuming the loop delivers that state
+  without unbounded callback growth.
+- Credential-bearing LLM SDKs explicitly neutralize SDK-captured ambient custom
+  headers per provider instance. Ambient `Host`, credential, and arbitrary
+  headers cannot override settings-owned authority, and the implementation
+  never mutates process-global environment state that concurrent app-scoped
+  providers could race.
+- SDK credential isolation covers retained client fields as well as outbound
+  headers. OpenAI admin and webhook secrets, Azure admin/webhook and AD token or
+  token-provider authority, and Anthropic webhook keys are explicitly neutral
+  before adoption. In particular, an ambient Azure AD token cannot outrank the
+  API key selected by `Settings`; construction must fail closed if the pinned
+  SDK no longer exposes the expected neutral state.
+- Published provider dependency floors are executable security contracts. CI
+  installs the exact Anthropic and OpenAI direct lower bounds and constructs
+  Anthropic, OpenAI, and Azure OpenAI without network access. A constructor
+  argument required to neutralize ambient authority raises the dependency floor;
+  it is not removed to retain compatibility with an older SDK.
+- Provider close serialization records only successful settlement. A failed SDK
+  close leaves the guard retryable so the generation owner's fixed second
+  attempt executes the SDK close again; success remains exactly once for all
+  concurrent and later callers, while a repeated failure follows the existing
+  runtime-fatal path.
+- Cross-loop provider work that inherits a request lease also holds a
+  controller-owned retained-work permit. Caller cancellation may stop result
+  transport, but exiting the request scope cannot release aggregate capacity
+  before the provider owner settles the actual operation.
+- Async SDK construction has no after-allocation thread fallback. Before any
+  transport allocation, a synchronous constructor reserves one of 32 slots on
+  the process's single rollback-quarantine event-loop owner. Direct construction
+  on a running event loop, owner startup failure, and quarantine saturation all
+  fail before allocation. Successful adoption or completed rollback releases
+  the slot; no failure creates another thread or an unbounded cleanup queue.
+  The bound is process-wide rather than per runtime, so an exhausted quarantine
+  rejects every further constructor before it can allocate.
+- The admitted factory worker measures constructor rollback with a monotonic
+  wall-clock deadline outside the cleanup coroutine. Cleanup failure or timeout
+  settles that worker exactly once with the primary construction error as its
+  cause. The observing lifecycle worker then latches the canonical runtime-fatal
+  circuit before releasing its permit. A close that suppresses cancellation
+  remains owned by its fixed quarantine slot, while pipeline capacity reaches
+  zero and the final root drains to `closed`; normal work for that runtime stays
+  fenced until process restart.
+- Constructor tests and other direct dependency tests must close every runtime
+  owner they realize, even when the product is disabled or `None`. Mock SDK
+  clients still need an awaitable close and the test must assert that both the
+  wrapper and its owned HTTP transport retire.
+- A requester coroutine collected after its event loop has stopped preserves
+  `GeneratorExit`. If final drain already transferred to its lifecycle owner,
+  collection neither reports a fabricated root-cleanup failure nor consults
+  `asyncio.current_task()` as though a loop were still running. Tests that
+  force this state explicitly close or settle each coroutine they create.
+- Response-first ASGI disconnect listeners receive only disconnect events.
+  Request-body frames remain authenticated and inside the aggregate byte,
+  amplification, and deadline envelope even after response headers are sent.
+- Protected release publishers repeat tag, current-main-tip equality, and exact-SHA
+  successful-CI authorization after environment approval and setup, directly
+  before their first external mutation. The proof is shared code exercised
+  against a fake Actions endpoint so revocation cannot become a documentation-
+  only invariant.
+- Optional-integration settlement must inspect lifecycle-owned retained work,
+  not only the top-level task exception. Cancellation can be the ordinary
+  surface result while an SDK-created probe still owns executable authority;
+  report bounded retained/owner/fence counts once and keep the generation
+  unavailable until the owner loop has cancelled and joined every live task.
+- The owner loop's task inventory is authoritative even when third-party SDK
+  code never registers a child with Tacit's lifecycle helper. Track scheduling
+  before the operation begins, drain nested ready callbacks until one full turn
+  schedules nothing, then seal scheduling under the same lock before
+  `loop.close()`. A fixed turn budget prevents self-rescheduling callbacks from
+  spinning forever; exhaustion parks the bounded daemon owner under its
+  process-lifetime fence instead of discarding callbacks or claiming retirement.
+- Constructing a lifecycle transition thread belongs inside the same rollback
+  phase as registration and `Thread.start()`. A definite constructor failure
+  restores provider `STARTING` state and service capacity, or preserves the
+  final-root handle for its bounded retry; a failed recovery transport consumes
+  that handle into the process-fenced graph instead of returning it to callers.
+- Fault-injection tests substitute fresh process-fatal and optional-integration
+  fence registries for each test, then audit the original registry baselines
+  after the test. Production keeps its permanent, no-reset fencing semantics.
+- A browser handoff timeout is a protocol deadline, not a duration copied into
+  each participant. Publish an absolute expiry derived from the server's
+  monotonic remainder in the bootstrap, require redemption to echo that exact
+  value, compare it with a monotonic browser clock, and apply the same remainder
+  to accepted socket reads. Bootstrap may schedule repeated bounded platform
+  timers against that value, but neither bootstrap nor the target owns an
+  earlier fixed TTL that can reject a still-valid handoff.
+- Release authorization and asset verification are credential-bearing network
+  principals. Construct their openers with proxy discovery disabled, validate
+  HTTPS API origin before creating an Authorization-bearing request, and keep
+  the verifier in a checked-in module used verbatim by preflight and postflight
+  jobs. Reauthorization remains immediately adjacent to the first mutation.
+- Release artifact authorization is about bytes and the final pathname resolver,
+  not workspace source names. Carry descriptor-derived filenames and digests
+  through read-only preflight outputs, copy them as root into a root-controlled
+  backing directory, and bind that exact directory inode read-only over the
+  direct workspace child consumed by the pinned publisher. The hardened mount
+  prevents a same-UID rename/recreate after authorization and remains active
+  through postflight; privileged cleanup verifies mount/backing identity before
+  unmounting. Tests must race the real publisher pathname as well as inspect the
+  action input. Helper-only checksum or source-replacement tests do not prove
+  what an action uploads.
+- A read-only publication snapshot is also a write contract for the publisher.
+  Disable action features that create adjacent files, including PyPI attestation
+  sidecars, unless those outputs are produced and authorized before mounting the
+  snapshot. Docker cleanup similarly distinguishes canonical object absence from
+  daemon, permission, socket, transport, and malformed inspection failures; an
+  ambiguous nonzero result cannot suppress cleanup.
+- Treat security-sensitive documentation snippets as executable interfaces.
+  Run startup examples with a scrubbed environment, supply every required
+  Compose variable explicitly, and verify that advertised browser paths remain
+  available in the documented authentication mode.
 
 ## Validation expectations
 

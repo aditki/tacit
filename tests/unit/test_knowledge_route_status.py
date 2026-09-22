@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import pytest
-from fastapi.testclient import TestClient
 
 from tacit.api.app import create_app
 from tacit.config import Settings
+from tests.http_client import TestClient
 
 
 class _Repository:

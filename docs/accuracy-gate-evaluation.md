@@ -199,6 +199,8 @@ An **intent-level proxy** is now measurable: `tests/eval/prompt_variation_harnes
 N=5 trials each, cold-isolated, scoring an intent "useful" when it retains both the
 cache hypothesis and a latency/request path. It does not generate, validate, or
 publish a dashboard, so the formal useful-dashboard gate remains a live-stack gate.
+The cold harness accepts only an explicit local Ollama endpoint and uses its
+dependency-owned provider; it does not accept API credentials or cloud providers.
 
 **First measured run (Qwen3 Coder 30B, local Ollama): 125/150 = 83.33%** — a narrow
 miss. By class: precise 100%, noisy 100%, reworded 80%, vague 70%, misleading 66.7%.
@@ -300,9 +302,11 @@ baseline. The 92% remains development evidence only.
 the same expectation-aware scorer (`tests/eval/prompt_scoring.py`, phrase-based; this
 is stricter than the lenient scorer behind the 92% figure above, so compare within
 this table only). Qwen3 Coder 30B is local; Claude Opus 4.8 was run on 2026-06-19 via
-`prompt_variation_harness.py --provider anthropic --model claude-opus-4-8 --corpus dev
---trials 5` (Opus 4.8 rejects `temperature`, so it ran at default sampling — higher
-trial-to-trial variance).
+the then-current cloud-enabled harness (Opus 4.8 rejects `temperature`, so it ran
+at default sampling, with higher trial-to-trial variance). That historical command
+is intentionally no longer supported by the cold harness. A future cloud-model
+comparison must use a separate, explicitly authorized runner and must not inherit
+production credentials inside cold isolation.
 
 | Class | Qwen3 Coder 30B | Claude Opus 4.8 | Δ |
 |---|---:|---:|---:|
