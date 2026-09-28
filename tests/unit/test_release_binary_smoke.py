@@ -825,6 +825,18 @@ def test_image_smoke_executes_hardened_runtime_and_cleans_owned_resources(
                 ),
             )
         if command[:2] == ["docker", "inspect"]:
+            if image_smoke.CONTAINER_STATE_INSPECT_FORMAT in command:
+                return image_smoke.CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "Running": True,
+                            "ExitCode": 0,
+                            "OOMKilled": False,
+                            "Health": {"Status": "healthy", "FailingStreak": 0},
+                        }
+                    ),
+                )
             return image_smoke.CommandResult(
                 0,
                 json.dumps(
@@ -934,7 +946,7 @@ def test_image_smoke_timeout_reports_bounded_health_state(
     }
     monkeypatch.setattr(image_smoke.time, "monotonic", monotonic)
     monkeypatch.setattr(image_smoke.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(image_smoke, "_run_command", lambda *_args, **_kwargs: json.dumps(inspected))
+    monkeypatch.setattr(image_smoke, "_run_command", lambda *_args, **_kwargs: json.dumps(inspected["State"]))
 
     with pytest.raises(image_smoke.ImageSmokeError) as failure:
         image_smoke._wait_for_healthy(
@@ -948,6 +960,84 @@ def test_image_smoke_timeout_reports_bounded_health_state(
     assert "failing_streak" in message
     assert "probe import exceeded its deadline" in message
     assert len(message) <= image_smoke.MAX_DIAGNOSTIC_BYTES
+
+
+def test_image_smoke_health_poll_projects_only_bounded_state(
+    monkeypatch: pytest.MonkeyPatch,
+    image_smoke: ModuleType,
+) -> None:
+    commands: list[list[str]] = []
+
+    def inspect(command: list[str], **_kwargs: Any) -> str:
+        commands.append(command)
+        if "--format" not in command:
+            return "<truncated>\n" + ("x" * image_smoke.MAX_DIAGNOSTIC_BYTES)
+        return json.dumps(
+            {
+                "Running": True,
+                "ExitCode": 0,
+                "OOMKilled": False,
+                "Health": {"Status": "healthy", "FailingStreak": 0},
+            }
+        )
+
+    monkeypatch.setattr(image_smoke, "_run_command", inspect)
+
+    inspected = image_smoke._wait_for_healthy(
+        "arm64-server",
+        startup_timeout=1.0,
+        command_timeout=1.0,
+    )
+
+    assert inspected["State"]["Health"]["Status"] == "healthy"
+    assert commands == [
+        [
+            "docker",
+            "inspect",
+            "--format",
+            image_smoke.CONTAINER_STATE_INSPECT_FORMAT,
+            "arm64-server",
+        ]
+    ]
+    assert ".State.Health.Log" not in image_smoke.CONTAINER_STATE_INSPECT_FORMAT
+
+
+def test_image_smoke_runtime_contract_projects_only_validated_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    image_smoke: ModuleType,
+) -> None:
+    commands: list[list[str]] = []
+    projected = {
+        "Config": {"User": "tacit"},
+        "HostConfig": {
+            "ReadonlyRootfs": True,
+            "Tmpfs": {"/tmp": "rw,noexec,nosuid,size=67108864"},
+            "NetworkMode": "none",
+            "PidsLimit": image_smoke.RUNTIME_PIDS_LIMIT,
+            "Memory": image_smoke.RUNTIME_MEMORY_BYTES,
+            "NanoCpus": image_smoke.RUNTIME_NANO_CPUS,
+        },
+    }
+
+    def inspect(command: list[str], **_kwargs: Any) -> str:
+        commands.append(command)
+        return json.dumps(projected)
+
+    monkeypatch.setattr(image_smoke, "_run_command", inspect)
+
+    inspected = image_smoke._inspect_runtime_contract("arm64-server", command_timeout=1.0)
+    image_smoke._validate_runtime_inspect(inspected)
+
+    assert commands == [
+        [
+            "docker",
+            "inspect",
+            "--format",
+            image_smoke.RUNTIME_CONTRACT_INSPECT_FORMAT,
+            "arm64-server",
+        ]
+    ]
+    assert ".State" not in image_smoke.RUNTIME_CONTRACT_INSPECT_FORMAT
 
 
 def test_image_smoke_allows_unhealthy_probe_to_recover_before_startup_deadline(
@@ -965,11 +1055,10 @@ def test_image_smoke_allows_unhealthy_probe_to_recover_before_startup_deadline(
     def inspect(*_args: Any, **_kwargs: Any) -> str:
         return json.dumps(
             {
-                "State": {
-                    "Running": True,
-                    "ExitCode": 0,
-                    "Health": {"Status": next(statuses)},
-                }
+                "Running": True,
+                "ExitCode": 0,
+                "OOMKilled": False,
+                "Health": {"Status": next(statuses), "FailingStreak": 0},
             }
         )
 

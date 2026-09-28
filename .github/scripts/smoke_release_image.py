@@ -28,6 +28,22 @@ TMPFS_SPEC = "/tmp:rw,noexec,nosuid,size=67108864"
 RUNTIME_PIDS_LIMIT = 256
 RUNTIME_MEMORY_BYTES = 1024 * 1024 * 1024
 RUNTIME_NANO_CPUS = 2_000_000_000
+CONTAINER_STATE_INSPECT_FORMAT = (
+    '{"Running":{{json .State.Running}},'
+    '"ExitCode":{{json .State.ExitCode}},'
+    '"OOMKilled":{{json .State.OOMKilled}},'
+    '"Health":{"Status":{{json .State.Health.Status}},'
+    '"FailingStreak":{{json .State.Health.FailingStreak}}}}'
+)
+RUNTIME_CONTRACT_INSPECT_FORMAT = (
+    '{"Config":{"User":{{json .Config.User}}},'
+    '"HostConfig":{"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},'
+    '"Tmpfs":{{json .HostConfig.Tmpfs}},'
+    '"NetworkMode":{{json .HostConfig.NetworkMode}},'
+    '"PidsLimit":{{json .HostConfig.PidsLimit}},'
+    '"Memory":{{json .HostConfig.Memory}},'
+    '"NanoCpus":{{json .HostConfig.NanoCpus}}}}'
+)
 REQUIRED_RESOURCES = (
     "data/archetypes.yaml",
     "data/grounding_benchmark_v1.json",
@@ -398,17 +414,20 @@ def _wait_for_healthy(
     last_status = "created"
     last_state: dict[str, object] = {}
     while time.monotonic() < deadline:
-        inspected = _parse_object(
+        state = _parse_object(
             _run_command(
-                ["docker", "inspect", container_name],
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    CONTAINER_STATE_INSPECT_FORMAT,
+                    container_name,
+                ],
                 timeout=min(command_timeout, max(deadline - time.monotonic(), 0.1)),
                 label="release-image container inspect",
             ),
             "release-image container inspect",
         )
-        state = inspected.get("State")
-        if not isinstance(state, dict):
-            raise ImageSmokeError("release-image container has no runtime state")
         last_state = state
         if state.get("Running") is not True:
             raise ImageSmokeError(f"release-image server exited before health: {_health_state_diagnostic(state)}")
@@ -417,10 +436,27 @@ def _wait_for_healthy(
             raise ImageSmokeError("release-image container has no runtime health state")
         last_status = str(health.get("Status") or "unknown")
         if last_status == "healthy":
-            return inspected
+            return {"State": state}
         time.sleep(min(HEALTH_POLL_INTERVAL, max(deadline - time.monotonic(), 0)))
     raise ImageSmokeError(
         f"release-image server did not become healthy ({last_status}): {_health_state_diagnostic(last_state)}"
+    )
+
+
+def _inspect_runtime_contract(container_name: str, *, command_timeout: float) -> dict[str, object]:
+    return _parse_object(
+        _run_command(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                RUNTIME_CONTRACT_INSPECT_FORMAT,
+                container_name,
+            ],
+            timeout=command_timeout,
+            label="release-image runtime contract inspect",
+        ),
+        "release-image runtime contract inspect",
     )
 
 
@@ -671,9 +707,13 @@ def _smoke(args: argparse.Namespace) -> None:
                 timeout=args.command_timeout,
                 label="release-image server start",
             )
-            runtime_inspect = _wait_for_healthy(
+            _wait_for_healthy(
                 server_container,
                 startup_timeout=args.startup_timeout,
+                command_timeout=args.command_timeout,
+            )
+            runtime_inspect = _inspect_runtime_contract(
+                server_container,
                 command_timeout=args.command_timeout,
             )
             _validate_runtime_inspect(runtime_inspect)

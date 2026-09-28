@@ -701,6 +701,9 @@ work limit.
   Release-image execution has no network namespace access beyond loopback and
   carries explicit PID, memory, and CPU ceilings; post-start inspection verifies
   those exact constraints rather than trusting command construction alone.
+  Docker inspection projects only the bounded state and runtime fields consumed
+  by each check; it never sends a complete, growth-dependent inspect document
+  through a tail-bounded diagnostic capture before JSON decoding.
   Canonical runtime-admission fatal fencing returns HTTP 503, while saturation
   and optional-integration degradation remain HTTP 200 with bounded metadata.
 - Local demo teardown is credential-independent and idempotent: Compose-only
