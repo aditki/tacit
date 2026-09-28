@@ -133,6 +133,17 @@ foundation matrix and test every cancellation and worker-start phase. If those
 tests cannot be written without inspecting private state across several owners,
 the ownership boundary is not ready for implementation.
 
+Result publication must reflect the ownership transaction. An unadopted product
+stays in worker escrow with capacity charged until a named durable owner adopts
+it or the worker retires it. Validation and service-owner adoption are distinct realization
+phases; only successful completion of the explicit adoption phase changes result
+publication order. The realizing worker then releases its permit before exposing
+the adopted product to a public accessor. Tests delay permit release deliberately; scheduler
+speed is not proof of settled ownership. Permit release is itself a terminal
+boundary: if it fails, fence the runtime and settle the accessor with bounded
+failure metadata. Never leave publication waiting on an exception that escaped
+the worker.
+
 Do not claim that an already-started `asyncio.Task` can be moved off its event
 loop. Retaining such a task keeps its capacity charged and final root drain must
 wait until the loop runs it to a real terminal state. Work that must survive
@@ -1448,6 +1459,30 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
   implementation detail. Clear failed thread registration and reclaim selected
   work before retrying once. Persistent startup failure rejects and wakes the
   bounded queue instead of retaining invisible capacity or retrying forever.
+- A multi-resource release is one owner transaction, even when its children
+  retire in phases. Install one shared terminal result before the first authority
+  mutation, publish each phase from the durable owner, and let cancellation
+  detach from that result. Retries join the same result after either child has
+  left its active registry; they never reconstruct progress from missing rows.
+- Durable event-loop owners never wait on mutexes reachable from requester or
+  transport threads. Owner callbacks use owner-local state or one bounded
+  nonblocking retry per phase. This keeps heartbeats and terminal cleanup live
+  without turning lock contention into an unbounded callback or CPU loop.
+- Constructor rollback follows the same rule. Its cleanup result can settle the
+  waiting worker once resource retirement ends, but the fixed quarantine slot
+  remains occupied until a nonblocking registry publication succeeds. One
+  coalesced exponential retry per slot prevents both premature replacement and
+  unbounded retry growth.
+- Final-root transport wakeup coalescing is lifecycle-owner state. A requester
+  callback may acknowledge a delivered wakeup back to that owner, but the owner
+  never waits for the callback or enters a mutex the requester can retain.
+  Terminal-source callbacks likewise enqueue the one pre-registered relay
+  without acquiring its requester-side registry lock; that registry remains
+  bounded to one relay per requester loop for the drain generation. If
+  the dedicated request-liveness monitor exhausts its bounded start retry after
+  final drain has committed, the already-running lifecycle owner performs the
+  bounded liveness poll itself; it remains the visible graph owner until the
+  generation closes or terminal fencing succeeds.
 - Lifecycle-thread construction, registration, start, and readiness form one
   shared bounded transition. Provider generation owners, final-drain owners,
   recovery owners, admission maintenance, and synchronous cleanup transports
@@ -1513,6 +1548,24 @@ governed mapping that the selected snapshot cannot safely mark as applied.
   but do not own the resource, admission, or cleanup. Cancelling transport does
   not decrement the generation's active-operation count until the owner-loop
   operation actually settles.
+- Dashboard backends use that same service-loop owner without initializing LLM
+  or context products early. Their synchronous factories and validation run on
+  admitted workers; atomic adoption stores the raw products in a bounded
+  per-runtime registry and publishes only generation-fenced proxies inside an
+  opaque per-run lease. Every operation and release validates the complete graph
+  nonce, generation epoch, lease ID, provider handle, borrowed proxy set, and
+  provider-release disposition before owner-state lookup or mutation.
+  Operations, registry mutation, and close execute on the owner loop. Foreign
+  caller threads submit bounded commands only and may never acquire a lock that
+  can block the owner loop. The lease retains aggregate capacity until close;
+  adoption transfers retained admission to service ownership, and an internally
+  acquired generation lease is removed from requester-local cleanup state after
+  durable transfer so provider cleanup cannot race or duplicate backend cleanup.
+  Provider and final-root drain close backend children before their generation.
+  A transient close failure is retried within fixed attempt and wall-clock
+  bounds while service capacity remains charged. Exhaustion revokes proxy
+  authority, drops runtime references, and latches the process-lifetime fatal
+  fence before capacity is released.
 - Every accepted provider generation installs exactly one owner-local terminal
   monitor before publishing readiness. Cross-thread submission, ambiguity
   probes, cancellation, result publication, and owner-stop callbacks remain
@@ -1538,6 +1591,17 @@ governed mapping that the selected snapshot cannot safely mark as applied.
   including acquisitions that entered before shutdown was requested. After
   joining generation N, shutdown cannot return while an in-flight acquire
   publishes generation N+1 or retains a new service-owner permit.
+- Execution-graph locks protect authority publication, not construction or
+  lifecycle execution. Provider-manager construction uses one graph-fenced
+  reservation and runs outside the graph mutex. The final-root owner reads and
+  commits graph/controller state through nonblocking owner-local retries, so a
+  temporarily suspended requester cannot stop its event loop or heartbeat.
+- Provider-operation settlement crosses both its operation handoff and pipeline
+  admission state. The durable service owner must acquire both transition locks
+  without waiting before it marks either side complete; contention schedules one
+  bounded owner-local retry while capacity remains charged. The controller also
+  validates the exact service-owner permit and thread before exposing this
+  nonblocking mutation; a requester cannot invoke the owner-only shortcut.
 - Provider construction is transactional before graph adoption. If SDK
   construction or post-construction hardening fails, the constructor closes
   the SDK wrapper and its owned HTTP transport before re-raising. Adoption
@@ -1548,8 +1612,12 @@ governed mapping that the selected snapshot cannot safely mark as applied.
   assessment enrichment, demos, and administrative commands construct and
   adopt their provider through the same runtime lifecycle owner before entering
   a requester event loop, pass that exact provider into async work, and close it
-  through the owner. Requested LLM work fails the command when construction or
-  execution fails; printing a warning and exiting zero is not a successful gate.
+  through the owner. Its context lease must be transferred off the short-lived
+  acquisition task before that task's loop exits. Otherwise a nested pipeline
+  borrow can classify the still-live context lease as abandoned and retire the
+  provider out from under its synchronous owner. Requested LLM work fails the
+  command when construction or execution fails; printing a warning and exiting
+  zero is not a successful gate.
 - The current provider adapter reads the controller's private admission context
   only to distinguish an inherited active request from a direct call. Do not
   copy that compatibility read. The typed-runtime-boundary follow-up must expose
@@ -1563,14 +1631,19 @@ governed mapping that the selected snapshot cannot safely mark as applied.
   and recovery requires process restart. Pipeline admission is the sole owner
   of that bounded process-lifetime circuit. Provider and generic cleanup paths
   report fatal state through admission and keep no competing process registry.
+  Pipeline completion clears the exact acquired lease immediately after its
+  successful release and before later publish or persistence work. A subsequent
+  failure may still close backend authority, but cannot release that provider
+  generation twice. If primary work and cleanup both fail, the primary exception
+  remains the cause and only bounded cleanup phase/type metadata is attached.
 - The blocking Bedrock bridge is narrower still: credential realization,
   client construction, `converse`, parsing, and cleanup all occur in one worker,
   and no SDK product is adopted by another loop.
 
 These guarantees contain the blocking compatibility path and establish the
-provider-specific async resource manager. They do not make arbitrary
-`asyncio.to_thread` calls owned or transfer the provider proof to stores and
-backends. Noncooperative third-party calls cannot be force-killed inside a
+provider and backend async resource manager. They do not make arbitrary
+`asyncio.to_thread` calls owned or transfer the provider/backend proof to
+stores. Noncooperative third-party calls cannot be force-killed inside a
 Python thread; such resources require native async cancellation or subprocess
 isolation before they can be safely adopted.
 
@@ -1625,7 +1698,7 @@ process-wide capacity, cancellation, publication, or cleanup ownership.
 | Boundary | Deferred work and acceptance gate |
 |---|---|
 | Native Bedrock transport | First land runtime-scoped credential-plan composition. Then replace the bridge with `aiobotocore`, with the runtime execution graph as sole owner of session/client, credential refresh, and `AsyncExitStack`; composition roots own only generation-fenced handles. Inventory DNS/TLS/model-loading/default-executor work before adoption. Attach lifecycle before or with non-streaming `converse`; add `converse_stream` only after cancellation, shutdown, rotation, downstream-consumer bounds, saturation, and load tests are stable. Size connection pooling from the existing runtime admission authority |
-| Accepted non-provider event-loop affinity | Extend the provider execution-graph/lease/drain model to stores and backends. Reject unsupported cross-loop use until each resource type has its own lifecycle proof |
+| Accepted non-provider event-loop affinity beyond backends | Extend the implemented provider/backend execution-graph, lease, transfer, and drain model to stores and other accepted resource classes. Reject unsupported cross-loop use until each resource type has its own lifecycle proof |
 | Closable store factories | Give history, feedback, signal, and knowledge stores an explicit composition-root readiness/lease/close contract. Remove implicit process-lifetime and private-global assumptions |
 | SQLite startup and migrations | Keep schema, migration, bootstrap, and cold-store readiness outside request execution. Measure readiness and preserve transactional role identity and restartability |
 | SQLite steady-state execution | Measure loop blocking and lock wait, then choose bounded offload or an async adapter after the process-wide worker owner exists. Preserve protected-path admission, exact transactions, busy deadlines, cancellation-before-start, and shutdown drain |
@@ -1636,7 +1709,7 @@ process-wide capacity, cancellation, publication, or cleanup ownership.
 | Pipeline CPU work | Instrument selection, compilation, evidence, ranking, validation, hashing, and serialization. Add bounded thread/process ownership only for measured event-loop hotspots and prove output equivalence |
 | Fixed/shared worker-pool lifecycle | Decide application-lifespan construction, process-wide and per-runtime cardinality, aggregate sizing, queue bounds, broken-worker recovery, shutdown, and isolation between runtime owners. Include provider/service owners, admission maintenance, lifecycle cleanup workers, default-executor `to_thread` calls, CLI doctor workers, SDK/DNS helpers, and library-created pools. Provider-local executors remain prohibited |
 | Managed subprocess lifecycle | Inventory external commands and noncooperative SDKs. Runtime use requires allowlisted executable identity, shell-free typed arguments, minimal environment, bounded IPC/output, process/queue admission, process-group termination, descendant cleanup, and no retry after ambiguous side effects |
-| Cross-loop cleanup and admission | Extend the tested provider graph to remaining resource types. Event-loop futures may carry results but may not release capacity or be required for cleanup |
+| Cross-loop cleanup and admission beyond providers/backends | Extend the tested provider/backend graph to remaining resource types. Event-loop futures may carry results but may not release capacity or be required for cleanup |
 | Observability and scaling gates | Add event-loop lag, admission and pool queue depth/wait, active/retained work, cleanup duration/failure, SQLite queue/lock wait, blocking-phase timings, saturation, and limit-plus-one/load gates before tuning concurrency |
 | Runtime-scoped Bedrock credential plans | Capture and validate the stable plan once for API, Slack, CLI, and direct-provider composition owners, not once per request/provider. Keep per-operation credential-generation capture inside admitted work, invalidate the plan explicitly when settings change, and prove rejected traffic performs no credential-source I/O |
 | Aggregate HTTP body admission | Add one application-owned byte/concurrency permit before request buffering and retain it through decode, model validation, and disposal. Share it across connections/tenant partitions, reject limit-plus-one aggregate load before allocation, and expose active/queued body bytes without logging payloads |
@@ -1698,7 +1771,21 @@ capacity nor manufacture a scheduling partition.
   admission, final-release commitment, and natural task completion are one
   linearized execution-state transition. Only bounded membership and phase
   mutation happen under that lock; lifecycle replay, cancellation, callbacks,
-  and completion waits happen afterward. A late subscriber is rejected with a
+  and completion waits happen afterward. The event-loop owner never waits on a
+  transport or execution-state lock reachable from a subscriber. It detects a
+  stable empty callback turn with owner-local and transport sequence numbers,
+  retries temporary contention with one coalesced exponential timer, and keeps
+  the fixed registry slot occupied until terminal publication. Delayed handles
+  have a hard per-owner bound and are executed or cancelled before loop close.
+  More generally, every durable lifecycle owner has a closed call graph: it may
+  mutate owner-local state, but it may not acquire requester-reachable
+  reservation, subscriber, manager, coordinator, or admission locks; invoke
+  arbitrary callbacks; or submit bookkeeping to an untracked default executor.
+  Cross-boundary publication uses one bounded, coalesced relay. Executor-backed
+  work is an explicit owned resource whose identity and admission capacity
+  remain charged until the worker really retires, even after a terminal result
+  is available.
+  A late subscriber is rejected with a
   stable stopping reason instead of attaching to a generation whose callbacks
   were already collected or whose final cancellation was already committed. A
   definite owner-thread startup failure terminally settles every overlapping
@@ -1878,7 +1965,12 @@ capacity nor manufacture a scheduling partition.
   direct workspace child consumed by the pinned publisher. The hardened mount
   prevents a same-UID rename/recreate after authorization and remains active
   through postflight; privileged cleanup verifies mount/backing identity before
-  unmounting. Tests must race the real publisher pathname as well as inspect the
+  unmounting. On Linux, a bind beneath a shared parent propagates before the new
+  child can be changed to a slave. Isolate the existing covering mount before
+  the first bind, keep each new anchor non-shared before descending, and reject
+  any recorded authority that is shared. Accepting one ID from a propagated
+  mount stack leaves hidden authority behind. Tests must use a real shared peer,
+  race the real publisher pathname, and inspect the
   action input. Helper-only checksum or source-replacement tests do not prove
   what an action uploads.
 - A read-only publication snapshot is also a write contract for the publisher.
@@ -1891,6 +1983,22 @@ capacity nor manufacture a scheduling partition.
   Run startup examples with a scrubbed environment, supply every required
   Compose variable explicitly, and verify that advertised browser paths remain
   available in the documented authentication mode.
+- A plain worker value or resource already adopted by its service owner is not
+  publishable until its admission permit release has settled. A resource-bearing
+  realization without a durable adopter is rejected before its factory runs;
+  an unadopted resource remains with the admitted worker until adoption or
+  worker-owned retirement. Caller-loop delivery is never an ownership phase.
+  Keep replacement admission closed across the complete release call so a
+  post-mutation exception cannot expose success or admit work before the
+  runtime-fatal fence lands. Cache adoption is likewise provisional while its
+  initialization handoff remains active, and every construction or group-
+  rollback permit uses this same release boundary.
+- Release publication currently records mount authority only after the complete
+  anchor set is sealed. The privileged sealer fails closed and CI runners are
+  ephemeral, so a crash-durable provisional mount journal is not required for
+  the current hosted release lane. Add one before supporting persistent or
+  self-hosted publishers where process death must be recoverable without runner
+  disposal.
 
 ## Validation expectations
 

@@ -83,6 +83,7 @@ async def test_active_loop_rejected_provider_reserves_worker_before_realization(
             blocking_work.realize_owned_sync(
                 realize,
                 validate=lambda _product: None,
+                adopt=lambda _product: None,
                 retire=lambda product: product.close(),
                 reason_code="rejected_provider_admission",
             )
@@ -134,6 +135,7 @@ async def test_active_loop_worker_start_failure_prevents_product_realization(
         blocking_work.realize_owned_sync(
             realize,
             validate=lambda _product: None,
+            adopt=lambda _product: None,
             retire=lambda product: product.close(),
             reason_code="rejected_provider_start_failure",
         )
@@ -161,6 +163,7 @@ async def test_sync_realization_adopts_product_inside_active_event_loop(
     lifecycle = PipelineAdmissionController(1, max_queued=0)
     blocking_work = LifecycleOwnedBlockingWork(lifecycle)
     factory_thread_ids: list[int] = []
+    adopted: list[_AsyncCloseProvider] = []
     caller_thread_id = threading.get_ident()
 
     def realize() -> _AsyncCloseProvider:
@@ -170,10 +173,12 @@ async def test_sync_realization_adopts_product_inside_active_event_loop(
     product = blocking_work.realize_owned_sync(
         realize,
         validate=lambda _product: None,
+        adopt=adopted.append,
         retire=lambda rejected: rejected.close(),
         reason_code="sync_provider_realization_active_loop",
     )
 
+    assert adopted == [product]
     assert factory_thread_ids != [caller_thread_id]
     assert product.closed is False
     assert blocking_work.active == 0
@@ -209,6 +214,7 @@ async def test_sync_validation_rejection_closes_async_product_on_worker_loop(
         blocking_work.realize_owned_sync(
             realize,
             validate=reject,
+            adopt=lambda _product: None,
             retire=lambda product: product.close(),
             reason_code="sync_rejected_provider_validation",
         )
@@ -251,6 +257,7 @@ async def test_validation_rejection_retires_product_on_worker_local_loop(
         await blocking_work.realize_owned(
             realize,
             validate=reject,
+            adopt=lambda _product: None,
             retire=lambda product: product.close(),
             reason_code="rejected_provider_validation",
         )
@@ -278,6 +285,7 @@ async def test_abandoned_realized_product_is_retired_on_worker_local_loop(
     lifecycle = PipelineAdmissionController(1, max_queued=0)
     blocking_work = LifecycleOwnedBlockingWork(lifecycle)
     products: list[_AsyncCloseProvider] = []
+    adopted: list[_AsyncCloseProvider] = []
     realization_started = threading.Event()
     release_realization = threading.Event()
 
@@ -292,6 +300,7 @@ async def test_abandoned_realized_product_is_retired_on_worker_local_loop(
         blocking_work.realize_owned(
             realize,
             validate=lambda _product: None,
+            adopt=adopted.append,
             retire=lambda product: product.close(),
             reason_code="abandoned_provider_realization",
         )
@@ -306,6 +315,7 @@ async def test_abandoned_realized_product_is_retired_on_worker_local_loop(
         lambda: bool(products) and products[0].closed and lifecycle.in_flight == 0 and blocking_work.active == 0,
     )
     assert len(products) == 1
+    assert adopted == products
     assert products[0].close_calls == 1
     assert products[0].closed is True
     assert lifecycle.in_flight == 0

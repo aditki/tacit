@@ -129,6 +129,7 @@ class _LifecycleBlockingCall:
         on_discarded: Callable[[], None] | None,
         background: bool,
         result_handoff_seconds: float,
+        publish_after_release: bool = False,
         start_decision: _WorkerStartDecision | None = None,
     ) -> None:
         self._function: Callable[[], Any] | None = function
@@ -139,6 +140,7 @@ class _LifecycleBlockingCall:
         self._on_discarded = on_discarded
         self._background = background
         self._synchronous = loop is None and not background
+        self._publish_after_release = publish_after_release
         self._result_handoff_seconds = result_handoff_seconds
         self._start_decision = start_decision or _WorkerStartDecision()
         self._lock = threading.Lock()
@@ -208,11 +210,43 @@ class _LifecycleBlockingCall:
                 terminal_cleanup_pending = self._terminal_cleanup_error is not None
         if terminal_cleanup_pending:
             return
+        if self._publish_after_release:
+            return
+        self._publish_result_transport()
+
+    def _publish_result_transport(self) -> None:
+        """Publish or retire a completed result from its worker owner."""
         if self._publish_or_cleanup():
             if not self._result_handoff.wait(timeout=self._result_handoff_seconds):
                 self._expire_result_transport()
             else:
                 self._cleanup_abandoned_result()
+
+    def publish_deferred_result(self) -> None:
+        """Publish a foreground result only after worker capacity is released."""
+        if self._publish_after_release:
+            self._publish_result_transport()
+
+    def retire_abandoned_result_before_release(self) -> None:
+        """Retire an unreachable result while its worker still owns capacity."""
+        with self._lock:
+            loop = self._loop
+            future = self._future
+            owns_result_cleanup = self._on_abandoned_result is not None
+            transport_unavailable = (
+                not self._synchronous
+                and not self._background
+                and (
+                    loop is None
+                    or loop.is_closed()
+                    or (not loop.is_running() and owns_result_cleanup)
+                    or future is None
+                    or future.cancelled()
+                )
+            )
+        if transport_unavailable:
+            self.abandon(discard_before_start=False)
+        self._cleanup_abandoned_result()
 
     def abandon(self, *, discard_before_start: bool = True) -> None:
         """Mark the async result transport abandoned without touching capacity."""
@@ -237,17 +271,25 @@ class _LifecycleBlockingCall:
         self.discard()
 
     def wait_for_sync_result(self) -> Any:
-        """Adopt one worker result without depending on an asyncio loop."""
+        """Adopt one worker result only after its release outcome is terminal."""
         self.completed.wait()
         with self._lock:
+            result = self._result
+        if result is not _BLOCKING_RESULT_MISSING:
+            self._result_handoff.set()
+        self.finished.wait()
+        with self._lock:
             error = self._error
-            self._error = None
             result = self._result
         if error is not None:
             raise error
         if result is _BLOCKING_RESULT_MISSING:
             raise RuntimeError("blocking worker completed without a result")
         return self.claim(result)
+
+    def mark_finished(self) -> None:
+        """Publish worker finalization after its permit transition settles."""
+        self.finished.set()
 
     def claim(self, result: Any) -> Any:
         """Atomically transfer an escrowed result to its asyncio consumer."""
@@ -396,6 +438,38 @@ class _LifecycleBlockingCall:
         with self._lock:
             return self._terminal_cleanup_error
 
+    def replace_result_with_terminal_failure(self, error: RuntimeOwnershipError) -> None:
+        """Retire unclaimed result transport and install one terminal failure."""
+        cleanup: Callable[[Any], None] | None = None
+        result: Any = _BLOCKING_RESULT_MISSING
+        with self._lock:
+            if self._result is not _BLOCKING_RESULT_MISSING:
+                result = self._result
+                cleanup = self._on_abandoned_result
+            self._result = _BLOCKING_RESULT_MISSING
+            self._on_abandoned_result = None
+            self._terminal_cleanup_error = error
+            self._error = error
+            self._result_handoff.set()
+        if cleanup is not None and result is not _BLOCKING_RESULT_MISSING:
+            try:
+                cleanup(result)
+            except BaseException as cleanup_error:
+                combined = terminal_cleanup_failure(
+                    error,
+                    cleanup_error,
+                    reason_code="blocking_permit_release_failed",
+                    message="Pipeline blocking capacity release failed",
+                )
+                with self._lock:
+                    self._terminal_cleanup_error = combined
+                    self._error = combined
+                logger.warning(
+                    "pipeline_blocking_work_cleanup_failed",
+                    reason_code="blocking_permit_release_failed",
+                    error_type=type(cleanup_error).__name__,
+                )
+
     def publish_terminal_result(self) -> None:
         """Publish a terminal failure only after worker-owned finalization."""
         with self._lock:
@@ -466,6 +540,7 @@ class LifecycleOwnedBlockingWork:
         on_discarded: Callable[[], None] | None = None,
         cancel_pending: bool = True,
         cleanup: bool = False,
+        publish_after_release: bool = False,
         result_handoff_seconds: float = DEFAULT_PIPELINE_CLEANUP_GRACE_SECONDS,
         timeout_seconds: float | None = None,
     ) -> Result:
@@ -486,6 +561,7 @@ class LifecycleOwnedBlockingWork:
             on_discarded=on_discarded,
             background=False,
             result_handoff_seconds=validate_cleanup_grace_seconds(result_handoff_seconds),
+            publish_after_release=publish_after_release or on_abandoned_result is None,
         )
         try:
             if cleanup:
@@ -521,24 +597,30 @@ class LifecycleOwnedBlockingWork:
         factory: Callable[[], Product],
         *,
         validate: Callable[[Product], Any],
+        adopt: Callable[[Product], Any] | None = None,
         retire: Callable[[Product], Any],
+        on_discarded: Callable[[], None] | None = None,
         reason_code: str,
         result_handoff_seconds: float = DEFAULT_PIPELINE_CLEANUP_GRACE_SECONDS,
         timeout_seconds: float | None = None,
     ) -> Product:
         """Create, validate, escrow, and retire one product on its admitted worker."""
+        if adopt is None:
+            raise RuntimeOwnershipError("Owned resource realization requires a durable adopt callback")
         lifecycle = self._require_lifecycle()
         lifecycle.raise_if_runtime_fatal()
         if lifecycle.current_thread_can_reuse_blocking_capacity(cleanup=False):
             return await self._realize_owned_on_current_worker(
                 factory,
                 validate=validate,
+                adopt=adopt,
                 retire=retire,
                 reason_code=reason_code,
             )
         operation, retire_product = self._owned_realization(
             factory,
             validate=validate,
+            adopt=adopt,
             retire=retire,
             reason_code=reason_code,
         )
@@ -546,6 +628,8 @@ class LifecycleOwnedBlockingWork:
             operation,
             reason_code=reason_code,
             on_abandoned_result=retire_product,
+            on_discarded=on_discarded,
+            publish_after_release=adopt is not None,
             result_handoff_seconds=result_handoff_seconds,
             timeout_seconds=timeout_seconds,
         )
@@ -555,16 +639,20 @@ class LifecycleOwnedBlockingWork:
         factory: Callable[[], Product],
         *,
         validate: Callable[[Product], Any],
+        adopt: Callable[[Product], Any] | None = None,
         retire: Callable[[Product], Any],
         reason_code: str,
         result_handoff_seconds: float = DEFAULT_PIPELINE_CLEANUP_GRACE_SECONDS,
     ) -> Product:
         """Synchronously adopt an admitted product without using the caller loop."""
+        if adopt is None:
+            raise RuntimeOwnershipError("Owned resource realization requires a durable adopt callback")
         lifecycle = self._require_lifecycle()
         lifecycle.raise_if_runtime_fatal()
         operation, retire_product = self._owned_realization(
             factory,
             validate=validate,
+            adopt=adopt,
             retire=retire,
             reason_code=reason_code,
         )
@@ -584,8 +672,13 @@ class LifecycleOwnedBlockingWork:
                 background=False,
                 result_handoff_seconds=validate_cleanup_grace_seconds(result_handoff_seconds),
             )
-        except BaseException:
-            lifecycle.release_blocking_permit(permit)
+        except BaseException as construction_error:
+            release_error = self._release_unmaterialized_permits(
+                (permit,),
+                primary_error=construction_error,
+            )
+            if release_error is not None:
+                raise release_error from construction_error
             raise
         try:
             self._register_and_start(call, permit)
@@ -596,8 +689,6 @@ class LifecycleOwnedBlockingWork:
         except BaseException:
             call.abandon(discard_before_start=False)
             raise
-        finally:
-            call.finished.wait()
 
     def run_background(
         self,
@@ -657,12 +748,16 @@ class LifecycleOwnedBlockingWork:
                 calls.append(call)
                 self._register(call)
                 threads.append(self._worker_thread(call, permit, thread_name=thread_name))
-        except BaseException:
+        except BaseException as construction_error:
             start_decision.abort()
-            self._rollback_group_construction(
-                calls,
-                permits,
-            )
+            try:
+                self._rollback_group_construction(
+                    calls,
+                    permits,
+                    primary_error=construction_error,
+                )
+            except RuntimeOwnershipError as rollback_error:
+                raise rollback_error from construction_error
             raise
 
         start_error: BaseException | None = None
@@ -679,9 +774,14 @@ class LifecycleOwnedBlockingWork:
                 break
         if start_error is not None:
             start_decision.abort()
+            terminal_error: RuntimeOwnershipError | None = None
             for call, permit in zip(calls, permits, strict=True):
                 call.fail_to_start(type(start_error).__name__)
-                self._release_reserved_call(call, permit)
+                release_error = self._release_reserved_call(call, permit, primary_error=start_error)
+                if terminal_error is None and release_error is not None:
+                    terminal_error = release_error
+            if terminal_error is not None:
+                raise terminal_error from start_error
             return False
         start_decision.commit()
         return True
@@ -706,16 +806,20 @@ class LifecycleOwnedBlockingWork:
     ) -> None:
         try:
             self._register(call)
-        except BaseException:
+        except BaseException as registration_error:
             call.fail_to_start("registration_failure")
-            self._release_reserved_call(call, permit)
+            release_error = self._release_reserved_call(call, permit, primary_error=registration_error)
+            if release_error is not None:
+                raise release_error from registration_error
             raise
         try:
             self._start_worker(call, permit)
         except BaseException as exc:
             error_type = type(exc).__name__
             call.fail_to_start(error_type)
-            self._release_reserved_call(call, permit)
+            release_error = self._release_reserved_call(call, permit, primary_error=exc)
+            if release_error is not None:
+                raise release_error from exc
             raise _WorkerStartError(error_type) from exc
 
     def _worker_thread(
@@ -747,6 +851,7 @@ class LifecycleOwnedBlockingWork:
         try:
             with lifecycle.blocking_worker(permit):
                 call.execute()
+                call.retire_abandoned_result_before_release()
         finally:
             terminal_error = call.terminal_cleanup_error()
             if terminal_error is not None and _retains_cleanup_capacity(terminal_error):
@@ -764,47 +869,124 @@ class LifecycleOwnedBlockingWork:
         if not call.claim_release():
             return
         lifecycle = self._require_lifecycle()
+        call.revoke_executable_authority()
         try:
-            call.revoke_executable_authority()
             lifecycle.fence_runtime_fatal(terminal_error)
-            lifecycle.release_blocking_permit(permit)
+            self._release_permit_failure_aware(
+                permit,
+                call=call,
+                primary_error=terminal_error,
+            )
         finally:
             self._unregister(call)
-            call.finished.set()
+            call.mark_finished()
         call.publish_terminal_result()
 
     def _release_reserved_call(
         self,
         call: _LifecycleBlockingCall,
         permit: PipelineBlockingPermit,
-    ) -> None:
+        *,
+        primary_error: BaseException | None = None,
+    ) -> RuntimeOwnershipError | None:
         if not call.claim_release():
-            return
+            return None
+        terminal_error: RuntimeOwnershipError | None = None
         try:
-            self._require_lifecycle().release_blocking_permit(permit)
+            terminal_error = self._release_permit_failure_aware(
+                permit,
+                call=call,
+                primary_error=primary_error,
+            )
         finally:
             self._unregister(call)
-            call.finished.set()
+            call.mark_finished()
+        if terminal_error is not None:
+            call.publish_terminal_result()
+        else:
+            call.publish_deferred_result()
+            deferred_cleanup_error = call.terminal_cleanup_error()
+            if deferred_cleanup_error is not None:
+                self._require_lifecycle().fence_runtime_fatal(deferred_cleanup_error)
+        return terminal_error
+
+    def _release_permit_failure_aware(
+        self,
+        permit: PipelineBlockingPermit,
+        *,
+        call: _LifecycleBlockingCall | None = None,
+        primary_error: BaseException | None = None,
+    ) -> RuntimeOwnershipError | None:
+        """Release one permit without opening a replacement-admission window."""
+        lifecycle = self._require_lifecycle()
+        terminal_error: RuntimeOwnershipError | None = None
+        with lifecycle.blocking_permit_release_transition():
+            try:
+                lifecycle.release_blocking_permit(permit)
+            except BaseException as release_error:
+                terminal_error = terminal_cleanup_failure(
+                    primary_error,
+                    release_error,
+                    reason_code="blocking_permit_release_failed",
+                    message="Pipeline blocking capacity release failed",
+                )
+                if call is not None:
+                    call.replace_result_with_terminal_failure(terminal_error)
+                    terminal_error = call.terminal_cleanup_error() or terminal_error
+                lifecycle.fence_runtime_fatal(terminal_error)
+        return terminal_error
+
+    def _release_unmaterialized_permits(
+        self,
+        permits: Iterable[PipelineBlockingPermit],
+        *,
+        primary_error: BaseException,
+    ) -> RuntimeOwnershipError | None:
+        first_error: RuntimeOwnershipError | None = None
+        for permit in permits:
+            release_error = self._release_permit_failure_aware(
+                permit,
+                primary_error=primary_error,
+            )
+            if first_error is None and release_error is not None:
+                first_error = release_error
+        return first_error
 
     def _rollback_group_construction(
         self,
         calls: list[_LifecycleBlockingCall],
         permits: tuple[PipelineBlockingPermit, ...],
+        *,
+        primary_error: BaseException,
     ) -> None:
         for call in calls:
             call.fail_to_start("construction_failure")
-        lifecycle = self._require_lifecycle()
+        first_error: RuntimeOwnershipError | None = None
         for index, permit in enumerate(permits):
             if index < len(calls):
-                self._release_reserved_call(calls[index], permit)
+                release_error = self._release_reserved_call(
+                    calls[index],
+                    permit,
+                    primary_error=primary_error,
+                )
+                if first_error is None and release_error is not None:
+                    first_error = release_error
                 continue
-            lifecycle.release_blocking_permit(permit)
+            release_error = self._release_permit_failure_aware(
+                permit,
+                primary_error=primary_error,
+            )
+            if first_error is None and release_error is not None:
+                first_error = release_error
+        if first_error is not None:
+            raise first_error
 
     async def _realize_owned_on_current_worker[Product](
         self,
         factory: Callable[[], Product],
         *,
         validate: Callable[[Product], Any],
+        adopt: Callable[[Product], Any] | None,
         retire: Callable[[Product], Any],
         reason_code: str,
     ) -> Product:
@@ -813,6 +995,10 @@ class LifecycleOwnedBlockingWork:
             validation = validate(product)
             if inspect.isawaitable(validation):
                 await validation
+            if adopt is not None:
+                adoption = adopt(product)
+                if inspect.isawaitable(adoption):
+                    await adoption
         except BaseException as primary_error:
             try:
                 retirement = retire(product)
@@ -838,6 +1024,7 @@ class LifecycleOwnedBlockingWork:
         factory: Callable[[], Product],
         *,
         validate: Callable[[Product], Any],
+        adopt: Callable[[Product], Any] | None,
         retire: Callable[[Product], Any],
         reason_code: str,
     ) -> tuple[Callable[[], Product], Callable[[Product], None]]:
@@ -850,6 +1037,9 @@ class LifecycleOwnedBlockingWork:
             try:
                 validation = validate(product)
                 self._complete_worker_awaitable(validation)
+                if adopt is not None:
+                    adoption = adopt(product)
+                    self._complete_worker_awaitable(adoption)
             except BaseException as primary_error:
                 try:
                     retire_product(product)

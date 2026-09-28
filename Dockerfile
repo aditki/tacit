@@ -6,6 +6,7 @@ FROM python:3.12.14-alpine3.24@sha256:1887c114801a8c82a4ec01daa52cfe7fc3f6357364
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    TACIT_CONTAINER_HEALTHCHECK=1 \
     UV_PROJECT_ENVIRONMENT=/app/.venv \
     PATH="/app/.venv/bin:$PATH"
 
@@ -39,6 +40,6 @@ USER tacit
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["python", "/app/tacit/api/routes/system.py"]
+    CMD ["python", "/app/tacit/container_healthcheck.py"]
 
 CMD ["tacit", "serve", "--host", "0.0.0.0", "--port", "8000", "--no-slack"]

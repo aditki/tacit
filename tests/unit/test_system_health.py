@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import stat
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 import tacit.api.routes.system as system_routes
+import tacit.container_healthcheck as container_healthcheck_module
 import tacit.pipeline_admission as pipeline_admission_module
 from tacit.api.app import create_app
 from tacit.config import Settings
@@ -246,6 +248,103 @@ def test_container_healthcheck_uses_canonical_host_while_connecting_only_to_loop
     assert hits == [{"path": "/healthz", "host": expected_host}]
 
 
+def test_lightweight_container_healthcheck_uses_materialized_validated_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    host_path = tmp_path / "health-host"
+    monkeypatch.setattr(container_healthcheck_module, "_CONTAINER_HEALTH_HOST_PATH", host_path)
+    hits: list[dict[str, str]] = []
+    with _serve(_handler(hits=hits)) as server:
+        container_healthcheck_module.write_container_health_host("tacit.example.com")
+        container_healthcheck_module.probe_container_health(
+            port=server.server_port,
+            deadline_seconds=1.0,
+        )
+
+    assert hits == [{"path": "/healthz", "host": "tacit.example.com"}]
+    assert stat.S_IMODE(host_path.stat().st_mode) == 0o400
+
+
+def test_container_health_host_publication_retries_after_stale_same_pid_temporary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    host_path = tmp_path / "health-host"
+    stale = tmp_path / f".{host_path.name}.{container_healthcheck_module.os.getpid()}.tmp"
+    stale.write_text("stale\n", encoding="ascii")
+    monkeypatch.setattr(container_healthcheck_module, "_CONTAINER_HEALTH_HOST_PATH", host_path)
+
+    container_healthcheck_module.write_container_health_host("tacit.example.com")
+
+    assert host_path.read_text(encoding="ascii") == "tacit.example.com\n"
+
+
+def test_container_health_host_publication_completes_short_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    host_path = tmp_path / "health-host"
+    monkeypatch.setattr(container_healthcheck_module, "_CONTAINER_HEALTH_HOST_PATH", host_path)
+    original_write = container_healthcheck_module.os.write
+    writes = 0
+
+    def short_first_write(descriptor: int, payload: bytes) -> int:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            return original_write(descriptor, payload[:1])
+        return original_write(descriptor, payload)
+
+    monkeypatch.setattr(container_healthcheck_module.os, "write", short_first_write)
+
+    container_healthcheck_module.write_container_health_host("tacit.example.com")
+
+    assert writes >= 2
+    assert host_path.read_text(encoding="ascii") == "tacit.example.com\n"
+
+
+@pytest.mark.parametrize("failure_phase", ["write", "fsync", "replace"])
+def test_container_health_host_publication_failure_preserves_previous_value_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    failure_phase: str,
+) -> None:
+    host_path = tmp_path / "health-host"
+    host_path.write_text("previous.example.com\n", encoding="ascii")
+    host_path.chmod(0o400)
+    monkeypatch.setattr(container_healthcheck_module, "_CONTAINER_HEALTH_HOST_PATH", host_path)
+
+    with monkeypatch.context() as failure_patch:
+        if failure_phase == "write":
+            failure_patch.setattr(
+                container_healthcheck_module.os,
+                "write",
+                lambda _descriptor, _payload: (_ for _ in ()).throw(OSError("write failed")),
+            )
+        elif failure_phase == "fsync":
+            failure_patch.setattr(
+                container_healthcheck_module.os,
+                "fsync",
+                lambda _descriptor: (_ for _ in ()).throw(OSError("fsync failed")),
+            )
+        else:
+            failure_patch.setattr(
+                container_healthcheck_module.os,
+                "replace",
+                lambda _source, _target: (_ for _ in ()).throw(OSError("replace failed")),
+            )
+
+        with pytest.raises(OSError, match=f"{failure_phase} failed"):
+            container_healthcheck_module.write_container_health_host("new.example.com")
+
+    assert host_path.read_text(encoding="ascii") == "previous.example.com\n"
+    assert not tuple(tmp_path.glob(f".{host_path.name}.*.tmp"))
+
+    container_healthcheck_module.write_container_health_host("new.example.com")
+    assert host_path.read_text(encoding="ascii") == "new.example.com\n"
+
+
 def test_container_healthcheck_loads_tacit_config_yaml_with_server_precedence(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -398,7 +497,7 @@ def test_container_healthcheck_enforces_one_absolute_deadline(
         return current
 
     monkeypatch.setattr(socket, "create_connection", lambda *_args, **_kwargs: SlowSocket())
-    monkeypatch.setattr(system_routes.time, "monotonic", monotonic)
+    monkeypatch.setattr(container_healthcheck_module.time, "monotonic", monotonic)
     monkeypatch.setattr(system_routes, "_CONTAINER_HEALTH_DEADLINE_SECONDS", 0.05)
 
     with pytest.raises(TimeoutError, match="deadline"):

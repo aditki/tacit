@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import weakref
-from dataclasses import FrozenInstanceError, dataclass
+from dataclasses import FrozenInstanceError, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -30,7 +30,13 @@ import tacit.pipeline_admission as pipeline_admission_module
 from tacit.agents.providers.base import LLMProvider, LLMResult
 from tacit.agents.providers.bedrock import BedrockProvider, _ResolvedBedrockRuntime
 from tacit.config import Settings
-from tacit.dependencies import ProviderLifecycleState, _RuntimeProviderResources, declare_runtime_factory
+from tacit.dependencies import (
+    BackendResourceLease,
+    ProviderLeaseHandle,
+    ProviderLifecycleState,
+    _RuntimeProviderResources,
+    declare_runtime_factory,
+)
 from tacit.errors import RuntimeOwnershipError
 from tacit.pipeline.runner import _cleanup_pipeline_resources
 from tacit.pipeline.side_effects import LifecycleOwnedBlockingWork
@@ -749,6 +755,7 @@ async def test_rejected_dashboard_cleanup_failure_uses_shared_terminal_circuit(
         await blocking_work.realize_owned(
             factory,
             validate=reject,
+            adopt=lambda _product: None,
             retire=fail_retirement,
             reason_code="backend:dashboard_realization",
         )
@@ -908,6 +915,198 @@ async def test_rejected_provider_validation_and_retirement_failure_are_distinct_
     _assert_sanitized_logs(logs)
 
 
+class _BackendCleanupFailure(RuntimeError):
+    pass
+
+
+class _ProviderCleanupFailure(RuntimeError):
+    pass
+
+
+def _test_backend_lease() -> BackendResourceLease:
+    return BackendResourceLease(
+        graph_nonce="test-graph",
+        generation_epoch=1,
+        lease_id="test-backend-lease",
+        backends=(),
+        _provider_lease=ProviderLeaseHandle(
+            graph_nonce="test-graph",
+            generation_epoch=1,
+            lease_id=1,
+        ),
+        _release_provider_lease=False,
+        _release_state=cast(Any, object()),
+    )
+
+
+@dataclass(slots=True)
+class _OrderedCleanupDependencies:
+    events: list[str]
+    backend_release: asyncio.Event | None = None
+    provider_release: asyncio.Event | None = None
+    backend_error: BaseException | None = None
+    provider_error: BaseException | None = None
+    backend_started: asyncio.Event = field(init=False)
+    provider_started: asyncio.Event = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.backend_started = asyncio.Event()
+        self.provider_started = asyncio.Event()
+
+    async def close_backends(self, lease: BackendResourceLease) -> None:
+        assert isinstance(lease, BackendResourceLease)
+        self.events.append("backend_started")
+        self.backend_started.set()
+        if self.backend_release is not None:
+            await self.backend_release.wait()
+        self.events.append("backend_settled")
+        if self.backend_error is not None:
+            raise self.backend_error
+
+    async def close_resources(self) -> None:
+        self.events.append("providers_started")
+        self.provider_started.set()
+        if self.provider_release is not None:
+            await self.provider_release.wait()
+        self.events.append("providers_settled")
+        if self.provider_error is not None:
+            raise self.provider_error
+
+
+@pytest.mark.asyncio
+async def test_pipeline_cleanup_closes_backend_lease_before_shared_resources() -> None:
+    backend_release = asyncio.Event()
+    events: list[str] = []
+    deps = _OrderedCleanupDependencies(events, backend_release=backend_release)
+
+    cleanup = asyncio.create_task(_cleanup_pipeline_resources(cast(Any, deps), _test_backend_lease()))
+    await asyncio.wait_for(deps.backend_started.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert events == ["backend_started"]
+    assert deps.provider_started.is_set() is False
+
+    backend_release.set()
+    await asyncio.wait_for(cleanup, timeout=1)
+
+    assert events == [
+        "backend_started",
+        "backend_settled",
+        "providers_started",
+        "providers_settled",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_cleanup_attempts_providers_after_backend_failure_and_keeps_first_error() -> None:
+    events: list[str] = []
+    deps = _OrderedCleanupDependencies(
+        events,
+        backend_error=_BackendCleanupFailure("backend cleanup failed"),
+        provider_error=_ProviderCleanupFailure("provider cleanup failed"),
+    )
+
+    with pytest.raises(RuntimeOwnershipError) as exc_info:
+        await _cleanup_pipeline_resources(cast(Any, deps), _test_backend_lease())
+
+    assert getattr(exc_info.value, "cleanup_error_type", None) == "_BackendCleanupFailure"
+    assert events == [
+        "backend_started",
+        "backend_settled",
+        "providers_started",
+        "providers_settled",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_cleanup_finishes_ordered_phases_before_propagating_cancellation() -> None:
+    backend_release = asyncio.Event()
+    provider_release = asyncio.Event()
+    events: list[str] = []
+    deps = _OrderedCleanupDependencies(
+        events,
+        backend_release=backend_release,
+        provider_release=provider_release,
+    )
+    cleanup = asyncio.create_task(_cleanup_pipeline_resources(cast(Any, deps), _test_backend_lease()))
+    await asyncio.wait_for(deps.backend_started.wait(), timeout=1)
+
+    cleanup.cancel()
+    await asyncio.sleep(0)
+    assert cleanup.done() is False
+    assert deps.provider_started.is_set() is False
+
+    backend_release.set()
+    await asyncio.wait_for(deps.provider_started.wait(), timeout=1)
+    assert cleanup.done() is False
+    provider_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(cleanup, timeout=1)
+    assert events == [
+        "backend_started",
+        "backend_settled",
+        "providers_started",
+        "providers_settled",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_cleanup_settles_provider_phase_before_propagating_cancellation() -> None:
+    provider_release = asyncio.Event()
+    events: list[str] = []
+    deps = _OrderedCleanupDependencies(events, provider_release=provider_release)
+    cleanup = asyncio.create_task(_cleanup_pipeline_resources(cast(Any, deps), _test_backend_lease()))
+    await asyncio.wait_for(deps.provider_started.wait(), timeout=1)
+
+    assert events == [
+        "backend_started",
+        "backend_settled",
+        "providers_started",
+    ]
+    cleanup.cancel()
+    await asyncio.sleep(0)
+    assert cleanup.done() is False
+
+    provider_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(cleanup, timeout=1)
+    assert events == [
+        "backend_started",
+        "backend_settled",
+        "providers_started",
+        "providers_settled",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_terminal_cleanup_failure_precedes_overlapping_cancellation() -> None:
+    backend_release = asyncio.Event()
+    events: list[str] = []
+    deps = _OrderedCleanupDependencies(
+        events,
+        backend_release=backend_release,
+        backend_error=_BackendCleanupFailure("backend cleanup failed"),
+    )
+    cleanup = asyncio.create_task(_cleanup_pipeline_resources(cast(Any, deps), _test_backend_lease()))
+    await asyncio.wait_for(deps.backend_started.wait(), timeout=1)
+
+    cleanup.cancel()
+    backend_release.set()
+
+    with pytest.raises(RuntimeOwnershipError) as exc_info:
+        await asyncio.wait_for(cleanup, timeout=1)
+
+    assert getattr(exc_info.value, "cleanup_error_type", None) == "_BackendCleanupFailure"
+    assert isinstance(exc_info.value.__cause__, asyncio.CancelledError)
+    assert events == [
+        "backend_started",
+        "backend_settled",
+        "providers_started",
+        "providers_settled",
+    ]
+
+
 @dataclass(slots=True)
 class _CleanupDependencies:
     manager: _RuntimeProviderResources
@@ -957,7 +1156,7 @@ async def test_pipeline_failure_preserves_primary_error_when_generation_cleanup_
         try:
             raise _PrimaryOperationFailure(_PRIMARY_SECRET)
         finally:
-            await _cleanup_pipeline_resources(cast(Any, deps), [])
+            await _cleanup_pipeline_resources(cast(Any, deps), None)
 
     pipeline = asyncio.create_task(fail_pipeline_then_cleanup())
     try:
@@ -1124,7 +1323,8 @@ async def test_abandoned_result_cleanup_failure_fatal_fences_runtime_and_drains_
     blocking_work = LifecycleOwnedBlockingWork(lifecycle)
     close_calls = 0
     logs = _RecordingLogger()
-    observed_capacity: list[tuple[int, int, int]] = []
+    observed_capacity: list[tuple[int, int, int, int]] = []
+    service_owner_permits: list[Any] = []
     monkeypatch.setattr(side_effects_module, "logger", logs)
 
     class FailingFatalLogger:
@@ -1162,6 +1362,17 @@ async def test_abandoned_result_cleanup_failure_fatal_fences_runtime_and_drains_
         lifecycle.product_ref = weakref.ref(resource)
         return resource
 
+    def adopt(_resource: _CloseProbe) -> None:
+        permit = lifecycle.try_acquire_service_owner()
+        assert permit is not None
+        service_owner_permits.append(permit)
+
+    def retire(resource: _CloseProbe) -> None:
+        try:
+            resource.close()
+        finally:
+            lifecycle.release_service_owner(service_owner_permits.pop())
+
     def observe_cleanup() -> None:
         if cleanup_started.wait(timeout=2):
             observed_capacity.append(
@@ -1169,6 +1380,7 @@ async def test_abandoned_result_cleanup_failure_fatal_fences_runtime_and_drains_
                     lifecycle.in_flight,
                     lifecycle.blocking_in_flight,
                     lifecycle.retained,
+                    lifecycle.service_owner_in_flight,
                 )
             )
         release_cleanup.set()
@@ -1179,7 +1391,8 @@ async def test_abandoned_result_cleanup_failure_fatal_fences_runtime_and_drains_
         blocking_work.realize_owned(
             realize,
             validate=lambda _resource: None,
-            retire=lambda resource: resource.close(),
+            adopt=adopt,
+            retire=retire,
             reason_code="abandoned_result_cleanup_failure",
             result_handoff_seconds=0.01,
         )
@@ -1198,11 +1411,11 @@ async def test_abandoned_result_cleanup_failure_fatal_fences_runtime_and_drains_
 
     assert _PRIMARY_SECRET not in repr(first_error.value)
     assert _CLEANUP_SECRET not in repr(first_error.value)
-    assert observed_capacity == [(1, 1, 1)]
+    assert observed_capacity == [(0, 0, 0, 1)]
     assert close_calls == 1
     assert lifecycle.product_ref is not None
     assert lifecycle.product_ref() is None
-    assert lifecycle.release_observations == [(True, True)]
+    assert lifecycle.release_observations == [(False, False)]
     assert blocking_work.active == 0
     _assert_runtime_capacity(
         lifecycle,
@@ -1246,6 +1459,7 @@ async def test_abandoned_result_cleanup_failure_fatal_fences_runtime_and_drains_
             await blocking_work.realize_owned(
                 unexpected_realize,
                 validate=lambda _resource: None,
+                adopt=lambda _resource: None,
                 retire=lambda resource: resource.close(),
                 reason_code="abandoned_result_cleanup_failure",
                 result_handoff_seconds=0.01,
@@ -1306,6 +1520,7 @@ async def test_worker_validation_cleanup_failure_fatal_fences_runtime(
         blocking_work.realize_owned(
             realize,
             validate=reject,
+            adopt=lambda _resource: None,
             retire=lambda resource: resource.close(),
             reason_code="worker_validation_cleanup_failure",
         )
@@ -1331,6 +1546,7 @@ async def test_worker_validation_cleanup_failure_fatal_fences_runtime(
             await blocking_work.realize_owned(
                 realize,
                 validate=reject,
+                adopt=lambda _resource: None,
                 retire=lambda resource: resource.close(),
                 reason_code="worker_validation_cleanup_failure",
             )

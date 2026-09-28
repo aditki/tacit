@@ -22,6 +22,7 @@ from tacit import config as config_module
 from tacit.archetypes.generated.schema import ArchetypeRetrievalMode
 from tacit.cache import llm_cache, metric_cache
 from tacit.config import settings
+from tacit.models.schemas import Intent
 from tacit.pipeline_admission import RuntimeRootDrainStartupError, RuntimeRootOwnerHandle
 from tacit.runtime_ownership import RuntimeOwnedFactory, runtime_descriptor_for_backends
 from tests.eval import cold_isolation as cold_isolation_module
@@ -122,12 +123,18 @@ def test_cold_isolation_bypasses_and_restores_ambient_proxies(tmp_path, monkeypa
                 result = await provider.chat_text("system", "sensitive local prompt")
                 assert result.text == "local response"
 
-                backends = state.dependencies.backend_factory()
-                assert len(backends) == 1
+                backend_lease = await state.dependencies.realize_backends()
+                assert len(backend_lease.backends) == 1
                 try:
-                    assert await backends[0]._client.list_datasources() == []
+                    assert (
+                        await backend_lease.backends[0].discover_datasource_targets(
+                            [],
+                            Intent(summary="local isolation probe", domain="application"),
+                        )
+                        == []
+                    )
                 finally:
-                    await backends[0].close()
+                    await state.dependencies.close_backends(backend_lease)
                     await state.dependencies.close_resources()
 
             asyncio.run(exercise_local_clients())
@@ -756,16 +763,21 @@ def test_cold_isolation_denies_unselected_remote_integrations_before_path_access
         assert isolated.learning_auto_register_archetype is False
         assert all(name not in os.environ for name in COLD_ENV_CREDENTIAL_NAMES)
 
-        backends = state.dependencies.backend_factory()
-        assert [backend.name for backend in backends] == ["grafana"]
-        assert backends[0].runtime_settings is not None
-        assert backends[0].runtime_settings.grafana_url == selected_grafana
-        assert state.dependencies.context_provider_factory is not None
-        assert state.dependencies.context_provider_factory() is None
-        assert state.dependencies.llm_provider_factory is not None
-        provider = state.dependencies.llm_provider_factory()
-        assert provider._base_url == selected_ollama
-        asyncio.run(state.dependencies.close_resources())
+        async def inspect_runtime() -> None:
+            backend_lease = await state.dependencies.realize_backends()
+            try:
+                assert [backend.name for backend in backend_lease.backends] == ["grafana"]
+                assert state.settings.grafana_url == selected_grafana
+                assert state.dependencies.context_provider_factory is not None
+                assert state.dependencies.context_provider_factory() is None
+                assert state.dependencies.llm_provider_factory is not None
+                provider = state.dependencies.llm_provider_factory()
+                assert provider._base_url == selected_ollama
+            finally:
+                await state.dependencies.close_backends(backend_lease)
+                await state.dependencies.close_resources()
+
+        asyncio.run(inspect_runtime())
 
     assert hostile_reads == []
     assert all(os.environ[name].startswith("hostile-") for name in COLD_ENV_CREDENTIAL_NAMES)
@@ -969,7 +981,15 @@ def test_cold_isolation_offline_mode_does_not_require_ambient_endpoints(tmp_path
         assert state.settings.llm_provider == "ollama"
         assert state.settings.llm_api_base == "http://127.0.0.1:9"
         assert state.settings.llm_api_key == ""
-        assert state.dependencies.backend_factory() == []
+
+        async def inspect_backends() -> None:
+            backend_lease = await state.dependencies.realize_backends()
+            try:
+                assert backend_lease.backends == ()
+            finally:
+                await state.dependencies.close_backends(backend_lease)
+
+        asyncio.run(inspect_backends())
         assert "OPENAI_API_KEY" not in os.environ
 
 

@@ -449,10 +449,10 @@ async def _realize_dependency_product(
     capability: str,
 ) -> Any:
     if capability == "backend":
-        realize_backends = getattr(dependencies, "realize_backends")
-        products = await realize_backends()
-        assert len(products) == 1
-        return products[0]
+        lease = await dependencies.realize_backends()
+        _BACKEND_LEASES.setdefault(id(dependencies), []).append(lease)
+        assert len(lease.backends) == 1
+        return lease.backends[0]
     await dependencies.acquire_resources()
     factory = dependencies.llm_provider_factory if capability == "llm" else dependencies.context_provider_factory
     assert factory is not None
@@ -465,9 +465,13 @@ async def _close_dependency_products(
     products: list[Any],
 ) -> None:
     if capability == "backend":
-        await asyncio.gather(*(product.close() for product in products))
+        leases = _BACKEND_LEASES.pop(id(dependencies), [])
+        await asyncio.gather(*(dependencies.close_backends(lease) for lease in leases))
     else:
         await dependencies.close_resources()
+
+
+_BACKEND_LEASES: dict[int, list[Any]] = {}
 
 
 async def _assert_dependency_lifecycle_idle(lifecycle: PipelineAdmissionController) -> None:
@@ -652,7 +656,8 @@ def test_foreign_backend_factory_fails_before_invocation(tmp_path) -> None:
     assert calls == 0
 
 
-def test_realized_backend_is_rejected_when_no_backend_remote_is_declared(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_realized_backend_is_rejected_when_no_backend_remote_is_declared(tmp_path) -> None:
     runtime_settings = _settings(
         tmp_path,
         grafana_enabled=False,
@@ -670,7 +675,7 @@ def test_realized_backend_is_rejected_when_no_backend_remote_is_declared(tmp_pat
     )
 
     with pytest.raises(RuntimeOwnershipError, match="backend realization failed"):
-        dependencies.backend_factory()
+        await dependencies.realize_backends()
 
 
 @pytest.mark.asyncio
@@ -711,7 +716,7 @@ async def test_realized_backend_set_must_match_declared_remotes_one_to_one(
 
     async with dependencies.pipeline_admission.slot():
         with pytest.raises(RuntimeOwnershipError, match="backend realization failed"):
-            dependencies.backend_factory()
+            await dependencies.realize_backends()
 
     for _ in range(100):
         if all(backend.close_calls == 1 for backend in realized) and dependencies.pipeline_admission.in_flight == 0:
@@ -783,8 +788,11 @@ async def test_realized_backend_set_accepts_each_declared_remote_exactly_once(tm
         backend_factory=_backend_factory(lambda: cast(list[DashboardBackend], realized), runtime_settings),
     )
 
-    assert dependencies.backend_factory() == realized
-    await asyncio.gather(*(backend.close() for backend in realized))
+    lease = await dependencies.realize_backends()
+    assert len(lease.backends) == len(realized)
+    assert all(proxy is not backend for proxy, backend in zip(lease.backends, realized, strict=True))
+    await dependencies.close_backends(lease)
+    assert [backend.close_calls for backend in realized] == [1] * len(realized)
 
 
 @pytest.mark.asyncio
@@ -1175,14 +1183,20 @@ async def test_dependency_realization_commits_admitted_worker_before_factory_and
     monkeypatch.setattr(threading.Thread, "start", observe_worker_start)
     product = await _realize_dependency_product(dependencies, capability)
 
-    assert product is trace.products[0]
+    if capability == "backend":
+        assert product is not trace.products[0]
+        assert product.name == trace.products[0].name
+    else:
+        assert product is trace.products[0]
     assert lifecycle_starts >= 1
     assert precommit_factory_runs == []
     assert trace.factory_threads != [caller_thread]
     assert trace.factory_blocking_counts == [1]
     if capability == "backend":
         assert await asyncio.to_thread(permit_released.wait, 1.0)
-        await _assert_dependency_lifecycle_idle(lifecycle)
+        assert lifecycle.blocking_in_flight == 0
+        assert lifecycle.retained == 1
+        assert lifecycle.service_owner_in_flight == 1
     else:
         assert lifecycle.in_flight == 0
         assert lifecycle.blocking_in_flight == 0
@@ -1190,6 +1204,75 @@ async def test_dependency_realization_commits_admitted_worker_before_factory_and
         assert lifecycle.service_owner_in_flight == 1
 
     await _close_dependency_products(dependencies, capability, trace.products)
+    await _assert_dependency_lifecycle_idle(lifecycle)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capability", ["llm", "context"])
+async def test_provider_cache_remains_gated_until_factory_permit_release_settles(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capability: str,
+) -> None:
+    llm_products: list[_ProviderProbe] = []
+    context_products: list[_ContextProbe] = []
+
+    def llm_factory(runtime_settings: Settings) -> LLMProvider:
+        provider = _ProviderProbe(runtime_settings)
+        llm_products.append(provider)
+        return provider
+
+    def context_factory(runtime_settings: Settings) -> ContextProvider:
+        provider = _ContextProbe(runtime_settings)
+        context_products.append(provider)
+        return provider
+
+    resources, lifecycle, _runtime_settings = _provider_resource_matrix(
+        tmp_path,
+        llm_factory=llm_factory,
+        context_factory=context_factory if capability == "context" else None,
+    )
+    if capability == "context":
+        await resources._ensure_llm_provider()
+
+    release_entered = threading.Event()
+    allow_release = threading.Event()
+    original_release = lifecycle.release_blocking_permit
+
+    def delayed_release(permit: Any) -> None:
+        release_entered.set()
+        assert allow_release.wait(timeout=1.0)
+        original_release(permit)
+
+    monkeypatch.setattr(lifecycle, "release_blocking_permit", delayed_release)
+    ensure = resources._ensure_llm_provider if capability == "llm" else resources._ensure_context_provider
+    accessor = resources.llm if capability == "llm" else resources.context
+    first = asyncio.create_task(ensure())
+    second: asyncio.Task[None] | None = None
+    try:
+        assert await asyncio.to_thread(release_entered.wait, 1.0)
+        with resources._lock:
+            if capability == "llm":
+                assert resources._llm_provider is llm_products[0]
+                assert resources._llm_initializing is not None
+            else:
+                assert resources._context_provider is context_products[0]
+                assert resources._context_initializing is not None
+
+        second = asyncio.create_task(ensure())
+        await asyncio.sleep(0)
+        assert second.done() is False
+        with pytest.raises(RuntimeOwnershipError, match="being acquired"):
+            await asyncio.to_thread(accessor)
+
+        allow_release.set()
+        await asyncio.gather(first, second)
+    finally:
+        allow_release.set()
+        await asyncio.gather(first, *(task for task in (second,) if task is not None), return_exceptions=True)
+        monkeypatch.setattr(lifecycle, "release_blocking_permit", original_release)
+        await resources.close()
+
     await _assert_dependency_lifecycle_idle(lifecycle)
 
 
@@ -1358,7 +1441,7 @@ async def test_rejected_dependency_product_is_closed_once_by_its_admitted_realiz
         assert trace.close_service_owner_counts == [1]
     else:
         assert trace.close_blocking_counts == [1]
-        assert trace.close_service_owner_counts == [0]
+        assert trace.close_service_owner_counts == [1]
     await _assert_dependency_lifecycle_idle(lifecycle)
 
 
@@ -4905,8 +4988,8 @@ async def test_limit_one_provider_owner_does_not_starve_backend_realization(tmp_
         assert provider_resource is not None
         assert await provider_resource().chat_text("system", "user") == LLMResult("")
         assert lifecycle.blocking_in_flight == 0
-        backends = await dependencies.realize_backends()
-        assert len(backends) == 1
+        backend_lease = await dependencies.realize_backends()
+        assert len(backend_lease.backends) == 1
         assert backend_observations == [(1, "tacit-lifecycle-blocking-work")]
         for _ in range(100):
             if lifecycle.blocking_in_flight == 0:
@@ -4914,6 +4997,7 @@ async def test_limit_one_provider_owner_does_not_starve_backend_realization(tmp_
             await asyncio.sleep(0)
         assert lifecycle.blocking_in_flight == 0
         assert lifecycle.service_owner_in_flight == 1
+        await dependencies.close_backends(backend_lease)
         await dependencies.close_resources()
 
     assert lifecycle.service_owner_in_flight == 0
@@ -6213,6 +6297,201 @@ async def test_provider_adoption_lock_contention_never_blocks_generation_owner(
 
 
 @pytest.mark.asyncio
+async def test_provider_operation_settlement_never_waits_on_requester_admission_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    operation_gate = _CrossLoopAsyncGate()
+    operation_returned = threading.Event()
+    admissions: list[Any] = []
+    original_admission = dependencies_module._ProviderOperationAdmission
+
+    class ReturningProvider(_ProviderProbe):
+        async def chat_text(self, *_args, **_kwargs) -> LLMResult:
+            await operation_gate.wait()
+            operation_returned.set()
+            return LLMResult("settled")
+
+    def capture_admission(*args: Any, **kwargs: Any) -> Any:
+        admission = original_admission(*args, **kwargs)
+        admissions.append(admission)
+        return admission
+
+    monkeypatch.setattr(dependencies_module, "_ProviderOperationAdmission", capture_admission)
+    resources, lifecycle, _runtime_settings = _provider_resource_matrix(
+        tmp_path,
+        llm_factory=lambda settings: ReturningProvider(settings),
+        cleanup_grace_seconds=1.0,
+    )
+    handle = await resources.acquire()
+    provider = resources.llm()
+    operation = asyncio.create_task(provider.chat_text("system", "user"))
+    assert await asyncio.to_thread(operation_gate.started.wait, 1.0)
+    assert len(admissions) == 1
+
+    with resources._lock:
+        state = resources._generation_owner
+        assert state is not None
+        owner_loop = state.loop
+    assert owner_loop is not None
+
+    admission = admissions[0]
+    admission.lock.acquire()
+    owner_responsive = False
+    try:
+        operation_gate.release()
+        assert await asyncio.to_thread(operation_returned.wait, 1.0)
+        heartbeat = threading.Event()
+        owner_loop.call_soon_threadsafe(heartbeat.set)
+        owner_responsive = await asyncio.to_thread(heartbeat.wait, 0.2)
+    finally:
+        admission.lock.release()
+
+    assert await asyncio.wait_for(operation, timeout=1.0) == LLMResult("settled")
+    await resources.close(handle)
+
+    assert owner_responsive
+    await _assert_dependency_lifecycle_idle(lifecycle)
+
+
+@pytest.mark.asyncio
+async def test_provider_operation_settlement_never_waits_on_controller_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    operation_gate = _CrossLoopAsyncGate()
+    operation_returned = threading.Event()
+    admissions: list[Any] = []
+    original_admission = dependencies_module._ProviderOperationAdmission
+
+    class ReturningProvider(_ProviderProbe):
+        async def chat_text(self, *_args, **_kwargs) -> LLMResult:
+            await operation_gate.wait()
+            operation_returned.set()
+            return LLMResult("settled")
+
+    def capture_admission(*args: Any, **kwargs: Any) -> Any:
+        admission = original_admission(*args, **kwargs)
+        admissions.append(admission)
+        return admission
+
+    monkeypatch.setattr(dependencies_module, "_ProviderOperationAdmission", capture_admission)
+    resources, lifecycle, _runtime_settings = _provider_resource_matrix(
+        tmp_path,
+        llm_factory=lambda settings: ReturningProvider(settings),
+        cleanup_grace_seconds=1.0,
+    )
+    handle = await resources.acquire()
+    provider = resources.llm()
+    operation = asyncio.create_task(provider.chat_text("system", "user"))
+    assert await asyncio.to_thread(operation_gate.started.wait, 1.0)
+    assert len(admissions) == 1
+
+    with resources._lock:
+        state = resources._generation_owner
+        assert state is not None
+        owner_loop = state.loop
+    assert owner_loop is not None
+
+    lifecycle._lock.acquire()
+    owner_responsive = False
+    try:
+        operation_gate.release()
+        assert await asyncio.to_thread(operation_returned.wait, 1.0)
+        heartbeat = threading.Event()
+        owner_loop.call_soon_threadsafe(heartbeat.set)
+        owner_responsive = await asyncio.to_thread(heartbeat.wait, 0.2)
+    finally:
+        lifecycle._lock.release()
+
+    assert await asyncio.wait_for(operation, timeout=1.0) == LLMResult("settled")
+    await resources.close(handle)
+
+    assert owner_responsive
+    await _assert_dependency_lifecycle_idle(lifecycle)
+
+
+@pytest.mark.asyncio
+async def test_provider_generation_cleanup_never_waits_on_requester_manager_lock(tmp_path) -> None:
+    cleanup_gate = _CrossLoopAsyncGate()
+    cleanup_returned = threading.Event()
+
+    class ReturningCloseProvider(_ProviderProbe):
+        async def close(self) -> None:
+            await cleanup_gate.wait()
+            cleanup_returned.set()
+            await super().close()
+
+    resources, lifecycle, _runtime_settings = _provider_resource_matrix(
+        tmp_path,
+        llm_factory=lambda settings: ReturningCloseProvider(settings),
+        cleanup_grace_seconds=1.0,
+    )
+    handle = await resources.acquire()
+    with resources._lock:
+        state = resources._generation_owner
+        assert state is not None
+        owner_loop = state.loop
+    assert owner_loop is not None
+
+    close = asyncio.create_task(resources.close(handle))
+    assert await asyncio.to_thread(cleanup_gate.started.wait, 1.0)
+    resources._lock.acquire()
+    owner_responsive = False
+    try:
+        cleanup_gate.release()
+        assert await asyncio.to_thread(cleanup_returned.wait, 1.0)
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while state.cleanup_future is None or not state.cleanup_future.done():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0)
+        heartbeat = threading.Event()
+        owner_loop.call_soon_threadsafe(heartbeat.set)
+        owner_responsive = await asyncio.to_thread(heartbeat.wait, 0.2)
+    finally:
+        resources._lock.release()
+
+    await asyncio.wait_for(close, timeout=1.0)
+
+    assert owner_responsive
+    await _assert_dependency_lifecycle_idle(lifecycle)
+
+
+@pytest.mark.parametrize("lock_boundary", ["manager", "admission"])
+@pytest.mark.asyncio
+async def test_provider_owner_loss_exits_before_foreign_terminal_lock_releases(
+    tmp_path,
+    lock_boundary: str,
+) -> None:
+    resources, lifecycle, _runtime_settings = _provider_resource_matrix(
+        tmp_path,
+        llm_factory=lambda settings: _ProviderProbe(settings),
+        cleanup_grace_seconds=1.0,
+    )
+    handle = await resources.acquire()
+    with resources._lock:
+        state = resources._generation_owner
+        assert state is not None
+        owner_loop = state.loop
+    assert owner_loop is not None
+    foreign_lock = resources._lock if lock_boundary == "manager" else lifecycle._lock
+
+    foreign_lock.acquire()
+    try:
+        owner_loop.call_soon_threadsafe(owner_loop.stop)
+        deadline = asyncio.get_running_loop().time() + 0.25
+        while not state.owner_exited.done() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.001)
+        assert state.owner_exited.done(), f"provider owner waited on the foreign {lock_boundary} lock"
+    finally:
+        foreign_lock.release()
+
+    with pytest.raises(RuntimeOwnershipError, match="generation cleanup failed"):
+        await resources.close(handle)
+    await _assert_dependency_lifecycle_idle(lifecycle)
+
+
+@pytest.mark.asyncio
 async def test_cancelled_provider_operation_drains_before_final_lease_close(tmp_path) -> None:
     operation_started = threading.Event()
     operation_finished = threading.Event()
@@ -6477,6 +6756,7 @@ async def test_next_epoch_waits_until_prior_owner_thread_has_exited(monkeypatch,
     resources, lifecycle, _runtime_settings = _provider_resource_matrix(
         tmp_path,
         llm_factory=lambda settings: _ProviderProbe(settings),
+        cleanup_grace_seconds=0.2,
     )
     first_handle = await resources.acquire()
     first_close = asyncio.create_task(resources.close(first_handle))

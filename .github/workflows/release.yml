@@ -1442,6 +1442,18 @@ jobs:
             --backing-directory "$PYPI_PUBLICATION_BACKING_DIR" \
             --artifact "wheel=$WHEEL_NAME=$WHEEL_DIGEST" \
             --artifact "sdist=$SDIST_NAME=$SDIST_DIGEST"
+      - name: Verify PyPI publication state
+        env:
+          PACKAGE_VERSION: ${{ needs.validate-release.outputs.package_version }}
+          WHEEL_NAME: ${{ needs.pypi-preflight.outputs.wheel_name }}
+          WHEEL_DIGEST: ${{ needs.pypi-preflight.outputs.wheel_digest }}
+          SDIST_NAME: ${{ needs.pypi-preflight.outputs.sdist_name }}
+          SDIST_DIGEST: ${{ needs.pypi-preflight.outputs.sdist_digest }}
+        run: |
+          python .github/scripts/verify_pypi_release.py preflight \
+            --version "$PACKAGE_VERSION" \
+            --artifact "wheel=$WHEEL_NAME=$WHEEL_DIGEST" \
+            --artifact "sdist=$SDIST_NAME=$SDIST_DIGEST"
       - name: Re-authorize release before publication
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

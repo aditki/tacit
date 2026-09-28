@@ -19,6 +19,7 @@ from tacit.pipeline_admission import (
     RuntimeOwnershipError,
     RuntimeRootDrainStartupError,
     RuntimeRootOwnerHandle,
+    release_runtime_root_with_startup_retry,
 )
 
 _DRAIN_THREAD_PREFIX = "tacit-runtime-root-drain-"
@@ -54,6 +55,157 @@ def _assert_terminal_zero(controller: PipelineAdmissionController) -> None:
     assert controller.retained == 0
     assert controller.blocking_in_flight == 0
     assert controller.service_owner_in_flight == 0
+
+
+def test_provider_manager_construction_does_not_hold_execution_graph_lock() -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    graph = controller.execution_graph
+    root = graph.register_root_owner()
+    construction_started = threading.Event()
+    allow_construction = threading.Event()
+    resolver_errors: list[BaseException] = []
+
+    class Manager:
+        async def shutdown(self) -> None:
+            return None
+
+    def create_manager() -> object:
+        construction_started.set()
+        assert allow_construction.wait(timeout=1.0)
+        return Manager()
+
+    def resolve_manager() -> None:
+        try:
+            graph.resolve_provider_manager(spec="slow-manager", create=create_manager)
+        except BaseException as exc:
+            resolver_errors.append(exc)
+
+    resolver = threading.Thread(target=resolve_manager, name="slow-provider-manager-construction")
+    resolver.start()
+    try:
+        assert construction_started.wait(timeout=1.0)
+        assert graph._lock.acquire(blocking=False), "provider construction retained the graph mutex"
+        graph._lock.release()
+    finally:
+        allow_construction.set()
+        resolver.join(timeout=1.0)
+
+    assert resolver.is_alive() is False
+    assert resolver_errors == []
+    asyncio.run(graph.release_root_owner(root))
+
+
+@pytest.mark.asyncio
+async def test_provider_manager_coalescing_never_blocks_async_followers() -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    graph = controller.execution_graph
+    root = graph.register_root_owner()
+    construction_started = threading.Event()
+    allow_construction = threading.Event()
+    heartbeat_ticks = 0
+
+    class Manager:
+        async def shutdown(self) -> None:
+            return None
+
+    manager = Manager()
+
+    def create_manager() -> object:
+        construction_started.set()
+        assert allow_construction.wait(timeout=1.0)
+        return manager
+
+    async def heartbeat() -> None:
+        nonlocal heartbeat_ticks
+        while True:
+            heartbeat_ticks += 1
+            await asyncio.sleep(0.002)
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    creator = asyncio.create_task(
+        graph.resolve_provider_manager_async(spec="slow-async-manager", create=create_manager)
+    )
+    follower: asyncio.Task[object] | None = None
+    try:
+        assert await asyncio.to_thread(construction_started.wait, 1.0)
+        follower = asyncio.create_task(
+            graph.resolve_provider_manager_async(spec="slow-async-manager", create=create_manager)
+        )
+        ticks_before_wait = heartbeat_ticks
+        await asyncio.sleep(0.05)
+        assert heartbeat_ticks - ticks_before_wait >= 10
+
+        follower.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(follower, timeout=0.2)
+        assert creator.done() is False
+    finally:
+        allow_construction.set()
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+    assert await asyncio.wait_for(creator, timeout=1.0) is manager
+    await graph.release_root_owner(root)
+    _assert_terminal_zero(controller)
+
+
+@pytest.mark.asyncio
+async def test_final_root_owner_remains_responsive_during_graph_lock_contention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    graph = controller.execution_graph
+    root = graph.register_root_owner()
+    drain_entered = threading.Event()
+    continue_drain = threading.Event()
+    ticks = 0
+    original_drain = graph._drain_final_root
+
+    class Manager:
+        async def shutdown(self) -> None:
+            return None
+
+    graph.resolve_provider_manager(spec="graph-lock-manager", create=Manager)
+
+    async def paused_drain(
+        generation: int,
+        initial_manager: object | None,
+        provider_recheck_required: bool,
+    ) -> None:
+        drain_entered.set()
+        await asyncio.to_thread(continue_drain.wait)
+        await original_drain(generation, initial_manager, provider_recheck_required)
+
+    def count_tick(owner: Any) -> None:
+        nonlocal ticks
+        ticks += 1
+        owner.transport_wakeup_pending = False
+
+    monkeypatch.setattr(graph, "_drain_final_root", paused_drain)
+    monkeypatch.setattr(admission_module, "_drain_transport_tick", count_tick)
+    release_task = asyncio.create_task(graph.release_root_owner(root))
+    assert await asyncio.to_thread(drain_entered.wait, 1.0)
+    owner = graph._final_drain_owner
+    assert owner is not None
+    for _ in range(100):
+        if owner.transport_relays:
+            break
+        await asyncio.sleep(0)
+    assert owner.transport_relays
+
+    graph._lock.acquire()
+    try:
+        continue_drain.set()
+        ticks_before = ticks
+        await asyncio.sleep(0.2)
+        assert ticks >= ticks_before + 2, "graph mutex contention blocked the lifecycle owner"
+    finally:
+        graph._lock.release()
+        continue_drain.set()
+
+    await asyncio.wait_for(release_task, timeout=1.0)
+    _assert_terminal_zero(controller)
 
 
 @pytest.mark.asyncio
@@ -440,8 +592,10 @@ async def test_final_drain_transition_worker_start_failure_preserves_single_auth
         if ambiguous_start:
             await graph.release_root_owner(root)
         else:
-            with pytest.raises(RuntimeError, match="transition worker start failed"):
+            with pytest.raises(RuntimeRootDrainStartupError) as observed:
                 await graph.release_root_owner(root)
+            assert observed.value.__cause__ is not None
+            assert str(observed.value.__cause__) == "transition worker start failed"
 
     assert transition_starts == 1
     if ambiguous_start:
@@ -452,6 +606,52 @@ async def test_final_drain_transition_worker_start_failure_preserves_single_auth
     assert graph.root_owner_count == 1
     assert controller.runtime_root_state == "active"
     await graph.release_root_owner(root)
+    _assert_terminal_zero(controller)
+
+
+@pytest.mark.parametrize("failed_starts", [1, 2])
+@pytest.mark.asyncio
+async def test_final_root_transition_start_gets_one_retry_then_restores_or_fences(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_starts: int,
+) -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    graph = controller.execution_graph
+    root = graph.register_root_owner()
+    original_start = threading.Thread.start
+    transition_starts = 0
+    release_attempts = 0
+
+    def fail_selected_transition_starts(thread: threading.Thread) -> None:
+        nonlocal transition_starts
+        if not thread.name.startswith("tacit-lifecycle-transition-"):
+            original_start(thread)
+            return
+        transition_starts += 1
+        if transition_starts <= failed_starts:
+            raise RuntimeError("definite transition worker start failure")
+        original_start(thread)
+
+    async def release_once(handle: RuntimeRootOwnerHandle) -> None:
+        nonlocal release_attempts
+        release_attempts += 1
+        await graph.release_root_owner(handle)
+
+    with monkeypatch.context() as start_failure:
+        start_failure.setattr(threading.Thread, "start", fail_selected_transition_starts)
+        if failed_starts == 1:
+            await release_runtime_root_with_startup_retry(release_once, root)
+        else:
+            with pytest.raises(RuntimeRootDrainStartupError):
+                await release_runtime_root_with_startup_retry(release_once, root)
+
+    assert release_attempts == 2
+    if failed_starts == 1:
+        assert transition_starts == 2
+        assert controller.runtime_fatal_circuit is None
+    else:
+        assert transition_starts == 3
+        assert controller.runtime_fatal_circuit is not None
     _assert_terminal_zero(controller)
 
 

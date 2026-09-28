@@ -51,7 +51,6 @@ DIGEST_PATTERN = re.compile(r"sha256:([0-9a-f]{64})\Z")
 REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 QUALITY_WORKFLOW = "release-quality.yml"
 QUALITY_WORKFLOW_PATH = ".github/workflows/release-quality.yml"
-QUALITY_WORKFLOW_RUN_PATH = f"{QUALITY_WORKFLOW_PATH}@main"
 QUALITY_CORPUS_PATH = "tests/tacit_validation_prompts.csv"
 QUALITY_EVIDENCE_PATH = "release-quality-evidence.json"
 QUALITY_STATE_MANIFEST_PATH = ARCHIVED_STATE_MANIFEST
@@ -992,7 +991,7 @@ def require_successful_release_quality(
         and run.get("event") == "workflow_dispatch"
         and run.get("status") == "completed"
         and run.get("conclusion") == "success"
-        and run.get("path") == QUALITY_WORKFLOW_RUN_PATH
+        and run.get("path") == QUALITY_WORKFLOW_PATH
     ]
     if not accepted:
         raise ReleaseAuthorizationError(

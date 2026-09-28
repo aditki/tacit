@@ -776,12 +776,20 @@ async def test_owner_loop_loss_settles_committed_handoff_once_before_final_drain
     )
     released_tokens: list[int] = []
     original_release = controller.release
+    original_owner_release = controller.try_release_from_service_owner
 
     def track_release(lease: Any) -> None:
         released_tokens.append(lease.token)
         original_release(lease)
 
+    def track_owner_release(lease: Any) -> bool:
+        released = original_owner_release(lease)
+        if released:
+            released_tokens.append(lease.token)
+        return released
+
     monkeypatch.setattr(controller, "release", track_release)
+    monkeypatch.setattr(controller, "try_release_from_service_owner", track_owner_release)
 
     handoff_committed = threading.Event()
     original_call_soon_threadsafe = state.loop.call_soon_threadsafe

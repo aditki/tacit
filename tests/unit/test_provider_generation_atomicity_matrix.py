@@ -1438,14 +1438,14 @@ def test_startup_failure_retirement_reserves_the_generation_before_replacement_a
         )
 
     replacement_reached_manager = threading.Event()
-    original_resolve_manager = resources._resolve_active_manager
+    original_resolve_manager = resources._resolve_active_manager_async
 
-    def tracked_resolve_manager() -> _RuntimeProviderResources:
+    async def tracked_resolve_manager() -> _RuntimeProviderResources:
         if threading.current_thread().name == f"provider-replacement-acquire-{attempt}":
             replacement_reached_manager.set()
-        return original_resolve_manager()
+        return await original_resolve_manager()
 
-    monkeypatch.setattr(resources, "_resolve_active_manager", tracked_resolve_manager)
+    monkeypatch.setattr(resources, "_resolve_active_manager_async", tracked_resolve_manager)
     replacement_handles: list[ProviderLeaseHandle] = []
     replacement_errors: list[BaseException] = []
 

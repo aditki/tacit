@@ -424,6 +424,28 @@ def test_nonpipeline_owner_retries_root_drain_startup_once(
     _assert_runtime_released(stores)
 
 
+def test_nonpipeline_owner_survives_nested_pipeline_borrows_from_new_loops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_settings = _settings(tmp_path, "ollama")
+    observations: dict[str, Any] = {}
+    _install_probe_factory(monkeypatch, runtime_settings, observations)
+    stores = RuntimeStores(runtime_settings)
+    dependencies = _dependencies(runtime_settings, stores)
+
+    async def borrow_provider_generation() -> None:
+        lease = await dependencies.acquire_resources()
+        await dependencies.close_resources(lease)
+
+    with managed_nonpipeline_llm_provider(runtime_settings, dependencies=dependencies):
+        asyncio.run(borrow_provider_generation())
+        asyncio.run(borrow_provider_generation())
+
+    assert observations["closed"] == observations["providers"]
+    _assert_runtime_released(stores)
+
+
 def test_nonpipeline_owner_runs_bedrock_through_operation_scoped_capacity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

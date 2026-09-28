@@ -117,6 +117,24 @@ drains this manager before its runtime owner disappears.
 The Bedrock provider participates in this provider lifecycle, but its Boto3
 session and clients remain operation-scoped inside admitted workers.
 
+Accepted dashboard backends now use the same runtime generation's dedicated
+service-owner loop. Synchronous backend construction and validation execute in
+an admitted worker. Before publication, that worker transfers retained admission
+to service ownership and the owner loop atomically adopts the raw backends; the
+caller receives only generation-fenced proxies in an opaque per-run lease.
+Every operation and release validates the complete graph nonce, generation
+epoch, lease ID, provider handle, borrowed proxy set, and provider-release
+disposition before looking up or mutating owner state. Foreign caller
+threads submit bounded commands only and may never acquire a lock that can block
+the owner loop.
+
+The owner loop closes backend children before provider-generation shutdown.
+Backend close keeps retained service capacity charged and retries transient
+failure within fixed attempt and wall-clock bounds. Exhausting those bounds
+revokes proxy authority, drops runtime references, and latches the runtime's
+process-lifetime fatal fence. Request cancellation or requester-loop loss does
+not move cleanup or capacity-release authority back to the requester.
+
 ## Native-Async Follow-up
 
 The next Bedrock sequence first moves the stable credential plan to the runtime
@@ -153,8 +171,10 @@ controller, and uncharged cleanup threads are outside the design.
 
 Bedrock SDK resources do not exercise adoption because no realized session or
 client leaves its worker. Accepted provider objects do use the runtime service
-loop described above. This changeset does not claim the same affinity or
-cross-loop shutdown guarantees for stores or backends.
+loop described above. Accepted dashboard backends use that same dedicated
+runtime owner and the lease, transfer, bounded-close, and fatal-fence contract
+described above. This changeset does not claim the same affinity or cross-loop
+shutdown guarantees for stores or other accepted resource classes.
 
 ## Separate Sync/Async Debt
 
@@ -164,7 +184,7 @@ this changeset:
 | Boundary | Deferred decision |
 |---|---|
 | Native Bedrock async transport | First land runtime-scoped credential-plan ownership, then use `aiobotocore`; attach its session/client, credential refresh, and `AsyncExitStack` lifecycle solely to the established runtime execution graph before or with non-streaming `converse`, then land `converse_stream`. Composition roots own generation-fenced handles; the existing runtime admission authority sizes connection pooling |
-| Accepted non-provider resource affinity | Extend the proven provider loop/lease/drain contract to stores and backends; do not infer that the provider proof covers them |
+| Accepted non-provider resource affinity beyond backends | Extend the proven provider/backend loop, lease, transfer, and drain contract to stores and other accepted resource classes; do not infer that the backend proof covers them |
 | Closable store factories | Add explicit composition-root readiness, leasing, and deterministic shutdown for stores rather than assuming process lifetime or global ownership |
 | SQLite startup and migrations | Complete required schema, migration, bootstrap, and readiness work before serving requests; retain restartable protected-path semantics and report cold-start cost |
 | SQLite steady-state execution | Choose bounded offload or an async adapter from measurements without weakening protected-path, transaction, deadline, cancellation-before-start, or shutdown-drain invariants |
@@ -172,7 +192,7 @@ this changeset:
 | Remote response decoding | Bound compressed/decoded bytes, JSON structure, decode CPU, and aggregate memory before adapter item limits, then migrate each HTTP adapter through the shared contract |
 | Pipeline CPU work | Instrument loop delay and stage CPU first, then assign selection, compilation, evidence, ranking, validation, hashing, and serialization to bounded owners only where measurements require it |
 | Fixed/shared worker-pool lifecycle | Define lifespan creation, process-wide and per-runtime cardinality, aggregate sizing, queue limits, failure recovery, shutdown, and runtime isolation; do not introduce provider-local pools |
-| Cross-loop cleanup and admission | Extend the runtime execution-graph contract beyond providers without making request-loop futures capacity or cleanup owners |
+| Cross-loop cleanup and admission beyond providers/backends | Extend the runtime execution-graph contract to remaining accepted resource classes without making request-loop futures capacity or cleanup owners |
 | Observability and scaling gates | Add event-loop lag, admission/pool queue depth and wait, retained work, cleanup duration/failure, SQLite queue/lock wait, phase timing, saturation, and limit-plus-one/load gates |
 | Runtime-scoped credential-plan ownership | Move stable Bedrock plan capture for API, Slack, CLI, and direct-provider owners to their composition roots so request rejection happens before credential-source reads; retain per-operation generation capture inside the admitted worker and define explicit settings-change invalidation |
 | Aggregate HTTP request-body admission | Preserve the per-request ASGI limit but add an application-owned aggregate byte/concurrency permit before buffering and retain it through decode, validation, and disposal; test limit, limit-plus-one, malformed/deep JSON, disconnect, and tenant saturation behavior |
@@ -196,7 +216,7 @@ authority while trying to optimize an earlier boundary:
 | 2 | Native Bedrock lifecycle plus `converse` | `aiobotocore` session/client, refresh work, and `AsyncExitStack` are attached solely to the established runtime graph before request use; composition roots hold generation-fenced handles; exact credential declaration parity, cancellation, shutdown, rotation, saturation, and limit-plus-one tests pass; the blocking bridge remains available only until parity passes |
 | 3 | Bedrock `converse_stream` | Bounded event stream parsing, downstream-consumer limits, disconnect/cancellation cleanup, partial-response policy, and no leaked response bodies or pool slots |
 | 4 | Bedrock pool tuning | Pool size derives from the existing runtime admission authority; measure queue wait, active connections, saturation, latency, and credential refresh before changing defaults |
-| 5 | Remaining runtime composition boundaries | Extend accepted-resource ownership to stores/backends and add store readiness/close contracts |
+| 5 | Remaining runtime composition boundaries | Extend the implemented provider/backend ownership contract to closable stores and other accepted resources; add their readiness and close contracts without weakening the backend proof |
 | 6 | Aggregate ingress admission | Hold one bounded request permit from first byte through decode, model validation, and disposal; partition fairly by tenant and expose aggregate utilization without payload data |
 | 7 | Store and document boundaries | Separate SQLite cold readiness from steady-state execution; add bounded structured-document loading and remote-response decoding with loop-delay and memory gates |
 | 8 | Pipeline CPU boundaries | Instrument stage CPU and event-loop delay, then offload only measured hotspots with cancellation, concurrency, and output-equivalence tests |
@@ -213,6 +233,15 @@ does not enter an earlier changeset merely because both use threads or async I/O
 - Independently constructed bundles for one runtime share a single provider
   generation and service-loop owner; stale handles and callbacks cannot mutate
   a later generation.
+- Dashboard backends are adopted, used, retried, and closed by that dedicated
+  owner. Complete lease identity prevents stale or foreign operation and release,
+  and caller threads cannot block owner-loop progress.
+- `PipelineDependencies.backend_factory` remains a declared construction input,
+  not a synchronous execution API. Direct embedders must migrate runtime use to
+  `await dependencies.realize_backends()`, consume only the returned lease's
+  proxies, and finish with `await dependencies.close_backends(lease)`. Calling
+  the legacy synchronous accessor raises a deprecation warning and fails before
+  backend construction so it cannot bypass runtime admission or ownership.
 - Accepted provider cleanup failure is visible to the completing run, revokes
   the generation, converges to zero executable authority, and latches a
   process-lifetime fatal circuit for that runtime. Recovery requires process

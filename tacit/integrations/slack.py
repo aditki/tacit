@@ -271,12 +271,17 @@ def create_slack_app(
         client=web_client,
     )
 
+    dependencies: PipelineDependencies | None = None
+
     def deps_factory() -> PipelineDependencies:
-        return build_pipeline_dependencies(
-            runtime_settings,
-            stores=runtime_stores,
-            required_runtime_root_generation=required_runtime_root_generation,
-        )
+        nonlocal dependencies
+        if dependencies is None:
+            dependencies = build_pipeline_dependencies(
+                runtime_settings,
+                stores=runtime_stores,
+                required_runtime_root_generation=required_runtime_root_generation,
+            )
+        return dependencies
 
     async def runtime_handle_mention(event: dict, say) -> None:
         if lifecycle is not None and not lifecycle.callback_authority_active:

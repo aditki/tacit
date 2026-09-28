@@ -8,7 +8,7 @@ from dataclasses import replace
 import pytest
 
 import tacit.pipeline.side_effects as side_effects
-from tacit.errors import RuntimeOwnershipError
+from tacit.errors import PipelineAdmissionRejected, RuntimeOwnershipError
 from tacit.pipeline.side_effects import (
     LifecycleOwnedBlockingWork,
     cancel_task_with_grace,
@@ -52,6 +52,7 @@ async def test_async_nested_same_worker_realization_reuses_owned_permit(
             result = await blocking_work.realize_owned(
                 lambda: worker_threads.append(threading.get_ident()) or nested_product,
                 validate=lambda _nested: None,
+                adopt=lambda _nested: None,
                 retire=retired.append,
                 reason_code="nested_same_worker_realization",
                 timeout_seconds=0.01,
@@ -61,6 +62,7 @@ async def test_async_nested_same_worker_realization_reuses_owned_permit(
     result = await blocking_work.realize_owned(
         outer_factory,
         validate=validate_outer,
+        adopt=lambda _product: None,
         retire=retired.append,
         reason_code="outer_same_worker_realization",
     )
@@ -74,6 +76,333 @@ async def test_async_nested_same_worker_realization_reuses_owned_permit(
     assert lifecycle.in_flight == 0
     assert lifecycle.blocking_in_flight == 0
     assert blocking_work.active == 0
+
+
+@pytest.mark.asyncio
+async def test_adopted_result_is_not_published_before_worker_releases_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    product = object()
+    release_entered = threading.Event()
+    allow_release = threading.Event()
+    original_release = lifecycle.release_blocking_permit
+    adopted = threading.Event()
+
+    def delayed_release(permit: PipelineBlockingPermit) -> None:
+        release_entered.set()
+        assert allow_release.wait(timeout=1.0)
+        original_release(permit)
+
+    monkeypatch.setattr(lifecycle, "release_blocking_permit", delayed_release)
+    realization = asyncio.create_task(
+        blocking_work.realize_owned(
+            lambda: product,
+            validate=lambda _product: None,
+            adopt=lambda _product: adopted.set(),
+            retire=lambda _product: None,
+            reason_code="adopted_result_release_order",
+        )
+    )
+    try:
+        assert await asyncio.to_thread(release_entered.wait, 1.0)
+        assert adopted.is_set()
+        await asyncio.sleep(0)
+        assert realization.done() is False
+        assert lifecycle.blocking_in_flight == 1
+
+        allow_release.set()
+        assert await realization is product
+        assert lifecycle.in_flight == 0
+        assert lifecycle.blocking_in_flight == 0
+        assert blocking_work.active == 0
+    finally:
+        allow_release.set()
+        if not realization.done():
+            realization.cancel()
+            await asyncio.gather(realization, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_plain_async_result_is_not_published_before_worker_releases_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    product = object()
+    release_entered = threading.Event()
+    allow_release = threading.Event()
+    original_release = lifecycle.release_blocking_permit
+
+    def delayed_release(permit: PipelineBlockingPermit) -> None:
+        release_entered.set()
+        assert allow_release.wait(timeout=1.0)
+        original_release(permit)
+
+    monkeypatch.setattr(lifecycle, "release_blocking_permit", delayed_release)
+    result = asyncio.create_task(
+        blocking_work.run(
+            lambda: product,
+            reason_code="plain_result_release_order",
+        )
+    )
+    try:
+        assert await asyncio.to_thread(release_entered.wait, 1.0)
+        await asyncio.sleep(0)
+        assert result.done() is False
+        assert lifecycle.blocking_in_flight == 1
+
+        allow_release.set()
+        assert await result is product
+        assert lifecycle.in_flight == 0
+        assert lifecycle.blocking_in_flight == 0
+        assert blocking_work.active == 0
+    finally:
+        allow_release.set()
+        if not result.done():
+            result.cancel()
+            await asyncio.gather(result, return_exceptions=True)
+
+
+@pytest.mark.parametrize("release_before_failure", [False, True])
+@pytest.mark.asyncio
+async def test_deferred_result_release_failure_fences_runtime_and_settles_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+    release_before_failure: bool,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    product = object()
+    captured_permits: list[PipelineBlockingPermit] = []
+    retired: list[object] = []
+    original_release = lifecycle.release_blocking_permit
+    adopted = threading.Event()
+
+    def retire_unadopted(candidate: object) -> None:
+        if not adopted.is_set():
+            retired.append(candidate)
+
+    def fail_release(permit: PipelineBlockingPermit) -> None:
+        captured_permits.append(permit)
+        if release_before_failure:
+            original_release(permit)
+        raise RuntimeError("synthetic permit release failure")
+
+    monkeypatch.setattr(lifecycle, "release_blocking_permit", fail_release)
+    realization = asyncio.create_task(
+        blocking_work.realize_owned(
+            lambda: product,
+            validate=lambda _product: None,
+            adopt=lambda _product: adopted.set(),
+            retire=retire_unadopted,
+            reason_code="deferred_result_release_failure",
+        )
+    )
+
+    with pytest.raises(RuntimeOwnershipError, match="capacity release failed"):
+        await asyncio.wait_for(realization, timeout=1.0)
+
+    assert lifecycle.runtime_fatal_circuit is not None
+    assert adopted.is_set()
+    with pytest.raises(RuntimeOwnershipError, match="cleanup failed"):
+        await blocking_work.run(lambda: None, reason_code="work_after_release_failure")
+    assert retired == []
+    assert blocking_work.active == 0
+
+    if not release_before_failure:
+        assert len(captured_permits) == 1
+        original_release(captured_permits[0])
+    assert lifecycle.in_flight == 0
+    assert lifecycle.blocking_in_flight == 0
+
+
+@pytest.mark.parametrize("release_before_failure", [False, True])
+@pytest.mark.asyncio
+async def test_plain_async_release_failure_fences_before_replacement_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    release_before_failure: bool,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    captured_permits: list[PipelineBlockingPermit] = []
+    replacement_attempts: list[PipelineBlockingPermit | None] = []
+    replacement_releases: list[PipelineBlockingPermit] = []
+    original_release = lifecycle.release_blocking_permit
+
+    def fail_release(permit: PipelineBlockingPermit) -> None:
+        captured_permits.append(permit)
+        if release_before_failure:
+            original_release(permit)
+            replacement = lifecycle.try_acquire_blocking_permit()
+            replacement_attempts.append(replacement)
+            if replacement is not None:
+                replacement_releases.append(replacement)
+                original_release(replacement)
+        raise RuntimeError("synthetic permit release failure")
+
+    monkeypatch.setattr(lifecycle, "release_blocking_permit", fail_release)
+    with pytest.raises(RuntimeOwnershipError, match="capacity release failed"):
+        await asyncio.wait_for(
+            blocking_work.run(
+                lambda: "must-not-escape",
+                reason_code="plain_result_release_failure",
+            ),
+            timeout=1.0,
+        )
+
+    assert lifecycle.runtime_fatal_circuit is not None
+    assert blocking_work.active == 0
+    if release_before_failure:
+        assert replacement_attempts == [None]
+        assert replacement_releases == []
+    else:
+        original_release(captured_permits[0])
+    assert lifecycle.in_flight == 0
+    assert lifecycle.blocking_in_flight == 0
+
+
+@pytest.mark.parametrize("release_before_failure", [False, True])
+@pytest.mark.asyncio
+async def test_inherited_child_task_cannot_reserve_during_release_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    release_before_failure: bool,
+) -> None:
+    lifecycle = PipelineAdmissionController(2, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    release_transition_started = asyncio.Event()
+    replacement_finished = threading.Event()
+    replacement_outcomes: list[str] = []
+    captured_permits: list[PipelineBlockingPermit] = []
+    original_release = lifecycle.release_blocking_permit
+    loop = asyncio.get_running_loop()
+
+    async with lifecycle.slot():
+
+        async def reserve_from_inherited_lease() -> None:
+            await release_transition_started.wait()
+            try:
+                replacement = await lifecycle.acquire_blocking_permit()
+            except PipelineAdmissionRejected as exc:
+                replacement_outcomes.append(exc.reason_code)
+            else:
+                replacement_outcomes.append("admitted")
+                original_release(replacement)
+            finally:
+                replacement_finished.set()
+
+        inherited_child = asyncio.create_task(reserve_from_inherited_lease())
+
+        def fail_release(permit: PipelineBlockingPermit) -> None:
+            captured_permits.append(permit)
+            if release_before_failure:
+                original_release(permit)
+            loop.call_soon_threadsafe(release_transition_started.set)
+            assert replacement_finished.wait(timeout=1.0)
+            raise RuntimeError("synthetic permit release failure")
+
+        monkeypatch.setattr(lifecycle, "release_blocking_permit", fail_release)
+        with pytest.raises(RuntimeOwnershipError, match="capacity release failed"):
+            await asyncio.wait_for(
+                blocking_work.run(
+                    lambda: "must-not-escape",
+                    reason_code="inherited_lease_release_transition",
+                ),
+                timeout=1.0,
+            )
+        await inherited_child
+
+        assert replacement_outcomes == ["pipeline_admission_queue_full"]
+        assert lifecycle.runtime_fatal_circuit is not None
+        assert blocking_work.active == 0
+        if not release_before_failure:
+            original_release(captured_permits[0])
+
+    assert lifecycle.in_flight == 0
+    assert lifecycle.blocking_in_flight == 0
+
+
+@pytest.mark.parametrize("release_before_failure", [False, True])
+@pytest.mark.asyncio
+async def test_cleanup_and_release_failure_still_settles_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+    release_before_failure: bool,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    captured_permits: list[PipelineBlockingPermit] = []
+    original_release = lifecycle.release_blocking_permit
+
+    def fail_release(permit: PipelineBlockingPermit) -> None:
+        captured_permits.append(permit)
+        if release_before_failure:
+            original_release(permit)
+        raise RuntimeError("synthetic permit release failure")
+
+    def reject(_product: object) -> None:
+        raise ValueError("synthetic validation failure")
+
+    def fail_retirement(_product: object) -> None:
+        raise RuntimeError("synthetic retirement failure")
+
+    monkeypatch.setattr(lifecycle, "release_blocking_permit", fail_release)
+    with pytest.raises(RuntimeOwnershipError, match="capacity release failed"):
+        await asyncio.wait_for(
+            blocking_work.realize_owned(
+                object,
+                validate=reject,
+                adopt=lambda _product: None,
+                retire=fail_retirement,
+                reason_code="cleanup_and_release_failure",
+            ),
+            timeout=1.0,
+        )
+
+    assert lifecycle.runtime_fatal_circuit is not None
+    assert blocking_work.active == 0
+    if not release_before_failure:
+        original_release(captured_permits[0])
+    assert lifecycle.in_flight == 0
+    assert lifecycle.blocking_in_flight == 0
+
+
+@pytest.mark.parametrize("release_before_failure", [False, True])
+def test_sync_realization_never_returns_product_after_release_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    release_before_failure: bool,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    product = object()
+    adopted: list[object] = []
+    retired: list[object] = []
+    captured_permits: list[PipelineBlockingPermit] = []
+    original_release = lifecycle.release_blocking_permit
+
+    def fail_release(permit: PipelineBlockingPermit) -> None:
+        captured_permits.append(permit)
+        if release_before_failure:
+            original_release(permit)
+        raise RuntimeError("synthetic permit release failure")
+
+    monkeypatch.setattr(lifecycle, "release_blocking_permit", fail_release)
+    with pytest.raises(RuntimeOwnershipError, match="capacity release failed"):
+        blocking_work.realize_owned_sync(
+            lambda: product,
+            validate=lambda _product: None,
+            adopt=adopted.append,
+            retire=retired.append,
+            reason_code="sync_release_failure",
+        )
+
+    assert adopted == [product]
+    assert retired == [product]
+    assert lifecycle.runtime_fatal_circuit is not None
+    assert blocking_work.active == 0
+    if not release_before_failure:
+        original_release(captured_permits[0])
+    assert lifecycle.in_flight == 0
+    assert lifecycle.blocking_in_flight == 0
 
 
 @pytest.mark.parametrize("failure_mode", ["iterable", "cardinality"])
@@ -302,6 +631,7 @@ def test_cleanup_permit_rejects_normal_same_worker_reentry(
                     blocking_work.realize_owned(
                         factory,
                         validate=lambda _product: None,
+                        adopt=lambda _product: None,
                         retire=lambda _product: None,
                         reason_code="normal_realization_from_cleanup_worker",
                     )
@@ -310,6 +640,7 @@ def test_cleanup_permit_rejects_normal_same_worker_reentry(
                 blocking_work.realize_owned_sync(
                     factory,
                     validate=lambda _product: None,
+                    adopt=lambda _product: None,
                     retire=lambda _product: None,
                     reason_code="normal_sync_realization_from_cleanup_worker",
                 )
@@ -424,6 +755,7 @@ async def test_setup_failure_after_reservation_releases_capacity_once(
             blocking_work.realize_owned_sync(
                 lambda: function_ran.set() or object(),
                 validate=lambda _product: None,
+                adopt=lambda _product: None,
                 retire=lambda _product: None,
                 reason_code="sync_registration_failure",
             )
@@ -460,6 +792,7 @@ async def test_sync_call_construction_failure_releases_reserved_capacity_once(
         blocking_work.realize_owned_sync(
             object,
             validate=lambda _product: None,
+            adopt=lambda _product: None,
             retire=lambda _product: None,
             reason_code="sync_call_construction_failure",
         )
@@ -469,6 +802,92 @@ async def test_sync_call_construction_failure_releases_reserved_capacity_once(
     assert lifecycle.blocking_in_flight == 0
     assert lifecycle.retained == 0
     assert blocking_work.active == 0
+
+
+@pytest.mark.parametrize("release_before_failure", [False, True])
+def test_sync_call_construction_release_failure_fences_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    release_before_failure: bool,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    captured_permits: list[PipelineBlockingPermit] = []
+    original_release = lifecycle.release_blocking_permit
+
+    def fail_release(permit: PipelineBlockingPermit) -> None:
+        captured_permits.append(permit)
+        if release_before_failure:
+            original_release(permit)
+        raise RuntimeError("synthetic construction rollback release failure")
+
+    def reject_call_construction(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("synthetic call construction failure")
+
+    monkeypatch.setattr(lifecycle, "release_blocking_permit", fail_release)
+    monkeypatch.setattr(side_effects, "_LifecycleBlockingCall", reject_call_construction)
+
+    with pytest.raises(RuntimeOwnershipError, match="capacity release failed"):
+        blocking_work.realize_owned_sync(
+            object,
+            validate=lambda _product: None,
+            adopt=lambda _product: None,
+            retire=lambda _product: None,
+            reason_code="sync_call_construction_release_failure",
+        )
+
+    assert lifecycle.runtime_fatal_circuit is not None
+    assert len(captured_permits) == 1
+    if not release_before_failure:
+        original_release(captured_permits[0])
+    assert lifecycle.in_flight == 0
+    assert lifecycle.blocking_in_flight == 0
+    assert lifecycle.retained == 0
+    assert blocking_work.active == 0
+
+
+@pytest.mark.parametrize("failure_index", [0, 1, 2])
+@pytest.mark.parametrize("release_before_failure", [False, True])
+def test_cleanup_group_rollback_attempts_every_permit_after_release_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_index: int,
+    release_before_failure: bool,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    permits = blocking_work.reserve_cleanup_permits(3)
+    assert permits is not None
+    original_release = lifecycle.release_blocking_permit
+    attempts: list[int] = []
+    released: set[int] = set()
+
+    def flaky_release(permit: PipelineBlockingPermit) -> None:
+        index = len(attempts)
+        attempts.append(permit.permit_id)
+        if index == failure_index:
+            if release_before_failure:
+                original_release(permit)
+                released.add(permit.permit_id)
+            raise RuntimeError("synthetic group rollback release failure")
+        original_release(permit)
+        released.add(permit.permit_id)
+
+    monkeypatch.setattr(lifecycle, "release_blocking_permit", flaky_release)
+    with pytest.raises(RuntimeOwnershipError, match="capacity release failed"):
+        blocking_work.run_reserved_background_group(
+            (),
+            permits,
+            reason_code="cleanup_group_release_failure",
+        )
+
+    assert attempts == [permit.permit_id for permit in permits]
+    assert lifecycle.runtime_fatal_circuit is not None
+    assert blocking_work.active == 0
+    for permit in permits:
+        if permit.permit_id not in released:
+            original_release(permit)
+    assert lifecycle.in_flight == 0
+    assert lifecycle.blocking_in_flight == 0
+    assert lifecycle.retained == 0
 
 
 @pytest.mark.asyncio

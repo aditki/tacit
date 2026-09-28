@@ -826,19 +826,19 @@ def test_final_root_drain_survives_releasing_caller_loop_loss(
     releasing_loop: list[asyncio.AbstractEventLoop] = []
     releasing_loop_errors: list[BaseException] = []
     begin_root_drain = controller.begin_root_drain
-    finish_root_drain = controller.finish_root_drain
+    finish_root_drain = controller._finish_root_drain_owned
 
     def observed_begin_root_drain(generation: int) -> bool:
         admitted_work_active = begin_root_drain(generation)
         drain_started.set()
         return admitted_work_active
 
-    def observed_finish_root_drain(generation: int) -> None:
-        finish_root_drain(generation)
+    async def observed_finish_root_drain(generation: int) -> None:
+        await finish_root_drain(generation)
         drain_finished.set()
 
     monkeypatch.setattr(controller, "begin_root_drain", observed_begin_root_drain)
-    monkeypatch.setattr(controller, "finish_root_drain", observed_finish_root_drain)
+    monkeypatch.setattr(controller, "_finish_root_drain_owned", observed_finish_root_drain)
 
     def run_releasing_loop() -> None:
         loop = asyncio.new_event_loop()

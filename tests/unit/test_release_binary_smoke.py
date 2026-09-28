@@ -833,6 +833,10 @@ def test_image_smoke_executes_hardened_runtime_and_cleans_owned_resources(
                         "HostConfig": {
                             "ReadonlyRootfs": True,
                             "Tmpfs": {"/tmp": "rw,noexec,nosuid,size=67108864"},
+                            "NetworkMode": "none",
+                            "PidsLimit": image_smoke.RUNTIME_PIDS_LIMIT,
+                            "Memory": image_smoke.RUNTIME_MEMORY_BYTES,
+                            "NanoCpus": image_smoke.RUNTIME_NANO_CPUS,
                         },
                         "State": {"Running": True, "ExitCode": 0, "Health": {"Status": "healthy"}},
                     }
@@ -875,12 +879,111 @@ def test_image_smoke_executes_hardened_runtime_and_cleans_owned_resources(
     assert len({command[command.index("--name") + 1] for command in run_commands}) == 3
     assert all("--tmpfs" in command for command in run_commands)
     assert all("--mount" in command and "target=/app/data" in " ".join(command) for command in run_commands)
-    assert any("--detach" in command for command in run_commands)
+    assert all("--network" in command and command[command.index("--network") + 1] == "none" for command in run_commands)
+    assert all(
+        "--pids-limit" in command and command[command.index("--pids-limit") + 1] == str(image_smoke.RUNTIME_PIDS_LIMIT)
+        for command in run_commands
+    )
+    assert all(
+        "--memory" in command and command[command.index("--memory") + 1] == str(image_smoke.RUNTIME_MEMORY_BYTES)
+        for command in run_commands
+    )
+    assert all(
+        "--cpus" in command
+        and command[command.index("--cpus") + 1] == str(image_smoke.RUNTIME_NANO_CPUS / 1_000_000_000)
+        for command in run_commands
+    )
+    server_command = next(command for command in run_commands if "--detach" in command)
+    assert server_command[server_command.index("--health-start-period") + 1] == "5s"
     assert ["docker", "rm", "--force"] in [command[:3] for command in commands]
     assert ["docker", "volume", "rm"] in [command[:3] for command in commands]
     assert not containers
     assert not volumes
     assert image_smoke._hash_file(archive) in checksum.read_text(encoding="utf-8")
+
+
+def test_image_smoke_timeout_reports_bounded_health_state(
+    monkeypatch: pytest.MonkeyPatch,
+    image_smoke: ModuleType,
+) -> None:
+    clock = 100.0
+
+    def monotonic() -> float:
+        nonlocal clock
+        clock += 0.02
+        return clock
+
+    inspected = {
+        "State": {
+            "Running": True,
+            "ExitCode": 0,
+            "OOMKilled": False,
+            "Health": {
+                "Status": "starting",
+                "FailingStreak": 2,
+                "Log": [
+                    {
+                        "Start": "bounded-start",
+                        "End": "bounded-end",
+                        "ExitCode": 1,
+                        "Output": "probe import exceeded its deadline",
+                    }
+                ],
+            },
+        }
+    }
+    monkeypatch.setattr(image_smoke.time, "monotonic", monotonic)
+    monkeypatch.setattr(image_smoke.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(image_smoke, "_run_command", lambda *_args, **_kwargs: json.dumps(inspected))
+
+    with pytest.raises(image_smoke.ImageSmokeError) as failure:
+        image_smoke._wait_for_healthy(
+            "bounded-server",
+            startup_timeout=0.1,
+            command_timeout=1.0,
+        )
+
+    message = str(failure.value)
+    assert "starting" in message
+    assert "failing_streak" in message
+    assert "probe import exceeded its deadline" in message
+    assert len(message) <= image_smoke.MAX_DIAGNOSTIC_BYTES
+
+
+def test_image_smoke_allows_unhealthy_probe_to_recover_before_startup_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    image_smoke: ModuleType,
+) -> None:
+    clock = 100.0
+    statuses = iter(("unhealthy", "starting", "healthy"))
+
+    def monotonic() -> float:
+        nonlocal clock
+        clock += 0.1
+        return clock
+
+    def inspect(*_args: Any, **_kwargs: Any) -> str:
+        return json.dumps(
+            {
+                "State": {
+                    "Running": True,
+                    "ExitCode": 0,
+                    "Health": {"Status": next(statuses)},
+                }
+            }
+        )
+
+    monkeypatch.setattr(image_smoke.time, "monotonic", monotonic)
+    monkeypatch.setattr(image_smoke.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(image_smoke, "_run_command", inspect)
+
+    inspected = image_smoke._wait_for_healthy(
+        "delayed-server",
+        startup_timeout=1.0,
+        command_timeout=1.0,
+    )
+
+    assert inspected["State"]["Health"]["Status"] == "healthy"
 
 
 def test_image_smoke_probes_exact_absence_of_release_build_tooling(image_smoke: ModuleType) -> None:

@@ -6,11 +6,12 @@ import asyncio
 import contextvars
 import inspect
 import threading
+import warnings
 import weakref
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from concurrent.futures import Future as ThreadFuture
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
@@ -376,6 +377,200 @@ class ProviderLeaseHandle:
 
 
 @dataclass(frozen=True, slots=True)
+class BackendResourceLease:
+    """Opaque per-run handle whose backends are borrowed owner-loop proxies."""
+
+    graph_nonce: str
+    generation_epoch: int
+    lease_id: str
+    backends: tuple[DashboardBackend, ...]
+    _provider_lease: ProviderLeaseHandle = field(repr=False, compare=False)
+    _release_provider_lease: bool = field(repr=False, compare=False)
+    _release_state: _BackendLeaseReleaseState = field(
+        repr=False,
+        compare=False,
+    )
+
+
+@dataclass(slots=True)
+class _BackendLeaseReleaseState:
+    graph_nonce: str
+    generation_epoch: int
+    lease_id: str
+    provider_lease: ProviderLeaseHandle
+    proxy_ids: tuple[int, ...]
+    release_provider_lease: bool
+    lock: Any = field(default_factory=threading.Lock, repr=False)
+    resource_released: bool = False
+    provider_released: bool = False
+    composite_release: ThreadFuture[None] | None = field(default=None, repr=False)
+
+    def validate(self, lease: BackendResourceLease) -> None:
+        if (
+            self.graph_nonce != lease.graph_nonce
+            or self.generation_epoch != lease.generation_epoch
+            or self.lease_id != lease.lease_id
+            or self.provider_lease != lease._provider_lease
+            or self.proxy_ids != tuple(id(backend) for backend in lease.backends)
+            or self.release_provider_lease != lease._release_provider_lease
+        ):
+            raise RuntimeOwnershipError("Backend resource lease authority identity does not match")
+
+    def mark_resource_released(self) -> None:
+        with self.lock:
+            self.resource_released = True
+
+    def try_mark_resource_released_on_owner(self) -> bool:
+        """Publish owner-local retirement without waiting on a foreign holder."""
+        if not self.lock.acquire(blocking=False):
+            return False
+        try:
+            self.resource_released = True
+            return True
+        finally:
+            self.lock.release()
+
+    def is_resource_released(self) -> bool:
+        with self.lock:
+            return self.resource_released
+
+    def is_provider_released(self) -> bool:
+        with self.lock:
+            return self.provider_released
+
+    def begin_composite_release(self) -> tuple[ThreadFuture[None], bool]:
+        """Install the one joinable release before either authority mutates."""
+        with self.lock:
+            if self.composite_release is not None:
+                return self.composite_release, False
+            if self.resource_released and (self.provider_released or not self.release_provider_lease):
+                completed: ThreadFuture[None] = ThreadFuture()
+                completed.set_result(None)
+                return completed, False
+            release: ThreadFuture[None] = ThreadFuture()
+            self.composite_release = release
+            return release, True
+
+    def complete_composite_release(self, release: ThreadFuture[None]) -> None:
+        """Publish terminal success without acquiring requester-owned locks."""
+        if self.composite_release is not release:
+            return
+        self.resource_released = True
+        if self.release_provider_lease:
+            self.provider_released = True
+        if not release.done():
+            release.set_result(None)
+
+    def fail_composite_release(
+        self,
+        release: ThreadFuture[None],
+        error: BaseException,
+    ) -> None:
+        """Publish the stable terminal failure for every current or later joiner."""
+        if self.composite_release is not release:
+            return
+        if not release.done():
+            release.set_exception(error)
+
+
+@dataclass(slots=True)
+class _OwnedBackendRecord:
+    """One backend set retained by the runtime service owner until close."""
+
+    generation: _ProviderGenerationCloseState
+    provider_lease: ProviderLeaseHandle
+    resource_id: int
+    retained_work: PipelineRetainedWorkPermit
+    release_provider_lease: bool
+    phase: str = "realizing"
+    products: tuple[DashboardBackend, ...] = ()
+    proxies: tuple[DashboardBackend, ...] = ()
+    active_operations: set[asyncio.Task[Any]] = field(default_factory=set, repr=False)
+    adopted: threading.Event = field(default_factory=threading.Event, repr=False)
+    closed: ThreadFuture[None] = field(default_factory=ThreadFuture, repr=False)
+    release_state: _BackendLeaseReleaseState | None = field(default=None, repr=False)
+
+
+class _OwnedDashboardBackend:
+    """Transport DashboardBackend operations to the durable runtime owner."""
+
+    def __init__(
+        self,
+        owner: _RuntimeAsyncResourceOwner,
+        generation: _ProviderGenerationCloseState,
+        lease_id: str,
+        index: int,
+        product: DashboardBackend,
+    ) -> None:
+        self._owner = owner
+        self._generation = generation
+        self._lease_id = lease_id
+        self._index = index
+        self._name = product.name
+        self._query_language = product.query_language
+        self._runtime_ownership = get_runtime_ownership(
+            product,
+            component=f"owned_{product.name}_backend",
+        )
+        self.last_discovery_status = getattr(product, "last_discovery_status", None)
+        self.last_alert_list_complete = bool(getattr(product, "last_alert_list_complete", False))
+        self.last_dashboard_list_complete = bool(getattr(product, "last_dashboard_list_complete", False))
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def query_language(self) -> str:
+        return self._query_language
+
+    @property
+    def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
+        return self._runtime_ownership
+
+    async def _invoke(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        result, status = await self._owner.invoke(
+            self._generation,
+            self._lease_id,
+            self._index,
+            method,
+            args,
+            kwargs,
+        )
+        self.last_discovery_status = status[0]
+        self.last_alert_list_complete = status[1]
+        self.last_dashboard_list_complete = status[2]
+        return result
+
+    async def discover_metrics(self, keywords: list[str], intent: Any) -> Any:
+        return await self._invoke("discover_metrics", keywords, intent)
+
+    async def discover_datasource_targets(self, keywords: list[str], intent: Any) -> Any:
+        return await self._invoke("discover_datasource_targets", keywords, intent)
+
+    async def validate_queries(self, spec: Any, catalog: Any = None) -> Any:
+        return await self._invoke("validate_queries", spec, catalog)
+
+    async def publish(self, spec: Any) -> Any:
+        return await self._invoke("publish", spec)
+
+    async def ingest_dashboard(self, uid: str) -> Any:
+        return await self._invoke("ingest_dashboard", uid)
+
+    async def list_dashboards(self, limit: int = 500) -> Any:
+        return await self._invoke("list_dashboards", limit)
+
+    async def ingest_alert(self, uid: str) -> Any:
+        return await self._invoke("ingest_alert", uid)
+
+    async def list_alerts(self, limit: int = 500) -> Any:
+        return await self._invoke("list_alerts", limit)
+
+    async def close(self) -> None:
+        raise RuntimeOwnershipError("Backend proxies cannot close shared resources; release the backend lease owner")
+
+
+@dataclass(frozen=True, slots=True)
 class _ProviderLeaseOwner:
     """Requester identity retained only for abandoned-lease reclamation."""
 
@@ -497,12 +692,59 @@ class _ProviderGenerationCloseState:
     next_handoff_id: int = 0
     handoff_limit: int = 1
     committed_submissions: dict[int, _ProviderCommittedSubmission] = field(default_factory=dict)
+    submission_retry_keys: set[tuple[int, str]] = field(default_factory=set)
+    terminal_retry_keys: set[str] = field(default_factory=set)
+    backend_releases: dict[
+        int,
+        tuple[_BackendLeaseReleaseState, ThreadFuture[None]],
+    ] = field(default_factory=dict)
     next_submission_id: int = 0
-    cleanup_future: ThreadFuture[None] | None = None
+    cleanup_future: ThreadFuture[RuntimeOwnershipError | None] | None = None
     terminal_monitor_task: asyncio.Task[None] | None = field(default=None, repr=False)
     service_owner_permit: PipelineServiceOwnerPermit | None = None
     service_owner_released: bool = False
+    abandon_pending_owner_tasks: bool = False
+    owner_loop_lost: bool = False
     owner_thread: threading.Thread | None = None
+    transition_thread: threading.Thread | None = None
+    transition_ready: ThreadFuture[None] = field(default_factory=ThreadFuture)
+    transition_exited: ThreadFuture[None] = field(default_factory=ThreadFuture)
+    owner_terminal_error: BaseException | None = None
+
+
+class _BoundedRuntimeOwnerRunner:
+    """Close a healthy owner normally, or abandon a fatally fenced loop promptly."""
+
+    def __init__(self, state: _ProviderGenerationCloseState) -> None:
+        self._state = state
+        self._runner = asyncio.Runner()
+
+    def __enter__(self) -> asyncio.Runner:
+        return self._runner.__enter__()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        if not self._state.abandon_pending_owner_tasks:
+            self._runner.__exit__(exc_type, exc, traceback)
+            return
+
+        owner_loop = self._runner.get_loop()
+        pending_tasks = tuple(task for task in asyncio.all_tasks(owner_loop) if not task.done())
+        logger.error(
+            "runtime_owner_pending_tasks_abandoned",
+            reason_code="backend_owner_cleanup_timeout",
+            generation_epoch=self._state.generation_epoch,
+            pending_task_count=len(pending_tasks),
+        )
+        for task in pending_tasks:
+            task.cancel()
+            setattr(task, "_log_destroy_pending", False)
+        owner_loop.close()
+        asyncio.set_event_loop(None)
 
 
 @dataclass(slots=True)
@@ -583,6 +825,24 @@ class _ProviderOperationAdmission:
             lifecycle, permit = retained_release
             lifecycle.release_retained_work(permit)
 
+    def finish_on_owner(self) -> bool:
+        """Finish only when both the handoff and controller can commit now."""
+        if not self.lock.acquire(blocking=False):
+            return False
+        try:
+            if self.released:
+                return True
+            if self.lifecycle is not None and self.lease is not None:
+                if not self.lifecycle.try_release_from_service_owner(self.lease):
+                    return False
+            if self.lifecycle is not None and self.retained_work is not None:
+                if not self.lifecycle.try_release_retained_work_from_service_owner(self.retained_work):
+                    return False
+            self.released = True
+            return True
+        finally:
+            self.lock.release()
+
     def finish_if_unsubmitted(self) -> None:
         """Roll back admission when no owner-loop handoff was committed."""
         with self.lock:
@@ -605,6 +865,544 @@ class _ProviderCommittedSubmission:
     submission_started: bool = False
     settled: bool = False
     lock: Any = field(default_factory=threading.Lock, repr=False)
+
+
+class _RuntimeAsyncResourceOwner:
+    """Own per-run async backend products on the runtime's existing service loop."""
+
+    def __init__(
+        self,
+        host: _RuntimeProviderResources,
+        lifecycle: PipelineAdmissionController,
+        *,
+        cleanup_grace_seconds: float,
+    ) -> None:
+        self._host = host
+        self._lifecycle = lifecycle
+        self._cleanup_grace_seconds = cleanup_grace_seconds
+        # Registry authority lives exclusively on the runtime owner loop. The
+        # separate caller-side ID allocator is never acquired by that loop.
+        self._id_lock = threading.Lock()
+        self._next_resource_id = 0
+        self._records: dict[str, _OwnedBackendRecord] = {}
+        self._active_record_count = 0
+
+    @property
+    def active_lease_count(self) -> int:
+        return self._active_record_count
+
+    def _publish_registry_snapshot_on_owner(self) -> None:
+        self._active_record_count = len(self._records)
+
+    def _record(self, lease_id: str) -> _OwnedBackendRecord:
+        record = self._records.get(lease_id)
+        if record is None:
+            raise RuntimeOwnershipError("Backend resource lease is stale or belongs to another runtime")
+        if threading.current_thread() is not record.generation.owner_thread:
+            raise RuntimeOwnershipError("Backend registry access must run on its runtime owner")
+        return record
+
+    async def _release_retained_work_on_owner(self, record: _OwnedBackendRecord) -> None:
+        if record.closed.done():
+            return
+        try:
+            await self._lifecycle.release_retained_work_async(
+                record.retained_work,
+                timeout_seconds=self._cleanup_grace_seconds,
+            )
+        except BaseException as exc:
+            failure = RuntimeOwnershipError("Backend retained capacity release failed")
+            setattr(failure, "cleanup_reason_code", "backend_retained_capacity_release_failed")
+            setattr(failure, "cleanup_error_type", type(exc).__name__[:128])
+            self._lifecycle.fence_runtime_fatal(failure)
+            record.closed.set_exception(failure)
+            raise failure from exc
+        record.closed.set_result(None)
+
+    def _discard_unadopted_record(self, record: _OwnedBackendRecord) -> None:
+        if record.adopted.is_set():
+            raise RuntimeOwnershipError("Adopted backend records must retire on their owner loop")
+        record.phase = "closed"
+        try:
+            self._lifecycle.release_retained_work(record.retained_work)
+        except BaseException as exc:
+            failure = RuntimeOwnershipError("Backend retained capacity release failed")
+            setattr(failure, "cleanup_reason_code", "backend_retained_capacity_release_failed")
+            setattr(failure, "cleanup_error_type", type(exc).__name__[:128])
+            self._lifecycle.fence_runtime_fatal(failure)
+            record.closed.set_exception(failure)
+            raise failure from exc
+        record.closed.set_result(None)
+
+    async def _discard_record_on_owner(self, record: _OwnedBackendRecord) -> None:
+        lease_id = self._lease_id(record)
+        if self._records.get(lease_id) is not record:
+            return
+        self._records.pop(lease_id, None)
+        self._publish_registry_snapshot_on_owner()
+        record.products = ()
+        record.proxies = ()
+        record.phase = "closed"
+        await self._release_retained_work_on_owner(record)
+
+    @staticmethod
+    def _lease_id(record: _OwnedBackendRecord) -> str:
+        return f"{record.generation.generation_epoch}:{record.resource_id}"
+
+    async def realize(
+        self,
+        provider_lease: ProviderLeaseHandle,
+        factory: Callable[[], list[DashboardBackend]],
+        *,
+        request_lease_to_release: PipelineAdmissionLease | None,
+        validate: Callable[[list[DashboardBackend]], Any],
+        retire: Callable[[list[DashboardBackend]], Awaitable[None]],
+        release_provider_lease: bool,
+        reason_code: str,
+    ) -> BackendResourceLease:
+        """Adopt raw products before the worker may publish borrowed proxies."""
+        state = self._host._state_for_provider_lease(provider_lease)
+        retained = self._lifecycle.retain_current_work(
+            reservation_key="dashboard-backend-set",
+        )
+        request_release_lock = threading.Lock()
+        request_released = False
+
+        def release_request_once() -> None:
+            nonlocal request_released
+            if request_lease_to_release is None:
+                return
+            with request_release_lock:
+                if request_released:
+                    return
+                request_released = True
+            self._lifecycle.release(request_lease_to_release)
+
+        with self._id_lock:
+            self._next_resource_id += 1
+            record = _OwnedBackendRecord(
+                generation=state,
+                provider_lease=provider_lease,
+                resource_id=self._next_resource_id,
+                retained_work=retained,
+                release_provider_lease=release_provider_lease,
+            )
+        lease_id = self._lease_id(record)
+
+        def construct() -> list[DashboardBackend]:
+            try:
+                return factory()
+            except BaseException:
+                release_request_once()
+                raise
+
+        def adopt_on_owner(products: list[DashboardBackend]) -> None:
+            # The realization worker commits cross-component ownership before
+            # publishing the owner-loop callback. The owner loop never waits
+            # on admission-controller or provider-host locks.
+            self._lifecycle.transfer_retained_work_to_service_owner(retained)
+            if release_provider_lease:
+                self._host._transfer_provider_lease_to_backend_owner(
+                    provider_lease,
+                    state,
+                )
+
+            async def adopt() -> tuple[DashboardBackend, ...]:
+                if threading.current_thread() is not state.owner_thread:
+                    raise RuntimeOwnershipError("Backend adoption did not run on the runtime service owner")
+                raw_products = tuple(products)
+                if record.phase != "realizing" or lease_id in self._records:
+                    raise RuntimeOwnershipError("Backend resource adoption was revoked")
+                proxies = tuple(
+                    cast(
+                        DashboardBackend,
+                        _OwnedDashboardBackend(self, state, lease_id, index, product),
+                    )
+                    for index, product in enumerate(raw_products)
+                )
+                record.products = raw_products
+                record.proxies = proxies
+                record.release_state = _BackendLeaseReleaseState(
+                    graph_nonce=self._host._graph_nonce,
+                    generation_epoch=state.generation_epoch,
+                    lease_id=lease_id,
+                    provider_lease=provider_lease,
+                    proxy_ids=tuple(id(proxy) for proxy in proxies),
+                    release_provider_lease=release_provider_lease,
+                )
+                record.phase = "active"
+                self._records[lease_id] = record
+                self._publish_registry_snapshot_on_owner()
+                record.adopted.set()
+                return proxies
+
+            self._host._invoke_on_generation_owner_sync(state, adopt)
+            release_request_once()
+
+        def retire_candidate(products: list[DashboardBackend]) -> None:
+            if record.adopted.is_set():
+                with asyncio.Runner() as runner:
+                    runner.run(self._release_record(record))
+                return
+
+            async def retire_products() -> None:
+                await retire(products)
+
+            try:
+                with asyncio.Runner() as runner:
+                    runner.run(retire_products())
+            finally:
+                self._discard_unadopted_record(record)
+                release_request_once()
+
+        try:
+            await self._host._provider_factory_work.realize_owned(
+                construct,
+                validate=validate,
+                adopt=adopt_on_owner,
+                retire=retire_candidate,
+                on_discarded=release_request_once,
+                reason_code=reason_code,
+                result_handoff_seconds=self._cleanup_grace_seconds,
+            )
+        except BaseException:
+            if not record.adopted.is_set() and not record.closed.done():
+                self._discard_unadopted_record(record)
+            release_request_once()
+            raise
+
+        if release_provider_lease:
+            self._host._detach_provider_lease_from_current_task(provider_lease)
+
+        release_state = record.release_state
+        if release_state is None:
+            raise RuntimeOwnershipError("Backend resource release authority was not adopted")
+        return BackendResourceLease(
+            graph_nonce=self._host._graph_nonce,
+            generation_epoch=state.generation_epoch,
+            lease_id=lease_id,
+            backends=record.proxies,
+            _provider_lease=provider_lease,
+            _release_provider_lease=release_provider_lease,
+            _release_state=release_state,
+        )
+
+    async def invoke(
+        self,
+        state: _ProviderGenerationCloseState,
+        lease_id: str,
+        index: int,
+        method: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[Any, tuple[Any, bool, bool]]:
+        async def operation() -> tuple[Any, tuple[Any, bool, bool]]:
+            record = self._record(lease_id)
+            if record.generation is not state or record.phase != "active":
+                raise RuntimeOwnershipError("Backend resource lease is no longer active")
+            if not 0 <= index < len(record.products):
+                raise RuntimeOwnershipError("Backend proxy index is invalid")
+            product = record.products[index]
+            target = getattr(product, method, None)
+            if not callable(target):
+                raise RuntimeOwnershipError(f"Backend does not support {method}")
+            operation_task = asyncio.current_task()
+            if operation_task is None:
+                raise RuntimeOwnershipError("Backend operation has no owner task")
+            record.active_operations.add(operation_task)
+            try:
+                result = target(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+                status = (
+                    getattr(product, "last_discovery_status", None),
+                    bool(getattr(product, "last_alert_list_complete", False)),
+                    bool(getattr(product, "last_dashboard_list_complete", False)),
+                )
+                return result, status
+            finally:
+                record.active_operations.discard(operation_task)
+
+        return cast(
+            tuple[Any, tuple[Any, bool, bool]],
+            await self._host._invoke_on_generation_owner(
+                state,
+                operation,
+                limit_handoff=True,
+            ),
+        )
+
+    async def release(self, lease: BackendResourceLease) -> None:
+        if lease.graph_nonce != self._host._graph_nonce:
+            raise RuntimeOwnershipError("Backend resource lease belongs to another runtime")
+        lease._release_state.validate(lease)
+        release, owns_release = lease._release_state.begin_composite_release()
+        if owns_release:
+            try:
+                state = self._host._state_for_provider_lease(lease._provider_lease)
+            except BaseException as exc:
+                lease._release_state.fail_composite_release(release, exc)
+                raise
+
+            async def release_on_owner() -> None:
+                record = self._record(lease.lease_id)
+                if (
+                    record.generation is not state
+                    or record.generation.generation_epoch != lease.generation_epoch
+                    or record.provider_lease != lease._provider_lease
+                    or record.proxies != lease.backends
+                    or record.release_provider_lease != lease._release_provider_lease
+                    or record.release_state is not lease._release_state
+                ):
+                    raise RuntimeOwnershipError("Backend resource lease authority identity does not match")
+                await self._release_composite_on_owner(
+                    record,
+                    lease._release_state,
+                    release,
+                )
+
+            try:
+                await self._host._invoke_on_generation_owner(
+                    state,
+                    release_on_owner,
+                    settle_on_cancel=False,
+                )
+            except asyncio.CancelledError:
+                release.add_done_callback(self._host._consume_provider_operation)
+                raise
+            except BaseException as exc:
+                lease._release_state.fail_composite_release(release, exc)
+
+        wrapped = asyncio.wrap_future(release)
+        try:
+            await asyncio.shield(wrapped)
+        except asyncio.CancelledError:
+            release.add_done_callback(self._host._consume_provider_operation)
+            wrapped.add_done_callback(self._host._consume_async_provider_operation)
+            raise
+
+    async def release_for_provider(self, handle: ProviderLeaseHandle) -> bool:
+        state = self._host._state_for_provider_lease(handle)
+
+        async def release_all_on_owner() -> tuple[tuple[ThreadFuture[None], ...], bool]:
+            records = tuple(record for record in self._records.values() if record.provider_lease == handle)
+            first_error: BaseException | None = None
+            releases: list[ThreadFuture[None]] = []
+            provider_release_committed = False
+            for record in records:
+                release_state = record.release_state
+                if release_state is None:
+                    if first_error is None:
+                        first_error = RuntimeOwnershipError("Backend resource release authority was not adopted")
+                    continue
+                release, owns_release = release_state.begin_composite_release()
+                releases.append(release)
+                provider_release_committed = provider_release_committed or release_state.release_provider_lease
+                if not owns_release:
+                    continue
+                try:
+                    await self._release_composite_on_owner(record, release_state, release)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+            return tuple(releases), provider_release_committed
+
+        releases, provider_release_committed = await self._host._invoke_on_generation_owner(
+            state,
+            release_all_on_owner,
+            settle_on_cancel=False,
+        )
+        for release in releases:
+            wrapped = asyncio.wrap_future(release)
+            try:
+                await asyncio.shield(wrapped)
+            except asyncio.CancelledError:
+                release.add_done_callback(self._host._consume_provider_operation)
+                wrapped.add_done_callback(self._host._consume_async_provider_operation)
+                raise
+        return provider_release_committed
+
+    async def _release_composite_on_owner(
+        self,
+        record: _OwnedBackendRecord,
+        release_state: _BackendLeaseReleaseState,
+        release: ThreadFuture[None],
+    ) -> None:
+        """Retire one backend through the release terminal shared by every entry point."""
+        try:
+            await self._release_record_on_owner(record)
+            while not release_state.try_mark_resource_released_on_owner():
+                await asyncio.sleep(_PROVIDER_OWNER_TERMINAL_POLL_SECONDS)
+            if release_state.release_provider_lease:
+                await self._host._release_backend_provider_lease_on_owner(
+                    release_state.provider_lease,
+                    record.generation,
+                    release_state,
+                    release,
+                )
+            else:
+                release_state.complete_composite_release(release)
+        except BaseException as exc:
+            release_state.fail_composite_release(release, exc)
+            raise
+
+    async def _release_record(self, record: _OwnedBackendRecord) -> None:
+        async def release_on_owner() -> None:
+            if self._records.get(self._lease_id(record)) is not record:
+                return
+            await self._release_record_on_owner(record)
+
+        await self._host._invoke_on_generation_owner(
+            record.generation,
+            release_on_owner,
+            settle_on_cancel=True,
+        )
+
+    async def _release_record_on_owner(self, record: _OwnedBackendRecord) -> None:
+        closed = record.closed
+        if record.phase == "draining":
+            await asyncio.shield(asyncio.wrap_future(closed))
+            return
+        if record.phase == "active":
+            record.phase = "draining"
+        elif record.phase == "realizing":
+            raise RuntimeOwnershipError("Backend resource lease is still realizing")
+        else:
+            return
+        try:
+            while record.active_operations:
+                await asyncio.wait(tuple(record.active_operations))
+            await self._close_record_on_owner(record)
+        except BaseException as exc:
+            if not closed.done():
+                await self._terminal_close_failure(record, exc)
+            raise
+        await asyncio.shield(asyncio.wrap_future(closed))
+
+    async def _close_record_on_owner(self, record: _OwnedBackendRecord) -> None:
+        products = record.products
+        results = await asyncio.gather(
+            *(self._close_one(record, product) for product in products),
+            return_exceptions=True,
+        )
+        failure = next((item for item in results if isinstance(item, BaseException)), None)
+        if failure is not None:
+            await self._terminal_close_failure(record, failure)
+            terminal = record.closed.exception()
+            if terminal is None:
+                raise RuntimeOwnershipError("Backend owner cleanup failed")
+            raise terminal
+        await self._discard_record_on_owner(record)
+
+    async def _close_one(
+        self,
+        record: _OwnedBackendRecord,
+        product: DashboardBackend,
+    ) -> None:
+        last_error: BaseException | None = None
+        for attempt in range(2):
+            close_task = asyncio.create_task(
+                product.close(),
+                name=f"tacit-backend-{record.resource_id}-close-{attempt + 1}",
+            )
+            done, _pending = await asyncio.wait(
+                {close_task},
+                timeout=self._cleanup_grace_seconds,
+            )
+            if close_task in done:
+                try:
+                    close_task.result()
+                except BaseException as exc:
+                    last_error = exc
+                    if attempt == 0:
+                        logger.warning(
+                            "backend_owner_cleanup_retry",
+                            reason_code="backend_owner_cleanup_retry",
+                            resource_id=record.resource_id,
+                            error_type=type(exc).__name__[:128],
+                        )
+                        await asyncio.sleep(0)
+                        continue
+                    raise
+                return
+
+            close_task.cancel()
+            done, _pending = await asyncio.wait(
+                {close_task},
+                timeout=self._cleanup_grace_seconds,
+            )
+            if close_task not in done:
+                setattr(close_task, "_log_destroy_pending", False)
+                record.generation.abandon_pending_owner_tasks = True
+                timeout_error = RuntimeOwnershipError("Backend owner cleanup exceeded its cancellation deadline")
+                setattr(timeout_error, "cleanup_reason_code", "backend_owner_cleanup_timeout")
+                setattr(timeout_error, "cleanup_error_type", "TimeoutError")
+                raise timeout_error
+            try:
+                close_task.result()
+            except BaseException as exc:
+                last_error = exc
+            if attempt == 0:
+                logger.warning(
+                    "backend_owner_cleanup_retry",
+                    reason_code="backend_owner_cleanup_retry",
+                    resource_id=record.resource_id,
+                    error_type=type(last_error).__name__[:128],
+                )
+                await asyncio.sleep(0)
+                continue
+
+        if last_error is not None:
+            raise last_error
+
+    async def _terminal_close_failure(
+        self,
+        record: _OwnedBackendRecord,
+        error: BaseException,
+    ) -> None:
+        from tacit.pipeline.side_effects import terminal_cleanup_failure
+
+        reason_code = str(getattr(error, "cleanup_reason_code", "backend_owner_cleanup_failed"))[:128]
+        failure = terminal_cleanup_failure(
+            None,
+            error,
+            reason_code=reason_code,
+            message="Backend owner cleanup failed",
+        )
+        lease_id = self._lease_id(record)
+        if self._records.get(lease_id) is record:
+            self._records.pop(lease_id, None)
+            self._publish_registry_snapshot_on_owner()
+        record.products = ()
+        record.proxies = ()
+        record.phase = "fenced"
+        self._lifecycle.fence_runtime_fatal(failure)
+        try:
+            await self._lifecycle.release_retained_work_async(
+                record.retained_work,
+                timeout_seconds=self._cleanup_grace_seconds,
+            )
+        except BaseException:
+            pass
+        if not record.closed.done():
+            record.closed.set_exception(failure)
+
+    async def close_generation_on_owner(self, state: _ProviderGenerationCloseState) -> None:
+        records = tuple(record for record in self._records.values() if record.generation is state)
+        for record in records:
+            if record.phase == "active":
+                record.phase = "draining"
+        first_error: BaseException | None = None
+        for record in records:
+            try:
+                await self._close_record_on_owner(record)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
 
 def _validate_provider_factory_event_loop(
@@ -1066,32 +1864,18 @@ def _validated_backend_factory(
     lifecycle: PipelineAdmissionController,
     cleanup_grace_seconds: float,
 ) -> Callable[[], list[DashboardBackend]]:
-    """Validate a backend declaration and every realized backend before use."""
+    """Reject unsafe synchronous acquisition while preserving factory injection."""
     factory_kind = "backend:dashboard"
     declared = _factory_preflight(factory, expected=expected, factory_kind=factory_kind)
-    blocking_work = _lifecycle_blocking_work(lifecycle)
 
     def realize() -> list[DashboardBackend]:
-        def construct() -> list[DashboardBackend]:
-            with observe_runtime_factory_realization(factory_kind):
-                return factory()
-
-        return blocking_work.realize_owned_sync(
-            construct,
-            validate=lambda backends: _validate_backend_products(
-                backends,
-                expected=expected,
-                lifecycle=lifecycle,
-                cleanup_grace_seconds=cleanup_grace_seconds,
-                cleanup_rejected=False,
-            ),
-            retire=lambda backends: _retire_products(
-                backends,
-                reason_code="runtime_factory_realization_rejected",
-                cleanup_grace_seconds=cleanup_grace_seconds,
-            ),
-            reason_code=f"{factory_kind}_realization",
-            result_handoff_seconds=cleanup_grace_seconds,
+        warnings.warn(
+            "Synchronous backend resource acquisition is deprecated; use await realize_backends()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        raise RuntimeOwnershipError(
+            "Synchronous backend resource acquisition is unsupported; use await realize_backends()"
         )
 
     return declare_runtime_factory(realize, ownership=declared, factory_kind=factory_kind)
@@ -1102,34 +1886,22 @@ def _validated_backend_realizer(
     *,
     expected: RuntimeOwnershipDescriptor,
     lifecycle: PipelineAdmissionController,
+    owner: _RuntimeProviderResources | _DeferredRuntimeProviderResources,
     cleanup_grace_seconds: float,
-) -> Callable[[], Awaitable[list[DashboardBackend]]]:
+) -> Callable[[PipelineAdmissionLease | None], Awaitable[BackendResourceLease]]:
     """Build and validate backends asynchronously under runtime admission."""
     factory_kind = "backend:dashboard"
     _factory_preflight(factory, expected=expected, factory_kind=factory_kind)
-    blocking_work = _lifecycle_blocking_work(lifecycle)
 
-    async def realize() -> list[DashboardBackend]:
+    async def realize(request_lease_to_release: PipelineAdmissionLease | None = None) -> BackendResourceLease:
         def construct() -> list[DashboardBackend]:
             with observe_runtime_factory_realization(factory_kind):
                 return factory()
 
-        return await blocking_work.realize_owned(
+        return await owner.realize_backends(
             construct,
-            validate=lambda backends: _validate_backend_products(
-                backends,
-                expected=expected,
-                lifecycle=lifecycle,
-                cleanup_grace_seconds=cleanup_grace_seconds,
-                cleanup_rejected=False,
-            ),
-            retire=lambda backends: _retire_products(
-                backends,
-                reason_code="runtime_factory_realization_rejected",
-                cleanup_grace_seconds=cleanup_grace_seconds,
-            ),
-            reason_code=f"{factory_kind}_realization",
-            result_handoff_seconds=cleanup_grace_seconds,
+            expected=expected,
+            request_lease_to_release=request_lease_to_release,
         )
 
     return realize
@@ -1359,6 +2131,44 @@ class _RuntimeProviderResources:
             raise RuntimeOwnershipError("Runtime provider manager has an incompatible implementation")
         return manager
 
+    @classmethod
+    async def resolve_async(
+        cls,
+        runtime_settings: Settings,
+        *,
+        lifecycle: PipelineAdmissionController,
+        llm_factory: Callable[[], LLMProvider] | None = None,
+        context_factory: Callable[[], ContextProvider | None] | None = None,
+        chained_cleanup: Callable[[], Awaitable[None]] | None = None,
+        cleanup_grace_seconds: float = DEFAULT_PIPELINE_CLEANUP_GRACE_SECONDS,
+        spec: ProviderSpec | None = None,
+    ) -> _RuntimeProviderResources:
+        """Resolve one manager without blocking the caller's event loop."""
+        cls._bind_lifecycle_identity(runtime_settings, lifecycle)
+        lifecycle.raise_if_runtime_fatal()
+        selected_spec = spec or _semantic_provider_spec(
+            runtime_settings,
+            llm_factory=llm_factory,
+            context_factory=context_factory,
+            chained_cleanup=chained_cleanup,
+            cleanup_grace_seconds=cleanup_grace_seconds,
+        )
+        manager = await lifecycle.execution_graph.resolve_provider_manager_async(
+            spec=selected_spec,
+            create=lambda: cls(
+                runtime_settings,
+                lifecycle=lifecycle,
+                llm_factory=llm_factory,
+                context_factory=context_factory,
+                chained_cleanup=chained_cleanup,
+                cleanup_grace_seconds=cleanup_grace_seconds,
+                spec=selected_spec,
+            ),
+        )
+        if not isinstance(manager, cls):
+            raise RuntimeOwnershipError("Runtime provider manager has an incompatible implementation")
+        return manager
+
     def __init__(
         self,
         runtime_settings: Settings,
@@ -1385,6 +2195,11 @@ class _RuntimeProviderResources:
         self._cleanup_grace_seconds = _validate_cleanup_grace_seconds(cleanup_grace_seconds)
         self._requires_async_llm_realization = str(runtime_settings.llm_provider).strip().casefold() == "bedrock"
         self._provider_factory_work = _lifecycle_blocking_work(lifecycle)
+        self._backend_owner = _RuntimeAsyncResourceOwner(
+            self,
+            lifecycle,
+            cleanup_grace_seconds=self._cleanup_grace_seconds,
+        )
         self._bedrock_credential_plan = (
             BedrockCredentialPlan.capture(runtime_settings).as_cross_generation_declaration()
             if self._requires_async_llm_realization and llm_factory is None
@@ -1480,25 +2295,14 @@ class _RuntimeProviderResources:
             )
         )
 
-    def _resolve_active_manager(self) -> _RuntimeProviderResources:
-        """Attach retained dependency bundles to the current root generation.
-
-        Dependency bundles can outlive one application lifespan. The execution
-        graph clears its provider manager after the final root drains, so a
-        later direct run must either reattach this fully retired manager or
-        delegate to the compatible manager already selected by a sibling root.
-        """
-        self._raise_if_runtime_fatal()
-        graph = self._lifecycle.execution_graph
-        manager = graph.resolve_provider_manager(
-            spec=self._spec,
-            create=lambda: self,
-        )
+    def _activate_resolved_manager(self, manager: object) -> _RuntimeProviderResources:
+        """Validate and, when needed, reactivate this retired manager."""
         if not isinstance(manager, _RuntimeProviderResources):
             raise RuntimeOwnershipError("Runtime provider manager has an incompatible implementation")
         if manager is not self:
             return manager
 
+        graph = self._lifecycle.execution_graph
         with self._lock:
             if not self._shutdown_requested:
                 return self
@@ -1516,6 +2320,31 @@ class _RuntimeProviderResources:
             self._shutdown_requested = False
             self._cleanup_pending = self._chained_cleanup is not None
         return self
+
+    def _resolve_active_manager(self) -> _RuntimeProviderResources:
+        """Attach retained dependency bundles to the current root generation.
+
+        Dependency bundles can outlive one application lifespan. The execution
+        graph clears its provider manager after the final root drains, so a
+        later direct run must either reattach this fully retired manager or
+        delegate to the compatible manager already selected by a sibling root.
+        """
+        self._raise_if_runtime_fatal()
+        graph = self._lifecycle.execution_graph
+        manager = graph.resolve_provider_manager(
+            spec=self._spec,
+            create=lambda: self,
+        )
+        return self._activate_resolved_manager(manager)
+
+    async def _resolve_active_manager_async(self) -> _RuntimeProviderResources:
+        """Attach to the active manager without blocking an async caller."""
+        self._raise_if_runtime_fatal()
+        manager = await self._lifecycle.execution_graph.resolve_provider_manager_async(
+            spec=self._spec,
+            create=lambda: self,
+        )
+        return self._activate_resolved_manager(manager)
 
     @property
     def generation_epoch(self) -> int:
@@ -1548,6 +2377,176 @@ class _RuntimeProviderResources:
             loop=asyncio.get_running_loop(),
             task=asyncio.current_task(),
         )
+
+    @property
+    def backend_owner(self) -> _RuntimeAsyncResourceOwner:
+        return self._backend_owner
+
+    def _current_provider_lease(self) -> ProviderLeaseHandle | None:
+        leases = self._task_leases.get()
+        if not leases or not leases[-1][1].matches_current():
+            return None
+        return leases[-1][0]
+
+    def _state_for_provider_lease(self, handle: ProviderLeaseHandle) -> _ProviderGenerationCloseState:
+        with self._lock:
+            self._validate_release_handle_locked(handle)
+            state = self._generation_owner
+            if state is None or state.generation_epoch != handle.generation_epoch:
+                raise RuntimeOwnershipError("Backend resource lease lost its runtime generation")
+            if self._state not in {ProviderLifecycleState.STARTING, ProviderLifecycleState.ACTIVE}:
+                raise RuntimeOwnershipError("Backend runtime generation is not active")
+            return state
+
+    def _transfer_provider_lease_to_backend_owner(
+        self,
+        handle: ProviderLeaseHandle,
+        state: _ProviderGenerationCloseState,
+    ) -> None:
+        """Move an auto-acquired provider lease off the requester transport."""
+        owner_loop = state.loop
+        owner_thread = state.owner_thread
+        if owner_loop is None or owner_thread is None:
+            raise RuntimeOwnershipError("Backend runtime owner is unavailable")
+        with self._lock:
+            self._validate_release_handle_locked(handle)
+            if self._generation_owner is not state:
+                raise RuntimeOwnershipError("Backend runtime generation changed during adoption")
+            self._lease_owners[handle.lease_id] = _ProviderLeaseOwner(
+                thread_id=owner_thread.ident or 0,
+                loop=owner_loop,
+                task=None,
+            )
+
+    def retain_provider_lease_on_service_owner(self, handle: ProviderLeaseHandle) -> None:
+        """Keep a synchronous composition lease beyond its acquisition task."""
+        manager = self._resolve_active_manager()
+        if manager is not self:
+            manager.retain_provider_lease_on_service_owner(handle)
+            return
+        with self._lock:
+            self._validate_release_handle_locked(handle)
+            state = self._generation_owner
+            if state is None or state.generation_epoch != handle.generation_epoch:
+                raise RuntimeOwnershipError("Provider lease lost its runtime generation")
+            if self._state not in {ProviderLifecycleState.STARTING, ProviderLifecycleState.ACTIVE}:
+                raise RuntimeOwnershipError("Provider runtime generation is not active")
+            owner_loop = state.loop
+            owner_thread = state.owner_thread
+            if owner_loop is None or owner_thread is None:
+                raise RuntimeOwnershipError("Provider runtime owner is unavailable")
+            self._lease_owners[handle.lease_id] = _ProviderLeaseOwner(
+                thread_id=owner_thread.ident or 0,
+                loop=owner_loop,
+                task=None,
+            )
+
+    async def _release_backend_provider_lease_on_owner(
+        self,
+        handle: ProviderLeaseHandle,
+        state: _ProviderGenerationCloseState,
+        release_state: _BackendLeaseReleaseState,
+        release: ThreadFuture[None],
+    ) -> None:
+        """Commit a backend's provider release without blocking the owner loop."""
+        if threading.current_thread() is not state.owner_thread:
+            raise RuntimeOwnershipError("Backend provider release must run on its generation owner")
+
+        while not self._lock.acquire(blocking=False):
+            await asyncio.sleep(_PROVIDER_OWNER_TERMINAL_POLL_SECONDS)
+        complete_immediately = False
+        try:
+            if self._generation_owner is not state:
+                raise RuntimeOwnershipError("Backend provider generation changed during release")
+            self._validate_release_handle_locked(handle)
+            state.backend_releases[handle.lease_id] = (release_state, release)
+            self._active_leases.pop(handle.lease_id, None)
+            self._lease_owners.pop(handle.lease_id, None)
+
+            abandoned = tuple(
+                lease_id
+                for lease_id in self._active_leases
+                if (owner := self._lease_owners.get(lease_id)) is not None and owner.is_abandoned()
+            )
+            for lease_id in abandoned:
+                self._active_leases.pop(lease_id, None)
+                self._lease_owners.pop(lease_id, None)
+            if abandoned:
+                logger.warning(
+                    "provider_generation_requesters_abandoned",
+                    reason_code="provider_generation_requesters_abandoned",
+                    abandoned_leases=len(abandoned),
+                )
+
+            if self._active_leases:
+                state.backend_releases.pop(handle.lease_id, None)
+                complete_immediately = True
+            elif self._state not in {ProviderLifecycleState.REVOKED, ProviderLifecycleState.DRAINING}:
+                self._state = ProviderLifecycleState.DRAINING
+                self._closing_event = state
+        finally:
+            self._lock.release()
+
+        if complete_immediately:
+            release_state.complete_composite_release(release)
+
+    def _detach_provider_lease_from_current_task(self, handle: ProviderLeaseHandle) -> None:
+        """Remove a durably adopted lease from requester-local cleanup state."""
+        leases = self._task_leases.get()
+        self._task_leases.set(tuple(item for item in leases if item[0] != handle))
+
+    async def realize_backends(
+        self,
+        factory: Callable[[], list[DashboardBackend]],
+        *,
+        expected: RuntimeOwnershipDescriptor,
+        request_lease_to_release: PipelineAdmissionLease | None = None,
+    ) -> BackendResourceLease:
+        """Realize one per-run backend set into the persistent runtime owner."""
+        manager = await self._resolve_active_manager_async()
+        if manager is not self:
+            return await manager.realize_backends(
+                factory,
+                expected=expected,
+                request_lease_to_release=request_lease_to_release,
+            )
+        provider_lease = self._current_provider_lease()
+        release_provider_lease = provider_lease is None
+        if provider_lease is None:
+            provider_lease = await self._acquire_service_owner_lease()
+        try:
+            return await self._backend_owner.realize(
+                provider_lease,
+                factory,
+                request_lease_to_release=request_lease_to_release,
+                validate=lambda backends: _validate_backend_products(
+                    backends,
+                    expected=expected,
+                    lifecycle=self._lifecycle,
+                    cleanup_grace_seconds=self._cleanup_grace_seconds,
+                    cleanup_rejected=False,
+                ),
+                retire=lambda backends: _retire_products(
+                    backends,
+                    reason_code="runtime_factory_realization_rejected",
+                    cleanup_grace_seconds=self._cleanup_grace_seconds,
+                ),
+                release_provider_lease=release_provider_lease,
+                reason_code="backend:dashboard_realization",
+            )
+        except (GeneratorExit, SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException:
+            if release_provider_lease:
+                await self.close(provider_lease)
+            raise
+
+    async def close_backends(self, lease: BackendResourceLease) -> None:
+        manager = await self._resolve_active_manager_async()
+        if manager is not self:
+            await manager.close_backends(lease)
+            return
+        await self._backend_owner.release(lease)
 
     def _prepare_generation_owner_locked(self) -> _ProviderGenerationCloseState:
         """Install one starting generation without waiting for owner readiness."""
@@ -1586,9 +2585,10 @@ class _RuntimeProviderResources:
         owner_finished = threading.Event()
 
         def own_generation() -> None:
+            terminal_error: BaseException | None = None
             try:
                 if owner_abort.is_set():
-                    terminal_error: BaseException | None = state.terminal_error or RuntimeOwnershipError(
+                    terminal_error = state.terminal_error or RuntimeOwnershipError(
                         "Pipeline provider lifecycle owner startup was aborted"
                     )
                 else:
@@ -1598,22 +2598,8 @@ class _RuntimeProviderResources:
                     except BaseException as exc:
                         self._publish_generation_startup_failure(state, exc)
                         terminal_error = exc
-                try:
-                    if terminal_error is None and state.cleanup_succeeded:
-                        self._finish_generation_cleanup(state)
-                    else:
-                        self._finish_generation_terminal_failure(
-                            state,
-                            terminal_error
-                            or RuntimeOwnershipError("Pipeline provider lifecycle owner stopped unexpectedly"),
-                        )
-                finally:
-                    self._release_generation_service_owner(state)
             finally:
-                with self._lock:
-                    waiters = tuple(state.waiters)
-                    state.waiters.clear()
-                self._notify_generation_waiters(waiters)
+                state.owner_terminal_error = terminal_error
                 owner_finished.set()
 
         def abort_owner_start() -> None:
@@ -1685,7 +2671,8 @@ class _RuntimeProviderResources:
         # proved, so the long transition must not retain the manager lock.
         self._lock.release()
         try:
-            self._start_prepared_generation_owner(state)
+            self._start_generation_transition(state)
+            state.transition_ready.result(timeout=_LIFECYCLE_OWNER_STARTUP_TIMEOUT_SECONDS)
         finally:
             self._lock.acquire()
         return state
@@ -1710,20 +2697,27 @@ class _RuntimeProviderResources:
         startup_error.__cause__ = cause
         return startup_error
 
-    async def _start_prepared_generation_owner_async(
-        self,
-        state: _ProviderGenerationCloseState,
-    ) -> None:
-        """Transport the blocking readiness proof without blocking its caller loop."""
-        transition_result: ThreadFuture[None] = ThreadFuture()
+    def _start_generation_transition(self, state: _ProviderGenerationCloseState) -> None:
+        """Start the generation's sole startup and terminal transition owner."""
 
         def run_transition() -> None:
             try:
-                self._start_prepared_generation_owner(state)
-            except BaseException as exc:
-                transition_result.set_exception(exc)
-            else:
-                transition_result.set_result(None)
+                try:
+                    self._start_prepared_generation_owner(state)
+                except BaseException as exc:
+                    if not state.transition_ready.done():
+                        state.transition_ready.set_exception(exc)
+                    if state.owner_thread is not None:
+                        state.owner_exited.result()
+                        self._finish_generation_after_owner_exit(state, startup_error=exc)
+                    return
+                if not state.transition_ready.done():
+                    state.transition_ready.set_result(None)
+                state.owner_exited.result()
+                self._finish_generation_after_owner_exit(state)
+            finally:
+                if not state.transition_exited.done():
+                    state.transition_exited.set_result(None)
 
         transition_thread: threading.Thread | None = None
         try:
@@ -1732,37 +2726,17 @@ class _RuntimeProviderResources:
                 name=f"tacit-provider-generation-startup-transition-{state.generation_epoch}",
                 daemon=True,
             )
+            state.transition_thread = transition_thread
             transition_thread.start()
         except BaseException as exc:
             if (
                 transition_thread is None
                 or transition_thread.ident is None
-                or (not transition_thread.is_alive() and not transition_result.done())
+                or (not transition_thread.is_alive() and not state.transition_ready.done())
             ):
-                raise self._rollback_generation_start_transport(state, exc) from exc
-
-        transition = asyncio.wrap_future(transition_result)
-        cancelled = False
-        while True:
-            try:
-                await asyncio.shield(transition)
-                break
-            except asyncio.CancelledError:
-                cancelled = True
-                if transition.done():
-                    try:
-                        transition.result()
-                    except BaseException as exc:
-                        raise asyncio.CancelledError from exc
-                    break
-            except BaseException as exc:
-                if cancelled:
-                    raise asyncio.CancelledError from exc
-                raise
-        assert transition_thread is not None
-        transition_thread.join(timeout=0)
-        if cancelled:
-            raise asyncio.CancelledError
+                startup_error = self._rollback_generation_start_transport(state, exc)
+                if not state.transition_ready.done():
+                    state.transition_ready.set_exception(startup_error)
 
     def _publish_generation_startup_failure(
         self,
@@ -1782,6 +2756,62 @@ class _RuntimeProviderResources:
                 state.service_owner_permit = None
         if permit is not None:
             self._lifecycle.release_service_owner(permit)
+
+    def _finish_generation_after_owner_exit(
+        self,
+        state: _ProviderGenerationCloseState,
+        *,
+        startup_error: BaseException | None = None,
+    ) -> None:
+        """Settle cross-component authority only after the durable owner exits."""
+        terminal_error = startup_error or state.owner_terminal_error or state.terminal_error
+        settlement_error: BaseException | None = None
+        try:
+            if terminal_error is None and state.cleanup_succeeded:
+                self._finish_generation_cleanup(state)
+            else:
+                self._finish_generation_terminal_failure(
+                    state,
+                    terminal_error or RuntimeOwnershipError("Pipeline provider lifecycle owner stopped unexpectedly"),
+                )
+        except BaseException as exc:
+            settlement_error = exc
+            stable_error = self._stable_generation_error(exc)
+            setattr(stable_error, "runtime_provider_fatal", True)
+            try:
+                fatal = self._lifecycle.fence_runtime_fatal(stable_error)
+                stable_error = self._fatal_circuit_error(fatal)
+            except BaseException:
+                pass
+            with self._lock:
+                state.terminal_error = stable_error
+                self._state = ProviderLifecycleState.REVOKED
+
+        service_release_error: BaseException | None = None
+        try:
+            self._release_generation_service_owner(state)
+        except BaseException as exc:
+            service_release_error = exc
+            stable_error = self._stable_generation_error(exc)
+            setattr(stable_error, "runtime_provider_fatal", True)
+            try:
+                fatal = self._lifecycle.fence_runtime_fatal(stable_error)
+                stable_error = self._fatal_circuit_error(fatal)
+            except BaseException:
+                pass
+            with self._lock:
+                state.terminal_error = stable_error
+                self._state = ProviderLifecycleState.REVOKED
+        finally:
+            self._settle_backend_releases_after_generation(
+                state,
+                error=service_release_error or settlement_error,
+            )
+            with self._lock:
+                waiters = tuple(state.waiters)
+                state.waiters.clear()
+            state.done.set()
+            self._notify_generation_waiters(waiters)
 
     def _install_generation_owner_thread(
         self,
@@ -1815,7 +2845,8 @@ class _RuntimeProviderResources:
                 state = self._prepare_generation_owner_locked()
             start_owner = self._claim_generation_owner_start_locked(state)
         if start_owner:
-            await self._start_prepared_generation_owner_async(state)
+            self._start_generation_transition(state)
+        await asyncio.shield(asyncio.wrap_future(state.transition_ready))
         await asyncio.wait_for(
             asyncio.shield(asyncio.wrap_future(state.ready)),
             timeout=_LIFECYCLE_OWNER_STARTUP_TIMEOUT_SECONDS,
@@ -1829,16 +2860,33 @@ class _RuntimeProviderResources:
                 state = self._prepare_generation_owner_locked()
             start_owner = self._claim_generation_owner_start_locked(state)
         if start_owner:
-            self._start_prepared_generation_owner(state)
+            self._start_generation_transition(state)
+        state.transition_ready.result(timeout=_LIFECYCLE_OWNER_STARTUP_TIMEOUT_SECONDS)
         state.ready.result(timeout=_LIFECYCLE_OWNER_STARTUP_TIMEOUT_SECONDS)
         return state
 
     async def acquire(self) -> ProviderLeaseHandle:
         """Lease the runtime provider generation and return its fenced handle."""
         self._raise_if_runtime_fatal()
-        manager = self._resolve_active_manager()
+        manager = await self._resolve_active_manager_async()
         if manager is not self:
             return await manager.acquire()
+        return await self._acquire_generation_lease(initialize_providers=True)
+
+    async def _acquire_service_owner_lease(self) -> ProviderLeaseHandle:
+        """Lease only the durable owner loop without constructing providers."""
+        self._raise_if_runtime_fatal()
+        manager = await self._resolve_active_manager_async()
+        if manager is not self:
+            return await manager._acquire_service_owner_lease()
+        return await self._acquire_generation_lease(initialize_providers=False)
+
+    async def _acquire_generation_lease(
+        self,
+        *,
+        initialize_providers: bool,
+    ) -> ProviderLeaseHandle:
+        """Start one generation and optionally realize its provider products."""
         lease_owner = self._lease_owner()
         while True:
             retired_state: _ProviderGenerationCloseState | None = None
@@ -1884,8 +2932,9 @@ class _RuntimeProviderResources:
                 raise RuntimeOwnershipError("Pipeline provider resources are still closing after cleanup grace")
         try:
             state = await self._ensure_generation_owner(expected_state=state)
-            await self._ensure_llm_provider()
-            await self._ensure_context_provider()
+            if initialize_providers:
+                await self._ensure_llm_provider()
+                await self._ensure_context_provider()
             with self._lock:
                 if self._generation_owner is not state or state.terminal_error is not None:
                     raise RuntimeOwnershipError("Pipeline provider generation failed during startup")
@@ -1924,9 +2973,9 @@ class _RuntimeProviderResources:
         while True:
             initializer = False
             with self._lock:
-                if self._llm_provider is not None:
-                    return
                 initializing = self._llm_initializing
+                if self._llm_provider is not None and initializing is None:
+                    return
                 if initializing is None:
                     initializing = ThreadFuture()
                     self._llm_initializing = initializing
@@ -2004,27 +3053,90 @@ class _RuntimeProviderResources:
         error: BaseException | None = None,
         schedule_cleanup: bool = True,
     ) -> bool:
-        """Settle one committed handoff exactly once from any terminal path."""
-        with submission.lock:
+        """Settle once without letting foreign locks block the generation owner."""
+        owner_thread = state.owner_thread
+        owner_loop = state.loop
+        if (
+            owner_thread is not None
+            and threading.current_thread() is not owner_thread
+            and owner_loop is not None
+            and owner_loop.is_running()
+            and not owner_loop.is_closed()
+        ):
+            try:
+                owner_loop.call_soon_threadsafe(
+                    lambda: self._settle_generation_submission(
+                        state,
+                        submission,
+                        task=task,
+                        error=error,
+                        schedule_cleanup=schedule_cleanup,
+                    )
+                )
+            except RuntimeError:
+                pass
+            else:
+                return True
+
+        def retry() -> None:
+            self._settle_generation_submission(
+                state,
+                submission,
+                task=task,
+                error=error,
+                schedule_cleanup=schedule_cleanup,
+            )
+
+        if owner_thread is not None and threading.current_thread() is owner_thread:
+            if not submission.lock.acquire(blocking=False):
+                self._schedule_submission_retry_on_owner(state, submission, "settle", retry)
+                return True
+        else:
+            submission.lock.acquire()
+        schedule_cleanup_after_unlock = False
+        manager_acquired = False
+        try:
             if submission.settled:
                 return False
-            submission.settled = True
-
-        with self._lock:
+            if submission.admission is not None:
+                if owner_thread is not None and threading.current_thread() is owner_thread:
+                    if not submission.admission.finish_on_owner():
+                        self._schedule_submission_retry_on_owner(state, submission, "settle", retry)
+                        return True
+                else:
+                    submission.admission.finish()
+            if owner_thread is not None and threading.current_thread() is owner_thread:
+                manager_acquired = self._lock.acquire(blocking=False)
+                if not manager_acquired:
+                    self._schedule_submission_retry_on_owner(state, submission, "settle", retry)
+                    return True
+            else:
+                self._lock.acquire()
+                manager_acquired = True
             current = state.committed_submissions.get(submission.submission_id)
             if current is submission:
                 state.committed_submissions.pop(submission.submission_id, None)
+            submission.settled = True
+            if submission.handoff_id is not None:
+                self._finish_generation_handoff(
+                    state,
+                    submission.handoff_id,
+                    _manager_lock_held=True,
+                )
+            if submission.operation_id is not None:
+                schedule_cleanup_after_unlock = self._finish_generation_operation(
+                    state,
+                    submission.operation_id,
+                    schedule_cleanup=schedule_cleanup,
+                    _manager_lock_held=True,
+                )
+        finally:
+            if manager_acquired:
+                self._lock.release()
+            submission.lock.release()
 
-        if submission.handoff_id is not None:
-            self._finish_generation_handoff(state, submission.handoff_id)
-        if submission.operation_id is not None:
-            self._finish_generation_operation(
-                state,
-                submission.operation_id,
-                schedule_cleanup=schedule_cleanup,
-            )
-        if submission.admission is not None:
-            submission.admission.finish()
+        if schedule_cleanup_after_unlock:
+            self._schedule_generation_cleanup_from_state(state)
         try:
             if not submission.future.done():
                 if task is not None:
@@ -2052,6 +3164,46 @@ class _RuntimeProviderResources:
             )
         return True
 
+    @staticmethod
+    def _schedule_submission_retry_on_owner(
+        state: _ProviderGenerationCloseState,
+        submission: _ProviderCommittedSubmission,
+        phase: str,
+        callback: Callable[[], None],
+    ) -> None:
+        """Keep at most one owner-local retry callback per submission phase."""
+        owner_loop = state.loop
+        if owner_loop is None or owner_loop.is_closed():
+            return
+        key = (submission.submission_id, phase)
+        if key in state.submission_retry_keys:
+            return
+        state.submission_retry_keys.add(key)
+
+        def retry_once() -> None:
+            state.submission_retry_keys.discard(key)
+            callback()
+
+        owner_loop.call_later(_PROVIDER_OWNER_TERMINAL_POLL_SECONDS, retry_once)
+
+    @staticmethod
+    def _schedule_generation_retry_on_owner(
+        state: _ProviderGenerationCloseState,
+        phase: str,
+        callback: Callable[[], None],
+    ) -> None:
+        """Keep one retry callback per generation terminal phase."""
+        owner_loop = state.loop
+        if owner_loop is None or owner_loop.is_closed() or phase in state.terminal_retry_keys:
+            return
+        state.terminal_retry_keys.add(phase)
+
+        def retry_once() -> None:
+            state.terminal_retry_keys.discard(phase)
+            callback()
+
+        owner_loop.call_later(_PROVIDER_OWNER_TERMINAL_POLL_SECONDS, retry_once)
+
     def _settle_committed_generation_submissions(
         self,
         state: _ProviderGenerationCloseState,
@@ -2074,14 +3226,23 @@ class _RuntimeProviderResources:
         error: BaseException,
     ) -> int:
         """Settle only work the owner proves never started on its event loop."""
-        with self._lock:
+        manager_acquired = self._lock.acquire(blocking=False)
+        if not manager_acquired:
+            return 0
+        try:
             submissions = tuple(state.committed_submissions.values())
+        finally:
+            self._lock.release()
         settled = 0
         for submission in submissions:
-            with submission.lock:
+            if not submission.lock.acquire(blocking=False):
+                continue
+            try:
                 owner_task = submission.owner_task
                 submission_started = submission.submission_started
                 cancellation_requested = submission.cancellation_requested
+            finally:
+                submission.lock.release()
             if owner_task is not None:
                 if cancellation_requested and not owner_task.done():
                     owner_task.cancel()
@@ -2186,10 +3347,20 @@ class _RuntimeProviderResources:
                 task.exception()
 
         def submit_operation() -> None:
-            with submission.lock:
+            if not submission.lock.acquire(blocking=False):
+                self._schedule_submission_retry_on_owner(
+                    state,
+                    submission,
+                    "submit",
+                    submit_operation,
+                )
+                return
+            try:
                 if submission.settled:
                     return
                 submission.submission_started = True
+            finally:
+                submission.lock.release()
             coroutine = owned_operation()
             try:
                 task = owner_loop.create_task(coroutine)
@@ -2198,11 +3369,27 @@ class _RuntimeProviderResources:
                 finish_submission(exc)
                 return
             task.add_done_callback(operation_completed)
-            with submission.lock:
-                submission.owner_task = task
-                cancel_now = submission.cancellation_requested
-            if cancel_now:
-                task.cancel()
+
+            def attach_owner_task() -> None:
+                if not submission.lock.acquire(blocking=False):
+                    self._schedule_submission_retry_on_owner(
+                        state,
+                        submission,
+                        "attach",
+                        attach_owner_task,
+                    )
+                    return
+                try:
+                    if submission.settled:
+                        return
+                    submission.owner_task = task
+                    cancel_now = submission.cancellation_requested
+                finally:
+                    submission.lock.release()
+                if cancel_now:
+                    task.cancel()
+
+            attach_owner_task()
 
         def cancel_operation() -> None:
             with submission.lock:
@@ -2215,8 +3402,18 @@ class _RuntimeProviderResources:
                     pass
 
         def settle_ambiguous_submission(error: BaseException) -> None:
-            with submission.lock:
+            if not submission.lock.acquire(blocking=False):
+                self._schedule_submission_retry_on_owner(
+                    state,
+                    submission,
+                    "ambiguity",
+                    lambda: settle_ambiguous_submission(error),
+                )
+                return
+            try:
                 started = submission.submission_started or submission.owner_task is not None
+            finally:
+                submission.lock.release()
             if not started:
                 finish_submission(
                     RuntimeOwnershipError("Provider operation could not be submitted to its lifecycle owner")
@@ -2331,8 +3528,13 @@ class _RuntimeProviderResources:
         self,
         state: _ProviderGenerationCloseState,
         handoff_id: int,
+        *,
+        _manager_lock_held: bool = False,
     ) -> None:
         """Release one generation handoff permit at its real terminal edge."""
+        if _manager_lock_held:
+            state.active_handoffs.discard(handoff_id)
+            return
         with self._lock:
             state.active_handoffs.discard(handoff_id)
 
@@ -2342,11 +3544,12 @@ class _RuntimeProviderResources:
         operation_id: int,
         *,
         schedule_cleanup: bool = True,
-    ) -> None:
+        _manager_lock_held: bool = False,
+    ) -> bool:
         should_schedule_cleanup = False
-        with self._lock:
+        if _manager_lock_held:
             if self._generation_owner is not state:
-                return
+                return False
             state.active_operations.discard(operation_id)
             should_schedule_cleanup = (
                 schedule_cleanup
@@ -2354,8 +3557,20 @@ class _RuntimeProviderResources:
                 and self._state in {ProviderLifecycleState.DRAINING, ProviderLifecycleState.REVOKED}
                 and not state.cleanup_scheduled
             )
-        if should_schedule_cleanup:
+        else:
+            with self._lock:
+                if self._generation_owner is not state:
+                    return False
+                state.active_operations.discard(operation_id)
+                should_schedule_cleanup = (
+                    schedule_cleanup
+                    and not state.active_operations
+                    and self._state in {ProviderLifecycleState.DRAINING, ProviderLifecycleState.REVOKED}
+                    and not state.cleanup_scheduled
+                )
+        if should_schedule_cleanup and not _manager_lock_held:
             self._schedule_generation_cleanup_from_state(state)
+        return should_schedule_cleanup
 
     def _caller_has_active_request_admission(self) -> bool:
         """Read the controller's inherited request context without creating a second lease.
@@ -2497,7 +3712,7 @@ class _RuntimeProviderResources:
                     handoff.reject_on_owner()
                     raise
 
-            def validate_and_adopt(product: Any) -> None:
+            def validate_product(product: Any) -> None:
                 nonlocal rejection_primary_error
                 try:
                     validate(product)
@@ -2506,6 +3721,8 @@ class _RuntimeProviderResources:
                         rejection_primary_error = validation_error
                     validation_rejected.set()
                     raise
+
+            def adopt_validated_product(product: Any) -> None:
                 operation_id = self._begin_generation_operation(state, allow_starting=True)
                 adoption_coroutine = adopt_on_owner(product)
                 owner_loop = state.loop
@@ -2605,7 +3822,8 @@ class _RuntimeProviderResources:
             try:
                 return await self._provider_factory_work.realize_owned(
                     construct_on_worker,
-                    validate=validate_and_adopt,
+                    validate=validate_product,
+                    adopt=adopt_validated_product,
                     retire=retire_unadopted,
                     reason_code=reason_code,
                     result_handoff_seconds=self._cleanup_grace_seconds,
@@ -2760,9 +3978,9 @@ class _RuntimeProviderResources:
         while True:
             initializer = False
             with self._lock:
-                if self._context_initialized:
-                    return
                 initializing = self._context_initializing
+                if self._context_initialized and initializing is None:
+                    return
                 if initializing is None:
                     initializing = ThreadFuture()
                     self._context_initializing = initializing
@@ -2934,15 +4152,17 @@ class _RuntimeProviderResources:
         with self._lock:
             if self._closing_event is not None:
                 raise RuntimeOwnershipError("Pipeline provider resources are closing")
+            if self._llm_initializing is not None:
+                raise RuntimeOwnershipError("Pipeline LLM provider resources are being acquired")
             provider = self._llm_provider
             if provider is not None:
                 return provider
             if self._requires_async_llm_realization:
                 raise RuntimeOwnershipError("Pipeline LLM provider resources were not acquired")
-            if self._llm_initializing is not None:
-                raise RuntimeOwnershipError("Pipeline LLM provider resources are being acquired")
         with self._sync_realization_lock:
             with self._lock:
+                if self._llm_initializing is not None:
+                    raise RuntimeOwnershipError("Pipeline LLM provider resources are being acquired")
                 provider = self._llm_provider
                 if provider is not None:
                     return provider
@@ -2969,12 +4189,14 @@ class _RuntimeProviderResources:
         with self._lock:
             if self._closing_event is not None:
                 raise RuntimeOwnershipError("Pipeline provider resources are closing")
-            if self._context_initialized:
-                return self._context_provider
             if self._context_initializing is not None:
                 raise RuntimeOwnershipError("Pipeline context provider resources are being acquired")
+            if self._context_initialized:
+                return self._context_provider
         with self._sync_realization_lock:
             with self._lock:
+                if self._context_initializing is not None:
+                    raise RuntimeOwnershipError("Pipeline context provider resources are being acquired")
                 if self._context_initialized:
                     return self._context_provider
             state = self._ensure_generation_owner_sync()
@@ -3053,6 +4275,13 @@ class _RuntimeProviderResources:
 
     async def _join_retired_generation(self, state: _ProviderGenerationCloseState) -> None:
         await self._wait_for_generation_owner_exit(state)
+        transition_thread = state.transition_thread
+        if transition_thread is not None and transition_thread is not threading.current_thread():
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(state.transition_exited)),
+                timeout=_LIFECYCLE_OWNER_STARTUP_TIMEOUT_SECONDS,
+            )
+            transition_thread.join(timeout=0)
         with self._lock:
             if self._retired_generation is state:
                 self._retired_generation = None
@@ -3061,11 +4290,18 @@ class _RuntimeProviderResources:
         state = self._retired_generation
         if state is None:
             return
+        if not state.done.is_set():
+            raise RuntimeOwnershipError("Pipeline provider lifecycle owner is still retiring")
         thread = state.owner_thread
         if thread is not None and thread is not threading.current_thread():
             if thread.is_alive():
                 raise RuntimeOwnershipError("Pipeline provider lifecycle owner is still retiring")
             thread.join(timeout=0)
+        transition_thread = state.transition_thread
+        if transition_thread is not None and transition_thread is not threading.current_thread():
+            if transition_thread.is_alive():
+                raise RuntimeOwnershipError("Pipeline provider lifecycle transition is still retiring")
+            transition_thread.join(timeout=0)
         if self._retired_generation is state:
             self._retired_generation = None
 
@@ -3186,11 +4422,12 @@ class _RuntimeProviderResources:
             owner_loop = state.loop
             active_operations = bool(state.active_operations)
             owner_recovery_active = state.owner_recovery_active
+            owner_loop_lost = state.owner_loop_lost
         if active_operations:
             return
         if cleanup_future is not None and not cleanup_future.done():
             cleanup_future.cancel()
-        if owner_loop is not None and not owner_loop.is_closed() and not owner_recovery_active:
+        if owner_loop is not None and not owner_loop.is_closed() and not owner_recovery_active and not owner_loop_lost:
             self._request_generation_owner_stop(state, owner_loop)
 
     @staticmethod
@@ -3225,13 +4462,17 @@ class _RuntimeProviderResources:
         try:
             while True:
                 await asyncio.sleep(_PROVIDER_OWNER_TERMINAL_POLL_SECONDS)
-                with self._lock:
+                if not self._lock.acquire(blocking=False):
+                    continue
+                try:
                     if self._generation_owner is not state:
                         return
                     cleanup_succeeded = state.cleanup_succeeded
                     terminal_error = state.terminal_error
                     cleanup_future = state.cleanup_future
                     cleanup_submission_failed = state.cleanup_submission_failed
+                finally:
+                    self._lock.release()
 
                 if cleanup_succeeded:
                     if recovery_started:
@@ -3252,8 +4493,12 @@ class _RuntimeProviderResources:
                     await asyncio.sleep(0)
 
                 settled = self._settle_owner_terminal_submissions(state, terminal_error)
-                with self._lock:
+                if not self._lock.acquire(blocking=False):
+                    continue
+                try:
                     active_operations = bool(state.active_operations)
+                finally:
+                    self._lock.release()
                 if settled:
                     logger.info(
                         "provider_generation_terminal_submissions_settled",
@@ -3264,10 +4509,14 @@ class _RuntimeProviderResources:
                 if not active_operations:
                     self._begin_generation_retirement(state)
 
-                with self._lock:
+                if not self._lock.acquire(blocking=False):
+                    continue
+                try:
                     cleanup_succeeded = state.cleanup_succeeded
                     cleanup_future = state.cleanup_future
                     cleanup_submission_failed = state.cleanup_submission_failed
+                finally:
+                    self._lock.release()
                 if cleanup_succeeded:
                     logger.info(
                         "provider_generation_terminal_recovery_settled",
@@ -3296,50 +4545,63 @@ class _RuntimeProviderResources:
         state: _ProviderGenerationCloseState,
         owner_loop: asyncio.AbstractEventLoop,
     ) -> None:
-        """Reach a cleanup terminal state before the dedicated owner loop closes."""
+        """Bound owner-local tasks without entering requester-reachable locks."""
         current_task = asyncio.current_task()
-        with self._lock:
-            cleanup_scheduled = state.cleanup_scheduled
-            terminal_error = state.terminal_error or RuntimeOwnershipError(
-                "Pipeline provider lifecycle loop stopped before cleanup"
-            )
-        if not cleanup_scheduled:
-            active_tasks = tuple(
-                task for task in asyncio.all_tasks(owner_loop) if task is not current_task and not task.done()
-            )
-            for task in active_tasks:
-                task.cancel()
-            if active_tasks:
-                await asyncio.gather(*active_tasks, return_exceptions=True)
-            self._settle_committed_generation_submissions(state, terminal_error)
-            await asyncio.sleep(0)
-
-        self._begin_generation_retirement(state)
-        await asyncio.sleep(0)
-        with self._lock:
-            cleanup_future = state.cleanup_future
-        if cleanup_future is not None:
-            try:
-                await asyncio.shield(asyncio.wrap_future(cleanup_future))
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-            await asyncio.sleep(0)
-
+        terminal_error = state.terminal_error or RuntimeOwnershipError(
+            "Pipeline provider lifecycle loop stopped before cleanup"
+        )
         remaining_tasks = tuple(
             task for task in asyncio.all_tasks(owner_loop) if task is not current_task and not task.done()
         )
         for task in remaining_tasks:
             task.cancel()
         if remaining_tasks:
-            await asyncio.gather(*remaining_tasks, return_exceptions=True)
-        self._settle_committed_generation_submissions(state, terminal_error)
+            done, pending = await asyncio.wait(
+                remaining_tasks,
+                timeout=self._cleanup_grace_seconds,
+            )
+            for task in done:
+                with suppress(BaseException):
+                    task.result()
+            if pending:
+                state.abandon_pending_owner_tasks = True
+                for task in pending:
+                    setattr(task, "_log_destroy_pending", False)
+        self._settle_owner_terminal_submissions(state, terminal_error)
+        # Cancellation completion callbacks may enqueue generation cleanup one
+        # turn after the owned operation settles. Drain that transition here;
+        # otherwise Runner shutdown can be interrupted by a late loop.stop()
+        # and leave its executor-shutdown task pending on a closed loop.
+        deadline = owner_loop.time() + self._cleanup_grace_seconds
+        while owner_loop.time() < deadline:
+            await asyncio.sleep(0)
+            if not self._lock.acquire(blocking=False):
+                return
+            try:
+                active_operations = bool(state.active_operations)
+                cleanup_scheduled = state.cleanup_scheduled
+                cleanup_future = state.cleanup_future
+            finally:
+                self._lock.release()
+            if not active_operations and not cleanup_scheduled:
+                self._begin_generation_retirement(state)
+                continue
+            if cleanup_future is None:
+                continue
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.wrap_future(cleanup_future)),
+                    timeout=max(deadline - owner_loop.time(), 0.0),
+                )
+            except BaseException:
+                pass
+            await asyncio.sleep(0)
+            return
 
     def _run_generation_owner(self, state: _ProviderGenerationCloseState) -> BaseException | None:
         ready = False
         try:
-            with asyncio.Runner() as runner:
+            with _BoundedRuntimeOwnerRunner(state) as runner:
                 owner_loop = runner.get_loop()
                 with self._lock:
                     if self._generation_owner is not state:
@@ -3385,39 +4647,54 @@ class _RuntimeProviderResources:
 
                 owner_loop.call_soon(publish_readiness)
                 owner_loop.run_forever()
-                with self._lock:
-                    cleanup_succeeded = state.cleanup_succeeded
-                    terminal_error = state.terminal_error
+                cleanup_succeeded = state.cleanup_succeeded
+                terminal_error = state.terminal_error
                 if terminal_error is not None:
                     return terminal_error
                 if cleanup_succeeded:
                     return None
-                with self._lock:
-                    state.owner_recovery_active = True
+                state.owner_recovery_active = True
                 owner_loss_error = RuntimeOwnershipError("Pipeline provider lifecycle loop stopped before cleanup")
                 setattr(owner_loss_error, "cleanup_reason_code", "provider_generation_owner_lost")
                 setattr(owner_loss_error, "cleanup_error_type", "RuntimeOwnershipError")
                 setattr(owner_loss_error, "runtime_provider_fatal", True)
                 self._publish_generation_startup_failure(state, owner_loss_error)
-                owner_loss_error = self._fence_generation(state, owner_loss_error)
+                stable_owner_loss = self._stable_generation_error(owner_loss_error)
+                stable_owner_loss.__cause__ = owner_loss_error
+                setattr(stable_owner_loss, "runtime_provider_fatal", True)
+                state.terminal_error = stable_owner_loss
+                state.owner_loop_lost = True
                 try:
                     runner.run(self._settle_generation_after_owner_loop_loss(state, owner_loop))
                 finally:
-                    with self._lock:
-                        state.owner_recovery_active = False
-                with self._lock:
-                    return state.terminal_error or owner_loss_error
+                    state.owner_recovery_active = False
+                return state.terminal_error or stable_owner_loss
         except BaseException as exc:
             self._publish_generation_startup_failure(state, exc)
             if ready:
-                return self._fence_generation(state, exc)
+                stable_error = self._stable_generation_error(exc)
+                stable_error.__cause__ = exc
+                setattr(stable_error, "runtime_provider_fatal", True)
+                state.terminal_error = stable_error
+                return stable_error
             return exc
 
     def _schedule_generation_cleanup_from_state(
         self,
         state: _ProviderGenerationCloseState,
     ) -> None:
-        with self._lock:
+        called_by_owner = state.owner_thread is not None and threading.current_thread() is state.owner_thread
+        if called_by_owner:
+            if not self._lock.acquire(blocking=False):
+                self._schedule_generation_retry_on_owner(
+                    state,
+                    "schedule_cleanup",
+                    lambda: self._schedule_generation_cleanup_from_state(state),
+                )
+                return
+        else:
+            self._lock.acquire()
+        try:
             if self._generation_owner is not state or state.cleanup_scheduled:
                 return
             if state.active_operations:
@@ -3430,6 +4707,8 @@ class _RuntimeProviderResources:
             state.retained_products = tuple(
                 product for product in (context_provider, llm_provider) if product is not None
             )
+        finally:
+            self._lock.release()
         owner_loop = state.loop
         if owner_loop is None or owner_loop.is_closed() or not owner_loop.is_running():
             self._revoke_generation(
@@ -3438,33 +4717,46 @@ class _RuntimeProviderResources:
             )
             return
 
-        async def cleanup_generation() -> None:
-            cleanup_calls: list[tuple[str, Callable[[], Awaitable[None]]]] = []
+        async def cleanup_generation() -> RuntimeOwnershipError | None:
             retained_products = tuple(product for product in (context_provider, llm_provider) if product is not None)
+            parent_cleanup_calls: list[tuple[str, Callable[[], Awaitable[None]]]] = []
             if context_provider is not None:
-                cleanup_calls.append(
+                parent_cleanup_calls.append(
                     (
                         "context",
                         lambda: ContextProvider.close_from_lifecycle(context_provider, owner=state),
                     )
                 )
             if llm_provider is not None:
-                cleanup_calls.append(
+                parent_cleanup_calls.append(
                     (
                         "llm",
                         lambda: LLMProvider.close_from_lifecycle(llm_provider, owner=state),
                     )
                 )
-            if chained_cleanup is not None:
-                cleanup_calls.append(("chained", chained_cleanup))
             results: list[RuntimeOwnershipError | None] = []
             revoke_error: RuntimeOwnershipError | None = None
             try:
-                results = list(
-                    await asyncio.gather(
-                        *(self._settle_generation_cleanup(label, cleanup) for label, cleanup in cleanup_calls)
+                # Child backends can still invoke their parent providers while
+                # draining. Retire them fully before any parent authority.
+                results.append(
+                    await self._settle_generation_cleanup(
+                        "backends",
+                        lambda: self._backend_owner.close_generation_on_owner(state),
                     )
                 )
+                results.extend(
+                    await asyncio.gather(
+                        *(self._settle_generation_cleanup(label, cleanup) for label, cleanup in parent_cleanup_calls)
+                    )
+                )
+                if chained_cleanup is not None:
+                    results.append(
+                        await self._settle_generation_cleanup(
+                            "chained",
+                            chained_cleanup,
+                        )
+                    )
             finally:
                 for product in retained_products:
                     try:
@@ -3482,13 +4774,12 @@ class _RuntimeProviderResources:
                                 reason_code="provider_authority_revoke_failed",
                                 message="Provider authority revocation failed",
                             )
-                cleanup_calls.clear()
+                parent_cleanup_calls.clear()
             cleanup_error = next((result for result in results if result is not None), None)
             if cleanup_error is None:
                 cleanup_error = revoke_error
             results.clear()
-            if cleanup_error is not None:
-                raise cleanup_error.with_traceback(None) from None
+            return cleanup_error
 
         cleanup_coroutine = cleanup_generation()
         try:
@@ -3496,7 +4787,7 @@ class _RuntimeProviderResources:
                 current_loop = asyncio.get_running_loop()
             except RuntimeError:
                 current_loop = None
-            cleanup_future: ThreadFuture[None]
+            cleanup_future: ThreadFuture[RuntimeOwnershipError | None]
             if current_loop is owner_loop:
                 cleanup_future = ThreadFuture()
                 cleanup_task = owner_loop.create_task(
@@ -3504,15 +4795,22 @@ class _RuntimeProviderResources:
                     name=f"tacit-provider-generation-{state.generation_epoch}-cleanup",
                 )
 
-                def publish_cleanup_result(task: asyncio.Task[None]) -> None:
-                    try:
-                        task.result()
-                    except asyncio.CancelledError:
+                def publish_cleanup_result(task: asyncio.Task[RuntimeOwnershipError | None]) -> None:
+                    if task.cancelled():
                         cleanup_future.cancel()
-                    except BaseException as exc:
-                        cleanup_future.set_exception(exc)
-                    else:
-                        cleanup_future.set_result(None)
+                        return
+                    error = task.exception()
+                    if error is not None:
+                        stable_error = self._stable_generation_error(error)
+                        # The completed task retains its exception. Strip frames
+                        # after copying bounded metadata so revoked provider
+                        # authority is not kept alive by the transport future.
+                        error.__traceback__ = None
+                        error.__cause__ = None
+                        error.__context__ = None
+                        cleanup_future.set_exception(stable_error)
+                        return
+                    cleanup_future.set_result(task.result())
 
                 cleanup_task.add_done_callback(publish_cleanup_result)
             else:
@@ -3526,20 +4824,80 @@ class _RuntimeProviderResources:
         with self._lock:
             state.cleanup_future = cleanup_future
 
-        def cleanup_completed(_future: ThreadFuture[None]) -> None:
+        def cleanup_completed(_future: ThreadFuture[RuntimeOwnershipError | None]) -> None:
             try:
-                _future.result()
+                cleanup_error = _future.result()
             except BaseException as exc:
-                self._revoke_generation(state, exc)
-                return
-            with self._lock:
-                state.cleanup_succeeded = True
-                owner_recovery_active = state.owner_recovery_active
-            if owner_recovery_active:
-                return
-            self._request_generation_owner_stop(state, owner_loop)
+                cleanup_error = self._stable_generation_error(exc)
+            self._finish_generation_cleanup_on_owner(
+                state,
+                owner_loop,
+                error=cleanup_error,
+            )
 
         cleanup_future.add_done_callback(cleanup_completed)
+
+    def _finish_generation_cleanup_on_owner(
+        self,
+        state: _ProviderGenerationCloseState,
+        owner_loop: asyncio.AbstractEventLoop,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        """Commit cleanup without waiting on the requester-reachable manager lock."""
+        owner_thread = state.owner_thread
+        if owner_thread is not None and threading.current_thread() is not owner_thread:
+            try:
+                owner_loop.call_soon_threadsafe(
+                    lambda: self._finish_generation_cleanup_on_owner(
+                        state,
+                        owner_loop,
+                        error=error,
+                    )
+                )
+            except RuntimeError:
+                self._revoke_generation(
+                    state,
+                    error or RuntimeOwnershipError("Pipeline provider lifecycle owner is unavailable for cleanup"),
+                )
+            return
+        if not self._lock.acquire(blocking=False):
+            self._schedule_generation_retry_on_owner(
+                state,
+                "finish_cleanup",
+                lambda: self._finish_generation_cleanup_on_owner(
+                    state,
+                    owner_loop,
+                    error=error,
+                ),
+            )
+            return
+        try:
+            if self._generation_owner is not state:
+                return
+            owner_recovery_active = state.owner_recovery_active
+            if error is None:
+                state.cleanup_succeeded = True
+            else:
+                if state.terminal_error is None:
+                    stable_error = self._stable_generation_error(error)
+                    if stable_error is not error:
+                        stable_error.__cause__ = error
+                    state.terminal_error = stable_error
+                self._state = ProviderLifecycleState.REVOKED
+                self._closing_event = state
+            active_operations = bool(state.active_operations)
+        finally:
+            self._lock.release()
+        if error is not None:
+            logger.warning(
+                "provider_generation_revoked",
+                reason_code="provider_generation_revoked",
+                error_type=type(error).__name__,
+                generation_epoch=state.generation_epoch,
+            )
+        if not state.owner_loop_lost and not owner_recovery_active and not active_operations:
+            self._request_generation_owner_stop(state, owner_loop)
 
     def _begin_generation_retirement(
         self,
@@ -3581,6 +4939,8 @@ class _RuntimeProviderResources:
         state.retained_products = ()
         state.cleanup_future = None
         state.terminal_monitor_task = None
+        state.submission_retry_keys.clear()
+        state.terminal_retry_keys.clear()
         state.loop = None
         self._context_provider = None
         self._context_initialized = False
@@ -3602,7 +4962,6 @@ class _RuntimeProviderResources:
             if not state.cleanup_succeeded:
                 raise RuntimeOwnershipError("Pipeline provider cleanup cannot release an incomplete generation")
             self._clear_generation_locked(state)
-            state.done.set()
 
     def _finish_generation_terminal_failure(
         self,
@@ -3651,9 +5010,6 @@ class _RuntimeProviderResources:
             )
             self._quarantine.append(quarantine)
             runtime_fatal = authority_unretired or bool(getattr(stable_error, "runtime_provider_fatal", False))
-            if runtime_fatal:
-                fatal_circuit = self._lifecycle.fence_runtime_fatal(stable_error)
-                stable_error = self._fatal_circuit_error(fatal_circuit)
             state.terminal_error = stable_error
             state.active_operations.clear()
             state.active_handoffs.clear()
@@ -3662,7 +5018,31 @@ class _RuntimeProviderResources:
             self._clear_generation_locked(state)
             if runtime_fatal:
                 self._state = ProviderLifecycleState.REVOKED
-            state.done.set()
+        if runtime_fatal:
+            fatal_circuit = self._lifecycle.fence_runtime_fatal(stable_error)
+            stable_error = self._fatal_circuit_error(fatal_circuit)
+            with self._lock:
+                state.terminal_error = stable_error
+                self._state = ProviderLifecycleState.REVOKED
+
+    @staticmethod
+    def _settle_backend_releases_after_generation(
+        state: _ProviderGenerationCloseState,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        """Publish one terminal generation result to every joined backend release."""
+        releases = tuple(state.backend_releases.values())
+        state.backend_releases.clear()
+        terminal_error = error or state.terminal_error
+        for release_state, release in releases:
+            if terminal_error is None and state.cleanup_succeeded:
+                release_state.complete_composite_release(release)
+            else:
+                release_state.fail_composite_release(
+                    release,
+                    terminal_error or RuntimeOwnershipError("Pipeline provider generation cleanup failed"),
+                )
 
     def _quarantined_epoch_locked(self, epoch: int) -> bool:
         return any(item.generation_epoch == epoch for item in self._quarantine)
@@ -3681,10 +5061,19 @@ class _RuntimeProviderResources:
 
     async def close(self, handle: ProviderLeaseHandle | None = None) -> None:
         installed = self._lifecycle.execution_graph.provider_manager()
-        manager = self if installed is self else self._resolve_active_manager()
+        manager = self if installed is self else await self._resolve_active_manager_async()
         if manager is not self:
             await manager.close(handle)
             return
+        if handle is not None:
+            with self._lock:
+                terminal_state = self._generation_owner
+                terminal_pending = terminal_state is not None and terminal_state.terminal_error is not None
+            if terminal_pending:
+                assert terminal_state is not None
+                await self._wait_for_generation_close(terminal_state)
+            if await self._backend_owner.release_for_provider(handle):
+                return
         wait_state: _ProviderGenerationCloseState | None = None
         retired_state: _ProviderGenerationCloseState | None = None
         with self._lock:
@@ -3848,8 +5237,16 @@ def create_scoped_knowledge_service(
     )
 
 
+def _caller_has_running_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
 class _DeferredRuntimeProviderResources:
-    """Resolve a provider manager only after a closed graph is reopened."""
+    """Resolve a provider manager at the first sync or async resource boundary."""
 
     def __init__(
         self,
@@ -3858,12 +5255,14 @@ class _DeferredRuntimeProviderResources:
         lifecycle: PipelineAdmissionController,
         llm_factory: Callable[[], LLMProvider] | None,
         context_factory: Callable[[], ContextProvider | None] | None,
+        chained_cleanup: Callable[[], Awaitable[None]] | None,
         cleanup_grace_seconds: float,
     ) -> None:
         self._settings = runtime_settings
         self._lifecycle = lifecycle
         self._llm_factory = llm_factory
         self._context_factory = context_factory
+        self._chained_cleanup = chained_cleanup
         self._cleanup_grace_seconds = cleanup_grace_seconds
         _RuntimeProviderResources._bind_lifecycle_identity(runtime_settings, lifecycle)
         lifecycle.raise_if_runtime_fatal()
@@ -3871,7 +5270,7 @@ class _DeferredRuntimeProviderResources:
             runtime_settings,
             llm_factory=llm_factory,
             context_factory=context_factory,
-            chained_cleanup=None,
+            chained_cleanup=chained_cleanup,
             cleanup_grace_seconds=cleanup_grace_seconds,
         )
 
@@ -3881,6 +5280,18 @@ class _DeferredRuntimeProviderResources:
             lifecycle=self._lifecycle,
             llm_factory=self._llm_factory,
             context_factory=self._context_factory,
+            chained_cleanup=self._chained_cleanup,
+            cleanup_grace_seconds=self._cleanup_grace_seconds,
+            spec=self._spec,
+        )
+
+    async def _resolve_async(self) -> _RuntimeProviderResources:
+        return await _RuntimeProviderResources.resolve_async(
+            self._settings,
+            lifecycle=self._lifecycle,
+            llm_factory=self._llm_factory,
+            context_factory=self._context_factory,
+            chained_cleanup=self._chained_cleanup,
             cleanup_grace_seconds=self._cleanup_grace_seconds,
             spec=self._spec,
         )
@@ -3894,11 +5305,37 @@ class _DeferredRuntimeProviderResources:
     def context(self) -> ContextProvider | None:
         return self._resolve().context()
 
+    @property
+    def backend_owner(self) -> _RuntimeAsyncResourceOwner:
+        return self._resolve().backend_owner
+
+    async def realize_backends(
+        self,
+        factory: Callable[[], list[DashboardBackend]],
+        *,
+        expected: RuntimeOwnershipDescriptor,
+        request_lease_to_release: PipelineAdmissionLease | None = None,
+    ) -> BackendResourceLease:
+        manager = await self._resolve_async()
+        return await manager.realize_backends(
+            factory,
+            expected=expected,
+            request_lease_to_release=request_lease_to_release,
+        )
+
+    async def close_backends(self, lease: BackendResourceLease) -> None:
+        manager = await self._resolve_async()
+        await manager.close_backends(lease)
+
     async def acquire(self) -> ProviderLeaseHandle | None:
-        return await self._resolve().acquire()
+        manager = await self._resolve_async()
+        return await manager.acquire()
+
+    def retain_provider_lease_on_service_owner(self, handle: ProviderLeaseHandle) -> None:
+        self._resolve().retain_provider_lease_on_service_owner(handle)
 
     async def close(self, handle: ProviderLeaseHandle | None = None) -> None:
-        manager = self._resolve()
+        manager = await self._resolve_async()
         if handle is None:
             await manager.close()
         else:
@@ -3912,6 +5349,16 @@ class RuntimeRootUseHandle:
     _coordinator: _RuntimeRootCoordinator = field(repr=False)
     token: int = field(repr=False)
     generation: int
+    _requester_loop: asyncio.AbstractEventLoop | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _requester_task: asyncio.Task[Any] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def _mark_drain_startup_retry(self) -> None:
         """Mark the next release as the final caller-owned startup attempt."""
@@ -3956,6 +5403,12 @@ class _RuntimeRootCoordinator:
         if graph is None:
             raise RuntimeOwnershipError("Pipeline runtime execution graph is unavailable")
         graph.admission.raise_if_runtime_fatal()
+        try:
+            requester_loop = asyncio.get_running_loop()
+            requester_task = asyncio.current_task()
+        except RuntimeError:
+            requester_loop = None
+            requester_task = None
         with self._lock:
             if self._release_in_progress:
                 raise RuntimeOwnershipError("Pipeline runtime composition root is shutting down")
@@ -3982,6 +5435,8 @@ class _RuntimeRootCoordinator:
                 _coordinator=self,
                 token=token,
                 generation=graph.root_generation,
+                _requester_loop=requester_loop,
+                _requester_task=requester_task,
             )
 
     def release_detached(self, handle: RuntimeRootUseHandle) -> None:
@@ -4405,7 +5860,7 @@ class PipelineDependencies:
         compare=False,
         default=None,
     )
-    _backend_realizer: Callable[[], Awaitable[list[DashboardBackend]]] = field(
+    _backend_realizer: Callable[[PipelineAdmissionLease | None], Awaitable[BackendResourceLease]] = field(
         init=False,
         repr=False,
         compare=False,
@@ -4499,6 +5954,10 @@ class PipelineDependencies:
                 declared_backend_factory,
                 expected=expected_backends,
                 lifecycle=admission,
+                owner=cast(
+                    _RuntimeProviderResources | _DeferredRuntimeProviderResources,
+                    self.provider_lifecycle_owner,
+                ),
                 cleanup_grace_seconds=self.cleanup_grace_seconds,
             ),
         )
@@ -4639,17 +6098,29 @@ class PipelineDependencies:
             runtime_settings,
             component="isolated_pipeline_dependencies",
         )
-        provider_resources = _RuntimeProviderResources.resolve(
-            runtime_settings,
-            lifecycle=values["pipeline_admission"],
-            llm_factory=values.get("llm_provider_factory"),
-            context_factory=values.get("context_provider_factory"),
-            chained_cleanup=values.get("resource_cleanup"),
-            cleanup_grace_seconds=values.get(
-                "cleanup_grace_seconds",
-                DEFAULT_PIPELINE_CLEANUP_GRACE_SECONDS,
-            ),
+        cleanup_grace_seconds = values.get(
+            "cleanup_grace_seconds",
+            DEFAULT_PIPELINE_CLEANUP_GRACE_SECONDS,
         )
+        provider_resources: _RuntimeProviderResources | _DeferredRuntimeProviderResources
+        if _caller_has_running_event_loop():
+            provider_resources = _RuntimeProviderResources(
+                runtime_settings,
+                lifecycle=values["pipeline_admission"],
+                llm_factory=values.get("llm_provider_factory"),
+                context_factory=values.get("context_provider_factory"),
+                chained_cleanup=values.get("resource_cleanup"),
+                cleanup_grace_seconds=cleanup_grace_seconds,
+            )
+        else:
+            provider_resources = _RuntimeProviderResources.resolve(
+                runtime_settings,
+                lifecycle=values["pipeline_admission"],
+                llm_factory=values.get("llm_provider_factory"),
+                context_factory=values.get("context_provider_factory"),
+                chained_cleanup=values.get("resource_cleanup"),
+                cleanup_grace_seconds=cleanup_grace_seconds,
+            )
         values["llm_provider_factory"] = declare_runtime_factory(
             _AdmittedProviderAccessor(provider_resources.llm),
             ownership=provider_resources.llm_ownership(
@@ -4677,9 +6148,44 @@ class PipelineDependencies:
             return await self.resource_acquire()
         return None
 
-    async def realize_backends(self) -> list[DashboardBackend]:
+    def retain_resources_on_lifecycle_owner(self, handle: ProviderLeaseHandle) -> None:
+        """Transfer a lease that must survive its acquisition event loop."""
+        owner = self.provider_lifecycle_owner
+        if not isinstance(owner, (_RuntimeProviderResources, _DeferredRuntimeProviderResources)):
+            raise RuntimeOwnershipError("Pipeline provider lifecycle owner is unavailable")
+        owner.retain_provider_lease_on_service_owner(handle)
+
+    @property
+    def backend_lifecycle_owner(self) -> _RuntimeAsyncResourceOwner:
+        owner = self.provider_lifecycle_owner
+        if not isinstance(owner, (_RuntimeProviderResources, _DeferredRuntimeProviderResources)):
+            raise RuntimeOwnershipError("Pipeline backend lifecycle owner is unavailable")
+        return owner.backend_owner
+
+    async def realize_backends(self) -> BackendResourceLease:
         """Construct and validate dashboard backends under runtime admission."""
-        return await self._backend_realizer()
+        admission = self.pipeline_admission
+        if admission is None:
+            raise RuntimeOwnershipError("Pipeline backend realization has no admission owner")
+        if admission.current_task_has_active_admission():
+            return await self._backend_realizer(None)
+        request_lease = await admission.acquire()
+        try:
+            with admission.admitted_lease_context(request_lease):
+                return await self._backend_realizer(request_lease)
+        except BaseException:
+            try:
+                admission.release(request_lease)
+            except RuntimeError:
+                pass
+            raise
+
+    async def close_backends(self, lease: BackendResourceLease) -> None:
+        """Release one backend set through its durable runtime owner."""
+        owner = self.provider_lifecycle_owner
+        if not isinstance(owner, (_RuntimeProviderResources, _DeferredRuntimeProviderResources)):
+            raise RuntimeOwnershipError("Pipeline backend lifecycle owner is unavailable")
+        await owner.close_backends(lease)
 
     async def close_resources(self, handle: ProviderLeaseHandle | None = None) -> None:
         """Close resources owned by this dependency bundle."""
@@ -4711,12 +6217,22 @@ class PipelineDependencies:
         """Release this request's composition borrow."""
         if handle is None:
             return
+        if self.pipeline_admission is not None:
+            self.pipeline_admission.relinquish_request_path(
+                handle._requester_loop,
+                handle._requester_task,
+            )
         await release_runtime_root_scope(handle, wait_for_drain=wait_for_drain)
 
     def stop_runtime_root_detached(self, handle: RuntimeRootUseHandle | None) -> None:
         """Transfer a discarded request's root to the existing lifecycle owner."""
         if handle is None:
             return
+        if self.pipeline_admission is not None:
+            self.pipeline_admission.relinquish_request_path(
+                handle._requester_loop,
+                handle._requester_task,
+            )
         release_runtime_root_scope_detached(handle)
 
     @classmethod
@@ -4803,8 +6319,17 @@ def build_pipeline_dependencies(
                 lifecycle=resolved_pipeline_admission,
                 llm_factory=llm_provider_factory,
                 context_factory=context_provider_factory,
+                chained_cleanup=None,
                 cleanup_grace_seconds=cleanup_grace_seconds,
             )
+        )
+    elif _caller_has_running_event_loop():
+        provider_resources = _RuntimeProviderResources(
+            resolved_settings,
+            lifecycle=resolved_pipeline_admission,
+            llm_factory=llm_provider_factory,
+            context_factory=context_provider_factory,
+            cleanup_grace_seconds=cleanup_grace_seconds,
         )
     else:
         try:
@@ -4823,6 +6348,7 @@ def build_pipeline_dependencies(
                 lifecycle=resolved_pipeline_admission,
                 llm_factory=llm_provider_factory,
                 context_factory=context_provider_factory,
+                chained_cleanup=None,
                 cleanup_grace_seconds=cleanup_grace_seconds,
             )
     declared_llm_resource_factory = declare_runtime_factory(
@@ -4918,7 +6444,14 @@ def managed_nonpipeline_llm_provider(
     acquire_started = False
     try:
         acquire_started = True
-        provider_lease = asyncio.run(selected_dependencies.acquire_resources())
+
+        async def acquire_owned_resources() -> ProviderLeaseHandle | None:
+            handle = await selected_dependencies.acquire_resources()
+            if handle is not None:
+                selected_dependencies.retain_resources_on_lifecycle_owner(handle)
+            return handle
+
+        provider_lease = asyncio.run(acquire_owned_resources())
         provider_factory = selected_dependencies.llm_provider_factory
         if provider_factory is None:
             raise RuntimeOwnershipError("Non-pipeline LLM provider factory is unavailable")

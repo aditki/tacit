@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import gc
 import threading
+import time
 import weakref
 from dataclasses import replace
 from typing import Any, cast
@@ -11,6 +12,7 @@ from unittest import mock
 
 import pytest
 
+import tacit.pipeline_admission as pipeline_admission_module
 from tacit.config import Settings
 from tacit.errors import PipelineAdmissionRejected, RuntimeOwnershipError
 from tacit.pipeline_admission import PipelineAdmissionController, pipeline_admission_limits
@@ -570,6 +572,578 @@ async def test_last_queued_path_fires_idle_callback_once(terminal_transition: st
     controller.release_service_owner(service_owner)
     assert controller.in_flight == 0
     assert controller.queued == 0
+
+
+def test_service_retained_work_does_not_hide_a_stopped_live_requester() -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    service_owner = controller.try_acquire_service_owner()
+    assert service_owner is not None
+    paused = threading.Event()
+    resume = threading.Event()
+    errors: list[BaseException] = []
+
+    def requester() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        gate = asyncio.Event()
+
+        async def run() -> None:
+            async with controller.slot():
+                permit = controller.retain_current_work()
+                controller.transfer_retained_work_to_service_owner(permit)
+                loop.call_soon(loop.stop)
+                await gate.wait()
+                controller.release_retained_work(permit)
+
+        task = loop.create_task(run())
+        task.add_done_callback(lambda _completed: loop.stop())
+        try:
+            loop.run_forever()
+            paused.set()
+            assert resume.wait(timeout=2.0)
+            loop.call_soon(gate.set)
+            loop.run_forever()
+            task.result()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+    thread = threading.Thread(target=requester, name="admission-stopped-requester")
+    thread.start()
+    assert paused.wait(timeout=1.0)
+
+    callbacks: list[str] = []
+    callback_fired = threading.Event()
+
+    def record_idle() -> None:
+        callbacks.append("idle")
+        callback_fired.set()
+
+    try:
+        controller.when_request_paths_idle(record_idle)
+        assert callbacks == []
+    finally:
+        resume.set()
+        thread.join(timeout=2.0)
+    assert thread.is_alive() is False
+    assert errors == []
+    assert callback_fired.wait(timeout=1.0)
+    assert callbacks == ["idle"]
+    controller.release_service_owner(service_owner)
+    assert controller.in_flight == 0
+
+
+def test_completed_service_requester_rechecks_request_path_drain() -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    service_owner = controller.try_acquire_service_owner()
+    assert service_owner is not None
+    paused = threading.Event()
+    resume = threading.Event()
+    retained: list[Any] = []
+    errors: list[BaseException] = []
+
+    def requester() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        gate = asyncio.Event()
+
+        async def run() -> None:
+            async with controller.slot():
+                permit = controller.retain_current_work()
+                retained.append(permit)
+                controller.transfer_retained_work_to_service_owner(permit)
+                loop.call_soon(loop.stop)
+                await gate.wait()
+
+        task = loop.create_task(run())
+        task.add_done_callback(lambda _completed: loop.stop())
+        try:
+            loop.run_forever()
+            paused.set()
+            assert resume.wait(timeout=2.0)
+            loop.call_soon(gate.set)
+            loop.run_forever()
+            task.result()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+    thread = threading.Thread(target=requester, name="admission-completed-requester")
+    thread.start()
+    assert paused.wait(timeout=1.0)
+
+    callbacks: list[str] = []
+    callback_fired = threading.Event()
+
+    def record_idle() -> None:
+        callbacks.append("idle")
+        callback_fired.set()
+
+    try:
+        controller.when_request_paths_idle(record_idle)
+        assert callbacks == []
+    finally:
+        resume.set()
+        thread.join(timeout=2.0)
+    assert thread.is_alive() is False
+    assert errors == []
+    assert callback_fired.wait(timeout=1.0)
+    assert callbacks == ["idle"]
+    controller.release_retained_work(retained.pop())
+    controller.release_service_owner(service_owner)
+    assert controller.in_flight == 0
+
+
+def test_closed_service_requester_loop_rechecks_request_path_drain() -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    service_owner = controller.try_acquire_service_owner()
+    assert service_owner is not None
+    paused = threading.Event()
+    close_loop = threading.Event()
+    retained: list[Any] = []
+    tasks: list[asyncio.Task[Any]] = []
+    errors: list[BaseException] = []
+
+    def requester() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def run() -> None:
+            lease = await controller.acquire()
+            with controller.admitted_lease_context(lease):
+                permit = controller.retain_current_work()
+                retained.append(permit)
+                controller.transfer_retained_work_to_service_owner(permit)
+                loop.call_soon(loop.stop)
+                await asyncio.Event().wait()
+
+        task = loop.create_task(run())
+        tasks.append(task)
+        setattr(task, "_log_destroy_pending", False)
+        try:
+            loop.run_forever()
+            paused.set()
+            assert close_loop.wait(timeout=2.0)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+    thread = threading.Thread(target=requester, name="admission-closed-requester")
+    thread.start()
+    assert paused.wait(timeout=1.0)
+
+    callback_fired = threading.Event()
+    try:
+        controller.when_request_paths_idle(callback_fired.set)
+        assert callback_fired.is_set() is False
+    finally:
+        close_loop.set()
+        thread.join(timeout=2.0)
+    assert thread.is_alive() is False
+    assert errors == []
+    assert callback_fired.wait(timeout=1.0)
+    controller.release_retained_work(retained.pop())
+    tasks.pop().get_coro().close()
+    controller.release_service_owner(service_owner)
+    assert controller.in_flight == 0
+
+
+def test_final_root_drain_owner_does_not_wait_on_suspended_transport_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    graph = controller.execution_graph
+    root = graph.register_root_owner()
+    requester_callback_started = threading.Event()
+    release_requester_callback = threading.Event()
+    drain_started = threading.Event()
+    finish_drain = threading.Event()
+    owner_progress = [0]
+    requester_errors: list[BaseException] = []
+    original_drain = graph._drain_final_root
+    original_tick = pipeline_admission_module._drain_transport_tick
+
+    async def observed_drain(
+        generation: int,
+        initial_manager: object | None,
+        provider_recheck_required: bool,
+    ) -> None:
+        drain_started.set()
+        while not finish_drain.is_set():
+            owner_progress[0] += 1
+            await asyncio.sleep(0.01)
+        await original_drain(
+            generation,
+            initial_manager,
+            provider_recheck_required,
+        )
+
+    def suspended_transport_tick(owner: Any) -> None:
+        transport_lock = getattr(owner, "transport_wakeup_lock", None)
+        lock_context = transport_lock if transport_lock is not None else contextlib.nullcontext()
+        with lock_context:
+            requester_callback_started.set()
+            assert release_requester_callback.wait(timeout=2.0)
+        original_tick(owner)
+
+    monkeypatch.setattr(graph, "_drain_final_root", observed_drain)
+    monkeypatch.setattr(
+        pipeline_admission_module,
+        "_drain_transport_tick",
+        suspended_transport_tick,
+    )
+
+    def release_root() -> None:
+        try:
+            asyncio.run(graph.release_root_owner(root))
+        except BaseException as exc:
+            requester_errors.append(exc)
+
+    requester = threading.Thread(
+        target=release_root,
+        name="final-root-suspended-transport",
+    )
+    requester.start()
+    try:
+        assert drain_started.wait(timeout=1.0)
+        assert requester_callback_started.wait(timeout=1.0)
+        progress_before = owner_progress[0]
+        time.sleep(0.15)
+        assert owner_progress[0] >= progress_before + 5
+    finally:
+        release_requester_callback.set()
+        finish_drain.set()
+        requester.join(timeout=2.0)
+
+    assert requester.is_alive() is False
+    assert requester_errors == []
+    assert graph.root_state == "closed"
+    assert graph.root_owner_count == 0
+    assert controller.runtime_root_state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_final_root_terminal_publication_never_waits_on_requester_relay_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    graph = controller.execution_graph
+    root = graph.register_root_owner()
+    drain_started = threading.Event()
+    finish_drain = threading.Event()
+    original_drain = graph._drain_final_root
+
+    async def observed_drain(
+        generation: int,
+        initial_manager: object | None,
+        provider_recheck_required: bool,
+    ) -> None:
+        drain_started.set()
+        await asyncio.to_thread(finish_drain.wait)
+        await original_drain(
+            generation,
+            initial_manager,
+            provider_recheck_required,
+        )
+
+    monkeypatch.setattr(graph, "_drain_final_root", observed_drain)
+    release_task = asyncio.create_task(graph.release_root_owner(root))
+    assert await asyncio.to_thread(drain_started.wait, 1.0)
+    owner = graph._final_drain_owner
+    assert owner is not None
+    for _ in range(100):
+        if owner.transport_relays:
+            break
+        await asyncio.sleep(0)
+    assert owner.transport_relays
+
+    owner.transport_relay_lock.acquire()
+    try:
+        finish_drain.set()
+        assert await asyncio.to_thread(
+            owner.finished.wait,
+            0.2,
+        ), "requester-held relay lock blocked final-root owner exit"
+        await asyncio.wait_for(asyncio.shield(release_task), timeout=0.2)
+    finally:
+        owner.transport_relay_lock.release()
+        finish_drain.set()
+        if not release_task.done():
+            await asyncio.wait_for(release_task, timeout=1.0)
+
+    assert graph.root_state == "closed"
+    assert graph.root_owner_count == 0
+    assert controller.runtime_root_state == "closed"
+
+
+async def test_request_path_liveness_monitor_start_failure_cannot_strand_execution_graph() -> None:
+    failed_starts = 2
+    controller = PipelineAdmissionController(1, max_queued=0)
+    graph = controller.execution_graph
+    root = graph.register_root_owner()
+    service_owner = controller.try_acquire_service_owner()
+    assert service_owner is not None
+    requester_paused = threading.Event()
+    close_requester_loop = threading.Event()
+    retained: list[Any] = []
+    requester_tasks: list[asyncio.Task[Any]] = []
+    requester_errors: list[BaseException] = []
+
+    def requester() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def run() -> None:
+            lease = await controller.acquire()
+            with controller.admitted_lease_context(lease):
+                permit = controller.retain_current_work()
+                retained.append(permit)
+                controller.transfer_retained_work_to_service_owner(permit)
+                loop.call_soon(loop.stop)
+                await asyncio.Event().wait()
+
+        task = loop.create_task(run())
+        requester_tasks.append(task)
+        setattr(task, "_log_destroy_pending", False)
+        try:
+            loop.run_forever()
+            requester_paused.set()
+            assert close_requester_loop.wait(timeout=2.0)
+        except BaseException as exc:
+            requester_errors.append(exc)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+    requester_thread = threading.Thread(
+        target=requester,
+        name="admission-monitor-start-failure-requester",
+    )
+    requester_thread.start()
+    assert requester_paused.wait(timeout=1.0)
+
+    monitor_name = f"tacit-request-path-liveness-{id(controller)}"
+    real_start = threading.Thread.start
+    monitor_start_attempts: list[int] = []
+
+    def fail_first_monitor_start(thread: threading.Thread) -> None:
+        if thread.name == monitor_name:
+            monitor_start_attempts.append(len(monitor_start_attempts) + 1)
+            if len(monitor_start_attempts) <= failed_starts:
+                raise RuntimeError("injected request-path monitor start failure")
+        real_start(thread)
+
+    drain_task: asyncio.Task[None] | None = None
+    drain_error: BaseException | None = None
+    owner_heartbeat_observed = False
+    try:
+        with mock.patch.object(threading.Thread, "start", new=fail_first_monitor_start):
+            drain_task = asyncio.create_task(graph.release_root_owner(root))
+            for _ in range(100):
+                if len(monitor_start_attempts) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert monitor_start_attempts == [1, 2]
+            assert graph.root_state == "draining"
+            assert graph.root_owner_count == 0
+            drain_owner = graph._final_drain_owner
+            assert drain_owner is not None
+            assert drain_owner.drain_started.is_set()
+            assert controller.runtime_root_state == "draining"
+            assert controller.runtime_fatal_circuit is None
+
+            owner_heartbeat = threading.Event()
+            lifecycle_loop = getattr(drain_owner, "lifecycle_loop", None)
+            if lifecycle_loop is not None:
+                lifecycle_loop.call_soon_threadsafe(owner_heartbeat.set)
+                owner_heartbeat_observed = await asyncio.to_thread(owner_heartbeat.wait, 0.2)
+
+            close_requester_loop.set()
+            requester_thread.join(timeout=1.0)
+            assert requester_thread.is_alive() is False
+            assert requester_errors == []
+            controller.release_retained_work(retained.pop())
+            requester_tasks.pop().get_coro().close()
+            controller.release_service_owner(service_owner)
+            try:
+                await asyncio.wait_for(asyncio.shield(drain_task), timeout=1.0)
+            except BaseException as exc:
+                drain_error = exc
+    finally:
+        close_requester_loop.set()
+        requester_thread.join(timeout=1.0)
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await drain_task
+        if retained:
+            controller.release_retained_work(retained.pop())
+        if requester_tasks:
+            requester_tasks.pop().get_coro().close()
+        if controller.service_owner_in_flight:
+            controller.release_service_owner(service_owner)
+
+    assert drain_error is None
+    assert owner_heartbeat_observed is True
+    assert graph.root_state == "closed"
+    assert graph.root_owner_count == 0
+    assert graph._final_drain_owner is not None
+    assert graph._final_drain_owner.terminal is True
+    assert controller.runtime_root_state == "closed"
+    assert controller.runtime_fatal_circuit is None
+    assert controller.in_flight == 0
+
+
+async def test_async_retained_release_never_blocks_on_the_controller_lock() -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    lease = await controller.acquire()
+    with controller.admitted_lease_context(lease):
+        permit = controller.retain_current_work()
+    controller.release(lease)
+    callbacks: list[str] = []
+
+    def record_idle() -> None:
+        callbacks.append(f"idle:{controller.in_flight}")
+
+    controller.when_request_paths_idle(record_idle)
+
+    lock_held = threading.Event()
+    unlock = threading.Event()
+
+    def hold_controller_lock() -> None:
+        with controller._lock:
+            lock_held.set()
+            assert unlock.wait(timeout=2.0)
+
+    holder = threading.Thread(target=hold_controller_lock, name="admission-lock-holder")
+    holder.start()
+    assert await asyncio.to_thread(lock_held.wait, 1.0)
+
+    try:
+        release = asyncio.create_task(controller.release_retained_work_async(permit, timeout_seconds=1.0))
+        await asyncio.sleep(0.02)
+        assert release.done() is False
+    finally:
+        unlock.set()
+        holder.join(timeout=1.0)
+    await release
+    assert holder.is_alive() is False
+    assert callbacks == ["idle:0"]
+    assert controller.in_flight == 0
+
+
+async def test_requester_cannot_use_service_owner_release_boundaries() -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    lease = await controller.acquire()
+    with controller.admitted_lease_context(lease):
+        permit = controller.retain_current_work()
+
+    with pytest.raises(RuntimeOwnershipError, match="service owner"):
+        controller.try_release_from_service_owner(lease)
+    with pytest.raises(RuntimeOwnershipError, match="service owner"):
+        controller.try_release_retained_work_from_service_owner(permit)
+
+    controller.release_retained_work(permit)
+    controller.release(lease)
+    assert controller.in_flight == 0
+
+
+async def test_async_retained_release_timeout_is_retryable() -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    lease = await controller.acquire()
+    with controller.admitted_lease_context(lease):
+        permit = controller.retain_current_work()
+
+    lock_held = threading.Event()
+    unlock = threading.Event()
+
+    def hold_controller_lock() -> None:
+        with controller._lock:
+            lock_held.set()
+            assert unlock.wait(timeout=2.0)
+
+    holder = threading.Thread(target=hold_controller_lock, name="admission-timeout-lock-holder")
+    holder.start()
+    assert await asyncio.to_thread(lock_held.wait, 1.0)
+
+    try:
+        with pytest.raises(TimeoutError, match="retained-work release timed out"):
+            await controller.release_retained_work_async(permit, timeout_seconds=0.01)
+    finally:
+        unlock.set()
+        holder.join(timeout=1.0)
+    assert holder.is_alive() is False
+    await controller.release_retained_work_async(permit, timeout_seconds=1.0)
+    controller.release(lease)
+    assert controller.in_flight == 0
+
+
+async def test_async_retained_release_preserves_permit_identity_validation() -> None:
+    owner = PipelineAdmissionController(1, max_queued=0)
+    foreign = PipelineAdmissionController(1, max_queued=0)
+    lease = await owner.acquire()
+    with owner.admitted_lease_context(lease):
+        permit = owner.retain_current_work()
+
+    with pytest.raises(RuntimeError, match="belongs to another controller"):
+        await foreign.release_retained_work_async(permit, timeout_seconds=1.0)
+
+    await owner.release_retained_work_async(permit, timeout_seconds=1.0)
+    with pytest.raises(RuntimeError, match="is not active"):
+        await owner.release_retained_work_async(permit, timeout_seconds=1.0)
+    owner.release(lease)
+    assert owner.in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_service_owner_settlement_relays_idle_callbacks_off_owner_thread() -> None:
+    controller = PipelineAdmissionController(1, max_queued=0)
+    lease = await controller.acquire()
+    service_owner = controller.try_acquire_service_owner()
+    assert service_owner is not None
+    with controller.admitted_lease_context(lease):
+        retained = controller.retain_current_work()
+    controller.transfer_retained_work_to_service_owner(retained)
+    callback_started = threading.Event()
+    allow_callback = threading.Event()
+    settlement_returned = threading.Event()
+    owner_thread_id: list[int] = []
+    callback_thread_id: list[int] = []
+
+    def final_root_callback() -> None:
+        callback_thread_id.append(threading.get_ident())
+        callback_started.set()
+        assert allow_callback.wait(timeout=1.0)
+
+    controller.when_request_paths_idle(final_root_callback)
+
+    def settle_on_owner() -> None:
+        owner_thread_id.append(threading.get_ident())
+        with controller.service_owner(service_owner):
+            assert controller.try_release_from_service_owner(lease)
+            assert controller.try_release_retained_work_from_service_owner(retained)
+            settlement_returned.set()
+        controller.release_service_owner(service_owner)
+
+    owner = threading.Thread(target=settle_on_owner, name="provider-settlement-owner")
+    owner.start()
+    try:
+        assert await asyncio.to_thread(callback_started.wait, 1.0)
+        assert settlement_returned.is_set(), "final-root callback ran synchronously on the durable owner"
+        assert callback_thread_id != owner_thread_id
+    finally:
+        allow_callback.set()
+        owner.join(timeout=1.0)
+
+    assert owner.is_alive() is False
+    assert controller.in_flight == 0
+    assert controller.service_owner_in_flight == 0
 
 
 async def test_partitioned_queue_reserves_capacity_and_wakes_tenants_round_robin() -> None:

@@ -25,6 +25,9 @@ MAX_DIAGNOSTIC_BYTES = 16 * 1024
 PROCESS_REAP_TIMEOUT = 2.0
 HEALTH_POLL_INTERVAL = 0.2
 TMPFS_SPEC = "/tmp:rw,noexec,nosuid,size=67108864"
+RUNTIME_PIDS_LIMIT = 256
+RUNTIME_MEMORY_BYTES = 1024 * 1024 * 1024
+RUNTIME_NANO_CPUS = 2_000_000_000
 REQUIRED_RESOURCES = (
     "data/archetypes.yaml",
     "data/grounding_benchmark_v1.json",
@@ -256,6 +259,14 @@ def _runtime_options(platform: str, volume_name: str) -> list[str]:
     return [
         "--platform",
         platform,
+        "--network",
+        "none",
+        "--pids-limit",
+        str(RUNTIME_PIDS_LIMIT),
+        "--memory",
+        str(RUNTIME_MEMORY_BYTES),
+        "--cpus",
+        str(RUNTIME_NANO_CPUS / 1_000_000_000),
         "--read-only",
         "--tmpfs",
         TMPFS_SPEC,
@@ -385,6 +396,7 @@ def _wait_for_healthy(
 ) -> dict[str, object]:
     deadline = time.monotonic() + startup_timeout
     last_status = "created"
+    last_state: dict[str, object] = {}
     while time.monotonic() < deadline:
         inspected = _parse_object(
             _run_command(
@@ -397,18 +409,45 @@ def _wait_for_healthy(
         state = inspected.get("State")
         if not isinstance(state, dict):
             raise ImageSmokeError("release-image container has no runtime state")
+        last_state = state
         if state.get("Running") is not True:
-            raise ImageSmokeError(f"release-image server exited before health: {state.get('ExitCode')!r}")
+            raise ImageSmokeError(f"release-image server exited before health: {_health_state_diagnostic(state)}")
         health = state.get("Health")
         if not isinstance(health, dict):
             raise ImageSmokeError("release-image container has no runtime health state")
         last_status = str(health.get("Status") or "unknown")
         if last_status == "healthy":
             return inspected
-        if last_status == "unhealthy":
-            raise ImageSmokeError("release-image server became unhealthy")
         time.sleep(min(HEALTH_POLL_INTERVAL, max(deadline - time.monotonic(), 0)))
-    raise ImageSmokeError(f"release-image server did not become healthy ({last_status})")
+    raise ImageSmokeError(
+        f"release-image server did not become healthy ({last_status}): {_health_state_diagnostic(last_state)}"
+    )
+
+
+def _health_state_diagnostic(state: dict[str, object]) -> str:
+    health = state.get("Health")
+    selected: dict[str, object] = {
+        "running": state.get("Running"),
+        "exit_code": state.get("ExitCode"),
+        "oom_killed": state.get("OOMKilled"),
+    }
+    if isinstance(health, dict):
+        selected["status"] = str(health.get("Status") or "unknown")[:64]
+        selected["failing_streak"] = health.get("FailingStreak")
+        log = health.get("Log")
+        if isinstance(log, list):
+            selected["checks"] = [
+                {
+                    "start": str(item.get("Start") or "")[:128],
+                    "end": str(item.get("End") or "")[:128],
+                    "exit_code": item.get("ExitCode"),
+                    "output": str(item.get("Output") or "")[-1024:],
+                }
+                for item in log[-5:]
+                if isinstance(item, dict)
+            ]
+    rendered = json.dumps(selected, sort_keys=True, separators=(",", ":"))
+    return rendered[: MAX_DIAGNOSTIC_BYTES // 2]
 
 
 def _validate_runtime_inspect(inspected: dict[str, object]) -> None:
@@ -424,6 +463,14 @@ def _validate_runtime_inspect(inspected: dict[str, object]) -> None:
     tmpfs = host_config.get("Tmpfs")
     if not isinstance(tmpfs, dict) or "/tmp" not in tmpfs:
         raise ImageSmokeError("release-image server has no /tmp tmpfs")
+    if host_config.get("NetworkMode") != "none":
+        raise ImageSmokeError("release-image server network is not isolated")
+    if host_config.get("PidsLimit") != RUNTIME_PIDS_LIMIT:
+        raise ImageSmokeError("release-image server PID limit changed")
+    if host_config.get("Memory") != RUNTIME_MEMORY_BYTES:
+        raise ImageSmokeError("release-image server memory limit changed")
+    if host_config.get("NanoCpus") != RUNTIME_NANO_CPUS:
+        raise ImageSmokeError("release-image server CPU limit changed")
 
 
 def _resource_exists(kind: str, name: str, timeout: float) -> bool:
@@ -612,7 +659,7 @@ def _smoke(args: argparse.Namespace) -> None:
                 "--health-timeout",
                 "5s",
                 "--health-start-period",
-                "1s",
+                f"{max(1, math.ceil(args.startup_timeout))}s",
                 "--health-retries",
                 "10",
             ]
@@ -644,12 +691,17 @@ def _smoke(args: argparse.Namespace) -> None:
             failure = exc
             try:
                 if _resource_exists("container", server_container, args.cleanup_timeout):
-                    _run_command(
+                    logs = _run_command(
                         ["docker", "logs", "--tail", "200", server_container],
                         timeout=args.cleanup_timeout,
                         label="release-image failure logs",
                         check=False,
                     )
+                    if logs:
+                        diagnosed = ImageSmokeError(f"{failure}; server_logs={logs[-(MAX_DIAGNOSTIC_BYTES // 2):]}")
+                        diagnosed.__cause__ = failure
+                        diagnosed.__suppress_context__ = True
+                        failure = diagnosed
             except BaseException:
                 pass
         finally:

@@ -9,7 +9,10 @@ import subprocess
 import sys
 import textwrap
 import threading
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Awaitable, Callable, Coroutine
+from concurrent.futures import Executor, Future
+from contextvars import Context
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -134,12 +137,15 @@ async def _construct_owned_provider(
         max_queued=runtime_settings.pipeline_max_queued,
     )
     construction = LifecycleOwnedBlockingWork(lifecycle)
+    adopted: list[AnthropicProvider | OpenAIProvider | AzureOpenAIProvider] = []
     provider = await construction.realize_owned(
         lambda: case.provider_type(runtime_settings),
         validate=lambda _provider: None,
+        adopt=adopted.append,
         retire=lambda rejected: rejected.close(),
         reason_code=f"test_{case.name}_provider_construction",
     )
+    assert adopted == [provider]
     for _ in range(100):
         if construction.active == 0:
             break
@@ -679,6 +685,7 @@ async def test_owned_worker_start_failure_precedes_sdk_allocation(
         await construction.realize_owned(
             lambda: case.provider_type(runtime_settings),
             validate=lambda _provider: None,
+            adopt=lambda _provider: None,
             retire=lambda rejected: rejected.close(),
             reason_code=f"test_{case.name}_provider_start_failure",
         )
@@ -723,6 +730,722 @@ def test_rollback_quarantine_owner_start_failure_precedes_sdk_allocation(
     assert allocations == 0
     assert snapshot.slots == 0
     assert snapshot.owner_threads == 0
+
+
+def test_rollback_quarantine_owner_start_transition_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=1)
+    owner_start_entered = threading.Event()
+    release_owner_start = threading.Event()
+
+    def stall_owner_start(**_kwargs: object) -> threading.Thread:
+        owner_start_entered.set()
+        release_owner_start.wait(timeout=1.0)
+        raise RuntimeError("synthetic delayed owner start")
+
+    monkeypatch.setattr(
+        http_transport,
+        "_CONSTRUCTION_ROLLBACK_OWNER_STARTUP_TIMEOUT_SECONDS",
+        0.05,
+    )
+    monkeypatch.setattr(
+        http_transport,
+        "_start_lifecycle_owner_thread",
+        stall_owner_start,
+        raising=False,
+    )
+
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(RuntimeOwnershipError, match="readiness timed out"):
+            quarantine.reserve()
+    finally:
+        release_owner_start.set()
+
+    assert owner_start_entered.wait(timeout=0.25)
+    assert time.monotonic() - started_at < 0.25
+    assert quarantine.snapshot().slots == 0
+
+
+def test_rollback_quarantine_ambiguous_owner_start_remains_fenced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=1)
+
+    def fail_owner_start(**_kwargs: object) -> threading.Thread:
+        raise http_transport._LifecycleOwnerStartupError(
+            phase="start",
+            cause=RuntimeError("synthetic ambiguous owner start"),
+            thread_alive=True,
+        )
+
+    monkeypatch.setattr(
+        http_transport,
+        "_start_lifecycle_owner_thread",
+        fail_owner_start,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeOwnershipError, match="owner is unavailable"):
+        quarantine.reserve()
+
+    snapshot = quarantine.snapshot()
+    assert snapshot.slots == 0
+    assert snapshot.owner_threads == 0
+
+
+def test_rollback_quarantine_completion_never_waits_on_requester_registry_lock() -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=1)
+    reservation = quarantine.reserve()
+    operation_started = threading.Event()
+    release_operation = threading.Event()
+    heartbeat = threading.Event()
+    callback_registered = threading.Event()
+    rollback_finished = threading.Event()
+    rollback_errors: list[BaseException | None] = []
+
+    async def rollback_operation() -> None:
+        operation_started.set()
+        while not release_operation.is_set():
+            await asyncio.sleep(0.001)
+
+    def submit_rollback() -> None:
+        try:
+            rollback_errors.append(
+                quarantine.rollback(
+                    reservation,
+                    rollback_operation,
+                    deadline=time.monotonic() + 1.0,
+                )
+            )
+        finally:
+            rollback_finished.set()
+
+    submitter = threading.Thread(target=submit_rollback)
+    submitter.start()
+    assert operation_started.wait(timeout=1.0)
+
+    task = reservation._task
+    assert task is not None
+    assert quarantine._loop is not None
+
+    def register_heartbeat() -> None:
+        task.add_done_callback(lambda _completed: heartbeat.set())
+        callback_registered.set()
+
+    quarantine._loop.call_soon_threadsafe(register_heartbeat)
+    assert callback_registered.wait(timeout=1.0)
+
+    quarantine._lock.acquire()
+    try:
+        release_operation.set()
+        assert heartbeat.wait(timeout=0.25), "durable cleanup owner blocked on the requester registry lock"
+        assert rollback_finished.wait(timeout=0.25)
+    finally:
+        quarantine._lock.release()
+        submitter.join(timeout=1.0)
+
+    assert submitter.is_alive() is False
+    assert rollback_errors == [None]
+    for _ in range(100):
+        if quarantine.snapshot().slots == 0:
+            break
+        time.sleep(0.01)
+    assert quarantine.snapshot().slots == 0
+
+
+def test_rollback_quarantine_startup_never_waits_on_requester_reservation_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=2)
+    blocked = quarantine.reserve()
+    unrelated = quarantine.reserve()
+    assert quarantine._loop is not None
+    real_call_soon_threadsafe = quarantine._loop.call_soon_threadsafe
+    blocked_dispatch_ready = threading.Event()
+    allow_blocked_dispatch = threading.Event()
+    blocked_transition_entered = threading.Event()
+    blocked_operation_started = threading.Event()
+    release_blocked_operation = threading.Event()
+    unrelated_operation_started = threading.Event()
+    heartbeat = threading.Event()
+    blocked_errors: list[BaseException | None] = []
+    unrelated_errors: list[BaseException | None] = []
+    original_start_submission = quarantine._start_submission
+
+    def observed_start_submission(
+        reservation: http_transport._ConstructionRollbackReservation,
+    ) -> None:
+        blocked_transition_entered.set()
+        original_start_submission(reservation)
+
+    monkeypatch.setattr(quarantine, "_start_submission", observed_start_submission)
+
+    def intercept_call_soon_threadsafe(
+        callback: Callable[..., object],
+        *args: object,
+        context: Context | None = None,
+    ) -> asyncio.Handle:
+        if callback is observed_start_submission and args and args[0] is blocked:
+            blocked_dispatch_ready.set()
+            assert allow_blocked_dispatch.wait(timeout=1.0)
+        return real_call_soon_threadsafe(callback, *args, context=context)
+
+    monkeypatch.setattr(quarantine._loop, "call_soon_threadsafe", intercept_call_soon_threadsafe)
+
+    async def blocked_operation() -> None:
+        blocked_operation_started.set()
+        while not release_blocked_operation.is_set():
+            await asyncio.sleep(0.001)
+
+    async def unrelated_operation() -> None:
+        unrelated_operation_started.set()
+
+    blocked_submitter = threading.Thread(
+        target=lambda: blocked_errors.append(
+            quarantine.rollback(
+                blocked,
+                blocked_operation,
+                deadline=time.monotonic() + 2.0,
+            )
+        )
+    )
+    unrelated_submitter = threading.Thread(
+        target=lambda: unrelated_errors.append(
+            quarantine.rollback(
+                unrelated,
+                unrelated_operation,
+                deadline=time.monotonic() + 2.0,
+            )
+        )
+    )
+    blocked_submitter.start()
+    assert blocked_dispatch_ready.wait(timeout=1.0)
+
+    blocked._lock.acquire()
+    try:
+        allow_blocked_dispatch.set()
+        assert blocked_transition_entered.wait(timeout=1.0)
+        unrelated_submitter.start()
+        real_call_soon_threadsafe(heartbeat.set)
+
+        assert heartbeat.wait(timeout=0.25), "rollback owner blocked during startup publication"
+        assert unrelated_operation_started.wait(timeout=0.25), "unrelated rollback slot did not progress"
+        assert blocked_operation_started.wait(timeout=0.25)
+    finally:
+        blocked._lock.release()
+        release_blocked_operation.set()
+        allow_blocked_dispatch.set()
+        blocked_submitter.join(timeout=2.0)
+        unrelated_submitter.join(timeout=2.0)
+
+    assert blocked_submitter.is_alive() is False
+    assert unrelated_submitter.is_alive() is False
+    assert blocked_errors == [None]
+    assert unrelated_errors == [None]
+
+
+def test_rollback_quarantine_cancellation_never_waits_on_requester_reservation_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=2)
+    blocked = quarantine.reserve()
+    unrelated = quarantine.reserve()
+    assert quarantine._loop is not None
+    real_call_soon_threadsafe = quarantine._loop.call_soon_threadsafe
+    cancellation_dispatch_ready = threading.Event()
+    allow_cancellation_dispatch = threading.Event()
+    cancellation_transition_entered = threading.Event()
+    blocked_operation_started = threading.Event()
+    cancellation_observed = threading.Event()
+    unrelated_operation_started = threading.Event()
+    heartbeat = threading.Event()
+    blocked_errors: list[BaseException | None] = []
+    unrelated_errors: list[BaseException | None] = []
+    original_cancel_submission = quarantine._cancel_submission
+
+    def observed_cancel_submission(
+        reservation: http_transport._ConstructionRollbackReservation,
+    ) -> None:
+        cancellation_transition_entered.set()
+        original_cancel_submission(reservation)
+
+    monkeypatch.setattr(quarantine, "_cancel_submission", observed_cancel_submission)
+
+    def intercept_call_soon_threadsafe(
+        callback: Callable[..., object],
+        *args: object,
+        context: Context | None = None,
+    ) -> asyncio.Handle:
+        if callback is observed_cancel_submission and args and args[0] is blocked:
+            cancellation_dispatch_ready.set()
+            assert allow_cancellation_dispatch.wait(timeout=1.0)
+        return real_call_soon_threadsafe(callback, *args, context=context)
+
+    monkeypatch.setattr(quarantine._loop, "call_soon_threadsafe", intercept_call_soon_threadsafe)
+
+    async def blocked_operation() -> None:
+        blocked_operation_started.set()
+        try:
+            while True:
+                await asyncio.sleep(0.001)
+        except asyncio.CancelledError:
+            cancellation_observed.set()
+            raise
+
+    async def unrelated_operation() -> None:
+        unrelated_operation_started.set()
+
+    blocked_submitter = threading.Thread(
+        target=lambda: blocked_errors.append(
+            quarantine.rollback(
+                blocked,
+                blocked_operation,
+                deadline=time.monotonic() + 0.05,
+            )
+        )
+    )
+    unrelated_submitter = threading.Thread(
+        target=lambda: unrelated_errors.append(
+            quarantine.rollback(
+                unrelated,
+                unrelated_operation,
+                deadline=time.monotonic() + 2.0,
+            )
+        )
+    )
+    blocked_submitter.start()
+    assert blocked_operation_started.wait(timeout=1.0)
+    assert cancellation_dispatch_ready.wait(timeout=1.0)
+
+    blocked._lock.acquire()
+    try:
+        allow_cancellation_dispatch.set()
+        assert cancellation_transition_entered.wait(timeout=1.0)
+        unrelated_submitter.start()
+        real_call_soon_threadsafe(heartbeat.set)
+
+        assert heartbeat.wait(timeout=0.25), "rollback owner blocked while claiming cancellation"
+        assert unrelated_operation_started.wait(timeout=0.25), "unrelated rollback slot did not progress"
+        assert cancellation_observed.wait(timeout=0.25)
+    finally:
+        blocked._lock.release()
+        allow_cancellation_dispatch.set()
+        blocked_submitter.join(timeout=2.0)
+        unrelated_submitter.join(timeout=2.0)
+
+    assert blocked_submitter.is_alive() is False
+    assert unrelated_submitter.is_alive() is False
+    assert len(blocked_errors) == 1
+    assert isinstance(blocked_errors[0], TimeoutError)
+    assert unrelated_errors == [None]
+
+
+def test_rollback_quarantine_completion_keeps_capacity_while_requester_lock_is_held() -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=2)
+    blocked = quarantine.reserve()
+    unrelated = quarantine.reserve()
+    assert quarantine._loop is not None
+    blocked_operation_started = threading.Event()
+    release_blocked_operation = threading.Event()
+    unrelated_operation_started = threading.Event()
+    heartbeat = threading.Event()
+    blocked_errors: list[BaseException | None] = []
+    unrelated_errors: list[BaseException | None] = []
+
+    async def blocked_operation() -> None:
+        blocked_operation_started.set()
+        while not release_blocked_operation.is_set():
+            await asyncio.sleep(0.001)
+
+    async def unrelated_operation() -> None:
+        unrelated_operation_started.set()
+
+    blocked_submitter = threading.Thread(
+        target=lambda: blocked_errors.append(
+            quarantine.rollback(
+                blocked,
+                blocked_operation,
+                deadline=time.monotonic() + 2.0,
+            )
+        )
+    )
+    unrelated_submitter = threading.Thread(
+        target=lambda: unrelated_errors.append(
+            quarantine.rollback(
+                unrelated,
+                unrelated_operation,
+                deadline=time.monotonic() + 2.0,
+            )
+        )
+    )
+    blocked_submitter.start()
+    assert blocked_operation_started.wait(timeout=1.0)
+
+    blocked._lock.acquire()
+    try:
+        release_blocked_operation.set()
+        unrelated_submitter.start()
+        quarantine._loop.call_soon_threadsafe(heartbeat.set)
+
+        assert heartbeat.wait(timeout=0.25), "rollback owner blocked during terminal publication"
+        assert unrelated_operation_started.wait(timeout=0.25), "unrelated rollback slot did not progress"
+        with quarantine._lock:
+            assert quarantine._slots.get(blocked.token) is blocked
+    finally:
+        blocked._lock.release()
+        blocked_submitter.join(timeout=2.0)
+        unrelated_submitter.join(timeout=2.0)
+
+    assert blocked_submitter.is_alive() is False
+    assert unrelated_submitter.is_alive() is False
+    assert blocked_errors == [None]
+    assert unrelated_errors == [None]
+    for _ in range(100):
+        with quarantine._lock:
+            if blocked.token not in quarantine._slots:
+                break
+        time.sleep(0.01)
+    with quarantine._lock:
+        assert blocked.token not in quarantine._slots
+
+
+def test_rollback_quarantine_retries_transient_owner_dispatch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=1)
+    reservation = quarantine.reserve()
+    assert quarantine._loop is not None
+    real_call_soon_threadsafe = quarantine._loop.call_soon_threadsafe
+    dispatch_attempts = 0
+    operation_started = threading.Event()
+
+    def flaky_call_soon_threadsafe(
+        callback: Callable[..., object],
+        *args: object,
+        context: Context | None = None,
+    ) -> asyncio.Handle:
+        nonlocal dispatch_attempts
+        if getattr(callback, "__name__", "") == "_start_submission":
+            dispatch_attempts += 1
+            if dispatch_attempts == 1:
+                raise RuntimeError("synthetic transient owner dispatch failure")
+        return real_call_soon_threadsafe(callback, *args, context=context)
+
+    monkeypatch.setattr(quarantine._loop, "call_soon_threadsafe", flaky_call_soon_threadsafe)
+
+    async def rollback_operation() -> None:
+        operation_started.set()
+
+    assert (
+        quarantine.rollback(
+            reservation,
+            rollback_operation,
+            deadline=time.monotonic() + 1.0,
+        )
+        is None
+    )
+    assert operation_started.is_set()
+    assert dispatch_attempts == 2
+    for _ in range(100):
+        if quarantine.snapshot().slots == 0:
+            break
+        time.sleep(0.01)
+    assert quarantine.snapshot().slots == 0
+
+
+def test_rollback_quarantine_persistent_owner_dispatch_failure_is_fenced_and_charged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=1)
+    reservation = quarantine.reserve()
+    assert quarantine._loop is not None
+    real_call_soon_threadsafe = quarantine._loop.call_soon_threadsafe
+    dispatch_attempts = 0
+    operation_started = threading.Event()
+
+    def fail_start_dispatch(
+        callback: Callable[..., object],
+        *args: object,
+        context: Context | None = None,
+    ) -> asyncio.Handle:
+        nonlocal dispatch_attempts
+        if getattr(callback, "__name__", "") == "_start_submission":
+            dispatch_attempts += 1
+            raise RuntimeError("synthetic persistent owner dispatch failure")
+        return real_call_soon_threadsafe(callback, *args, context=context)
+
+    monkeypatch.setattr(quarantine._loop, "call_soon_threadsafe", fail_start_dispatch)
+
+    async def rollback_operation() -> None:
+        operation_started.set()
+
+    started_at = time.monotonic()
+    error = quarantine.rollback(
+        reservation,
+        rollback_operation,
+        deadline=started_at + 0.05,
+    )
+
+    assert time.monotonic() - started_at < 0.25
+    assert isinstance(error, TimeoutError)
+    assert isinstance(error.__cause__, RuntimeError)
+    assert operation_started.is_set() is False
+    assert dispatch_attempts >= 2
+    snapshot = quarantine.snapshot()
+    assert snapshot.slots == 1
+    assert snapshot.owner_threads == 1
+
+
+def test_rollback_quarantine_retries_transient_task_creation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=1)
+    reservation = quarantine.reserve()
+    real_create_task = asyncio.create_task
+    create_attempts = 0
+    operation_started = threading.Event()
+
+    def flaky_create_task(
+        coroutine: Coroutine[object, object, None],
+        *,
+        name: str | None = None,
+        context: Context | None = None,
+    ) -> asyncio.Task[None]:
+        nonlocal create_attempts
+        if threading.current_thread().name == http_transport._CONSTRUCTION_ROLLBACK_THREAD_NAME:
+            create_attempts += 1
+            if create_attempts == 1:
+                raise RuntimeError("synthetic transient task creation failure")
+        return real_create_task(coroutine, name=name, context=context)
+
+    monkeypatch.setattr(http_transport.asyncio, "create_task", flaky_create_task)
+
+    async def rollback_operation() -> None:
+        operation_started.set()
+
+    assert (
+        quarantine.rollback(
+            reservation,
+            rollback_operation,
+            deadline=time.monotonic() + 1.0,
+        )
+        is None
+    )
+    assert operation_started.is_set()
+    assert create_attempts == 2
+    for _ in range(100):
+        if quarantine.snapshot().slots == 0:
+            break
+        time.sleep(0.01)
+    assert quarantine.snapshot().slots == 0
+
+
+def test_rollback_quarantine_persistent_task_creation_failure_is_fenced_and_charged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=1)
+    reservation = quarantine.reserve()
+    real_create_task = asyncio.create_task
+    create_attempts = 0
+    operation_started = threading.Event()
+
+    def fail_owner_create_task(
+        coroutine: Coroutine[object, object, None],
+        *,
+        name: str | None = None,
+        context: Context | None = None,
+    ) -> asyncio.Task[None]:
+        nonlocal create_attempts
+        if threading.current_thread().name == http_transport._CONSTRUCTION_ROLLBACK_THREAD_NAME:
+            create_attempts += 1
+            raise RuntimeError("synthetic persistent task creation failure")
+        return real_create_task(coroutine, name=name, context=context)
+
+    monkeypatch.setattr(http_transport.asyncio, "create_task", fail_owner_create_task)
+
+    async def rollback_operation() -> None:
+        operation_started.set()
+
+    error = quarantine.rollback(
+        reservation,
+        rollback_operation,
+        deadline=time.monotonic() + 0.05,
+    )
+
+    assert isinstance(error, RuntimeOwnershipError)
+    assert "task could not be created" in str(error)
+    assert isinstance(error.__cause__, RuntimeError)
+    assert operation_started.is_set() is False
+    assert create_attempts >= 2
+    snapshot = quarantine.snapshot()
+    assert snapshot.slots == 1
+    assert snapshot.owner_threads == 1
+
+
+def test_rollback_quarantine_requester_lock_cannot_defeat_deadline() -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=1)
+    reservation = quarantine.reserve()
+    operation_started = threading.Event()
+    release_operation = threading.Event()
+    rollback_finished = threading.Event()
+    heartbeat = threading.Event()
+    rollback_errors: list[BaseException | None] = []
+
+    async def rollback_operation() -> None:
+        operation_started.set()
+        while not release_operation.is_set():
+            await asyncio.sleep(0.001)
+
+    def submit_rollback() -> None:
+        try:
+            rollback_errors.append(
+                quarantine.rollback(
+                    reservation,
+                    rollback_operation,
+                    deadline=time.monotonic() + 0.05,
+                )
+            )
+        finally:
+            rollback_finished.set()
+
+    reservation._lock.acquire()
+    submitter = threading.Thread(target=submit_rollback)
+    submitter.start()
+    try:
+        assert operation_started.wait(timeout=0.25)
+        assert rollback_finished.wait(timeout=0.25), "requester lock defeated rollback deadline"
+        assert len(rollback_errors) == 1
+        assert isinstance(rollback_errors[0], TimeoutError)
+        assert quarantine._loop is not None
+        quarantine._loop.call_soon_threadsafe(heartbeat.set)
+        assert heartbeat.wait(timeout=0.25)
+        with quarantine._lock:
+            assert quarantine._slots.get(reservation.token) is reservation
+        release_operation.set()
+        time.sleep(0.05)
+        with quarantine._lock:
+            assert quarantine._slots.get(reservation.token) is reservation
+    finally:
+        reservation._lock.release()
+        release_operation.set()
+        submitter.join(timeout=1.0)
+
+    assert submitter.is_alive() is False
+    for _ in range(100):
+        if quarantine.snapshot().slots == 0:
+            break
+        time.sleep(0.01)
+    assert quarantine.snapshot().slots == 0
+
+
+def test_rollback_quarantine_tracks_descendants_until_actual_retirement() -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=1)
+    reservation = quarantine.reserve()
+    descendant_started = threading.Event()
+    descendant_cancelled = threading.Event()
+    release_descendant = threading.Event()
+    rollback_finished = threading.Event()
+    rollback_errors: list[BaseException | None] = []
+
+    async def descendant() -> None:
+        descendant_started.set()
+        try:
+            while not release_descendant.is_set():
+                await asyncio.sleep(0.001)
+        except asyncio.CancelledError:
+            descendant_cancelled.set()
+            while not release_descendant.is_set():
+                await asyncio.sleep(0.001)
+
+    async def rollback_operation() -> None:
+        asyncio.create_task(descendant())
+
+    def submit_rollback() -> None:
+        try:
+            rollback_errors.append(
+                quarantine.rollback(
+                    reservation,
+                    rollback_operation,
+                    deadline=time.monotonic() + 0.05,
+                )
+            )
+        finally:
+            rollback_finished.set()
+
+    submitter = threading.Thread(target=submit_rollback)
+    submitter.start()
+    try:
+        assert descendant_started.wait(timeout=1.0)
+        assert rollback_finished.wait(timeout=0.5)
+        assert len(rollback_errors) == 1
+        assert isinstance(rollback_errors[0], TimeoutError)
+        assert descendant_cancelled.wait(timeout=0.5)
+        snapshot = quarantine.snapshot()
+        assert snapshot.slots == 1
+        assert snapshot.owner_threads == 1
+        with pytest.raises(RuntimeOwnershipError, match="capacity is exhausted"):
+            quarantine.reserve()
+    finally:
+        release_descendant.set()
+        submitter.join(timeout=1.0)
+
+    assert submitter.is_alive() is False
+    for _ in range(100):
+        if quarantine.snapshot().slots == 0:
+            break
+        time.sleep(0.01)
+    assert quarantine.snapshot().slots == 0
+
+
+@pytest.mark.parametrize("executor_kind", ["default", "explicit"])
+def test_rollback_quarantine_rejects_executor_offload_and_keeps_slot_fenced(
+    executor_kind: str,
+) -> None:
+    quarantine = http_transport._ConstructionRollbackQuarantine(capacity=1)
+    reservation = quarantine.reserve()
+    offloaded_work_ran = threading.Event()
+    offload_rejected = threading.Event()
+    submitted = threading.Event()
+
+    class ExecutorProbe:
+        def submit(self, fn: Callable[..., object], /, *args: object, **kwargs: object) -> Future[object]:
+            submitted.set()
+            future: Future[object] = Future()
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except BaseException as error:
+                future.set_exception(error)
+            return future
+
+    executor = cast(Executor, ExecutorProbe())
+
+    async def rollback_operation() -> None:
+        try:
+            if executor_kind == "default":
+                await asyncio.to_thread(offloaded_work_ran.set)
+            else:
+                await asyncio.get_running_loop().run_in_executor(executor, offloaded_work_ran.set)
+        except RuntimeOwnershipError:
+            offload_rejected.set()
+
+    error = quarantine.rollback(
+        reservation,
+        rollback_operation,
+        deadline=time.monotonic() + 1.0,
+    )
+
+    assert isinstance(error, RuntimeOwnershipError)
+    assert "executor offload is unsupported" in str(error)
+    assert offload_rejected.wait(timeout=0.25)
+    assert offloaded_work_ran.is_set() is False
+    assert submitted.is_set() is False
+    snapshot = quarantine.snapshot()
+    assert snapshot.slots == 1
+    assert snapshot.owner_threads == 1
+    with pytest.raises(RuntimeOwnershipError, match="capacity is exhausted"):
+        quarantine.reserve()
 
 
 @pytest.mark.parametrize("cleanup_fault", ["failure", "timeout"])
@@ -881,6 +1604,7 @@ def test_cancellation_resistant_constructor_rollback_is_bounded_and_fences_runti
                 await construction_work.realize_owned(
                     construct,
                     validate=lambda _provider: None,
+                    adopt=lambda _provider: None,
                     retire=lambda _provider: None,
                     reason_code="provider:llm_realization",
                 )

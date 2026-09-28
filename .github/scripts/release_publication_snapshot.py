@@ -64,6 +64,7 @@ class _MountInfoEntry(NamedTuple):
     root: str
     mount_point: str
     options: frozenset[str]
+    optional_fields: frozenset[str]
     filesystem: str
     source: str
     super_options: frozenset[str]
@@ -370,6 +371,7 @@ def _mountinfo_entries(path: Path | None = None) -> list[_MountInfoEntry]:
                     root=_decode_mountinfo_field(fields[3]),
                     mount_point=mount_point,
                     options=frozenset(fields[5].split(",")),
+                    optional_fields=frozenset(fields[6:separator]),
                     filesystem=fields[separator + 1],
                     source=_decode_mountinfo_field(fields[separator + 2]),
                     super_options=frozenset(fields[separator + 3].split(",")),
@@ -400,6 +402,30 @@ def _created_mount_entry(path: Path, previous_ids: set[int]) -> _MountInfoEntry:
     return created[0]
 
 
+def _mount_is_shared(entry: _MountInfoEntry) -> bool:
+    return any(field.startswith("shared:") for field in entry.optional_fields)
+
+
+def _covering_mount_entry(path: Path) -> _MountInfoEntry:
+    candidates = [
+        entry
+        for entry in _mountinfo_entries()
+        if Path(entry.mount_point) == path or Path(entry.mount_point) in path.parents
+    ]
+    if not candidates:
+        raise PublicationSnapshotError("publication path has no covering mount")
+    return max(candidates, key=lambda entry: len(Path(entry.mount_point).parts))
+
+
+def _isolate_destination_mount_propagation(destination: Path) -> None:
+    covering = _covering_mount_entry(destination)
+    if not _mount_is_shared(covering):
+        return
+    _run_mount_command(_MOUNT_COMMAND, "--make-slave", covering.mount_point)
+    if _mount_is_shared(_covering_mount_entry(destination)):
+        raise PublicationSnapshotError("publication destination mount propagation was not isolated")
+
+
 def _create_bind_mount(
     source: Path,
     destination: Path,
@@ -409,12 +435,17 @@ def _create_bind_mount(
     required_options: frozenset[str],
 ) -> _MountRecord:
     expected_identity = _directory_identity(source)
+    _isolate_destination_mount_propagation(destination)
     previous_ids = {entry.mount_id for entry in _mountinfo_entries(destination)}
     created_id: int | None = None
     try:
         _run_mount_command(_MOUNT_COMMAND, "--bind", str(source), str(destination))
         created = _created_mount_entry(destination, previous_ids)
         created_id = created.mount_id
+        _run_mount_command(_MOUNT_COMMAND, "--make-slave", str(destination))
+        isolated = _mountinfo_by_id().get(created_id)
+        if isolated is None or _mount_is_shared(isolated):
+            raise PublicationSnapshotError("publication mount propagation was not isolated")
         _run_mount_command(_MOUNT_COMMAND, "-o", remount_options, str(destination))
         current = _mountinfo_by_id().get(created_id)
         if current is None or not required_options.issubset(current.options):
@@ -694,6 +725,8 @@ def _verified_recorded_mounts(authority: _MountAuthority) -> dict[int, _MountInf
         required = _REQUIRED_MOUNT_OPTIONS if record.kind == "payload" else _REQUIRED_ANCHOR_OPTIONS
         if not required.issubset(entry.options):
             raise PublicationSnapshotError("recorded publication mount options changed")
+        if _mount_is_shared(entry):
+            raise PublicationSnapshotError("recorded publication mount propagation changed")
         if _directory_identity(Path(entry.mount_point)) != (record.device, record.inode):
             raise PublicationSnapshotError("recorded publication mount directory changed")
         selected[record.mount_id] = entry
@@ -730,7 +763,7 @@ def _verify_sealed_mount(
     mount_id: int,
 ) -> None:
     entries = [entry for entry in _mountinfo_entries(destination_directory) if entry.mount_id == mount_id]
-    if len(entries) != 1 or not _REQUIRED_MOUNT_OPTIONS.issubset(entries[0].options):
+    if len(entries) != 1 or not _REQUIRED_MOUNT_OPTIONS.issubset(entries[0].options) or _mount_is_shared(entries[0]):
         raise PublicationSnapshotError("publisher path is not one read-only hardened bind mount")
     if _directory_identity(destination_directory) != _directory_identity(backing_directory):
         raise PublicationSnapshotError("publisher path is not bound to the sealed backing directory")

@@ -2315,7 +2315,12 @@ def serve(host: str, port: int, reload: bool, no_slack: bool):
     """Start the Tacit API server."""
     _load_env()
 
-    from tacit.config import create_settings, is_loopback_bind_host, validate_api_server_bind
+    from tacit.config import (
+        canonical_api_allowed_hosts,
+        create_settings,
+        is_loopback_bind_host,
+        validate_api_server_bind,
+    )
 
     if no_slack:
         _disable_slack_environment()
@@ -2331,6 +2336,12 @@ def serve(host: str, port: int, reload: bool, no_slack: bool):
         host = validate_api_server_bind(active_settings, host)
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
+    if os.environ.get("TACIT_CONTAINER_HEALTHCHECK") == "1":
+        from tacit.container_healthcheck import write_container_health_host
+
+        first_allowed = canonical_api_allowed_hosts(active_settings.api_allowed_hosts).split(",", maxsplit=1)[0]
+        health_host = f"health.{first_allowed[2:]}" if first_allowed.startswith("*.") else first_allowed
+        write_container_health_host(health_host)
     if reload and not is_loopback_bind_host(host):
         raise click.UsageError(
             "Reload is limited to loopback serving because each reload worker re-imports runtime security settings"

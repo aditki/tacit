@@ -20,6 +20,7 @@ from tacit.config import Settings, settings
 from tacit.context.enrichment import enrich_context
 from tacit.culprit_ranking import rank_culprits
 from tacit.dependencies import (
+    BackendResourceLease,
     PipelineDependencies,
     ProviderLeaseHandle,
     RuntimeRootUseHandle,
@@ -73,7 +74,6 @@ from tacit.pipeline.recording import (
 from tacit.pipeline.side_effects import (
     begin_task_cancellation,
     cancel_task_with_grace,
-    safe_close_backends,
     terminal_cleanup_failure,
 )
 from tacit.pipeline.stages.archetypes import (
@@ -171,55 +171,88 @@ def _default_dependencies(runtime_stores: RuntimeStores | None = None) -> Pipeli
 
 async def _cleanup_pipeline_resources(
     deps: PipelineDependencies,
-    backends: list[DashboardBackend],
+    backend_lease: BackendResourceLease | None,
+    provider_lease: ProviderLeaseHandle | None = None,
 ) -> None:
-    """Release per-run backends and shared provider leases concurrently."""
+    """Close per-run backends before releasing shared provider resources."""
     primary_error = sys.exception()
-    first_cleanup_error_type: str | None = None
-    backend_cleanup = asyncio.create_task(
-        safe_close_backends(
-            backends,
-            grace_seconds=deps.cleanup_grace_seconds,
-            lifecycle=deps.pipeline_admission,
-        ),
-        name="tacit-pipeline-backend-cleanup",
+    cancellation: asyncio.CancelledError | None = None
+    backend_error: BaseException | None = None
+    if isinstance(backend_lease, BackendResourceLease):
+        backend_error, cancellation = await _settle_pipeline_cleanup_phase(
+            deps.close_backends(backend_lease),
+            task_name="tacit-pipeline-backend-cleanup",
+        )
+
+    provider_cleanup = deps.close_resources(provider_lease) if provider_lease is not None else deps.close_resources()
+    provider_error, provider_cancellation = await _settle_pipeline_cleanup_phase(
+        provider_cleanup,
+        task_name="tacit-pipeline-provider-cleanup",
     )
-    try:
-        await deps.close_resources()
-    except asyncio.CancelledError:
-        backend_cleanup.cancel()
-        await asyncio.gather(backend_cleanup, return_exceptions=True)
-        raise
-    except BaseException as exc:
-        first_cleanup_error_type = type(exc).__name__
-    try:
-        await backend_cleanup
-    except asyncio.CancelledError:
-        raise
-    except BaseException as exc:
-        if first_cleanup_error_type is None:
-            first_cleanup_error_type = type(exc).__name__
-    if first_cleanup_error_type is not None:
+    if cancellation is None:
+        cancellation = provider_cancellation
+
+    first_cleanup_error = backend_error if backend_error is not None else provider_error
+    if first_cleanup_error is not None:
+        first_cleanup_resource = "backends" if backend_error is not None else "providers"
+        cleanup_reason_code = str(
+            getattr(first_cleanup_error, "cleanup_reason_code", "pipeline_resource_cleanup_failed")
+        )[:128]
         logger.warning(
             "pipeline_resource_cleanup_failed",
-            reason_code="pipeline_resource_cleanup_failed",
-            error_type=first_cleanup_error_type,
+            reason_code=cleanup_reason_code,
+            error_type=type(first_cleanup_error).__name__[:128],
+            resource=first_cleanup_resource,
         )
+        cleanup_primary = primary_error if primary_error is not None else cancellation
         raise terminal_cleanup_failure(
-            primary_error,
-            first_cleanup_error_type,
+            cleanup_primary,
+            first_cleanup_error,
             reason_code="pipeline_resource_cleanup_failed",
             message="Pipeline resource cleanup failed",
         )
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _settle_pipeline_cleanup_phase(
+    cleanup: Awaitable[None],
+    *,
+    task_name: str,
+) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+    """Settle one cleanup phase without making caller cancellation its owner."""
+    cleanup_task: asyncio.Future[None] = asyncio.ensure_future(cleanup)
+    if isinstance(cleanup_task, asyncio.Task):
+        cleanup_task.set_name(task_name)
+    cancellation: asyncio.CancelledError | None = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as exc:
+            if _current_task_is_cancelling() and cancellation is None:
+                cancellation = exc
+        except BaseException:
+            break
+
+    cleanup_error: BaseException | None = None
+    try:
+        cleanup_task.result()
+    except BaseException as exc:
+        cleanup_error = exc
+    return cleanup_error, cancellation
 
 
 async def _complete_after_provider_release(
     deps: PipelineDependencies,
     provider_lease: ProviderLeaseHandle | None,
     complete: Callable[[], Awaitable[DashResponse]],
+    *,
+    on_released: Callable[[], None] | None = None,
 ) -> DashResponse:
     """Make provider retirement part of the run's successful completion gate."""
     await deps.close_resources(provider_lease)
+    if on_released is not None:
+        on_released()
     return await complete()
 
 
@@ -259,6 +292,23 @@ def _append_terminal_cleanup_audit(
             f"cleanup_reason_code={reason_code}",
             f"cleanup_error_type={error_type}",
         )
+    )
+
+
+def _attach_pipeline_resource_cleanup_metadata(
+    primary_error: BaseException,
+    cleanup_error: RuntimeOwnershipError,
+) -> None:
+    """Attach bounded cleanup identity without replacing the pipeline failure."""
+    setattr(
+        primary_error,
+        "cleanup_reason_code",
+        _bounded_terminal_metadata(getattr(cleanup_error, "cleanup_reason_code", "pipeline_resource_cleanup_failed")),
+    )
+    setattr(
+        primary_error,
+        "cleanup_error_type",
+        _bounded_terminal_metadata(getattr(cleanup_error, "cleanup_error_type", type(cleanup_error).__name__)),
     )
 
 
@@ -309,9 +359,11 @@ def _attach_runtime_root_cleanup_metadata(
     primary_error: BaseException,
     cleanup_error: BaseException,
 ) -> None:
-    """Keep the primary error while attaching only bounded cleanup diagnostics."""
-    setattr(primary_error, "cleanup_reason_code", _RUNTIME_ROOT_CLEANUP_REASON)
-    setattr(primary_error, "cleanup_error_type", _runtime_root_cleanup_error_type(cleanup_error))
+    """Keep the first cleanup phase while attaching only bounded diagnostics."""
+    if not getattr(primary_error, "cleanup_reason_code", None):
+        setattr(primary_error, "cleanup_reason_code", _RUNTIME_ROOT_CLEANUP_REASON)
+    if not getattr(primary_error, "cleanup_error_type", None):
+        setattr(primary_error, "cleanup_error_type", _runtime_root_cleanup_error_type(cleanup_error))
 
 
 def _runtime_root_authority_is_active(deps: PipelineDependencies | None) -> bool:
@@ -768,14 +820,15 @@ async def _run_pipeline_inner(
     t_start = time.monotonic()
     timings: dict[str, float] = {}
     backends: list[DashboardBackend] = []
+    backend_lease: BackendResourceLease | None = None
     provider_lease = None
     try:
         history = deps.history_store_factory()
     except asyncio.CancelledError:
-        await _cleanup_pipeline_resources(deps, backends)
+        await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
         raise
     except Exception as exc:
-        await _cleanup_pipeline_resources(deps, backends)
+        await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
         raise PipelineExecutionError(
             "Investigation audit storage is unavailable",
             investigation_id=investigation_id or "",
@@ -784,7 +837,7 @@ async def _run_pipeline_inner(
     current_contract = None
     if investigation_id:
         if not hasattr(history, "get_contract"):
-            await _cleanup_pipeline_resources(deps, backends)
+            await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
             raise ValueError("existing investigations require a tenant-aware history store")
         try:
             current_contract = history.get_contract(
@@ -792,27 +845,27 @@ async def _run_pipeline_inner(
                 tenant_id=request.tenant_id,
             )
         except asyncio.CancelledError:
-            await _cleanup_pipeline_resources(deps, backends)
+            await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
             raise
         except Exception as exc:
-            await _cleanup_pipeline_resources(deps, backends)
+            await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
             raise PipelineExecutionError(
                 "Investigation audit storage is unavailable",
                 investigation_id=investigation_id,
                 audit_status="run_unavailable",
             ) from exc
         if current_contract is None:
-            await _cleanup_pipeline_resources(deps, backends)
+            await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
             raise ValueError("investigation not found for the selected tenant")
         inv_id = investigation_id
     else:
         try:
             tenant_aware_history = "tenant_id" in inspect.signature(history.start).parameters
         except asyncio.CancelledError:
-            await _cleanup_pipeline_resources(deps, backends)
+            await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
             raise
         except Exception as exc:
-            await _cleanup_pipeline_resources(deps, backends)
+            await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
             raise PipelineExecutionError(
                 "Investigation audit storage is unavailable",
                 audit_status="run_unavailable",
@@ -826,10 +879,10 @@ async def _run_pipeline_inner(
                     tenant_id=request.tenant_id,
                 )
             except asyncio.CancelledError:
-                await _cleanup_pipeline_resources(deps, backends)
+                await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
                 raise
             except Exception as exc:
-                await _cleanup_pipeline_resources(deps, backends)
+                await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
                 raise PipelineExecutionError(
                     "Investigation audit storage is unavailable",
                     audit_status="run_unavailable",
@@ -837,15 +890,15 @@ async def _run_pipeline_inner(
         else:
             configured_tenant = str(getattr(runtime_settings, "knowledge_tenant_id", "default") or "default")
             if configured_tenant != "default":
-                await _cleanup_pipeline_resources(deps, backends)
+                await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
                 raise ValueError("non-default tenant pipelines require a tenant-aware history store")
             try:
                 inv_id = history.start(request.prompt, request.user_id or "", request.channel_id or "")
             except asyncio.CancelledError:
-                await _cleanup_pipeline_resources(deps, backends)
+                await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
                 raise
             except Exception as exc:
-                await _cleanup_pipeline_resources(deps, backends)
+                await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
                 raise PipelineExecutionError(
                     "Investigation audit storage is unavailable",
                     audit_status="run_unavailable",
@@ -881,7 +934,7 @@ async def _run_pipeline_inner(
                 total_time=time.monotonic() - t_start,
             )
             cancellation.audit_status = recorder.audit_status
-            await _cleanup_pipeline_resources(deps, backends)
+            await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
             raise
         except Exception as exc:
             error_detail, diagnostics = _safe_pipeline_failure(
@@ -907,7 +960,7 @@ async def _run_pipeline_inner(
                 timings=timings,
                 total_time=time.monotonic() - t_start,
             )
-            await _cleanup_pipeline_resources(deps, backends)
+            await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
             raise PipelineExecutionError(
                 "Investigation run audit could not be started",
                 investigation_id=inv_id,
@@ -925,7 +978,8 @@ async def _run_pipeline_inner(
         cancellation.run_id = run_id or ""
         cancellation.audit_status = recorder.audit_status
     try:
-        backends = await deps.realize_backends()
+        backend_lease = await deps.realize_backends()
+        backends = list(backend_lease.backends)
     except asyncio.CancelledError:
         cancellation = cancellation or _PipelineCancellation()
         recorder.finish(
@@ -935,7 +989,7 @@ async def _run_pipeline_inner(
             total_time=time.monotonic() - t_start,
         )
         cancellation.audit_status = recorder.audit_status
-        await _cleanup_pipeline_resources(deps, backends)
+        await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
         raise
     except Exception as exc:
         backend_error: BaseException = exc
@@ -958,7 +1012,7 @@ async def _run_pipeline_inner(
         )
         if cancellation is not None:
             cancellation.audit_status = audit_status
-        await _cleanup_pipeline_resources(deps, backends)
+        await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
         raise PipelineExecutionError(
             "Dashboard backend initialization failed",
             investigation_id=inv_id,
@@ -974,7 +1028,7 @@ async def _run_pipeline_inner(
         )
         if cancellation is not None:
             cancellation.audit_status = recorder.audit_status
-        await _cleanup_pipeline_resources(deps, backends)
+        await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
         return PipelineFailureFactory.no_backends(recorder=recorder)
 
     primary = backends[0]  # determines query language for compilation
@@ -1578,6 +1632,11 @@ async def _run_pipeline_inner(
             )
 
         lifecycle.ensure_side_effects_allowed()
+
+        def mark_provider_released() -> None:
+            nonlocal provider_lease
+            provider_lease = None
+
         return await _complete_after_provider_release(
             deps,
             provider_lease,
@@ -1608,6 +1667,7 @@ async def _run_pipeline_inner(
                 token_usage=runtime.token_usage,
                 started_at=runtime.started_at,
             ),
+            on_released=mark_provider_released,
         )
 
     except asyncio.CancelledError:
@@ -1623,7 +1683,7 @@ async def _run_pipeline_inner(
     except Exception as exc:
         cleanup_failure: RuntimeOwnershipError | None = None
         try:
-            await _cleanup_pipeline_resources(deps, backends)
+            await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)
         except RuntimeOwnershipError as cleanup_error:
             cleanup_failure = cleanup_error
         finally:
@@ -1645,16 +1705,19 @@ async def _run_pipeline_inner(
         )
         if cancellation is not None:
             cancellation.audit_status = audit_status
-        if cleanup_failure is not None:
-            raise cleanup_failure
         if isinstance(exc, PipelineExecutionError):
+            if cleanup_failure is not None:
+                _attach_pipeline_resource_cleanup_metadata(exc, cleanup_failure)
             raise
-        raise PipelineExecutionError(
+        failure = PipelineExecutionError(
             public_message,
             investigation_id=runtime.investigation_id,
             investigation_run_id=runtime.recorder.run_id or "",
             audit_status=audit_status,
-        ) from exc
+        )
+        if cleanup_failure is not None:
+            _attach_pipeline_resource_cleanup_metadata(failure, cleanup_failure)
+        raise failure from exc
     finally:
         if knowledge_pin_token is not None and signal_store is not SIGNAL_STORE_UNAVAILABLE:
             reset_pin = getattr(signal_store, "reset_pinned_governed_mappings", None)
@@ -1672,4 +1735,4 @@ async def _run_pipeline_inner(
                         **diagnostics,
                     )
         if not resources_cleaned:
-            await _cleanup_pipeline_resources(deps, backends)
+            await _cleanup_pipeline_resources(deps, backend_lease, provider_lease)

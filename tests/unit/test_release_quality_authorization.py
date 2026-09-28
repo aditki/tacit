@@ -23,7 +23,6 @@ REPOSITORY_ROOT = Path(__file__).parents[2]
 AUTHORIZATION_SCRIPT = REPOSITORY_ROOT / ".github" / "scripts" / "authorize_release_publication.py"
 QUALITY_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "release-quality.yml"
 QUALITY_WORKFLOW_PATH = ".github/workflows/release-quality.yml"
-QUALITY_WORKFLOW_RUN_PATH = f"{QUALITY_WORKFLOW_PATH}@main"
 CORPUS_PATH = "tests/tacit_validation_prompts.csv"
 STATE_MANIFEST_PATH = "long-lived-state-manifest.json"
 
@@ -1113,7 +1112,7 @@ def test_quality_authorization_requires_successful_exact_sha_main_run_and_audite
                         "event": "workflow_dispatch",
                         "status": "completed",
                         "conclusion": "success",
-                        "path": QUALITY_WORKFLOW_RUN_PATH,
+                        "path": QUALITY_WORKFLOW_PATH,
                     }
                 ]
             },
@@ -1148,6 +1147,106 @@ def test_quality_authorization_requires_successful_exact_sha_main_run_and_audite
     )
 
 
+def test_quality_authorization_accepts_githubs_bare_workflow_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authorization = _load_script_module(AUTHORIZATION_SCRIPT)
+    sha = "a" * 40
+    archive = _quality_archive(sha=sha)
+    responses = iter(
+        [
+            {
+                "workflow_runs": [
+                    {
+                        "id": 42,
+                        "run_attempt": 1,
+                        "head_sha": sha,
+                        "head_branch": "main",
+                        "event": "workflow_dispatch",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "path": QUALITY_WORKFLOW_PATH,
+                    }
+                ]
+            },
+            {
+                "artifacts": [
+                    {
+                        "id": 7,
+                        "name": f"release-quality-evidence-{sha}-42-1",
+                        "expired": False,
+                        "size_in_bytes": len(archive),
+                        "digest": f"sha256:{hashlib.sha256(archive).hexdigest()}",
+                        "archive_download_url": "https://api.github.com/repos/aditki/tacit/actions/artifacts/7/zip",
+                        "workflow_run": {"id": 42, "head_branch": "main", "head_sha": sha},
+                    }
+                ]
+            },
+        ]
+    )
+    monkeypatch.setattr(authorization, "_load_actions_response", lambda request: next(responses))
+    monkeypatch.setattr(authorization, "_download_actions_artifact", lambda request: archive)
+    monkeypatch.setattr(
+        authorization,
+        "_canonical_quality_corpus_digest",
+        lambda repository: hashlib.sha256(_corpus_bytes()).hexdigest(),
+    )
+
+    authorization.require_successful_release_quality(
+        expected_sha=sha,
+        repository_slug="aditki/tacit",
+        token="token",
+        api_url="https://api.github.com",
+    )
+
+
+@pytest.mark.parametrize(
+    "workflow_path",
+    (
+        ".github/workflows/not-release-quality.yml",
+        f"{QUALITY_WORKFLOW_PATH}@feature-branch",
+    ),
+)
+def test_quality_authorization_rejects_other_workflow_or_ref_combinations(
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_path: str,
+) -> None:
+    authorization = _load_script_module(AUTHORIZATION_SCRIPT)
+    sha = "a" * 40
+    monkeypatch.setattr(
+        authorization,
+        "_load_actions_response",
+        lambda request: {
+            "workflow_runs": [
+                {
+                    "id": 42,
+                    "run_attempt": 1,
+                    "head_sha": sha,
+                    "head_branch": "main",
+                    "event": "workflow_dispatch",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "path": workflow_path,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        authorization,
+        "_download_actions_artifact",
+        lambda request: pytest.fail("wrong workflow identity must not reach artifact download"),
+        raising=False,
+    )
+
+    with pytest.raises(authorization.ReleaseAuthorizationError, match="quality run"):
+        authorization.require_successful_release_quality(
+            expected_sha=sha,
+            repository_slug="aditki/tacit",
+            token="token",
+            api_url="https://api.github.com",
+        )
+
+
 def test_quality_authorization_rejects_success_from_another_commit_without_downloading(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1165,7 +1264,7 @@ def test_quality_authorization_rejects_success_from_another_commit_without_downl
                     "event": "workflow_dispatch",
                     "status": "completed",
                     "conclusion": "success",
-                    "path": QUALITY_WORKFLOW_RUN_PATH,
+                    "path": QUALITY_WORKFLOW_PATH,
                 }
             ]
         },

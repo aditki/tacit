@@ -616,7 +616,11 @@ def test_chart_route_uses_app_scoped_pipeline_settings(monkeypatch):
 
     async def fake_run_pipeline(request: DashRequest, deps):
         seen_settings.append(deps.settings)
-        assert deps.backend_factory() == []
+        backend_lease = await deps.realize_backends()
+        try:
+            assert backend_lease.backends == ()
+        finally:
+            await deps.close_backends(backend_lease)
         return DashResponse(
             dashboard_url="http://dash",
             dashboard_uid="dash-1",
@@ -664,7 +668,15 @@ def test_api_backend_factory_is_declared_and_lazy(monkeypatch, tmp_path):
         expected_kind="backend:dashboard",
     )
     assert ownership.settings_identity == dependencies.runtime_ownership.settings_identity
-    assert dependencies.backend_factory() == []
+
+    async def realize() -> None:
+        lease = await dependencies.realize_backends()
+        try:
+            assert lease.backends == ()
+        finally:
+            await dependencies.close_backends(lease)
+
+    asyncio.run(realize())
     assert calls == [runtime_settings]
 
 

@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -52,11 +53,13 @@ def _acquire_direct_owner(
     *,
     runtime_identity: str,
     lifecycle: optional_integrations_module.OptionalIntegrationLifecycle | None = None,
+    blocking_lifecycle: Any | None = None,
 ) -> optional_integrations_module.OptionalIntegrationExecutionOwner:
     return optional_integrations_module.OptionalIntegrationExecutionOwner.acquire(
         name="slack",
         runtime_identity=runtime_identity,
         lifecycle=lifecycle or optional_integrations_module.OptionalIntegrationLifecycle(None, name="slack"),
+        blocking_lifecycle=blocking_lifecycle,
     )
 
 
@@ -79,6 +82,530 @@ def _assert_unstarted_generation_released(
     assert state.task is None
     assert state.key not in optional_integrations_module._OPTIONAL_INTEGRATION_EXECUTION_OWNERS
     assert state.key not in optional_integrations_module._FENCED_OPTIONAL_INTEGRATION_EXECUTION_OWNERS
+
+
+class _ObservedLock:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.attempted = threading.Event()
+        self.failed_attempts = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        self.attempted.set()
+        if timeout == -1:
+            acquired = self._lock.acquire(blocking)
+        else:
+            acquired = self._lock.acquire(blocking, timeout)
+        if not acquired:
+            self.failed_attempts += 1
+        return acquired
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> _ObservedLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.release()
+
+
+def test_durable_owner_scheduling_ignores_foreign_transport_synchronization(monkeypatch) -> None:
+    runtime_identity = "optional-integration-foreign-transport-synchronization"
+    baseline_threads = _owner_thread_count()
+    callback_drain_ready = threading.Event()
+    operation_started = threading.Event()
+    owner_callback_started = threading.Event()
+    owner_heartbeat = threading.Event()
+    foreign_lock_held = threading.Event()
+    release_foreign_lock = threading.Event()
+    captured_drains: list[optional_integrations_module._OptionalIntegrationCallbackDrain] = []
+    real_init = optional_integrations_module._OptionalIntegrationCallbackDrain.__init__
+
+    def capture_callback_drain(
+        self: optional_integrations_module._OptionalIntegrationCallbackDrain,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        real_init(self, loop)
+        captured_drains.append(self)
+        callback_drain_ready.set()
+
+    monkeypatch.setattr(
+        optional_integrations_module._OptionalIntegrationCallbackDrain,
+        "__init__",
+        capture_callback_drain,
+    )
+    owner = _acquire_direct_owner(runtime_identity=runtime_identity)
+
+    async def operation() -> None:
+        operation_started.set()
+        await asyncio.Event().wait()
+
+    owner.start(operation, on_completion=lambda _settlement: None)
+    assert callback_drain_ready.wait(timeout=1.0)
+    assert operation_started.wait(timeout=1.0)
+    callback_drain = captured_drains[0]
+
+    def hold_foreign_transport_state() -> None:
+        with callback_drain._lock:
+            foreign_lock_held.set()
+            assert release_foreign_lock.wait(timeout=2.0)
+
+    foreign_thread = threading.Thread(
+        target=hold_foreign_transport_state,
+        name="optional-integration-foreign-transport",
+    )
+    foreign_thread.start()
+    assert foreign_lock_held.wait(timeout=1.0)
+
+    def schedule_owner_heartbeat() -> None:
+        owner_callback_started.set()
+        asyncio.get_running_loop().call_soon(owner_heartbeat.set)
+
+    owner_was_responsive = False
+    settlement: optional_integrations_module.OptionalIntegrationTaskSettlement | None = None
+    try:
+        callback_drain._call_soon_threadsafe(schedule_owner_heartbeat)
+        assert owner_callback_started.wait(timeout=1.0)
+        owner_was_responsive = owner_heartbeat.wait(timeout=0.2)
+    finally:
+        release_foreign_lock.set()
+        foreign_thread.join(timeout=1.0)
+        assert foreign_thread.is_alive() is False
+        settlement = asyncio.run(
+            owner.shutdown(
+                timeout_seconds=1.0,
+                timeout_reason_code="slack_shutdown_timed_out",
+            )
+        )
+
+    assert owner_was_responsive, "foreign transport synchronization blocked the durable owner loop"
+    assert settlement is not None
+    assert settlement.completed
+    assert settlement.cancelled
+    assert owner._state.finished.is_set()
+    assert owner._state.key not in optional_integrations_module._OPTIONAL_INTEGRATION_EXECUTION_OWNERS
+    assert _owner_thread_count() == baseline_threads
+
+
+def test_temporary_transport_lock_contention_retries_without_fencing_or_parking(monkeypatch) -> None:
+    runtime_identity = "optional-integration-temporary-transport-contention"
+    baseline_threads = _owner_thread_count()
+    callback_drain_ready = threading.Event()
+    operation_started = threading.Event()
+    allow_operation_finish = threading.Event()
+    transport_lock_held = threading.Event()
+    release_transport_lock = threading.Event()
+    parked = threading.Event()
+    captured_drains: list[optional_integrations_module._OptionalIntegrationCallbackDrain] = []
+    real_init = optional_integrations_module._OptionalIntegrationCallbackDrain.__init__
+
+    def capture_callback_drain(
+        self: optional_integrations_module._OptionalIntegrationCallbackDrain,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        real_init(self, loop)
+        captured_drains.append(self)
+        callback_drain_ready.set()
+
+    def observed_park() -> None:
+        parked.set()
+        release_transport_lock.wait(timeout=1.0)
+
+    monkeypatch.setattr(
+        optional_integrations_module._OptionalIntegrationCallbackDrain,
+        "__init__",
+        capture_callback_drain,
+    )
+    monkeypatch.setattr(optional_integrations_module, "_MAX_OPTIONAL_INTEGRATION_CALLBACK_DRAIN_TURNS", 2)
+    monkeypatch.setattr(
+        optional_integrations_module,
+        "_park_non_quiescent_optional_integration_owner",
+        observed_park,
+    )
+    owner = _acquire_direct_owner(runtime_identity=runtime_identity)
+    state = owner._state
+
+    async def operation() -> None:
+        operation_started.set()
+        while not allow_operation_finish.is_set():
+            await asyncio.sleep(0.001)
+
+    owner.start(operation, on_completion=lambda _settlement: None)
+    assert callback_drain_ready.wait(timeout=1.0)
+    assert operation_started.wait(timeout=1.0)
+    callback_drain = captured_drains[0]
+    observed_lock = _ObservedLock()
+    callback_drain._transport_lock = observed_lock  # type: ignore[assignment]
+    callback_drain._lock = observed_lock  # type: ignore[assignment]
+
+    def hold_transport_lock() -> None:
+        with observed_lock:
+            transport_lock_held.set()
+            assert release_transport_lock.wait(timeout=2.0)
+
+    holder = threading.Thread(target=hold_transport_lock, name="temporary-slack-transport-contention")
+    holder.start()
+    assert transport_lock_held.wait(timeout=1.0)
+    observed_lock.attempted.clear()
+    allow_operation_finish.set()
+
+    completion_during_contention = False
+    fenced_during_contention = False
+    owner_registered_during_contention = False
+    try:
+        assert observed_lock.attempted.wait(timeout=1.0)
+        time.sleep(0.05)
+        completion_during_contention = state.completion.done()
+        fenced_during_contention = (
+            state.key in optional_integrations_module._FENCED_OPTIONAL_INTEGRATION_EXECUTION_OWNERS
+        )
+        owner_registered_during_contention = (
+            optional_integrations_module._OPTIONAL_INTEGRATION_EXECUTION_OWNERS.get(state.key) is state
+        )
+    finally:
+        release_transport_lock.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+        assert state.finished.wait(timeout=1.0)
+
+    assert not completion_during_contention
+    assert not fenced_during_contention
+    assert owner_registered_during_contention
+    assert not parked.is_set()
+    assert 1 <= observed_lock.failed_attempts <= 12
+    assert state.completion.result(timeout=0).completed
+    assert state.key not in optional_integrations_module._OPTIONAL_INTEGRATION_EXECUTION_OWNERS
+    assert state.key not in optional_integrations_module._FENCED_OPTIONAL_INTEGRATION_EXECUTION_OWNERS
+    assert _owner_thread_count() == baseline_threads
+
+
+def test_terminal_publication_retries_state_lock_without_blocking_owner(monkeypatch) -> None:
+    runtime_identity = "optional-integration-terminal-state-contention"
+    baseline_threads = _owner_thread_count()
+    callback_drain_ready = threading.Event()
+    operation_started = threading.Event()
+    allow_operation_finish = threading.Event()
+    state_lock_held = threading.Event()
+    release_state_lock = threading.Event()
+    owner_heartbeat = threading.Event()
+    captured_drains: list[optional_integrations_module._OptionalIntegrationCallbackDrain] = []
+    real_init = optional_integrations_module._OptionalIntegrationCallbackDrain.__init__
+    primary_error = RuntimeError("primary Slack operation failure")
+
+    def capture_callback_drain(
+        self: optional_integrations_module._OptionalIntegrationCallbackDrain,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        real_init(self, loop)
+        captured_drains.append(self)
+        callback_drain_ready.set()
+
+    monkeypatch.setattr(
+        optional_integrations_module._OptionalIntegrationCallbackDrain,
+        "__init__",
+        capture_callback_drain,
+    )
+    owner = _acquire_direct_owner(runtime_identity=runtime_identity)
+    state = owner._state
+    observed_lock = _ObservedLock()
+    state.state_lock = observed_lock  # type: ignore[assignment]
+
+    async def operation() -> None:
+        operation_started.set()
+        while not allow_operation_finish.is_set():
+            await asyncio.sleep(0.001)
+        raise primary_error
+
+    owner.start(operation, on_completion=lambda _settlement: None)
+    assert callback_drain_ready.wait(timeout=1.0)
+    assert operation_started.wait(timeout=1.0)
+    callback_drain = captured_drains[0]
+
+    def hold_state_lock() -> None:
+        with observed_lock:
+            state_lock_held.set()
+            assert release_state_lock.wait(timeout=2.0)
+
+    holder = threading.Thread(target=hold_state_lock, name="temporary-slack-state-contention")
+    holder.start()
+    assert state_lock_held.wait(timeout=1.0)
+    observed_lock.attempted.clear()
+    allow_operation_finish.set()
+
+    heartbeat_delivered = False
+    completion_during_contention = False
+    owner_registered_during_contention = False
+    try:
+        assert observed_lock.attempted.wait(timeout=1.0)
+        try:
+            callback_drain._call_soon_threadsafe(owner_heartbeat.set)
+        except RuntimeError:
+            pass
+        heartbeat_delivered = owner_heartbeat.wait(timeout=0.2)
+        completion_during_contention = state.completion.done()
+        owner_registered_during_contention = (
+            optional_integrations_module._OPTIONAL_INTEGRATION_EXECUTION_OWNERS.get(state.key) is state
+        )
+    finally:
+        release_state_lock.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+        assert state.finished.wait(timeout=1.0)
+
+    settlement = state.completion.result(timeout=0)
+    assert heartbeat_delivered
+    assert not completion_during_contention
+    assert owner_registered_during_contention
+    assert 1 <= observed_lock.failed_attempts <= 12
+    assert settlement.failure is primary_error
+    assert state.key not in optional_integrations_module._OPTIONAL_INTEGRATION_EXECUTION_OWNERS
+    assert state.key not in optional_integrations_module._FENCED_OPTIONAL_INTEGRATION_EXECUTION_OWNERS
+    assert _owner_thread_count() == baseline_threads
+
+
+@pytest.mark.parametrize("held_lock", ["shared", "subscriber"])
+def test_durable_owner_never_waits_on_lifecycle_publication_locks(held_lock: str) -> None:
+    """Requester-reachable lifecycle locks cannot stop the execution owner."""
+    runtime_identity = f"optional-integration-{held_lock}-publication-lock"
+    lifecycle = optional_integrations_module.OptionalIntegrationLifecycle(None, name="slack")
+    owner = _acquire_direct_owner(runtime_identity=runtime_identity, lifecycle=lifecycle)
+    state = owner._state
+    operation_started = threading.Event()
+    publish_requested = threading.Event()
+    allow_publish = threading.Event()
+    owner_heartbeat = threading.Event()
+    release_lock = threading.Event()
+    lock_held = threading.Event()
+    lock = state.lifecycle._lock if held_lock == "shared" else lifecycle._state_lock
+
+    async def operation() -> None:
+        operation_started.set()
+        while not allow_publish.is_set():
+            await asyncio.sleep(0.001)
+        publish_requested.set()
+        owner.lifecycle.publish(status="ready", reason_code="slack_ready")
+
+    def hold_lifecycle_lock() -> None:
+        with lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=2.0)
+
+    holder = threading.Thread(target=hold_lifecycle_lock, name=f"held-{held_lock}-lifecycle-lock")
+    holder.start()
+    assert lock_held.wait(timeout=1.0)
+    owner.start(operation, on_completion=lambda _settlement: None)
+    assert operation_started.wait(timeout=1.0)
+    allow_publish.set()
+    assert publish_requested.wait(timeout=1.0)
+    assert state.loop is not None
+    state.loop.call_soon_threadsafe(owner_heartbeat.set)
+
+    heartbeat_during_contention = owner_heartbeat.wait(timeout=0.2)
+    state.completion.result(timeout=0.5)
+    completion_during_contention = True
+    try:
+        assert heartbeat_during_contention
+        assert completion_during_contention
+    finally:
+        release_lock.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+        assert state.finished.wait(timeout=1.0)
+
+
+def test_blocking_completion_callback_runs_on_subscriber_loop_not_durable_owner() -> None:
+    """Arbitrary completion code is transported back to its subscriber loop."""
+    runtime_identity = "optional-integration-blocking-completion-relay"
+    subscriber_loop = asyncio.new_event_loop()
+    subscriber_ready = threading.Event()
+    lifecycle_holder: dict[str, optional_integrations_module.OptionalIntegrationLifecycle] = {}
+
+    def run_subscriber_loop() -> None:
+        asyncio.set_event_loop(subscriber_loop)
+
+        def create_lifecycle() -> None:
+            lifecycle_holder["lifecycle"] = optional_integrations_module.OptionalIntegrationLifecycle(
+                None,
+                name="slack",
+            )
+            subscriber_ready.set()
+
+        subscriber_loop.call_soon(create_lifecycle)
+        subscriber_loop.run_forever()
+        subscriber_loop.close()
+
+    subscriber_thread = threading.Thread(target=run_subscriber_loop, name="slack-subscriber-loop")
+    subscriber_thread.start()
+    assert subscriber_ready.wait(timeout=1.0)
+    owner = _acquire_direct_owner(
+        runtime_identity=runtime_identity,
+        lifecycle=lifecycle_holder["lifecycle"],
+    )
+    state = owner._state
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    callback_threads: list[int] = []
+
+    async def operation() -> None:
+        return None
+
+    def block_completion(
+        _settlement: optional_integrations_module.OptionalIntegrationTaskSettlement,
+    ) -> None:
+        callback_threads.append(threading.get_ident())
+        callback_started.set()
+        assert release_callback.wait(timeout=2.0)
+
+    owner.start(operation, on_completion=block_completion)
+    callback_started_before_timeout = callback_started.wait(timeout=1.0)
+    completion_during_callback = state.completion.done()
+    callback_ran_on_subscriber = callback_threads == [subscriber_thread.ident]
+    owner_finished_during_callback = state.finished.wait(timeout=0.2)
+    try:
+        assert callback_started_before_timeout
+        assert completion_during_callback
+        assert callback_ran_on_subscriber
+        assert owner_finished_during_callback
+    finally:
+        release_callback.set()
+        subscriber_loop.call_soon_threadsafe(subscriber_loop.stop)
+        subscriber_thread.join(timeout=1.0)
+
+    assert not subscriber_thread.is_alive()
+    assert state.key not in optional_integrations_module._OPTIONAL_INTEGRATION_EXECUTION_OWNERS
+
+
+def test_default_executor_work_uses_runtime_admission_and_retains_owner_until_retirement(tmp_path) -> None:
+    """Slack blocking work is charged centrally until the admitted worker exits."""
+    runtime_identity = "optional-integration-default-executor-retirement"
+    stores = RuntimeStores(_settings(tmp_path, suffix="slack-blocking-admission"))
+    root_handle = stores.start_runtime_services()
+    admission = stores.pipeline_admission()
+    owner = _acquire_direct_owner(
+        runtime_identity=runtime_identity,
+        blocking_lifecycle=admission,
+    )
+    state = owner._state
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    worker_retired = threading.Event()
+
+    def blocking_worker() -> None:
+        worker_started.set()
+        try:
+            assert release_worker.wait(timeout=2.0)
+        finally:
+            worker_retired.set()
+
+    async def operation() -> None:
+        await asyncio.to_thread(blocking_worker)
+
+    owner.start(operation, on_completion=lambda _settlement: None)
+    worker_started_before_timeout = worker_started.wait(timeout=1.0)
+    owner.request_stop()
+    state.completion.result(timeout=0.5)
+    completion_before_retirement = True
+    time.sleep(0.05)
+    worker_live = not worker_retired.is_set()
+    owner_live = not state.finished.is_set()
+    owner_registered = optional_integrations_module._OPTIONAL_INTEGRATION_EXECUTION_OWNERS.get(state.key) is state
+    centrally_charged = admission.blocking_in_flight == 1
+    replacement_rejected = False
+    try:
+        try:
+            _acquire_direct_owner(runtime_identity=runtime_identity)
+        except optional_integrations_module.OptionalIntegrationExecutionUnavailable as exc:
+            replacement_rejected = exc.reason_code in {
+                "slack_execution_owner_stopping",
+                "slack_execution_owner_fenced",
+            }
+    finally:
+        release_worker.set()
+        worker_retired_after_release = worker_retired.wait(timeout=1.0)
+        owner_finished_after_release = state.finished.wait(timeout=1.0)
+        asyncio.run(stores.shutdown_runtime_services(root_handle))
+
+    assert worker_started_before_timeout
+    assert completion_before_retirement
+    assert worker_live
+    assert owner_live
+    assert owner_registered
+    assert centrally_charged
+    assert replacement_rejected
+    assert worker_retired_after_release
+    assert owner_finished_after_release
+    assert state.key not in optional_integrations_module._OPTIONAL_INTEGRATION_EXECUTION_OWNERS
+
+
+def test_default_executor_work_fails_closed_without_runtime_admission() -> None:
+    worker_started = threading.Event()
+    owner = _acquire_direct_owner(runtime_identity="optional-integration-unowned-blocking-work")
+    state = owner._state
+
+    async def operation() -> None:
+        await asyncio.to_thread(worker_started.set)
+
+    owner.start(operation, on_completion=lambda _settlement: None)
+    assert state.finished.wait(timeout=1.0)
+
+    settlement = state.completion.result(timeout=0)
+    assert not worker_started.is_set()
+    assert isinstance(settlement.failure, optional_integrations_module.OptionalIntegrationExecutionUnavailable)
+    assert settlement.failure.reason_code == "slack_blocking_work_owner_unavailable"
+
+
+def test_blocking_ingress_is_sealed_before_terminal_callback_drain() -> None:
+    """A task-done callback cannot reach a restored default executor."""
+    worker_started = threading.Event()
+    rejection_reasons: list[str] = []
+    owner = _acquire_direct_owner(runtime_identity="optional-integration-terminal-ingress-seal")
+    state = owner._state
+
+    def submit_after_terminal(_task: asyncio.Task[object]) -> None:
+        try:
+            asyncio.get_running_loop().run_in_executor(None, worker_started.set)
+        except optional_integrations_module.OptionalIntegrationExecutionUnavailable as exc:
+            rejection_reasons.append(exc.reason_code)
+
+    async def operation() -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.add_done_callback(submit_after_terminal)
+
+    owner.start(operation, on_completion=lambda _settlement: None)
+    assert state.finished.wait(timeout=1.0)
+
+    assert not worker_started.is_set()
+    assert rejection_reasons == ["slack_blocking_work_ingress_sealed"]
+
+
+def test_optional_integration_subscriber_fanout_is_bounded() -> None:
+    runtime_identity = "optional-integration-subscriber-capacity"
+    primary = _acquire_direct_owner(runtime_identity=runtime_identity)
+    subscribers = [primary]
+    expected_limit = 256
+    rejected = False
+    try:
+        for _ in range(expected_limit - 1):
+            subscribers.append(_acquire_direct_owner(runtime_identity=runtime_identity))
+        try:
+            subscribers.append(_acquire_direct_owner(runtime_identity=runtime_identity))
+        except optional_integrations_module.OptionalIntegrationExecutionUnavailable as exc:
+            rejected = exc.reason_code == "slack_execution_subscriber_capacity_exhausted"
+    finally:
+        settlement = asyncio.run(
+            primary.shutdown(
+                timeout_seconds=1.0,
+                timeout_reason_code="slack_shutdown_timed_out",
+            )
+        )
+
+    assert optional_integrations_module._MAX_OPTIONAL_INTEGRATION_SUBSCRIPTIONS == expected_limit
+    assert rejected
+    assert settlement.cancelled
+    assert primary._state.finished.is_set()
 
 
 def test_stopped_open_subscriber_coalesces_publications_to_one_terminal_callback() -> None:
@@ -292,7 +819,7 @@ def test_cancelled_primary_settles_secondary_on_a_separate_event_loop_thread() -
             shared["secondary_lifecycle"] = lifecycle
             owner.start(must_not_run, on_completion=observe)
             secondary_registered.set()
-            assert allow_secondary_shutdown.wait(timeout=1.0)
+            await _wait_until(allow_secondary_shutdown.is_set)
             shared["secondary_settlement"] = await owner.shutdown(
                 timeout_seconds=1.0,
                 timeout_reason_code="slack_shutdown_timed_out",
@@ -1174,7 +1701,7 @@ async def test_retained_slack_health_probe_keeps_execution_owner_fenced_until_re
         retained_events = [fields for event, fields in observed_events if event == "optional_integration_retained_work"]
         assert len(retained_events) == 1
         assert retained_events[0]["detached_task_count"] == 1
-        assert retained_events[0]["pending_task_count"] >= 1
+        assert cast(int, retained_events[0]["pending_task_count"]) >= 1
         assert runtime_identity not in repr(retained_events[0])
         assert probe_calls == 1
     finally:
@@ -1299,8 +1826,66 @@ async def test_deferred_sdk_child_is_retired_before_owner_loop_close() -> None:
         assert child_retired.is_set()
     finally:
         if child_holder and not child_holder[0].done():
-            child_holder[0]._log_destroy_pending = False
-            child_holder[0].get_coro().close()
+            child_holder[0]._log_destroy_pending = False  # type: ignore[attr-defined]
+            coroutine = child_holder[0].get_coro()
+            if coroutine is not None:
+                coroutine.close()
+
+
+async def test_positive_delay_callbacks_execute_or_cancel_before_owner_loop_close() -> None:
+    runtime_identity = "positive-delay-callback-lifecycle"
+    owner = _acquire_direct_owner(runtime_identity=runtime_identity)
+    state = owner._state
+    executed_handles: list[asyncio.TimerHandle] = []
+    delayed_handles: list[asyncio.TimerHandle] = []
+    executed_callback_called = threading.Event()
+    cancelled_callback_called = threading.Event()
+
+    async def operation() -> None:
+        loop = asyncio.get_running_loop()
+        executed_handles.append(loop.call_later(0.001, executed_callback_called.set))
+        await asyncio.sleep(0.01)
+        delayed_handles.append(
+            loop.call_later(
+                60.0,
+                cancelled_callback_called.set,
+            )
+        )
+
+    started_at = time.monotonic()
+    owner.start(operation, on_completion=lambda _settlement: None)
+
+    assert await asyncio.to_thread(state.finished.wait, 1.0)
+    assert time.monotonic() - started_at < 1.0
+    assert len(executed_handles) == 1
+    assert executed_callback_called.is_set()
+    assert not executed_handles[0].cancelled()
+    assert len(delayed_handles) == 1
+    assert delayed_handles[0].cancelled()
+    assert not cancelled_callback_called.is_set()
+    assert state.key not in optional_integrations_module._OPTIONAL_INTEGRATION_EXECUTION_OWNERS
+    assert state.key not in optional_integrations_module._FENCED_OPTIONAL_INTEGRATION_EXECUTION_OWNERS
+
+
+async def test_positive_delay_callback_ownership_is_bounded() -> None:
+    owner = _acquire_direct_owner(runtime_identity="positive-delay-callback-capacity")
+    state = owner._state
+    delayed_handles: list[asyncio.TimerHandle] = []
+
+    async def operation() -> None:
+        loop = asyncio.get_running_loop()
+        for _ in range(optional_integrations_module._MAX_OPTIONAL_INTEGRATION_PENDING_TIMER_HANDLES):
+            delayed_handles.append(loop.call_later(60.0, lambda: None))
+        with pytest.raises(RuntimeError, match="delayed callback capacity exhausted"):
+            loop.call_later(60.0, lambda: None)
+
+    owner.start(operation, on_completion=lambda _settlement: None)
+
+    settlement = await asyncio.wait_for(asyncio.wrap_future(state.completion), timeout=1.0)
+    assert settlement == optional_integrations_module.OptionalIntegrationTaskSettlement(completed=True)
+    assert await asyncio.to_thread(state.finished.wait, 1.0)
+    assert len(delayed_handles) == optional_integrations_module._MAX_OPTIONAL_INTEGRATION_PENDING_TIMER_HANDLES
+    assert all(handle.cancelled() for handle in delayed_handles)
 
 
 def test_non_quiescent_sdk_callback_chain_retains_fenced_owner_without_spinning() -> None:

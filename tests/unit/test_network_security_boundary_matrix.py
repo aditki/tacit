@@ -513,6 +513,28 @@ def test_serve_defaults_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
     }
 
 
+def test_container_serve_materializes_the_validated_health_host_before_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    written_hosts: list[str] = []
+    monkeypatch.setenv("TACIT_CONTAINER_HEALTHCHECK", "1")
+    monkeypatch.setattr("tacit.container_healthcheck.write_container_health_host", written_hosts.append)
+
+    result, calls = _invoke_serve(
+        monkeypatch,
+        runtime_settings=_settings(
+            api_auth_enabled=True,
+            api_auth_key="secret",
+            api_allowed_hosts="*.internal.example",
+        ),
+        arguments=["--host", "0.0.0.0"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert written_hosts == ["health.internal.example"]
+    assert len(calls) == 1
+
+
 def test_serve_no_slack_builds_uvicorn_app_from_one_disabled_settings_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

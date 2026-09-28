@@ -33,6 +33,7 @@ _SELECTED_MAINTENANCE_BUDGET = 8
 _SELECTED_CLAIM_LEASE_SECONDS = 1.0
 _CLEANUP_PERMITS_PER_LEASE = 3
 _RUNTIME_DRAIN_HEARTBEAT_SECONDS = 0.05
+_RETAINED_WORK_LOCK_RETRY_SECONDS = 0.005
 _LIFECYCLE_OWNER_STARTUP_TIMEOUT_SECONDS = 5.0
 _MAX_RUNTIME_FATAL_FIELD_LENGTH = 128
 _RUNTIME_FATAL_REASON_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_:-.")
@@ -42,6 +43,8 @@ _RUNTIME_FATAL_REASON_CODES = frozenset(
         "api_lifespan_teardown_failed_during_cancellation",
         "api_runtime_shutdown_failed",
         "backend:dashboard_realization",
+        "backend_owner_cleanup_failed",
+        "backend_owner_cleanup_timeout",
         "bedrock_credential_cleanup_failed",
         "bedrock_operation_cleanup_failed",
         "bedrock_rejected_runtime_cleanup_failed",
@@ -83,9 +86,20 @@ _PIPELINE_EXECUTION_DEADLINE: contextvars.ContextVar[float | None] = contextvars
 
 
 def _drain_transport_tick(owner: _RuntimeRootDrainOwner) -> None:
-    """Complete one coalesced transport wakeup without owning lifecycle work."""
-    with owner.transport_wakeup_lock:
-        owner.transport_wakeup_pending = False
+    """Acknowledge one transport wakeup back to its lifecycle owner."""
+    lifecycle_loop = owner.lifecycle_loop
+    if lifecycle_loop is None or lifecycle_loop.is_closed():
+        return
+    try:
+        lifecycle_loop.call_soon_threadsafe(_finish_drain_transport_tick, owner)
+    except RuntimeError:
+        # Terminal lifecycle shutdown makes the acknowledgment unnecessary.
+        pass
+
+
+def _finish_drain_transport_tick(owner: _RuntimeRootDrainOwner) -> None:
+    """Clear coalescing state only from the durable lifecycle-owner loop."""
+    owner.transport_wakeup_pending = False
 
 
 @contextmanager
@@ -261,12 +275,25 @@ class PipelineRetainedWorkPermit:
 
 
 @dataclass(frozen=True)
+class _RetainedWorkRequester:
+    """Requester transport observed when durable work is retained."""
+
+    loop: asyncio.AbstractEventLoop = field(repr=False, compare=False)
+    task: asyncio.Task[Any] | None = field(repr=False, compare=False)
+
+    def is_abandoned(self) -> bool:
+        return self.loop.is_closed() or (self.task is not None and self.task.done())
+
+
+@dataclass(frozen=True)
 class PipelineServiceOwnerPermit:
     """Controller-owned authority for one persistent async service loop."""
 
     controller_identity: object = field(repr=False)
     runtime_identity: str
     permit_id: int = field(repr=False)
+    owner_started: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+    owner_exited: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -531,17 +558,27 @@ class _RuntimeRootDrainOwner:
     start_gate: threading.Event = field(default_factory=threading.Event)
     drain_started: threading.Event = field(default_factory=threading.Event)
     finished: threading.Event = field(default_factory=threading.Event)
-    transport_wakeup_lock: threading.Lock = field(default_factory=threading.Lock)
     transport_wakeup_pending: bool = False
     transport_relay_lock: threading.Lock = field(default_factory=threading.Lock)
     transport_relays: dict[asyncio.AbstractEventLoop, _RuntimeDrainTransportRelay] = field(default_factory=dict)
     thread: threading.Thread | None = None
+    lifecycle_loop: asyncio.AbstractEventLoop | None = None
     manager: object | None = None
     provider_recheck_required: bool = False
     aborted: bool = False
     terminal: bool = False
     startup_error: BaseException | None = None
     rollback_error: BaseException | None = None
+
+
+@dataclass
+class _ProviderManagerInitialization:
+    """One manager construction reservation published outside the graph lock."""
+
+    spec: object
+    creator_thread_id: int | None = None
+    future: ThreadFuture[object] = field(default_factory=ThreadFuture)
+    thread: threading.Thread | None = None
 
 
 def fence_runtime_root_after_transport_failure(
@@ -686,6 +723,7 @@ class RuntimeExecutionGraph:
         self._lock = threading.RLock()
         self._provider_spec: object | None = None
         self._provider_manager: object | None = None
+        self._provider_initialization: _ProviderManagerInitialization | None = None
         self._root_generation = 0
         self._next_root_owner = 0
         self._root_owners: dict[int, RuntimeRootOwnerHandle] = {}
@@ -698,7 +736,35 @@ class RuntimeExecutionGraph:
         spec: object,
         create: Callable[[], object],
     ) -> object:
-        """Return the namespace's sole provider manager after semantic preflight."""
+        """Synchronously join the namespace's one background manager transition."""
+        manager, initialization, creator = self._reserve_provider_manager(spec)
+        if manager is not None:
+            return manager
+        assert initialization is not None
+        if creator:
+            self._start_provider_manager_initialization(initialization, create)
+        return initialization.future.result()
+
+    async def resolve_provider_manager_async(
+        self,
+        *,
+        spec: object,
+        create: Callable[[], object],
+    ) -> object:
+        """Join manager construction without blocking or transferring it to the caller loop."""
+        manager, initialization, creator = self._reserve_provider_manager(spec)
+        if manager is not None:
+            return manager
+        assert initialization is not None
+        if creator:
+            self._start_provider_manager_initialization(initialization, create)
+        return await asyncio.shield(asyncio.wrap_future(initialization.future))
+
+    def _reserve_provider_manager(
+        self,
+        spec: object,
+    ) -> tuple[object | None, _ProviderManagerInitialization | None, bool]:
+        """Reserve one coalesced construction without executing factory code."""
         with self._lock:
             self.admission.raise_if_runtime_fatal()
             if self._root_state == "closed":
@@ -710,11 +776,78 @@ class RuntimeExecutionGraph:
                     raise RuntimeOwnershipError(
                         "Runtime provider specification conflicts with the active execution graph"
                     )
-                return self._provider_manager
-            manager = create()
-            self._provider_spec = spec
-            self._provider_manager = manager
-            return manager
+                return self._provider_manager, None, False
+            initialization = self._provider_initialization
+            if initialization is not None:
+                if initialization.spec != spec:
+                    raise RuntimeOwnershipError(
+                        "Runtime provider specification conflicts with the active execution graph"
+                    )
+                if initialization.creator_thread_id == threading.get_ident():
+                    raise RuntimeOwnershipError("Runtime provider manager construction cannot re-enter itself")
+                return None, initialization, False
+            else:
+                initialization = _ProviderManagerInitialization(spec=spec)
+                self._provider_initialization = initialization
+                return None, initialization, True
+
+    def _start_provider_manager_initialization(
+        self,
+        initialization: _ProviderManagerInitialization,
+        create: Callable[[], object],
+    ) -> None:
+        """Start the generation's sole manager-construction owner."""
+
+        def initialize() -> None:
+            initialization.creator_thread_id = threading.get_ident()
+            try:
+                manager = create()
+            except BaseException as exc:
+                with self._lock:
+                    if self._provider_initialization is initialization:
+                        self._provider_initialization = None
+                if not initialization.future.done():
+                    initialization.future.set_exception(exc)
+                return
+
+            with self._lock:
+                if self._provider_initialization is initialization:
+                    self._provider_initialization = None
+                    if self._root_state not in {"closed", "fenced"}:
+                        self._provider_spec = initialization.spec
+                        self._provider_manager = manager
+                        install = True
+                    else:
+                        install = False
+                else:
+                    install = False
+            if install:
+                if not initialization.future.done():
+                    initialization.future.set_result(manager)
+                return
+            if not initialization.future.done():
+                initialization.future.set_exception(
+                    RuntimeOwnershipError("Runtime provider manager construction lost its graph generation")
+                )
+
+        try:
+            thread = threading.Thread(
+                target=initialize,
+                name=f"tacit-provider-manager-transition-{id(self)}",
+                daemon=True,
+            )
+            initialization.thread = thread
+            thread.start()
+        except BaseException as exc:
+            thread_ident = getattr(initialization.thread, "ident", None)
+            thread_alive = bool(initialization.thread is not None and initialization.thread.is_alive())
+            if thread_ident is not None or thread_alive or initialization.future.done():
+                return
+            with self._lock:
+                if self._provider_initialization is initialization:
+                    self._provider_initialization = None
+            if not initialization.future.done():
+                initialization.future.set_exception(exc)
 
     def register_root_owner(self) -> RuntimeRootOwnerHandle:
         """Register one composition root and open a clean shared generation."""
@@ -929,9 +1062,13 @@ class RuntimeExecutionGraph:
             ) from cause
         try:
             transition_thread.start()
-        except BaseException:
+        except BaseException as cause:
             if transition_thread.ident is None or (not transition_thread.is_alive() and not source.done()):
-                raise
+                raise _LifecycleOwnerStartupError(
+                    phase="start",
+                    cause=cause,
+                    thread_alive=False,
+                ) from cause
         transition = asyncio.wrap_future(source)
         cancelled = False
         while True:
@@ -1159,8 +1296,7 @@ class RuntimeExecutionGraph:
         source: ThreadFuture[None],
     ) -> None:
         """Publish one lifecycle result after its transport loop resumes."""
-        with owner.transport_relay_lock:
-            relay.completion_pending = False
+        relay.completion_pending = False
         if relay.future.done():
             return
         try:
@@ -1177,14 +1313,15 @@ class RuntimeExecutionGraph:
         source: ThreadFuture[None],
     ) -> None:
         """Queue at most one completion callback on a live or stopped loop."""
-        with owner.transport_relay_lock:
-            if relay.completion_pending or relay.future.done():
-                return
-            relay.completion_pending = True
-            owner.transport_relays.pop(relay.loop, None)
+        # Each relay registers exactly one callback on the terminal source.
+        # Keep this owner-thread callback independent from requester-held state:
+        # it must remain able to publish owner exit even if that requester is
+        # suspended while registering or awaiting the relay.
+        if relay.completion_pending or relay.future.done():
+            return
+        relay.completion_pending = True
         if relay.loop.is_closed():
-            with owner.transport_relay_lock:
-                relay.completion_pending = False
+            relay.completion_pending = False
             return
         try:
             relay.loop.call_soon_threadsafe(
@@ -1194,8 +1331,7 @@ class RuntimeExecutionGraph:
                 source,
             )
         except RuntimeError:
-            with owner.transport_relay_lock:
-                relay.completion_pending = False
+            relay.completion_pending = False
 
     def _final_drain_transport_relay(
         self,
@@ -1276,6 +1412,7 @@ class RuntimeExecutionGraph:
 
     async def _run_owned_final_root_drain(self, owner: _RuntimeRootDrainOwner) -> None:
         """Keep lifecycle and result-transport loops responsive during cleanup."""
+        owner.lifecycle_loop = asyncio.get_running_loop()
         owner.drain_started.set()
         heartbeat = asyncio.create_task(
             self._run_final_drain_heartbeat(owner),
@@ -1300,10 +1437,9 @@ class RuntimeExecutionGraph:
         while True:
             transport_loop = owner.transport_loop
             if transport_loop is not None and not transport_loop.is_closed():
-                with owner.transport_wakeup_lock:
-                    should_wake = not owner.transport_wakeup_pending
-                    if should_wake:
-                        owner.transport_wakeup_pending = True
+                should_wake = not owner.transport_wakeup_pending
+                if should_wake:
+                    owner.transport_wakeup_pending = True
                 if should_wake:
                     try:
                         transport_loop.call_soon_threadsafe(_drain_transport_tick, owner)
@@ -1326,7 +1462,7 @@ class RuntimeExecutionGraph:
             root_generation=generation,
         )
         manager_error: BaseException | None = None
-        await self.admission.wait_for_root_request_paths(generation)
+        await self.admission._wait_for_root_request_paths_owned(generation)
         logger.info(
             "runtime_root_request_paths_drained",
             root_generation=generation,
@@ -1335,7 +1471,7 @@ class RuntimeExecutionGraph:
         # Work admitted before the synchronous fence may install the manager
         # after release_root_owner captured its snapshot. Request-path
         # quiescence makes this the authoritative generation to revoke.
-        settled_manager = self.provider_manager()
+        settled_manager = await self._provider_manager_for_final_drain()
         if initial_manager is not None and settled_manager is not initial_manager:
             manager_error = RuntimeOwnershipError("Runtime provider manager changed during final drain")
         shutdown_error = await self._shutdown_provider_manager(settled_manager)
@@ -1345,8 +1481,8 @@ class RuntimeExecutionGraph:
         # Provider shutdown may settle retained operations and create cleanup
         # permits. Drain those before the final late-manager recheck, so no
         # pre-fence worker can publish an unclosed manager after our snapshot.
-        await self.admission.wait_for_root_drain(generation, include_service_owner=False)
-        late_manager = self.provider_manager()
+        await self.admission._wait_for_root_drain_owned(generation, include_service_owner=False)
+        late_manager = await self._provider_manager_for_final_drain()
         if late_manager is not None and late_manager is not settled_manager:
             shutdown_error = await self._shutdown_provider_manager(late_manager)
             if manager_error is None:
@@ -1357,25 +1493,54 @@ class RuntimeExecutionGraph:
             root_generation=generation,
             status="failed" if manager_error is not None else "completed",
         )
-        await self.admission.wait_for_root_drain(generation, include_service_owner=True)
-        self.admission.finish_root_drain(generation)
-        with self._lock:
-            if self._root_generation != generation or self._root_owners or self._root_state != "draining":
-                raise RuntimeOwnershipError("Runtime root generation changed during final drain")
-            drain_owner = self._final_drain_owner
-            if drain_owner is None or drain_owner.generation != generation:
-                raise RuntimeOwnershipError("Runtime root drain owner changed during final drain")
-            if self._provider_manager is not None:
-                self._provider_manager = None
-                self._provider_spec = None
-            self._root_state = "closed"
-            drain_owner.terminal = True
+        await self.admission._wait_for_root_drain_owned(generation, include_service_owner=True)
+        await self.admission._finish_root_drain_owned(generation)
+        await self._finish_final_root_graph_owned(generation)
         logger.info(
             "runtime_root_drain_completed",
             root_generation=generation,
         )
         if manager_error is not None:
             raise manager_error
+
+    async def _provider_manager_for_final_drain(self) -> object | None:
+        """Read and fence manager authority without blocking the lifecycle loop."""
+        while True:
+            if self._lock.acquire(blocking=False):
+                initialization: _ProviderManagerInitialization | None = None
+                try:
+                    initialization = self._provider_initialization
+                    if initialization is not None:
+                        self._provider_initialization = None
+                    manager = self._provider_manager
+                finally:
+                    self._lock.release()
+                if initialization is not None and not initialization.future.done():
+                    initialization.future.set_exception(
+                        RuntimeOwnershipError("Runtime provider manager construction was revoked by final drain")
+                    )
+                return manager
+            await asyncio.sleep(_RUNTIME_DRAIN_HEARTBEAT_SECONDS)
+
+    async def _finish_final_root_graph_owned(self, generation: int) -> None:
+        """Commit graph terminal state without blocking its lifecycle loop."""
+        while True:
+            if self._lock.acquire(blocking=False):
+                try:
+                    if self._root_generation != generation or self._root_owners or self._root_state != "draining":
+                        raise RuntimeOwnershipError("Runtime root generation changed during final drain")
+                    drain_owner = self._final_drain_owner
+                    if drain_owner is None or drain_owner.generation != generation:
+                        raise RuntimeOwnershipError("Runtime root drain owner changed during final drain")
+                    if self._provider_manager is not None:
+                        self._provider_manager = None
+                        self._provider_spec = None
+                    self._root_state = "closed"
+                    drain_owner.terminal = True
+                    return
+                finally:
+                    self._lock.release()
+            await asyncio.sleep(_RUNTIME_DRAIN_HEARTBEAT_SECONDS)
 
     @staticmethod
     async def _shutdown_provider_manager(manager: object | None) -> BaseException | None:
@@ -1504,6 +1669,13 @@ class PipelineAdmissionController:
         self._retained_task_tokens: dict[asyncio.Task[Any], int] = {}
         self._retained_work_permits: dict[int, set[int]] = {}
         self._retained_work_permit_tokens: dict[int, int] = {}
+        self._retained_work_requesters: dict[int, _RetainedWorkRequester] = {}
+        self._retained_work_reservations: dict[tuple[int, str], int] = {}
+        self._retained_work_permit_reservations: dict[int, str] = {}
+        self._service_retained_work_requesters: dict[
+            int,
+            dict[int, _RetainedWorkRequester],
+        ] = {}
         self._next_retained_work_permit = 0
         self._blocking_permits: dict[int, set[int]] = {}
         self._blocking_permit_tokens: dict[int, int] = {}
@@ -1516,12 +1688,14 @@ class PipelineAdmissionController:
         self._next_service_owner_permit = 0
         self._service_owner_thread_id: int | None = None
         self._release_pending: set[int] = set()
+        self._blocking_release_transitions = 0
         self._blocking_worker_context = threading.local()
         self._service_owner_context = threading.local()
         self._runtime_root_generation = 0
         self._runtime_root_state = "unmanaged"
         self._runtime_drain_waiters: list[_RuntimeDrainWaiter] = []
         self._request_paths_idle_callbacks: list[Callable[[], None]] = []
+        self._request_path_liveness_thread: threading.Thread | None = None
         self._execution_graph = RuntimeExecutionGraph(
             self,
             runtime_identity=self._runtime_identity,
@@ -1614,6 +1788,7 @@ class PipelineAdmissionController:
             if (
                 graph._root_owners
                 or graph._provider_manager is not None
+                or graph._provider_initialization is not None
                 or graph._final_drain_owner is not None
                 or graph._root_state not in {"unmanaged", "closed"}
                 or self._in_flight
@@ -1622,6 +1797,7 @@ class PipelineAdmissionController:
                 or self._retained_tasks
                 or self._retained_work_permit_tokens
                 or self._release_pending
+                or self._blocking_release_transitions
                 or self._blocking_permit_tokens
                 or self._cleanup_permits
                 or self._service_owner_permit is not None
@@ -1656,6 +1832,7 @@ class PipelineAdmissionController:
                 or graph._root_owners
                 or graph._provider_spec is not None
                 or graph._provider_manager is not None
+                or graph._provider_initialization is not None
                 or graph._final_drain_owner is not None
                 or graph._root_state != "unmanaged"
                 or self._runtime_root_generation
@@ -1669,6 +1846,7 @@ class PipelineAdmissionController:
                 or self._retained_tasks
                 or self._retained_work_permit_tokens
                 or self._release_pending
+                or self._blocking_release_transitions
                 or self._blocking_permit_tokens
                 or self._cleanup_permits
                 or self._service_owner_permit is not None
@@ -1716,7 +1894,7 @@ class PipelineAdmissionController:
     def retained(self) -> int:
         """Return request-complete work still consuming effective capacity."""
         with self._lock:
-            return len(self._release_pending)
+            return len(self._release_pending) + self._blocking_release_transitions
 
     @property
     def blocking_in_flight(self) -> int:
@@ -1742,7 +1920,7 @@ class PipelineAdmissionController:
             fatal = _PROCESS_RUNTIME_FATAL_REGISTRY.get(self._runtime_identity)
             active = self._in_flight
             queued = self._queued_count
-            retained = len(self._release_pending)
+            retained = len(self._release_pending) + self._blocking_release_transitions
             blocking = len(self._blocking_permit_tokens)
             cleanup = len(self._cleanup_permits)
             service_owner = int(self._service_owner_permit is not None)
@@ -1840,8 +2018,9 @@ class PipelineAdmissionController:
                 raise RuntimeError("pipeline service owner belongs to another runtime")
             if self._service_owner_permit != permit:
                 raise RuntimeError("pipeline service owner is not active")
-            if self._service_owner_thread_id is not None:
+            if permit.owner_started.is_set() and not permit.owner_exited.is_set():
                 raise RuntimeError("pipeline service owner is still running")
+            self._service_owner_thread_id = None
             self._service_owner_permit = None
             self._wake_runtime_drain_waiters_locked()
 
@@ -1874,6 +2053,7 @@ class PipelineAdmissionController:
                 or self._retained_tasks
                 or self._retained_work_permit_tokens
                 or self._release_pending
+                or self._blocking_release_transitions
                 or self._service_owner_permit is not None
             )
             self._runtime_root_state = "draining"
@@ -1911,6 +2091,102 @@ class PipelineAdmissionController:
             request_paths_only=True,
         )
 
+    async def _wait_for_root_request_paths_owned(self, generation: int) -> None:
+        """Let the durable drain owner observe liveness after monitor exhaustion."""
+        try:
+            await self._wait_for_root_condition_owned(
+                generation,
+                include_service_owner=False,
+                request_paths_only=True,
+            )
+            return
+        except RuntimeOwnershipError as exc:
+            if getattr(exc, "cleanup_reason_code", "") != "runtime_root_drain_startup_exhausted":
+                raise
+
+        logger.warning(
+            "pipeline_request_path_liveness_transferred_to_root_owner",
+            reason_code="runtime_root_drain_startup_exhausted",
+            root_generation=generation,
+        )
+        while True:
+            if self._poll_root_request_paths_from_owner(generation):
+                return
+            await asyncio.sleep(_RUNTIME_DRAIN_HEARTBEAT_SECONDS)
+
+    async def _wait_for_root_drain_owned(self, generation: int, *, include_service_owner: bool) -> None:
+        """Wait for drain capacity without blocking the durable owner on callers."""
+        await self._wait_for_root_condition_owned(
+            generation,
+            include_service_owner=include_service_owner,
+            request_paths_only=False,
+        )
+
+    async def _wait_for_root_condition_owned(
+        self,
+        generation: int,
+        *,
+        include_service_owner: bool,
+        request_paths_only: bool,
+    ) -> None:
+        waiter: _RuntimeDrainWaiter | None = None
+        while waiter is None:
+            if not self._lock.acquire(blocking=False):
+                await asyncio.sleep(_RUNTIME_DRAIN_HEARTBEAT_SECONDS)
+                continue
+            try:
+                self._validate_root_generation_locked(generation, expected_state="draining")
+                if self._runtime_wait_condition_locked(
+                    include_service_owner=include_service_owner,
+                    request_paths_only=request_paths_only,
+                ):
+                    return
+                waiter = _RuntimeDrainWaiter(
+                    generation=generation,
+                    include_service_owner=include_service_owner,
+                    request_paths_only=request_paths_only,
+                    future=ThreadFuture(),
+                )
+                self._runtime_drain_waiters.append(waiter)
+                if request_paths_only:
+                    try:
+                        self._schedule_request_path_liveness_monitor_locked()
+                    except BaseException:
+                        self._runtime_drain_waiters.remove(waiter)
+                        raise
+            finally:
+                self._lock.release()
+        try:
+            await asyncio.shield(asyncio.wrap_future(waiter.future))
+        finally:
+            while True:
+                if self._lock.acquire(blocking=False):
+                    try:
+                        if waiter in self._runtime_drain_waiters:
+                            self._runtime_drain_waiters.remove(waiter)
+                    finally:
+                        self._lock.release()
+                    break
+                await asyncio.sleep(_RUNTIME_DRAIN_HEARTBEAT_SECONDS)
+
+    def _poll_root_request_paths_from_owner(self, generation: int) -> bool:
+        """Perform one nonblocking owner-local liveness observation."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        callbacks: tuple[Callable[[], None], ...] = ()
+        try:
+            self._validate_root_generation_locked(generation, expected_state="draining")
+            fatal = _PROCESS_RUNTIME_FATAL_REGISTRY.get(self._runtime_identity)
+            if fatal is not None:
+                raise self._runtime_fatal_error(fatal)
+            self._wake_runtime_drain_waiters_locked()
+            callbacks = self._take_request_paths_idle_callbacks_locked()
+            idle = self._runtime_request_paths_idle_locked()
+        finally:
+            self._lock.release()
+        self._invoke_request_paths_idle_callbacks(callbacks)
+        return idle
+
     async def _wait_for_root_condition(
         self,
         generation: int,
@@ -1933,6 +2209,12 @@ class PipelineAdmissionController:
                 future=ThreadFuture(),
             )
             self._runtime_drain_waiters.append(waiter)
+            if request_paths_only:
+                try:
+                    self._schedule_request_path_liveness_monitor_locked()
+                except BaseException:
+                    self._runtime_drain_waiters.remove(waiter)
+                    raise
         try:
             await asyncio.shield(asyncio.wrap_future(waiter.future))
         finally:
@@ -1948,6 +2230,21 @@ class PipelineAdmissionController:
                 raise RuntimeOwnershipError("Runtime root drain completed with live capacity")
             self._runtime_root_state = "closed"
             self._wake_runtime_drain_waiters_locked()
+
+    async def _finish_root_drain_owned(self, generation: int) -> None:
+        """Commit controller terminal state without blocking its lifecycle loop."""
+        while True:
+            if self._lock.acquire(blocking=False):
+                try:
+                    self._validate_root_generation_locked(generation, expected_state="draining")
+                    if not self._runtime_idle_locked(include_service_owner=True):
+                        raise RuntimeOwnershipError("Runtime root drain completed with live capacity")
+                    self._runtime_root_state = "closed"
+                    self._wake_runtime_drain_waiters_locked()
+                    return
+                finally:
+                    self._lock.release()
+            await asyncio.sleep(_RUNTIME_DRAIN_HEARTBEAT_SECONDS)
 
     @property
     def runtime_root_state(self) -> str:
@@ -1967,22 +2264,34 @@ class PipelineAdmissionController:
                 raise RuntimeError("pipeline service owner is not active")
             if self._service_owner_thread_id is not None:
                 raise RuntimeError("pipeline service owner is already running")
+            if permit.owner_started.is_set():
+                raise RuntimeError("pipeline service owner permit was already consumed")
             self._service_owner_thread_id = thread_id
+            permit.owner_started.set()
         self._service_owner_context.permit = permit
         try:
             yield
         finally:
             del self._service_owner_context.permit
-            with self._lock:
-                if self._service_owner_thread_id != thread_id:
-                    raise RuntimeError("pipeline service owner thread state was corrupted")
-                self._service_owner_thread_id = None
+            # The durable owner publishes its own exit without entering a lock
+            # that requester code can hold. The transition owner later clears
+            # the controller's thread identity while releasing the permit.
+            permit.owner_exited.set()
 
     def current_thread_owns_service_owner(self) -> bool:
         """Return whether this thread owns the persistent async service loop."""
         permit = getattr(self._service_owner_context, "permit", None)
         with self._lock:
             return permit is not None and self._service_owner_permit == permit
+
+    def _validate_service_owner_thread_locked(self) -> None:
+        permit = getattr(self._service_owner_context, "permit", None)
+        if (
+            permit is None
+            or self._service_owner_permit != permit
+            or self._service_owner_thread_id != threading.get_ident()
+        ):
+            raise RuntimeOwnershipError("Pipeline service owner authority is required")
 
     async def acquire_cleanup_permits(
         self,
@@ -2123,6 +2432,23 @@ class PipelineAdmissionController:
             if not retained:
                 self._blocking_permits.pop(token, None)
             self._complete_pending_release_if_idle_locked(token)
+
+    @contextmanager
+    def blocking_permit_release_transition(self) -> Iterator[None]:
+        """Keep replacement admission closed until one permit release settles."""
+        with self._request_path_state_transition():
+            self._blocking_release_transitions += 1
+        try:
+            yield
+        finally:
+            with self._request_path_state_transition():
+                if self._blocking_release_transitions <= 0:
+                    raise RuntimeError("pipeline blocking release transition state was corrupted")
+                self._blocking_release_transitions -= 1
+                if self._blocking_release_transitions == 0:
+                    now = time.monotonic()
+                    self._maintain_selected_locked(now)
+                    self._notify_available_locked(now)
 
     def validate_cleanup_permits(self, permits: tuple[PipelineBlockingPermit, ...]) -> None:
         """Validate a complete cleanup group without consuming any permit."""
@@ -2323,6 +2649,22 @@ class PipelineAdmissionController:
             self._mark_release_pending_locked(lease.token)
             self._complete_pending_release_if_idle_locked(lease.token)
 
+    def try_release_from_service_owner(self, lease: PipelineAdmissionLease) -> bool:
+        """Release immediately or leave the lease unchanged for an owner retry."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            self._validate_service_owner_thread_locked()
+            self._validate_active_lease_locked(lease)
+            if lease.token in self._release_pending:
+                raise RuntimeError("pipeline admission lease is not active")
+            self._mark_release_pending_locked(lease.token)
+            self._complete_pending_release_if_idle_locked(lease.token)
+            self._wake_runtime_drain_waiters_locked()
+        finally:
+            self._lock.release()
+        return True
+
     def retain_task(self, lease: PipelineAdmissionLease, task: asyncio.Task[Any]) -> bool:
         """Keep a lease charged until resistant work has actually terminated."""
         with self._lock:
@@ -2349,16 +2691,35 @@ class PipelineAdmissionController:
                 self._complete_pending_release_if_idle_locked(token)
             return retained
 
-    def retain_current_work(self) -> PipelineRetainedWorkPermit:
+    def retain_current_work(
+        self,
+        *,
+        reservation_key: str = "",
+    ) -> PipelineRetainedWorkPermit:
         """Transfer the current request lease to controller-owned terminal work."""
+        reservation = str(reservation_key).strip()
+        try:
+            requester = _RetainedWorkRequester(
+                loop=asyncio.get_running_loop(),
+                task=asyncio.current_task(),
+            )
+        except RuntimeError:
+            requester = None
         with self._request_path_state_transition():
             for token in reversed(self._current_leases.get()):
                 if token not in self._active_leases or token in self._release_pending:
                     continue
+                if reservation and (token, reservation) in self._retained_work_reservations:
+                    raise PipelineAdmissionRejected("pipeline_admission_queue_full")
                 self._next_retained_work_permit += 1
                 permit_id = self._next_retained_work_permit
                 self._retained_work_permits.setdefault(token, set()).add(permit_id)
                 self._retained_work_permit_tokens[permit_id] = token
+                if reservation:
+                    self._retained_work_reservations[(token, reservation)] = permit_id
+                    self._retained_work_permit_reservations[permit_id] = reservation
+                if requester is not None:
+                    self._retained_work_requesters[permit_id] = requester
                 return PipelineRetainedWorkPermit(
                     controller_identity=self._identity,
                     runtime_identity=self._runtime_identity,
@@ -2367,8 +2728,109 @@ class PipelineAdmissionController:
                 )
         raise PipelineAdmissionRejected("pipeline_admission_queue_full")
 
+    def current_task_has_active_admission(self) -> bool:
+        """Return whether this task already owns one active request lease."""
+        with self._lock:
+            return any(
+                token in self._active_leases and token not in self._release_pending
+                for token in self._current_leases.get()
+            )
+
+    @contextmanager
+    def admitted_lease_context(self, lease: PipelineAdmissionLease) -> Iterator[None]:
+        """Expose one explicitly acquired lease to synchronous admission children."""
+        with self._lock:
+            self._validate_active_lease_locked(lease)
+            if lease.token in self._release_pending:
+                raise RuntimeOwnershipError("Pipeline admission lease is not active")
+        context_token = self._current_leases.set((*self._current_leases.get(), lease.token))
+        try:
+            yield
+        finally:
+            try:
+                self._current_leases.reset(context_token)
+            except ValueError:
+                # A coroutine finalized after its transport loop disappeared
+                # may be destroyed in another Context. The durable owner, not
+                # this transport token, owns the admitted terminal transition.
+                pass
+
     def release_retained_work(self, permit: PipelineRetainedWorkPermit) -> None:
         """Release transferred work from its actual cross-runtime terminal edge."""
+        with self._request_path_state_transition():
+            self._release_retained_work_locked(permit)
+
+    def try_release_retained_work_from_service_owner(
+        self,
+        permit: PipelineRetainedWorkPermit,
+    ) -> bool:
+        """Release retained work without waiting on the admission mutex."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            self._validate_service_owner_thread_locked()
+            self._release_retained_work_locked(permit)
+            self._wake_runtime_drain_waiters_locked()
+        finally:
+            self._lock.release()
+        return True
+
+    async def release_retained_work_async(
+        self,
+        permit: PipelineRetainedWorkPermit,
+        *,
+        timeout_seconds: float = 1.0,
+    ) -> None:
+        """Release retained work without blocking an async runtime owner on this lock."""
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("retained-work release timeout must be finite and non-negative")
+        deadline = time.monotonic() + timeout
+        while not self._lock.acquire(blocking=False):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("pipeline retained-work release timed out")
+            await asyncio.sleep(min(_RETAINED_WORK_LOCK_RETRY_SECONDS, remaining))
+
+        idle_callbacks: tuple[Callable[[], None], ...] = ()
+        try:
+            self._release_retained_work_locked(permit)
+            self._wake_runtime_drain_waiters_locked()
+            idle_callbacks = self._take_request_paths_idle_callbacks_locked()
+        finally:
+            self._lock.release()
+        self._invoke_request_paths_idle_callbacks(idle_callbacks)
+
+    def _release_retained_work_locked(self, permit: PipelineRetainedWorkPermit) -> None:
+        if permit.controller_identity is not self._identity:
+            raise RuntimeError("pipeline retained-work permit belongs to another controller")
+        if permit.runtime_identity != self._runtime_identity:
+            raise RuntimeError("pipeline retained-work permit belongs to another runtime")
+        token = self._retained_work_permit_tokens.get(permit.permit_id)
+        if token != permit.token:
+            raise RuntimeError("pipeline retained-work permit is not active")
+        retained = self._retained_work_permits.get(token)
+        if retained is None or permit.permit_id not in retained:
+            raise RuntimeError("pipeline retained-work permit state was corrupted")
+        reservation = self._retained_work_permit_reservations.get(permit.permit_id, "")
+        if reservation:
+            reservation_owner = self._retained_work_reservations.get((token, reservation))
+            if reservation_owner != permit.permit_id:
+                raise RuntimeError("pipeline retained-work reservation state was corrupted")
+        retained.remove(permit.permit_id)
+        self._retained_work_permit_tokens.pop(permit.permit_id, None)
+        self._retained_work_permit_reservations.pop(permit.permit_id, None)
+        if reservation:
+            self._retained_work_reservations.pop((token, reservation), None)
+        requester = self._retained_work_requesters.pop(permit.permit_id, None)
+        if not retained:
+            self._retained_work_permits.pop(token, None)
+        if token in self._service_admitted_tokens and requester is not None and requester.is_abandoned():
+            self._mark_release_pending_locked(token)
+        self._complete_pending_release_if_idle_locked(token)
+
+    def transfer_retained_work_to_service_owner(self, permit: PipelineRetainedWorkPermit) -> None:
+        """Exclude durable service-owned work from requester-path root drain."""
         with self._request_path_state_transition():
             if permit.controller_identity is not self._identity:
                 raise RuntimeError("pipeline retained-work permit belongs to another controller")
@@ -2377,14 +2839,33 @@ class PipelineAdmissionController:
             token = self._retained_work_permit_tokens.get(permit.permit_id)
             if token != permit.token:
                 raise RuntimeError("pipeline retained-work permit is not active")
-            retained = self._retained_work_permits.get(token)
-            if retained is None or permit.permit_id not in retained:
-                raise RuntimeError("pipeline retained-work permit state was corrupted")
-            retained.remove(permit.permit_id)
-            self._retained_work_permit_tokens.pop(permit.permit_id, None)
-            if not retained:
-                self._retained_work_permits.pop(token, None)
-            self._complete_pending_release_if_idle_locked(token)
+            if self._service_owner_permit is None:
+                raise RuntimeOwnershipError("Durable retained work has no service owner")
+            self._service_admitted_tokens.add(token)
+            requester = self._retained_work_requesters.get(permit.permit_id)
+            if requester is not None:
+                self._service_retained_work_requesters.setdefault(token, {})[permit.permit_id] = requester
+            self._schedule_request_path_liveness_monitor_locked()
+
+    def relinquish_request_path(
+        self,
+        loop: asyncio.AbstractEventLoop | None,
+        task: asyncio.Task[Any] | None,
+    ) -> None:
+        """Stop treating one root borrow's requester as live during explicit exit."""
+        if loop is None or task is None:
+            return
+        with self._request_path_state_transition():
+            for token, requesters in tuple(self._service_retained_work_requesters.items()):
+                relinquished = tuple(
+                    permit_id
+                    for permit_id, requester in requesters.items()
+                    if requester.loop is loop and requester.task is task
+                )
+                for permit_id in relinquished:
+                    requesters.pop(permit_id, None)
+                if not requesters:
+                    self._service_retained_work_requesters.pop(token, None)
 
     @asynccontextmanager
     async def slot(
@@ -2409,6 +2890,8 @@ class PipelineAdmissionController:
         return str(partition_key or _DEFAULT_PARTITION)
 
     def _reserve_current_blocking_permit_locked(self) -> PipelineBlockingPermit | None:
+        if self._blocking_release_transitions:
+            return None
         for token in reversed(self._current_leases.get()):
             if token not in self._active_leases:
                 continue
@@ -2597,6 +3080,7 @@ class PipelineAdmissionController:
             raise RuntimeError("pipeline admission lease still has retained work")
         self._active_leases.pop(token)
         self._service_admitted_tokens.discard(token)
+        self._service_retained_work_requesters.pop(token, None)
         self._release_pending.discard(token)
         self._in_flight -= 1
         self._decrement_partition_count(self._in_flight_by_partition, partition)
@@ -2922,6 +3406,7 @@ class PipelineAdmissionController:
     def _accepting_normal_work_locked(self) -> bool:
         return (
             not self._process_authority_retired
+            and self._blocking_release_transitions == 0
             and _PROCESS_RUNTIME_FATAL_REGISTRY.get(self._runtime_identity) is None
             and self._runtime_root_state in {"unmanaged", "active"}
         )
@@ -2935,6 +3420,7 @@ class PipelineAdmissionController:
             or self._retained_work_permit_tokens
             or self._blocking_permit_tokens
             or self._release_pending
+            or self._blocking_release_transitions
             or self._selected_maintenance_thread is not None
             or (include_service_owner and self._service_owner_permit is not None)
         )
@@ -2943,9 +3429,10 @@ class PipelineAdmissionController:
         # A release-pending requester can still retain a cancellation-resistant
         # task or worker that uses the provider. Only service-loop work belongs
         # to provider shutdown; every requester-owned lease must really finish.
-        active_request_tokens = self._active_leases.keys() - self._service_admitted_tokens
+        active_request_tokens = any(self._token_has_live_request_path_locked(token) for token in self._active_leases)
         return not (
             active_request_tokens
+            or self._blocking_release_transitions
             or self._queued_count
             or self._selected
             or self._selected_maintenance_thread is not None
@@ -2959,6 +3446,11 @@ class PipelineAdmissionController:
                 invoke_now = True
             elif callback not in self._request_paths_idle_callbacks:
                 self._request_paths_idle_callbacks.append(callback)
+                try:
+                    self._schedule_request_path_liveness_monitor_locked()
+                except BaseException:
+                    self._request_paths_idle_callbacks.remove(callback)
+                    raise
         if invoke_now:
             self._invoke_request_paths_idle_callbacks((callback,))
 
@@ -2971,6 +3463,7 @@ class PipelineAdmissionController:
                 try:
                     yield
                 finally:
+                    self._wake_runtime_drain_waiters_locked()
                     idle_callbacks = self._take_request_paths_idle_callbacks_locked()
         finally:
             self._invoke_request_paths_idle_callbacks(idle_callbacks)
@@ -2981,6 +3474,86 @@ class PipelineAdmissionController:
         callbacks = tuple(self._request_paths_idle_callbacks)
         self._request_paths_idle_callbacks.clear()
         return callbacks
+
+    def _token_has_live_request_path_locked(self, token: int) -> bool:
+        if token not in self._service_admitted_tokens:
+            return True
+        if self._retained_tasks.get(token):
+            return True
+        requesters = self._service_retained_work_requesters.get(token)
+        if not requesters:
+            return False
+        return any(not requester.is_abandoned() for requester in requesters.values())
+
+    def _requester_liveness_can_change_locked(self) -> bool:
+        return any(
+            token in self._active_leases and requesters
+            for token, requesters in self._service_retained_work_requesters.items()
+        )
+
+    def _schedule_request_path_liveness_monitor_locked(self) -> None:
+        if self._request_path_liveness_thread is not None:
+            return
+        if not (
+            self._request_paths_idle_callbacks
+            or any(waiter.request_paths_only for waiter in self._runtime_drain_waiters)
+        ):
+            return
+        for attempt in range(2):
+            try:
+                _start_lifecycle_owner_thread(
+                    target=self._run_request_path_liveness_monitor,
+                    name=f"tacit-request-path-liveness-{id(self)}",
+                    install=lambda thread: setattr(self, "_request_path_liveness_thread", thread),
+                    daemon=True,
+                )
+                return
+            except _LifecycleOwnerStartupError as exc:
+                if exc.thread_alive:
+                    logger.warning(
+                        "pipeline_request_path_liveness_monitor_start_ambiguous",
+                        reason_code="runtime_root_deferred_release_failed",
+                        error_type=type(exc.cause).__name__,
+                    )
+                    return
+                self._request_path_liveness_thread = None
+                if attempt == 0:
+                    logger.warning(
+                        "pipeline_request_path_liveness_monitor_start_retry",
+                        reason_code="lifecycle_owner_preflight_failed",
+                        error_type=type(exc.cause).__name__,
+                    )
+                    continue
+                failure = RuntimeOwnershipError("Pipeline request-path liveness monitor failed to start")
+                setattr(failure, "cleanup_reason_code", "runtime_root_drain_startup_exhausted")
+                setattr(failure, "cleanup_error_type", type(exc.cause).__name__)
+                logger.error(
+                    "pipeline_request_path_liveness_monitor_start_failed",
+                    reason_code="runtime_root_drain_startup_exhausted",
+                    error_type=type(exc.cause).__name__,
+                )
+                raise failure from exc.cause
+
+    def _run_request_path_liveness_monitor(self) -> None:
+        monitor = threading.current_thread()
+        while True:
+            time.sleep(_RUNTIME_DRAIN_HEARTBEAT_SECONDS)
+            idle_callbacks: tuple[Callable[[], None], ...] = ()
+            should_exit = False
+            with self._lock:
+                if self._request_path_liveness_thread is not monitor:
+                    return
+                self._wake_runtime_drain_waiters_locked()
+                idle_callbacks = self._take_request_paths_idle_callbacks_locked()
+                has_observer = bool(self._request_paths_idle_callbacks) or any(
+                    waiter.request_paths_only for waiter in self._runtime_drain_waiters
+                )
+                if not has_observer:
+                    self._request_path_liveness_thread = None
+                    should_exit = True
+            self._invoke_request_paths_idle_callbacks(idle_callbacks)
+            if should_exit:
+                return
 
     @staticmethod
     def _invoke_request_paths_idle_callbacks(

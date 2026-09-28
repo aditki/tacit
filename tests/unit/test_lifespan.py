@@ -508,8 +508,7 @@ async def test_slack_app_reuses_one_runtime_owner_for_every_event(monkeypatch):
     assert callable(slash)
     await mention({}, object())
     await slash(object(), {}, object())
-    assert len(seen_stores) == 2
-    assert seen_stores[0] is seen_stores[1]
+    assert len(seen_stores) == 1
 
 
 async def test_slack_event_bundles_share_the_runtime_provider_resource(monkeypatch, tmp_path):

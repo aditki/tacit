@@ -282,6 +282,7 @@ def create_lifespan(runtime_settings: Settings = default_settings):
                         name="slack",
                         runtime_identity=runtime_identity,
                         lifecycle=slack_lifecycle,
+                        blocking_lifecycle=runtime_stores.pipeline_admission(),
                     )
                     slack_owner.start(
                         run_slack,

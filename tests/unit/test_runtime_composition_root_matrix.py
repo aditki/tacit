@@ -749,7 +749,7 @@ def test_isolated_direct_pipeline_drain_survives_requester_loop_loss(
     unraisable: list[Any] = []
     logs = _RecordingLogger()
     original_begin = admission.begin_root_drain
-    original_finish = admission.finish_root_drain
+    original_finish = admission._finish_root_drain_owned
 
     monkeypatch.setattr(runner_module, "logger", logs)
     monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
@@ -759,8 +759,8 @@ def test_isolated_direct_pipeline_drain_survives_requester_loop_loss(
         drain_started.set()
         return active
 
-    def observed_finish(generation: int) -> None:
-        original_finish(generation)
+    async def observed_finish(generation: int) -> None:
+        await original_finish(generation)
         drain_finished.set()
 
     async def successful_inner(*_args: Any, **_kwargs: Any) -> DashResponse:
@@ -768,7 +768,7 @@ def test_isolated_direct_pipeline_drain_survives_requester_loop_loss(
         return _response(1)
 
     monkeypatch.setattr(admission, "begin_root_drain", observed_begin)
-    monkeypatch.setattr(admission, "finish_root_drain", observed_finish)
+    monkeypatch.setattr(admission, "_finish_root_drain_owned", observed_finish)
     monkeypatch.setattr(runner_module, "_run_pipeline_inner", successful_inner)
 
     def run_requester_loop() -> None:

@@ -1464,6 +1464,31 @@ def test_protected_release_publishers_reauthorize_adjacent_to_first_external_mut
         assert steps.index(_step(job, name)) < authority_index
 
 
+def test_pypi_publisher_rechecks_remote_state_after_sealing_and_before_upload() -> None:
+    job = _release_workflow()["jobs"]["publish-pypi"]
+    steps = job["steps"]
+    snapshot = _step(job, "Prepare sealed PyPI publisher path")
+    authorization = _step(job, "Re-authorize release before publication")
+    publish = _step(job, "Publish to PyPI")
+    rechecks = [step for step in steps if step.get("name") == "Verify PyPI publication state"]
+
+    assert len(rechecks) == 1, "PyPI state must be rechecked from sealed descriptors immediately before upload"
+    recheck = rechecks[0]
+    assert recheck["env"] == {
+        "PACKAGE_VERSION": "${{ needs.validate-release.outputs.package_version }}",
+        "WHEEL_NAME": "${{ needs.pypi-preflight.outputs.wheel_name }}",
+        "WHEEL_DIGEST": "${{ needs.pypi-preflight.outputs.wheel_digest }}",
+        "SDIST_NAME": "${{ needs.pypi-preflight.outputs.sdist_name }}",
+        "SDIST_DIGEST": "${{ needs.pypi-preflight.outputs.sdist_digest }}",
+    }
+    assert "verify_pypi_release.py preflight" in recheck["run"]
+    assert '--artifact "wheel=$WHEEL_NAME=$WHEEL_DIGEST"' in recheck["run"]
+    assert '--artifact "sdist=$SDIST_NAME=$SDIST_DIGEST"' in recheck["run"]
+    assert steps.index(snapshot) + 1 == steps.index(recheck)
+    assert steps.index(recheck) + 1 == steps.index(authorization)
+    assert steps.index(authorization) + 1 == steps.index(publish)
+
+
 def test_final_publishers_consume_preflight_carried_sealed_snapshots() -> None:
     jobs = _release_workflow()["jobs"]
 
@@ -1501,6 +1526,7 @@ def test_final_publishers_consume_preflight_carried_sealed_snapshots() -> None:
 
     pypi = jobs["publish-pypi"]
     pypi_snapshot = _step(pypi, "Prepare sealed PyPI publisher path")
+    pypi_recheck = _step(pypi, "Verify PyPI publication state")
     pypi_authorization = _step(pypi, "Re-authorize release before publication")
     pypi_publish = _step(pypi, "Publish to PyPI")
     pypi_postflight = _step(pypi, "Verify published PyPI files")
@@ -1516,7 +1542,8 @@ def test_final_publishers_consume_preflight_carried_sealed_snapshots() -> None:
     assert "--source-directory dist" in pypi_snapshot["run"]
     assert '--destination-directory "$PYPI_PUBLICATION_SNAPSHOT_DIR"' in pypi_snapshot["run"]
     assert '--backing-directory "$PYPI_PUBLICATION_BACKING_DIR"' in pypi_snapshot["run"]
-    assert pypi_steps.index(pypi_snapshot) + 1 == pypi_steps.index(pypi_authorization)
+    assert pypi_steps.index(pypi_snapshot) + 1 == pypi_steps.index(pypi_recheck)
+    assert pypi_steps.index(pypi_recheck) + 1 == pypi_steps.index(pypi_authorization)
     assert pypi_steps.index(pypi_authorization) + 1 == pypi_steps.index(pypi_publish)
     assert pypi_publish["with"]["packages-dir"] == "${{ env.PYPI_PUBLICATION_SNAPSHOT_DIR }}"
     # The sealed directory is the complete authorized payload. Publisher-generated
@@ -3581,6 +3608,167 @@ for candidate in pathlib.Path('/var/lib').glob(backing.name + '*'):
         emergency_cleanup()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="mount propagation is a Linux publication boundary")
+def test_sealed_publication_path_neutralizes_shared_mount_propagation() -> None:
+    if os.geteuid() == 0:
+        privilege_prefix: list[str] = []
+    else:
+        sudo = shutil.which("sudo")
+        if sudo is None:
+            pytest.skip("passwordless sudo is unavailable")
+        probe = subprocess.run(
+            [sudo, "--non-interactive", "true"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0:
+            pytest.skip("passwordless sudo is unavailable")
+        privilege_prefix = [sudo, "--non-interactive"]
+
+    suffix = secrets.token_hex(12)
+    trusted_root = Path("/var/lib") / f"tacit-release-publication-test-root-{suffix}"
+    shared_peer = Path("/var/lib") / f"tacit-release-publication-test-peer-{suffix}"
+    runner_home = trusted_root / "runner"
+    workspace = runner_home / "work" / "tacit" / "tacit"
+    source_directory = workspace / "downloaded"
+    publication_path = workspace / f".tacit-pypi-publication-{suffix}"
+    backing_directory = Path("/var/lib") / f"tacit-release-publication-test-{suffix}"
+    artifact_name = "tacit_ai-1.2.3-py3-none-any.whl"
+    payload = b"shared-propagation-bound publisher bytes"
+    artifact_spec = f"wheel={artifact_name}={hashlib.sha256(payload).hexdigest()}"
+    owner_uid = os.getuid() if os.getuid() != 0 else 65534
+    owner_gid = os.getgid() if os.getuid() != 0 else 65534
+
+    setup = subprocess.run(
+        [
+            *privilege_prefix,
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,subprocess,sys; root,peer,home,workspace,uid,gid=sys.argv[1:]; "
+                "pathlib.Path(root).mkdir(mode=0o755); pathlib.Path(peer).mkdir(mode=0o755); "
+                "pathlib.Path(home).mkdir(mode=0o700); pathlib.Path(workspace).mkdir(parents=True); "
+                "paths=[pathlib.Path(home)]; current=pathlib.Path(home); "
+                "[(paths.append(current := current / part)) for part in "
+                "pathlib.Path(workspace).relative_to(home).parts]; "
+                "[os.chown(path,int(uid),int(gid)) for path in paths]; "
+                "subprocess.run(['/usr/bin/mount','--bind',home,home],check=True); "
+                "subprocess.run(['/usr/bin/mount','--make-shared',home],check=True); "
+                "subprocess.run(['/usr/bin/mount','--bind',home,peer],check=True)"
+            ),
+            str(trusted_root),
+            str(shared_peer),
+            str(runner_home),
+            str(workspace),
+            str(owner_uid),
+            str(owner_gid),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert setup.returncode == 0, setup.stderr
+
+    try:
+        source_directory.mkdir(parents=True)
+        (source_directory / artifact_name).write_bytes(payload)
+        seal = subprocess.run(
+            [
+                *privilege_prefix,
+                sys.executable,
+                str(RELEASE_PUBLICATION_SNAPSHOT),
+                "seal",
+                "--source-directory",
+                str(source_directory),
+                "--destination-directory",
+                str(publication_path),
+                "--backing-directory",
+                str(backing_directory),
+                "--artifact",
+                artifact_spec,
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert seal.returncode == 0, seal.stderr
+
+        mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+        expected_mounts = (
+            runner_home,
+            runner_home / "work",
+            runner_home / "work" / "tacit",
+            workspace,
+            publication_path,
+        )
+        for expected_mount in expected_mounts:
+            matching = [line for line in mountinfo if line.split()[4] == str(expected_mount)]
+            assert len(matching) == (2 if expected_mount == runner_home else 1)
+            assert all(" shared:" not in f" {line} " for line in matching)
+            peer_mount = shared_peer / expected_mount.relative_to(runner_home)
+            peer_matching = [line for line in mountinfo if line.split()[4] == str(peer_mount)]
+            if expected_mount == runner_home:
+                assert len(peer_matching) == 1
+            else:
+                assert peer_matching == []
+
+        cleanup = subprocess.run(
+            [
+                *privilege_prefix,
+                sys.executable,
+                str(RELEASE_PUBLICATION_SNAPSHOT),
+                "unseal",
+                "--directory",
+                str(publication_path),
+                "--backing-directory",
+                str(backing_directory),
+                "--artifact-name",
+                artifact_name,
+            ],
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert cleanup.returncode == 0, cleanup.stderr
+    finally:
+        emergency = subprocess.run(
+            [
+                *privilege_prefix,
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib,shutil,subprocess,sys; root=pathlib.Path(sys.argv[1]); "
+                    "peer=pathlib.Path(sys.argv[2]); backing=pathlib.Path(sys.argv[3]); "
+                    "lines=pathlib.Path('/proc/self/mountinfo').read_text(encoding='utf-8').splitlines(); "
+                    "mounts=[pathlib.Path(fields[4].replace('\\\\040',' ')) for line in lines "
+                    "if len(fields:=line.split())>=10 and "
+                    "(fields[4].replace('\\\\040',' ')==str(root) or root in "
+                    "pathlib.Path(fields[4].replace('\\\\040',' ')).parents or "
+                    "fields[4].replace('\\\\040',' ')==str(peer) or peer in "
+                    "pathlib.Path(fields[4].replace('\\\\040',' ')).parents)]; "
+                    "[subprocess.run(['/usr/bin/umount','--',str(path)],check=False) "
+                    "for path in sorted(mounts,key=lambda item:len(item.parts),reverse=True)]; "
+                    "subprocess.run(['/usr/bin/umount','--',str(peer)],check=False); "
+                    "subprocess.run(['/usr/bin/umount','--',str(root)],check=False); "
+                    "shutil.rmtree(root,ignore_errors=True); shutil.rmtree(peer,ignore_errors=True); "
+                    "[path.chmod(0o700) if path.is_dir() else None for path in (backing,) if path.exists()]; "
+                    "shutil.rmtree(backing,ignore_errors=True); "
+                    "backing.with_name(backing.name+'.mount-authority.json').unlink(missing_ok=True)"
+                ),
+                str(trusted_root),
+                str(shared_peer),
+                str(backing_directory),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert emergency.returncode == 0, emergency.stderr
+
+
 def test_publication_descriptor_cli_hashes_and_verifies_the_exact_file_set(tmp_path: Path) -> None:
     payloads = tmp_path / "payloads"
     payloads.mkdir()
@@ -4026,10 +4214,26 @@ def test_runtime_image_keeps_dependency_cache_out_of_layers_and_uses_allowed_pro
     assert dockerfile.count("uv sync --locked --link-mode=copy") == 2
     assert "tacit_ai-*.dist-info/uv_cache.json" in dockerfile
     assert "sed -i '/uv_cache\\.json,/d'" in dockerfile
-    assert 'CMD ["python", "/app/tacit/api/routes/system.py"]' in dockerfile
+    assert 'CMD ["python", "/app/tacit/container_healthcheck.py"]' in dockerfile
+
+    healthcheck = (REPOSITORY_ROOT / "tacit" / "container_healthcheck.py").read_text(encoding="utf-8")
+    assert "from tacit" not in healthcheck
+    assert "import fastapi" not in healthcheck
+    assert "import pydantic" not in healthcheck
 
     readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
     assert "API_ALLOWED_HOSTS=tacit.example.com" in readme
+
+
+def test_runtime_image_repository_healthcheck_is_tracked() -> None:
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "tacit/container_healthcheck.py"],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert tracked.returncode == 0, tracked.stderr
 
 
 def test_container_api_deployments_use_the_shared_authenticated_bind_boundary() -> None:
