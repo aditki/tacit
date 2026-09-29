@@ -188,10 +188,11 @@ async def test_final_root_owner_remains_responsive_during_graph_lock_contention(
     assert await asyncio.to_thread(drain_entered.wait, 1.0)
     owner = graph._final_drain_owner
     assert owner is not None
-    for _ in range(100):
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while asyncio.get_running_loop().time() < deadline:
         if owner.transport_relays:
             break
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.001)
     assert owner.transport_relays
 
     graph._lock.acquire()

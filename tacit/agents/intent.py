@@ -106,15 +106,8 @@ SECURITY RULES (never violate these):
 
 
 def _resolve_provider(provider: LLMProvider | None) -> LLMProvider | None:
-    """Resolve the provider classify_intent will use, tolerating init failures."""
-    if provider is not None:
-        return provider
-    try:
-        from tacit.agents import llm as llm_module
-
-        return llm_module.get_provider()
-    except Exception:
-        return None
+    """Use only an explicitly owned provider at this async boundary."""
+    return provider
 
 
 async def classify_intent(
@@ -147,6 +140,7 @@ async def classify_intent(
         response_model=Intent,
         temperature=0.1,
         provider=resolved if resolved is not None else provider,
+        runtime_settings=active_settings,
     )
 
     # Operational-vocabulary normalization, two tiers:

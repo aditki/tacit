@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import structlog
 from structlog.testing import capture_logs
@@ -205,8 +205,7 @@ def test_call_llm_returns_tuple():
         )
     )
 
-    with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
-        model, usage = asyncio.run(call_llm("sys", "user", Simple))
+    model, usage = asyncio.run(call_llm("sys", "user", Simple, provider=mock_provider))
 
     assert model.v == 42
     assert usage.total_tokens == 120
@@ -236,8 +235,7 @@ def test_call_llm_accumulates_repair_tokens():
         ]
     )
 
-    with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
-        model, usage = asyncio.run(call_llm("sys", "user", Simple))
+    model, usage = asyncio.run(call_llm("sys", "user", Simple, provider=mock_provider))
 
     assert model.v == 7
     assert usage.total_tokens == 260  # 150 + 110
@@ -271,8 +269,7 @@ def test_classify_intent_returns_usage():
         )
     )
 
-    with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
-        intent, usage = asyncio.run(classify_intent("high cpu"))
+    intent, usage = asyncio.run(classify_intent("high cpu", provider=mock_provider))
 
     assert intent.domain == "general"
     assert usage.total_tokens == 600

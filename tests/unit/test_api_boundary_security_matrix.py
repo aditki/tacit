@@ -586,7 +586,7 @@ def test_security_header_boundary_preserves_sse_response_stream() -> None:
     assert admission.reserved_bytes == 0
 
 
-async def test_fastapi_eager_body_releases_ingress_before_streaming_response_completes() -> None:
+async def test_fastapi_eager_body_retains_ingress_until_streaming_response_completes() -> None:
     app = create_app(
         runtime_settings=_settings(
             api_auth_enabled=True,
@@ -646,12 +646,11 @@ async def test_fastapi_eager_body_releases_ingress_before_streaming_response_com
         await asyncio.wait_for(response_started.wait(), timeout=1)
         assert task.done() is False
         during_stream = app.state.request_body_admission.snapshot()
-        assert during_stream.active_requests == 0
-        assert during_stream.reserved_bytes == 0
+        assert during_stream.active_requests == 1
+        assert during_stream.reserved_bytes > 0
 
         capacity_probe = app.state.request_body_admission.try_acquire("capacity-probe", 1)
-        assert capacity_probe.lease is not None
-        capacity_probe.lease.release()
+        assert capacity_probe.lease is None
     finally:
         finish_stream.set()
         await asyncio.wait_for(task, timeout=1)
@@ -659,6 +658,9 @@ async def test_fastapi_eager_body_releases_ingress_before_streaming_response_com
     start = next(message for message in sent if message["type"] == "http.response.start")
     assert [value for name, value in start["headers"] if name.lower() == b"connection"] == []
     assert _response(sent) == (200, b"first-complete")
+    after_stream = app.state.request_body_admission.snapshot()
+    assert after_stream.active_requests == 0
+    assert after_stream.reserved_bytes == 0
 
 
 @pytest.mark.parametrize(

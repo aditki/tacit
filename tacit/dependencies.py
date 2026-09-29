@@ -9,9 +9,9 @@ import threading
 import warnings
 import weakref
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable, Coroutine, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from concurrent.futures import Future as ThreadFuture
-from contextlib import contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
@@ -396,6 +396,7 @@ class BackendResourceLease:
 class _BackendLeaseReleaseState:
     graph_nonce: str
     generation_epoch: int
+    generation: _ProviderGenerationCloseState = field(repr=False)
     lease_id: str
     provider_lease: ProviderLeaseHandle
     proxy_ids: tuple[int, ...]
@@ -438,18 +439,29 @@ class _BackendLeaseReleaseState:
         with self.lock:
             return self.provider_released
 
-    def begin_composite_release(self) -> tuple[ThreadFuture[None], bool]:
-        """Install the one joinable release before either authority mutates."""
-        with self.lock:
-            if self.composite_release is not None:
-                return self.composite_release, False
-            if self.resource_released and (self.provider_released or not self.release_provider_lease):
-                completed: ThreadFuture[None] = ThreadFuture()
-                completed.set_result(None)
-                return completed, False
-            release: ThreadFuture[None] = ThreadFuture()
-            self.composite_release = release
-            return release, True
+    def try_begin_composite_release_on_owner(self) -> tuple[ThreadFuture[None], bool] | None:
+        """Install or join release without blocking the shared provider owner."""
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            return self._begin_composite_release_locked()
+        finally:
+            self.lock.release()
+
+    def _begin_composite_release_locked(self) -> tuple[ThreadFuture[None], bool]:
+        if self.composite_release is not None:
+            return self.composite_release, False
+        if self.resource_released and (self.provider_released or not self.release_provider_lease):
+            completed: ThreadFuture[None] = ThreadFuture()
+            completed.set_result(None)
+            return completed, False
+        release: ThreadFuture[None] = ThreadFuture()
+        self.composite_release = release
+        return release, True
+
+    def published_composite_release(self) -> ThreadFuture[None] | None:
+        """Return the monotonic join handle without acquiring foreign state."""
+        return self.composite_release
 
     def complete_composite_release(self, release: ThreadFuture[None]) -> None:
         """Publish terminal success without acquiring requester-owned locks."""
@@ -694,6 +706,7 @@ class _ProviderGenerationCloseState:
     committed_submissions: dict[int, _ProviderCommittedSubmission] = field(default_factory=dict)
     submission_retry_keys: set[tuple[int, str]] = field(default_factory=set)
     terminal_retry_keys: set[str] = field(default_factory=set)
+    backend_release_retry_events: dict[str, asyncio.Event] = field(default_factory=dict, repr=False)
     backend_releases: dict[
         int,
         tuple[_BackendLeaseReleaseState, ThreadFuture[None]],
@@ -798,13 +811,30 @@ class _ProviderOperationAdmission:
             self.operation_started = True
             return True
 
-    def request_cancel(self) -> bool:
-        """Prevent unstarted work while leaving committed capacity charged."""
-        with self.lock:
+    def try_begin_operation_on_owner(self) -> bool | None:
+        """Start on the owner without waiting on a foreign admission lock."""
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            self.submitted = True
+            if self.cancel_requested:
+                return False
+            self.operation_started = True
+            return True
+        finally:
+            self.lock.release()
+
+    def try_request_cancel_on_owner(self) -> bool | None:
+        """Prevent unstarted work without waiting on requester-owned state."""
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
             if self.operation_started:
                 return False
             self.cancel_requested = True
             return True
+        finally:
+            self.lock.release()
 
     def finish(self) -> None:
         """Release a standalone lease exactly once at the real terminal edge."""
@@ -845,6 +875,10 @@ class _ProviderOperationAdmission:
 
     def finish_if_unsubmitted(self) -> None:
         """Roll back admission when no owner-loop handoff was committed."""
+        if self.submitted:
+            # Publication is monotonic; after it commits, only the owner may
+            # settle admission and requester cleanup needs no lock.
+            return
         with self.lock:
             submitted = self.submitted
         if not submitted:
@@ -865,6 +899,7 @@ class _ProviderCommittedSubmission:
     submission_started: bool = False
     settled: bool = False
     lock: Any = field(default_factory=threading.Lock, repr=False)
+    retry_events: dict[str, asyncio.Event] = field(default_factory=dict, repr=False)
 
 
 class _RuntimeAsyncResourceOwner:
@@ -1025,6 +1060,7 @@ class _RuntimeAsyncResourceOwner:
                 record.release_state = _BackendLeaseReleaseState(
                     graph_nonce=self._host._graph_nonce,
                     generation_epoch=state.generation_epoch,
+                    generation=state,
                     lease_id=lease_id,
                     provider_lease=provider_lease,
                     proxy_ids=tuple(id(proxy) for proxy in proxies),
@@ -1135,43 +1171,55 @@ class _RuntimeAsyncResourceOwner:
     async def release(self, lease: BackendResourceLease) -> None:
         if lease.graph_nonce != self._host._graph_nonce:
             raise RuntimeOwnershipError("Backend resource lease belongs to another runtime")
-        lease._release_state.validate(lease)
-        release, owns_release = lease._release_state.begin_composite_release()
-        if owns_release:
-            try:
-                state = self._host._state_for_provider_lease(lease._provider_lease)
-            except BaseException as exc:
-                lease._release_state.fail_composite_release(release, exc)
-                raise
+        release_state = lease._release_state
+        release_state.validate(lease)
+        state = release_state.generation
 
-            async def release_on_owner() -> None:
-                record = self._record(lease.lease_id)
-                if (
-                    record.generation is not state
-                    or record.generation.generation_epoch != lease.generation_epoch
-                    or record.provider_lease != lease._provider_lease
-                    or record.proxies != lease.backends
-                    or record.release_provider_lease != lease._release_provider_lease
-                    or record.release_state is not lease._release_state
-                ):
-                    raise RuntimeOwnershipError("Backend resource lease authority identity does not match")
-                await self._release_composite_on_owner(
-                    record,
-                    lease._release_state,
-                    release,
-                )
+        async def release_on_owner() -> ThreadFuture[None]:
+            published = release_state.published_composite_release()
+            if published is not None:
+                return published
+            record = self._record(lease.lease_id)
+            if (
+                record.generation is not state
+                or record.generation.generation_epoch != lease.generation_epoch
+                or record.provider_lease != lease._provider_lease
+                or record.proxies != lease.backends
+                or record.release_provider_lease != lease._release_provider_lease
+                or record.release_state is not release_state
+            ):
+                raise RuntimeOwnershipError("Backend resource lease authority identity does not match")
+            release, owns_release = await self._begin_composite_release_on_owner(record, release_state)
+            if owns_release:
+                try:
+                    await self._release_composite_on_owner(
+                        record,
+                        release_state,
+                        release,
+                    )
+                except BaseException:
+                    # The shared release future is the terminal result for all
+                    # concurrent callers, including detached requesters.
+                    pass
+            return release
 
+        release = release_state.published_composite_release()
+        if release is None:
             try:
-                await self._host._invoke_on_generation_owner(
-                    state,
-                    release_on_owner,
-                    settle_on_cancel=False,
+                release = cast(
+                    ThreadFuture[None],
+                    await self._host._invoke_on_generation_owner(
+                        state,
+                        release_on_owner,
+                        settle_on_cancel=False,
+                    ),
                 )
             except asyncio.CancelledError:
-                release.add_done_callback(self._host._consume_provider_operation)
                 raise
-            except BaseException as exc:
-                lease._release_state.fail_composite_release(release, exc)
+            except BaseException:
+                release = release_state.published_composite_release()
+                if release is None:
+                    raise
 
         wrapped = asyncio.wrap_future(release)
         try:
@@ -1195,7 +1243,7 @@ class _RuntimeAsyncResourceOwner:
                     if first_error is None:
                         first_error = RuntimeOwnershipError("Backend resource release authority was not adopted")
                     continue
-                release, owns_release = release_state.begin_composite_release()
+                release, owns_release = await self._begin_composite_release_on_owner(record, release_state)
                 releases.append(release)
                 provider_release_committed = provider_release_committed or release_state.release_provider_lease
                 if not owns_release:
@@ -1223,6 +1271,34 @@ class _RuntimeAsyncResourceOwner:
                 wrapped.add_done_callback(self._host._consume_async_provider_operation)
                 raise
         return provider_release_committed
+
+    async def _begin_composite_release_on_owner(
+        self,
+        record: _OwnedBackendRecord,
+        release_state: _BackendLeaseReleaseState,
+    ) -> tuple[ThreadFuture[None], bool]:
+        """Join one backend release through a bounded owner-local retry relay."""
+        state = record.generation
+        if threading.current_thread() is not state.owner_thread:
+            raise RuntimeOwnershipError("Backend composite release must begin on its generation owner")
+        phase = f"backend_composite_release:{release_state.lease_id}"
+        while True:
+            transition = release_state.try_begin_composite_release_on_owner()
+            if transition is not None:
+                return transition
+
+            retry_event = state.backend_release_retry_events.get(phase)
+            if retry_event is None:
+                retry_event = asyncio.Event()
+                state.backend_release_retry_events[phase] = retry_event
+
+                def wake_retry() -> None:
+                    current = state.backend_release_retry_events.pop(phase, None)
+                    if current is retry_event:
+                        current.set()
+
+                self._host._schedule_generation_retry_on_owner(state, phase, wake_retry)
+            await retry_event.wait()
 
     async def _release_composite_on_owner(
         self,
@@ -2294,6 +2370,12 @@ class _RuntimeProviderResources:
                 default=(),
             )
         )
+        self._provider_operation_scope: contextvars.ContextVar[
+            tuple[_ProviderGenerationCloseState, asyncio.Task[Any]] | None
+        ] = contextvars.ContextVar(
+            f"tacit_provider_operation_{id(self)}",
+            default=None,
+        )
 
     def _activate_resolved_manager(self, manager: object) -> _RuntimeProviderResources:
         """Validate and, when needed, reactivate this retired manager."""
@@ -3098,13 +3180,6 @@ class _RuntimeProviderResources:
         try:
             if submission.settled:
                 return False
-            if submission.admission is not None:
-                if owner_thread is not None and threading.current_thread() is owner_thread:
-                    if not submission.admission.finish_on_owner():
-                        self._schedule_submission_retry_on_owner(state, submission, "settle", retry)
-                        return True
-                else:
-                    submission.admission.finish()
             if owner_thread is not None and threading.current_thread() is owner_thread:
                 manager_acquired = self._lock.acquire(blocking=False)
                 if not manager_acquired:
@@ -3113,6 +3188,13 @@ class _RuntimeProviderResources:
             else:
                 self._lock.acquire()
                 manager_acquired = True
+            if submission.admission is not None:
+                if owner_thread is not None and threading.current_thread() is owner_thread:
+                    if not submission.admission.finish_on_owner():
+                        self._schedule_submission_retry_on_owner(state, submission, "settle", retry)
+                        return True
+                else:
+                    submission.admission.finish()
             current = state.committed_submissions.get(submission.submission_id)
             if current is submission:
                 state.committed_submissions.pop(submission.submission_id, None)
@@ -3204,6 +3286,106 @@ class _RuntimeProviderResources:
 
         owner_loop.call_later(_PROVIDER_OWNER_TERMINAL_POLL_SECONDS, retry_once)
 
+    async def _wait_for_submission_retry_on_owner(
+        self,
+        state: _ProviderGenerationCloseState,
+        submission: _ProviderCommittedSubmission,
+        phase: str,
+    ) -> None:
+        """Yield one submission transition behind a coalesced owner retry."""
+        retry_event = submission.retry_events.get(phase)
+        if retry_event is None:
+            retry_event = asyncio.Event()
+            submission.retry_events[phase] = retry_event
+
+            def wake_retry() -> None:
+                current = submission.retry_events.pop(phase, None)
+                if current is retry_event:
+                    current.set()
+
+            self._schedule_submission_retry_on_owner(
+                state,
+                submission,
+                phase,
+                wake_retry,
+            )
+        await retry_event.wait()
+
+    async def _begin_submission_admission_on_owner(
+        self,
+        state: _ProviderGenerationCloseState,
+        submission: _ProviderCommittedSubmission,
+        admission: _ProviderOperationAdmission,
+    ) -> bool:
+        """Commit admission on its owner without blocking that owner loop."""
+        while True:
+            started = admission.try_begin_operation_on_owner()
+            if started is not None:
+                return started
+            await self._wait_for_submission_retry_on_owner(
+                state,
+                submission,
+                "begin_admission",
+            )
+
+    def _request_submission_cancellation(
+        self,
+        state: _ProviderGenerationCloseState,
+        submission: _ProviderCommittedSubmission,
+        *,
+        force: bool,
+    ) -> None:
+        """Publish cancellation once; the generation owner commits or retries it."""
+        owner_loop = state.loop
+        if owner_loop is None or owner_loop.is_closed():
+            return
+        phase = "force_cancel" if force else "cancel"
+
+        def cancel_on_owner() -> None:
+            if not submission.lock.acquire(blocking=False):
+                self._schedule_submission_retry_on_owner(
+                    state,
+                    submission,
+                    phase,
+                    cancel_on_owner,
+                )
+                return
+            retry = False
+            task: asyncio.Task[Any] | None = None
+            try:
+                if submission.settled:
+                    return
+                if not force:
+                    admission = submission.admission
+                    if admission is None:
+                        return
+                    cancellation = admission.try_request_cancel_on_owner()
+                    if cancellation is None:
+                        retry = True
+                    elif not cancellation:
+                        return
+                if not retry:
+                    submission.cancellation_requested = True
+                    task = submission.owner_task
+            finally:
+                submission.lock.release()
+            if retry:
+                self._schedule_submission_retry_on_owner(
+                    state,
+                    submission,
+                    phase,
+                    cancel_on_owner,
+                )
+            elif task is not None:
+                task.cancel()
+
+        try:
+            owner_loop.call_soon_threadsafe(cancel_on_owner)
+        except RuntimeError:
+            # Owner-loss recovery is already responsible for settling every
+            # committed submission and releasing its capacity.
+            return
+
     def _settle_committed_generation_submissions(
         self,
         state: _ProviderGenerationCloseState,
@@ -3269,6 +3451,7 @@ class _RuntimeProviderResources:
         limit_handoff: bool = False,
         allow_starting: bool = False,
         admission: _ProviderOperationAdmission | None = None,
+        provider_operation_scope: bool = False,
     ) -> Any:
         owner_loop = state.loop
         if owner_loop is None:
@@ -3294,10 +3477,30 @@ class _RuntimeProviderResources:
                 self._finish_generation_operation(state, operation_id)
             raise RuntimeOwnershipError("Pipeline provider lifecycle owner is unavailable")
 
+        submission: _ProviderCommittedSubmission | None = None
+
         async def owned_operation() -> Any:
-            if admission is not None and not admission.begin_operation():
-                raise asyncio.CancelledError
-            return await operation()
+            if admission is not None:
+                if submission is None:
+                    started = admission.begin_operation()
+                else:
+                    started = await self._begin_submission_admission_on_owner(
+                        state,
+                        submission,
+                        admission,
+                    )
+                if not started:
+                    raise asyncio.CancelledError
+            if not provider_operation_scope:
+                return await operation()
+            owner_task = asyncio.current_task()
+            if owner_task is None:
+                raise RuntimeOwnershipError("Provider operation has no owner task")
+            scope_token = self._provider_operation_scope.set((state, owner_task))
+            try:
+                return await operation()
+            finally:
+                self._provider_operation_scope.reset(scope_token)
 
         if asyncio.get_running_loop() is owner_loop:
             try:
@@ -3391,16 +3594,6 @@ class _RuntimeProviderResources:
 
             attach_owner_task()
 
-        def cancel_operation() -> None:
-            with submission.lock:
-                submission.cancellation_requested = True
-                task = submission.owner_task
-            if task is not None:
-                try:
-                    owner_loop.call_soon_threadsafe(task.cancel)
-                except RuntimeError:
-                    pass
-
         def settle_ambiguous_submission(error: BaseException) -> None:
             if not submission.lock.acquire(blocking=False):
                 self._schedule_submission_retry_on_owner(
@@ -3453,7 +3646,11 @@ class _RuntimeProviderResources:
             return await asyncio.shield(wrapped)
         except asyncio.CancelledError:
             if settle_on_cancel:
-                cancel_operation()
+                self._request_submission_cancellation(
+                    state,
+                    submission,
+                    force=True,
+                )
                 while not wrapped.done():
                     try:
                         await asyncio.shield(wrapped)
@@ -3467,8 +3664,12 @@ class _RuntimeProviderResources:
                     except BaseException:
                         pass
                 raise
-            if admission is not None and admission.request_cancel():
-                cancel_operation()
+            if admission is not None:
+                self._request_submission_cancellation(
+                    state,
+                    submission,
+                    force=False,
+                )
             future.add_done_callback(self._consume_provider_operation)
             wrapped.add_done_callback(self._consume_async_provider_operation)
             raise
@@ -3600,6 +3801,11 @@ class _RuntimeProviderResources:
         state: _ProviderGenerationCloseState,
         operation: Callable[[], Awaitable[Any]],
     ) -> Any:
+        active_scope = self._provider_operation_scope.get()
+        current_task = asyncio.current_task()
+        if active_scope is not None and active_scope[0] is state and active_scope[1] is current_task:
+            return await operation()
+
         self._raise_if_runtime_fatal()
         caller_admitted = self._caller_has_active_request_admission()
         if caller_admitted:
@@ -3613,6 +3819,7 @@ class _RuntimeProviderResources:
                     operation,
                     limit_handoff=True,
                     admission=admission,
+                    provider_operation_scope=True,
                 )
             finally:
                 admission.finish_if_unsubmitted()
@@ -3630,6 +3837,7 @@ class _RuntimeProviderResources:
                 operation,
                 limit_handoff=True,
                 admission=admission,
+                provider_operation_scope=True,
             )
         finally:
             lease_context.reset(context_token)
@@ -4469,8 +4677,6 @@ class _RuntimeProviderResources:
                         return
                     cleanup_succeeded = state.cleanup_succeeded
                     terminal_error = state.terminal_error
-                    cleanup_future = state.cleanup_future
-                    cleanup_submission_failed = state.cleanup_submission_failed
                 finally:
                     self._lock.release()
 
@@ -4506,8 +4712,8 @@ class _RuntimeProviderResources:
                         settled_submissions=settled,
                         generation_epoch=state.generation_epoch,
                     )
-                if not active_operations:
-                    self._begin_generation_retirement(state)
+                if not active_operations and not self._try_begin_generation_retirement_on_owner(state):
+                    continue
 
                 if not self._lock.acquire(blocking=False):
                     continue
@@ -4523,9 +4729,6 @@ class _RuntimeProviderResources:
                         reason_code="provider_generation_terminal_recovery_settled",
                         generation_epoch=state.generation_epoch,
                     )
-                    owner_loop.stop()
-                    return
-                if cleanup_future is not None and cleanup_future.done():
                     owner_loop.stop()
                     return
                 if cleanup_submission_failed and cleanup_future is None:
@@ -4584,7 +4787,8 @@ class _RuntimeProviderResources:
             finally:
                 self._lock.release()
             if not active_operations and not cleanup_scheduled:
-                self._begin_generation_retirement(state)
+                if not self._try_begin_generation_retirement_on_owner(state):
+                    continue
                 continue
             if cleanup_future is None:
                 continue
@@ -4917,6 +5121,27 @@ class _RuntimeProviderResources:
             schedule_cleanup = state.owner_ready and not state.active_operations and not state.cleanup_scheduled
         if schedule_cleanup:
             self._schedule_generation_cleanup_from_state(state)
+
+    def _try_begin_generation_retirement_on_owner(
+        self,
+        state: _ProviderGenerationCloseState,
+    ) -> bool:
+        """Commit retirement without blocking the owner loop on caller authority."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        schedule_cleanup = False
+        try:
+            if self._generation_owner is not state or state.active_operations:
+                return True
+            if self._state not in {ProviderLifecycleState.REVOKED, ProviderLifecycleState.DRAINING}:
+                self._state = ProviderLifecycleState.DRAINING
+                self._closing_event = state
+            schedule_cleanup = state.owner_ready and not state.cleanup_scheduled
+        finally:
+            self._lock.release()
+        if schedule_cleanup:
+            self._schedule_generation_cleanup_from_state(state)
+        return True
 
     async def _retire_unleased_generation(
         self,
@@ -6392,6 +6617,73 @@ def build_pipeline_dependencies(
     )
 
 
+@asynccontextmanager
+async def managed_async_nonpipeline_llm_provider(
+    runtime_settings: Settings,
+    *,
+    runtime_stores: RuntimeStores | None = None,
+    dependencies: PipelineDependencies | None = None,
+) -> AsyncIterator[LLMProvider]:
+    """Lease an implicit async helper provider from a durable runtime owner."""
+    if runtime_stores is not None and dependencies is not None:
+        raise RuntimeOwnershipError("Async non-pipeline LLM composition accepts one runtime owner")
+
+    selected_dependencies = dependencies
+    if selected_dependencies is None:
+        selected_stores = runtime_stores or RuntimeStores(runtime_settings)
+        selected_dependencies = build_pipeline_dependencies(
+            runtime_settings,
+            stores=selected_stores,
+        )
+    else:
+        require_compatible_runtime_ownership(
+            boundary="Async non-pipeline LLM lifecycle owner",
+            descriptors=(
+                runtime_descriptor_from_settings(
+                    runtime_settings,
+                    component="async_nonpipeline_llm_settings",
+                ),
+                runtime_descriptor_from_settings(
+                    selected_dependencies.settings,
+                    component="async_nonpipeline_llm_dependencies",
+                ),
+            ),
+        )
+
+    root_handle = selected_dependencies.start_runtime_root()
+    if root_handle is None:
+        raise RuntimeOwnershipError("Async non-pipeline LLM runtime root is unavailable")
+
+    provider_lease: ProviderLeaseHandle | None = None
+    try:
+        provider_lease = await selected_dependencies.acquire_resources()
+        provider_factory = selected_dependencies.llm_provider_factory
+        if provider_factory is None:
+            raise RuntimeOwnershipError("Async non-pipeline LLM provider factory is unavailable")
+        yield provider_factory()
+    finally:
+        provider_error: BaseException | None = None
+        root_error: BaseException | None = None
+        try:
+            if provider_lease is not None:
+                await selected_dependencies.close_resources(provider_lease)
+        except BaseException as exc:
+            provider_error = exc
+        try:
+            await release_runtime_root_with_startup_retry(
+                selected_dependencies.stop_runtime_root,
+                root_handle,
+            )
+        except BaseException as exc:
+            root_error = exc
+        if provider_error is not None:
+            if root_error is not None:
+                provider_error.add_note(f"Runtime root release also failed ({type(root_error).__name__})")
+            raise provider_error
+        if root_error is not None:
+            raise root_error
+
+
 @contextmanager
 def managed_nonpipeline_llm_provider(
     runtime_settings: Settings,
@@ -6441,9 +6733,7 @@ def managed_nonpipeline_llm_provider(
         raise RuntimeOwnershipError("Non-pipeline LLM runtime root is unavailable")
 
     provider_lease: ProviderLeaseHandle | None = None
-    acquire_started = False
     try:
-        acquire_started = True
 
         async def acquire_owned_resources() -> ProviderLeaseHandle | None:
             handle = await selected_dependencies.acquire_resources()
@@ -6462,7 +6752,7 @@ def managed_nonpipeline_llm_provider(
             provider_error: BaseException | None = None
             root_error: BaseException | None = None
             try:
-                if acquire_started:
+                if provider_lease is not None:
                     await selected_dependencies.close_resources(provider_lease)
             except BaseException as exc:
                 provider_error = exc

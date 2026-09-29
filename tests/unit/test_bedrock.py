@@ -148,9 +148,7 @@ def test_bedrock_session_default_chain(monkeypatch, tmp_path):
     ):
         monkeypatch.delenv(name, raising=False)
     credentials_path = tmp_path / "credentials"
-    credentials_path.write_text(
-        "[default]\n" "aws_access_key_id = AKIADEFAULT\n" "aws_secret_access_key = default-secret\n"
-    )
+    credentials_path.write_text("[default]\naws_access_key_id = AKIADEFAULT\naws_secret_access_key = default-secret\n")
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials_path))
     monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "missing-config"))
     runtime_settings = Settings(
@@ -215,7 +213,7 @@ def test_bedrock_freezes_ambient_credentials_before_client_creation(
     config_path = tmp_path / "config"
     selected_profile = profile_name or "default"
     credentials_path.write_text(
-        f"[{selected_profile}]\n" "aws_access_key_id = AKIAFROZEN\n" "aws_secret_access_key = frozen-secret-material\n"
+        f"[{selected_profile}]\naws_access_key_id = AKIAFROZEN\naws_secret_access_key = frozen-secret-material\n"
     )
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials_path))
     monkeypatch.setenv("AWS_CONFIG_FILE", str(config_path))
@@ -292,7 +290,7 @@ def test_bedrock_provider_pins_profile_and_ignores_ambient_endpoint(monkeypatch,
     monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
     credentials_path = tmp_path / "credentials"
     credentials_path.write_text(
-        "[owner-a]\n" "aws_access_key_id = AKIAPROFILEA\n" "aws_secret_access_key = profile-a-secret\n"
+        "[owner-a]\naws_access_key_id = AKIAPROFILEA\naws_secret_access_key = profile-a-secret\n"
     )
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials_path))
     monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "missing-config"))
@@ -340,9 +338,7 @@ def test_bedrock_provider_uses_one_ambient_identity_snapshot(monkeypatch, tmp_pa
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
     monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
     credentials_path = tmp_path / "credentials"
-    credentials_path.write_text(
-        "[owner-a]\n" "aws_access_key_id = AKIAOWNERA\n" "aws_secret_access_key = owner-a-secret\n"
-    )
+    credentials_path.write_text("[owner-a]\naws_access_key_id = AKIAOWNERA\naws_secret_access_key = owner-a-secret\n")
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials_path))
     monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "missing-config"))
     runtime_settings = Settings(
@@ -1273,13 +1269,12 @@ def test_bedrock_converse_wraps_throttling_for_retry():
     mock_provider = MagicMock()
     mock_provider.chat_json = AsyncMock(side_effect=[throttle_exc, LLMResult(text='{"value": 99}')])
 
-    with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
-        try:
-            model, usage = asyncio.run(call_llm("sys", "user", SimpleModel))
-            assert model.value == 99
-            assert mock_provider.chat_json.call_count == 2
-        except Exception as exc:
-            assert isinstance(exc, LLMTransientError), f"Expected LLMTransientError, got {type(exc).__name__}: {exc}"
+    try:
+        model, usage = asyncio.run(call_llm("sys", "user", SimpleModel, provider=mock_provider))
+        assert model.value == 99
+        assert mock_provider.chat_json.call_count == 2
+    except Exception as exc:
+        assert isinstance(exc, LLMTransientError), f"Expected LLMTransientError, got {type(exc).__name__}: {exc}"
 
     print("[PASS] test_bedrock_converse_wraps_throttling_for_retry")
 
@@ -1308,10 +1303,9 @@ def test_bedrock_service_specific_exception_retried():
     call_llm.retry.wait = wait_none()
 
     try:
-        with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
-            model, usage = asyncio.run(call_llm("sys", "user", Simple))
-            assert model.v == 42
-            assert mock_provider.chat_json.call_count == 2
+        model, usage = asyncio.run(call_llm("sys", "user", Simple, provider=mock_provider))
+        assert model.v == 42
+        assert mock_provider.chat_json.call_count == 2
     finally:
         call_llm.retry.wait = original_wait
 

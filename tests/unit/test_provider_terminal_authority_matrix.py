@@ -13,6 +13,7 @@ import asyncio
 import gc
 import re
 import threading
+import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -437,6 +438,148 @@ async def test_startup_retirement_and_replacement_acquire_have_one_atomic_winner
     assert llm_plans[0].attempts == 1
     assert llm_plans[0].closed is True
     _assert_zero(controller)
+
+
+@pytest.mark.asyncio
+async def test_terminal_monitor_waits_for_owner_cleanup_commit_after_future_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    resources, _controller, _runtime_settings = _managed_resources(
+        tmp_path,
+        suffix="cleanup-future-before-owner-commit",
+        llm_factory=lambda settings: _ManagedLLMProbe(settings, _ClosePlan()),
+    )
+    state = dependencies_module._ProviderGenerationCloseState(generation_epoch=1)
+    state.terminal_error = RuntimeOwnershipError("synthetic startup failure")
+    state.cleanup_scheduled = True
+    cleanup_future = dependencies_module.ThreadFuture()
+    cleanup_future.set_result(None)
+    state.cleanup_future = cleanup_future
+    with resources._lock:
+        resources._generation_owner = state
+        resources._state = ProviderLifecycleState.REVOKED
+
+    retirement_observed = asyncio.Event()
+
+    def observe_retirement(*_args: Any, **_kwargs: Any) -> None:
+        retirement_observed.set()
+
+    class OwnerLoopProbe:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    owner_loop = OwnerLoopProbe()
+    monkeypatch.setattr(resources, "_try_begin_generation_retirement_on_owner", observe_retirement)
+    monitor = asyncio.create_task(
+        resources._monitor_generation_terminal_authority(
+            state,
+            cast(asyncio.AbstractEventLoop, owner_loop),
+        )
+    )
+    try:
+        await asyncio.wait_for(retirement_observed.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert monitor.done() is False
+        assert owner_loop.stop_calls == 0
+
+        with resources._lock:
+            state.cleanup_succeeded = True
+        await asyncio.wait_for(monitor, timeout=1.0)
+        assert owner_loop.stop_calls == 1
+    finally:
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
+        with resources._lock:
+            resources._generation_owner = None
+            resources._state = ProviderLifecycleState.EMPTY
+
+
+def test_owner_retirement_transition_never_waits_on_manager_lock(tmp_path: Path) -> None:
+    resources, _controller, _runtime_settings = _managed_resources(
+        tmp_path,
+        suffix="retirement-manager-contention",
+        llm_factory=lambda settings: _ManagedLLMProbe(settings, _ClosePlan()),
+    )
+    state = dependencies_module._ProviderGenerationCloseState(generation_epoch=1)
+    with resources._lock:
+        resources._generation_owner = state
+        resources._state = ProviderLifecycleState.ACTIVE
+
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_manager_lock() -> None:
+        with resources._lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=1.0)
+
+    holder = threading.Thread(target=hold_manager_lock, daemon=True)
+    holder.start()
+    assert lock_held.wait(timeout=1.0)
+    started = time.monotonic()
+    try:
+        assert resources._try_begin_generation_retirement_on_owner(state) is False
+        assert time.monotonic() - started < 0.05
+    finally:
+        release_lock.set()
+        holder.join(timeout=1.0)
+    assert holder.is_alive() is False
+
+    assert resources._try_begin_generation_retirement_on_owner(state) is True
+    assert resources.lifecycle_state is ProviderLifecycleState.DRAINING
+
+    with resources._lock:
+        resources._generation_owner = None
+        resources._state = ProviderLifecycleState.EMPTY
+
+
+@pytest.mark.asyncio
+async def test_owner_loop_loss_recovery_uses_one_nonblocking_retirement_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    resources, _controller, _runtime_settings = _managed_resources(
+        tmp_path,
+        suffix="owner-loop-loss-nonblocking-retirement",
+        llm_factory=lambda settings: _ManagedLLMProbe(settings, _ClosePlan()),
+    )
+    state = dependencies_module._ProviderGenerationCloseState(generation_epoch=1)
+    cleanup_future: dependencies_module.ThreadFuture[None] = dependencies_module.ThreadFuture()
+    cleanup_future.set_result(None)
+    with resources._lock:
+        resources._generation_owner = state
+        resources._state = ProviderLifecycleState.REVOKED
+
+    transitions: list[int] = []
+
+    def forbid_blocking_retirement(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("owner-loop recovery entered the blocking retirement path")
+
+    def commit_nonblocking_retirement(
+        selected_state: dependencies_module._ProviderGenerationCloseState,
+    ) -> bool:
+        assert selected_state is state
+        transitions.append(selected_state.generation_epoch)
+        selected_state.cleanup_scheduled = True
+        selected_state.cleanup_future = cleanup_future
+        return True
+
+    current_task = asyncio.current_task()
+    assert current_task is not None
+    monkeypatch.setattr(resources, "_begin_generation_retirement", forbid_blocking_retirement)
+    monkeypatch.setattr(resources, "_try_begin_generation_retirement_on_owner", commit_nonblocking_retirement)
+    monkeypatch.setattr(asyncio, "all_tasks", lambda _loop=None: {current_task})
+
+    await resources._settle_generation_after_owner_loop_loss(state, asyncio.get_running_loop())
+
+    assert transitions == [state.generation_epoch]
+    with resources._lock:
+        resources._generation_owner = None
+        resources._state = ProviderLifecycleState.EMPTY
 
 
 @pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")

@@ -162,6 +162,32 @@ _ExecutorWorkItem = tuple[
 ]
 
 
+class _OptionalIntegrationWorkerStartup:
+    """Atomically transfer one reserved worker slot to its native worker."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state: Literal["pending", "committed", "aborted"] = "pending"
+
+    def commit_worker_ownership(self) -> bool:
+        with self._lock:
+            if self._state == "aborted":
+                return False
+            if self._state != "pending":
+                raise RuntimeError("optional integration worker startup already committed")
+            self._state = "committed"
+            return True
+
+    def abort_uncommitted_startup(self) -> bool:
+        with self._lock:
+            if self._state == "committed":
+                return False
+            if self._state != "pending":
+                raise RuntimeError("optional integration worker startup already aborted")
+            self._state = "aborted"
+            return True
+
+
 class _BoundedOptionalIntegrationExecutor(Executor):
     """Bounded daemon work owned by one optional-integration generation."""
 
@@ -228,17 +254,23 @@ class _BoundedOptionalIntegrationExecutor(Executor):
                 self._outstanding + 1,
             )
             if start_worker:
-                worker = _new_optional_integration_worker_thread(
-                    target=self._run_worker,
-                    name=f"{self._name}-worker",
-                )
+                startup = _OptionalIntegrationWorkerStartup()
+                try:
+                    worker = _new_optional_integration_worker_thread(
+                        target=lambda: self._run_worker_after_startup(startup),
+                        name=f"{self._name}-worker",
+                    )
+                except BaseException:
+                    self._release_blocking_permit(permit)
+                    raise
                 self._worker_count += 1
                 try:
                     worker.start()
                 except BaseException:
-                    self._worker_count -= 1
-                    self._release_blocking_permit(permit)
-                    raise
+                    if startup.abort_uncommitted_startup():
+                        self._worker_count -= 1
+                        self._release_blocking_permit(permit)
+                        raise
             future: ThreadFuture[Any] = ThreadFuture()
             self._outstanding += 1
             if not authority:
@@ -253,6 +285,11 @@ class _BoundedOptionalIntegrationExecutor(Executor):
                 self._release_blocking_permit(permit)
                 raise
             return future
+
+    def _run_worker_after_startup(self, startup: _OptionalIntegrationWorkerStartup) -> None:
+        if not startup.commit_worker_ownership():
+            return
+        self._run_worker()
 
     def _release_blocking_permit(self, permit: PipelineBlockingPermit | None) -> None:
         if permit is None or self._blocking_lifecycle is None:

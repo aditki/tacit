@@ -24,7 +24,7 @@ from tacit.api.request_body_limit import (
     RequestBodyLimitMiddleware,
 )
 from tacit.api.routes.system import healthz
-from tacit.config import Settings
+from tacit.config import DEFAULT_API_MAX_REQUEST_BODY_BYTES, Settings
 from tacit.models.schemas import DashRequest
 
 JSON_DECODE_MEMORY_FACTOR = 64
@@ -1791,6 +1791,159 @@ async def test_memory_envelope_covers_real_framework_peak_allocations(media_type
     assert reserved_at_handler <= settings.api_request_body_max_buffered_bytes
 
 
+async def test_headerless_json_is_charged_for_mandatory_decode_memory_before_downstream() -> None:
+    body = b'{"service":"checkout"}'
+    controller = RequestBodyAdmissionController(
+        max_concurrent=1,
+        max_buffered_bytes=len(body) * JSON_DECODE_MEMORY_FACTOR,
+        memory_amplification_factor=1,
+    )
+    reserved_at_decode = 0
+
+    async def decode_headerless_json(
+        _scope: dict[str, Any],
+        receive: ASGIReceive,
+        send: ASGISend,
+    ) -> None:
+        nonlocal reserved_at_decode
+        message = await receive()
+        reserved_at_decode = controller.snapshot().reserved_bytes
+        assert json.loads(message["body"]) == {"service": "checkout"}
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    middleware = RequestBodyLimitMiddleware(
+        decode_headerless_json,
+        max_body_bytes=len(body),
+        admission_controller=controller,
+        runtime_settings=Settings(_env_file=None),
+    )
+    scope = _scope(content_length=len(body))
+    scope["headers"] = [(name, value) for name, value in scope["headers"] if name.lower() != b"content-type"]
+
+    sent, receive_calls = await _drive(
+        middleware,
+        scope=scope,
+        incoming=[{"type": "http.request", "body": body, "more_body": False}],
+    )
+
+    assert _response(sent) == (204, b"")
+    assert receive_calls == 1
+    assert reserved_at_decode == len(body) * JSON_DECODE_MEMORY_FACTOR
+    assert controller.snapshot().active_requests == 0
+    assert controller.snapshot().reserved_bytes == 0
+
+
+async def test_decoded_body_admission_remains_owned_until_stream_terminates() -> None:
+    body = b'{"service":"checkout"}'
+    controller = RequestBodyAdmissionController(
+        max_concurrent=1,
+        max_buffered_bytes=len(body) * JSON_DECODE_MEMORY_FACTOR,
+        memory_amplification_factor=JSON_DECODE_MEMORY_FACTOR,
+    )
+    response_started = asyncio.Event()
+    finish_stream = asyncio.Event()
+
+    async def streaming_app(_scope: dict[str, Any], receive: ASGIReceive, send: ASGISend) -> None:
+        message = await receive()
+        decoded = json.loads(message["body"])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        response_started.set()
+        await finish_stream.wait()
+        assert decoded == {"service": "checkout"}
+        await send({"type": "http.response.body", "body": b"complete", "more_body": False})
+
+    sent: list[ASGIMessage] = []
+
+    async def receive() -> ASGIMessage:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message: ASGIMessage) -> None:
+        sent.append(message)
+
+    middleware = RequestBodyLimitMiddleware(
+        streaming_app,
+        max_body_bytes=len(body),
+        admission_controller=controller,
+        runtime_settings=_wildcard_settings(),
+    )
+    task = asyncio.create_task(
+        middleware(
+            _scope(
+                tenant="tenant-a",
+                api_key="tenant-a-key",
+                content_length=len(body),
+                content_type="application/json",
+            ),
+            receive,
+            send,
+        )
+    )
+
+    await asyncio.wait_for(response_started.wait(), timeout=1)
+    assert controller.snapshot().active_requests == 1
+    assert controller.snapshot().reserved_bytes == len(body) * JSON_DECODE_MEMORY_FACTOR
+
+    finish_stream.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert _response(sent) == (200, b"complete")
+    assert controller.snapshot().active_requests == 0
+    assert controller.snapshot().reserved_bytes == 0
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    ["application/json", None],
+    ids=["json", "headerless-json"],
+)
+async def test_default_admission_accepts_one_maximum_json_decode_envelope(
+    content_type: str | None,
+) -> None:
+    maximum_body_bytes = DEFAULT_API_MAX_REQUEST_BODY_BYTES
+    body = b'"' + (b"x" * (maximum_body_bytes - 2)) + b'"'
+    reserved_at_decode = 0
+
+    async def decode_json(
+        _scope: dict[str, Any],
+        receive: ASGIReceive,
+        send: ASGISend,
+    ) -> None:
+        nonlocal reserved_at_decode
+        message = await receive()
+        reserved_at_decode = middleware.admission_controller.snapshot().reserved_bytes
+        assert len(json.loads(message["body"])) == maximum_body_bytes - 2
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    middleware = RequestBodyLimitMiddleware(
+        decode_json,
+        max_body_bytes=maximum_body_bytes,
+        runtime_settings=Settings(_env_file=None),
+    )
+    scope = _scope(
+        content_length=maximum_body_bytes,
+        content_type=content_type or "application/json",
+    )
+    if content_type is None:
+        scope["headers"] = [(name, value) for name, value in scope["headers"] if name.lower() != b"content-type"]
+
+    sent, receive_calls = await _drive(
+        middleware,
+        scope=scope,
+        incoming=[{"type": "http.request", "body": body, "more_body": False}],
+    )
+
+    maximum_charge = maximum_body_bytes * JSON_DECODE_MEMORY_FACTOR
+    assert _response(sent) == (204, b"")
+    assert receive_calls == 1
+    assert reserved_at_decode == maximum_charge
+    assert middleware.admission_controller.max_buffered_bytes >= maximum_charge
+    assert middleware.admission_controller.max_buffered_bytes_per_tenant >= maximum_charge
+    assert middleware.admission_controller.snapshot().active_requests == 0
+    assert middleware.admission_controller.snapshot().reserved_bytes == 0
+
+
 @pytest.mark.parametrize(
     "request_limits",
     [
@@ -1867,6 +2020,18 @@ def test_app_factory_rejects_copied_budget_below_the_mandatory_json_decode_envel
     )
 
     with pytest.raises(ValueError, match="maximum request memory envelope"):
+        create_app(runtime_settings=settings, include_default_routes=False)
+
+
+def test_app_factory_rejects_copied_maximum_body_above_the_tenant_decode_envelope() -> None:
+    settings = Settings(_env_file=None).model_copy(
+        update={"api_max_request_body_bytes": DEFAULT_API_MAX_REQUEST_BODY_BYTES + 1}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="api_request_body_tenant_max_buffered_bytes must admit the configured maximum request memory envelope",
+    ):
         create_app(runtime_settings=settings, include_default_routes=False)
 
 

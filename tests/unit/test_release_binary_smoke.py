@@ -1289,6 +1289,49 @@ def test_image_smoke_fails_when_attempted_resource_cannot_be_removed(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process-group ownership requires POSIX")
+def test_image_smoke_keeps_success_diagnostics_out_of_machine_readable_stdout(
+    image_smoke: ModuleType,
+) -> None:
+    output = image_smoke._run_command(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,sys; "
+                "os.write(sys.stderr.fileno(), b'platform emulation warning\\n'); "
+                'os.write(sys.stdout.fileno(), b\'{"State":{"Running":true}}\\n\')'
+            ),
+        ],
+        timeout=1.0,
+        label="structured probe",
+    )
+
+    assert image_smoke._parse_object(output, "structured probe") == {"State": {"Running": True}}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group ownership requires POSIX")
+def test_image_smoke_failure_retains_stdout_and_stderr_diagnostics(image_smoke: ModuleType) -> None:
+    with pytest.raises(image_smoke.ImageSmokeError, match="structured failure failed") as failure:
+        image_smoke._run_command(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys; "
+                    "os.write(sys.stdout.fileno(), b'stdout detail\\n'); "
+                    "os.write(sys.stderr.fileno(), b'stderr detail\\n'); "
+                    "raise SystemExit(7)"
+                ),
+            ],
+            timeout=1.0,
+            label="structured failure",
+        )
+
+    assert "stdout detail" in str(failure.value)
+    assert "stderr detail" in str(failure.value)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group ownership requires POSIX")
 def test_image_smoke_command_timeout_reaps_and_bounds_output(image_smoke: ModuleType) -> None:
     began = time.monotonic()
     with pytest.raises(image_smoke.ImageSmokeError, match="bounded probe exceeded its timeout") as failure:

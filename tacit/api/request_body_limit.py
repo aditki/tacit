@@ -327,10 +327,12 @@ class RequestBodyLimitMiddleware:
             raise ValueError("read_timeout_seconds must be a positive finite number")
         self.app = app
         self.max_body_bytes = max_body_bytes
-        self.admission_controller = admission_controller or RequestBodyAdmissionController(
-            max_concurrent=16,
-            max_buffered_bytes=16 * max_body_bytes,
-        )
+        if admission_controller is None:
+            admission_controller = RequestBodyAdmissionController(
+                max_concurrent=16,
+                max_buffered_bytes=API_REQUEST_BODY_JSON_MEMORY_AMPLIFICATION_FACTOR * max_body_bytes,
+            )
+        self.admission_controller = admission_controller
         maximum_charge = self.admission_controller.estimated_memory_bytes(max_body_bytes)
         if self.admission_controller.max_buffered_bytes < maximum_charge:
             raise ValueError("admission_controller must admit one maximum-size request")
@@ -472,7 +474,6 @@ class RequestBodyLimitMiddleware:
             replay = _ResponseAwareBodyReplay(
                 body,
                 receive,
-                release_ingress=release_lease,
                 read_timeout_seconds=self.read_timeout_seconds,
                 admission_controller=self.admission_controller,
             )
@@ -790,13 +791,11 @@ class _ResponseAwareBodyReplay:
         body: bytearray,
         receive: Receive,
         *,
-        release_ingress: Callable[[], None],
         read_timeout_seconds: float,
         admission_controller: RequestBodyAdmissionController,
     ) -> None:
         self._body = body
         self._receive = receive
-        self._release_ingress = release_ingress
         self._read_timeout_seconds = read_timeout_seconds
         self._admission_controller = admission_controller
         self._pending = True
@@ -808,7 +807,6 @@ class _ResponseAwareBodyReplay:
         self._response_sender_task = asyncio.current_task()
         self._pending = False
         self._body.clear()
-        self._release_ingress()
 
     async def __call__(self) -> Message:
         if self._pending:
@@ -927,14 +925,20 @@ def _request_memory_amplification_factor(
     default_factor: int,
 ) -> int:
     """Choose a non-weakenable decoded-memory envelope from the media type."""
+    content_type_present = False
     for name, raw_value in headers:
         if name.lower() != b"content-type":
             continue
+        content_type_present = True
         media_type = raw_value.split(b";", 1)[0].strip().lower()
+        if not media_type:
+            return max(default_factor, API_REQUEST_BODY_JSON_MEMORY_AMPLIFICATION_FACTOR)
         _main_type, separator, subtype = media_type.partition(b"/")
         if separator and (subtype == b"json" or subtype.endswith(b"+json")):
             return max(default_factor, API_REQUEST_BODY_JSON_MEMORY_AMPLIFICATION_FACTOR)
-    return default_factor
+    if content_type_present:
+        return default_factor
+    return max(default_factor, API_REQUEST_BODY_JSON_MEMORY_AMPLIFICATION_FACTOR)
 
 
 def _log_admission_rejection(

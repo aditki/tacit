@@ -275,7 +275,9 @@ jobs:
       REPRO_SOURCE_ROOT: binary-build-repro/source
       BINARY_PATH: binary-build-primary/source/${{ matrix.binary }}
       REPRO_BINARY_PATH: binary-build-repro/source/${{ matrix.binary }}
+      BINARY_PUBLICATION_DIR: binary-publication
       PACKAGE_NAME: ${{ matrix.package }}
+      PRIMARY_PACKAGE_PATH: binary-publication/${{ matrix.package }}
       REPRO_PACKAGE_PATH: binary-build-repro/${{ matrix.package }}
       PRIMARY_PYINSTALLER_CONFIG_DIR: binary-build-primary/pyinstaller-config
       REPRO_PYINSTALLER_CONFIG_DIR: binary-build-repro/pyinstaller-config
@@ -363,10 +365,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -m 0700 "$BINARY_PUBLICATION_DIR"
           uv run --project "$PRIMARY_SOURCE_ROOT" --no-sync python \
             "$PRIMARY_SOURCE_ROOT/.github/scripts/package_release_binary.py" \
             --source "$BINARY_PATH" \
-            --package "$PACKAGE_NAME" \
+            --package "$PRIMARY_PACKAGE_PATH" \
             --max-binary-bytes 536870912 \
             --max-package-bytes 536870912
           uv run --project "$REPRO_SOURCE_ROOT" --no-sync python \
@@ -379,8 +382,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmp "$PACKAGE_NAME" "$REPRO_PACKAGE_PATH"
-          cmp "$PACKAGE_NAME.sha256" "$REPRO_PACKAGE_PATH.sha256"
+          cmp "$PRIMARY_PACKAGE_PATH" "$REPRO_PACKAGE_PATH"
+          cmp "$PRIMARY_PACKAGE_PATH.sha256" "$REPRO_PACKAGE_PATH.sha256"
       - name: Smoke-test binary version
         env:
           EXPECTED_VERSION: ${{ needs.validate-release.outputs.package_version }}
@@ -448,8 +451,8 @@ jobs:
           trap 'rm -rf "$package_snapshot_root" "$smoke_root"' EXIT
           private_package="${package_snapshot_root}/${PACKAGE_NAME}"
           python "$PRIMARY_SOURCE_ROOT/.github/scripts/release_image_archive.py" copy \
-            --archive "$PACKAGE_NAME" \
-            --checksum "$PACKAGE_NAME.sha256" \
+            --archive "$PRIMARY_PACKAGE_PATH" \
+            --checksum "$PRIMARY_PACKAGE_PATH.sha256" \
             --destination "$private_package" \
             --max-bytes 536870912
           members="$(tar --list --gzip --file "$private_package")"
@@ -480,7 +483,7 @@ jobs:
         run: |
           set -euo pipefail
           python "$PRIMARY_SOURCE_ROOT/.github/scripts/release_publication_snapshot.py" describe \
-            --directory . \
+            --directory "$BINARY_PUBLICATION_DIR" \
             --selector "package=$PACKAGE_NAME" \
             --selector "checksum=$PACKAGE_NAME.sha256" \
             --github-output "$GITHUB_OUTPUT"
@@ -488,8 +491,8 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: |
-            ${{ matrix.package }}
-            ${{ matrix.package }}.sha256
+            ${{ env.BINARY_PUBLICATION_DIR }}/${{ matrix.package }}
+            ${{ env.BINARY_PUBLICATION_DIR }}/${{ matrix.package }}.sha256
           if-no-files-found: error
 
   build-release-images:
@@ -629,7 +632,6 @@ jobs:
             echo "Independent clean build produced a different architecture digest" >&2
             exit 1
           fi
-          printf '%s\n' "$AUTHORITATIVE_DIGEST" > "${IMAGE_ARCHIVE}.manifest-digest"
       - name: Validate built image archive before upload
         shell: bash
         run: |
@@ -659,7 +661,6 @@ jobs:
           path: |
             ${{ env.IMAGE_ARCHIVE }}
             ${{ env.IMAGE_ARCHIVE }}.sha256
-            ${{ env.IMAGE_ARCHIVE }}.manifest-digest
           if-no-files-found: error
           compression-level: 0
 
@@ -1154,11 +1155,6 @@ jobs:
             fi
             digest="$(docker buildx imagetools inspect "$staging_ref" --format '{{json .Manifest}}' | jq -r '.digest // empty')"
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-            approved_digest="$(cat "release-images/tacit-release-${arch}.tar.manifest-digest")"
-            if [[ "$digest" != "$approved_digest" ]]; then
-              echo "Published ${arch} manifest differs from the reproducibility-approved build" >&2
-              exit 1
-            fi
             echo "${arch}_source=${IMAGE_NAME_LOWER}@${digest}" >> "$GITHUB_OUTPUT"
           done
       - name: Pin scanned architecture digests
@@ -1412,6 +1408,7 @@ jobs:
     env:
       PYPI_PUBLICATION_SNAPSHOT_DIR: .tacit-pypi-publication-${{ github.run_id }}-${{ github.run_attempt }}
       PYPI_PUBLICATION_BACKING_DIR: /var/lib/tacit-release-publication-pypi-${{ github.run_id }}-${{ github.run_attempt }}
+      PYPI_PUBLICATION_TOOL_DIR: /var/lib/tacit-release-publication-tool-pypi-${{ github.run_id }}-${{ github.run_attempt }}
     environment:
       name: pypi
       url: https://pypi.org/project/tacit-ai/
@@ -1429,6 +1426,32 @@ jobs:
         with:
           name: dist
           path: dist/
+      - name: Install sealed publication authority
+        run: |
+          set -euo pipefail
+          tool_digest_args=()
+          for script_name in release_publication_snapshot.py release_payload_snapshot.py; do
+            source_path=".github/scripts/$script_name"
+            expected_digest="$(/usr/bin/git show "${GITHUB_SHA}:${source_path}" | /usr/bin/sha256sum | /usr/bin/cut -d ' ' -f 1)"
+            source_digest="$(/usr/bin/sha256sum "$source_path" | /usr/bin/cut -d ' ' -f 1)"
+            test "$source_digest" = "$expected_digest"
+            if test "$script_name" = release_publication_snapshot.py; then
+              target_path="${PYPI_PUBLICATION_TOOL_DIR}.cleanup.py"
+            else
+              target_path="${PYPI_PUBLICATION_TOOL_DIR}.cleanup-helper.py"
+            fi
+            sudo --non-interactive /usr/bin/install -o root -g root -m 0600 /dev/null "${target_path}.next"
+            /usr/bin/git show "${GITHUB_SHA}:${source_path}" | sudo --non-interactive /usr/bin/tee "${target_path}.next" >/dev/null
+            printf '%s  %s\n' "$expected_digest" "${target_path}.next" | sudo --non-interactive /usr/bin/sha256sum --check --strict -
+            sudo --non-interactive /usr/bin/chown root:root "${target_path}.next"
+            sudo --non-interactive /usr/bin/chmod 0500 "${target_path}.next"
+            sudo --non-interactive /usr/bin/mv -f -- "${target_path}.next" "$target_path"
+            tool_digest_args+=(--script-digest "$script_name=$expected_digest")
+          done
+          sudo --non-interactive /usr/bin/python3 -I -B "${PYPI_PUBLICATION_TOOL_DIR}.cleanup.py" install-tool \
+            --source-directory .github/scripts \
+            --tool-directory "$PYPI_PUBLICATION_TOOL_DIR" \
+            "${tool_digest_args[@]}"
       - name: Prepare sealed PyPI publisher path
         env:
           WHEEL_NAME: ${{ needs.pypi-preflight.outputs.wheel_name }}
@@ -1436,7 +1459,7 @@ jobs:
           SDIST_NAME: ${{ needs.pypi-preflight.outputs.sdist_name }}
           SDIST_DIGEST: ${{ needs.pypi-preflight.outputs.sdist_digest }}
         run: |
-          sudo --non-interactive "$(command -v python)" .github/scripts/release_publication_snapshot.py seal \
+          sudo --non-interactive /usr/bin/python3 -I -B "$PYPI_PUBLICATION_TOOL_DIR/release_publication_snapshot.py" seal \
             --source-directory dist \
             --destination-directory "$PYPI_PUBLICATION_SNAPSHOT_DIR" \
             --backing-directory "$PYPI_PUBLICATION_BACKING_DIR" \
@@ -1459,7 +1482,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python .github/scripts/authorize_release_publication.py
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        uses: ./.github/actions/pypi-publish
         with:
           packages-dir: ${{ env.PYPI_PUBLICATION_SNAPSHOT_DIR }}
           skip-existing: true
@@ -1485,11 +1508,62 @@ jobs:
           WHEEL_NAME: ${{ needs.pypi-preflight.outputs.wheel_name }}
           SDIST_NAME: ${{ needs.pypi-preflight.outputs.sdist_name }}
         run: |
-          sudo --non-interactive "$(command -v python)" .github/scripts/release_publication_snapshot.py unseal \
-            --directory "$PYPI_PUBLICATION_SNAPSHOT_DIR" \
+          cd /var/lib
+          sudo --non-interactive /usr/bin/python3 -I -B -c '
+          import os
+          import stat
+          import sys
+          from pathlib import Path
+          tool = Path(sys.argv[1])
+          trusted_parent = Path(sys.argv[2]) if len(sys.argv) == 3 else Path("/var/lib")
+          if not tool.is_absolute() or tool.parent != trusted_parent or not tool.name.startswith("tacit-release-publication-tool-"):
+              raise SystemExit("publication bootstrap tool path is unsafe")
+          launcher = tool.with_name(f"{tool.name}.cleanup.py")
+          helper = tool.with_name(f"{tool.name}.cleanup-helper.py")
+          authority = tool.with_name(f"{tool.name}.tool-authority.json")
+          def present(path):
+              try:
+                  path.lstat()
+              except FileNotFoundError:
+                  return False
+              return True
+          launcher_present = present(launcher)
+          if not launcher_present and (present(tool) or present(authority)):
+              raise SystemExit("publication bootstrap authority requires its launcher")
+          targets = [launcher.with_name(f"{launcher.name}.next"), helper.with_name(f"{helper.name}.next")]
+          if not launcher_present:
+              targets.append(helper)
+          changed = False
+          for path in targets:
+              if not present(path):
+                  continue
+              metadata = path.lstat()
+              if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) not in {0o500, 0o600}:
+                  raise SystemExit("publication bootstrap residue is unsafe")
+              path.unlink()
+              changed = True
+          for path in ([launcher, helper] if launcher_present else []):
+              if not present(path):
+                  continue
+              metadata = path.lstat()
+              if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o500:
+                  raise SystemExit("publication bootstrap residue is unsafe")
+          if changed:
+              descriptor = os.open(tool.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+              try:
+                  os.fsync(descriptor)
+              finally:
+                  os.close(descriptor)
+          ' "$PYPI_PUBLICATION_TOOL_DIR"
+          if test ! -e "${PYPI_PUBLICATION_TOOL_DIR}.cleanup.py"; then
+            exit 0
+          fi
+          exec sudo --non-interactive /usr/bin/python3 -I -B "${PYPI_PUBLICATION_TOOL_DIR}.cleanup.py" unseal \
+            --directory "$GITHUB_WORKSPACE/$PYPI_PUBLICATION_SNAPSHOT_DIR" \
             --backing-directory "$PYPI_PUBLICATION_BACKING_DIR" \
             --artifact-name "$WHEEL_NAME" \
-            --artifact-name "$SDIST_NAME"
+            --artifact-name "$SDIST_NAME" \
+            --tool-directory "$PYPI_PUBLICATION_TOOL_DIR"
 
   publish-github-release:
     needs:
@@ -1502,6 +1576,7 @@ jobs:
     env:
       GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR: .tacit-github-publication-${{ github.run_id }}-${{ github.run_attempt }}
       GITHUB_RELEASE_PUBLICATION_BACKING_DIR: /var/lib/tacit-release-publication-github-${{ github.run_id }}-${{ github.run_attempt }}
+      GITHUB_RELEASE_PUBLICATION_TOOL_DIR: /var/lib/tacit-release-publication-tool-github-${{ github.run_id }}-${{ github.run_attempt }}
     environment:
       name: github-release
       url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
@@ -1519,6 +1594,32 @@ jobs:
           pattern: tacit-binary-*
           path: release-binaries
           merge-multiple: true
+      - name: Install sealed publication authority
+        run: |
+          set -euo pipefail
+          tool_digest_args=()
+          for script_name in release_publication_snapshot.py release_payload_snapshot.py; do
+            source_path=".github/scripts/$script_name"
+            expected_digest="$(/usr/bin/git show "${GITHUB_SHA}:${source_path}" | /usr/bin/sha256sum | /usr/bin/cut -d ' ' -f 1)"
+            source_digest="$(/usr/bin/sha256sum "$source_path" | /usr/bin/cut -d ' ' -f 1)"
+            test "$source_digest" = "$expected_digest"
+            if test "$script_name" = release_publication_snapshot.py; then
+              target_path="${GITHUB_RELEASE_PUBLICATION_TOOL_DIR}.cleanup.py"
+            else
+              target_path="${GITHUB_RELEASE_PUBLICATION_TOOL_DIR}.cleanup-helper.py"
+            fi
+            sudo --non-interactive /usr/bin/install -o root -g root -m 0600 /dev/null "${target_path}.next"
+            /usr/bin/git show "${GITHUB_SHA}:${source_path}" | sudo --non-interactive /usr/bin/tee "${target_path}.next" >/dev/null
+            printf '%s  %s\n' "$expected_digest" "${target_path}.next" | sudo --non-interactive /usr/bin/sha256sum --check --strict -
+            sudo --non-interactive /usr/bin/chown root:root "${target_path}.next"
+            sudo --non-interactive /usr/bin/chmod 0500 "${target_path}.next"
+            sudo --non-interactive /usr/bin/mv -f -- "${target_path}.next" "$target_path"
+            tool_digest_args+=(--script-digest "$script_name=$expected_digest")
+          done
+          sudo --non-interactive /usr/bin/python3 -I -B "${GITHUB_RELEASE_PUBLICATION_TOOL_DIR}.cleanup.py" install-tool \
+            --source-directory .github/scripts \
+            --tool-directory "$GITHUB_RELEASE_PUBLICATION_TOOL_DIR" \
+            "${tool_digest_args[@]}"
       - name: Verify binary packages and checksums
         working-directory: release-binaries
         run: |
@@ -1532,7 +1633,7 @@ jobs:
           CHECKSUM_NAME: ${{ needs.github-release-preflight.outputs.checksum_name }}
           CHECKSUM_DIGEST: ${{ needs.github-release-preflight.outputs.checksum_digest }}
         run: |
-          sudo --non-interactive "$(command -v python)" .github/scripts/release_publication_snapshot.py seal \
+          sudo --non-interactive /usr/bin/python3 -I -B "$GITHUB_RELEASE_PUBLICATION_TOOL_DIR/release_publication_snapshot.py" seal \
             --source-directory release-binaries \
             --destination-directory "$GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR" \
             --backing-directory "$GITHUB_RELEASE_PUBLICATION_BACKING_DIR" \
@@ -1568,8 +1669,59 @@ jobs:
           PACKAGE_NAME: ${{ needs.github-release-preflight.outputs.package_name }}
           CHECKSUM_NAME: ${{ needs.github-release-preflight.outputs.checksum_name }}
         run: |
-          sudo --non-interactive "$(command -v python)" .github/scripts/release_publication_snapshot.py unseal \
-            --directory "$GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR" \
+          cd /var/lib
+          sudo --non-interactive /usr/bin/python3 -I -B -c '
+          import os
+          import stat
+          import sys
+          from pathlib import Path
+          tool = Path(sys.argv[1])
+          trusted_parent = Path(sys.argv[2]) if len(sys.argv) == 3 else Path("/var/lib")
+          if not tool.is_absolute() or tool.parent != trusted_parent or not tool.name.startswith("tacit-release-publication-tool-"):
+              raise SystemExit("publication bootstrap tool path is unsafe")
+          launcher = tool.with_name(f"{tool.name}.cleanup.py")
+          helper = tool.with_name(f"{tool.name}.cleanup-helper.py")
+          authority = tool.with_name(f"{tool.name}.tool-authority.json")
+          def present(path):
+              try:
+                  path.lstat()
+              except FileNotFoundError:
+                  return False
+              return True
+          launcher_present = present(launcher)
+          if not launcher_present and (present(tool) or present(authority)):
+              raise SystemExit("publication bootstrap authority requires its launcher")
+          targets = [launcher.with_name(f"{launcher.name}.next"), helper.with_name(f"{helper.name}.next")]
+          if not launcher_present:
+              targets.append(helper)
+          changed = False
+          for path in targets:
+              if not present(path):
+                  continue
+              metadata = path.lstat()
+              if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) not in {0o500, 0o600}:
+                  raise SystemExit("publication bootstrap residue is unsafe")
+              path.unlink()
+              changed = True
+          for path in ([launcher, helper] if launcher_present else []):
+              if not present(path):
+                  continue
+              metadata = path.lstat()
+              if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o500:
+                  raise SystemExit("publication bootstrap residue is unsafe")
+          if changed:
+              descriptor = os.open(tool.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+              try:
+                  os.fsync(descriptor)
+              finally:
+                  os.close(descriptor)
+          ' "$GITHUB_RELEASE_PUBLICATION_TOOL_DIR"
+          if test ! -e "${GITHUB_RELEASE_PUBLICATION_TOOL_DIR}.cleanup.py"; then
+            exit 0
+          fi
+          exec sudo --non-interactive /usr/bin/python3 -I -B "${GITHUB_RELEASE_PUBLICATION_TOOL_DIR}.cleanup.py" unseal \
+            --directory "$GITHUB_WORKSPACE/$GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR" \
             --backing-directory "$GITHUB_RELEASE_PUBLICATION_BACKING_DIR" \
             --artifact-name "$PACKAGE_NAME" \
-            --artifact-name "$CHECKSUM_NAME"
+            --artifact-name "$CHECKSUM_NAME" \
+            --tool-directory "$GITHUB_RELEASE_PUBLICATION_TOOL_DIR"

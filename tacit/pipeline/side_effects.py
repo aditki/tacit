@@ -129,18 +129,25 @@ class _LifecycleBlockingCall:
         on_discarded: Callable[[], None] | None,
         background: bool,
         result_handoff_seconds: float,
-        publish_after_release: bool = False,
+        defer_result_publication: bool = False,
         start_decision: _WorkerStartDecision | None = None,
     ) -> None:
         self._function: Callable[[], Any] | None = function
         self._reason_code = reason_code
         self._loop = loop
         self._future = future
+        self._finished_future: asyncio.Future[None] | None = loop.create_future() if loop is not None else None
+        self._requester_settlement_future: asyncio.Future[None] | None = (
+            loop.create_future() if loop is not None else None
+        )
+        self._result_claim_ready_future: asyncio.Future[None] | None = (
+            loop.create_future() if loop is not None else None
+        )
         self._on_abandoned_result = on_abandoned_result
         self._on_discarded = on_discarded
         self._background = background
         self._synchronous = loop is None and not background
-        self._publish_after_release = publish_after_release
+        self._defer_result_publication = defer_result_publication
         self._result_handoff_seconds = result_handoff_seconds
         self._start_decision = start_decision or _WorkerStartDecision()
         self._lock = threading.Lock()
@@ -154,10 +161,18 @@ class _LifecycleBlockingCall:
         self._error: BaseException | None = None
         self._terminal_cleanup_error: RuntimeOwnershipError | None = None
         self._terminal_result_published = False
+        self._result_claim_intent = False
+        self._result_claim_requested = False
+        self._result_ownership_committed = False
+        self._worker_finish_claimed = False
+        self._worker_terminal_published = False
         self.started = threading.Event()
         self.completed = threading.Event()
         self.finished = threading.Event()
         self._result_handoff = threading.Event()
+        self._result_claim_decision = threading.Event()
+        self._result_final_decision = threading.Event()
+        self._result_terminal_decision = threading.Event()
 
     def commit_start(self) -> None:
         self._start_decision.commit()
@@ -210,7 +225,7 @@ class _LifecycleBlockingCall:
                 terminal_cleanup_pending = self._terminal_cleanup_error is not None
         if terminal_cleanup_pending:
             return
-        if self._publish_after_release:
+        if self._defer_result_publication:
             return
         self._publish_result_transport()
 
@@ -223,12 +238,12 @@ class _LifecycleBlockingCall:
                 self._cleanup_abandoned_result()
 
     def publish_deferred_result(self) -> None:
-        """Publish a foreground result only after worker capacity is released."""
-        if self._publish_after_release:
+        """Publish a foreground result while its worker still owns capacity."""
+        if self._defer_result_publication:
             self._publish_result_transport()
 
-    def retire_abandoned_result_before_release(self) -> None:
-        """Retire an unreachable result while its worker still owns capacity."""
+    def retire_abandoned_result_before_final_settlement(self) -> None:
+        """Retire an unreachable result before worker finalization is published."""
         with self._lock:
             loop = self._loop
             future = self._future
@@ -248,10 +263,12 @@ class _LifecycleBlockingCall:
             self.abandon(discard_before_start=False)
         self._cleanup_abandoned_result()
 
-    def abandon(self, *, discard_before_start: bool = True) -> None:
-        """Mark the async result transport abandoned without touching capacity."""
+    def abandon(self, *, discard_before_start: bool = True) -> bool:
+        """Mark an uncommitted result abandoned without touching capacity."""
         discarded_callback: Callable[[], None] | None = None
         with self._lock:
+            if self._result_ownership_committed:
+                return False
             self._abandoned = True
             if discard_before_start and not self._started and not self._discarded:
                 self._discarded = True
@@ -260,8 +277,10 @@ class _LifecycleBlockingCall:
                 self._on_discarded = None
             if self._result is not _BLOCKING_RESULT_MISSING and self._on_abandoned_result is not None:
                 self._result_handoff.set()
+            self._result_claim_decision.set()
         if discarded_callback is not None:
             self._run_callback(discarded_callback, event="pipeline_blocking_work_discard_failed")
+        return True
 
     def discard(self) -> None:
         self.abandon(discard_before_start=True)
@@ -288,8 +307,261 @@ class _LifecycleBlockingCall:
         return self.claim(result)
 
     def mark_finished(self) -> None:
-        """Publish worker finalization after its permit transition settles."""
+        """Resolve ownership and publish terminal readiness while charged."""
+        with self._lock:
+            if not self._worker_finish_claimed:
+                self._worker_finish_claimed = True
+                resolve_ownership = True
+            elif not self._worker_terminal_published:
+                self._worker_terminal_published = True
+                resolve_ownership = False
+            else:
+                return
+            loop = self._loop
+            finished_future = self._finished_future
+            requester_settlement_future = self._requester_settlement_future
+            committed_escrow = (
+                self._result_ownership_committed
+                and self._result is not _BLOCKING_RESULT_MISSING
+                and self._on_abandoned_result is not None
+            )
+            claim_requested = self._result_claim_requested
+            loop_can_queue = loop is not None and not loop.is_closed()
+            loop_available = loop.is_running() if loop_can_queue and loop is not None else False
+            settlement_deliverable = (
+                loop_can_queue
+                and requester_settlement_future is not None
+                and not requester_settlement_future.cancelled()
+            )
+        if resolve_ownership:
+            if not committed_escrow:
+                return
+            if settlement_deliverable:
+                assert loop is not None
+                try:
+                    loop.call_soon_threadsafe(self._deliver_requester_settlement)
+                except RuntimeError:
+                    loop_available = False
+            if not loop_available:
+                self.revoke_committed_result_transport()
+            elif not self._result_final_decision.wait(timeout=self._result_handoff_seconds):
+                self._expire_result_transport()
+            self._cleanup_abandoned_result()
+            return
+        if committed_escrow and claim_requested:
+            if loop_can_queue and finished_future is not None and not finished_future.done():
+                assert loop is not None
+                try:
+                    loop.call_soon_threadsafe(self._deliver_finished)
+                except RuntimeError:
+                    loop_available = False
+            if not loop_available:
+                self.revoke_committed_result_transport()
+            elif not self._result_terminal_decision.wait(timeout=self._result_handoff_seconds):
+                self._expire_result_transport()
+            self._cleanup_abandoned_result()
         self.finished.set()
+        if loop is None or finished_future is None or loop.is_closed():
+            return
+        try:
+            self._deliver_requester_settlement_soon(loop, requester_settlement_future)
+            loop.call_soon_threadsafe(self._deliver_finished)
+        except RuntimeError:
+            return
+
+    def _deliver_requester_settlement_soon(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        future: asyncio.Future[None] | None,
+    ) -> None:
+        if future is not None and not future.done():
+            loop.call_soon_threadsafe(self._deliver_requester_settlement)
+
+    async def wait_for_async_finish(self) -> None:
+        """Wait until result handoff and worker permit settlement both finish."""
+        with self._lock:
+            requester_settlement_future = self._requester_settlement_future
+        if requester_settlement_future is None:
+            raise RuntimeError("blocking call has no asynchronous finalization transport")
+        await requester_settlement_future
+        with self._lock:
+            terminal_cleanup_error = self._terminal_cleanup_error
+        if terminal_cleanup_error is not None:
+            raise terminal_cleanup_error
+
+    async def wait_for_async_finish_after_claim_intent(self) -> None:
+        """Await terminal readiness while preserving worker cleanup on loop loss."""
+        with self._lock:
+            finished_future = self._finished_future
+        if finished_future is None:
+            raise RuntimeError("blocking call has no protected finalization transport")
+        while True:
+            try:
+                await asyncio.shield(finished_future)
+            except asyncio.CancelledError:
+                continue
+            except GeneratorExit:
+                self.revoke_committed_result_transport()
+                raise
+            break
+        with self._lock:
+            terminal_cleanup_error = self._terminal_cleanup_error
+        if terminal_cleanup_error is not None:
+            raise terminal_cleanup_error
+
+    async def wait_for_result_claim_ready(self) -> None:
+        """Wait until the worker is ready to linearize result ownership."""
+        with self._lock:
+            claim_ready_future = self._result_claim_ready_future
+        if claim_ready_future is None:
+            raise RuntimeError("blocking call has no asynchronous result-claim transport")
+        await asyncio.shield(claim_ready_future)
+
+    def commit_result_claim_intent(self, result: Any) -> None:
+        """Commit the requester to receive the result after permit settlement."""
+        with self._lock:
+            if self._abandoned or self._result_expired:
+                raise RuntimeError("blocking result transport expired before adoption")
+            if self._result is _BLOCKING_RESULT_MISSING or self._result is not result:
+                raise RuntimeError("blocking result transport ownership was corrupted")
+            if self._result_claim_intent:
+                raise RuntimeError("blocking result claim intent was already committed")
+            self._result_claim_intent = True
+            self._result_claim_decision.set()
+
+    def prepare_result_claim_before_release(self) -> None:
+        """Let cancellation or one requester claim intent win before release."""
+        with self._lock:
+            escrowed = (
+                not self._synchronous
+                and not self._background
+                and self._result is not _BLOCKING_RESULT_MISSING
+                and self._on_abandoned_result is not None
+            )
+            abandoned = self._abandoned or self._result_expired
+            loop = self._loop
+            claim_ready_future = self._result_claim_ready_future
+        if not escrowed:
+            return
+        if abandoned:
+            self._cleanup_abandoned_result()
+            return
+        if loop is None or claim_ready_future is None or loop.is_closed():
+            self.abandon(discard_before_start=False)
+            self._cleanup_abandoned_result()
+            return
+        try:
+            loop.call_soon_threadsafe(self._deliver_result_claim_ready)
+        except RuntimeError:
+            self.abandon(discard_before_start=False)
+            self._cleanup_abandoned_result()
+            return
+        if not self._result_claim_decision.wait(timeout=self._result_handoff_seconds):
+            self._expire_result_transport()
+        self._cleanup_abandoned_result()
+
+    def settle_result_ownership_after_release(self) -> None:
+        """Provisionally commit one claimant or retire a lost transport."""
+        cleanup: Callable[[Any], None] | None = None
+        result: Any = _BLOCKING_RESULT_MISSING
+        with self._lock:
+            if self._synchronous or self._background or self._on_abandoned_result is None:
+                return
+            if self._result is _BLOCKING_RESULT_MISSING:
+                return
+            requester_settlement_future = self._requester_settlement_future
+            requester_cancelled = requester_settlement_future is not None and requester_settlement_future.cancelled()
+            loop = self._loop
+            transport_unavailable = loop is None or loop.is_closed() or not loop.is_running()
+            if self._abandoned or self._result_expired or requester_cancelled or transport_unavailable:
+                self._abandoned = True
+                result = self._result
+                cleanup = self._on_abandoned_result
+                self._result = _BLOCKING_RESULT_MISSING
+                self._on_abandoned_result = None
+                self._result_handoff.set()
+            elif not self._result_claim_intent:
+                raise RuntimeError("blocking result release has no committed claimant")
+            else:
+                self._result_ownership_committed = True
+        if cleanup is not None and result is not _BLOCKING_RESULT_MISSING:
+            self._run_result_cleanup(cleanup, result)
+
+    def finalize_committed_result(self, result: Any) -> Any:
+        """Irreversibly claim a terminal-ready result without another suspension."""
+        with self._lock:
+            terminal_cleanup_error = self._terminal_cleanup_error
+            ownership_committed = self._result_ownership_committed
+            claim_requested = self._result_claim_requested
+            abandoned = self._abandoned or self._result_expired
+            result_matches = self._result is result and self._on_abandoned_result is not None
+            if (
+                terminal_cleanup_error is None
+                and ownership_committed
+                and claim_requested
+                and not abandoned
+                and result_matches
+            ):
+                self._result = _BLOCKING_RESULT_MISSING
+                self._on_abandoned_result = None
+                self._result_terminal_decision.set()
+        if terminal_cleanup_error is not None:
+            raise terminal_cleanup_error
+        if not ownership_committed or not claim_requested or abandoned or not result_matches:
+            raise RuntimeError("blocking result ownership did not settle")
+        return result
+
+    def request_committed_result_claim(self, result: Any) -> None:
+        """Request terminal ownership while the worker retains cleanup escrow."""
+        with self._lock:
+            if self._terminal_cleanup_error is not None:
+                raise self._terminal_cleanup_error
+            if not self._result_ownership_committed or self._abandoned or self._result_expired:
+                raise RuntimeError("blocking result ownership did not settle")
+            if self._result is not result or self._on_abandoned_result is None:
+                raise RuntimeError("blocking result transport ownership was corrupted")
+            self._result_claim_requested = True
+            self._result_final_decision.set()
+
+    def revoke_committed_result_transport(self) -> bool:
+        """Return a provisional requester claim to its worker cleanup owner."""
+        with self._lock:
+            if not self._result_ownership_committed:
+                return False
+            if self._result is _BLOCKING_RESULT_MISSING or self._on_abandoned_result is None:
+                return False
+            self._abandoned = True
+            self._result_handoff.set()
+            self._result_final_decision.set()
+            self._result_terminal_decision.set()
+            return True
+
+    def acknowledge_result_handoff(self, result: Any) -> None:
+        """Let the worker finish while result ownership remains in escrow."""
+        with self._lock:
+            if self._abandoned or self._result_expired:
+                raise RuntimeError("blocking result transport expired before adoption")
+            if self._result is _BLOCKING_RESULT_MISSING or self._result is not result:
+                raise RuntimeError("blocking result transport ownership was corrupted")
+            self._result_handoff.set()
+
+    def _deliver_result_claim_ready(self) -> None:
+        with self._lock:
+            claim_ready_future = self._result_claim_ready_future
+        if claim_ready_future is not None and not claim_ready_future.done():
+            claim_ready_future.set_result(None)
+
+    def _deliver_requester_settlement(self) -> None:
+        with self._lock:
+            requester_settlement_future = self._requester_settlement_future
+        if requester_settlement_future is not None and not requester_settlement_future.done():
+            requester_settlement_future.set_result(None)
+
+    def _deliver_finished(self) -> None:
+        with self._lock:
+            finished_future = self._finished_future
+        if finished_future is not None and not finished_future.done():
+            finished_future.set_result(None)
 
     def claim(self, result: Any) -> Any:
         """Atomically transfer an escrowed result to its asyncio consumer."""
@@ -380,6 +652,8 @@ class _LifecycleBlockingCall:
                 return
             self._result_expired = True
             self._abandoned = True
+            self._result_final_decision.set()
+            self._result_terminal_decision.set()
         logger.warning(
             "pipeline_blocking_result_handoff_expired",
             reason_code=self._reason_code,
@@ -540,7 +814,7 @@ class LifecycleOwnedBlockingWork:
         on_discarded: Callable[[], None] | None = None,
         cancel_pending: bool = True,
         cleanup: bool = False,
-        publish_after_release: bool = False,
+        defer_result_publication: bool = False,
         result_handoff_seconds: float = DEFAULT_PIPELINE_CLEANUP_GRACE_SECONDS,
         timeout_seconds: float | None = None,
     ) -> Result:
@@ -561,7 +835,7 @@ class LifecycleOwnedBlockingWork:
             on_discarded=on_discarded,
             background=False,
             result_handoff_seconds=validate_cleanup_grace_seconds(result_handoff_seconds),
-            publish_after_release=publish_after_release or on_abandoned_result is None,
+            defer_result_publication=defer_result_publication or on_abandoned_result is None,
         )
         try:
             if cleanup:
@@ -581,16 +855,63 @@ class LifecycleOwnedBlockingWork:
         try:
             result = await future
             if on_abandoned_result is not None:
-                return call.claim(result)
-            return result
+                call.acknowledge_result_handoff(result)
+                await call.wait_for_result_claim_ready()
+                call.commit_result_claim_intent(result)
         except asyncio.CancelledError:
-            call.abandon(discard_before_start=cancel_pending)
+            abandoned = call.abandon(discard_before_start=cancel_pending)
+            if abandoned:
+                logger.warning(
+                    "pipeline_blocking_work_cancelled",
+                    reason_code=reason_code,
+                    admission_retained=True,
+                )
+                raise
             logger.warning(
-                "pipeline_blocking_work_cancelled",
+                "pipeline_blocking_work_cancellation_deferred",
                 reason_code=reason_code,
-                admission_retained=True,
+                ownership_committed=True,
             )
+            call.request_committed_result_claim(result)
+            await call.wait_for_async_finish_after_claim_intent()
+            return call.finalize_committed_result(result)
+        except GeneratorExit:
+            abandoned = call.abandon(discard_before_start=cancel_pending)
+            if not abandoned:
+                call.revoke_committed_result_transport()
             raise
+        except BaseException:
+            await call.wait_for_async_finish()
+            raise
+        try:
+            await call.wait_for_async_finish()
+        except asyncio.CancelledError:
+            abandoned = call.abandon(discard_before_start=False)
+            if abandoned:
+                logger.warning(
+                    "pipeline_blocking_work_cancelled",
+                    reason_code=reason_code,
+                    admission_retained=True,
+                )
+                raise
+            logger.warning(
+                "pipeline_blocking_work_cancellation_deferred",
+                reason_code=reason_code,
+                ownership_committed=True,
+            )
+            call.request_committed_result_claim(result)
+            await call.wait_for_async_finish_after_claim_intent()
+            return call.finalize_committed_result(result)
+        except GeneratorExit:
+            abandoned = call.abandon(discard_before_start=False)
+            if not abandoned:
+                call.revoke_committed_result_transport()
+            raise
+        if on_abandoned_result is not None:
+            call.request_committed_result_claim(result)
+            await call.wait_for_async_finish_after_claim_intent()
+            result = call.finalize_committed_result(result)
+        return result
 
     async def realize_owned[Product](
         self,
@@ -629,7 +950,7 @@ class LifecycleOwnedBlockingWork:
             reason_code=reason_code,
             on_abandoned_result=retire_product,
             on_discarded=on_discarded,
-            publish_after_release=adopt is not None,
+            defer_result_publication=adopt is not None,
             result_handoff_seconds=result_handoff_seconds,
             timeout_seconds=timeout_seconds,
         )
@@ -851,7 +1172,7 @@ class LifecycleOwnedBlockingWork:
         try:
             with lifecycle.blocking_worker(permit):
                 call.execute()
-                call.retire_abandoned_result_before_release()
+                call.retire_abandoned_result_before_final_settlement()
         finally:
             terminal_error = call.terminal_cleanup_error()
             if terminal_error is not None and _retains_cleanup_capacity(terminal_error):
@@ -893,21 +1214,24 @@ class LifecycleOwnedBlockingWork:
             return None
         terminal_error: RuntimeOwnershipError | None = None
         try:
-            terminal_error = self._release_permit_failure_aware(
-                permit,
-                call=call,
-                primary_error=primary_error,
-            )
-        finally:
-            self._unregister(call)
-            call.mark_finished()
-        if terminal_error is not None:
-            call.publish_terminal_result()
-        else:
             call.publish_deferred_result()
+            call.retire_abandoned_result_before_final_settlement()
+            call.prepare_result_claim_before_release()
             deferred_cleanup_error = call.terminal_cleanup_error()
             if deferred_cleanup_error is not None:
                 self._require_lifecycle().fence_runtime_fatal(deferred_cleanup_error)
+        finally:
+            try:
+                terminal_error = self._release_permit_failure_aware(
+                    permit,
+                    call=call,
+                    primary_error=primary_error,
+                )
+            finally:
+                self._unregister(call)
+                call.mark_finished()
+        if terminal_error is not None:
+            call.publish_terminal_result()
         return terminal_error
 
     def _release_permit_failure_aware(
@@ -920,20 +1244,53 @@ class LifecycleOwnedBlockingWork:
         """Release one permit without opening a replacement-admission window."""
         lifecycle = self._require_lifecycle()
         terminal_error: RuntimeOwnershipError | None = None
+        preexisting_terminal_error = None if call is None else call.terminal_cleanup_error()
         with lifecycle.blocking_permit_release_transition():
             try:
-                lifecycle.release_blocking_permit(permit)
-            except BaseException as release_error:
-                terminal_error = terminal_cleanup_failure(
-                    primary_error,
-                    release_error,
-                    reason_code="blocking_permit_release_failed",
-                    message="Pipeline blocking capacity release failed",
-                )
+                if call is not None and preexisting_terminal_error is None:
+                    call.retire_abandoned_result_before_final_settlement()
+                    terminal_error = call.terminal_cleanup_error()
+                    if terminal_error is not None:
+                        lifecycle.fence_runtime_fatal(terminal_error)
+                try:
+                    lifecycle.release_blocking_permit(permit)
+                except BaseException as release_error:
+                    terminal_error = terminal_cleanup_failure(
+                        primary_error,
+                        release_error,
+                        reason_code="blocking_permit_release_failed",
+                        message="Pipeline blocking capacity release failed",
+                    )
+                    if call is not None:
+                        call.replace_result_with_terminal_failure(terminal_error)
+                        terminal_error = call.terminal_cleanup_error() or terminal_error
+                    lifecycle.fence_runtime_fatal(terminal_error)
+                else:
+                    if call is not None and terminal_error is None and preexisting_terminal_error is None:
+                        try:
+                            call.settle_result_ownership_after_release()
+                        except BaseException as ownership_error:
+                            terminal_error = terminal_cleanup_failure(
+                                primary_error,
+                                ownership_error,
+                                reason_code="blocking_result_ownership_failed",
+                                message="Pipeline blocking result ownership failed",
+                            )
+                            call.replace_result_with_terminal_failure(terminal_error)
+                            terminal_error = call.terminal_cleanup_error() or terminal_error
+                            lifecycle.fence_runtime_fatal(terminal_error)
+            finally:
                 if call is not None:
-                    call.replace_result_with_terminal_failure(terminal_error)
-                    terminal_error = call.terminal_cleanup_error() or terminal_error
-                lifecycle.fence_runtime_fatal(terminal_error)
+                    call.mark_finished()
+                    settled_error = call.terminal_cleanup_error()
+                    if (
+                        settled_error is not None
+                        and settled_error is not terminal_error
+                        and settled_error is not preexisting_terminal_error
+                    ):
+                        terminal_error = settled_error
+                        lifecycle.fence_runtime_fatal(terminal_error)
+                    call.mark_finished()
         return terminal_error
 
     def _release_unmaterialized_permits(

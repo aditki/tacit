@@ -48,6 +48,8 @@ def _http_scope(*, path: str = "/consume", headers: list[tuple[bytes, bytes]] | 
     request_headers = list(headers or [])
     if not any(name.lower() == b"host" for name, _value in request_headers):
         request_headers.append((b"host", b"testserver"))
+    if not any(name.lower() == b"content-type" for name, _value in request_headers):
+        request_headers.append((b"content-type", b"application/octet-stream"))
     return {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},

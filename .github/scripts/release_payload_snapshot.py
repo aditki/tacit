@@ -53,7 +53,10 @@ def _open_source(path: Path, maximum: int) -> tuple[int, os.stat_result]:
         raise ReleasePayloadError(f"release payload is unavailable: {path}") from exc
     if not stat.S_ISREG(listed.st_mode):
         raise ReleasePayloadError(f"release payload must be a regular file: {path}")
-    descriptor = _open_no_follow(path, os.O_RDONLY)
+    # A pathname that was regular at lstat() can be replaced with a FIFO before
+    # open(). Nonblocking admission makes that race fail at fstat() instead of
+    # hanging the privileged publication process.
+    descriptor = _open_no_follow(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or (listed.st_dev, listed.st_ino, listed.st_size) != (
@@ -237,7 +240,12 @@ def verified_payload_snapshot(
             raise ReleasePayloadError("private release snapshot cleanup failed") from cleanup_errors[0]
 
 
-def cleanup_private_directory(path: Path, expected_names: Sequence[str]) -> None:
+def cleanup_private_directory(
+    path: Path,
+    expected_names: Sequence[str],
+    *,
+    pending_temporary_name: str | None = None,
+) -> None:
     listed = _validated_private_directory(path)
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
@@ -250,7 +258,15 @@ def cleanup_private_directory(path: Path, expected_names: Sequence[str]) -> None
         os.fchmod(descriptor, 0o700)
         actual = set(os.listdir(descriptor))
         expected = set(expected_names)
-        if not actual.issubset(expected) or len(expected) != len(expected_names):
+        temporary_names: set[str] = set()
+        if pending_temporary_name is not None:
+            prefix = f".{pending_temporary_name}."
+            temporary_names = {
+                name
+                for name in actual
+                if name.startswith(prefix) and name.endswith(".tmp") and len(name) > len(prefix) + 4
+            }
+        if not actual.issubset(expected | temporary_names) or len(expected) != len(expected_names):
             raise ReleasePayloadError("private snapshot directory contents are unexpected")
         for name in sorted(actual):
             if not name or Path(name).name != name:

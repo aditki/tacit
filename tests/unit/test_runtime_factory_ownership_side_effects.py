@@ -25,6 +25,13 @@ async def _wait_for_zero(controller: PipelineAdmissionController) -> None:
     raise AssertionError("runtime admission did not return to zero")
 
 
+async def _wait_for_worker_zero(blocking_work: LifecycleOwnedBlockingWork) -> None:
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while blocking_work.active and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0)
+    assert blocking_work.active == 0
+
+
 @pytest.mark.parametrize("nested_operation", ["run", "realize_owned"])
 @pytest.mark.asyncio
 async def test_async_nested_same_worker_realization_reuses_owned_permit(
@@ -73,6 +80,7 @@ async def test_async_nested_same_worker_realization_reuses_owned_permit(
     assert retired == []
     assert lifecycle.queued == 0
     await _wait_for_zero(lifecycle)
+    await _wait_for_worker_zero(blocking_work)
     assert lifecycle.in_flight == 0
     assert lifecycle.blocking_in_flight == 0
     assert blocking_work.active == 0
@@ -125,6 +133,504 @@ async def test_adopted_result_is_not_published_before_worker_releases_capacity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("_iteration", range(25))
+async def test_cancellation_after_handoff_ack_retires_escrow_before_final_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+    _iteration: int,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    product = object()
+    handoff_acknowledged = threading.Event()
+    second_abandonment_check_returned = threading.Event()
+    allow_final_settlement = threading.Event()
+    retired: list[object] = []
+    factory_threads: list[int] = []
+    retirement_threads: list[int] = []
+    abandonment_checks = 0
+    abandonment_checks_lock = threading.Lock()
+    original_acknowledge = side_effects._LifecycleBlockingCall.acknowledge_result_handoff
+    original_retire = side_effects._LifecycleBlockingCall.retire_abandoned_result_before_final_settlement
+
+    def realize() -> object:
+        factory_threads.append(threading.get_ident())
+        return product
+
+    def retire(candidate: object) -> None:
+        retirement_threads.append(threading.get_ident())
+        retired.append(candidate)
+
+    def observe_acknowledgement(
+        call: side_effects._LifecycleBlockingCall,
+        result: object,
+    ) -> None:
+        original_acknowledge(call, result)
+        handoff_acknowledged.set()
+
+    def pause_after_second_abandonment_check(
+        call: side_effects._LifecycleBlockingCall,
+    ) -> None:
+        nonlocal abandonment_checks
+        original_retire(call)
+        with abandonment_checks_lock:
+            abandonment_checks += 1
+            check_index = abandonment_checks
+        if check_index == 2:
+            second_abandonment_check_returned.set()
+            assert allow_final_settlement.wait(timeout=1.0)
+
+    monkeypatch.setattr(
+        side_effects._LifecycleBlockingCall,
+        "acknowledge_result_handoff",
+        observe_acknowledgement,
+    )
+    monkeypatch.setattr(
+        side_effects._LifecycleBlockingCall,
+        "retire_abandoned_result_before_final_settlement",
+        pause_after_second_abandonment_check,
+    )
+    realization = asyncio.create_task(
+        blocking_work.realize_owned(
+            realize,
+            validate=lambda _product: None,
+            adopt=lambda _product: None,
+            retire=retire,
+            reason_code="post_ack_cancellation_matrix",
+        )
+    )
+    try:
+        assert await asyncio.to_thread(handoff_acknowledged.wait, 1.0)
+        assert await asyncio.to_thread(second_abandonment_check_returned.wait, 1.0)
+        assert lifecycle.blocking_in_flight == 1
+        assert blocking_work.active == 1
+
+        realization.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await realization
+
+        allow_final_settlement.set()
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while blocking_work.active and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.001)
+
+        assert retired == [product]
+        assert retirement_threads == factory_threads
+        assert lifecycle.in_flight == 0
+        assert lifecycle.blocking_in_flight == 0
+        assert lifecycle.retained == 0
+        assert blocking_work.active == 0
+    finally:
+        allow_final_settlement.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "settlement_phase",
+    ["before_permit_release", "permit_release", "worker_finish"],
+)
+@pytest.mark.parametrize("_iteration", range(10))
+async def test_post_ack_cancellation_has_one_owner_at_each_settlement_phase(
+    monkeypatch: pytest.MonkeyPatch,
+    settlement_phase: str,
+    _iteration: int,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    product = object()
+    settlement_entered = threading.Event()
+    allow_settlement = threading.Event()
+    retired: list[object] = []
+    factory_threads: list[int] = []
+    retirement_threads: list[int] = []
+    retirement_capacity: list[tuple[int, int]] = []
+
+    def realize() -> object:
+        factory_threads.append(threading.get_ident())
+        return product
+
+    def retire(candidate: object) -> None:
+        retirement_threads.append(threading.get_ident())
+        retirement_capacity.append((lifecycle.blocking_in_flight, lifecycle.retained))
+        retired.append(candidate)
+
+    if settlement_phase == "before_permit_release":
+        original_release_transition = blocking_work._release_permit_failure_aware
+
+        def pause_settlement(
+            permit: PipelineBlockingPermit,
+            *,
+            call: side_effects._LifecycleBlockingCall | None = None,
+            primary_error: BaseException | None = None,
+        ):
+            settlement_entered.set()
+            assert allow_settlement.wait(timeout=1.0)
+            return original_release_transition(
+                permit,
+                call=call,
+                primary_error=primary_error,
+            )
+
+        monkeypatch.setattr(
+            blocking_work,
+            "_release_permit_failure_aware",
+            pause_settlement,
+        )
+    elif settlement_phase == "permit_release":
+        original_release = lifecycle.release_blocking_permit
+
+        def pause_settlement(permit: PipelineBlockingPermit) -> None:
+            settlement_entered.set()
+            assert allow_settlement.wait(timeout=1.0)
+            original_release(permit)
+
+        monkeypatch.setattr(lifecycle, "release_blocking_permit", pause_settlement)
+    else:
+        original_mark_finished = side_effects._LifecycleBlockingCall.mark_finished
+
+        def pause_settlement(call: side_effects._LifecycleBlockingCall) -> None:
+            settlement_entered.set()
+            assert allow_settlement.wait(timeout=1.0)
+            original_mark_finished(call)
+
+        monkeypatch.setattr(
+            side_effects._LifecycleBlockingCall,
+            "mark_finished",
+            pause_settlement,
+        )
+
+    realization = asyncio.create_task(
+        blocking_work.realize_owned(
+            realize,
+            validate=lambda _product: None,
+            adopt=lambda _product: None,
+            retire=retire,
+            reason_code=f"post_claim_cancellation_{settlement_phase}",
+        )
+    )
+    try:
+        assert await asyncio.to_thread(settlement_entered.wait, 1.0)
+        realization.cancel()
+        await asyncio.sleep(0)
+        allow_settlement.set()
+
+        if settlement_phase != "worker_finish":
+            with pytest.raises(asyncio.CancelledError):
+                await realization
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while blocking_work.active and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.001)
+            assert retired == [product]
+            assert retirement_threads == factory_threads
+            expected_capacity = (1, 2) if settlement_phase == "before_permit_release" else (0, 1)
+            assert retirement_capacity == [expected_capacity]
+        else:
+            assert await realization is product
+            assert retired == []
+            assert retirement_threads == []
+            assert retirement_capacity == []
+        await _wait_for_zero(lifecycle)
+        await _wait_for_worker_zero(blocking_work)
+        assert lifecycle.in_flight == 0
+        assert lifecycle.blocking_in_flight == 0
+        assert lifecycle.retained == 0
+        assert blocking_work.active == 0
+    finally:
+        allow_settlement.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ownership_phase", ["pre_commit", "post_commit"])
+async def test_real_coroutine_close_preserves_exactly_one_result_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    ownership_phase: str,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    product = object()
+    boundary_entered = threading.Event()
+    close_handler_entered = threading.Event()
+    allow_worker = threading.Event()
+    close_in_progress = threading.Event()
+    retired: list[object] = []
+    factory_threads: list[int] = []
+    retirement_threads: list[int] = []
+    retirement_capacity: list[tuple[int, int]] = []
+
+    def realize() -> object:
+        factory_threads.append(threading.get_ident())
+        return product
+
+    def retire(candidate: object) -> None:
+        retirement_threads.append(threading.get_ident())
+        retirement_capacity.append((lifecycle.blocking_in_flight, lifecycle.retained))
+        retired.append(candidate)
+
+    if ownership_phase == "pre_commit":
+        original_release = lifecycle.release_blocking_permit
+
+        def pause_before_commit(permit: PipelineBlockingPermit) -> None:
+            boundary_entered.set()
+            assert allow_worker.wait(timeout=1.0)
+            original_release(permit)
+
+        monkeypatch.setattr(lifecycle, "release_blocking_permit", pause_before_commit)
+    else:
+        original_mark_finished = side_effects._LifecycleBlockingCall.mark_finished
+
+        def pause_after_commit(call: side_effects._LifecycleBlockingCall) -> None:
+            boundary_entered.set()
+            assert allow_worker.wait(timeout=1.0)
+            original_mark_finished(call)
+
+        monkeypatch.setattr(
+            side_effects._LifecycleBlockingCall,
+            "mark_finished",
+            pause_after_commit,
+        )
+
+    original_abandon = side_effects._LifecycleBlockingCall.abandon
+
+    def observe_close_handler(
+        call: side_effects._LifecycleBlockingCall,
+        *,
+        discard_before_start: bool = True,
+    ) -> bool:
+        abandoned = original_abandon(call, discard_before_start=discard_before_start)
+        if close_in_progress.is_set():
+            close_handler_entered.set()
+        return abandoned
+
+    monkeypatch.setattr(side_effects._LifecycleBlockingCall, "abandon", observe_close_handler)
+    operation = blocking_work.realize_owned(
+        realize,
+        validate=lambda _product: None,
+        adopt=lambda _product: None,
+        retire=retire,
+        reason_code=f"generator_exit_{ownership_phase}",
+    )
+    realization = asyncio.create_task(operation)
+
+    def release_worker_after_close_handler() -> None:
+        assert close_handler_entered.wait(timeout=1.0)
+        allow_worker.set()
+
+    release_thread = threading.Thread(
+        target=release_worker_after_close_handler,
+        name="release-generator-exit-worker",
+    )
+    try:
+        assert await asyncio.to_thread(boundary_entered.wait, 1.0)
+        release_thread.start()
+        close_in_progress.set()
+        close_error: BaseException | None = None
+        try:
+            operation.close()
+        except BaseException as exc:
+            close_error = exc
+        finally:
+            close_in_progress.clear()
+            allow_worker.set()
+        await asyncio.to_thread(release_thread.join, 1.0)
+        assert release_thread.is_alive() is False
+
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while (blocking_work.active or not realization.done()) and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.001)
+
+        assert close_error is None
+        assert realization.done()
+        if not realization.cancelled():
+            task_error = realization.exception()
+            assert not (isinstance(task_error, RuntimeError) and str(task_error) == "coroutine ignored GeneratorExit")
+        assert retired == [product]
+        assert retirement_threads == factory_threads
+        assert retirement_capacity == [(0, 1)]
+        assert lifecycle.in_flight == 0
+        assert lifecycle.blocking_in_flight == 0
+        assert lifecycle.retained == 0
+        assert blocking_work.active == 0
+    finally:
+        allow_worker.set()
+        if release_thread.is_alive():
+            await asyncio.to_thread(release_thread.join, 1.0)
+
+
+def test_closed_requester_loop_retires_escrow_before_ownership_commit() -> None:
+    loop = asyncio.new_event_loop()
+    future: asyncio.Future[object] = loop.create_future()
+    product = object()
+    retired: list[object] = []
+    call = side_effects._LifecycleBlockingCall(
+        lambda: product,
+        reason_code="closed_requester_loop",
+        loop=loop,
+        future=future,
+        on_abandoned_result=retired.append,
+        on_discarded=None,
+        background=False,
+        result_handoff_seconds=0.1,
+        defer_result_publication=True,
+    )
+    call.execute()
+    call.acknowledge_result_handoff(product)
+    call.commit_result_claim_intent(product)
+    loop.close()
+
+    call.settle_result_ownership_after_release()
+
+    assert retired == [product]
+
+
+@pytest.mark.asyncio
+async def test_second_terminal_mark_keeps_capacity_charged_without_blocking_requester_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    product = object()
+    second_mark_entered = threading.Event()
+    allow_second_mark = threading.Event()
+    requester_loop_progressed = threading.Event()
+    worker_unregistered = threading.Event()
+    mark_count = 0
+    mark_lock = threading.Lock()
+    heartbeat_responsive: list[bool] = []
+    charged_state: list[tuple[int, int, int]] = []
+    requester_loop = asyncio.get_running_loop()
+    original_mark_finished = side_effects._LifecycleBlockingCall.mark_finished
+    original_unregister = blocking_work._unregister
+
+    def pause_second_mark(call: side_effects._LifecycleBlockingCall) -> None:
+        nonlocal mark_count
+        with mark_lock:
+            mark_count += 1
+            current_mark = mark_count
+        if current_mark == 2:
+            second_mark_entered.set()
+            assert allow_second_mark.wait(timeout=1.0)
+        original_mark_finished(call)
+
+    def observe_unregister(call: side_effects._LifecycleBlockingCall) -> None:
+        original_unregister(call)
+        worker_unregistered.set()
+
+    def observe_paused_terminal_mark() -> None:
+        assert second_mark_entered.wait(timeout=1.0)
+        charged_state.append(
+            (
+                lifecycle.blocking_in_flight,
+                lifecycle.retained,
+                blocking_work.active,
+            )
+        )
+        requester_loop.call_soon_threadsafe(requester_loop_progressed.set)
+        heartbeat_responsive.append(requester_loop_progressed.wait(timeout=0.2))
+        allow_second_mark.set()
+
+    monkeypatch.setattr(
+        side_effects._LifecycleBlockingCall,
+        "mark_finished",
+        pause_second_mark,
+    )
+    monkeypatch.setattr(blocking_work, "_unregister", observe_unregister)
+    observer = threading.Thread(
+        target=observe_paused_terminal_mark,
+        name="observe-paused-terminal-mark",
+    )
+    observer.start()
+    try:
+        assert (
+            await blocking_work.realize_owned(
+                lambda: product,
+                validate=lambda _product: None,
+                adopt=lambda _product: None,
+                retire=lambda _product: None,
+                reason_code="paused_terminal_publication",
+            )
+            is product
+        )
+        await asyncio.to_thread(observer.join, 1.0)
+        assert observer.is_alive() is False
+        assert heartbeat_responsive == [True]
+        assert charged_state == [(0, 1, 1)]
+        assert await asyncio.to_thread(worker_unregistered.wait, 1.0)
+        assert lifecycle.in_flight == 0
+        assert lifecycle.blocking_in_flight == 0
+        assert lifecycle.retained == 0
+        assert blocking_work.active == 0
+    finally:
+        allow_second_mark.set()
+        if observer.is_alive():
+            await asyncio.to_thread(observer.join, 1.0)
+
+
+@pytest.mark.asyncio
+async def test_release_race_retirement_failure_fences_with_transition_retained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    product = object()
+    release_entered = threading.Event()
+    allow_release = threading.Event()
+    factory_threads: list[int] = []
+    retirement_threads: list[int] = []
+    fence_capacity: list[tuple[int, int]] = []
+    original_release = lifecycle.release_blocking_permit
+    original_fence = lifecycle.fence_runtime_fatal
+
+    def realize() -> object:
+        factory_threads.append(threading.get_ident())
+        return product
+
+    def fail_retirement(_candidate: object) -> None:
+        retirement_threads.append(threading.get_ident())
+        raise RuntimeError("synthetic post-release retirement failure")
+
+    def pause_release(permit: PipelineBlockingPermit) -> None:
+        if not permit.cleanup:
+            release_entered.set()
+            assert allow_release.wait(timeout=1.0)
+        original_release(permit)
+
+    def observe_fence(error: BaseException):
+        fence_capacity.append((lifecycle.blocking_in_flight, lifecycle.retained))
+        return original_fence(error)
+
+    monkeypatch.setattr(lifecycle, "release_blocking_permit", pause_release)
+    monkeypatch.setattr(lifecycle, "fence_runtime_fatal", observe_fence)
+    realization = asyncio.create_task(
+        blocking_work.realize_owned(
+            realize,
+            validate=lambda _product: None,
+            adopt=lambda _product: None,
+            retire=fail_retirement,
+            reason_code="post_release_retirement_failure",
+        )
+    )
+    try:
+        assert await asyncio.to_thread(release_entered.wait, 1.0)
+        realization.cancel()
+        allow_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await realization
+
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while blocking_work.active and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.001)
+
+        assert retirement_threads == factory_threads
+        assert fence_capacity == [(0, 1)]
+        assert lifecycle.runtime_fatal_circuit is not None
+        assert lifecycle.in_flight == 0
+        assert lifecycle.blocking_in_flight == 0
+        assert lifecycle.retained == 0
+        assert blocking_work.active == 0
+    finally:
+        allow_release.set()
+
+
+@pytest.mark.asyncio
 async def test_plain_async_result_is_not_published_before_worker_releases_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -163,6 +669,115 @@ async def test_plain_async_result_is_not_published_before_worker_releases_capaci
         if not result.done():
             result.cancel()
             await asyncio.gather(result, return_exceptions=True)
+
+
+@pytest.mark.parametrize("requester_loop_state", ["paused", "closed"])
+def test_deferred_result_handoff_retains_capacity_until_publication_and_thread_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    requester_loop_state: str,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    requester_loop = asyncio.new_event_loop()
+    product = object()
+    worker_started = threading.Event()
+    allow_worker_result = threading.Event()
+    publication_entered = threading.Event()
+    allow_publication = threading.Event()
+    publication_finished = threading.Event()
+    handoff_threads: list[threading.Thread] = []
+    accounting: list[tuple[str, int, int]] = []
+    retired: list[object] = []
+    original_publish = side_effects._LifecycleBlockingCall.publish_deferred_result
+    original_worker_thread = blocking_work._worker_thread
+
+    def work() -> object:
+        worker_started.set()
+        assert allow_worker_result.wait(timeout=1.0)
+        return product
+
+    def observe_publication(call: side_effects._LifecycleBlockingCall) -> None:
+        accounting.append(("entered", lifecycle.blocking_in_flight, blocking_work.active))
+        publication_entered.set()
+        assert allow_publication.wait(timeout=1.0)
+        original_publish(call)
+        accounting.append(("returned", lifecycle.blocking_in_flight, blocking_work.active))
+        publication_finished.set()
+
+    def capture_worker_thread(
+        call: side_effects._LifecycleBlockingCall,
+        permit: PipelineBlockingPermit,
+        *,
+        thread_name: str = "tacit-lifecycle-blocking-work",
+    ) -> threading.Thread:
+        thread = original_worker_thread(call, permit, thread_name=thread_name)
+        handoff_threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(
+        side_effects._LifecycleBlockingCall,
+        "publish_deferred_result",
+        observe_publication,
+    )
+    monkeypatch.setattr(blocking_work, "_worker_thread", capture_worker_thread)
+    task = requester_loop.create_task(
+        blocking_work.run(
+            work,
+            reason_code=f"{requester_loop_state}_deferred_result_handoff",
+            on_abandoned_result=retired.append,
+            defer_result_publication=True,
+            result_handoff_seconds=0.02,
+        )
+    )
+
+    async def wait_for_worker_start() -> None:
+        deadline = requester_loop.time() + 1.0
+        while not worker_started.is_set():
+            if requester_loop.time() >= deadline:
+                raise AssertionError("blocking worker did not start")
+            await asyncio.sleep(0.001)
+
+    try:
+        requester_loop.run_until_complete(wait_for_worker_start())
+        assert lifecycle.blocking_in_flight == 1
+        assert blocking_work.active == 1
+        if requester_loop_state == "closed":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                requester_loop.run_until_complete(task)
+            requester_loop.close()
+
+        allow_worker_result.set()
+        assert publication_entered.wait(timeout=1.0)
+        assert len(handoff_threads) == 1
+        assert handoff_threads[0].is_alive() is True
+        assert lifecycle.blocking_in_flight == 1
+        assert blocking_work.active == 1
+        allow_publication.set()
+        assert publication_finished.wait(timeout=1.0)
+        handoff_threads[0].join(timeout=1.0)
+        assert handoff_threads[0].is_alive() is False
+
+        assert accounting == [("entered", 1, 1), ("returned", 1, 1)]
+        assert lifecycle.in_flight == 0
+        assert lifecycle.blocking_in_flight == 0
+        assert blocking_work.active == 0
+        assert retired == [product]
+
+        if requester_loop_state == "paused":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                requester_loop.run_until_complete(task)
+    finally:
+        allow_worker_result.set()
+        allow_publication.set()
+        for thread in handoff_threads:
+            thread.join(timeout=1.0)
+        if not requester_loop.is_closed():
+            if not task.done():
+                task.cancel()
+                requester_loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+            requester_loop.close()
 
 
 @pytest.mark.parametrize("release_before_failure", [False, True])
@@ -252,6 +867,7 @@ async def test_plain_async_release_failure_fences_before_replacement_admission(
         )
 
     assert lifecycle.runtime_fatal_circuit is not None
+    await _wait_for_worker_zero(blocking_work)
     assert blocking_work.active == 0
     if release_before_failure:
         assert replacement_attempts == [None]

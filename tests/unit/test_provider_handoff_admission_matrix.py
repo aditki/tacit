@@ -132,6 +132,7 @@ def _runtime(
     *,
     active_limit: int,
     queue_limit: int,
+    cleanup_grace_seconds: float = 0.1,
 ) -> tuple[_RuntimeProviderResources, PipelineAdmissionController, _ImmediateProvider]:
     setting_values: dict[str, Any] = {
         "_env_file": None,
@@ -170,7 +171,7 @@ def _runtime(
         settings,
         lifecycle=controller,
         llm_factory=factory,
-        cleanup_grace_seconds=0.1,
+        cleanup_grace_seconds=cleanup_grace_seconds,
     )
     assert resources.llm() is product
     return resources, controller, product
@@ -395,6 +396,12 @@ def _exercise_blocked_owner(
         release_owner.set()
         if futures:
             outcomes = _settle_outcomes(futures)
+
+        def provider_operations_settled() -> bool:
+            with resources._lock:
+                return not state.active_operations and not state.active_handoffs and not state.committed_submissions
+
+        assert _wait_until(provider_operations_settled)
         with resources._lock:
             pre_close = {
                 "operation_ids": len(state.active_operations),
@@ -485,6 +492,104 @@ def test_cross_loop_handoff_cancellation_preserves_the_aggregate_bound(
     assert result["outcomes"].count(("cancelled", "")) == 2
     assert result["outcomes"].count(("overload", "pipeline_admission_queue_full")) == 1
     assert all(value == 0 for value in result["terminal"].values())
+
+
+@pytest.mark.parametrize("lock_boundary", ["admission", "submission"])
+@pytest.mark.asyncio
+async def test_requester_cancellation_never_waits_on_foreign_submission_locks(
+    lock_boundary: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    resources, controller, provider = await asyncio.to_thread(
+        _runtime,
+        tmp_path,
+        active_limit=1,
+        queue_limit=0,
+        cleanup_grace_seconds=1.0,
+    )
+    state = resources._generation_owner
+    assert state is not None and state.loop is not None
+    owner_blocked = threading.Event()
+    release_owner = threading.Event()
+    submission_committed = threading.Event()
+    submissions: list[Any] = []
+    original_commit = resources._commit_generation_submission
+
+    def block_owner_loop() -> None:
+        owner_blocked.set()
+        release_owner.wait(timeout=2.0)
+
+    def observe_submission(*args: Any, **kwargs: Any) -> Any:
+        submission = original_commit(*args, **kwargs)
+        submissions.append(submission)
+        submission_committed.set()
+        return submission
+
+    monkeypatch.setattr(resources, "_commit_generation_submission", observe_submission)
+    state.loop.call_soon_threadsafe(block_owner_loop)
+    assert await asyncio.to_thread(owner_blocked.wait, 1.0)
+
+    operation = asyncio.create_task(provider.chat_text("system", f"cancel-{lock_boundary}"))
+    assert await asyncio.to_thread(submission_committed.wait, 1.0)
+    submission = submissions[0]
+    assert submission.admission is not None
+    foreign_lock = submission.admission.lock if lock_boundary == "admission" else submission.lock
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    safety_released = threading.Event()
+
+    def hold_foreign_lock() -> None:
+        foreign_lock.acquire()
+        try:
+            lock_held.set()
+            assert release_lock.wait(timeout=2.0)
+        finally:
+            foreign_lock.release()
+
+    holder = threading.Thread(target=hold_foreign_lock, name=f"provider-{lock_boundary}-lock-holder")
+    holder.start()
+    assert await asyncio.to_thread(lock_held.wait, 1.0)
+
+    def safety_release() -> None:
+        safety_released.set()
+        release_lock.set()
+
+    safety = threading.Timer(0.5, safety_release)
+    requester_heartbeat = threading.Event()
+    started = time.monotonic()
+    safety.start()
+    try:
+        operation.cancel()
+        asyncio.get_running_loop().call_soon(requester_heartbeat.set)
+        await asyncio.sleep(0)
+        elapsed = time.monotonic() - started
+        assert requester_heartbeat.is_set(), "requester loop stopped at a foreign provider lock"
+        assert elapsed < 0.2, "requester cancellation waited on a foreign provider lock"
+        assert not safety_released.is_set(), "requester resumed only after the safety lock release"
+        release_owner.set()
+        loop = asyncio.get_running_loop()
+        retry_deadline = loop.time() + 0.2
+        while not state.submission_retry_keys and loop.time() < retry_deadline:
+            await asyncio.sleep(0.001)
+        assert state.submission_retry_keys, "owner did not defer the contended transition"
+        assert len(state.submission_retry_keys) <= 2
+        owner_heartbeat = threading.Event()
+        state.loop.call_soon_threadsafe(owner_heartbeat.set)
+        assert await asyncio.to_thread(owner_heartbeat.wait, 0.2), "foreign lock blocked the owner loop"
+    finally:
+        release_lock.set()
+        release_owner.set()
+        safety.cancel()
+        holder.join(timeout=1.0)
+
+    assert holder.is_alive() is False
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    await resources.close()
+
+    assert provider.calls == 0
+    assert all(value == 0 for value in _terminal_state(resources, controller).values())
 
 
 @pytest.mark.asyncio

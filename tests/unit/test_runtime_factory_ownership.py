@@ -285,10 +285,12 @@ async def _wait_for_admission_queue(
     lifecycle: PipelineAdmissionController,
     expected: int,
 ) -> None:
-    for _ in range(1_000):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 1.0
+    while loop.time() < deadline:
         if lifecycle.queued == expected:
             return
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.001)
     raise AssertionError(f"expected {expected} queued pipeline runs, found {lifecycle.queued}")
 
 
@@ -2444,12 +2446,35 @@ def test_direct_bedrock_uses_runtime_stores_admission_controller(monkeypatch, tm
 def test_completed_blocking_worker_releases_off_lease_capacity_when_origin_loop_stops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tacit.pipeline import side_effects as side_effects_module
+
     lifecycle = PipelineAdmissionController(1, max_queued=0)
     blocking_work = LifecycleOwnedBlockingWork(lifecycle)
-    permit_released = _observe_blocking_permit_release(monkeypatch, lifecycle)
     worker_started = threading.Event()
     allow_worker = threading.Event()
     worker_finished = threading.Event()
+    result_delivery_queued = threading.Event()
+    worker_unregistered = threading.Event()
+    retired: list[str] = []
+    original_publish_or_cleanup = side_effects_module._LifecycleBlockingCall._publish_or_cleanup
+    original_unregister = blocking_work._unregister
+
+    def observe_result_delivery(call: side_effects_module._LifecycleBlockingCall) -> bool:
+        awaiting_handoff = original_publish_or_cleanup(call)
+        if awaiting_handoff:
+            result_delivery_queued.set()
+        return awaiting_handoff
+
+    def observe_unregister(call: side_effects_module._LifecycleBlockingCall) -> None:
+        original_unregister(call)
+        worker_unregistered.set()
+
+    monkeypatch.setattr(
+        side_effects_module._LifecycleBlockingCall,
+        "_publish_or_cleanup",
+        observe_result_delivery,
+    )
+    monkeypatch.setattr(blocking_work, "_unregister", observe_unregister)
 
     def blocking_call() -> str:
         worker_started.set()
@@ -2458,8 +2483,7 @@ def test_completed_blocking_worker_releases_off_lease_capacity_when_origin_loop_
         return "completed"
 
     async def wait_until_started() -> None:
-        while not worker_started.is_set():
-            await asyncio.sleep(0)
+        assert await asyncio.to_thread(worker_started.wait, 1.0)
 
     loop = asyncio.new_event_loop()
     loop.set_exception_handler(lambda *_args: None)
@@ -2467,6 +2491,8 @@ def test_completed_blocking_worker_releases_off_lease_capacity_when_origin_loop_
         blocking_work.run(
             blocking_call,
             reason_code="stopped_origin_loop_worker_permit",
+            on_abandoned_result=retired.append,
+            result_handoff_seconds=2.0,
         )
     )
     task._log_destroy_pending = False
@@ -2474,11 +2500,22 @@ def test_completed_blocking_worker_releases_off_lease_capacity_when_origin_loop_
         loop.run_until_complete(wait_until_started())
         allow_worker.set()
         assert worker_finished.wait(timeout=0.5)
-        assert permit_released.wait(timeout=1.0)
+        assert result_delivery_queued.wait(timeout=1.0)
+
+        assert lifecycle.in_flight == 1
+        assert lifecycle.blocking_in_flight == 1
+        assert lifecycle.retained == 1
+        assert blocking_work.active == 1
+        assert task.done() is False
+
+        assert loop.run_until_complete(task) == "completed"
+        assert worker_unregistered.wait(timeout=1.0)
 
         assert lifecycle.in_flight == 0
         assert lifecycle.retained == 0
+        assert lifecycle.blocking_in_flight == 0
         assert blocking_work.active == 0
+        assert retired == []
     finally:
         loop.close()
 
@@ -6210,6 +6247,9 @@ async def test_provider_adoption_lock_contention_never_blocks_generation_owner(
 ) -> None:
     """A foreign handoff mutex cannot stall the persistent service event loop."""
     products: list[_ProviderProbe] = []
+    product_constructed = threading.Event()
+    allow_factory_return = threading.Event()
+    owner_progressed_after_contention = threading.Event()
 
     class CountingProvider(_ProviderProbe):
         def __init__(self, runtime_settings: Settings) -> None:
@@ -6223,6 +6263,8 @@ async def test_provider_adoption_lock_contention_never_blocks_generation_owner(
     def provider_factory(runtime_settings: Settings) -> LLMProvider:
         product = CountingProvider(runtime_settings)
         products.append(product)
+        product_constructed.set()
+        assert allow_factory_return.wait(timeout=1.0), "test did not release provider construction"
         return product
 
     resources, lifecycle, _runtime_settings = _provider_resource_matrix(
@@ -6238,7 +6280,10 @@ async def test_provider_adoption_lock_contention_never_blocks_generation_owner(
 
         def acquire(self, blocking: bool = True) -> bool:
             lock_attempted.set()
-            return self._lock.acquire(blocking=blocking)
+            acquired = self._lock.acquire(blocking=blocking)
+            if not blocking:
+                asyncio.get_running_loop().call_soon(owner_progressed_after_contention.set)
+            return acquired
 
         def release(self) -> None:
             self._lock.release()
@@ -6257,20 +6302,14 @@ async def test_provider_adoption_lock_contention_never_blocks_generation_owner(
     monkeypatch.setattr(dependencies_module, "_ProviderAdoptionHandoff", lambda: handoff)
 
     acquisition = asyncio.create_task(resources.acquire())
-    owner_loop = None
-    for _ in range(1_000):
-        with resources._lock:
-            state = resources._generation_owner
-            owner_loop = None if state is None else state.loop
-        if owner_loop is not None and products:
-            break
-        await asyncio.sleep(0)
+    assert await asyncio.to_thread(product_constructed.wait, 1.0)
+    with resources._lock:
+        state = resources._generation_owner
+        owner_loop = None if state is None else state.loop
     assert owner_loop is not None
+    allow_factory_return.set()
     assert await asyncio.to_thread(lock_attempted.wait, 1.0)
-
-    heartbeat = threading.Event()
-    owner_loop.call_soon_threadsafe(heartbeat.set)
-    owner_was_responsive = await asyncio.to_thread(heartbeat.wait, 0.2)
+    owner_was_responsive = await asyncio.to_thread(owner_progressed_after_contention.wait, 0.2)
     try:
         result = (
             await asyncio.wait_for(
@@ -6279,6 +6318,7 @@ async def test_provider_adoption_lock_contention_never_blocks_generation_owner(
             )
         )[0]
     finally:
+        allow_factory_return.set()
         handoff.lock.release()
     if not isinstance(result, BaseException):
         await resources.close(result)
@@ -6408,6 +6448,85 @@ async def test_provider_operation_settlement_never_waits_on_controller_lock(
     await resources.close(handle)
 
     assert owner_responsive
+    await _assert_dependency_lifecycle_idle(lifecycle)
+
+
+@pytest.mark.asyncio
+async def test_provider_operation_settlement_keeps_capacity_charged_until_manager_commit(
+    tmp_path,
+) -> None:
+    operation_gate = _CrossLoopAsyncGate()
+    operation_returned = threading.Event()
+
+    class ReturningProvider(_ProviderProbe):
+        async def chat_text(self, *_args, **_kwargs) -> LLMResult:
+            await operation_gate.wait()
+            operation_returned.set()
+            return LLMResult("settled")
+
+    resources, lifecycle, _runtime_settings = _provider_resource_matrix(
+        tmp_path,
+        llm_factory=lambda settings: ReturningProvider(settings),
+        cleanup_grace_seconds=1.0,
+    )
+    handle = await resources.acquire()
+    operation = asyncio.create_task(resources.llm().chat_text("system", "user"))
+    assert await asyncio.to_thread(operation_gate.started.wait, 1.0)
+    result: LLMResult | None = None
+    try:
+        resources._lock.acquire()
+        try:
+            operation_gate.release()
+            assert await asyncio.to_thread(operation_returned.wait, 1.0)
+            await asyncio.sleep(0.05)
+            assert lifecycle.in_flight == 1
+            assert operation.done() is False
+        finally:
+            resources._lock.release()
+        result = await asyncio.wait_for(operation, timeout=1.0)
+    finally:
+        if not operation.done():
+            operation_gate.release()
+            await asyncio.gather(operation, return_exceptions=True)
+        await resources.close(handle)
+
+    assert result == LLMResult("settled")
+    await _assert_dependency_lifecycle_idle(lifecycle)
+
+
+@pytest.mark.asyncio
+async def test_reentrant_provider_method_stays_inside_current_owner_operation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReentrantProvider(_ProviderProbe):
+        async def chat_json(self, *_args, **_kwargs) -> LLMResult:
+            return await self.chat_text("nested-system", "nested-user")
+
+        async def chat_text(self, *_args, **_kwargs) -> LLMResult:
+            return LLMResult("nested-result")
+
+    resources, lifecycle, _runtime_settings = _provider_resource_matrix(
+        tmp_path,
+        llm_factory=lambda settings: ReentrantProvider(settings),
+    )
+    handle = await resources.acquire()
+    state = resources._generation_owner
+    assert state is not None and state.owner_thread is not None
+    original_admission_check = resources._caller_has_active_request_admission
+
+    def reject_owner_reentry() -> bool:
+        if threading.current_thread() is state.owner_thread:
+            raise AssertionError("reentrant provider method re-entered admission synchronization")
+        return original_admission_check()
+
+    monkeypatch.setattr(resources, "_caller_has_active_request_admission", reject_owner_reentry)
+    try:
+        result = await resources.llm().chat_json("system", "user")
+    finally:
+        await resources.close(handle)
+
+    assert result == LLMResult("nested-result")
     await _assert_dependency_lifecycle_idle(lifecycle)
 
 

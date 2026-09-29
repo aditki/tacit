@@ -17,12 +17,14 @@ import asyncio
 import subprocess
 import sys
 import threading
+import time
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from structlog.testing import capture_logs
 
 from tacit.backends.base import DashboardBackend
 from tacit.config import Settings
@@ -1116,6 +1118,179 @@ async def test_real_foreign_component_locks_never_block_backend_owner_loop(
     assert products[0].close_calls == 1
 
 
+@pytest.mark.asyncio
+async def test_provider_close_retries_composite_release_lock_without_blocking_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dependencies, products, _factory_threads = _dependencies(tmp_path)
+    lifecycle = dependencies.pipeline_admission
+    assert lifecycle is not None
+    root = dependencies.start_runtime_root()
+    assert root is not None
+    provider_lease = await dependencies.acquire_resources()
+    assert provider_lease is not None
+    lease = _require_backend_lease(await dependencies.realize_backends())
+    release_state = lease._release_state
+    host = cast(Any, dependencies.provider_lifecycle_owner)
+    assert host is not None
+    state_type = type(release_state)
+    blocker = _ForeignLockBlocker(release_state.lock)
+    original_try_begin = state_type.try_begin_composite_release_on_owner
+    original_schedule_retry = host._schedule_generation_retry_on_owner
+    owner_attempts: list[int] = []
+    retry_scheduled = threading.Event()
+    pending_retries = 0
+    max_pending_retries = 0
+
+    def observe_try_begin(state: Any) -> Any:
+        if state is release_state:
+            owner_attempts.append(threading.get_ident())
+            blocker.intercept_owner()
+        return original_try_begin(state)
+
+    def observe_retry(state: Any, phase: str, callback: Any) -> None:
+        nonlocal pending_retries, max_pending_retries
+        if phase != f"backend_composite_release:{release_state.lease_id}":
+            original_schedule_retry(state, phase, callback)
+            return
+        pending_retries += 1
+        max_pending_retries = max(max_pending_retries, pending_retries)
+        retry_scheduled.set()
+
+        def finish_retry() -> None:
+            nonlocal pending_retries
+            try:
+                callback()
+            finally:
+                pending_retries -= 1
+
+        original_schedule_retry(state, phase, finish_retry)
+
+    monkeypatch.setattr(
+        state_type,
+        "try_begin_composite_release_on_owner",
+        observe_try_begin,
+    )
+    monkeypatch.setattr(host, "_schedule_generation_retry_on_owner", observe_retry)
+    blocker.start()
+    provider_close = asyncio.create_task(dependencies.close_resources(provider_lease))
+    owner_was_responsive = False
+    capacity_remained_charged = False
+    try:
+        await _wait_for_event(blocker.owner_waiting)
+        await _wait_for_event(retry_scheduled)
+        state = host._generation_owner
+        assert state is not None
+        owner_was_responsive = await _owner_loop_responds(state)
+        capacity_remained_charged = (
+            lifecycle.in_flight == 1
+            and lifecycle.service_owner_in_flight == 1
+            and _active_backend_leases(dependencies) == 1
+            and not provider_close.done()
+        )
+        with pytest.raises(PipelineAdmissionRejected):
+            async with lifecycle.slot(timeout_seconds=0.01):
+                raise AssertionError("limit+1 work acquired capacity during composite release contention")
+    finally:
+        blocker.release()
+
+    try:
+        await asyncio.wait_for(provider_close, timeout=1.0)
+        await _wait_for_idle(dependencies)
+    finally:
+        if not provider_close.done():
+            provider_close.cancel()
+            await asyncio.gather(provider_close, return_exceptions=True)
+        await _stop_root(dependencies, root, tolerate_fatal=True)
+
+    assert owner_attempts
+    assert all(thread_id != threading.get_ident() for thread_id in owner_attempts)
+    assert max_pending_retries == 1
+    assert pending_retries == 0
+    assert owner_was_responsive
+    assert capacity_remained_charged
+    assert products[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_release_never_waits_on_foreign_composite_lock(
+    tmp_path: Path,
+) -> None:
+    dependencies, products, _factory_threads = _dependencies(
+        tmp_path,
+        cleanup_grace_seconds=1.0,
+    )
+    lifecycle = dependencies.pipeline_admission
+    assert lifecycle is not None
+    root = dependencies.start_runtime_root()
+    assert root is not None
+    lease = _require_backend_lease(await dependencies.realize_backends())
+    release_state = lease._release_state
+    host = cast(Any, dependencies.provider_lifecycle_owner)
+    assert host is not None
+    state = host._generation_owner
+    assert state is not None
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    safety_released = threading.Event()
+
+    def hold_foreign_lock() -> None:
+        release_state.lock.acquire()
+        try:
+            lock_held.set()
+            assert release_lock.wait(timeout=2.0)
+        finally:
+            release_state.lock.release()
+
+    holder = threading.Thread(target=hold_foreign_lock, name="backend-composite-lock-holder")
+    holder.start()
+    assert await asyncio.to_thread(lock_held.wait, 1.0)
+
+    def safety_release() -> None:
+        safety_released.set()
+        release_lock.set()
+
+    safety = threading.Timer(0.5, safety_release)
+    requester_heartbeat = threading.Event()
+    release_task = asyncio.create_task(_close_backend_lease(dependencies, lease))
+    started = time.monotonic()
+    safety.start()
+    try:
+        asyncio.get_running_loop().call_soon(requester_heartbeat.set)
+        await asyncio.sleep(0)
+        elapsed = time.monotonic() - started
+        assert requester_heartbeat.is_set(), "requester loop stopped at the backend composite lock"
+        assert elapsed < 0.2, "requester release waited on the backend composite lock"
+        assert not safety_released.is_set(), "requester resumed only after the safety lock release"
+        assert await _owner_loop_responds(state)
+        assert not release_task.done()
+        assert _active_backend_leases(dependencies) == 1
+    finally:
+        release_lock.set()
+        safety.cancel()
+        holder.join(timeout=1.0)
+
+    assert holder.is_alive() is False
+    try:
+        await asyncio.wait_for(release_task, timeout=1.0)
+        await _wait_for_idle(dependencies)
+    finally:
+        if not release_task.done():
+            release_task.cancel()
+            await asyncio.gather(release_task, return_exceptions=True)
+        await _stop_root(dependencies, root, tolerate_fatal=True)
+
+    snapshot = lifecycle.health_snapshot()
+    assert snapshot.active == 0
+    assert snapshot.queued == 0
+    assert snapshot.retained == 0
+    assert snapshot.blocking_in_flight == 0
+    assert snapshot.service_owner_in_flight == 0
+    assert _active_backend_leases(dependencies) == 0
+    assert products[0].close_calls == 1
+
+
 @pytest.mark.parametrize("lock_boundary", ("submission", "manager"))
 @pytest.mark.asyncio
 async def test_requester_held_provider_locks_cannot_block_owner_heartbeat(
@@ -1682,9 +1857,9 @@ async def test_cancel_after_provider_authority_commit_can_join_successful_retry(
     cleanup_gate = _CrossThreadAsyncGate()
     provider_authority_committed = threading.Event()
     retry_release_started = threading.Event()
-    begin_count = 0
+    validation_count = 0
     original_settle = host._settle_generation_cleanup
-    original_begin = state_type.begin_composite_release
+    original_validate = state_type.validate
 
     async def gate_cleanup(label: str, cleanup: Any) -> Any:
         if label == "backends" and not provider_authority_committed.is_set():
@@ -1694,17 +1869,16 @@ async def test_cancel_after_provider_authority_commit_can_join_successful_retry(
             await cleanup_gate.wait()
         return await original_settle(label, cleanup)
 
-    def observe_composite_release(state: Any) -> tuple[Any, bool]:
-        nonlocal begin_count
-        result = original_begin(state)
+    def observe_validation(state: Any, candidate: Any) -> None:
+        nonlocal validation_count
+        original_validate(state, candidate)
         if state is release_state:
-            begin_count += 1
-            if begin_count == 2:
+            validation_count += 1
+            if validation_count == 2:
                 retry_release_started.set()
-        return result
 
     monkeypatch.setattr(host, "_settle_generation_cleanup", gate_cleanup)
-    monkeypatch.setattr(state_type, "begin_composite_release", observe_composite_release)
+    monkeypatch.setattr(state_type, "validate", observe_validation)
     first_close = asyncio.create_task(_close_backend_lease(dependencies, lease))
     retry_close: asyncio.Task[None] | None = None
     first_result: Any = None
@@ -1828,24 +2002,36 @@ async def test_provider_and_direct_backend_close_race_has_one_release_owner(
     owner_release_entered = threading.Event()
     direct_done = threading.Event()
     direct_errors: list[BaseException] = []
-    original_state_for_lease = host._state_for_provider_lease
     release_state_type = type(release_state)
-    original_begin = release_state_type.begin_composite_release
+    original_published_release = release_state_type.published_composite_release
+    original_try_begin = release_state_type.try_begin_composite_release_on_owner
 
-    def gate_direct_state_lookup(handle: Any) -> Any:
-        if handle == provider_lease and threading.current_thread().name == "backend-direct-release-racer":
+    def gate_direct_release_lookup(state: Any) -> Any:
+        if (
+            state is release_state
+            and threading.current_thread().name == "backend-direct-release-racer"
+            and not direct_lookup_entered.is_set()
+        ):
             direct_lookup_entered.set()
             assert allow_direct_lookup.wait(timeout=2.0)
-        return original_state_for_lease(handle)
+        return original_published_release(state)
 
-    def observe_owner_release(state: Any) -> tuple[Any, bool]:
-        result = original_begin(state)
+    def observe_owner_release(state: Any) -> Any:
+        result = original_try_begin(state)
         if state is release_state and threading.current_thread() is owner_thread:
             owner_release_entered.set()
         return result
 
-    monkeypatch.setattr(host, "_state_for_provider_lease", gate_direct_state_lookup)
-    monkeypatch.setattr(release_state_type, "begin_composite_release", observe_owner_release)
+    monkeypatch.setattr(
+        release_state_type,
+        "published_composite_release",
+        gate_direct_release_lookup,
+    )
+    monkeypatch.setattr(
+        release_state_type,
+        "try_begin_composite_release_on_owner",
+        observe_owner_release,
+    )
 
     def run_direct_close() -> None:
         try:
@@ -1892,7 +2078,6 @@ async def test_provider_and_direct_backend_close_race_has_one_release_owner(
 @pytest.mark.asyncio
 async def test_transient_backend_close_retries_without_fencing_or_leaking(
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     dependencies, products, _factory_threads = _dependencies(tmp_path, fail_close_attempts=1)
     lifecycle = dependencies.pipeline_admission
@@ -1901,12 +2086,15 @@ async def test_transient_backend_close_retries_without_fencing_or_leaking(
     assert root is not None
     lease = _require_backend_lease(await dependencies.realize_backends())
     try:
-        await _close_backend_lease(dependencies, lease)
+        with capture_logs() as logs:
+            await _close_backend_lease(dependencies, lease)
         assert products[0].close_calls == 2
         assert lifecycle.runtime_fatal_circuit is None
-        rendered = capsys.readouterr().out
-        assert "backend_owner_cleanup_retry" in rendered
-        assert "reason_code=backend_owner_cleanup_retry" in rendered
+        assert any(
+            record.get("event") == "backend_owner_cleanup_retry"
+            and record.get("reason_code") == "backend_owner_cleanup_retry"
+            for record in logs
+        )
         await _wait_for_idle(dependencies)
     finally:
         with suppress(BaseException):

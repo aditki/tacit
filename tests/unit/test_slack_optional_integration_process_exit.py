@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import queue
 import subprocess
 import sys
 import textwrap
 import threading
 import time
+from concurrent.futures import Future as ThreadFuture
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -20,6 +22,7 @@ import tacit.api.lifespan as lifespan_module
 import tacit.api.optional_integrations as optional_integrations_module
 from tacit.api.lifespan import create_lifespan
 from tacit.config import Settings
+from tacit.pipeline_admission import PipelineAdmissionController
 from tacit.runtime_stores import RuntimeStores
 
 _OWNER_THREAD_NAME = "tacit-slack-optional-integration"
@@ -1016,6 +1019,176 @@ def test_definite_slack_owner_start_failure_settles_every_subscriber(monkeypatch
             timeout_reason_code="slack_shutdown_timed_out",
         )
     )
+
+
+def test_optional_worker_thread_construction_failure_rolls_back_reserved_capacity(
+    monkeypatch,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    executor = optional_integrations_module._BoundedOptionalIntegrationExecutor(
+        name="optional-worker-construction-failure",
+        blocking_lifecycle=lifecycle,
+    )
+    original_thread_factory = optional_integrations_module._new_optional_integration_worker_thread
+
+    def fail_thread_construction(*, target, name):
+        del target, name
+        raise RuntimeError("synthetic optional worker construction failure")
+
+    monkeypatch.setattr(
+        optional_integrations_module,
+        "_new_optional_integration_worker_thread",
+        fail_thread_construction,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic optional worker construction failure"):
+        executor.submit(lambda: None)
+
+    assert lifecycle.blocking_in_flight == 0
+    assert executor.outstanding_count == 0
+    assert executor.user_outstanding_count == 0
+    assert executor._worker_count == 0
+    assert executor._queue.empty()
+
+    monkeypatch.setattr(
+        optional_integrations_module,
+        "_new_optional_integration_worker_thread",
+        original_thread_factory,
+    )
+    recovered = executor.submit(lambda: "recovered")
+    assert recovered.result(timeout=1.0) == "recovered"
+    executor.shutdown()
+    assert lifecycle.blocking_in_flight == 0
+    assert executor.outstanding_count == 0
+    assert executor.user_outstanding_count == 0
+    assert executor._worker_count == 0
+    assert executor.workers_retired
+
+
+def test_optional_worker_ambiguous_start_commits_live_worker_ownership(
+    monkeypatch,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    executor = optional_integrations_module._BoundedOptionalIntegrationExecutor(
+        name="optional-worker-ambiguous-start",
+        blocking_lifecycle=lifecycle,
+    )
+    captured_threads: list[threading.Thread] = []
+    worker_entered_queue = threading.Event()
+    original_queue_get = executor._queue.get
+
+    def observed_queue_get(*args, **kwargs):
+        worker_entered_queue.set()
+        return original_queue_get(*args, **kwargs)
+
+    monkeypatch.setattr(executor._queue, "get", observed_queue_get)
+
+    def start_then_raise_thread(*, target, name):
+        class ConcealedIdentityThread(threading.Thread):
+            @property
+            def ident(self) -> None:
+                return None
+
+            def start(self) -> None:
+                super().start()
+                assert worker_entered_queue.wait(timeout=1.0)
+                raise RuntimeError("synthetic ambiguous optional worker start failure")
+
+        worker = ConcealedIdentityThread(target=target, name=name, daemon=True)
+        captured_threads.append(worker)
+        return worker
+
+    monkeypatch.setattr(
+        optional_integrations_module,
+        "_new_optional_integration_worker_thread",
+        start_then_raise_thread,
+    )
+
+    try:
+        completed = executor.submit(lambda: "completed")
+        assert completed.result(timeout=1.0) == "completed"
+    finally:
+        executor.seal()
+        for worker in captured_threads:
+            worker.join(timeout=1.0)
+
+    assert lifecycle.blocking_in_flight == 0
+    assert executor.outstanding_count == 0
+    assert executor.user_outstanding_count == 0
+    assert executor._worker_count == 0
+    assert executor.workers_retired
+
+
+@pytest.mark.parametrize("_iteration", range(16))
+def test_optional_worker_ambiguous_start_never_exceeds_worker_cap_or_double_releases(
+    monkeypatch,
+    _iteration: int,
+) -> None:
+    del _iteration
+    executor = optional_integrations_module._BoundedOptionalIntegrationExecutor(
+        name="optional-worker-ambiguous-start-cap",
+        blocking_lifecycle=None,
+    )
+    captured_threads: list[threading.Thread] = []
+    worker_queue_entries: queue.Queue[threading.Event] = queue.Queue()
+    original_queue_get = executor._queue.get
+    release_work = threading.Event()
+    worker_local = threading.local()
+
+    def observed_queue_get(*args, **kwargs):
+        if not getattr(worker_local, "startup_observed", False):
+            worker_local.startup_observed = True
+            worker_queue_entries.get_nowait().set()
+        return original_queue_get(*args, **kwargs)
+
+    monkeypatch.setattr(executor._queue, "get", observed_queue_get)
+
+    def ambiguous_thread(*, target, name):
+        entered_queue = threading.Event()
+        worker_queue_entries.put_nowait(entered_queue)
+
+        class ConcealedIdentityThread(threading.Thread):
+            @property
+            def ident(self) -> None:
+                return None
+
+            def start(self) -> None:
+                super().start()
+                assert entered_queue.wait(timeout=1.0)
+                raise RuntimeError("synthetic ambiguous optional worker start failure")
+
+        worker = ConcealedIdentityThread(target=target, name=name, daemon=True)
+        captured_threads.append(worker)
+        return worker
+
+    monkeypatch.setattr(
+        optional_integrations_module,
+        "_new_optional_integration_worker_thread",
+        ambiguous_thread,
+    )
+
+    futures: list[ThreadFuture[str]] = []
+    try:
+        for index in range(12):
+            futures.append(
+                executor.submit(
+                    lambda value=index: (release_work.wait(timeout=1.0), str(value))[1],
+                    authority=True,
+                )
+            )
+
+        assert executor._worker_count <= optional_integrations_module._MAX_OPTIONAL_INTEGRATION_EXECUTOR_WORKERS
+        assert len(captured_threads) <= optional_integrations_module._MAX_OPTIONAL_INTEGRATION_EXECUTOR_WORKERS
+    finally:
+        executor.seal()
+        release_work.set()
+        for worker in captured_threads:
+            worker.join(timeout=2.0)
+
+    assert [future.result(timeout=1.0) for future in futures] == [str(index) for index in range(12)]
+    assert executor._worker_count == 0
+    assert executor.outstanding_count == 0
+    assert executor.workers_retired
 
 
 def test_ambiguous_live_slack_owner_start_failure_fences_and_settles_subscribers(

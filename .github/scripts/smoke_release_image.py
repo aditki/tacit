@@ -61,6 +61,10 @@ class ImageSmokeError(RuntimeError):
 class CommandResult(NamedTuple):
     return_code: int
     output: str
+    diagnostics: str = ""
+
+    def diagnostic_output(self) -> str:
+        return _bounded_diagnostic(self.output, self.diagnostics)
 
 
 class _BoundedCapture:
@@ -97,6 +101,14 @@ class _BoundedCapture:
             raise ImageSmokeError("release-image command output capture failed") from self._failure
         prefix = "<truncated>\n" if self._total > MAX_DIAGNOSTIC_BYTES else ""
         return prefix + bytes(self._buffer).decode("utf-8", errors="replace")
+
+
+def _bounded_diagnostic(*parts: str) -> str:
+    rendered = "\n".join(part for part in parts if part)
+    encoded = rendered.encode("utf-8", errors="replace")
+    if len(encoded) <= MAX_DIAGNOSTIC_BYTES:
+        return rendered
+    return "<truncated>\n" + encoded[-MAX_DIAGNOSTIC_BYTES:].decode("utf-8", errors="replace")
 
 
 def _positive_finite_float(raw: str) -> float:
@@ -153,14 +165,15 @@ def _run_command_result(
         list(command),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         start_new_session=True,
     )
-    if process.stdout is None:
+    if process.stdout is None or process.stderr is None:
         _kill_process_group(process.pid)
         process.wait(timeout=PROCESS_REAP_TIMEOUT)
         raise ImageSmokeError(f"{label} did not expose command output")
-    capture = _BoundedCapture(process.stdout)
+    output_capture = _BoundedCapture(process.stdout)
+    diagnostic_capture = _BoundedCapture(process.stderr)
     timed_out = False
     try:
         try:
@@ -180,11 +193,12 @@ def _run_command_result(
             pass
         raise
     finally:
-        output = capture.finish()
+        output = output_capture.finish()
+        diagnostics = diagnostic_capture.finish()
 
     if timed_out:
-        raise ImageSmokeError(f"{label} exceeded its timeout: {output}")
-    return CommandResult(return_code, output.strip())
+        raise ImageSmokeError(f"{label} exceeded its timeout: {_bounded_diagnostic(output, diagnostics)}")
+    return CommandResult(return_code, output.strip(), diagnostics.strip())
 
 
 def _run_command(
@@ -196,7 +210,7 @@ def _run_command(
 ) -> str:
     result = _run_command_result(command, timeout=timeout, label=label)
     if check and result.return_code != 0:
-        raise ImageSmokeError(f"{label} failed with exit {result.return_code}: {result.output}")
+        raise ImageSmokeError(f"{label} failed with exit {result.return_code}: {result.diagnostic_output()}")
     return result.output
 
 
@@ -517,7 +531,8 @@ def _resource_exists(kind: str, name: str, timeout: float) -> bool:
     )
     if result.return_code == 0:
         return True
-    diagnostic_lines = result.output.strip().splitlines()
+    diagnostic = result.diagnostic_output()
+    diagnostic_lines = diagnostic.strip().splitlines()
     if diagnostic_lines[:1] == ["[]"]:
         diagnostic_lines = diagnostic_lines[1:]
     expected_absence = {
@@ -538,7 +553,7 @@ def _resource_exists(kind: str, name: str, timeout: float) -> bool:
     ):
         return False
     raise ImageSmokeError(
-        f"release-image {kind} ownership inspection failed with exit " f"{result.return_code}: {result.output}"
+        f"release-image {kind} ownership inspection failed with exit " f"{result.return_code}: {diagnostic}"
     )
 
 
@@ -562,7 +577,7 @@ def _cleanup_resource(kind: str, name: str, timeout: float) -> None:
         )
         if result.return_code != 0:
             raise ImageSmokeError(
-                f"release-image {kind} cleanup failed with exit {result.return_code}: {result.output}"
+                f"release-image {kind} cleanup failed with exit " f"{result.return_code}: {result.diagnostic_output()}"
             )
     if _resource_exists(kind, name, timeout):
         raise ImageSmokeError(f"release-image {kind} cleanup did not remove {name}")

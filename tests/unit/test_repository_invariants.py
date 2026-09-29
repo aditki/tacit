@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 import tomllib
 import zipfile
 from pathlib import Path
@@ -44,6 +45,7 @@ RELEASE_PUBLICATION_AUTHORIZATION = REPOSITORY_ROOT / ".github" / "scripts" / "a
 RELEASE_GITHUB_API = REPOSITORY_ROOT / ".github" / "scripts" / "release_github_api.py"
 RELEASE_GITHUB_ASSET_VERIFIER = REPOSITORY_ROOT / ".github" / "scripts" / "verify_github_release_assets.py"
 RELEASE_PYPI_VERIFIER = REPOSITORY_ROOT / ".github" / "scripts" / "verify_pypi_release.py"
+PYPI_PUBLISH_ACTION = REPOSITORY_ROOT / ".github" / "actions" / "pypi-publish" / "action.yml"
 GITLEAKS_RANGE_SELECTOR = REPOSITORY_ROOT / ".github" / "scripts" / "gitleaks_range.py"
 
 
@@ -109,6 +111,25 @@ def _load_script_module(path: Path) -> ModuleType:
     finally:
         if inserted:
             sys.path.remove(str(path.parent))
+
+
+def _linux_privilege_prefix() -> list[str]:
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux mount authority is required")
+    if os.geteuid() == 0:
+        return []
+    sudo = shutil.which("sudo")
+    if sudo is None:
+        pytest.skip("passwordless sudo is unavailable")
+    probe = subprocess.run(
+        [sudo, "--non-interactive", "true"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip("passwordless sudo is unavailable")
+    return [sudo, "--non-interactive"]
 
 
 def _test_https_material(tmp_path: Path) -> tuple[Path, Path]:
@@ -967,7 +988,10 @@ def test_release_actions_and_privileged_tools_are_pinned() -> None:
     workflow = _release_workflow()
     references = [step["uses"] for job in workflow["jobs"].values() for step in job["steps"] if "uses" in step]
     assert references
-    assert all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", reference) for reference in references)
+    assert all(
+        reference == "./.github/actions/pypi-publish" or re.fullmatch(r"[^@]+@[0-9a-f]{40}", reference)
+        for reference in references
+    )
 
     for job_name, job in workflow["jobs"].items():
         expected_runner = "${{ matrix.runner }}" if job_name == "build-binaries" else "ubuntu-24.04"
@@ -1013,12 +1037,32 @@ def test_release_actions_and_privileged_tools_are_pinned() -> None:
     assert re.search(r"moby/buildkit:v\d+\.\d+\.\d+@sha256:[0-9a-f]{64}", builder)
 
 
+def test_pypi_publisher_executes_an_immutable_container_manifest() -> None:
+    publish = _step(_release_workflow()["jobs"]["publish-pypi"], "Publish to PyPI")
+    assert publish["uses"] == "./.github/actions/pypi-publish"
+
+    action = yaml.load(PYPI_PUBLISH_ACTION.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    assert action["runs"] == {
+        "using": "docker",
+        "image": (
+            "docker://ghcr.io/pypa/gh-action-pypi-publish"
+            "@sha256:a68d05519f6d7e47372aeaddab80b851b69afa89be179ec41775c72c4e3ab2d5"
+        ),
+    }
+    assert action["inputs"]["user"]["default"] == "__token__"
+    assert action["inputs"]["repository-url"]["default"] == "https://upload.pypi.org/legacy/"
+    assert action["inputs"]["packages-dir"]["default"] == "dist"
+    assert action["inputs"]["verify-metadata"]["default"] == "true"
+    assert action["inputs"]["skip-existing"]["default"] == "false"
+    assert action["inputs"]["attestations"]["default"] == "true"
+
+
 def test_ci_authorization_workflow_uses_immutable_dependencies() -> None:
     workflow = _ci_workflow()
     references = [step["uses"] for job in workflow["jobs"].values() for step in job["steps"] if "uses" in step]
     assert references
     assert (
-        "docker://zricethezav/gitleaks@sha256:" "e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055"
+        "docker://zricethezav/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055"
     ) in references
     for reference in references:
         if reference.startswith("docker://"):
@@ -1037,7 +1081,7 @@ def test_ci_authorization_workflow_uses_immutable_dependencies() -> None:
                 checksum = step["with"]["checksum"]
                 if checksum == "${{ matrix.uv_checksum }}":
                     continue
-                assert checksum == ("90b2f223fb69d19db49e117da601f6497" "8593417988530aa733d456141b4bcbb")
+                assert checksum == ("90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb")
 
     fresh_install = workflow["jobs"]["fresh-install"]
     assert fresh_install["strategy"]["matrix"]["include"] == [
@@ -1366,7 +1410,7 @@ def test_release_scans_and_publishes_the_same_image_archives() -> None:
     assert image_build["with"]["push"] == "false"
     assert archive in upload["with"]["path"]
     assert f"{archive}.sha256" in upload["with"]["path"]
-    assert f"{archive}.manifest-digest" in upload["with"]["path"]
+    assert f"{archive}.manifest-digest" not in upload["with"]["path"]
     reproducibility = _step(build, "Verify reproducible ${{ matrix.platform }} child digest")
     assert reproducibility["env"] == {
         "AUTHORITATIVE_DIGEST": "${{ steps.build_image.outputs.digest }}",
@@ -1374,7 +1418,7 @@ def test_release_scans_and_publishes_the_same_image_archives() -> None:
     }
     assert "sha256:[0-9a-f]{64}" in reproducibility["run"]
     assert '"$AUTHORITATIVE_DIGEST" != "$REPRODUCED_DIGEST"' in reproducibility["run"]
-    assert '"${IMAGE_ARCHIVE}.manifest-digest"' in reproducibility["run"]
+    assert '"${IMAGE_ARCHIVE}.manifest-digest"' not in reproducibility["run"]
     step_names = [step.get("name") for step in build["steps"]]
     assert step_names.index("Verify reproducible ${{ matrix.platform }} child digest") < step_names.index(
         "Validate built image archive before upload"
@@ -1417,8 +1461,9 @@ def test_release_scans_and_publishes_the_same_image_archives() -> None:
     assert "docker image inspect" not in pushed
     assert "remote_config" in pushed
     assert "Published ${arch} image differs from the scanned archive" in pushed
-    assert "approved_digest" in pushed
-    assert '"$digest" != "$approved_digest"' in pushed
+    assert "approved_digest" not in pushed
+    assert 'echo "${arch}_source=${IMAGE_NAME_LOWER}@${digest}"' in pushed
+    assert "remote_config" in pushed
     immutable = _step(publish, "Publish immutable multi-architecture version")["run"]
     assert "docker buildx imagetools create" in immutable
     assert "org.opencontainers.image.revision" in immutable
@@ -1526,6 +1571,7 @@ def test_final_publishers_consume_preflight_carried_sealed_snapshots() -> None:
 
     pypi = jobs["publish-pypi"]
     pypi_snapshot = _step(pypi, "Prepare sealed PyPI publisher path")
+    pypi_tool = _step(pypi, "Install sealed publication authority")
     pypi_recheck = _step(pypi, "Verify PyPI publication state")
     pypi_authorization = _step(pypi, "Re-authorize release before publication")
     pypi_publish = _step(pypi, "Publish to PyPI")
@@ -1537,7 +1583,8 @@ def test_final_publishers_consume_preflight_carried_sealed_snapshots() -> None:
         "SDIST_NAME": "${{ needs.pypi-preflight.outputs.sdist_name }}",
         "SDIST_DIGEST": "${{ needs.pypi-preflight.outputs.sdist_digest }}",
     }
-    assert "release_publication_snapshot.py seal" in pypi_snapshot["run"]
+    assert "/usr/bin/python3 -I -B" in pypi_snapshot["run"]
+    assert '"$PYPI_PUBLICATION_TOOL_DIR/release_publication_snapshot.py" seal' in pypi_snapshot["run"]
     assert "sudo --non-interactive" in pypi_snapshot["run"]
     assert "--source-directory dist" in pypi_snapshot["run"]
     assert '--destination-directory "$PYPI_PUBLICATION_SNAPSHOT_DIR"' in pypi_snapshot["run"]
@@ -1552,10 +1599,32 @@ def test_final_publishers_consume_preflight_carried_sealed_snapshots() -> None:
     assert "dist" not in pypi_publish["with"]["packages-dir"]
     assert pypi["env"]["PYPI_PUBLICATION_SNAPSHOT_DIR"].startswith(".tacit-pypi-publication-")
     assert pypi["env"]["PYPI_PUBLICATION_BACKING_DIR"].startswith("/var/lib/tacit-release-publication-")
+    assert pypi["env"]["PYPI_PUBLICATION_TOOL_DIR"].startswith("/var/lib/tacit-release-publication-tool-")
+    assert "/usr/bin/git show" in pypi_tool["run"]
+    pypi_restrictive_create = '/usr/bin/install -o root -g root -m 0600 /dev/null "${target_path}.next"'
+    pypi_bootstrap_write = '/usr/bin/tee "${target_path}.next"'
+    assert pypi_restrictive_create in pypi_tool["run"]
+    assert pypi_bootstrap_write in pypi_tool["run"]
+    assert pypi_tool["run"].index(pypi_restrictive_create) < pypi_tool["run"].index(pypi_bootstrap_write)
+    assert '"${PYPI_PUBLICATION_TOOL_DIR}.cleanup.py" install-tool' in pypi_tool["run"]
+    assert '".github/scripts/release_publication_snapshot.py" install-tool' not in pypi_tool["run"]
+    assert '--tool-directory "$PYPI_PUBLICATION_TOOL_DIR"' in pypi_tool["run"]
+    assert "/usr/bin/install -o root -g root -m 0500" not in pypi_tool["run"]
+    assert pypi_steps.index(pypi_tool) < pypi_steps.index(pypi_snapshot)
     pypi_cleanup = _step(pypi, "Remove sealed PyPI publisher path")
     assert pypi_cleanup["if"] == "always()"
-    assert "release_publication_snapshot.py unseal" in pypi_cleanup["run"]
+    assert "publication bootstrap residue is unsafe" in pypi_cleanup["run"]
+    assert 'if test ! -e "${PYPI_PUBLICATION_TOOL_DIR}.cleanup.py"; then' in pypi_cleanup["run"]
+    assert (
+        "exec sudo --non-interactive /usr/bin/python3 -I -B "
+        '"${PYPI_PUBLICATION_TOOL_DIR}.cleanup.py" unseal' in pypi_cleanup["run"]
+    )
     assert "sudo --non-interactive" in pypi_cleanup["run"]
+    assert "cd /var/lib" in pypi_cleanup["run"]
+    assert "sudo --non-interactive /usr/bin/python3 -I -B" in pypi_cleanup["run"]
+    assert '"$GITHUB_WORKSPACE/.github/scripts/release_publication_snapshot.py"' not in pypi_cleanup["run"]
+    assert '--directory "$GITHUB_WORKSPACE/$PYPI_PUBLICATION_SNAPSHOT_DIR"' in pypi_cleanup["run"]
+    assert '--tool-directory "$PYPI_PUBLICATION_TOOL_DIR"' in pypi_cleanup["run"]
     assert pypi_steps.index(pypi_postflight) < pypi_steps.index(pypi_cleanup)
 
     binary_outputs = jobs["build-binaries"]["outputs"]
@@ -1590,6 +1659,7 @@ def test_final_publishers_consume_preflight_carried_sealed_snapshots() -> None:
 
     github = jobs["publish-github-release"]
     github_snapshot = _step(github, "Prepare sealed GitHub release publisher path")
+    github_tool = _step(github, "Install sealed publication authority")
     github_preflight_step = _step(github, "Verify GitHub release publication state")
     github_authorization = _step(github, "Re-authorize release before publication")
     github_publish = _step(github, "Publish GitHub release binaries")
@@ -1601,7 +1671,8 @@ def test_final_publishers_consume_preflight_carried_sealed_snapshots() -> None:
         "CHECKSUM_NAME": "${{ needs.github-release-preflight.outputs.checksum_name }}",
         "CHECKSUM_DIGEST": "${{ needs.github-release-preflight.outputs.checksum_digest }}",
     }
-    assert "release_publication_snapshot.py seal" in github_snapshot["run"]
+    assert "/usr/bin/python3 -I -B" in github_snapshot["run"]
+    assert '"$GITHUB_RELEASE_PUBLICATION_TOOL_DIR/release_publication_snapshot.py" seal' in github_snapshot["run"]
     assert "sudo --non-interactive" in github_snapshot["run"]
     assert "--source-directory release-binaries" in github_snapshot["run"]
     assert '--backing-directory "$GITHUB_RELEASE_PUBLICATION_BACKING_DIR"' in github_snapshot["run"]
@@ -1613,17 +1684,65 @@ def test_final_publishers_consume_preflight_carried_sealed_snapshots() -> None:
     assert "release-binaries" not in github_publish["with"]["files"]
     assert github["env"]["GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR"].startswith(".tacit-github-publication-")
     assert github["env"]["GITHUB_RELEASE_PUBLICATION_BACKING_DIR"].startswith("/var/lib/tacit-release-publication-")
+    assert github["env"]["GITHUB_RELEASE_PUBLICATION_TOOL_DIR"].startswith("/var/lib/tacit-release-publication-tool-")
+    assert "/usr/bin/git show" in github_tool["run"]
+    github_restrictive_create = '/usr/bin/install -o root -g root -m 0600 /dev/null "${target_path}.next"'
+    github_bootstrap_write = '/usr/bin/tee "${target_path}.next"'
+    assert github_restrictive_create in github_tool["run"]
+    assert github_bootstrap_write in github_tool["run"]
+    assert github_tool["run"].index(github_restrictive_create) < github_tool["run"].index(github_bootstrap_write)
+    assert '"${GITHUB_RELEASE_PUBLICATION_TOOL_DIR}.cleanup.py" install-tool' in github_tool["run"]
+    assert '".github/scripts/release_publication_snapshot.py" install-tool' not in github_tool["run"]
+    assert '--tool-directory "$GITHUB_RELEASE_PUBLICATION_TOOL_DIR"' in github_tool["run"]
+    assert "/usr/bin/install -o root -g root -m 0500" not in github_tool["run"]
+    assert github_steps.index(github_tool) < github_steps.index(github_snapshot)
     github_cleanup = _step(github, "Remove sealed GitHub release publisher path")
     assert github_cleanup["if"] == "always()"
-    assert "release_publication_snapshot.py unseal" in github_cleanup["run"]
+    assert "publication bootstrap residue is unsafe" in github_cleanup["run"]
+    assert 'if test ! -e "${GITHUB_RELEASE_PUBLICATION_TOOL_DIR}.cleanup.py"; then' in github_cleanup["run"]
+    assert (
+        "exec sudo --non-interactive /usr/bin/python3 -I -B "
+        '"${GITHUB_RELEASE_PUBLICATION_TOOL_DIR}.cleanup.py" unseal' in github_cleanup["run"]
+    )
     assert "sudo --non-interactive" in github_cleanup["run"]
+    assert "cd /var/lib" in github_cleanup["run"]
+    assert "sudo --non-interactive /usr/bin/python3 -I -B" in github_cleanup["run"]
+    assert '"$GITHUB_WORKSPACE/.github/scripts/release_publication_snapshot.py"' not in github_cleanup["run"]
+    assert '--directory "$GITHUB_WORKSPACE/$GITHUB_RELEASE_PUBLICATION_SNAPSHOT_DIR"' in github_cleanup["run"]
+    assert '--tool-directory "$GITHUB_RELEASE_PUBLICATION_TOOL_DIR"' in github_cleanup["run"]
     assert github_steps.index(github_postflight) < github_steps.index(github_cleanup)
+
+
+def test_installed_publication_authority_runs_in_python_isolated_mode(tmp_path: Path) -> None:
+    tool_directory = tmp_path / "root-owned-tool"
+    tool_directory.mkdir(mode=0o700)
+    for source in (RELEASE_PUBLICATION_SNAPSHOT, RELEASE_PAYLOAD_SNAPSHOT):
+        installed = tool_directory / source.name
+        shutil.copyfile(source, installed)
+        installed.chmod(0o500)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            str(tool_directory / RELEASE_PUBLICATION_SNAPSHOT.name),
+            "--help",
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "unseal" in completed.stdout
 
 
 def test_every_ghcr_publication_command_reauthorizes_immediately_before_mutation() -> None:
     job = _release_workflow()["jobs"]["publish-ghcr"]
     authorization_command = (
-        'GITHUB_TOKEN="$release_authorization_token" ' "python .github/scripts/authorize_release_publication.py"
+        'GITHUB_TOKEN="$release_authorization_token" python .github/scripts/authorize_release_publication.py'
     )
     expected_mutation_steps = {
         "Publish scanned architecture images",
@@ -1776,7 +1895,7 @@ def test_revoked_exact_sha_ci_authorization_prevents_publication_mutation(
         ),
         encoding="utf-8",
     )
-    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(ci_authorizer))} " '&& touch "$MUTATION_SENTINEL"'
+    command = f'{shlex.quote(sys.executable)} {shlex.quote(str(ci_authorizer))} && touch "$MUTATION_SENTINEL"'
     try:
         initially_authorized = subprocess.run(
             [sys.executable, str(ci_authorizer)],
@@ -2287,15 +2406,16 @@ def test_release_builds_verified_binaries_on_exact_runners() -> None:
     package = _step(binary_job, "Package binaries independently")["run"]
     assert package.count("package_release_binary.py") == 2
     assert '--source "$BINARY_PATH"' in package
-    assert '--package "$PACKAGE_NAME"' in package
+    assert 'mkdir -m 0700 "$BINARY_PUBLICATION_DIR"' in package
+    assert '--package "$PRIMARY_PACKAGE_PATH"' in package
     assert '--source "$REPRO_BINARY_PATH"' in package
     assert '--package "$REPRO_PACKAGE_PATH"' in package
     assert package.count("--max-binary-bytes 536870912") == 2
     assert package.count("--max-package-bytes 536870912") == 2
 
     comparison = _step(binary_job, "Verify reproducible binary packages")["run"]
-    assert 'cmp "$PACKAGE_NAME" "$REPRO_PACKAGE_PATH"' in comparison
-    assert 'cmp "$PACKAGE_NAME.sha256" "$REPRO_PACKAGE_PATH.sha256"' in comparison
+    assert 'cmp "$PRIMARY_PACKAGE_PATH" "$REPRO_PACKAGE_PATH"' in comparison
+    assert 'cmp "$PRIMARY_PACKAGE_PATH.sha256" "$REPRO_PACKAGE_PATH.sha256"' in comparison
     packager_source = RELEASE_BINARY_PACKAGER.read_text(encoding="utf-8")
     assert ".read_bytes()" not in packager_source
     assert ".lstat()" in packager_source
@@ -2319,12 +2439,21 @@ def test_release_builds_verified_binaries_on_exact_runners() -> None:
     packaged_smoke_script = packaged_smoke["run"]
     assert packaged_smoke["env"]["EXPECTED_GLIBC_BASELINE"] == "${{ matrix.glibc_baseline }}"
     assert 'release_image_archive.py" copy' in packaged_smoke_script
-    assert '--archive "$PACKAGE_NAME"' in packaged_smoke_script
-    assert '--checksum "$PACKAGE_NAME.sha256"' in packaged_smoke_script
+    assert '--archive "$PRIMARY_PACKAGE_PATH"' in packaged_smoke_script
+    assert '--checksum "$PRIMARY_PACKAGE_PATH.sha256"' in packaged_smoke_script
     assert 'tar --extract --gzip --file "$private_package"' in packaged_smoke_script
     assert '--binary "$smoke_root/tacit"' in packaged_smoke_script
     assert "getconf GNU_LIBC_VERSION" in packaged_smoke_script
-    assert 'tar --extract --gzip --file "$PACKAGE_NAME"' not in packaged_smoke_script
+    assert 'tar --extract --gzip --file "$PRIMARY_PACKAGE_PATH"' not in packaged_smoke_script
+
+    publication_payload = _step(binary_job, "Describe GitHub release publication payload")
+    assert '--directory "$BINARY_PUBLICATION_DIR"' in publication_payload["run"]
+    assert "--directory ." not in publication_payload["run"]
+    upload = next(step for step in binary_job["steps"] if step.get("uses", "").startswith("actions/upload-artifact@"))
+    assert upload["with"]["path"] == (
+        "${{ env.BINARY_PUBLICATION_DIR }}/${{ matrix.package }}\n"
+        "${{ env.BINARY_PUBLICATION_DIR }}/${{ matrix.package }}.sha256\n"
+    )
 
     steps = binary_job["steps"]
     build_index = steps.index(_step(binary_job, "Build binaries independently"))
@@ -3276,12 +3405,1876 @@ def test_unsealed_publication_directory_swap_cannot_be_the_publisher_input(
     for job, snapshot_name, path_variable, backing_variable, input_name, publish_name in publisher_specs:
         snapshot = _step(job, snapshot_name)["run"]
         publisher_input = _step(job, publish_name)["with"][input_name]
-        assert "release_publication_snapshot.py seal" in snapshot
+        assert 'release_publication_snapshot.py" seal' in snapshot
         assert "sudo --non-interactive" in snapshot
         assert f'--destination-directory "${path_variable}"' in snapshot
         assert f'--backing-directory "${backing_variable}"' in snapshot
         assert job["env"][backing_variable].startswith("/var/lib/tacit-release-publication-")
         assert f"${{{{ env.{path_variable} }}}}" in publisher_input
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["payload_unmounted", "destination_removed", "workspace_unmounted", "backing_removed"],
+)
+def test_publication_cleanup_journal_resumes_after_each_destructive_phase(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_point: str,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    destination = workspace / "publication"
+    destination.mkdir()
+    backing = tmp_path / "tacit-release-publication-test"
+    backing.mkdir()
+    state_path = tmp_path / "tacit-release-publication-test.mount-authority.json"
+    state_path.write_text("authority", encoding="utf-8")
+
+    real_identity = module._directory_identity
+    workspace_identity = real_identity(workspace)
+    destination_identity = real_identity(destination)
+    backing_identity = real_identity(backing)
+    workspace_record = module._MountRecord(
+        "workspace", 101, str(workspace), workspace_identity[0], workspace_identity[1]
+    )
+    payload_record = module._MountRecord("payload", 102, str(destination), backing_identity[0], backing_identity[1])
+    authority_box = [
+        module._MountAuthority(
+            state_path=state_path,
+            workspace_path=workspace,
+            workspace_mount_id=101,
+            workspace_identity=workspace_identity,
+            destination_name=destination.name,
+            destination_identity=destination_identity,
+            backing_identity=backing_identity,
+            artifact_names=(),
+            mounts=(workspace_record, payload_record),
+            remaining_mount_ids=(101, 102),
+            pending_unmount_id=None,
+            destination_removed=False,
+            backing_removed=False,
+            cleanup_phase="rollback",
+        )
+    ]
+    mounted = {
+        101: module._MountInfoEntry(
+            101,
+            1,
+            "0:1",
+            "/",
+            str(workspace),
+            frozenset({"rw", "nodev", "nosuid"}),
+            frozenset(),
+            "ext4",
+            "/dev/test",
+            frozenset(),
+        ),
+        102: module._MountInfoEntry(
+            102,
+            101,
+            "0:2",
+            "/",
+            str(destination),
+            frozenset({"ro", "nodev", "noexec", "nosuid"}),
+            frozenset(),
+            "ext4",
+            "/dev/test",
+            frozenset(),
+        ),
+    }
+    destructive_phase = [""]
+    injected = [False]
+
+    def identity(path: Path) -> tuple[int, int]:
+        if path == destination and 102 in mounted:
+            return backing_identity
+        return real_identity(path)
+
+    def run_mount_command(_command: Path, *_arguments: str) -> None:
+        mountpoint = _arguments[-1]
+        mount_id = next(key for key, entry in mounted.items() if entry.mount_point == mountpoint)
+        mounted.pop(mount_id)
+        destructive_phase[0] = "payload_unmounted" if mount_id == 102 else "workspace_unmounted"
+
+    def remove_destination(path: Path) -> None:
+        path.rmdir()
+        destructive_phase[0] = "destination_removed"
+
+    def remove_backing(path: Path, _names: list[str]) -> None:
+        path.rmdir()
+        destructive_phase[0] = "backing_removed"
+
+    def persist(authority: Any) -> None:
+        if destructive_phase[0] == failure_point and not injected[0]:
+            injected[0] = True
+            raise OSError("injected cleanup journal failure")
+        authority_box[0] = authority
+
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_validated_cleanup_mountpoint_path", Path)
+    monkeypatch.setattr(module, "_validated_backing_path", Path)
+    monkeypatch.setattr(module, "_read_mount_authority", lambda *_args: authority_box[0])
+    monkeypatch.setattr(module, "_persist_mount_authority", persist)
+    monkeypatch.setattr(module, "_mountinfo_by_id", lambda: dict(mounted))
+    monkeypatch.setattr(module, "_directory_identity", identity)
+    monkeypatch.setattr(module, "_run_mount_command", run_mount_command)
+    monkeypatch.setattr(module, "_remove_empty_mountpoint", remove_destination)
+    monkeypatch.setattr(module, "_remove_backing_directory", remove_backing)
+    monkeypatch.setattr(module.os, "chdir", lambda _path: None)
+
+    with pytest.raises(OSError, match="injected cleanup journal failure"):
+        module.unseal_publication_snapshot(destination, backing, [])
+    module.unseal_publication_snapshot(destination, backing, [])
+
+    assert injected == [True]
+    assert mounted == {}
+    assert destination.exists() is False
+    assert backing.exists() is False
+
+
+def test_publication_cleanup_resume_preserves_displaced_rollback_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    destination = workspace / "publication"
+    destination.mkdir()
+    displaced = workspace / "publication-displaced"
+    displaced.mkdir()
+    backing = tmp_path / "tacit-release-publication-displaced"
+    backing.mkdir()
+    state_path = tmp_path / "tacit-release-publication-displaced.mount-authority.json"
+    state_path.write_text("authority", encoding="utf-8")
+
+    workspace_identity = module._directory_identity(workspace)
+    displaced_identity = module._directory_identity(displaced)
+    backing_identity = module._directory_identity(backing)
+    workspace_record = module._MountRecord(
+        "workspace", 201, str(workspace), workspace_identity[0], workspace_identity[1]
+    )
+    payload_record = module._MountRecord("payload", 202, str(displaced), backing_identity[0], backing_identity[1])
+    authority_box = [
+        module._MountAuthority(
+            state_path=state_path,
+            workspace_path=workspace,
+            workspace_mount_id=201,
+            workspace_identity=workspace_identity,
+            destination_name=destination.name,
+            destination_identity=displaced_identity,
+            backing_identity=backing_identity,
+            artifact_names=(),
+            mounts=(workspace_record, payload_record),
+            remaining_mount_ids=(201,),
+            pending_unmount_id=None,
+            destination_removed=False,
+            backing_removed=False,
+            cleanup_phase="removing_destination",
+        )
+    ]
+    mounted = {
+        201: module._MountInfoEntry(
+            201,
+            1,
+            "0:1",
+            "/",
+            str(workspace),
+            frozenset({"rw", "nodev", "nosuid"}),
+            frozenset(),
+            "ext4",
+            "/dev/test",
+            frozenset(),
+        )
+    }
+    removed: list[Path] = []
+
+    def remove_destination(path: Path) -> None:
+        removed.append(path)
+        path.rmdir()
+
+    def unmount(_command: Path, *_arguments: str) -> None:
+        mounted.clear()
+
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_validated_cleanup_mountpoint_path", Path)
+    monkeypatch.setattr(module, "_validated_backing_path", Path)
+    monkeypatch.setattr(module, "_read_mount_authority", lambda *_args: authority_box[0])
+    monkeypatch.setattr(module, "_persist_mount_authority", lambda value: authority_box.__setitem__(0, value))
+    monkeypatch.setattr(module, "_mountinfo_by_id", lambda: dict(mounted))
+    monkeypatch.setattr(module, "_run_mount_command", unmount)
+    monkeypatch.setattr(module, "_remove_empty_mountpoint", remove_destination)
+    monkeypatch.setattr(module, "_remove_backing_directory", lambda path, _names: path.rmdir())
+    monkeypatch.setattr(module.os, "chdir", lambda _path: None)
+
+    module.unseal_publication_snapshot(destination, backing, [])
+
+    assert removed == [displaced]
+    assert destination.is_dir()
+    assert displaced.exists() is False
+    assert backing.exists() is False
+    assert state_path.exists() is False
+
+
+@pytest.mark.parametrize("rollback_succeeds", [False, True])
+def test_bind_mount_creation_reports_authority_before_hardening_and_failed_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rollback_succeeds: bool,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    identity = module._directory_identity(source)
+    mounted: dict[int, Any] = {}
+    created: list[Any] = []
+    rolled_back: list[Any] = []
+
+    def mount_entries(_path: Path | None = None) -> list[Any]:
+        return list(mounted.values())
+
+    real_identity = module._directory_identity
+
+    def mounted_identity(path: Path) -> tuple[int, int]:
+        if path == destination and mounted:
+            return identity
+        return real_identity(path)
+
+    def run_mount(command: Path, *arguments: str) -> None:
+        if command == module._MOUNT_COMMAND and arguments[:1] == ("--bind",):
+            mounted[401] = module._MountInfoEntry(
+                401,
+                1,
+                "0:1",
+                "/",
+                str(destination),
+                frozenset({"rw"}),
+                frozenset(),
+                "ext4",
+                str(source),
+                frozenset(),
+            )
+            return
+        if command == module._MOUNT_COMMAND and arguments[:1] == ("--make-slave",):
+            raise module.PublicationSnapshotError("injected mount hardening failure")
+        if command == module._UMOUNT_COMMAND:
+            if not rollback_succeeds:
+                raise OSError("injected rollback failure")
+            mounted.clear()
+            return
+        raise AssertionError(f"unexpected mount command: {command!r} {arguments!r}")
+
+    monkeypatch.setattr(module, "_isolate_destination_mount_propagation", lambda _path: None)
+    monkeypatch.setattr(module, "_mountinfo_entries", mount_entries)
+    monkeypatch.setattr(module, "_mountinfo_by_id", lambda: dict(mounted))
+    monkeypatch.setattr(module, "_directory_identity", mounted_identity)
+    monkeypatch.setattr(module, "_run_mount_command", run_mount)
+
+    with pytest.raises(module.PublicationSnapshotError, match="injected mount hardening failure"):
+        module._create_bind_mount(
+            source,
+            destination,
+            kind="payload",
+            remount_options="remount,bind,ro,nodev,noexec,nosuid",
+            required_options=frozenset({"ro", "nodev", "noexec", "nosuid"}),
+            on_created=created.append,
+            on_rolled_back=rolled_back.append,
+        )
+
+    assert created == [module._MountRecord("payload", 401, str(destination), identity[0], identity[1])]
+    assert rolled_back == (created if rollback_succeeds else [])
+    assert bool(mounted) is not rollback_succeeds
+
+
+def test_bind_mount_journals_emergency_unmount_before_kernel_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    identity = module._directory_identity(source)
+    mounted: dict[int, Any] = {}
+    transitions: list[tuple[str, int]] = []
+
+    def mount_entries(_path: Path | None = None) -> list[Any]:
+        return list(mounted.values())
+
+    def run_mount(command: Path, *arguments: str) -> None:
+        if command == module._MOUNT_COMMAND and arguments[:1] == ("--bind",):
+            mounted[451] = module._MountInfoEntry(
+                451,
+                1,
+                "0:1",
+                "/",
+                str(destination),
+                frozenset({"rw"}),
+                frozenset(),
+                "ext4",
+                str(source),
+                frozenset(),
+            )
+            return
+        if command == module._MOUNT_COMMAND and arguments[:1] == ("--make-slave",):
+            raise module.PublicationSnapshotError("injected hardening failure")
+        if command == module._UMOUNT_COMMAND:
+            assert transitions[-1] == ("pending_unmount", 451)
+            mounted.clear()
+            transitions.append(("kernel_unmounted", 451))
+            return
+        raise AssertionError(f"unexpected mount command: {command!r} {arguments!r}")
+
+    real_identity = module._directory_identity
+    monkeypatch.setattr(module, "_isolate_destination_mount_propagation", lambda _path: None)
+    monkeypatch.setattr(module, "_mountinfo_entries", mount_entries)
+    monkeypatch.setattr(module, "_mountinfo_by_id", lambda: dict(mounted))
+    monkeypatch.setattr(
+        module,
+        "_directory_identity",
+        lambda path: identity if path == destination and mounted else real_identity(path),
+    )
+    monkeypatch.setattr(module, "_run_mount_command", run_mount)
+
+    with pytest.raises(module.PublicationSnapshotError, match="injected hardening failure"):
+        module._create_bind_mount(
+            source,
+            destination,
+            kind="payload",
+            remount_options="remount,bind,ro,nodev,noexec,nosuid",
+            required_options=frozenset({"ro", "nodev", "noexec", "nosuid"}),
+            on_created=lambda record: transitions.append(("created", record.mount_id)),
+            on_rollback_intent=lambda record: transitions.append(("pending_unmount", record.mount_id)),
+            on_rolled_back=lambda record: transitions.append(("rolled_back", record.mount_id)),
+        )
+
+    assert transitions == [
+        ("created", 451),
+        ("pending_unmount", 451),
+        ("kernel_unmounted", 451),
+        ("rolled_back", 451),
+    ]
+
+
+@pytest.mark.parametrize("backing_phase", ["creating", "copying"])
+def test_partial_backing_authority_securely_converges_after_process_death(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    backing_phase: str,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    destination = workspace / "publication"
+    backing = tmp_path / "tacit-release-publication-partial"
+    backing.mkdir(mode=0o700)
+    artifact_name = "tacit_ai-1.2.3-py3-none-any.whl"
+    if backing_phase == "copying":
+        (backing / f".{artifact_name}.interrupted.tmp").write_bytes(b"partial")
+    state_path = tmp_path / "tacit-release-publication-partial.mount-authority.json"
+    state_path.write_text("authority", encoding="utf-8")
+    authority = module._MountAuthority(
+        state_path=state_path,
+        workspace_path=workspace,
+        workspace_mount_id=None,
+        workspace_identity=module._directory_identity(workspace),
+        destination_name=destination.name,
+        destination_identity=None,
+        backing_identity=(module._directory_identity(backing) if backing_phase == "copying" else None),
+        artifact_names=(artifact_name,),
+        mounts=(),
+        remaining_mount_ids=(),
+        pending_unmount_id=None,
+        destination_removed=True,
+        backing_removed=False,
+        cleanup_phase="rollback",
+        pending_mount=None,
+        backing_phase=backing_phase,
+        pending_copy_name=(artifact_name if backing_phase == "copying" else None),
+        copied_artifact_names=(),
+    )
+
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_validated_cleanup_mountpoint_path", Path)
+    monkeypatch.setattr(module, "_validated_backing_path", Path)
+    monkeypatch.setattr(module, "_read_mount_authority", lambda *_args: authority)
+    monkeypatch.setattr(module, "_persist_mount_authority", lambda _authority: None)
+    monkeypatch.setattr(module, "_mountinfo_by_id", lambda: {})
+    monkeypatch.setattr(module.os, "chdir", lambda _path: None)
+
+    module.unseal_publication_snapshot(destination, backing, [artifact_name])
+
+    assert backing.exists() is False
+    assert state_path.exists() is False
+
+
+def test_bind_mount_persists_recovery_intent_before_kernel_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    identity = module._directory_identity(source)
+    intents: list[Any] = []
+    records: list[Any] = []
+    mounted: dict[int, Any] = {}
+
+    def mount_entries(_path: Path | None = None) -> list[Any]:
+        return list(mounted.values())
+
+    real_identity = module._directory_identity
+
+    def mounted_identity(path: Path) -> tuple[int, int]:
+        if path == destination and mounted:
+            return identity
+        return real_identity(path)
+
+    def run_mount(command: Path, *arguments: str) -> None:
+        if command == module._MOUNT_COMMAND and arguments[:1] == ("--bind",):
+            assert intents == [
+                module._PendingMountIntent(
+                    "payload",
+                    str(destination),
+                    identity[0],
+                    identity[1],
+                    (),
+                    *module._directory_identity(destination),
+                )
+            ]
+            mounted[501] = module._MountInfoEntry(
+                501,
+                1,
+                "0:1",
+                "/",
+                str(destination),
+                frozenset({"rw"}),
+                frozenset(),
+                "ext4",
+                str(source),
+                frozenset(),
+            )
+            raise KeyboardInterrupt("simulate process death after mount")
+        if command == module._UMOUNT_COMMAND:
+            raise OSError("process died before rollback")
+        raise AssertionError(f"unexpected mount command: {command!r} {arguments!r}")
+
+    monkeypatch.setattr(module, "_isolate_destination_mount_propagation", lambda _path: None)
+    monkeypatch.setattr(module, "_mountinfo_entries", mount_entries)
+    monkeypatch.setattr(module, "_mountinfo_by_id", lambda: dict(mounted))
+    monkeypatch.setattr(module, "_directory_identity", mounted_identity)
+    monkeypatch.setattr(module, "_run_mount_command", run_mount)
+
+    with pytest.raises(KeyboardInterrupt, match="simulate process death"):
+        module._create_bind_mount(
+            source,
+            destination,
+            kind="payload",
+            remount_options="remount,bind,ro,nodev,noexec,nosuid",
+            required_options=frozenset({"ro", "nodev", "noexec", "nosuid"}),
+            on_intent=intents.append,
+            on_created=records.append,
+        )
+
+    assert records == [module._MountRecord("payload", 501, str(destination), identity[0], identity[1])]
+
+
+def test_pending_bind_intent_recovers_unknown_mount_identity_for_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    destination = workspace / "publication"
+    destination.mkdir()
+    backing = tmp_path / "tacit-release-publication-test"
+    backing.mkdir()
+    state_path = tmp_path / "tacit-release-publication-test.mount-authority.json"
+    state_path.write_text("authority", encoding="utf-8")
+    workspace_identity = module._directory_identity(workspace)
+    destination_identity = module._directory_identity(destination)
+    backing_identity = module._directory_identity(backing)
+    intent = module._PendingMountIntent(
+        "payload",
+        str(destination),
+        backing_identity[0],
+        backing_identity[1],
+        (),
+    )
+    authority_box = [
+        module._MountAuthority(
+            state_path=state_path,
+            workspace_path=workspace,
+            workspace_mount_id=None,
+            workspace_identity=workspace_identity,
+            destination_name=destination.name,
+            destination_identity=destination_identity,
+            backing_identity=backing_identity,
+            artifact_names=(),
+            mounts=(),
+            remaining_mount_ids=(),
+            pending_mount=intent,
+            pending_unmount_id=None,
+            destination_removed=False,
+            backing_removed=False,
+            cleanup_phase="rollback",
+        )
+    ]
+    mounted = {
+        601: module._MountInfoEntry(
+            601,
+            1,
+            "0:2",
+            "/",
+            str(destination),
+            frozenset({"rw"}),
+            frozenset(),
+            "ext4",
+            str(backing),
+            frozenset(),
+        )
+    }
+    real_identity = module._directory_identity
+
+    def identity(path: Path) -> tuple[int, int]:
+        if path == destination and 601 in mounted:
+            return backing_identity
+        return real_identity(path)
+
+    def run_mount(command: Path, *arguments: str) -> None:
+        assert command == module._UMOUNT_COMMAND
+        assert arguments[-1] == str(destination)
+        mounted.clear()
+
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    monkeypatch.setattr(module, "_validated_cleanup_mountpoint_path", Path)
+    monkeypatch.setattr(module, "_validated_backing_path", Path)
+    monkeypatch.setattr(module, "_read_mount_authority", lambda *_args: authority_box[0])
+    monkeypatch.setattr(module, "_persist_mount_authority", lambda authority: authority_box.__setitem__(0, authority))
+    monkeypatch.setattr(module, "_mountinfo_entries", lambda _path=None: list(mounted.values()))
+    monkeypatch.setattr(module, "_mountinfo_by_id", lambda: dict(mounted))
+    monkeypatch.setattr(module, "_directory_identity", identity)
+    monkeypatch.setattr(module, "_run_mount_command", run_mount)
+    monkeypatch.setattr(module, "_remove_empty_mountpoint", lambda path: path.rmdir())
+    monkeypatch.setattr(module, "_remove_backing_directory", lambda path, _names: path.rmdir())
+    monkeypatch.setattr(module.os, "chdir", lambda _path: None)
+
+    module.unseal_publication_snapshot(destination, backing, [])
+
+    assert mounted == {}
+    assert destination.exists() is False
+    assert backing.exists() is False
+    assert state_path.exists() is False
+
+
+def test_publication_tool_install_and_removal_resume_from_partial_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source_directory = tmp_path / "source"
+    source_directory.mkdir()
+    sources: dict[str, str] = {}
+    for source in (RELEASE_PUBLICATION_SNAPSHOT, RELEASE_PAYLOAD_SNAPSHOT):
+        copied = source_directory / source.name
+        shutil.copyfile(source, copied)
+        sources[source.name] = hashlib.sha256(copied.read_bytes()).hexdigest()
+    tool_directory = tmp_path / "tacit-release-publication-tool-test"
+    monkeypatch.setattr(module, "_BACKING_PARENT", tmp_path)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+
+    real_replace = module.os.replace
+    interrupted_install = [False]
+
+    def fail_main_install_replace(source: Any, destination: Any) -> None:
+        if Path(destination) == tool_directory / RELEASE_PUBLICATION_SNAPSHOT.name and not interrupted_install[0]:
+            interrupted_install[0] = True
+            raise OSError("injected install interruption")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(module.os, "replace", fail_main_install_replace)
+    with pytest.raises(OSError, match="injected install interruption"):
+        module.install_publication_tool(source_directory, tool_directory, sources)
+    monkeypatch.setattr(module.os, "replace", real_replace)
+    partial_copy = tool_directory / f".{RELEASE_PUBLICATION_SNAPSHOT.name}.next"
+    partial_copy.write_bytes(b"interrupted copy")
+    partial_copy.chmod(0o500)
+
+    module.install_publication_tool(source_directory, tool_directory, sources)
+    assert {entry.name for entry in tool_directory.iterdir()} == set(sources)
+
+    real_unlink = module.Path.unlink
+    interrupted = [False]
+
+    def fail_after_helper_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        real_unlink(path, *args, **kwargs)
+        if path.name == RELEASE_PAYLOAD_SNAPSHOT.name and not interrupted[0]:
+            interrupted[0] = True
+            raise OSError("injected removal interruption")
+
+    monkeypatch.setattr(module.Path, "unlink", fail_after_helper_unlink)
+    with pytest.raises(OSError, match="injected removal interruption"):
+        module._remove_installed_tool(tool_directory, require_active=False)
+    monkeypatch.setattr(module.Path, "unlink", real_unlink)
+
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    recovery = _load_script_module(module._tool_cleanup_launcher_path(tool_directory))
+    monkeypatch.setattr(recovery, "_BACKING_PARENT", tmp_path)
+    monkeypatch.setattr(recovery, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(recovery, "_require_linux_root", lambda: None)
+    recovery._remove_installed_tool(tool_directory)
+    assert tool_directory.exists() is False
+    assert module._tool_authority_path(tool_directory).exists() is False
+
+    module.install_publication_tool(source_directory, tool_directory, sources)
+    state_path = module._tool_authority_path(tool_directory)
+    state_interrupted = [False]
+
+    def fail_before_state_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path == state_path and not state_interrupted[0]:
+            state_interrupted[0] = True
+            raise OSError("injected terminal state interruption")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.Path, "unlink", fail_before_state_unlink)
+    with pytest.raises(OSError, match="injected terminal state interruption"):
+        module._remove_installed_tool(tool_directory, require_active=False)
+    monkeypatch.setattr(module.Path, "unlink", real_unlink)
+    assert tool_directory.exists() is False
+    assert state_path.exists()
+
+    module.install_publication_tool(source_directory, tool_directory, sources)
+    assert {entry.name for entry in tool_directory.iterdir()} == set(sources)
+    module._remove_installed_tool(tool_directory, require_active=False)
+    assert tool_directory.exists() is False
+    assert state_path.exists() is False
+
+
+@pytest.mark.parametrize(
+    "death_phase",
+    [
+        "before_main_intent",
+        "after_main_intent",
+        "after_main_unlink",
+        "after_main_fsync",
+        "after_main_commit",
+    ],
+)
+def test_publication_tool_cleanup_process_death_preserves_recovery_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    death_phase: str,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source_directory = tmp_path / "source"
+    source_directory.mkdir()
+    digests: dict[str, str] = {}
+    for source in (RELEASE_PUBLICATION_SNAPSHOT, RELEASE_PAYLOAD_SNAPSHOT):
+        copied = source_directory / source.name
+        shutil.copyfile(source, copied)
+        digests[source.name] = hashlib.sha256(copied.read_bytes()).hexdigest()
+    tool_directory = tmp_path / "tacit-release-publication-tool-kill-matrix"
+    monkeypatch.setattr(module, "_BACKING_PARENT", tmp_path)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    module.install_publication_tool(source_directory, tool_directory, digests)
+
+    recovery_entrypoint = module._tool_cleanup_launcher_path(tool_directory)
+    state_path = module._tool_authority_path(tool_directory)
+    driver = tmp_path / f"kill_tool_cleanup_{death_phase}.py"
+    driver.write_text(
+        f"""
+import importlib.util
+import os
+from pathlib import Path
+
+entrypoint = Path({str(recovery_entrypoint)!r})
+tool = Path({str(tool_directory)!r})
+state = Path({str(state_path)!r})
+phase = {death_phase!r}
+spec = importlib.util.spec_from_file_location('release_cleanup_kill_probe', entrypoint)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+module._BACKING_PARENT = Path({str(tmp_path)!r})
+module._ROOT_UID = os.getuid()
+module._require_linux_root = lambda: None
+main = tool / 'release_publication_snapshot.py'
+real_persist = module._persist_tool_authority
+real_unlink = module.Path.unlink
+real_fsync = module._fsync_directory
+
+def persist(authority):
+    if authority.pending_delete == main.name and phase == 'before_main_intent':
+        os._exit(91)
+    if main.name not in authority.remaining_files and phase == 'after_main_commit':
+        real_persist(authority)
+        os._exit(95)
+    real_persist(authority)
+
+def unlink(path, *args, **kwargs):
+    if path == main and phase == 'after_main_intent':
+        os._exit(92)
+    real_unlink(path, *args, **kwargs)
+    if path == main and phase == 'after_main_unlink':
+        os._exit(93)
+
+def fsync(path):
+    real_fsync(path)
+    if path == tool and not main.exists() and state.exists() and phase == 'after_main_fsync':
+        os._exit(94)
+
+module._persist_tool_authority = persist
+module.Path.unlink = unlink
+module._fsync_directory = fsync
+module._remove_installed_tool(tool)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    killed = subprocess.run(
+        [sys.executable, "-I", "-B", str(driver)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert killed.returncode in {91, 92, 93, 94, 95}, killed.stderr
+    assert recovery_entrypoint.is_file()
+
+    recovery = _load_script_module(recovery_entrypoint)
+    monkeypatch.setattr(recovery, "_BACKING_PARENT", tmp_path)
+    monkeypatch.setattr(recovery, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(recovery, "_require_linux_root", lambda: None)
+    recovery._remove_installed_tool(tool_directory)
+
+    assert tool_directory.exists() is False
+    assert state_path.exists() is False
+    assert recovery_entrypoint.exists() is False
+
+
+def test_publication_tool_cleanup_recovers_after_terminal_manifest_deletion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source_directory = tmp_path / "source"
+    source_directory.mkdir()
+    digests: dict[str, str] = {}
+    for source in (RELEASE_PUBLICATION_SNAPSHOT, RELEASE_PAYLOAD_SNAPSHOT):
+        copied = source_directory / source.name
+        shutil.copyfile(source, copied)
+        digests[source.name] = hashlib.sha256(copied.read_bytes()).hexdigest()
+    tool_directory = tmp_path / "tacit-release-publication-tool-terminal-kill"
+    monkeypatch.setattr(module, "_BACKING_PARENT", tmp_path)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    module.install_publication_tool(source_directory, tool_directory, digests)
+
+    recovery_entrypoint = module._tool_cleanup_launcher_path(tool_directory)
+    state_path = module._tool_authority_path(tool_directory)
+    driver = tmp_path / "kill_after_tool_manifest.py"
+    driver.write_text(
+        f"""
+import importlib.util
+import os
+from pathlib import Path
+
+entrypoint = Path({str(recovery_entrypoint)!r})
+tool = Path({str(tool_directory)!r})
+state = Path({str(state_path)!r})
+spec = importlib.util.spec_from_file_location('release_cleanup_terminal_probe', entrypoint)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+module._BACKING_PARENT = Path({str(tmp_path)!r})
+module._ROOT_UID = os.getuid()
+module._require_linux_root = lambda: None
+real_unlink = module.Path.unlink
+
+def unlink(path, *args, **kwargs):
+    real_unlink(path, *args, **kwargs)
+    if path == state:
+        os._exit(96)
+
+module.Path.unlink = unlink
+module._remove_installed_tool(tool)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    killed = subprocess.run(
+        [sys.executable, "-I", "-B", str(driver)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert killed.returncode == 96, killed.stderr
+    assert tool_directory.exists() is False
+    assert state_path.exists() is False
+    assert recovery_entrypoint.is_file()
+
+    recovery = _load_script_module(recovery_entrypoint)
+    monkeypatch.setattr(recovery, "_BACKING_PARENT", tmp_path)
+    monkeypatch.setattr(recovery, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(recovery, "_require_linux_root", lambda: None)
+    recovery._remove_installed_tool(tool_directory)
+    assert recovery_entrypoint.exists() is False
+
+
+def test_publication_cleanup_launcher_loads_payload_helper_in_a_fresh_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source_directory = tmp_path / "source"
+    source_directory.mkdir()
+    digests: dict[str, str] = {}
+    for source in (RELEASE_PUBLICATION_SNAPSHOT, RELEASE_PAYLOAD_SNAPSHOT):
+        copied = source_directory / source.name
+        shutil.copyfile(source, copied)
+        digests[source.name] = hashlib.sha256(copied.read_bytes()).hexdigest()
+    tool_directory = tmp_path / "tacit-release-publication-tool-fresh-cleanup"
+    monkeypatch.setattr(module, "_BACKING_PARENT", tmp_path)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    module.install_publication_tool(source_directory, tool_directory, digests)
+
+    payload_directory = tmp_path / "payload"
+    payload_directory.mkdir(mode=0o700)
+    artifact = payload_directory / "artifact.whl"
+    artifact.write_bytes(b"published bytes")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            str(module._tool_cleanup_launcher_path(tool_directory)),
+            "cleanup",
+            "--directory",
+            str(payload_directory),
+            "--artifact-name",
+            artifact.name,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert payload_directory.exists() is False
+
+
+def test_publication_tool_install_recovers_process_death_during_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source_directory = tmp_path / "source"
+    source_directory.mkdir()
+    digests: dict[str, str] = {}
+    for source in (RELEASE_PUBLICATION_SNAPSHOT, RELEASE_PAYLOAD_SNAPSHOT):
+        copied = source_directory / source.name
+        shutil.copyfile(source, copied)
+        digests[source.name] = hashlib.sha256(copied.read_bytes()).hexdigest()
+    tool_directory = tmp_path / "tacit-release-publication-tool-copy-kill"
+    monkeypatch.setattr(module, "_BACKING_PARENT", tmp_path)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    module._install_cleanup_launcher(source_directory, tool_directory, digests)
+    module._persist_tool_authority(
+        module._ToolAuthority(
+            state_path=module._tool_authority_path(tool_directory),
+            tool_path=tool_directory,
+            digests=tuple((name, digests[name]) for name in module._TOOL_FILES),
+            phase="installing",
+            remaining_files=(),
+            pending_delete=None,
+        )
+    )
+
+    driver = tmp_path / "kill_during_tool_copy.py"
+    driver.write_text(
+        f"""
+import importlib.util
+import os
+from pathlib import Path
+
+script = Path({str(RELEASE_PUBLICATION_SNAPSHOT)!r})
+spec = importlib.util.spec_from_file_location('release_install_copy_kill', script)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+module._BACKING_PARENT = Path({str(tmp_path)!r})
+module._ROOT_UID = os.getuid()
+module._require_linux_root = lambda: None
+def kill_copy(descriptor, _payload):
+    os.write(descriptor, b'partial tool bytes')
+    os.fsync(descriptor)
+    os._exit(97)
+
+module._write_bytes = kill_copy
+module.install_publication_tool(
+    Path({str(source_directory)!r}),
+    Path({str(tool_directory)!r}),
+    {digests!r},
+)
+""".strip(),
+        encoding="utf-8",
+    )
+    killed = subprocess.run([sys.executable, "-I", "-B", str(driver)], check=False)
+    assert killed.returncode == 97
+
+    module.install_publication_tool(source_directory, tool_directory, digests)
+    assert {entry.name for entry in tool_directory.iterdir()} == set(digests)
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_publication_tool_install_recovers_process_death_during_initial_authority_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source_directory = tmp_path / "source"
+    source_directory.mkdir()
+    digests: dict[str, str] = {}
+    for source in (RELEASE_PUBLICATION_SNAPSHOT, RELEASE_PAYLOAD_SNAPSHOT):
+        copied = source_directory / source.name
+        shutil.copyfile(source, copied)
+        digests[source.name] = hashlib.sha256(copied.read_bytes()).hexdigest()
+    tool_directory = tmp_path / "tacit-release-publication-tool-authority-kill"
+    monkeypatch.setattr(module, "_BACKING_PARENT", tmp_path)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    module._install_cleanup_launcher(source_directory, tool_directory, digests)
+
+    driver = tmp_path / "kill_during_tool_authority.py"
+    driver.write_text(
+        f"""
+import importlib.util
+import os
+from pathlib import Path
+
+script = Path({str(RELEASE_PUBLICATION_SNAPSHOT)!r})
+spec = importlib.util.spec_from_file_location('release_install_authority_kill', script)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+module._BACKING_PARENT = Path({str(tmp_path)!r})
+module._ROOT_UID = os.getuid()
+module._require_linux_root = lambda: None
+
+def kill_write(descriptor, payload):
+    os.write(descriptor, payload[: max(1, len(payload) // 2)])
+    os.fsync(descriptor)
+    os._exit(98)
+
+module._write_bytes = kill_write
+module.install_publication_tool(
+    Path({str(source_directory)!r}),
+    Path({str(tool_directory)!r}),
+    {digests!r},
+)
+""".strip(),
+        encoding="utf-8",
+    )
+    killed = subprocess.run([sys.executable, "-I", "-B", str(driver)], check=False)
+    assert killed.returncode == 98
+    assert module._tool_authority_path(tool_directory).exists() is False
+
+    module.install_publication_tool(source_directory, tool_directory, digests)
+    assert module._tool_authority_path(tool_directory).is_file()
+
+
+def test_publication_tool_removal_rejects_unexplained_file_disappearance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source_directory = tmp_path / "source"
+    source_directory.mkdir()
+    digests: dict[str, str] = {}
+    for source in (RELEASE_PUBLICATION_SNAPSHOT, RELEASE_PAYLOAD_SNAPSHOT):
+        copied = source_directory / source.name
+        shutil.copyfile(source, copied)
+        digests[source.name] = hashlib.sha256(copied.read_bytes()).hexdigest()
+    tool_directory = tmp_path / "tacit-release-publication-tool-missing-file"
+    monkeypatch.setattr(module, "_BACKING_PARENT", tmp_path)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    module.install_publication_tool(source_directory, tool_directory, digests)
+    (tool_directory / RELEASE_PAYLOAD_SNAPSHOT.name).unlink()
+
+    recovery = _load_script_module(module._tool_cleanup_launcher_path(tool_directory))
+    monkeypatch.setattr(recovery, "_BACKING_PARENT", tmp_path)
+    monkeypatch.setattr(recovery, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(recovery, "_require_linux_root", lambda: None)
+    with pytest.raises(recovery.PublicationSnapshotError, match="disappeared before its deletion intent"):
+        recovery._remove_installed_tool(tool_directory)
+
+
+def test_interrupted_publication_tool_install_can_be_cleaned_by_recovery_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_validated_tool_path", Path)
+    source_directory = tmp_path / "source"
+    source_directory.mkdir()
+    digests: dict[str, str] = {}
+    for source in (RELEASE_PUBLICATION_SNAPSHOT, RELEASE_PAYLOAD_SNAPSHOT):
+        copied = source_directory / source.name
+        shutil.copyfile(source, copied)
+        digests[source.name] = hashlib.sha256(copied.read_bytes()).hexdigest()
+
+    tool_directory = tmp_path / "tacit-release-publication-tool-interrupted-cleanup"
+    module.install_publication_tool(source_directory, tool_directory, digests)
+    payload = tool_directory / RELEASE_PAYLOAD_SNAPSHOT.name
+    payload.unlink()
+    partial = payload.with_name(f".{payload.name}.next")
+    partial.write_bytes(b"partial publication tool")
+    partial.chmod(0o600)
+    authority = module._read_tool_authority(tool_directory)._replace(
+        phase="installing",
+        remaining_files=(),
+        pending_delete=None,
+    )
+    module._persist_tool_authority(authority)
+
+    recovery = _load_script_module(module._tool_cleanup_launcher_path(tool_directory))
+    monkeypatch.setattr(recovery, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(recovery, "_validated_tool_path", Path)
+    recovery._remove_installed_tool(tool_directory)
+
+    assert tool_directory.exists() is False
+    assert module._tool_authority_path(tool_directory).exists() is False
+    assert module._tool_cleanup_launcher_path(tool_directory).exists() is False
+    assert module._tool_cleanup_helper_path(tool_directory).exists() is False
+
+
+def test_cleanup_launcher_removes_only_fixed_bootstrap_partials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    tool = tmp_path / "tacit-release-publication-tool-bootstrap-partials"
+    launcher = module._tool_cleanup_launcher_path(tool)
+    helper = module._tool_cleanup_helper_path(tool)
+    for source, target in (
+        (RELEASE_PUBLICATION_SNAPSHOT, launcher),
+        (RELEASE_PAYLOAD_SNAPSHOT, helper),
+    ):
+        shutil.copyfile(source, target)
+        target.chmod(0o500)
+        partial = target.with_name(f"{target.name}.next")
+        partial.write_bytes(b"partial bootstrap")
+        partial.chmod(0o600)
+
+    monkeypatch.setattr(module, "_SCRIPT_PATH", launcher)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    module._remove_cleanup_launcher(tool)
+
+    assert launcher.exists() is False
+    assert helper.exists() is False
+    assert launcher.with_name(f"{launcher.name}.next").exists() is False
+    assert helper.with_name(f"{helper.name}.next").exists() is False
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ("main_partial", "helper_partial", "orphan_helper"),
+)
+@pytest.mark.parametrize(
+    ("job_name", "tool_variable"),
+    (
+        ("publish-pypi", "PYPI_PUBLICATION_TOOL_DIR"),
+        ("publish-github-release", "GITHUB_RELEASE_PUBLICATION_TOOL_DIR"),
+    ),
+)
+def test_workflow_bootstrap_cleanup_converges_after_staging_process_death(
+    tmp_path: Path,
+    phase: str,
+    job_name: str,
+    tool_variable: str,
+) -> None:
+    cleanup = _step(
+        _release_workflow()["jobs"][job_name],
+        next(
+            name
+            for name in ("Remove sealed PyPI publisher path", "Remove sealed GitHub release publisher path")
+            if any(step.get("name") == name for step in _release_workflow()["jobs"][job_name]["steps"])
+        ),
+    )["run"]
+    prefix = "/usr/bin/python3 -I -B -c '\n"
+    suffix = f'\n\' "${tool_variable}"'
+    assert prefix in cleanup and suffix in cleanup
+    program = cleanup.split(prefix, 1)[1].split(suffix, 1)[0]
+    tool = tmp_path / "tacit-release-publication-tool-bootstrap"
+    launcher = tool.with_name(f"{tool.name}.cleanup.py")
+    helper = tool.with_name(f"{tool.name}.cleanup-helper.py")
+
+    if phase == "main_partial":
+        launcher.with_name(f"{launcher.name}.next").write_bytes(b"partial")
+        launcher.with_name(f"{launcher.name}.next").chmod(0o600)
+    elif phase == "helper_partial":
+        shutil.copyfile(RELEASE_PUBLICATION_SNAPSHOT, launcher)
+        launcher.chmod(0o500)
+        helper.with_name(f"{helper.name}.next").write_bytes(b"partial")
+        helper.with_name(f"{helper.name}.next").chmod(0o600)
+    else:
+        shutil.copyfile(RELEASE_PAYLOAD_SNAPSHOT, helper)
+        helper.chmod(0o500)
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", program, str(tool), str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert launcher.with_name(f"{launcher.name}.next").exists() is False
+    assert helper.with_name(f"{helper.name}.next").exists() is False
+    if phase == "orphan_helper":
+        assert helper.exists() is False
+
+
+def test_payload_source_open_is_nonblocking_after_metadata_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PAYLOAD_SNAPSHOT)
+    source = tmp_path / "payload.whl"
+    source.write_bytes(b"payload")
+    observed_flags: list[int] = []
+
+    def reject_open(_path: Path, flags: int) -> int:
+        observed_flags.append(flags)
+        raise OSError(errno.ENXIO, "injected nonblocking open")
+
+    monkeypatch.setattr(module, "_open_no_follow", reject_open)
+    with pytest.raises(OSError, match="injected nonblocking open"):
+        module._open_source(source, 1024)
+
+    assert observed_flags and observed_flags[0] & os.O_NONBLOCK
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO admission requires POSIX")
+def test_publication_tool_install_rejects_source_swapped_to_fifo_without_blocking(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / RELEASE_PUBLICATION_SNAPSHOT.name
+    payload = b"admitted publication tool bytes"
+    source.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    source.unlink()
+    os.mkfifo(source)
+    target = tmp_path / "installed" / RELEASE_PUBLICATION_SNAPSHOT.name
+    target.parent.mkdir()
+    driver = tmp_path / "install_swapped_fifo.py"
+    driver.write_text(
+        """
+import importlib.util
+import os
+import pathlib
+import sys
+
+script, source, target, digest = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('release_tool_fifo_probe', script)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+module._ROOT_UID = os.getuid()
+try:
+    module._copy_tool_file(pathlib.Path(source), pathlib.Path(target), digest)
+except module.PublicationSnapshotError:
+    raise SystemExit(0)
+raise SystemExit('swapped FIFO was accepted as a publication tool source')
+""".strip(),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            str(driver),
+            str(RELEASE_PUBLICATION_SNAPSHOT),
+            str(source),
+            str(target),
+            digest,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.exists() is False
+
+
+def test_seal_refuses_to_replace_existing_mount_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source = tmp_path / "source"
+    source.mkdir()
+    payload = source / "package.whl"
+    payload.write_bytes(b"package")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    destination = workspace / "publication"
+    backing = tmp_path / "tacit-release-publication-existing"
+    state_path = module._mount_authority_path(backing)
+    state_path.write_bytes(b"existing-authority")
+
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    monkeypatch.setattr(module, "_validated_mountpoint_path", Path)
+    monkeypatch.setattr(module, "_validated_backing_path", Path)
+    monkeypatch.setattr(
+        module,
+        "_action_path_anchor_directories",
+        lambda _workspace: pytest.fail("mounting began before existing authority was rejected"),
+    )
+    artifact = module.LabelledArtifact(
+        "wheel",
+        module.ArtifactSpec(payload.name, hashlib.sha256(payload.read_bytes()).hexdigest()),
+    )
+
+    with pytest.raises(module.PublicationSnapshotError, match="authority already exists"):
+        module.seal_publication_snapshot(source, destination, backing, [artifact], maximum=1024)
+
+    assert state_path.read_bytes() == b"existing-authority"
+
+
+def test_seal_journals_destination_creation_before_mkdir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_script_module(RELEASE_PUBLICATION_SNAPSHOT)
+    source = tmp_path / "source"
+    source.mkdir()
+    payload = source / "package.whl"
+    payload.write_bytes(b"package")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    destination = workspace / "publication"
+    backing = tmp_path / "tacit-release-publication-destination-intent"
+    state_path = module._mount_authority_path(backing)
+    real_mkdir = Path.mkdir
+    observed_authority: list[dict[str, Any]] = []
+
+    def interrupt_destination_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path == destination:
+            observed_authority.append(json.loads(state_path.read_text(encoding="ascii")))
+            raise KeyboardInterrupt("injected destination creation death")
+        real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_require_linux_root", lambda: None)
+    monkeypatch.setattr(module, "_ROOT_UID", os.getuid())
+    monkeypatch.setattr(module, "_validated_mountpoint_path", Path)
+    monkeypatch.setattr(module, "_validated_backing_path", Path)
+    monkeypatch.setattr(module, "_action_path_anchor_directories", lambda _workspace: [])
+    monkeypatch.setattr(module, "_verify_sealed_layout", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module, "unseal_publication_snapshot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(Path, "mkdir", interrupt_destination_mkdir)
+    artifact = module.LabelledArtifact(
+        "wheel",
+        module.ArtifactSpec(payload.name, hashlib.sha256(payload.read_bytes()).hexdigest()),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="destination creation death"):
+        module.seal_publication_snapshot(source, destination, backing, [artifact], maximum=1024)
+
+    assert observed_authority
+    assert observed_authority[-1]["destination_removed"] is False
+    assert observed_authority[-1]["destination"] is None
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="read-only bind mounts are a Linux publication boundary")
+def test_sealed_publication_recovers_process_kill_after_bind_before_identity_commit(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() == 0:
+        privilege_prefix: list[str] = []
+    else:
+        sudo = shutil.which("sudo")
+        if sudo is None:
+            pytest.skip("passwordless sudo is unavailable")
+        probe = subprocess.run(
+            [sudo, "--non-interactive", "true"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0:
+            pytest.skip("passwordless sudo is unavailable")
+        privilege_prefix = [sudo, "--non-interactive"]
+
+    source_directory = tmp_path / "downloaded"
+    source_directory.mkdir()
+    artifact = source_directory / "tacit_ai-1.2.3-py3-none-any.whl"
+    payload = b"descriptor-bound publisher bytes"
+    artifact.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    publication_path = tmp_path / "publication"
+    backing_directory = Path("/var/lib") / f"tacit-release-publication-test-{secrets.token_hex(12)}"
+    state_path = backing_directory.with_name(f"{backing_directory.name}.mount-authority.json")
+    driver = tmp_path / "kill_after_bind.py"
+    driver.write_text(
+        """
+import importlib.util
+import os
+import pathlib
+import signal
+import sys
+
+script, source, destination, backing, artifact, digest = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('release_snapshot_kill_probe', script)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+real_run = module._run_mount_command
+
+def kill_after_bind(command, *arguments):
+    real_run(command, *arguments)
+    if command == module._MOUNT_COMMAND and arguments[:1] == ('--bind',):
+        os.kill(os.getpid(), signal.SIGKILL)
+
+module._run_mount_command = kill_after_bind
+module.seal_publication_snapshot(
+    pathlib.Path(source),
+    pathlib.Path(destination),
+    pathlib.Path(backing),
+    [module.parse_labelled_artifact(f'wheel={artifact}={digest}')],
+    maximum=module.DEFAULT_MAXIMUM_BYTES,
+)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    killed = subprocess.run(
+        [
+            *privilege_prefix,
+            "/usr/bin/python3",
+            str(driver),
+            str(RELEASE_PUBLICATION_SNAPSHOT),
+            str(source_directory),
+            str(publication_path),
+            str(backing_directory),
+            artifact.name,
+            digest,
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert killed.returncode != 0
+    assert state_path.exists()
+    try:
+        cleanup = subprocess.run(
+            [
+                *privilege_prefix,
+                "/usr/bin/python3",
+                str(RELEASE_PUBLICATION_SNAPSHOT),
+                "unseal",
+                "--directory",
+                str(publication_path),
+                "--backing-directory",
+                str(backing_directory),
+                "--artifact-name",
+                artifact.name,
+            ],
+            cwd=Path("/var/lib"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert cleanup.returncode == 0, cleanup.stderr
+        assert state_path.exists() is False
+    finally:
+        if state_path.exists():
+            subprocess.run(
+                [
+                    *privilege_prefix,
+                    "/usr/bin/python3",
+                    str(RELEASE_PUBLICATION_SNAPSHOT),
+                    "unseal",
+                    "--directory",
+                    str(publication_path),
+                    "--backing-directory",
+                    str(backing_directory),
+                    "--artifact-name",
+                    artifact.name,
+                ],
+                cwd=Path("/var/lib"),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="mount-owner process lifetime requires Linux")
+def test_mount_mutation_cannot_outlive_its_killed_authority_process(tmp_path: Path) -> None:
+    privilege_prefix = _linux_privilege_prefix()
+    source_directory = tmp_path / "downloaded"
+    source_directory.mkdir()
+    artifact = source_directory / "tacit_ai-1.2.3-py3-none-any.whl"
+    payload = b"mount owner lifetime bytes"
+    artifact.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    publication_path = tmp_path / "publication"
+    backing_directory = Path("/var/lib") / f"tacit-release-publication-test-{secrets.token_hex(12)}"
+    state_path = backing_directory.with_name(f"{backing_directory.name}.mount-authority.json")
+    ready_path = tmp_path / "mount-child-ready"
+    target_path = tmp_path / "mount-child-target"
+    owner_pid_path = tmp_path / "mount-owner-pid"
+    delayed_mount = tmp_path / "delayed-mount"
+    delayed_mount.write_text(
+        (
+            "#!/bin/sh\n"
+            f"printf '%s' \"$3\" > {shlex.quote(str(target_path))}\n"
+            f": > {shlex.quote(str(ready_path))}\n"
+            "sleep 1\n"
+            'exec /usr/bin/mount "$@"\n'
+        ),
+        encoding="utf-8",
+    )
+    delayed_mount.chmod(0o755)
+    driver = tmp_path / "delayed_mount_owner.py"
+    driver.write_text(
+        """
+import importlib.util
+import os
+import pathlib
+import sys
+
+script, mount_command, pid_path, source, destination, backing, artifact, digest = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('release_snapshot_live_mount_child', script)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+module._MOUNT_COMMAND = pathlib.Path(mount_command)
+pathlib.Path(pid_path).write_text(str(os.getpid()), encoding='ascii')
+module.seal_publication_snapshot(
+    pathlib.Path(source),
+    pathlib.Path(destination),
+    pathlib.Path(backing),
+    [module.parse_labelled_artifact(f'wheel={artifact}={digest}')],
+    maximum=module.DEFAULT_MAXIMUM_BYTES,
+)
+""".strip(),
+        encoding="utf-8",
+    )
+    owner = subprocess.Popen(
+        [
+            *privilege_prefix,
+            "/usr/bin/python3",
+            str(driver),
+            str(RELEASE_PUBLICATION_SNAPSHOT),
+            str(delayed_mount),
+            str(owner_pid_path),
+            str(source_directory),
+            str(publication_path),
+            str(backing_directory),
+            artifact.name,
+            digest,
+        ],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    while owner.poll() is None and not ready_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert time.monotonic() < deadline, "mount owner did not reach a terminal or mutation state"
+    child_was_started = ready_path.exists()
+    if child_was_started:
+        owner_pid = owner_pid_path.read_text(encoding="ascii")
+        subprocess.run(
+            [*privilege_prefix, "/usr/bin/kill", "-KILL", owner_pid],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    owner.communicate(timeout=10)
+    time.sleep(1.25 if child_was_started else 0)
+    mounted_targets = {
+        Path(line.split()[4].replace("\\040", " "))
+        for line in Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    }
+    late_target = Path(target_path.read_text(encoding="utf-8")) if target_path.exists() else None
+    try:
+        assert (
+            late_target is None or late_target not in mounted_targets
+        ), "a mount child committed kernel state after its journal owner was killed"
+    finally:
+        cleanup = subprocess.run(
+            [
+                *privilege_prefix,
+                "/usr/bin/python3",
+                str(RELEASE_PUBLICATION_SNAPSHOT),
+                "unseal",
+                "--directory",
+                str(publication_path),
+                "--backing-directory",
+                str(backing_directory),
+                "--artifact-name",
+                artifact.name,
+            ],
+            cwd=Path("/var/lib"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert cleanup.returncode == 0, cleanup.stderr
+        assert state_path.exists() is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="descriptor-bound bind mounts require Linux")
+def test_sealed_publication_bind_is_bound_to_the_prevalidated_target_descriptor(
+    tmp_path: Path,
+) -> None:
+    privilege_prefix = _linux_privilege_prefix()
+    source_directory = tmp_path / "downloaded"
+    source_directory.mkdir()
+    artifact = source_directory / "tacit_ai-1.2.3-py3-none-any.whl"
+    payload = b"descriptor-bound publisher bytes"
+    artifact.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    publication_path = tmp_path / "publication"
+    displaced_path = tmp_path / "publication-displaced"
+    backing_directory = Path("/var/lib") / f"tacit-release-publication-test-{secrets.token_hex(12)}"
+    state_path = backing_directory.with_name(f"{backing_directory.name}.mount-authority.json")
+    driver = tmp_path / "race_before_bind.py"
+    driver.write_text(
+        """
+import importlib.util
+import os
+import pathlib
+import sys
+
+script, source, destination, displaced, backing, artifact, digest = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('release_snapshot_prebind_race', script)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+real_run = module._run_mount_command
+raced = False
+
+def race_before_payload_bind(command, *arguments):
+    global raced
+    destination_path = pathlib.Path(destination)
+    backing_path = pathlib.Path(backing)
+    if (
+        not raced
+        and command == module._MOUNT_COMMAND
+        and arguments[:1] == ('--bind',)
+        and backing_path.exists()
+        and destination_path.exists()
+    ):
+        raced = True
+        os.rename(destination_path, pathlib.Path(displaced))
+        destination_path.mkdir(mode=0o700)
+    return real_run(command, *arguments)
+
+module._run_mount_command = race_before_payload_bind
+module.seal_publication_snapshot(
+    pathlib.Path(source),
+    pathlib.Path(destination),
+    pathlib.Path(backing),
+    [module.parse_labelled_artifact(f'wheel={artifact}={digest}')],
+    maximum=module.DEFAULT_MAXIMUM_BYTES,
+)
+""".strip(),
+        encoding="utf-8",
+    )
+
+    raced = subprocess.run(
+        [
+            *privilege_prefix,
+            "/usr/bin/python3",
+            str(driver),
+            str(RELEASE_PUBLICATION_SNAPSHOT),
+            str(source_directory),
+            str(publication_path),
+            str(displaced_path),
+            str(backing_directory),
+            artifact.name,
+            digest,
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        assert raced.returncode != 0, "a renamed/recreated target was accepted for publication"
+        if state_path.exists():
+            cleanup = subprocess.run(
+                [
+                    *privilege_prefix,
+                    "/usr/bin/python3",
+                    str(RELEASE_PUBLICATION_SNAPSHOT),
+                    "unseal",
+                    "--directory",
+                    str(publication_path),
+                    "--backing-directory",
+                    str(backing_directory),
+                    "--artifact-name",
+                    artifact.name,
+                ],
+                cwd=Path("/var/lib"),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert cleanup.returncode == 0, cleanup.stderr
+        assert state_path.exists() is False
+        assert backing_directory.exists() is False
+        assert displaced_path.exists() is False
+        assert publication_path.is_dir()
+    finally:
+        cleanup_script = (
+            "import pathlib,subprocess,sys; "
+            "paths=[pathlib.Path(value) for value in sys.argv[1:]]; "
+            "mounts=[]; "
+            "lines=pathlib.Path('/proc/self/mountinfo').read_text().splitlines(); "
+            "mounts.extend(pathlib.Path(line.split()[4].replace('\\\\040',' ')) for line in lines "
+            "if any(pathlib.Path(line.split()[4].replace('\\\\040',' ')) == path for path in paths)); "
+            "[subprocess.run(['/usr/bin/umount','--',str(path)],check=False) for path in reversed(mounts)]; "
+            "[path.rmdir() for path in paths if path.exists() and path.is_dir() and not any(path.iterdir())]"
+        )
+        subprocess.run(
+            [
+                *privilege_prefix,
+                "/usr/bin/python3",
+                "-c",
+                cleanup_script,
+                str(publication_path),
+                str(displaced_path),
+                str(backing_directory),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if state_path.exists():
+            subprocess.run(
+                [*privilege_prefix, "/usr/bin/rm", "-f", "--", str(state_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="release rollback journaling requires Linux mounts")
+def test_sealed_publication_recovers_death_after_emergency_unmount_before_commit(
+    tmp_path: Path,
+) -> None:
+    privilege_prefix = _linux_privilege_prefix()
+    source_directory = tmp_path / "downloaded"
+    source_directory.mkdir()
+    artifact = source_directory / "tacit_ai-1.2.3-py3-none-any.whl"
+    payload = b"emergency rollback publication bytes"
+    artifact.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    publication_path = tmp_path / "publication"
+    backing_directory = Path("/var/lib") / f"tacit-release-publication-test-{secrets.token_hex(12)}"
+    state_path = backing_directory.with_name(f"{backing_directory.name}.mount-authority.json")
+    driver = tmp_path / "kill_after_emergency_unmount.py"
+    driver.write_text(
+        """
+import importlib.util
+import os
+import pathlib
+import sys
+
+script, source, destination, backing, artifact, digest = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('release_snapshot_emergency_unmount', script)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+real_run = module._run_mount_command
+
+def fail_hardening_then_die_after_unmount(command, *arguments):
+    if command == module._MOUNT_COMMAND and arguments[:1] == ('-o',):
+        raise module.PublicationSnapshotError('injected hardening failure')
+    result = real_run(command, *arguments)
+    if command == module._UMOUNT_COMMAND:
+        os._exit(91)
+    return result
+
+module._run_mount_command = fail_hardening_then_die_after_unmount
+module.seal_publication_snapshot(
+    pathlib.Path(source),
+    pathlib.Path(destination),
+    pathlib.Path(backing),
+    [module.parse_labelled_artifact(f'wheel={artifact}={digest}')],
+    maximum=module.DEFAULT_MAXIMUM_BYTES,
+)
+""".strip(),
+        encoding="utf-8",
+    )
+    killed = subprocess.run(
+        [
+            *privilege_prefix,
+            "/usr/bin/python3",
+            str(driver),
+            str(RELEASE_PUBLICATION_SNAPSHOT),
+            str(source_directory),
+            str(publication_path),
+            str(backing_directory),
+            artifact.name,
+            digest,
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert killed.returncode == 91
+    assert state_path.exists()
+
+    cleanup = subprocess.run(
+        [
+            *privilege_prefix,
+            "/usr/bin/python3",
+            str(RELEASE_PUBLICATION_SNAPSHOT),
+            "unseal",
+            "--directory",
+            str(publication_path),
+            "--backing-directory",
+            str(backing_directory),
+            "--artifact-name",
+            artifact.name,
+        ],
+        cwd=Path("/var/lib"),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert cleanup.returncode == 0, cleanup.stderr
+    assert state_path.exists() is False
+    assert backing_directory.exists() is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="release backing recovery requires Linux")
+@pytest.mark.parametrize("failure_phase", ["after_mkdir", "during_copy"])
+def test_sealed_publication_recovers_process_death_during_backing_creation(
+    tmp_path: Path,
+    failure_phase: str,
+) -> None:
+    privilege_prefix = _linux_privilege_prefix()
+    source_directory = tmp_path / "downloaded"
+    source_directory.mkdir()
+    artifact = source_directory / "tacit_ai-1.2.3-py3-none-any.whl"
+    payload = b"partial backing publication bytes"
+    artifact.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    publication_path = tmp_path / "publication"
+    backing_directory = Path("/var/lib") / f"tacit-release-publication-test-{secrets.token_hex(12)}"
+    state_path = backing_directory.with_name(f"{backing_directory.name}.mount-authority.json")
+    driver = tmp_path / "kill_during_backing.py"
+    driver.write_text(
+        """
+import importlib.util
+import os
+import pathlib
+import sys
+
+script, source, destination, backing, artifact, digest, failure_phase = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('release_snapshot_backing_kill', script)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+backing_path = pathlib.Path(backing)
+
+if failure_phase == 'after_mkdir':
+    real_mkdir = pathlib.Path.mkdir
+    def kill_after_mkdir(self, *args, **kwargs):
+        result = real_mkdir(self, *args, **kwargs)
+        if self == backing_path:
+            os._exit(92)
+        return result
+    pathlib.Path.mkdir = kill_after_mkdir
+else:
+    def kill_during_copy(_source, target, **_kwargs):
+        temporary = target.parent / f'.{target.name}.interrupted.tmp'
+        temporary.write_bytes(b'partial payload')
+        os.fsync(os.open(temporary, os.O_RDONLY))
+        os._exit(93)
+    module.copy_verified_payload = kill_during_copy
+
+module.seal_publication_snapshot(
+    pathlib.Path(source),
+    pathlib.Path(destination),
+    backing_path,
+    [module.parse_labelled_artifact(f'wheel={artifact}={digest}')],
+    maximum=module.DEFAULT_MAXIMUM_BYTES,
+)
+""".strip(),
+        encoding="utf-8",
+    )
+    killed = subprocess.run(
+        [
+            *privilege_prefix,
+            "/usr/bin/python3",
+            str(driver),
+            str(RELEASE_PUBLICATION_SNAPSHOT),
+            str(source_directory),
+            str(publication_path),
+            str(backing_directory),
+            artifact.name,
+            digest,
+            failure_phase,
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert killed.returncode == (92 if failure_phase == "after_mkdir" else 93)
+    assert state_path.exists()
+
+    cleanup = subprocess.run(
+        [
+            *privilege_prefix,
+            "/usr/bin/python3",
+            str(RELEASE_PUBLICATION_SNAPSHOT),
+            "unseal",
+            "--directory",
+            str(publication_path),
+            "--backing-directory",
+            str(backing_directory),
+            "--artifact-name",
+            artifact.name,
+        ],
+        cwd=Path("/var/lib"),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert cleanup.returncode == 0, cleanup.stderr
+    assert state_path.exists() is False
+    assert backing_directory.exists() is False
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="read-only bind mounts are a Linux publication boundary")
@@ -3364,7 +5357,7 @@ def test_sealed_publication_path_rejects_same_uid_directory_rename_recreate_race
         cleanup = subprocess.run(
             [
                 *privilege_prefix,
-                sys.executable,
+                "/usr/bin/python3",
                 str(RELEASE_PUBLICATION_SNAPSHOT),
                 "unseal",
                 "--directory",
@@ -3374,7 +5367,7 @@ def test_sealed_publication_path_rejects_same_uid_directory_rename_recreate_race
                 "--artifact-name",
                 artifact.name,
             ],
-            cwd=tmp_path,
+            cwd=Path("/var/lib"),
             check=False,
             capture_output=True,
             text=True,
@@ -3583,7 +5576,7 @@ for candidate in pathlib.Path('/var/lib').glob(backing.name + '*'):
         cleanup = subprocess.run(
             [
                 *privilege_prefix,
-                sys.executable,
+                "/usr/bin/python3",
                 str(RELEASE_PUBLICATION_SNAPSHOT),
                 "unseal",
                 "--directory",
@@ -3593,7 +5586,7 @@ for candidate in pathlib.Path('/var/lib').glob(backing.name + '*'):
                 "--artifact-name",
                 artifact_name,
             ],
-            cwd=workspace,
+            cwd=Path("/var/lib"),
             check=False,
             capture_output=True,
             text=True,
@@ -3717,7 +5710,7 @@ def test_sealed_publication_path_neutralizes_shared_mount_propagation() -> None:
         cleanup = subprocess.run(
             [
                 *privilege_prefix,
-                sys.executable,
+                "/usr/bin/python3",
                 str(RELEASE_PUBLICATION_SNAPSHOT),
                 "unseal",
                 "--directory",
@@ -3727,7 +5720,7 @@ def test_sealed_publication_path_neutralizes_shared_mount_propagation() -> None:
                 "--artifact-name",
                 artifact_name,
             ],
-            cwd=workspace,
+            cwd=Path("/var/lib"),
             check=False,
             capture_output=True,
             text=True,

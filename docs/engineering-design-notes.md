@@ -135,14 +135,22 @@ the ownership boundary is not ready for implementation.
 
 Result publication must reflect the ownership transaction. An unadopted product
 stays in worker escrow with capacity charged until a named durable owner adopts
-it or the worker retires it. Validation and service-owner adoption are distinct realization
-phases; only successful completion of the explicit adoption phase changes result
-publication order. The realizing worker then releases its permit before exposing
-the adopted product to a public accessor. Tests delay permit release deliberately; scheduler
-speed is not proof of settled ownership. Permit release is itself a terminal
-boundary: if it fails, fence the runtime and settle the accessor with bounded
-failure metadata. Never leave publication waiting on an exception that escaped
-the worker.
+it or the worker retires it. Validation and service-owner adoption are distinct
+realization phases; only successful completion of the explicit adoption phase
+changes result publication order. The realizing worker then releases its permit
+before exposing the adopted product to a public accessor. Tests delay permit
+release deliberately; scheduler speed is not proof of settled ownership. Permit
+release is itself a terminal boundary: if it fails, fence the runtime and settle
+the accessor with bounded failure metadata. Never leave publication waiting on
+an exception that escaped the worker. Deferred transport publication is still
+executable worker work: its permit and active-worker record remain charged while
+a paused or dead requester loop is detected, the result is handed off or retired,
+and the worker reaches its terminal transition. Delivery acknowledgement only
+opens the claim handshake. Requester cancellation or `GeneratorExit` before the
+worker's post-release ownership commit retires the escrowed product; after that
+commit, cancellation is deferred through finalization and the committed result
+is returned. A separate finalization acknowledgement prevents the public call
+from returning before permit release succeeds.
 
 Do not claim that an already-started `asyncio.Task` can be moved off its event
 loop. Retaining such a task keeps its capacity charged and final root drain must
@@ -250,10 +258,11 @@ Tenant selection is a data boundary, not request decoration.
   before tenant resolution, runtime-root acquisition, or queue admission.
   Framework validation errors use a bounded sanitized representation that omits
   attacker-controlled input and context, so deep invalid JSON remains a client
-  error rather than a recursive encoder failure. After eager buffering has transferred into
-  that bounded representation, response start is the disposal boundary: discard
-  any pending replay and release the ingress lease before a long-lived response
-  continues. One
+  error rather than a recursive encoder failure. After eager buffering has
+  transferred into that bounded representation, response start discards only
+  the pending middleware replay. Keep the ingress lease charged until the ASGI
+  application and any streaming response terminate because framework request
+  and decoded-body caches can retain the payload for that lifetime. One
   absolute read deadline covers eager bodies plus lazy reads of unframed `GET`
   and `HEAD` requests. Every
   cancellation, timeout, disconnect, saturation, and downstream failure releases
@@ -630,11 +639,14 @@ can guarantee instead of claiming strict atomic publication.
   Bound and checksum the first portable archive, then upload that authoritative
   archive before invoking any downloader-managed scanner. A separate read-only
   job verifies the checksum, scans a disposable copy, and cannot replace the
-  authoritative archive or its checksum. Publication downloads and verifies the original pre-scan artifact
-  and loads it without a second image build. The complete architecture manifest
-  digest approved by both independent builds travels with that archive and must
-  equal the digest observed after the staging push; matching only the image
-  config digest is insufficient publication identity.
+  authoritative archive or its checksum. Publication downloads and verifies
+  the original pre-scan artifact and loads it without a second image build.
+  Docker archive loading reconstructs a registry manifest with a different
+  encoding, so the BuildKit digest is not compared to the post-push digest.
+  Instead, reproducibility is established by the two clean BuildKit digests,
+  the pushed config is bound to the scanned archive, and the registry-observed
+  manifest digest becomes the pinned child identity used by the immutable
+  multi-architecture index.
 - CI, container, binary, and package builds reject a stale `uv.lock`. The PEP
   517 backend has a separately committed, hash-pinned closure generated from
   that lock; wheel smoke tests install locked runtime dependencies before the
@@ -1539,6 +1551,10 @@ governed mapping that the selected snapshot cannot safely mark as applied.
   adoption. Validation rejection, caller cancellation, or requester-loop loss
   before adoption leaves cleanup with that same runtime and worker owner. Its
   permit is released only after cleanup returns.
+- Result delivery acknowledgment is not ownership transfer. It only lets the
+  worker complete and release its permit; the requester claims the escrowed
+  product after that settlement, while cancellation, `GeneratorExit`, or loop
+  loss before the claim still retires it.
 - Adoption does not stop at the worker future. Accepted provider generations
   transfer atomically into the runtime execution graph. API, Slack, CLI, and
   direct bundles sharing an admission namespace resolve the same generation;
@@ -1635,10 +1651,23 @@ governed mapping that the selected snapshot cannot safely mark as applied.
   successful release and before later publish or persistence work. A subsequent
   failure may still close backend authority, but cannot release that provider
   generation twice. If primary work and cleanup both fail, the primary exception
-  remains the cause and only bounded cleanup phase/type metadata is attached.
+  remains the cause and only bounded cleanup phase/type metadata is attached. A
+  completed cross-thread cleanup future is only transport state; the owner loop
+  remains live until its owner-local callback commits cleanup success or failure.
+  Provider-driven backend release also treats its composite-release mutex as a
+  foreign boundary: it probes without blocking and shares one delayed retry per
+  backend lease while the service-owner capacity remains charged.
+  Submission settlement must hold provider-manager authority while it releases
+  admission and commits operation, handoff, and submission state; contention
+  retries before either boundary changes. Owner terminal monitoring uses only
+  nonblocking probes of requester-reachable locks and retries without stalling
+  the service loop.
 - The blocking Bedrock bridge is narrower still: credential realization,
   client construction, `converse`, parsing, and cleanup all occur in one worker,
   and no SDK product is adopted by another loop.
+- Public async LLM helpers without an injected provider compose a temporary
+  lifecycle-owned provider generation. They never construct an SDK client on
+  the caller loop and retire the provider and runtime root before returning.
 
 These guarantees contain the blocking compatibility path and establish the
 provider and backend async resource manager. They do not make arbitrary
@@ -1826,6 +1855,12 @@ capacity nor manufacture a scheduling partition.
   modules. Immediately before GitHub publication, the protected tag is fetched
   again and must still name the authorized SHA; prerelease and latest-channel
   metadata are explicit.
+- Publisher execution authority extends through indirection. A remote action
+  commit that generates a Docker action from a mutable commit tag is not an
+  immutable execution chain; repository-local metadata must name the reviewed
+  container manifest digest directly. Binary publication descriptors likewise
+  scan a dedicated directory containing only the archive and checksum rather
+  than a job root that also contains checkouts and build trees.
 - Every checksum-verified authoritative OCI architecture is executed before it
   can be uploaded or published. The smoke runs as the image's non-root user
   with a read-only root, bounded tmpfs, and writable data volume; it checks the
@@ -1843,7 +1878,10 @@ capacity nor manufacture a scheduling partition.
   other release installers stay outside the Docker context, while image smoke
   rejects release tooling beneath `/app`. Every Docker probe has a deterministic name before submission;
   ambiguous CLI outcomes trigger unconditional cleanup and absence checks for
-  all attempted containers and volumes. Cleanup failure fails the release. The
+  all attempted containers and volumes. Cleanup failure fails the release.
+  Machine-readable probe stdout is captured separately from bounded stderr
+  diagnostics so Docker or emulation warnings cannot corrupt structured
+  inspection responses, while both streams remain available on failure. The
   final GitHub publisher is pinned to a maintained Node 24 action and preserves
   no-overwrite partial-retry behavior.
 - Process health reads the existing runtime admission controller without
@@ -1970,9 +2008,19 @@ capacity nor manufacture a scheduling partition.
   the first bind, keep each new anchor non-shared before descending, and reject
   any recorded authority that is shared. Accepting one ID from a propagated
   mount stack leaves hidden authority behind. Tests must use a real shared peer,
-  race the real publisher pathname, and inspect the
-  action input. Helper-only checksum or source-replacement tests do not prove
-  what an action uploads.
+  race the real publisher pathname, and inspect the action input. The privileged
+  cleanup launcher must change to a root-controlled working directory and use an
+  interpreter outside every pinned action-path mount; otherwise the launcher or
+  interpreter itself keeps the mount busy and cleanup cannot establish terminal
+  zero. The program executed with privilege is installed and checksum-verified
+  in a root-owned directory before publisher actions begin; later cleanup never
+  executes workspace source. Destructive cleanup is a journaled state machine:
+  persist intent, mutate one mount or directory, then persist completion, leaving
+  the authority record until terminal mount zero. A newly created bind records
+  its kernel mount ID before propagation and option hardening, and a failed
+  emergency unmount keeps that record for resumable cleanup. Tests must use the same
+  external-launch boundary and inject failure after every destructive phase.
+  Helper-only checksum or source-replacement tests do not prove what an action uploads.
 - A read-only publication snapshot is also a write contract for the publisher.
   Disable action features that create adjacent files, including PyPI attestation
   sidecars, unless those outputs are produced and authorized before mounting the
@@ -1993,12 +2041,34 @@ capacity nor manufacture a scheduling partition.
   runtime-fatal fence lands. Cache adoption is likewise provisional while its
   initialization handoff remains active, and every construction or group-
   rollback permit uses this same release boundary.
-- Release publication currently records mount authority only after the complete
-  anchor set is sealed. The privileged sealer fails closed and CI runners are
-  ephemeral, so a crash-durable provisional mount journal is not required for
-  the current hosted release lane. Add one before supporting persistent or
-  self-hosted publishers where process death must be recoverable without runner
-  disposal.
+- Release publication records a provisional bind intent before each kernel mount
+  and replaces it with the exact mount identity before hardening continues. A
+  restart recovers only an unambiguous mount created after that intent, validates
+  its backing identity, and resumes the same journaled cleanup path. The sealed
+  root-owned publication tool has its own install/remove authority manifest; the
+  main cleanup program is installed first and deleted last so process death does
+  not erase the code required to finish cleanup.
+- The publication authority process owns kernel mount mutation directly. It
+  opens and validates source and target directories first, journals their
+  identities, and invokes Linux mount syscalls through `/proc/self/fd` handles;
+  spawning `mount` creates an uncloseable window in which a child can commit
+  after its journal owner dies. Post-bind propagation and remount use the
+  mountinfo-resolved path because an `O_PATH` descriptor retains the underlying
+  pre-mount view. Kernel mountpoints are rename-busy at that point. Emergency
+  rollback uses the ordinary pending-unmount journal before mutation. Backing
+  `creating`, `copying`, `ready`, `removing`, and `removed` phases belong to the
+  same authority record, including one pending artifact copy and its bounded
+  temporary-name pattern; cleanup never interprets arbitrary partial contents.
+  The first authority write is atomically create-only. Destination `mkdir` has
+  a durable pre-intent, and cleanup retains the kernel-resolved mountpoint path
+  so a displaced target remains recoverable after another process death. Tool
+  installation is rollback-safe while incomplete: only the two fixed script
+  names and their fixed `.next` files can be removed. The always-run workflow
+  uses `exec` for the root-owned cleanup launcher, preventing Bash's script
+  descriptor from retaining the workspace mount. BuildKit reproducibility and
+  registry publication use different manifest encodings for Docker archives;
+  compare clean BuildKit digests before upload, verify the pushed image's config
+  against the scanned archive, and then pin the actual registry manifest digest.
 
 ## Validation expectations
 

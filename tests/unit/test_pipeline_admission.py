@@ -432,6 +432,7 @@ async def test_maintenance_start_failure_reclaims_stopped_loop_selection_and_pre
             assert await asyncio.to_thread(worker_stopped.wait, 1) is True
             await asyncio.wait_for(asyncio.gather(*live_waiters), timeout=1)
             assert maintenance_start_attempts == 2
+            await _wait_for_admission_maintenance_exit(controller)
     finally:
         allow_stop.set()
         worker_thread.join(1)
@@ -452,7 +453,6 @@ async def test_maintenance_start_failure_reclaims_stopped_loop_selection_and_pre
 
         await asyncio.to_thread(drain_and_close_worker_loop)
 
-    await _wait_for_admission_maintenance_exit(controller)
     assert admitted == ["tenant-b", "tenant-c"]
     assert controller.in_flight == 0
     assert controller.queued == 0

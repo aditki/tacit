@@ -544,6 +544,44 @@ async def test_committed_publish_finishes_after_caller_cancellation():
     assert second.publish_calls == 1
 
 
+async def test_committed_publish_propagates_terminal_publish_task_cancellation(monkeypatch):
+    runtime_settings = Settings(_env_file=None)
+
+    class SelfCancellingBackend(_OwnedPublishingBackend):
+        async def publish(self, dashboard_spec: DashboardSpec) -> PublishResult:
+            self.publish_calls += 1
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+            raise AssertionError("cancelled publication task resumed")
+
+    backend = SelfCancellingBackend("grafana", runtime_settings)
+    real_shield = asyncio.shield
+    shield_calls = 0
+
+    async def bounded_shield(task):
+        nonlocal shield_calls
+        shield_calls += 1
+        if shield_calls > 1:
+            raise AssertionError("terminally cancelled publication was retried")
+        return await real_shield(task)
+
+    monkeypatch.setattr(asyncio, "shield", bounded_shield)
+
+    with pytest.raises(asyncio.CancelledError):
+        await publish_dashboard(
+            backends=[backend],
+            dashboard_spec=_dashboard(),
+            timings={},
+            runtime_settings=runtime_settings,
+            preserve_commit_on_cancellation=True,
+        )
+
+    assert shield_calls == 1
+    assert backend.publish_calls == 1
+
+
 def test_compilation_usage_keeps_only_governed_queries_that_survive_validation():
     kept_query = PanelQuery(
         expr="kept_metric",
@@ -1506,7 +1544,6 @@ async def test_isolated_intent_stage_never_consults_process_global_providers(mon
     def forbidden_global_provider():
         raise AssertionError("isolated stage consulted a process-global provider")
 
-    monkeypatch.setattr("tacit.agents.llm.get_provider", forbidden_global_provider)
     monkeypatch.setattr("tacit.context.enrichment.get_context_provider", forbidden_global_provider)
 
     async def classify(_prompt: str, *, provider=None, runtime_settings=None):

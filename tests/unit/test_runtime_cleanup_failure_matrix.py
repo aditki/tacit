@@ -1400,7 +1400,7 @@ async def test_abandoned_result_cleanup_failure_fatal_fences_runtime_and_drains_
     assert await asyncio.to_thread(factory_started.wait, 1), "product realization did not start"
     release_factory.set()
     time.sleep(0.05)
-    with pytest.raises(RuntimeError, match="transport expired before adoption") as first_error:
+    with pytest.raises(RuntimeOwnershipError, match="cleanup failed") as first_error:
         await task
     observer.join(timeout=1)
     assert not observer.is_alive()
@@ -1411,11 +1411,13 @@ async def test_abandoned_result_cleanup_failure_fatal_fences_runtime_and_drains_
 
     assert _PRIMARY_SECRET not in repr(first_error.value)
     assert _CLEANUP_SECRET not in repr(first_error.value)
-    assert observed_capacity == [(0, 0, 0, 1)]
+    assert isinstance(first_error.value.__cause__, RuntimeError)
+    assert "transport expired before adoption" in str(first_error.value.__cause__)
+    assert observed_capacity == [(1, 1, 1, 1)]
     assert close_calls == 1
     assert lifecycle.product_ref is not None
     assert lifecycle.product_ref() is None
-    assert lifecycle.release_observations == [(False, False)]
+    assert lifecycle.release_observations == [(True, True)]
     assert blocking_work.active == 0
     _assert_runtime_capacity(
         lifecycle,

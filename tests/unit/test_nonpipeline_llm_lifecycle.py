@@ -12,6 +12,7 @@ import pytest
 from click.testing import CliRunner
 
 from tacit import cli as cli_module
+from tacit.agents.llm import call_llm_text
 from tacit.agents.providers import registry
 from tacit.agents.providers.base import LLMProvider, LLMResult
 from tacit.agents.providers.http_transport import LLMSDKHTTPClientConstruction
@@ -19,6 +20,7 @@ from tacit.config import Settings
 from tacit.dependencies import (
     PipelineDependencies,
     build_pipeline_dependencies,
+    managed_async_nonpipeline_llm_provider,
     managed_nonpipeline_llm_provider,
 )
 from tacit.errors import RuntimeOwnershipError
@@ -179,6 +181,29 @@ def _dependencies(
     return build_pipeline_dependencies(runtime_settings, stores=stores)
 
 
+@pytest.mark.asyncio
+async def test_public_async_llm_helper_uses_lifecycle_owned_implicit_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_settings = _settings(tmp_path, "openai")
+    observations: dict[str, Any] = {}
+    _install_probe_factory(monkeypatch, runtime_settings, observations)
+
+    text, _usage = await call_llm_text(
+        "system",
+        "user",
+        runtime_settings=runtime_settings,
+    )
+
+    assert text == "Assessment narrative"
+    assert observations["construction_loops"] == [None]
+    assert observations["construction_threads"] != [threading.get_ident()]
+    assert observations["used"] == observations["providers"]
+    assert observations["closed"] == observations["providers"]
+    assert observations["use_threads"] == observations["close_threads"]
+
+
 @pytest.mark.parametrize("provider_name", _OWNER_MANAGED_PROVIDERS)
 def test_external_validation_uses_one_owner_realized_provider(
     provider_name: str,
@@ -189,7 +214,6 @@ def test_external_validation_uses_one_owner_realized_provider(
     observations: dict[str, Any] = {}
     _install_probe_factory(monkeypatch, runtime_settings, observations)
     stores = RuntimeStores(runtime_settings)
-    monkeypatch.setattr("tacit.agents.llm.get_provider", lambda: pytest.fail("global provider used"))
 
     exit_code = validate.main(
         [str(_case_file(tmp_path)), "--mode", "archetype", "--state", "external"],
@@ -293,6 +317,84 @@ def test_nonpipeline_owner_releases_runtime_when_acquire_fails(
         with managed_nonpipeline_llm_provider(runtime_settings, dependencies=dependencies):
             pytest.fail("acquire failure yielded a provider")
 
+    assert observations.get("providers", []) == []
+    _assert_runtime_released(stores)
+
+
+@pytest.mark.asyncio
+async def test_async_nonpipeline_failed_nested_acquisition_preserves_outer_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_settings = _settings(tmp_path, "openai")
+    observations: dict[str, Any] = {}
+    _install_probe_factory(monkeypatch, runtime_settings, observations)
+    stores = RuntimeStores(runtime_settings)
+    dependencies = _dependencies(runtime_settings, stores)
+    root_handle = dependencies.start_runtime_root()
+    assert root_handle is not None
+    outer_lease = await dependencies.acquire_resources()
+    assert outer_lease is not None
+    owner = dependencies.provider_lifecycle_owner
+    assert owner is not None
+
+    async def fail_nested_acquire(self: PipelineDependencies) -> Any:
+        assert self is dependencies
+        raise RuntimeError("synthetic nested provider acquire failure")
+
+    try:
+        with monkeypatch.context() as patch_context:
+            patch_context.setattr(PipelineDependencies, "acquire_resources", fail_nested_acquire)
+            with pytest.raises(RuntimeError, match="nested provider acquire failure"):
+                async with managed_async_nonpipeline_llm_provider(
+                    runtime_settings,
+                    dependencies=dependencies,
+                ):
+                    pytest.fail("failed nested acquisition yielded a provider")
+
+        with owner._lock:
+            assert outer_lease.lease_id in owner._active_leases
+    finally:
+        with owner._lock:
+            outer_active = outer_lease.lease_id in owner._active_leases
+        if outer_active:
+            await dependencies.close_resources(outer_lease)
+        await dependencies.stop_runtime_root(root_handle)
+
+    assert observations["closed"] == observations["providers"]
+    _assert_runtime_released(stores)
+
+
+def test_sync_nonpipeline_failed_acquisition_never_requests_ambient_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_settings = _settings(tmp_path, "openai")
+    observations: dict[str, Any] = {}
+    _install_probe_factory(monkeypatch, runtime_settings, observations)
+    stores = RuntimeStores(runtime_settings)
+    dependencies = _dependencies(runtime_settings, stores)
+    cleanup_handles: list[Any] = []
+
+    async def fail_acquire(self: PipelineDependencies) -> Any:
+        assert self is dependencies
+        raise RuntimeError("synthetic provider acquire failure")
+
+    async def observe_cleanup(
+        self: PipelineDependencies,
+        handle: Any = None,
+    ) -> None:
+        assert self is dependencies
+        cleanup_handles.append(handle)
+
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(PipelineDependencies, "acquire_resources", fail_acquire)
+        patch_context.setattr(PipelineDependencies, "close_resources", observe_cleanup)
+        with pytest.raises(RuntimeError, match="provider acquire failure"):
+            with managed_nonpipeline_llm_provider(runtime_settings, dependencies=dependencies):
+                pytest.fail("failed acquisition yielded a provider")
+
+    assert cleanup_handles == []
     assert observations.get("providers", []) == []
     _assert_runtime_released(stores)
 
