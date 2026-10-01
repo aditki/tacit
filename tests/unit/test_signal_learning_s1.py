@@ -8,7 +8,6 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 from structlog.testing import capture_logs
 
 import tacit.signals.store as signal_store_module
@@ -20,6 +19,7 @@ from tacit.models.schemas import MetricEntry
 from tacit.pagination import encode_cursor
 from tacit.signals import SignalStore
 from tacit.signals import migrations as signal_migrations
+from tests.http_client import TestClient
 
 _SQLITE_MIN_ID = -(2**63)
 _SQLITE_MAX_ID = 2**63 - 1

@@ -108,7 +108,9 @@ async def publish_dashboard(
         try:
             return await asyncio.shield(publish_task)
         except asyncio.CancelledError:
-            publication_state.cancellation_requested = True
             current_task = asyncio.current_task()
-            if current_task is not None:
+            if current_task is not None and current_task.cancelling():
+                publication_state.cancellation_requested = True
                 current_task.uncancel()
+            if publish_task.done():
+                return publish_task.result()

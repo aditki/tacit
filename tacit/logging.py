@@ -100,5 +100,8 @@ def configure_logging(log_level: str = "INFO") -> None:
         wrapper_class=structlog.make_filtering_bound_logger(level),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(),
-        cache_logger_on_first_use=True,
+        # App factories and test/runtime embeddings may reconfigure logging in
+        # one process. Caching here pins already-used module loggers to the old
+        # renderer and level, so keep each proxy bound to the active config.
+        cache_logger_on_first_use=False,
     )

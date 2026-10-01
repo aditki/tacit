@@ -572,7 +572,7 @@ def test_json_repair_path_reraises_transient_errors():
     """When the LLM repair call hits a transient error (timeout, 429),
     it must raise LLMTransientError so tenacity retries, not LLMParseError."""
     import asyncio
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import AsyncMock, MagicMock
 
     from pydantic import BaseModel
 
@@ -604,22 +604,19 @@ def test_json_repair_path_reraises_transient_errors():
     call_llm.retry.wait = wait_none()
 
     try:
-        with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
-            try:
-                asyncio.run(call_llm("sys", "user", Simple))
-                assert False, "Should have raised"
-            except RetryError as re:
-                # tenacity wraps the last exception — it must be LLMTransientError
-                last = re.last_attempt.exception()
-                assert isinstance(last, LLMTransientError), (
-                    f"Expected LLMTransientError inside RetryError, " f"got {type(last).__name__}: {last}"
-                )
-            except LLMTransientError:
-                pass  # also acceptable
-            except Exception as exc:
-                assert False, (
-                    f"Expected LLMTransientError for transient repair failure, " f"got {type(exc).__name__}: {exc}"
-                )
+        try:
+            asyncio.run(call_llm("sys", "user", Simple, provider=mock_provider))
+            assert False, "Should have raised"
+        except RetryError as re:
+            # tenacity wraps the last exception — it must be LLMTransientError
+            last = re.last_attempt.exception()
+            assert isinstance(
+                last, LLMTransientError
+            ), f"Expected LLMTransientError inside RetryError, got {type(last).__name__}: {last}"
+        except LLMTransientError:
+            pass  # also acceptable
+        except Exception as exc:
+            assert False, f"Expected LLMTransientError for transient repair failure, got {type(exc).__name__}: {exc}"
         # All 3 attempts should have been made (6 chat_json calls = 3 primary + 3 repair)
         assert (
             mock_provider.chat_json.call_count == 6
@@ -761,7 +758,7 @@ def test_provider_sdk_transient_error_in_repair_retried():
     OpenAI RateLimitError), it must be classified as LLMTransientError
     so tenacity retries, not swallowed as LLMParseError."""
     import asyncio
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import AsyncMock, MagicMock
 
     from pydantic import BaseModel
     from tenacity import RetryError, wait_none
@@ -797,21 +794,18 @@ def test_provider_sdk_transient_error_in_repair_retried():
     call_llm.retry.wait = wait_none()
 
     try:
-        with patch("tacit.agents.llm.get_provider", return_value=mock_provider):
-            try:
-                asyncio.run(call_llm("sys", "user", Simple))
-                assert False, "Should have raised"
-            except RetryError as re:
-                last = re.last_attempt.exception()
-                assert isinstance(last, LLMTransientError), (
-                    f"Expected LLMTransientError (retryable), " f"got {type(last).__name__}: {last}"
-                )
-            except LLMTransientError:
-                pass  # also acceptable
-            except Exception as exc:
-                assert False, (
-                    f"Provider SDK rate-limit error should be LLMTransientError, " f"got {type(exc).__name__}: {exc}"
-                )
+        try:
+            asyncio.run(call_llm("sys", "user", Simple, provider=mock_provider))
+            assert False, "Should have raised"
+        except RetryError as re:
+            last = re.last_attempt.exception()
+            assert isinstance(
+                last, LLMTransientError
+            ), f"Expected LLMTransientError (retryable), got {type(last).__name__}: {last}"
+        except LLMTransientError:
+            pass  # also acceptable
+        except Exception as exc:
+            assert False, f"Provider SDK rate-limit error should be LLMTransientError, got {type(exc).__name__}: {exc}"
         assert (
             mock_provider.chat_json.call_count == 6
         ), f"Expected 6 calls (3 attempts × 2), got {mock_provider.chat_json.call_count}"

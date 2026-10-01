@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from tacit.signals.schema import GLOBAL_BOOTSTRAP_TENANT_ID
+
+if TYPE_CHECKING:
+    from tacit.agents.providers.base import LLMProvider
 
 logger = structlog.get_logger()
 
@@ -489,7 +492,11 @@ def build_assessment(
     return report
 
 
-async def narrate_assessment(report: dict[str, Any]) -> str:
+async def narrate_assessment(
+    report: dict[str, Any],
+    *,
+    provider: LLMProvider,
+) -> str:
     """Optional LLM enrichment: what does this mean, what to look at first."""
     from tacit.agents.llm import call_llm_text
 
@@ -501,5 +508,9 @@ async def narrate_assessment(report: dict[str, Any]) -> str:
         "next action the team should take. Be concrete and reference the "
         "numbers. No markdown headers, no bullet symbols other than dashes."
     )
-    narrative, _usage = await call_llm_text(system_prompt, json.dumps(report, default=str))
+    narrative, _usage = await call_llm_text(
+        system_prompt,
+        json.dumps(report, default=str),
+        provider=provider,
+    )
     return narrative

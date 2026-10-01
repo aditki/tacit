@@ -16,6 +16,15 @@ When the same missing invariant appears in two paths, stop local patching. Updat
 the matrix, enumerate the complete owner/entry-point set, and implement one
 shared boundary before resuming feature work.
 
+For work that crosses event loops, worker threads, subprocesses, or runtime
+instances, complete the cross-runtime lifecycle design gate in
+`docs/foundation-invariant-matrix.md` before editing production code. Name the
+single runtime owner, admission authority, capacity-release authority, cleanup
+owner, and behavior for cancellation and loop loss. A caller-owned event loop
+may transport a result, but it may not own worker capacity or be required for
+cleanup. If any of those owners are ambiguous or duplicated, stop and resolve
+the architecture first.
+
 When implementation or debugging exposes a recurring workaround, unclear
 ownership boundary, missing invariant, or observability gap:
 

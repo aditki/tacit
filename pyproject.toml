@@ -8,8 +8,8 @@ license = { text = "MIT" }
 dependencies = [
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.30.0",
-    "anthropic>=0.49.0",
-    "openai>=1.35.0",
+    "anthropic>=0.100.0",
+    "openai>=2.34.0",
     "httpx>=0.27.0",
     "slack-bolt>=1.19.0",
     "slack-sdk>=3.31.0",
@@ -28,12 +28,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-bedrock = ["boto3>=1.34.116"]
+bedrock = [
+    "boto3==1.43.16",
+    "botocore==1.43.16",
+]
 
 [project.scripts]
 tacit = "tacit.cli:main"
 
 [dependency-groups]
+# Keep this equal to build-system.requires. The repository invariant exports
+# its complete locked closure into the release build constraints artifact.
+release-build = ["hatchling==1.32.0"]
+# Binary jobs add this group to the runtime plus Bedrock environment without
+# installing the development group.
+release-binary = ["pyinstaller==6.22.1"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
@@ -99,5 +108,5 @@ include = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"

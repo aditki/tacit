@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 from click.testing import CliRunner
-from fastapi.testclient import TestClient
 
 import tacit.backends as backends_mod
 import tacit.cli as cli_mod
@@ -12,6 +11,7 @@ from tacit.cli import cli
 from tacit.config import Settings, settings
 from tacit.main import app
 from tacit.runtime_stores import RuntimeStores
+from tests.http_client import TestClient
 
 
 @pytest.fixture

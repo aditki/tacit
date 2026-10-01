@@ -15,6 +15,7 @@ For local demos:
 
 ```bash
 cp .env.example .env
+export API_AUTH_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 docker compose -f docker-compose.dev.yml up -d
 ```
 
@@ -36,6 +37,33 @@ docker build -t tacit:local .
 Live vendor scripts under `tests/live/` are not part of the hermetic test suite.
 Run them only against accounts and dashboards you are allowed to mutate.
 
+### Release quality evidence
+
+Public releases require clean-state and representative long-lived-state
+100-prompt evidence for the exact current `origin/main` tip. Configure an
+ephemeral, isolated self-hosted Linux x64 runner with the `release-quality`
+label and a protected `release-quality` environment. The runner must have no
+ambient cloud credentials and may expose only the intended loopback LLM and
+Grafana fixtures plus sanitized representative state.
+
+Configure these environment variables:
+
+- `RELEASE_QUALITY_LLM_URL`
+- `RELEASE_QUALITY_LLM_MODEL`
+- `RELEASE_QUALITY_GRAFANA_URL`
+- `RELEASE_QUALITY_LONG_LIVED_STATE_DIR`
+- `RELEASE_QUALITY_TENANT`
+
+Require environment reviewers, disable self-review and administrator bypass,
+and restrict deployment to `main`. Dispatch `Release Quality Evidence` from
+`main` and enter `AUTHORIZE UP TO 500 LLM REQUESTS`. Both modes need at least
+400 provider requests; one shared counter includes retries, repairs, and
+freeform calls, and refuses request 501 before external spend. The resulting
+90-day artifact records corpus, the concrete tenant, the exact logical SQLite
+snapshot and fixed size limits, model, endpoint, run, request-budget, and report
+digests. If `main` advances before every registry publication finishes,
+discard that evidence and tag and repeat from the new tip.
+
 ## Design Guidance
 
 Before cross-cutting work, read the relevant records in `docs/adr/` and the
@@ -49,6 +77,12 @@ For every cross-cutting change, list the foundations and matrix rows touched in
 the PR description. Write failing matrix and no-side-effect tests before the
 implementation. If the same missing invariant appears in two paths, stop local
 patching and introduce a shared boundary instead.
+
+Changes involving event loops, workers, subprocesses, or runtime-owned resources
+must complete the matrix's cross-runtime lifecycle design gate first. Production
+implementation starts only after the owner, admission controller, permit release,
+resource adoption, cleanup, cancellation, and scaling contracts have failing
+tests.
 
 When a change exposes reusable design pressure, update the living notes. When it
 selects a durable product or architecture direction, create or amend an ADR.

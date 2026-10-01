@@ -3,12 +3,12 @@
 Covers:
 - PanelQuery: CloudWatch fields (namespace, stat, dimensions, region)
 - Dashboard rendering: CW target JSON with region, namespace stripping, dimension normalization
-- CLI _check_llm: Bedrock assume-role mirroring
+- CLI non-Bedrock provider checks
 """
 
 import os
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -104,7 +104,7 @@ def test_dashboard_prometheus_target_no_cloudwatch_fields():
     print("[PASS] test_dashboard_prometheus_target_no_cloudwatch_fields")
 
 
-# ── CLI _check_llm bedrock assume-role tests ───────────────────────────────
+# ── CLI _check_llm tests ───────────────────────────────────────────────────
 
 
 def test_llm_zero_key_mode_only_downgrades_key_based_providers():
@@ -115,17 +115,17 @@ def test_llm_zero_key_mode_only_downgrades_key_based_providers():
         mock_settings.llm_provider = "openai"
         mock_settings.llm_api_key = ""
         mock_settings.llm_api_base = ""
-        assert _llm_zero_key_mode() is True
+        assert _llm_zero_key_mode(mock_settings) is True
 
         mock_settings.llm_api_base = "http://localhost:8001/v1"
-        assert _llm_zero_key_mode() is False
+        assert _llm_zero_key_mode(mock_settings) is False
 
         mock_settings.llm_api_base = ""
         mock_settings.llm_provider = "ollama"
-        assert _llm_zero_key_mode() is False
+        assert _llm_zero_key_mode(mock_settings) is False
 
         mock_settings.llm_provider = "bedrock"
-        assert _llm_zero_key_mode() is False
+        assert _llm_zero_key_mode(mock_settings) is False
 
 
 def test_cli_version_uses_renamed_distribution_metadata():
@@ -140,6 +140,17 @@ def test_cli_version_uses_renamed_distribution_metadata():
         assert _get_version() == "1.2.3"
 
 
+def test_cli_version_falls_back_to_packaged_tacit_version_without_metadata():
+    from tacit import __version__
+    from tacit.cli import _get_version
+
+    with (
+        patch("importlib.metadata.version", side_effect=LookupError("metadata unavailable")),
+        patch("tacit.cli.Path.exists", return_value=False),
+    ):
+        assert _get_version() == __version__
+
+
 def test_check_llm_openai_compatible_base_without_key_is_configured():
     from tacit.cli import _check_llm
 
@@ -150,89 +161,7 @@ def test_check_llm_openai_compatible_base_without_key_is_configured():
         mock_settings.llm_model = "gpt-4o-mini"
         mock_settings.intent_fallback_enabled = True
 
-        assert _check_llm() is True
-
-
-def test_check_llm_bedrock_with_role_arn_calls_assume_role():
-    """When llm_bedrock_role_arn is set, _check_llm must call sts.assume_role
-    before declaring success — not just get_caller_identity on the base session."""
-    mock_boto3 = MagicMock()
-    base_session = MagicMock()
-    assumed_session = MagicMock()
-
-    mock_sts_base = MagicMock()
-    mock_sts_base.assume_role.return_value = {
-        "Credentials": {
-            "AccessKeyId": "ASIAEXAMPLE",
-            "SecretAccessKey": "secret",
-            "SessionToken": "token",
-        }
-    }
-    base_session.client.return_value = mock_sts_base
-
-    mock_sts_assumed = MagicMock()
-    mock_sts_assumed.get_caller_identity.return_value = {"Account": "123456789012"}
-    assumed_session.client.return_value = mock_sts_assumed
-
-    mock_boto3.Session.side_effect = [base_session, assumed_session]
-
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), patch("tacit.config.settings") as mock_settings:
-        mock_settings.llm_provider = "bedrock"
-        mock_settings.llm_api_key = ""
-        mock_settings.llm_model = "claude-sonnet-4-20250514"
-        mock_settings.llm_bedrock_region = "us-east-1"
-        mock_settings.llm_aws_access_key_id = ""
-        mock_settings.llm_aws_secret_access_key = ""
-        mock_settings.llm_bedrock_role_arn = "arn:aws:iam::123456789012:role/TestRole"
-        mock_settings.llm_bedrock_model_id = ""
-
-        from tacit.cli import _check_llm
-
-        result = _check_llm()
-
-        # Must have called assume_role on the base session's STS client
-        mock_sts_base.assume_role.assert_called_once_with(
-            RoleArn="arn:aws:iam::123456789012:role/TestRole",
-            RoleSessionName="tacit-bedrock",
-            DurationSeconds=3600,
-        )
-        # get_caller_identity should be called on the ASSUMED session, not base
-        mock_sts_assumed.get_caller_identity.assert_called_once()
-        assert result is True
-
-    print("[PASS] test_check_llm_bedrock_with_role_arn_calls_assume_role")
-
-
-def test_check_llm_bedrock_bad_role_arn_returns_false():
-    """A failing assume_role should make _check_llm return False."""
-    mock_boto3 = MagicMock()
-    base_session = MagicMock()
-
-    mock_sts = MagicMock()
-    mock_sts.assume_role.side_effect = Exception(
-        "An error occurred (AccessDenied) when calling the AssumeRole operation"
-    )
-    base_session.client.return_value = mock_sts
-
-    mock_boto3.Session.return_value = base_session
-
-    with patch.dict("sys.modules", {"boto3": mock_boto3}), patch("tacit.config.settings") as mock_settings:
-        mock_settings.llm_provider = "bedrock"
-        mock_settings.llm_api_key = ""
-        mock_settings.llm_model = "claude-sonnet-4-20250514"
-        mock_settings.llm_bedrock_region = "us-east-1"
-        mock_settings.llm_aws_access_key_id = ""
-        mock_settings.llm_aws_secret_access_key = ""
-        mock_settings.llm_bedrock_role_arn = "arn:aws:iam::999999999999:role/BadRole"
-        mock_settings.llm_bedrock_model_id = ""
-
-        from tacit.cli import _check_llm
-
-        result = _check_llm()
-
-        assert result is False
-
-    print("[PASS] test_check_llm_bedrock_bad_role_arn_returns_false")
+        assert _check_llm(mock_settings) is True
 
 
 # ── Runner ─────────────────────────────────────────────────────────────────

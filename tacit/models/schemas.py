@@ -5,6 +5,14 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from tacit.models.request_limits import (
+    DASH_REQUEST_CHANNEL_ID_MAX_LENGTH,
+    DASH_REQUEST_PROMPT_MAX_LENGTH,
+    DASH_REQUEST_THREAD_TS_MAX_LENGTH,
+    DASH_REQUEST_USER_ID_MAX_LENGTH,
+)
+from tacit.tenancy import MAX_TENANT_LENGTH
+
 # ── Intent ───────────────────────────────────────────────────────────────────
 
 
@@ -800,14 +808,30 @@ class CulpritRanking(BaseModel):
 class DashRequest(BaseModel):
     """Inbound request from Slack (or HTTP)."""
 
-    prompt: str = Field(description="Natural-language description of the dashboard you need")
-    channel_id: str = Field(default="", description="Slack channel ID (set automatically by Slack integration)")
+    prompt: str = Field(
+        max_length=DASH_REQUEST_PROMPT_MAX_LENGTH,
+        description="Natural-language description of the dashboard you need",
+    )
+    channel_id: str = Field(
+        default="",
+        max_length=DASH_REQUEST_CHANNEL_ID_MAX_LENGTH,
+        description="Slack channel ID (set automatically by Slack integration)",
+    )
     user_id: str = Field(
         default="",
+        max_length=DASH_REQUEST_USER_ID_MAX_LENGTH,
         description="Caller label for direct integrations; HTTP audit identity is derived from authentication",
     )
-    thread_ts: str = Field(default="", description="Slack thread timestamp (set automatically by Slack integration)")
-    tenant_id: str = Field(default="", description="Organization scope for Operational Knowledge isolation")
+    thread_ts: str = Field(
+        default="",
+        max_length=DASH_REQUEST_THREAD_TS_MAX_LENGTH,
+        description="Slack thread timestamp (set automatically by Slack integration)",
+    )
+    tenant_id: str = Field(
+        default="",
+        max_length=MAX_TENANT_LENGTH,
+        description="Organization scope for Operational Knowledge isolation",
+    )
 
     model_config = {
         "json_schema_extra": {

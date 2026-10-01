@@ -1,0 +1,41 @@
+name: Immutable PyPI publisher
+description: Publish Python distributions with the reviewed PyPA container manifest
+inputs:
+  user:
+    description: PyPI user
+    required: false
+    default: __token__
+  password:
+    description: PyPI password or API token
+    required: false
+  repository-url:
+    description: Python package index upload endpoint
+    required: false
+    default: https://upload.pypi.org/legacy/
+  packages-dir:
+    description: Directory containing distributions
+    required: false
+    default: dist
+  verify-metadata:
+    description: Validate distribution metadata before upload
+    required: false
+    default: "true"
+  skip-existing:
+    description: Skip distributions already present in the index
+    required: false
+    default: "false"
+  verbose:
+    description: Enable verbose publisher output
+    required: false
+    default: "true"
+  print-hash:
+    description: Print distribution hashes before upload
+    required: false
+    default: "true"
+  attestations:
+    description: Generate and upload PEP 740 attestations
+    required: false
+    default: "true"
+runs:
+  using: docker
+  image: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:a68d05519f6d7e47372aeaddab80b851b69afa89be179ec41775c72c4e3ab2d5

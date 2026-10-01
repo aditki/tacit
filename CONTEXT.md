@@ -541,12 +541,16 @@ tacit test
 tacit serve
 tacit serve --port 9000 --reload  # dev mode
 tacit serve --no-slack             # disable Slack
+# Network bind: also requires API_AUTH_ENABLED=true, API_AUTH_KEY, and
+# an explicit compatible API_ALLOWED_HOSTS value.
+tacit serve --host 0.0.0.0
 ```
 
 ### Option B: Docker
 
 ```bash
 # Start supporting services + Tacit
+# Set a strong API_AUTH_KEY in .env first; Tacit publishes on host loopback.
 docker compose up -d
 
 # Create Grafana service account token (Editor role)
@@ -570,7 +574,7 @@ docker compose up -d
 | `tacit doctor` | Validate Grafana, datasources, LLM, archetypes, cache |
 | `tacit connect grafana` | Test and persist Grafana connection |
 | `tacit test [-p "prompt"]` | Run sample investigation, open dashboard in browser |
-| `tacit serve [--port --reload --no-slack]` | Start API + Slack server |
+| `tacit serve [--host --port --reload --no-slack]` | Start API + Slack server; loopback by default |
 | `tacit history list [-n --status --user]` | List recent investigations (Rich table) |
 | `tacit history show <id>` | Full investigation detail (intent, metrics, queries, timings) |
 | `tacit history stats` | Aggregate stats (success/fail rates, avg time, path distribution) |
@@ -620,7 +624,7 @@ python tests/validate.py --mode pipeline --api-url http://localhost:8000 --revie
 - 100-prompt validation suite with tiered metrics
 - **CLI** — `tacit init/doctor/connect/test/serve/history` with Rich terminal UI
 - **Config discovery** — `~/.tacit/config.yaml` + `~/.tacit/.env`
-- **Single-binary distribution** — PyInstaller spec for macOS/Linux/Windows
+- **Single-binary distribution** — PyInstaller release artifacts for macOS/Linux; Windows is unsupported while protected runtime storage requires POSIX controls
 - **Investigation history** — full pipeline telemetry persisted in SQLite (`data/tacit_history.db`).
   Stores: prompt, intent, archetypes, datasources, metrics catalog, selected metrics,
   generated queries, validation warnings, per-step timings, failures, dashboard URLs.

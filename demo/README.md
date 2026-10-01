@@ -9,7 +9,7 @@ It is built around a checkout-service incident because it tells a recognizable o
 ## Run It
 
 The fastest path is the single command (boots the stack, teaches Tacit,
-generates the dashboard, opens the browser — zero API keys needed):
+generates the dashboard, opens the browser — no vendor API keys needed):
 
 ```bash
 uv run tacit demo
@@ -18,6 +18,7 @@ uv run tacit demo
 Or drive it manually. Start the local dev stack:
 
 ```bash
+export API_AUTH_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 docker compose -f docker-compose.dev.yml up -d --build
 ```
 
@@ -81,6 +82,7 @@ Tacit can learn from an existing incident dashboard, infer reusable observabilit
 Run:
 
 ```bash
+export API_AUTH_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
 docker compose -f docker-compose.dev.yml up -d --build
 demo/run_checkout_incident_demo.sh
 ```
@@ -92,7 +94,6 @@ Prompt:
 
 ## Good Screenshot Targets
 
-- `http://localhost:8000`: prompt and learning tabs
+- `http://localhost:8000`: prompt, learning, history, and review tabs
 - `http://localhost:3000`: generated Grafana dashboard
-- `http://localhost:8000/docs`: API surface if posting to the repo
 - Terminal output from `demo/run_checkout_incident_demo.sh`: inferred signals and approval count

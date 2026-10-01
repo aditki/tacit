@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import HTTPException, Request, Security
@@ -19,28 +20,51 @@ MAX_PROMPT_LENGTH = 2000
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-async def verify_api_key(request: Request, api_key: str | None = Security(api_key_header)) -> None:
-    """Verify API keys and fail closed for unauthenticated wildcard tenancy."""
-    runtime_settings = getattr(request.app.state, "settings", settings)
+@dataclass(frozen=True, slots=True)
+class RequestAuthentication:
+    """Header-derived identity established before request-body admission."""
+
+    tenant_id: str
+    actor: str
+
+
+def authenticate_request_headers(
+    runtime_settings: Any,
+    headers: list[tuple[bytes, bytes]],
+) -> RequestAuthentication:
+    """Authenticate raw ASGI headers without reading request bytes or opening stores."""
+    requested_tenant = _single_ascii_header(headers, b"x-tacit-tenant")
+    api_key = _single_ascii_header(headers, b"x-api-key")
     configured_tenant = str(runtime_settings.knowledge_tenant_id or "default")
     if configured_tenant == "*" and not runtime_settings.api_auth_enabled:
         raise HTTPException(status_code=503, detail="Wildcard knowledge tenancy requires API authentication")
+
+    selected_tenant = resolve_knowledge_tenant(configured_tenant, requested_tenant)
     if not runtime_settings.api_auth_enabled:
-        request.state.authenticated_actor = "local-unauthenticated"
-        return
-    expected_key = runtime_settings.api_auth_key
-    selected_tenant = configured_tenant
-    if configured_tenant == "*":
-        selected_tenant = resolve_knowledge_tenant(
-            configured_tenant,
-            request.headers.get("X-Tacit-Tenant"),
+        return RequestAuthentication(
+            tenant_id=selected_tenant,
+            actor="local-unauthenticated",
         )
+
+    expected_key = runtime_settings.api_auth_key
+    if configured_tenant == "*":
         tenant_keys = dict(getattr(runtime_settings, "knowledge_tenant_api_keys", {}) or {})
         expected_key = tenant_keys.get(selected_tenant, "")
     if not api_key or not expected_key or not secrets.compare_digest(api_key, expected_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     key_slot = "tenant-key" if configured_tenant == "*" else "api-key"
-    request.state.authenticated_actor = f"{key_slot}:{selected_tenant}"
+    return RequestAuthentication(
+        tenant_id=selected_tenant,
+        actor=f"{key_slot}:{selected_tenant}",
+    )
+
+
+async def verify_api_key(request: Request, api_key: str | None = Security(api_key_header)) -> None:
+    """Verify API keys and fail closed for unauthenticated wildcard tenancy."""
+    runtime_settings = getattr(request.app.state, "settings", settings)
+    authentication = authenticate_request_headers(runtime_settings, list(request.scope.get("headers", [])))
+    request.state.authenticated_actor = authentication.actor
+    request.state.authenticated_tenant = authentication.tenant_id
 
 
 def authenticated_actor(request: Request) -> str:
@@ -59,6 +83,9 @@ def sanitize_prompt(prompt: str) -> str:
 
 def knowledge_tenant(request: Request) -> str:
     """Resolve a tenant without allowing a request to cross the configured boundary."""
+    authenticated = str(getattr(request.state, "authenticated_tenant", "") or "")
+    if authenticated:
+        return authenticated
     runtime_settings = getattr(request.app.state, "settings", settings)
     return resolve_knowledge_tenant(
         runtime_settings.knowledge_tenant_id,
@@ -122,6 +149,21 @@ def resolve_knowledge_tenant(
         )
     except TenantBoundaryError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+def _single_ascii_header(headers: list[tuple[bytes, bytes]], name: bytes) -> str | None:
+    values = [bytes(value) for header_name, value in headers if bytes(header_name).lower() == name]
+    if not values:
+        return None
+    if len(values) != 1:
+        raise HTTPException(status_code=400, detail="Invalid authentication headers")
+    try:
+        value = values[0].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid authentication headers") from exc
+    if value != value.strip() or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise HTTPException(status_code=400, detail="Invalid authentication headers")
+    return value
 
 
 def require_knowledge_permission(permission: str):

@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
-from fastapi.testclient import TestClient
 from structlog.testing import capture_logs
 
 from tacit.api.app import create_app
@@ -18,6 +17,7 @@ from tacit.grounding_benchmark import _contract_for_case, load_grounding_corpus
 from tacit.history import InvestigationStore, StaleRevisionError
 from tacit.investigation_bundle import build_investigation_bundle, export_investigation_bundle
 from tacit.investigation_contract import InvestigationRunType
+from tests.http_client import TestClient
 
 
 def _contract(investigation_id: str = "inv-a", *, tenant_id: str = "tenant-a"):

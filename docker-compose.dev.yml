@@ -86,11 +86,14 @@ services:
     profiles: ["gamma"]
     build: .
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     env_file:
       - path: .env
         required: false
     environment:
+      API_AUTH_ENABLED: "true"
+      API_AUTH_KEY: "${API_AUTH_KEY:?Set API_AUTH_KEY to a strong runtime secret}"
+      API_ALLOWED_HOSTS: "${API_ALLOWED_HOSTS:-localhost,127.0.0.1}"
       GRAFANA_URL: http://gamma-grafana:3000
       GRAFANA_PUBLIC_URL: http://localhost:3001
       SSL_CERT_FILE: ""
@@ -109,11 +112,14 @@ services:
   tacit:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     env_file:
       - path: .env
         required: false
     environment:
+      API_AUTH_ENABLED: "true"
+      API_AUTH_KEY: "${API_AUTH_KEY:?Set API_AUTH_KEY to a strong runtime secret}"
+      API_ALLOWED_HOSTS: "${API_ALLOWED_HOSTS:-localhost,127.0.0.1}"
       GRAFANA_URL: http://grafana:3000
       # Dashboard links must open in the user's browser, which cannot resolve
       # the Docker-network hostname above.

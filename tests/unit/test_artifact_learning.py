@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sqlite3
-import time
 from bisect import bisect_right
 from contextlib import contextmanager
 from copy import deepcopy
@@ -155,7 +154,11 @@ def test_direct_artifact_learning_never_probes_injected_service_private_store(
     store = _DescriptorOnlySignalStore(real_store)
     service = _DescriptorOnlyKnowledgeService(
         KnowledgeService(
-            KnowledgeRepository(database_path),
+            KnowledgeRepository(
+                database_path,
+                runtime_settings=runtime_settings,
+                signal_store=real_store,
+            ),
             signal_store=real_store,
             runtime_settings=runtime_settings,
         )
@@ -1098,6 +1101,8 @@ def test_dependency_target_is_searchable_as_service(tmp_path, monkeypatch):
 
 
 def test_runbook_reingest_lifecycle_is_idempotent_and_updates_on_change(tmp_path, monkeypatch):
+    clock = [1_700_000_000.0]
+    monkeypatch.setattr("tacit.signals.store.time.time", lambda: clock[0])
     store = SignalStore(db_path=tmp_path / "signals.db")
     monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
     first_artifact = _artifact("## Checks\n- check redis_cache_misses_total")
@@ -1106,13 +1111,13 @@ def test_runbook_reingest_lifecycle_is_idempotent_and_updates_on_change(tmp_path
     first_row = store.get_learned_artifact(first_artifact.id)
     assert first_row is not None
 
-    time.sleep(0.001)
+    clock[0] += 1
     second = learn_artifact(first_artifact, RunbookExtractor())
     second_row = store.get_learned_artifact(first_artifact.id)
     assert second_row is not None
 
     changed_artifact = _artifact("## Checks\n- check redis_cache_misses_total\n- check checkout_latency_seconds")
-    time.sleep(0.001)
+    clock[0] += 1
     changed = learn_artifact(changed_artifact, RunbookExtractor())
     changed_row = store.get_learned_artifact(changed_artifact.id)
     assert changed_row is not None
@@ -1339,11 +1344,16 @@ def test_artifact_generation_rolls_back_when_governed_lifecycle_fails(tmp_path, 
         db_path=tmp_path / "signals.db",
         runtime_settings=runtime_settings,
     )
-    repository = KnowledgeRepository(store._db_path)
+    active_settings = store.runtime_settings
+    repository = KnowledgeRepository(
+        store._db_path,
+        runtime_settings=active_settings,
+        signal_store=store,
+    )
     service = KnowledgeService(
         repository,
         signal_store=store,
-        runtime_settings=runtime_settings,
+        runtime_settings=active_settings,
     )
     artifact = _artifact("## Checks\n- check redis_cache_misses_total")
 

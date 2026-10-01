@@ -112,15 +112,22 @@ def _signal_store_for_runtime(
         selected_settings = resolved_runtime_settings or runtime_settings
         if selected_settings is None:
             raise ValueError("Knowledge service signal-store resolution requires resolved runtime settings")
-        database_path = resolve_owned_database_path(
+        resolve_owned_database_path(
             boundary="Dashboard learning signal store resolution",
             database_role="signals",
             owners=(("knowledge_service", knowledge_service),),
             runtime_settings=selected_settings,
         )
-        from tacit.signals import SignalStore
+        from tacit.runtime_stores import require_shared_signal_knowledge_admission
 
-        return SignalStore(database_path, runtime_settings=selected_settings)
+        owned_signal_store = knowledge_service.signal_store
+        require_shared_signal_knowledge_admission(
+            owned_signal_store,
+            knowledge_service,
+            runtime_settings=selected_settings,
+            boundary="Dashboard learning signal store resolution",
+        )
+        return owned_signal_store
     if runtime_settings is not None:
         from tacit.runtime_stores import RuntimeStores
 
@@ -521,7 +528,9 @@ def _existing_governed_candidate_ids(
             boundary="Dashboard governed candidate lookup",
             database_role="signals",
             owners=(("signal_store", store),),
-        )
+        ),
+        runtime_settings=store.runtime_settings,
+        signal_store=store,
     )
     active: set[str] = set()
     after_candidate_id: str | None = None
@@ -684,7 +693,9 @@ def _active_governed_signal_mapping_ref(
             boundary="Dashboard governed mapping lookup",
             database_role="signals",
             owners=(("signal_store", store),),
-        )
+        ),
+        runtime_settings=store.runtime_settings,
+        signal_store=store,
     )
     candidate = repository.get_candidate(candidate_id, tenant_id)
     if candidate is None:
