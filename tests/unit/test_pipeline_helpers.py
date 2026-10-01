@@ -403,6 +403,34 @@ def _assert_runtime_generation_drained(dependencies: PipelineDependencies) -> No
     assert admission.service_owner_in_flight == 0
 
 
+async def _wait_for_runtime_generation_drained(
+    dependencies: PipelineDependencies,
+    *,
+    timeout: float = 5.0,
+) -> None:
+    admission = dependencies.pipeline_admission
+    assert admission is not None
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        graph = admission.execution_graph
+        state = {
+            "in_flight": admission.in_flight,
+            "retained": admission.retained,
+            "root_owner_count": graph.root_owner_count,
+            "root_state": graph.root_state,
+        }
+        if state == {
+            "in_flight": 0,
+            "retained": 0,
+            "root_owner_count": 0,
+            "root_state": "closed",
+        }:
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"runtime generation did not drain before its deadline; last state={state!r}")
+        await asyncio.sleep(0.001)
+
+
 def test_initial_knowledge_scope_includes_concrete_curated_archetype_ids():
     intent = _intent().model_copy(
         update={
@@ -2013,17 +2041,8 @@ async def test_pipeline_cancellation_grace_returns_request_but_retains_effective
             assert task.result().investigation_status == "failed"
     finally:
         release_cleanup.set()
-        for _ in range(100):
-            if (
-                dependencies.pipeline_admission.in_flight == 0
-                and dependencies.pipeline_admission.execution_graph.root_state == "closed"
-            ):
-                break
-            await asyncio.sleep(0)
-    assert dependencies.pipeline_admission.in_flight == 0
-    assert dependencies.pipeline_admission.retained == 0
-    assert dependencies.pipeline_admission.execution_graph.root_owner_count == 0
-    assert dependencies.pipeline_admission.execution_graph.root_state == "closed"
+        await _wait_for_runtime_generation_drained(dependencies)
+    _assert_runtime_generation_drained(dependencies)
 
 
 @pytest.mark.asyncio
