@@ -28,6 +28,26 @@ async def _wait_for_thread_event(event: threading.Event, *, timeout: float = 1.0
         await asyncio.sleep(0.001)
 
 
+async def _wait_for_optional_integration_status(
+    app: FastAPI,
+    *,
+    name: str,
+    status: str,
+    timeout: float = 5.0,
+) -> dict[str, str]:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        readiness = getattr(app.state, "optional_integration_readiness", {})
+        snapshot = readiness.get(name, {})
+        if snapshot.get("status") == status:
+            return snapshot
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"optional integration {name!r} did not reach {status!r}; last snapshot={snapshot!r}"
+            )
+        await asyncio.sleep(0.001)
+
+
 def _fail_first_lifecycle_loop_construction(monkeypatch) -> list[int]:
     original_new_event_loop = asyncio_events.new_event_loop
     calls: list[int] = []
@@ -225,11 +245,12 @@ async def test_lifespan_reports_slack_starting_until_socket_connection_is_confir
 
         allow_connection.set()
         await _wait_for_thread_event(connected)
-        for _ in range(100):
-            if app.state.optional_integration_readiness["slack"]["status"] == "ready":
-                break
-            await asyncio.sleep(0.001)
-        assert app.state.optional_integration_readiness["slack"] == {
+        slack_readiness = await _wait_for_optional_integration_status(
+            app,
+            name="slack",
+            status="ready",
+        )
+        assert slack_readiness == {
             "status": "ready",
             "reason_code": "slack_ready",
         }
@@ -268,13 +289,11 @@ async def test_lifespan_observes_slack_background_failure_in_optional_readiness(
 
     async with create_lifespan(runtime_settings)(app):
         await _wait_for_thread_event(started)
-        for _ in range(20):
-            await asyncio.sleep(0)
-            readiness = getattr(app.state, "optional_integration_readiness", {})
-            if readiness.get("slack", {}).get("status") == "failed":
-                break
-
-        slack_readiness = app.state.optional_integration_readiness["slack"]
+        slack_readiness = await _wait_for_optional_integration_status(
+            app,
+            name="slack",
+            status="failed",
+        )
         assert slack_readiness["status"] == "failed"
         assert slack_readiness["reason_code"] == "slack_background_task_failed"
         assert "private-slack-failure-canary" not in repr(slack_readiness)
