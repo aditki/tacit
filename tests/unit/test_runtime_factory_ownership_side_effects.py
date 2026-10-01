@@ -482,7 +482,7 @@ def test_closed_requester_loop_retires_escrow_before_ownership_commit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_second_terminal_mark_keeps_capacity_charged_without_blocking_requester_loop(
+async def test_terminal_mark_follows_permit_settlement_and_worker_unregistration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lifecycle = PipelineAdmissionController(1, max_queued=0)
@@ -495,7 +495,7 @@ async def test_second_terminal_mark_keeps_capacity_charged_without_blocking_requ
     mark_count = 0
     mark_lock = threading.Lock()
     heartbeat_responsive: list[bool] = []
-    charged_state: list[tuple[int, int, int]] = []
+    terminal_state: list[tuple[int, int, int]] = []
     requester_loop = asyncio.get_running_loop()
     original_mark_finished = side_effects._LifecycleBlockingCall.mark_finished
     original_unregister = blocking_work._unregister
@@ -516,7 +516,7 @@ async def test_second_terminal_mark_keeps_capacity_charged_without_blocking_requ
 
     def observe_paused_terminal_mark() -> None:
         assert second_mark_entered.wait(timeout=1.0)
-        charged_state.append(
+        terminal_state.append(
             (
                 lifecycle.blocking_in_flight,
                 lifecycle.retained,
@@ -552,7 +552,7 @@ async def test_second_terminal_mark_keeps_capacity_charged_without_blocking_requ
         await asyncio.to_thread(observer.join, 1.0)
         assert observer.is_alive() is False
         assert heartbeat_responsive == [True]
-        assert charged_state == [(0, 1, 1)]
+        assert terminal_state == [(0, 0, 0)]
         assert await asyncio.to_thread(worker_unregistered.wait, 1.0)
         assert lifecycle.in_flight == 0
         assert lifecycle.blocking_in_flight == 0
@@ -669,6 +669,63 @@ async def test_plain_async_result_is_not_published_before_worker_releases_capaci
         if not result.done():
             result.cancel()
             await asyncio.gather(result, return_exceptions=True)
+
+
+@pytest.mark.parametrize("outcome", ["result", "error"])
+@pytest.mark.asyncio
+async def test_plain_async_terminal_publication_waits_for_worker_unregistration(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    lifecycle = PipelineAdmissionController(1, max_queued=0)
+    blocking_work = LifecycleOwnedBlockingWork(lifecycle)
+    unregister_entered = threading.Event()
+    allow_unregister = threading.Event()
+    original_unregister = blocking_work._unregister
+
+    def pause_before_unregister(call: side_effects._LifecycleBlockingCall) -> None:
+        assert lifecycle.blocking_in_flight == 0
+        assert lifecycle.retained == 0
+        assert blocking_work.active == 1
+        unregister_entered.set()
+        assert allow_unregister.wait(timeout=1.0)
+        original_unregister(call)
+
+    def work() -> str:
+        if outcome == "error":
+            raise ValueError("synthetic blocking failure")
+        return "completed"
+
+    monkeypatch.setattr(blocking_work, "_unregister", pause_before_unregister)
+    operation = asyncio.create_task(
+        blocking_work.run(
+            work,
+            reason_code=f"terminal_publication_after_unregister_{outcome}",
+        )
+    )
+    try:
+        assert await asyncio.to_thread(unregister_entered.wait, 1.0)
+        await asyncio.sleep(0)
+
+        assert operation.done() is False
+        assert lifecycle.blocking_in_flight == 0
+        assert lifecycle.retained == 0
+        assert blocking_work.active == 1
+
+        allow_unregister.set()
+        if outcome == "error":
+            with pytest.raises(ValueError, match="synthetic blocking failure"):
+                await asyncio.wait_for(operation, timeout=1.0)
+        else:
+            assert await asyncio.wait_for(operation, timeout=1.0) == "completed"
+        assert lifecycle.blocking_in_flight == 0
+        assert lifecycle.retained == 0
+        assert blocking_work.active == 0
+    finally:
+        allow_unregister.set()
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
 
 
 @pytest.mark.parametrize("requester_loop_state", ["paused", "closed"])

@@ -1383,6 +1383,12 @@ def test_every_release_job_has_a_bounded_timeout() -> None:
         assert 1 <= timeout <= 90, name
 
 
+def test_hermetic_test_job_has_a_bounded_timeout() -> None:
+    test_job = _ci_workflow()["jobs"]["test"]
+    timeout = int(test_job["timeout-minutes"])
+    assert 1 <= timeout <= 30
+
+
 def test_release_scans_and_publishes_the_same_image_archives() -> None:
     jobs = _release_workflow()["jobs"]
     build = jobs["build-release-images"]

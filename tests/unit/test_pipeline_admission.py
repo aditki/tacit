@@ -55,12 +55,33 @@ class _CountingAdmissionController(PipelineAdmissionController):
         return checks
 
 
-async def _wait_for_queue(controller: PipelineAdmissionController, expected: int) -> None:
-    for _ in range(100):
-        if controller.queued == expected:
-            return
-        await asyncio.sleep(0)
-    raise AssertionError(f"expected {expected} queued pipeline runs, found {controller.queued}")
+async def _wait_for_queue(
+    controller: PipelineAdmissionController,
+    expected: int,
+    *,
+    timeout_seconds: float = 5.0,
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while controller.queued != expected:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError(f"expected {expected} queued pipeline runs, found {controller.queued}")
+        await asyncio.sleep(min(0.01, remaining))
+
+
+async def _wait_for_thread_event(
+    event: threading.Event,
+    *,
+    timeout_seconds: float = 5.0,
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while not event.is_set():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError("worker did not signal readiness before the deadline")
+        await asyncio.sleep(min(0.01, remaining))
 
 
 async def _wait_for_admission_maintenance_exit(controller: PipelineAdmissionController) -> None:
@@ -165,18 +186,35 @@ async def test_cancelled_waiter_does_not_leak_an_admission_slot() -> None:
 async def test_runtime_admission_can_transfer_a_slot_between_event_loops() -> None:
     controller = PipelineAdmissionController(1)
     active = await controller.acquire()
+    active_released = False
+    worker_started = threading.Event()
+    worker: asyncio.Task[None] | None = None
 
     async def acquire_in_worker_loop() -> None:
-        async with controller.slot():
+        worker_started.set()
+        async with controller.slot(timeout_seconds=5.0):
             assert controller.in_flight == 1
 
-    worker = asyncio.create_task(asyncio.to_thread(asyncio.run, acquire_in_worker_loop()))
-    await _wait_for_queue(controller, 1)
-    controller.release(active)
-    await asyncio.wait_for(worker, timeout=1)
+    try:
+        worker = asyncio.create_task(asyncio.to_thread(asyncio.run, acquire_in_worker_loop()))
+        await _wait_for_thread_event(worker_started)
+        await _wait_for_queue(controller, 1)
+        controller.release(active)
+        active_released = True
+        await asyncio.wait_for(asyncio.shield(worker), timeout=5.0)
 
-    assert controller.in_flight == 0
-    assert controller.queued == 0
+        assert controller.in_flight == 0
+        assert controller.queued == 0
+    finally:
+        if not active_released:
+            controller.release(active)
+        if worker is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(worker), timeout=5.0)
+            except TimeoutError:
+                worker.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await worker
 
 
 async def test_runtime_admission_rejects_work_beyond_the_bounded_queue() -> None:

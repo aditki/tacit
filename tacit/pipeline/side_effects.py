@@ -307,7 +307,7 @@ class _LifecycleBlockingCall:
         return self.claim(result)
 
     def mark_finished(self) -> None:
-        """Resolve ownership and publish terminal readiness while charged."""
+        """Resolve ownership first, then publish readiness after release."""
         with self._lock:
             if not self._worker_finish_claimed:
                 self._worker_finish_claimed = True
@@ -1290,7 +1290,6 @@ class LifecycleOwnedBlockingWork:
                     ):
                         terminal_error = settled_error
                         lifecycle.fence_runtime_fatal(terminal_error)
-                    call.mark_finished()
         return terminal_error
 
     def _release_unmaterialized_permits(
