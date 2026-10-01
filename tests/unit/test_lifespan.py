@@ -42,9 +42,7 @@ async def _wait_for_optional_integration_status(
         if snapshot.get("status") == status:
             return snapshot
         if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError(
-                f"optional integration {name!r} did not reach {status!r}; last snapshot={snapshot!r}"
-            )
+            raise AssertionError(f"optional integration {name!r} did not reach {status!r}; last snapshot={snapshot!r}")
         await asyncio.sleep(0.001)
 
 
