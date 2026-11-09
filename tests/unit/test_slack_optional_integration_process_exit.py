@@ -761,6 +761,7 @@ def test_primary_exit_terminally_settles_shared_unstarted_slack_generation() -> 
 def test_cancelled_primary_settles_secondary_on_a_separate_event_loop_thread() -> None:
     """Cancelled startup ownership settles subscribers across caller loops."""
     runtime_identity = "optional-integration-unstarted-cross-loop"
+    wait_timeout = 5.0
     baseline_threads = _owner_thread_count()
     primary_ready = threading.Event()
     secondary_registered = threading.Event()
@@ -790,7 +791,7 @@ def test_cancelled_primary_settles_secondary_on_a_separate_event_loop_thread() -
             shared["state"] = owner._state
             shared["primary_lifecycle"] = lifecycle
             primary_ready.set()
-            assert secondary_registered.wait(timeout=1.0)
+            assert secondary_registered.wait(timeout=wait_timeout)
             task = asyncio.current_task()
             assert task is not None
             task.cancel()
@@ -810,7 +811,7 @@ def test_cancelled_primary_settles_secondary_on_a_separate_event_loop_thread() -
         asyncio.run(exercise())
 
     def run_secondary() -> None:
-        assert primary_ready.wait(timeout=1.0)
+        assert primary_ready.wait(timeout=wait_timeout)
 
         async def exercise() -> None:
             lifecycle = optional_integrations_module.OptionalIntegrationLifecycle(None, name="slack")
@@ -822,7 +823,8 @@ def test_cancelled_primary_settles_secondary_on_a_separate_event_loop_thread() -
             shared["secondary_lifecycle"] = lifecycle
             owner.start(must_not_run, on_completion=observe)
             secondary_registered.set()
-            await _wait_until(allow_secondary_shutdown.is_set)
+            # Keep this loop available through both of the test thread's waits.
+            await _wait_until(allow_secondary_shutdown.is_set, timeout=3 * wait_timeout)
             shared["secondary_settlement"] = await owner.shutdown(
                 timeout_seconds=1.0,
                 timeout_reason_code="slack_shutdown_timed_out",
@@ -835,19 +837,20 @@ def test_cancelled_primary_settles_secondary_on_a_separate_event_loop_thread() -
     primary_thread.start()
     secondary_thread.start()
 
-    assert primary_done.wait(timeout=2.0)
-    state = shared["state"]
-    assert isinstance(state, optional_integrations_module._OptionalIntegrationExecutionState)
-    primary_exit_was_terminal = state.finished.is_set()
-    callback_was_published = callback_called.is_set()
-    allow_secondary_shutdown.set()
-    primary_thread.join(timeout=2.0)
-    secondary_thread.join(timeout=2.0)
+    try:
+        assert primary_done.wait(timeout=wait_timeout), "primary shutdown did not finish"
+        state = shared["state"]
+        assert isinstance(state, optional_integrations_module._OptionalIntegrationExecutionState)
+        primary_exit_was_terminal = state.finished.is_set()
+        assert callback_called.wait(timeout=wait_timeout), "secondary loop did not deliver completion"
+    finally:
+        allow_secondary_shutdown.set()
+        primary_thread.join(timeout=wait_timeout)
+        secondary_thread.join(timeout=wait_timeout)
 
     assert not primary_thread.is_alive()
     assert not secondary_thread.is_alive()
     assert primary_exit_was_terminal
-    assert callback_was_published
     primary_settlement = shared["primary_settlement"]
     secondary_settlement = shared["secondary_settlement"]
     assert isinstance(

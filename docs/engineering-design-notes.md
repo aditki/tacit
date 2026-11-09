@@ -2072,6 +2072,13 @@ capacity nor manufacture a scheduling partition.
 
 ## Validation expectations
 
+Cross-runtime tests should wait on the specific transition they assert. A
+runtime can settle before a subscriber loop delivers its callback, and a drain
+can release work before it publishes its final state. Give each observation a
+bounded wait, keep any required observer loop alive through that wait, and
+release gates and join test threads in `finally` so failed assertions still
+allow cleanup.
+
 The [foundation invariant matrix](foundation-invariant-matrix.md) is the
 authoritative implementation checklist. Cross-cutting work should use focused
 regression tests plus every applicable matrix row, including:
