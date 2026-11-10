@@ -646,6 +646,13 @@ work limit.
 
 ## UX, packaging, and observability matrix
 
+- Expected context-query failures in RAG API, MCP, A2A, and the enrichment
+  fallback share one diagnostic boundary. Each preserves empty-context
+  degradation and emits a stable reason code, bounded error class, and
+  fingerprint without endpoints, response data, exception messages, or
+  tracebacks. Test each entry point with synthetic private values and the
+  production JSON renderer.
+
 - Browser requests carry the selected tenant on every tenant-aware tab and
   fallback request. Actions are bound to the tenant that rendered the row.
 - Authenticated APIs default to same-origin browser access. Any CORS allowlist

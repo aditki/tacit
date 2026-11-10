@@ -1151,6 +1151,10 @@ Best-effort behavior must be visible. Silent fallback is not resilience.
 - Expected degraded paths log stable reason codes, bounded counters, and error
   classes only. They do not attach tracebacks, raw payloads, query text, tenant
   data, credentials, or filesystem paths to routine warning events.
+- Context-provider adapters and the enrichment fallback share one warning
+  boundary using `safe_failure_diagnostics`. Keep the reason specific to the
+  failing path while leaving provider endpoints and upstream error bodies out
+  of the log.
 - Time intent classification, discovery, semantic resolution, archetype
   selection, compilation, validation, publication, and persistence separately.
   Persist enough precision to distinguish sub-10ms stages; rounding seconds to

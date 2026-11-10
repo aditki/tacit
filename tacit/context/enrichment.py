@@ -13,7 +13,7 @@ from typing import cast
 
 import structlog
 
-from tacit.context.base import ContextProvider
+from tacit.context.base import ContextProvider, log_context_query_failure
 from tacit.context.registry import get_context_provider
 from tacit.models.schemas import ContextChunk, Intent
 
@@ -67,8 +67,8 @@ async def enrich_context(
         logger.warning("context_enrichment_timeout", provider=provider.name, timeout=CONTEXT_TIMEOUT)
         return []
 
-    except Exception:
-        logger.exception("context_enrichment_failed", provider=provider.name)
+    except Exception as exc:
+        log_context_query_failure("context_enrichment_failed", exc)
         return []
 
 
