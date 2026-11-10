@@ -9,6 +9,7 @@ Describe the user-visible and architectural change.
 - Tests written before implementation:
 - No-side-effect assertions:
 - Concurrency/fault cases:
+- Cross-runtime lifecycle gate (owner/controller/cancellation/cleanup), or N/A:
 - Scaling bounds and query plans:
 - Quality gates run:
 - Whole-diff architecture/security reviews:

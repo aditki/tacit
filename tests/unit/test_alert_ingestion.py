@@ -490,8 +490,13 @@ async def test_alert_auto_approval_retry_finalizes_claimed_generation(tmp_path, 
     monkeypatch.setattr("tacit.alert_ingest.persist_inferred_signal_review", idempotent_promotion)
 
     knowledge_service = KnowledgeService(
-        KnowledgeRepository(store._db_path),
+        KnowledgeRepository(
+            store._db_path,
+            runtime_settings=store.runtime_settings,
+            signal_store=store,
+        ),
         signal_store=store,
+        runtime_settings=store.runtime_settings,
     )
 
     original_finalize = store.finalize_ingested_alert_approval
@@ -531,8 +536,13 @@ async def test_alert_auto_approval_retry_finalizes_claimed_generation(tmp_path, 
 async def test_alert_approval_rolls_back_governed_authority_before_final_status(tmp_path, monkeypatch):
     store = SignalStore(db_path=tmp_path / "signals.db")
     knowledge_service = KnowledgeService(
-        KnowledgeRepository(store._db_path),
+        KnowledgeRepository(
+            store._db_path,
+            runtime_settings=store.runtime_settings,
+            signal_store=store,
+        ),
         signal_store=store,
+        runtime_settings=store.runtime_settings,
     )
     features = AlertFeatures(
         alert_uid="governed-alert-rollback",
@@ -643,8 +653,13 @@ async def test_auto_approved_alert_rolls_back_authority_when_indexing_fails(tmp_
     ]
     monkeypatch.setattr("tacit.alert_ingest.infer_signals_from_metrics", lambda *_args, **_kwargs: inferred)
     knowledge_service = KnowledgeService(
-        KnowledgeRepository(store._db_path),
+        KnowledgeRepository(
+            store._db_path,
+            runtime_settings=store.runtime_settings,
+            signal_store=store,
+        ),
         signal_store=store,
+        runtime_settings=store.runtime_settings,
     )
     repository = knowledge_service.repository
 
@@ -735,8 +750,13 @@ async def test_changed_auto_approved_alert_preserves_prior_authority_when_prepar
 
     monkeypatch.setattr("tacit.alert_ingest.infer_signals_from_metrics", inferred)
     knowledge_service = KnowledgeService(
-        KnowledgeRepository(store._db_path),
+        KnowledgeRepository(
+            store._db_path,
+            runtime_settings=store.runtime_settings,
+            signal_store=store,
+        ),
         signal_store=store,
+        runtime_settings=store.runtime_settings,
     )
 
     def promote_governed_mapping(**kwargs):

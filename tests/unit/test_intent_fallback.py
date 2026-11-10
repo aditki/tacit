@@ -167,10 +167,7 @@ class TestClassifyIntentFallbackRouting:
             llm_api_key="",
             llm_api_base="",
         )
-        with (
-            patch("tacit.config.settings", fake_settings),
-            patch("tacit.agents.llm.get_provider", side_effect=ValueError("boom")),
-        ):
+        with patch("tacit.config.settings", fake_settings):
             intent, usage = asyncio.run(classify_intent("high cpu on checkout"))
         assert usage.total_tokens == 0
         assert intent.archetypes[0].type == "resource_saturation"
@@ -184,12 +181,16 @@ class TestClassifyIntentFallbackRouting:
             llm_api_key="",
             llm_api_base="",
         )
-        with (
-            patch("tacit.config.settings", fake_settings),
-            patch("tacit.agents.llm.get_provider", side_effect=ValueError("ollama offline")),
-        ):
+
+        class FailingProvider:
+            is_configured = True
+
+            async def chat_json(self, *_args, **_kwargs):
+                raise ValueError("ollama offline")
+
+        with patch("tacit.config.settings", fake_settings):
             with pytest.raises(ValueError, match="ollama offline"):
-                asyncio.run(classify_intent("high cpu on checkout"))
+                asyncio.run(classify_intent("high cpu on checkout", provider=FailingProvider()))
 
     def test_runtime_zero_key_settings_enable_fallback_even_when_globals_do_not(self):
         from tacit.agents.intent import classify_intent

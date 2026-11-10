@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
-import httpx
 import structlog
 
 from tacit.agents.providers.base import LLMProvider, LLMResult, TokenUsage
+from tacit.agents.providers.http_transport import create_llm_sdk_http_client
 from tacit.config import Settings, settings
+from tacit.runtime_ownership import canonical_remote_endpoint
 
 logger = structlog.get_logger()
 
 
 class OllamaProvider(LLMProvider):
     def __init__(self, runtime_settings: Settings | None = None):
-        self._settings = runtime_settings or settings
-        base = self._settings.llm_api_base or "http://localhost:11434"
-        self._base_url = base.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=120.0)
+        super().__init__(runtime_settings or settings, component="ollama_llm_provider")
+        self._settings = self.runtime_settings
+        self._base_url = canonical_remote_endpoint(self._settings.llm_api_base or "http://localhost:11434")
+        self._client = create_llm_sdk_http_client(
+            self._settings,
+            endpoint=self._base_url,
+        )
 
     @staticmethod
     def _extract_usage(data: dict) -> TokenUsage:

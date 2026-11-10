@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 import structlog
 from pydantic import BaseModel, ValidationError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -16,10 +19,24 @@ from tacit.agents.llm_json import (
 from tacit.agents.llm_json import (
     strip_trailing_commas as _strip_trailing_commas,
 )
-from tacit.agents.providers import get_provider
 from tacit.agents.providers.base import LLMProvider, TokenUsage
+from tacit.config import Settings, settings
 
 logger = structlog.get_logger()
+
+
+@asynccontextmanager
+async def _provider_scope(
+    provider: LLMProvider | None,
+    runtime_settings: Settings | None,
+) -> AsyncIterator[LLMProvider]:
+    if provider is not None:
+        yield provider
+        return
+    from tacit.dependencies import managed_async_nonpipeline_llm_provider
+
+    async with managed_async_nonpipeline_llm_provider(runtime_settings or settings) as owned_provider:
+        yield owned_provider
 
 
 @retry(
@@ -34,26 +51,26 @@ async def call_llm[T: BaseModel](
     temperature: float = 0.2,
     *,
     provider: LLMProvider | None = None,
+    runtime_settings: Settings | None = None,
 ) -> tuple[T, TokenUsage]:
     """Call an LLM provider and parse JSON into *response_model*."""
-    provider = provider or get_provider()
     total_usage = TokenUsage()
+    async with _provider_scope(provider, runtime_settings) as active_provider:
+        try:
+            result = await active_provider.chat_json(system_prompt, user_prompt, temperature)
+        except Exception as exc:
+            transient = wrap_transient_llm_error(exc)
+            if transient is not None:
+                logger.warning("llm_transient_error", error=str(exc), exc_type=type(exc).__name__)
+                raise transient from exc
+            raise
 
-    try:
-        result = await provider.chat_json(system_prompt, user_prompt, temperature)
-    except Exception as exc:
-        transient = wrap_transient_llm_error(exc)
-        if transient is not None:
-            logger.warning("llm_transient_error", error=str(exc), exc_type=type(exc).__name__)
-            raise transient from exc
-        raise
+        raw = result.text
+        total_usage = total_usage + result.usage
+        logger.debug("llm_raw_response", raw=raw[:500])
 
-    raw = result.text
-    total_usage = total_usage + result.usage
-    logger.debug("llm_raw_response", raw=raw[:500])
-
-    parsed, repair_usage = await parse_json_with_repair(provider, raw)
-    total_usage = total_usage + repair_usage
+        parsed, repair_usage = await parse_json_with_repair(active_provider, raw)
+        total_usage = total_usage + repair_usage
 
     try:
         return response_model.model_validate(parsed), total_usage
@@ -68,11 +85,12 @@ async def call_llm_text(
     temperature: float = 0.3,
     *,
     provider: LLMProvider | None = None,
+    runtime_settings: Settings | None = None,
 ) -> tuple[str, TokenUsage]:
     """Return plain text from the LLM (no structured output)."""
-    provider = provider or get_provider()
-    result = await provider.chat_text(system_prompt, user_prompt, temperature)
-    return result.text, result.usage
+    async with _provider_scope(provider, runtime_settings) as active_provider:
+        result = await active_provider.chat_text(system_prompt, user_prompt, temperature)
+        return result.text, result.usage
 
 
 __all__ = [

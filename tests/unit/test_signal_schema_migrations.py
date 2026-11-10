@@ -268,6 +268,10 @@ def test_legacy_signal_definitions_use_bounded_restartable_text_keyset_copy(tmp_
         assert conn.execute("SELECT COUNT(*) FROM signal_types").fetchone()[0] == 1_201
         assert conn.execute("SELECT COUNT(*) FROM tenant_signal_types").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM signal_types_tacit_tenant_migration_v1").fetchone()[0] == 0
+        owner_claim = conn.execute(
+            "SELECT value FROM signal_tenant_migration_metadata WHERE key='default_owner_in_progress_v1'"
+        ).fetchone()
+    assert owner_claim == ("tenant-a",)
 
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row

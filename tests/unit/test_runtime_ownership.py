@@ -1286,6 +1286,7 @@ def test_knowledge_service_composes_repository_settings_and_signal_store_from_de
         signals_db_path=str(database_path),
         knowledge_tenant_id="tenant-a",
     )
+    admission = RuntimeStores(runtime_settings).signals().sqlite_readiness_admission
 
     class DescriptorRepository:
         def __init__(self):
@@ -1293,6 +1294,7 @@ def test_knowledge_service_composes_repository_settings_and_signal_store_from_de
                 component="descriptor-repository",
                 databases=(RuntimeDatabaseIdentity(role="signals", path=database_path),),
             )
+            self.sqlite_readiness_admission = admission
 
         @property
         def database_path(self):
@@ -1307,6 +1309,7 @@ def test_knowledge_service_composes_repository_settings_and_signal_store_from_de
                 database_path=database_path,
             )
             self.runtime_settings = runtime_settings
+            self.sqlite_readiness_admission = admission
 
         @property
         def database_path(self):

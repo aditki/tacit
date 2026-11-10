@@ -1,0 +1,86 @@
+name: Release Quality Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      external_credit_spend_acknowledgement:
+        description: Type AUTHORIZE UP TO 500 LLM REQUESTS to approve this external evaluation spend
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-quality-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  authorize-external-spend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require main and explicit spend approval
+        shell: bash
+        env:
+          CREDIT_SPEND_ACKNOWLEDGEMENT: ${{ inputs.external_credit_spend_acknowledgement }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$CREDIT_SPEND_ACKNOWLEDGEMENT" = "AUTHORIZE UP TO 500 LLM REQUESTS"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+  evaluate-release-quality:
+    needs: authorize-external-spend
+    runs-on: [self-hosted, linux, x64, release-quality]
+    timeout-minutes: 240
+    environment: release-quality
+    env:
+      RELEASE_QUALITY_GRAFANA_URL: ${{ vars.RELEASE_QUALITY_GRAFANA_URL }}
+      RELEASE_QUALITY_LLM_MODEL: ${{ vars.RELEASE_QUALITY_LLM_MODEL }}
+      RELEASE_QUALITY_LLM_URL: ${{ vars.RELEASE_QUALITY_LLM_URL }}
+      RELEASE_QUALITY_LONG_LIVED_STATE_DIR: ${{ vars.RELEASE_QUALITY_LONG_LIVED_STATE_DIR }}
+      RELEASE_QUALITY_TENANT: ${{ vars.RELEASE_QUALITY_TENANT }}
+      RELEASE_QUALITY_OUTPUT_DIR: ${{ github.workspace }}/release-quality-output-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.12.1"
+          checksum: "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb"
+          python-version: "3.12.13"
+      - name: Install the locked evaluation environment
+        run: uv sync --locked --all-extras --dev
+      - name: Run exact-SHA clean and long-lived quality gates
+        env:
+          CREDIT_SPEND_ACKNOWLEDGEMENT: ${{ inputs.external_credit_spend_acknowledgement }}
+        run: |
+          uv run python .github/scripts/run_release_quality_evaluation.py \
+            --expected-sha "$GITHUB_SHA" \
+            --repository-slug "$GITHUB_REPOSITORY" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --credit-spend-acknowledgement "$CREDIT_SPEND_ACKNOWLEDGEMENT" \
+            --corpus tests/tacit_validation_prompts.csv \
+            --expected-prompt-count 100 \
+            --max-llm-requests 500 \
+            --long-lived-state-dir "$RELEASE_QUALITY_LONG_LIVED_STATE_DIR" \
+            --tenant "$RELEASE_QUALITY_TENANT" \
+            --llm-url "$RELEASE_QUALITY_LLM_URL" \
+            --llm-model "$RELEASE_QUALITY_LLM_MODEL" \
+            --grafana-url "$RELEASE_QUALITY_GRAFANA_URL" \
+            --output-directory "$RELEASE_QUALITY_OUTPUT_DIR" \
+            --evaluation-timeout-seconds 6300
+      - name: Upload auditable quality evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-quality-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RELEASE_QUALITY_OUTPUT_DIR }}
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 90

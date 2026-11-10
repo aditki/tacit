@@ -122,10 +122,12 @@ from tacit.signals.schema import (
     SQLITE_BUSY_TIMEOUT_MS,
 )
 from tacit.sqlite_identity import (
+    SQLiteAuthorityReadinessAdmission,
     SQLiteDatabaseTarget,
     activate_sqlite_wal,
     claim_sqlite_database_identity,
     require_sqlite_database_identity,
+    runtime_sqlite_snapshot_max_bytes,
     sqlite_database_path,
 )
 from tacit.tenancy import TenantBoundaryError, resolve_tenant_boundary
@@ -831,7 +833,13 @@ class SignalStore:
 
     supports_signal_resolution_work_budget = True
 
-    def __init__(self, db_path: Path | None = None, *, runtime_settings: Settings | None = None):
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        *,
+        runtime_settings: Settings | None = None,
+        sqlite_snapshot_max_bytes: int | None = None,
+    ):
         settings_owner = runtime_settings or settings
         selected_path = db_path or settings_owner.signals_db_path or _DEFAULT_DB_PATH
         self._settings = snapshot_runtime_settings(
@@ -849,7 +857,14 @@ class SignalStore:
             database_path=self._db_path,
         )
         self._database_id: str | None = None
-        self._sqlite_target = SQLiteDatabaseTarget(self._db_path)
+        self._sqlite_target = SQLiteDatabaseTarget(
+            self._db_path,
+            admission_role="signals",
+            snapshot_max_bytes=runtime_sqlite_snapshot_max_bytes(
+                settings_owner,
+                sqlite_snapshot_max_bytes,
+            ),
+        )
         self._transaction_connection: ContextVar[sqlite3.Connection | None] = ContextVar(
             f"signal_transaction_{id(self)}",
             default=None,
@@ -861,6 +876,15 @@ class SignalStore:
         self._bootstrap_signal_definitions = self._load_bootstrap_signal_definitions()
         self._preflight_owner_before_mutation()
         self._ensure_schema()
+        if self._database_id is None:
+            raise RuntimeOwnershipError("Signal store readiness requires a claimed database generation")
+        self._sqlite_readiness_admission: SQLiteAuthorityReadinessAdmission = (
+            self._sqlite_target.issue_readiness_admission(
+                role="signals",
+                database_id=self._database_id,
+                tenant_owner=self._legacy_tenant or "*",
+            )
+        )
 
     def new_signal_resolution_work_budget(
         self,
@@ -965,6 +989,11 @@ class SignalStore:
     def runtime_ownership(self) -> RuntimeOwnershipDescriptor:
         """Return this store's public runtime ownership descriptor."""
         return self._runtime_ownership
+
+    @property
+    def sqlite_readiness_admission(self) -> SQLiteAuthorityReadinessAdmission:
+        """Return this store's immutable shared-authority readiness capability."""
+        return self._sqlite_readiness_admission
 
     def activate_pinned_governed_mappings(
         self,

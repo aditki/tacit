@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from ipaddress import IPv6Address, ip_address
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 try:
     import truststore
@@ -18,7 +20,12 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tacit.archetypes.generated.schema import ArchetypeRetrievalMode
-from tacit.sqlite_identity import inspect_sqlite_database_target, sqlite_database_path
+from tacit.models.request_limits import pipeline_retained_request_memory_bound
+from tacit.sqlite_identity import (
+    DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES,
+    inspect_sqlite_database_target,
+    sqlite_database_path,
+)
 from tacit.tenancy import TenantBoundaryError, resolve_tenant_boundary
 
 if TYPE_CHECKING:
@@ -37,6 +44,38 @@ _SIGNALFX_REALM_RE = re.compile(
     re.ASCII | re.IGNORECASE,
 )
 _KNOWLEDGE_PERMISSION_RE = re.compile(r"[A-Za-z0-9_.:-]+", re.ASCII)
+_CORS_HOST_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
+_AWS_REGION_RE = re.compile(
+    r"(?:af|ap|ca|cn|eu|eusc|il|me|mx|sa|us)(?:-[a-z0-9]+)+-[1-9][0-9]*",
+    re.ASCII,
+)
+
+API_MAX_REQUEST_BODY_BYTES_MIN = 1_024
+API_MAX_REQUEST_BODY_BYTES_MAX = 64 * 1_024 * 1_024
+DEFAULT_API_MAX_REQUEST_BODY_BYTES = 2 * 1_024 * 1_024
+API_REQUEST_BODY_MAX_CONCURRENT_MAX = 1_024
+DEFAULT_API_REQUEST_BODY_MAX_CONCURRENT = 16
+DEFAULT_API_REQUEST_BODY_TENANT_MAX_CONCURRENT = 4
+API_REQUEST_BODY_MAX_BUFFERED_BYTES_MAX = 8 * 1_024 * 1_024 * 1_024
+DEFAULT_API_REQUEST_BODY_MAX_BUFFERED_BYTES = 512 * 1_024 * 1_024
+DEFAULT_API_REQUEST_BODY_TENANT_MAX_BUFFERED_BYTES = 128 * 1_024 * 1_024
+API_REQUEST_BODY_MEMORY_AMPLIFICATION_FACTOR_MIN = 2
+API_REQUEST_BODY_MEMORY_AMPLIFICATION_FACTOR_MAX = 16
+DEFAULT_API_REQUEST_BODY_MEMORY_AMPLIFICATION_FACTOR = 8
+# CPython's decoded representation of dense JSON arrays, including allocator
+# overhead, can retain more than 60 bytes per wire byte. This floor is
+# intentionally not configurable: the
+# generic factor remains useful for byte-oriented bodies, while JSON admission
+# must not be weakened below its measured structural allocation envelope.
+API_REQUEST_BODY_JSON_MEMORY_AMPLIFICATION_FACTOR = 64
+API_REQUEST_BODY_MEMORY_FLOOR_BYTES_MIN = 4 * 1_024 * 1_024
+API_REQUEST_BODY_MEMORY_FLOOR_BYTES_MAX = 16 * 1_024 * 1_024
+DEFAULT_API_REQUEST_BODY_MEMORY_FLOOR_BYTES = API_REQUEST_BODY_MEMORY_FLOOR_BYTES_MIN
+API_REQUEST_BODY_READ_TIMEOUT_SECONDS_MIN = 0.05
+API_REQUEST_BODY_READ_TIMEOUT_SECONDS_MAX = 300.0
+DEFAULT_API_REQUEST_BODY_READ_TIMEOUT_SECONDS = 15.0
+DEFAULT_API_ALLOWED_HOSTS = "localhost,127.0.0.1,[::1],testserver"
+BEDROCK_COMPATIBILITY_MAX_CONCURRENT = 32
 
 
 def validate_distinct_sqlite_role_paths(
@@ -93,6 +132,14 @@ def canonical_signalfx_realm(value: str) -> str:
     return raw.casefold()
 
 
+def canonical_aws_region(value: object) -> str:
+    """Return one canonical AWS region identifier safe for endpoint synthesis."""
+    region = str(value or "").strip().casefold()
+    if _AWS_REGION_RE.fullmatch(region) is None:
+        raise ValueError("AWS region is invalid")
+    return region
+
+
 def canonical_knowledge_tenant_id(value: object) -> str:
     """Return the tenant identity used by settings, auth, and ownership."""
     tenant_id = str(value or "").strip() or "default"
@@ -134,6 +181,185 @@ def validated_knowledge_tenant_api_keys(
     return validated
 
 
+def canonical_cors_allowed_origins(value: object) -> str:
+    """Canonicalize a comma-separated list of exact browser origins."""
+    origins: list[str] = []
+    for candidate in str(value or "").split(","):
+        origin = candidate.strip()
+        if not origin:
+            continue
+        if origin == "*":
+            origins.append(origin)
+            continue
+        try:
+            parsed = urlsplit(origin)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            raise ValueError("CORS origins must be exact http(s) origins") from None
+        if (
+            parsed.scheme.casefold() not in {"http", "https"}
+            or not parsed.netloc
+            or hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or parsed.netloc.endswith(":")
+            or "%" in parsed.netloc
+            or "\\" in parsed.netloc
+            or any(
+                character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F for character in parsed.netloc
+            )
+        ):
+            raise ValueError("CORS origins must be exact http(s) origins")
+        if parsed.netloc.startswith("["):
+            try:
+                bracketed_address = ip_address(hostname)
+            except ValueError:
+                raise ValueError("CORS origins must be exact http(s) origins") from None
+            if not isinstance(bracketed_address, IPv6Address):
+                raise ValueError("CORS origins must be exact http(s) origins")
+        canonical_host = _canonical_cors_host(hostname)
+        scheme = parsed.scheme.casefold()
+        default_port = 80 if scheme == "http" else 443
+        authority = canonical_host if port in {None, default_port} else f"{canonical_host}:{port}"
+        origins.append(f"{scheme}://{authority}")
+    return ",".join(dict.fromkeys(origins))
+
+
+def canonical_api_host_name(value: object) -> str:
+    """Return one exact, port-free host identity for request admission."""
+    raw = str(value or "")
+    if not raw or raw != raw.strip() or any(character.isspace() for character in raw):
+        raise ValueError("API allowed hosts must be exact DNS or IP hosts")
+    if raw.startswith("[") or raw.endswith("]"):
+        if not (raw.startswith("[") and raw.endswith("]")):
+            raise ValueError("API allowed hosts must be exact DNS or IP hosts")
+        try:
+            address = ip_address(raw[1:-1])
+        except ValueError:
+            raise ValueError("API allowed hosts must be exact DNS or IP hosts") from None
+        if not isinstance(address, IPv6Address):
+            raise ValueError("API allowed hosts must be exact DNS or IP hosts")
+        return f"[{address.compressed}]"
+    try:
+        address = ip_address(raw)
+    except ValueError:
+        try:
+            return _canonical_cors_host(raw)
+        except ValueError:
+            raise ValueError("API allowed hosts must be exact DNS or IP hosts") from None
+    if isinstance(address, IPv6Address):
+        return f"[{address.compressed}]"
+    return address.compressed
+
+
+def canonical_api_allowed_hosts(value: object) -> str:
+    """Canonicalize an explicit comma-separated Host-header allowlist."""
+    patterns: list[str] = []
+    for candidate in str(value or "").split(","):
+        raw = candidate.strip()
+        if not raw:
+            continue
+        wildcard = raw.startswith("*.")
+        if "*" in raw and not wildcard:
+            raise ValueError("API allowed hosts cannot contain an unrestricted wildcard")
+        host = canonical_api_host_name(raw[2:] if wildcard else raw)
+        if wildcard:
+            try:
+                ip_address(host.strip("[]"))
+            except ValueError:
+                pass
+            else:
+                raise ValueError("API allowed hosts cannot wildcard an IP address")
+            host = f"*.{host}"
+        patterns.append(host)
+    if not patterns:
+        raise ValueError("API allowed hosts must include at least one exact host")
+    return ",".join(dict.fromkeys(patterns))
+
+
+def api_host_is_allowed(host: str, allowed_hosts: Iterable[str]) -> bool:
+    """Return whether one canonical Host identity matches an allowed pattern."""
+    return any(
+        host == pattern or (pattern.startswith("*.") and host.endswith(pattern[1:]) and host != pattern[2:])
+        for pattern in allowed_hosts
+    )
+
+
+def is_loopback_bind_host(value: object) -> bool:
+    """Return whether a server bind target is explicitly loopback-only."""
+    raw = str(value or "").strip().casefold()
+    if raw == "localhost":
+        return True
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    try:
+        return ip_address(raw).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_api_server_bind(runtime_settings: object, bind_host: object) -> str:
+    """Admit one server bind through the shared auth and Host-header policy."""
+    raw_host = str(bind_host or "")
+    canonical_host = canonical_api_host_name(raw_host)
+    if is_loopback_bind_host(raw_host):
+        return raw_host
+    if not bool(getattr(runtime_settings, "api_auth_enabled", False)):
+        raise ValueError("Non-loopback serving requires API authentication")
+
+    configured_fields = set(getattr(runtime_settings, "model_fields_set", set()))
+    if "api_allowed_hosts" not in configured_fields:
+        raise ValueError("Non-loopback serving requires an explicit API allowed-host policy")
+    allowed_hosts = tuple(canonical_api_allowed_hosts(getattr(runtime_settings, "api_allowed_hosts", "")).split(","))
+
+    try:
+        wildcard_bind = ip_address(canonical_host.strip("[]")).is_unspecified
+    except ValueError:
+        wildcard_bind = False
+    compatible = (
+        any(host != "testserver" for host in allowed_hosts)
+        if wildcard_bind
+        else api_host_is_allowed(canonical_host, allowed_hosts)
+    )
+    if not compatible:
+        raise ValueError("Non-loopback serving requires a compatible API allowed host")
+    return raw_host
+
+
+def _canonical_cors_host(hostname: str) -> str:
+    """Return a browser-compatible DNS or IP host without parser ambiguity."""
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        if ":" in hostname:
+            raise ValueError("CORS origins must be exact http(s) origins") from None
+        if not hostname.isascii():
+            raise ValueError("CORS origins must be exact http(s) origins") from None
+        canonical = hostname.casefold()
+        labels = canonical.split(".")
+        final_label = labels[-1] if labels else ""
+        browser_numeric_host = final_label.isdigit() or (
+            final_label.startswith("0x")
+            and len(final_label) > 2
+            and all(character in "0123456789abcdef" for character in final_label[2:])
+        )
+        if (
+            not canonical
+            or len(canonical) > 253
+            or browser_numeric_host
+            or any(_CORS_HOST_LABEL_RE.fullmatch(label) is None for label in labels)
+        ):
+            raise ValueError("CORS origins must be exact http(s) origins")
+        return canonical
+    if isinstance(address, IPv6Address):
+        return f"[{address.compressed}]"
+    return address.compressed
+
+
 # ── Config file discovery ──────────────────────────────────────────────────
 # Priority: TACIT_CONFIG env var → ./tacit.yaml → ./tacit.yml → None
 
@@ -169,15 +395,27 @@ def _load_yaml_config() -> dict[str, Any]:
 
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("Tacit YAML configuration must be a mapping")
 
     # Flatten nested sections: {llm: {provider: x}} → {llm_provider: x}
     flat: dict[str, Any] = {}
+    source_names: dict[str, str] = {}
     for key, value in raw.items():
         if isinstance(value, dict):
             for sub_key, sub_value in value.items():
-                flat[f"{key}_{sub_key}"] = sub_value
+                field_name = f"{key}_{sub_key}"
+                flat[field_name] = sub_value
+                source_names[field_name] = f"{key}.{sub_key}"
         else:
             flat[key] = value
+            source_names[key] = key
+
+    settings_type = globals().get("Settings")
+    if settings_type is not None:
+        unknown = sorted(source_names[name] for name in flat if name not in settings_type.model_fields)
+        if unknown:
+            raise ValueError(f"Unsupported Tacit YAML configuration key(s): {', '.join(unknown)}")
     return flat
 
 
@@ -198,6 +436,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        hide_input_in_errors=True,
         validate_assignment=True,
     )
 
@@ -216,6 +455,7 @@ class Settings(BaseSettings):
     llm_bedrock_role_arn: str = ""  # Optional IAM role ARN to assume (cross-account)
     llm_aws_access_key_id: str = Field(default="", repr=False)  # Optional explicit AWS key
     llm_aws_secret_access_key: str = Field(default="", repr=False)  # Optional explicit AWS secret
+    llm_aws_session_token: str = Field(default="", repr=False)  # Optional temporary-credential token
     # Zero-key mode: when the configured provider has no API key, fall back to
     # deterministic keyword-based intent classification instead of failing.
     # The archetype engine then compiles the dashboard without any LLM calls.
@@ -257,8 +497,12 @@ class Settings(BaseSettings):
     context_max_chunks: int = 10  # max context chunks per query
 
     # Concurrency & timeouts
-    pipeline_max_concurrent: int = 5  # max simultaneous pipeline runs
-    pipeline_timeout_seconds: int = 120  # overall pipeline timeout
+    pipeline_max_concurrent: int = Field(default=5, ge=1, le=1_000)
+    # Zero selects the wildcard-safe default of global concurrency minus one.
+    pipeline_max_concurrent_per_tenant: int = Field(default=0, ge=0, le=1_000)
+    pipeline_max_queued: int = Field(default=100, ge=0, le=1_000)
+    pipeline_max_queued_per_tenant: int = Field(default=25, ge=0, le=1_000)
+    pipeline_timeout_seconds: float = Field(default=120, gt=0, le=86_400)
     adapter_max_concurrent: int = 5  # max simultaneous datasource adapter calls
     adapter_timeout_seconds: int = 30  # per-adapter timeout
     max_metric_catalog_size: int = 300  # total metrics across all datasources sent to LLM
@@ -276,6 +520,14 @@ class Settings(BaseSettings):
     history_db_path: str = ""
     feedback_db_path: str = ""
     signals_db_path: str = ""
+    sqlite_snapshot_max_bytes: int = Field(
+        default=DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES,
+        gt=0,
+        description=(
+            "Per-physical-database copy cap for protected SQLite admission; "
+            "each admission shares it across main/WAL copies and retries"
+        ),
+    )
 
     # Generated archetypes are experimental artifacts, never curated registry
     # entries. Generation, quarantine persistence, and explicit experimental
@@ -357,6 +609,49 @@ class Settings(BaseSettings):
     # HTTP API auth
     api_auth_enabled: bool = False  # set True to require API key
     api_auth_key: str = Field(default="", repr=False)
+    api_allowed_hosts: str = DEFAULT_API_ALLOWED_HOSTS
+    api_cors_allowed_origins: str = ""
+    api_max_request_body_bytes: int = Field(
+        default=DEFAULT_API_MAX_REQUEST_BODY_BYTES,
+        ge=API_MAX_REQUEST_BODY_BYTES_MIN,
+        le=API_MAX_REQUEST_BODY_BYTES_MAX,
+    )
+    api_request_body_max_concurrent: int = Field(
+        default=DEFAULT_API_REQUEST_BODY_MAX_CONCURRENT,
+        ge=1,
+        le=API_REQUEST_BODY_MAX_CONCURRENT_MAX,
+    )
+    api_request_body_max_buffered_bytes: int = Field(
+        default=DEFAULT_API_REQUEST_BODY_MAX_BUFFERED_BYTES,
+        ge=API_MAX_REQUEST_BODY_BYTES_MIN,
+        le=API_REQUEST_BODY_MAX_BUFFERED_BYTES_MAX,
+    )
+    api_request_body_tenant_max_concurrent: int = Field(
+        default=DEFAULT_API_REQUEST_BODY_TENANT_MAX_CONCURRENT,
+        ge=1,
+        le=API_REQUEST_BODY_MAX_CONCURRENT_MAX,
+    )
+    api_request_body_tenant_max_buffered_bytes: int = Field(
+        default=DEFAULT_API_REQUEST_BODY_TENANT_MAX_BUFFERED_BYTES,
+        ge=API_MAX_REQUEST_BODY_BYTES_MIN,
+        le=API_REQUEST_BODY_MAX_BUFFERED_BYTES_MAX,
+    )
+    api_request_body_memory_amplification_factor: int = Field(
+        default=DEFAULT_API_REQUEST_BODY_MEMORY_AMPLIFICATION_FACTOR,
+        ge=API_REQUEST_BODY_MEMORY_AMPLIFICATION_FACTOR_MIN,
+        le=API_REQUEST_BODY_MEMORY_AMPLIFICATION_FACTOR_MAX,
+    )
+    api_request_body_memory_floor_bytes: int = Field(
+        default=DEFAULT_API_REQUEST_BODY_MEMORY_FLOOR_BYTES,
+        ge=API_REQUEST_BODY_MEMORY_FLOOR_BYTES_MIN,
+        le=API_REQUEST_BODY_MEMORY_FLOOR_BYTES_MAX,
+    )
+    api_request_body_read_timeout_seconds: float = Field(
+        default=DEFAULT_API_REQUEST_BODY_READ_TIMEOUT_SECONDS,
+        ge=API_REQUEST_BODY_READ_TIMEOUT_SECONDS_MIN,
+        le=API_REQUEST_BODY_READ_TIMEOUT_SECONDS_MAX,
+        allow_inf_nan=False,
+    )
     knowledge_tenant_id: str = "default"
     knowledge_tenant_api_keys: dict[str, str] = Field(default_factory=dict, repr=False)
     knowledge_permissions: str = (
@@ -399,6 +694,11 @@ class Settings(BaseSettings):
     def _validate_signalfx_realm(cls, value: str) -> str:
         return canonical_signalfx_realm(value)
 
+    @field_validator("llm_bedrock_region", mode="before")
+    @classmethod
+    def _canonicalize_llm_bedrock_region(cls, value: object) -> str:
+        return canonical_aws_region(value)
+
     @field_validator("knowledge_tenant_id", mode="before")
     @classmethod
     def _canonicalize_knowledge_tenant_id(cls, value: object) -> str:
@@ -417,6 +717,88 @@ class Settings(BaseSettings):
     ) -> dict[str, str]:
         return validated_knowledge_tenant_api_keys(value)
 
+    @field_validator("api_cors_allowed_origins", mode="before")
+    @classmethod
+    def _canonicalize_api_cors_allowed_origins(cls, value: object) -> str:
+        return canonical_cors_allowed_origins(value)
+
+    @field_validator("api_allowed_hosts", mode="before")
+    @classmethod
+    def _canonicalize_api_allowed_hosts(cls, value: object) -> str:
+        return canonical_api_allowed_hosts(value)
+
+    @model_validator(mode="after")
+    def _validate_authenticated_cors(self) -> Settings:
+        if self.api_auth_enabled and "*" in self.api_cors_allowed_origins.split(","):
+            raise ValueError("Authenticated API deployments cannot use wildcard CORS")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_request_body_admission(self) -> Settings:
+        required_memory = max(
+            self.api_request_body_memory_floor_bytes,
+            self.api_max_request_body_bytes
+            * max(
+                self.api_request_body_memory_amplification_factor,
+                API_REQUEST_BODY_JSON_MEMORY_AMPLIFICATION_FACTOR,
+            ),
+        )
+        if self.api_request_body_max_buffered_bytes < required_memory:
+            raise ValueError(
+                "api_request_body_max_buffered_bytes must admit the configured maximum request memory envelope"
+            )
+        if self.api_request_body_tenant_max_buffered_bytes < required_memory:
+            raise ValueError(
+                "api_request_body_tenant_max_buffered_bytes must admit the configured maximum request memory envelope"
+            )
+        wildcard_tenancy = self.knowledge_tenant_id == "*"
+        if self.api_request_body_tenant_max_buffered_bytes > self.api_request_body_max_buffered_bytes:
+            raise ValueError(
+                "api_request_body_tenant_max_buffered_bytes must not exceed api_request_body_max_buffered_bytes"
+            )
+        if wildcard_tenancy and (
+            self.api_request_body_tenant_max_buffered_bytes >= self.api_request_body_max_buffered_bytes
+        ):
+            raise ValueError(
+                "api_request_body_tenant_max_buffered_bytes must be lower than "
+                "api_request_body_max_buffered_bytes for wildcard tenancy"
+            )
+        if self.api_request_body_tenant_max_concurrent > self.api_request_body_max_concurrent:
+            raise ValueError("api_request_body_tenant_max_concurrent must not exceed api_request_body_max_concurrent")
+        if wildcard_tenancy and self.api_request_body_tenant_max_concurrent >= self.api_request_body_max_concurrent:
+            raise ValueError(
+                "api_request_body_tenant_max_concurrent must be lower than "
+                "api_request_body_max_concurrent for wildcard tenancy"
+            )
+        retained_request_memory = pipeline_retained_request_memory_bound(
+            max_concurrent=self.pipeline_max_concurrent,
+            max_queued=self.pipeline_max_queued,
+        )
+        if retained_request_memory > self.api_request_body_max_buffered_bytes:
+            raise ValueError("api_request_body_max_buffered_bytes must cover pipeline retained request memory")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_bedrock_compatibility_capacity(self) -> Settings:
+        if (
+            self.llm_provider.strip().casefold() == "bedrock"
+            and self.pipeline_max_concurrent > BEDROCK_COMPATIBILITY_MAX_CONCURRENT
+        ):
+            raise ValueError(
+                "Bedrock compatibility bridge limits pipeline_max_concurrent to "
+                f"{BEDROCK_COMPATIBILITY_MAX_CONCURRENT}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_explicit_aws_credentials(self) -> Settings:
+        access_key = str(self.llm_aws_access_key_id or "").strip()
+        secret_key = str(self.llm_aws_secret_access_key or "").strip()
+        session_token = str(self.llm_aws_session_token or "").strip()
+        if bool(access_key) != bool(secret_key) or (session_token and not (access_key and secret_key)):
+            raise ValueError("AWS credentials must include both access key and secret key")
+        return self
+
     @model_validator(mode="after")
     def _validate_tenant_api_keys(self) -> Settings:
         if self.knowledge_tenant_id != "*":
@@ -426,6 +808,17 @@ class Settings(BaseSettings):
         non_empty_keys = [value for value in self.knowledge_tenant_api_keys.values() if value]
         if len(non_empty_keys) != len(set(non_empty_keys)):
             raise ValueError("knowledge_tenant_api_keys must use a unique non-empty key per tenant")
+        active_per_tenant = self.pipeline_max_concurrent_per_tenant or max(1, self.pipeline_max_concurrent - 1)
+        if active_per_tenant > self.pipeline_max_concurrent or (
+            self.pipeline_max_concurrent > 1 and active_per_tenant == self.pipeline_max_concurrent
+        ):
+            raise ValueError(
+                "pipeline_max_concurrent_per_tenant must be lower than " "pipeline_max_concurrent for wildcard tenancy"
+            )
+        if self.pipeline_max_queued > 0 and self.pipeline_max_queued_per_tenant >= self.pipeline_max_queued:
+            raise ValueError(
+                "pipeline_max_queued_per_tenant must be lower than pipeline_max_queued " "for wildcard tenancy"
+            )
         return self
 
     @model_validator(mode="after")

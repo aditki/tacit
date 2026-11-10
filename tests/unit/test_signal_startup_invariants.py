@@ -37,6 +37,7 @@ _SUBPROCESS_OPEN_SCRIPT = r"""
 import json
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from tacit.config import Settings
@@ -56,7 +57,13 @@ try:
         runtime_settings=Settings(_env_file=None, knowledge_tenant_id=tenant_id),
     )
 except Exception as exc:
-    result = {"status": "error", "exception_class": type(exc).__name__}
+    frames = traceback.extract_tb(exc.__traceback__)
+    result = {
+        "status": "error",
+        "exception_class": type(exc).__name__,
+        "reason_code": str(getattr(exc, "reason_code", "")),
+        "failure_site": [f"{frame.name}:{frame.lineno}" for frame in frames[-3:]],
+    }
 else:
     result = {"status": "ok"}
 Path(result_path).write_text(json.dumps(result, sort_keys=True))

@@ -21,7 +21,7 @@ from tacit.api.security import (
     verify_api_key,
 )
 from tacit.dependencies import PipelineDependencies
-from tacit.errors import PipelineExecutionError, safe_failure_diagnostics
+from tacit.errors import PipelineAdmissionRejected, PipelineExecutionError, safe_failure_diagnostics
 from tacit.models.schemas import DashRequest, DashResponse
 from tacit.pipeline import run_pipeline
 from tacit.pipeline.progress import reset_progress_callback, set_progress_callback
@@ -73,6 +73,8 @@ async def create_chart(
         raise HTTPException(status_code=400, detail="prompt is required")
     try:
         return await run_pipeline(request, deps)
+    except PipelineAdmissionRejected as exc:
+        return JSONResponse(status_code=503, content=exc.public_payload())
     except PipelineExecutionError as exc:
         logger.error(
             "api_pipeline_error",
@@ -151,6 +153,9 @@ async def create_chart_stream(
                 yield _sse_frame("stage", event)
             try:
                 result = task.result()
+            except PipelineAdmissionRejected as exc:
+                yield _sse_frame("error", exc.public_payload())
+                return
             except PipelineExecutionError as exc:
                 logger.error(
                     "api_pipeline_stream_error",

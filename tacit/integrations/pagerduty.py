@@ -116,6 +116,7 @@ class PagerDutyClient:
             },
             timeout=_DEFAULT_TIMEOUT,
             transport=transport,
+            trust_env=False,
         )
 
     @property

@@ -25,6 +25,11 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from tacit.config import Settings
+from tacit.feedback import FeedbackStore
+from tacit.history import InvestigationStore
+from tacit.runtime_stores import RuntimeStores
+from tacit.signals.store import SignalStore
 from tacit.sqlite_identity import SQLiteDatabaseTarget, activate_sqlite_wal
 
 _TIMEOUT_MS = 30_000
@@ -177,7 +182,7 @@ def _run_coordinated_wal_lifecycle(kind: str, path: Path, *, last_closer: int) -
         )
         for worker in range(2)
     ]
-    fresh: multiprocessing.Process | None = None
+    fresh: Any | None = None
     try:
         for process in processes:
             process.start()
@@ -213,12 +218,12 @@ def _run_coordinated_wal_lifecycle(kind: str, path: Path, *, last_closer: int) -
         if fresh.exitcode != 0:
             raise RuntimeError("fresh WAL owner did not exit cleanly")
     finally:
-        for process in (*processes, fresh):
-            if process is None:
+        for cleanup_process in (*processes, fresh):
+            if cleanup_process is None:
                 continue
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=5)
+            if cleanup_process.is_alive():
+                cleanup_process.terminate()
+            cleanup_process.join(timeout=5)
         messages.close()
         messages.join_thread()
 
@@ -349,7 +354,7 @@ def _subprocess_workload(
             )
         if completed != [writes] * workers:
             raise RuntimeError("subprocess write count mismatch")
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             row_count = connection.execute("SELECT COUNT(*) FROM rows").fetchone()
         if row_count != (workers * writes,):
             raise RuntimeError("subprocess committed row count mismatch")
@@ -396,6 +401,52 @@ def _descriptor_count() -> int | None:
         except OSError:
             continue
     return None
+
+
+def _shared_signals_readiness_probe(root: Path) -> dict[str, Any]:
+    """Measure all runtime authorities while Signals remains shared by two owners."""
+    probe_root = root / "shared-signals-readiness"
+    settings = Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        history_db_path=str(probe_root / "history.db"),
+        feedback_db_path=str(probe_root / "feedback.db"),
+        signals_db_path=str(probe_root / "signals.db"),
+    )
+    InvestigationStore(Path(settings.history_db_path), runtime_settings=settings)
+    FeedbackStore(Path(settings.feedback_db_path), runtime_settings=settings)
+    seed = SignalStore(Path(settings.signals_db_path), runtime_settings=settings)
+    with seed.transaction() as connection:
+        connection.execute("CREATE TABLE readiness_benchmark_canary (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO readiness_benchmark_canary VALUES ('preserved')")
+    source_bytes = sum(
+        Path(path).stat().st_size
+        for path in (
+            settings.history_db_path,
+            settings.feedback_db_path,
+            settings.signals_db_path,
+        )
+    )
+
+    started = time.perf_counter_ns()
+    stores = RuntimeStores(settings)
+    readiness = stores.prepare_required_stores()
+    duration_ms = (time.perf_counter_ns() - started) / 1_000_000
+    with closing(sqlite3.connect(settings.signals_db_path)) as connection:
+        if connection.execute("SELECT value FROM readiness_benchmark_canary").fetchone() != ("preserved",):
+            raise RuntimeError("shared readiness did not preserve the admitted Signals generation")
+    if readiness.snapshot_copy_count != 3 or readiness.snapshot_copy_roles != (
+        "feedback",
+        "history",
+        "signals",
+    ):
+        raise RuntimeError("runtime readiness did not admit each physical authority exactly once")
+    return {
+        "duration_ms": round(duration_ms, 6),
+        "source_bytes": source_bytes,
+        "copy_count": readiness.snapshot_copy_count,
+        "copied_bytes": readiness.snapshot_copy_bytes,
+        "roles": list(readiness.snapshot_copy_roles),
+    }
 
 
 def run_benchmark(
@@ -490,13 +541,14 @@ def run_benchmark(
                     "p95_ms": 0.0,
                     "operations_per_second": 0.0,
                 }
+    readiness_admission = _shared_signals_readiness_probe(root)
     gc.collect()
     end_descriptors = _descriptor_count()
     descriptor_delta = (
         None if start_descriptors is None or end_descriptors is None else end_descriptors - start_descriptors
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "runtime": {
             "revision": _revision(),
             "python": platform.python_version(),
@@ -520,6 +572,7 @@ def run_benchmark(
             "coordinated_last_close_orders": [0, 1],
         },
         "descriptor_delta": descriptor_delta,
+        "readiness_admission": readiness_admission,
         "failures": failures,
         "workloads": workloads,
     }

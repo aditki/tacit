@@ -6,7 +6,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable, Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -82,7 +82,6 @@ from tacit.knowledge.repository import (
     CandidateReviewConflictError,
     KnowledgeRepository,
     KnowledgeRevisionConflictError,
-    get_knowledge_repository,
 )
 from tacit.knowledge.usage import KnowledgeRevisionRef, KnowledgeStageUse
 from tacit.pagination import MAX_COMPATIBILITY_OFFSET
@@ -199,6 +198,20 @@ class KnowledgeService:
     ):
         if history_store is not None and history_store_factory is not None:
             raise ValueError("provide either history_store or history_store_factory, not both")
+        runtime_settings_was_supplied = runtime_settings is not None
+
+        if repository is None and signal_store is None:
+            if runtime_settings is None:
+                from tacit.signals import get_signal_store
+
+                signal_store = get_signal_store()
+            else:
+                from tacit.signals.store import SignalStore
+
+                signal_store = SignalStore(
+                    Path(runtime_settings.signals_db_path or DEFAULT_SIGNALS_DB_PATH).expanduser().resolve(),
+                    runtime_settings=runtime_settings,
+                )
 
         repository_descriptor = None
         repository_path = None
@@ -242,10 +255,15 @@ class KnowledgeService:
             if repository_path is None or signal_db_path is None or repository_path == signal_db_path
             else None
         )
-        selected_settings = snapshot_runtime_settings(
-            runtime_settings or signal_settings or repository_settings or settings,
-            database_role="signals" if adopted_database_path is not None else None,
-            database_path=adopted_database_path,
+        selected_settings_owner = runtime_settings or signal_settings or repository_settings or settings
+        selected_settings = (
+            snapshot_runtime_settings(selected_settings_owner)
+            if not runtime_settings_was_supplied and signal_settings is not None
+            else snapshot_runtime_settings(
+                selected_settings_owner,
+                database_role="signals" if adopted_database_path is not None else None,
+                database_path=adopted_database_path,
+            )
         )
         self._runtime_settings = selected_settings
         if repository_owner is not None:
@@ -257,9 +275,13 @@ class KnowledgeService:
                     ("knowledge_repository", "knowledge_service_settings"),
                     message="knowledge repository tenant owner does not match the configured runtime",
                 )
-        settings_descriptor = runtime_descriptor_from_settings(
-            self._runtime_settings,
-            component="knowledge_service_settings",
+        settings_descriptor = (
+            replace(signal_descriptor, component="knowledge_service_settings")
+            if not runtime_settings_was_supplied and signal_descriptor is not None
+            else runtime_descriptor_from_settings(
+                self._runtime_settings,
+                component="knowledge_service_settings",
+            )
         )
         supplied_descriptors = tuple(
             descriptor
@@ -271,17 +293,30 @@ class KnowledgeService:
         if repository is not None:
             self.repository = repository
         elif signal_db_path is not None:
+            from tacit.runtime_stores import (
+                require_shared_signal_knowledge_admission,
+                require_signal_store_readiness_admission,
+            )
+
+            require_signal_store_readiness_admission(
+                signal_store,
+                runtime_settings=self._runtime_settings,
+                boundary="Knowledge service Signals admission",
+            )
             self.repository = KnowledgeRepository(
                 Path(signal_db_path),
-                runtime_settings=self._runtime_settings,
+                runtime_settings=self._runtime_settings if runtime_settings_was_supplied else None,
+                signal_store=signal_store,
             )
-        elif runtime_settings is not None:
-            self.repository = KnowledgeRepository(
-                Path(self._runtime_settings.signals_db_path or DEFAULT_SIGNALS_DB_PATH).expanduser().resolve(),
+            require_shared_signal_knowledge_admission(
+                signal_store,
+                self.repository,
                 runtime_settings=self._runtime_settings,
+                boundary="Knowledge service Signals admission",
+                revalidate_generation=False,
             )
         else:
-            self.repository = get_knowledge_repository()
+            raise RuntimeOwnershipError("Knowledge service requires an admitted Signals owner")
         realized_repository_descriptor = get_runtime_ownership(
             self.repository,
             component="knowledge_repository",
@@ -292,6 +327,15 @@ class KnowledgeService:
         )
         if repository_descriptor is None:
             _require_knowledge_runtime_graph((*supplied_descriptors, realized_repository_descriptor))
+        if signal_store is not None and repository is not None:
+            from tacit.runtime_stores import require_shared_signal_knowledge_admission
+
+            require_shared_signal_knowledge_admission(
+                signal_store,
+                self.repository,
+                runtime_settings=self._runtime_settings,
+                boundary="Knowledge service Signals admission",
+            )
         self._signal_store_instance = signal_store
         self._history_store_instance = history_store
         self._history_store_factory = history_store_factory
@@ -3023,11 +3067,8 @@ class KnowledgeService:
 
     def _signal_store(self):
         if self._signal_store_instance is None:
-            from tacit.signals.store import SignalStore
-
-            self._signal_store_instance = SignalStore(
-                self.repository.database_path,
-                runtime_settings=self._runtime_settings,
+            raise RuntimeOwnershipError(
+                "Knowledge service signal operations require an injected shared Signals admission owner"
             )
         return self._signal_store_instance
 
@@ -3744,4 +3785,6 @@ class KnowledgeService:
 
 
 def get_knowledge_service() -> KnowledgeService:
-    return KnowledgeService(get_knowledge_repository(), runtime_settings=settings)
+    from tacit.signals import get_signal_store
+
+    return KnowledgeService(signal_store=get_signal_store())

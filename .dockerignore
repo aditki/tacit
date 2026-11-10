@@ -6,6 +6,7 @@
 .uv-cache
 .venv
 .smoke-venv
+buildx-v*.linux-*
 __pycache__
 *.py[cod]
 *.egg-info
