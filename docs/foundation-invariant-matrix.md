@@ -772,13 +772,13 @@ work limit.
   a freshly fetched `origin/main`, and has a successful completed main CI run
   for that same SHA before publication. Installed metadata, runtime version, and
   CLI output agree semantically. The `v*` namespace and the `ghcr` and `pypi`
-  deployment environments are protected repository controls. Publication
-  actions use immutable commit identities; repository-local container actions
-  name immutable image manifests directly rather than commit-derived mutable
-  tags. Downloaded tools and privileged images use explicit versions and
-  immutable digests where available. Release
-  checkouts do not persist credentials, and emulation is enabled only where
-  required.
+  deployment environments are protected repository controls. Workflow actions,
+  including write-enabled vendor refresh, use immutable commit identities.
+  Workflow container actions use image digests. Repository-local container
+  actions name immutable image manifests directly. Downloaded tools and
+  privileged images use explicit versions and immutable digests where
+  available. Release checkouts do not persist credentials, and emulation is
+  enabled only where required.
 - Container architectures are built twice without cache on independent pinned
   BuildKit builders, and their same-SHA child digests must match before the
   first artifact upload. Only the first portable artifact is authoritative; it

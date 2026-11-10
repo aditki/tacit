@@ -984,6 +984,27 @@ def test_release_image_is_reproducible_with_no_cache_when_docker_is_requested(
     assert digests[0] == digests[1]
 
 
+def test_workflow_actions_use_immutable_references() -> None:
+    workflows = REPOSITORY_ROOT / ".github" / "workflows"
+    mutable_references = []
+    for path in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):
+        workflow = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        for job in workflow["jobs"].values():
+            for entry in [job, *job.get("steps", [])]:
+                reference = entry.get("uses")
+                if reference is None or reference.startswith("./"):
+                    continue
+                pin = (
+                    r"docker://[^@]+@sha256:[0-9a-f]{64}"
+                    if reference.startswith("docker://")
+                    else r"[^@]+@[0-9a-f]{40}"
+                )
+                if not re.fullmatch(pin, reference):
+                    mutable_references.append(f"{path.name}: {reference}")
+
+    assert not mutable_references
+
+
 def test_release_actions_and_privileged_tools_are_pinned() -> None:
     workflow = _release_workflow()
     references = [step["uses"] for job in workflow["jobs"].values() for step in job["steps"] if "uses" in step]
