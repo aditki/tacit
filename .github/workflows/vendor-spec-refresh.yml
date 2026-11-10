@@ -37,9 +37,9 @@ jobs:
       OPENSEARCH_OPENAPI_URL: ${{ inputs.opensearch_openapi_url || vars.OPENSEARCH_OPENAPI_URL || '' }}
       SIGNALFLOW_OPENAPI_URL: ${{ inputs.signalflow_openapi_url || vars.SIGNALFLOW_OPENAPI_URL || '' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           python-version: "3.12"
 
@@ -139,7 +139,7 @@ jobs:
           fi
 
       - name: Open refresh pull request
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v6.1.0
         with:
           token: ${{ secrets.VENDOR_SPEC_REFRESH_TOKEN }}
           branch: codex/vendor-spec-refresh
