@@ -15,7 +15,7 @@ import httpx
 import structlog
 
 from tacit.config import Settings, settings
-from tacit.context.base import ContextProvider
+from tacit.context.base import ContextProvider, log_context_query_failure
 from tacit.models.schemas import ContextChunk, Intent
 
 logger = structlog.get_logger()
@@ -109,8 +109,8 @@ class A2AProvider(ContextProvider):
             logger.info("a2a_context_retrieved", chunks=len(chunks))
             return chunks[:max_chunks]
 
-        except Exception:
-            logger.exception("a2a_query_failed", agent_url=self._agent_url)
+        except Exception as exc:
+            log_context_query_failure("a2a_query_failed", exc)
             return []
 
     async def close(self) -> None:

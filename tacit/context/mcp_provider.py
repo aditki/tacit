@@ -13,7 +13,7 @@ import httpx
 import structlog
 
 from tacit.config import Settings, settings
-from tacit.context.base import ContextProvider
+from tacit.context.base import ContextProvider, log_context_query_failure
 from tacit.models.schemas import ContextChunk, Intent
 
 logger = structlog.get_logger()
@@ -86,8 +86,8 @@ class MCPProvider(ContextProvider):
             logger.info("mcp_context_retrieved", chunks=len(chunks))
             return chunks
 
-        except Exception:
-            logger.exception("mcp_query_failed", server=self._server_url)
+        except Exception as exc:
+            log_context_query_failure("mcp_query_failed", exc)
             return []
 
     async def close(self) -> None:

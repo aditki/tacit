@@ -7,8 +7,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
+import structlog
+
 from tacit.config import Settings
-from tacit.errors import RuntimeOwnershipError
+from tacit.errors import RuntimeOwnershipError, safe_failure_diagnostics
 from tacit.models.schemas import ContextChunk, Intent
 from tacit.runtime_ownership import (
     RuntimeOwnershipDescriptor,
@@ -16,6 +18,17 @@ from tacit.runtime_ownership import (
     runtime_descriptor_for_provider,
     snapshot_runtime_settings,
 )
+
+logger = structlog.get_logger()
+
+
+def log_context_query_failure(reason_code: str, exc: Exception) -> None:
+    """Record an optional context failure with message-free diagnostics."""
+    logger.warning(
+        reason_code,
+        reason_code=reason_code,
+        **safe_failure_diagnostics(exc, reason_code=reason_code),
+    )
 
 
 class ContextProvider(ABC):
