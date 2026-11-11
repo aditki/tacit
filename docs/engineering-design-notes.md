@@ -1582,6 +1582,10 @@ governed mapping that the selected snapshot cannot safely mark as applied.
   acquired generation lease is removed from requester-local cleanup state after
   durable transfer so provider cleanup cannot race or duplicate backend cleanup.
   Provider and final-root drain close backend children before their generation.
+  When requester cancellation and worker abandonment overlap, the worker joins
+  the adopted backend's close result. A retired generation can reject a new
+  dispatch after the service owner has already closed that backend. The exact
+  record's terminal result governs retirement across that race.
   A transient close failure is retried within fixed attempt and wall-clock
   bounds while service capacity remains charged. Exhaustion revokes proxy
   authority, drops runtime references, and latches the process-lifetime fatal

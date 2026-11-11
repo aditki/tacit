@@ -1325,16 +1325,27 @@ class _RuntimeAsyncResourceOwner:
             raise
 
     async def _release_record(self, record: _OwnedBackendRecord) -> None:
-        async def release_on_owner() -> None:
-            if self._records.get(self._lease_id(record)) is not record:
-                return
-            await self._release_record_on_owner(record)
+        closed = record.closed
+        if closed.done():
+            closed.result()
+            return
 
-        await self._host._invoke_on_generation_owner(
-            record.generation,
-            release_on_owner,
-            settle_on_cancel=True,
-        )
+        async def release_on_owner() -> None:
+            if self._records.get(self._lease_id(record)) is record:
+                await self._release_record_on_owner(record)
+
+        try:
+            await self._host._invoke_on_generation_owner(
+                record.generation,
+                release_on_owner,
+                settle_on_cancel=True,
+            )
+        except RuntimeOwnershipError:
+            # Concurrent provider release can close the record and retire its
+            # generation before this worker's dispatch is admitted.
+            if not closed.done():
+                raise
+        await asyncio.shield(asyncio.wrap_future(closed))
 
     async def _release_record_on_owner(self, record: _OwnedBackendRecord) -> None:
         closed = record.closed

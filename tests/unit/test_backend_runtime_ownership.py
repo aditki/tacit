@@ -569,9 +569,11 @@ def test_sync_owned_resource_realization_requires_durable_adopt_before_factory()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider_closes_first", [False, True])
 async def test_cancellation_during_factory_permit_release_retires_adopted_backend_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    provider_closes_first: bool,
 ) -> None:
     dependencies, products, _factory_threads = _dependencies(tmp_path)
     lifecycle = dependencies.pipeline_admission
@@ -585,7 +587,7 @@ async def test_cancellation_during_factory_permit_release_retires_adopted_backen
     def delayed_release(permit: PipelineBlockingPermit) -> None:
         if products and not permit.cleanup:
             release_entered.set()
-            assert allow_release.wait(timeout=1.0)
+            assert allow_release.wait(timeout=5.0)
         original_release(permit)
 
     monkeypatch.setattr(lifecycle, "release_blocking_permit", delayed_release)
@@ -595,13 +597,19 @@ async def test_cancellation_during_factory_permit_release_retires_adopted_backen
         assert len(products) == 1
         assert _active_backend_leases(dependencies) == 1
         realization.cancel()
-        allow_release.set()
+        if not provider_closes_first:
+            allow_release.set()
         with pytest.raises(asyncio.CancelledError):
-            await realization
+            await asyncio.wait_for(realization, timeout=2.0)
+        if provider_closes_first:
+            assert products[0].close_finished.is_set()
+            assert lifecycle.blocking_in_flight == 1
+            allow_release.set()
         await _wait_for_event(products[0].close_finished)
         assert products[0].close_calls == 1
         assert products[0].close_capacity[0][0] == 1
         await _wait_for_idle(dependencies)
+        assert lifecycle.runtime_fatal_circuit is None
     finally:
         allow_release.set()
         await _stop_root(dependencies, root)

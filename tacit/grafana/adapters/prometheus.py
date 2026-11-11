@@ -8,7 +8,6 @@ from urllib.parse import quote
 import structlog
 
 from tacit.cache import cache_owner_namespace, make_cache_key, metric_cache
-from tacit.config import settings
 from tacit.grafana.adapters.base import DatasourceAdapter
 from tacit.grafana.client import GrafanaClient
 from tacit.models.schemas import DatasourceInfo, MetricEntry
@@ -99,7 +98,7 @@ class PrometheusAdapter(DatasourceAdapter):
         # Fetch per-metric labels with bounded concurrency to avoid
         # overwhelming the Grafana proxy / Prometheus instance.
         to_sample = all_names[:_MAX_SAMPLE_METRICS]
-        sem = asyncio.Semaphore(settings.adapter_max_concurrent)
+        sem = asyncio.Semaphore(max(1, client.runtime_settings.adapter_max_concurrent))
         fetch_errors = 0
         total_label_cardinality = 0
 

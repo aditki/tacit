@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -19,6 +20,7 @@ from tacit.catalog import catalog_for_services
 from tacit.config import Settings, settings
 from tacit.errors import RuntimeOwnershipError
 from tacit.grafana.adapters.prometheus import PrometheusAdapter
+from tacit.grafana.client import GrafanaClient
 from tacit.knowledge.usage import KnowledgeRevisionRef, KnowledgeUsageEffect, KnowledgeUsageStage
 from tacit.models.schemas import (
     ArchetypeMatch,
@@ -323,6 +325,58 @@ async def test_prometheus_metadata_is_loaded_from_datasource_api():
         metric_cache.invalidate()
 
     assert metadata == {"request_duration_seconds": ("seconds", "histogram")}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_limit", [0, 1])
+async def test_prometheus_label_sampling_uses_each_client_runtime_limit(monkeypatch, first_limit):
+    monkeypatch.setattr(settings, "adapter_max_concurrent", 3)
+    metric_names = ["first_total", "second_total", "third_total"]
+    datasource = DatasourceInfo(uid="runtime-limit", name="Prometheus", type="prometheus")
+    adapter = PrometheusAdapter()
+
+    async def discover(host, limit):
+        client = GrafanaClient(
+            base_url=f"https://{host}.example.test",
+            runtime_settings=Settings(_env_file=None, adapter_max_concurrent=limit),
+        )
+        active = peak = 0
+
+        async def proxy_get(uid, path):
+            nonlocal active, peak
+            assert uid == datasource.uid
+            if path == "api/v1/label/__name__/values":
+                return {"data": metric_names}
+            if path == "api/v1/metadata":
+                return {"data": {}}
+            assert path.startswith("api/v1/series?")
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0)
+                return {"data": [{"service": host}]}
+            finally:
+                active -= 1
+
+        monkeypatch.setattr(client, "datasource_proxy_get", proxy_get)
+        try:
+            entries = await adapter.discover_metrics(client, datasource, [])
+        finally:
+            await client.close()
+        assert [entry.name for entry in entries] == metric_names
+        assert all(entry.dimensions == [f"service={{{host}}}"] for entry in entries)
+        return peak
+
+    metric_cache.invalidate()
+    try:
+        peaks = await asyncio.wait_for(
+            asyncio.gather(discover("first", first_limit), discover("second", 2)),
+            timeout=2,
+        )
+    finally:
+        metric_cache.invalidate()
+
+    assert peaks == [1, 2]
 
 
 @pytest.mark.asyncio
