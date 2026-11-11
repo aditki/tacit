@@ -868,7 +868,7 @@ jobs:
           install -m 0755 "$download" "$HOME/.docker/cli-plugins/docker-buildx"
           docker buildx version
       - name: Log in to ghcr.io with read-only credentials
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1023,7 +1023,7 @@ jobs:
           install -m 0755 "$download" "$HOME/.docker/cli-plugins/docker-buildx"
           docker buildx version
       - name: Log in to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
