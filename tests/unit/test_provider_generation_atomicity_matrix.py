@@ -1403,6 +1403,16 @@ def test_startup_failure_retirement_reserves_the_generation_before_replacement_a
     retirement_reached = threading.Event()
     allow_retirement = threading.Event()
     retirement_states: list[Any] = []
+    allow_generation_cleanup = threading.Event()
+    original_schedule_cleanup = resources._schedule_generation_cleanup_from_state
+
+    def gated_schedule_cleanup(state: Any) -> None:
+        # Pausing the requester below does not pause the independent owner.
+        # Keep this generation alive until replacement admission has settled.
+        if allow_generation_cleanup.is_set():
+            original_schedule_cleanup(state)
+
+    monkeypatch.setattr(resources, "_schedule_generation_cleanup_from_state", gated_schedule_cleanup)
     original_retire_unleased = resources._retire_unleased_generation
 
     async def gated_retire_unleased(state: Any, **kwargs: Any) -> None:
@@ -1425,18 +1435,6 @@ def test_startup_failure_retirement_reserves_the_generation_before_replacement_a
         target=acquire_failing_generation,
         name=f"provider-startup-failure-{attempt}",
     )
-    first_thread.start()
-    assert retirement_reached.wait(timeout=1.0)
-    assert len(retirement_states) == 1
-    failed_state = retirement_states[0]
-    with resources._lock:
-        reserved_before_retirement_wait = (
-            resources._generation_owner is failed_state
-            and resources._closing_event is failed_state
-            and resources.lifecycle_state in {ProviderLifecycleState.DRAINING, ProviderLifecycleState.REVOKED}
-            and not resources._active_leases
-        )
-
     replacement_reached_manager = threading.Event()
     original_resolve_manager = resources._resolve_active_manager_async
 
@@ -1448,26 +1446,44 @@ def test_startup_failure_retirement_reserves_the_generation_before_replacement_a
     monkeypatch.setattr(resources, "_resolve_active_manager_async", tracked_resolve_manager)
     replacement_handles: list[ProviderLeaseHandle] = []
     replacement_errors: list[BaseException] = []
+    replacement_finished = threading.Event()
 
     def acquire_replacement_generation() -> None:
         try:
             replacement_handles.append(asyncio.run(resources.acquire()))
         except BaseException as exc:
             replacement_errors.append(exc)
+        finally:
+            replacement_finished.set()
 
     replacement_thread = threading.Thread(
         target=acquire_replacement_generation,
         name=f"provider-replacement-acquire-{attempt}",
     )
-    replacement_thread.start()
-    assert replacement_reached_manager.wait(timeout=1.0)
-    replacement_entered_unreserved_generation = replacement_factory_started.wait(
-        timeout=0.05 if reserved_before_retirement_wait else 1.0
-    )
-
-    allow_retirement.set()
-    first_thread.join(timeout=2.0)
-    replacement_thread.join(timeout=2.0)
+    first_thread.start()
+    try:
+        assert retirement_reached.wait(timeout=2.0)
+        assert len(retirement_states) == 1
+        failed_state = retirement_states[0]
+        with resources._lock:
+            reserved_before_retirement_wait = (
+                resources._generation_owner is failed_state
+                and resources._closing_event is failed_state
+                and resources.lifecycle_state in {ProviderLifecycleState.DRAINING, ProviderLifecycleState.REVOKED}
+                and not resources._active_leases
+            )
+        replacement_thread.start()
+        assert replacement_reached_manager.wait(timeout=2.0)
+        assert replacement_finished.wait(timeout=2.0)
+        replacement_entered_unreserved_generation = replacement_factory_started.is_set()
+    finally:
+        allow_generation_cleanup.set()
+        allow_retirement.set()
+        for state in retirement_states:
+            original_schedule_cleanup(state)
+        first_thread.join(timeout=2.0)
+        if replacement_thread.ident is not None:
+            replacement_thread.join(timeout=2.0)
     assert first_thread.is_alive() is False
     assert replacement_thread.is_alive() is False
 

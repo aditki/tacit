@@ -2087,6 +2087,11 @@ bounded wait, keep any required observer loop alive through that wait, and
 release gates and join test threads in `finally` so failed assertions still
 allow cleanup.
 
+When testing replacement admission during retirement, gate the owner cleanup
+transition itself and wait for the replacement attempt to settle. Pausing only
+the requester's cleanup wait lets the independent owner retire the generation
+and legitimately admit a fresh one before the assertion.
+
 The [foundation invariant matrix](foundation-invariant-matrix.md) is the
 authoritative implementation checklist. Cross-cutting work should use focused
 regression tests plus every applicable matrix row, including:
