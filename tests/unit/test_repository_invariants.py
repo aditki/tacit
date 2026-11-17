@@ -30,6 +30,7 @@ from urllib.request import HTTPSHandler, ProxyHandler, build_opener
 import pytest
 import truststore._api as truststore_api
 import yaml
+from packaging.version import Version
 
 from tacit.config import DEFAULT_API_REQUEST_BODY_MAX_BUFFERED_BYTES
 
@@ -47,6 +48,20 @@ RELEASE_GITHUB_ASSET_VERIFIER = REPOSITORY_ROOT / ".github" / "scripts" / "verif
 RELEASE_PYPI_VERIFIER = REPOSITORY_ROOT / ".github" / "scripts" / "verify_pypi_release.py"
 PYPI_PUBLISH_ACTION = REPOSITORY_ROOT / ".github" / "actions" / "pypi-publish" / "action.yml"
 GITLEAKS_RANGE_SELECTOR = REPOSITORY_ROOT / ".github" / "scripts" / "gitleaks_range.py"
+
+
+@pytest.mark.parametrize(
+    ("package_name", "minimum_safe_version"),
+    [
+        ("certifi", "2026.10.19"),  # GHSA-6q48-6c7w-9gw2; retain the unaffected emSign roots.
+        ("setuptools", "84.1.0"),  # GHSA-xmj3-9gf7-h52w.
+    ],
+)
+def test_locked_dependencies_meet_security_advisory_floors(package_name: str, minimum_safe_version: str) -> None:
+    lock = tomllib.loads((REPOSITORY_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    versions = [Version(package["version"]) for package in lock["package"] if package["name"] == package_name]
+    assert versions, f"Expected {package_name} in the locked dependency closure"
+    assert all(version >= Version(minimum_safe_version) for version in versions)
 
 
 @pytest.mark.parametrize("ecosystem", ["github-actions", "uv", "docker"])
