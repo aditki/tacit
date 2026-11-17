@@ -49,6 +49,17 @@ PYPI_PUBLISH_ACTION = REPOSITORY_ROOT / ".github" / "actions" / "pypi-publish" /
 GITLEAKS_RANGE_SELECTOR = REPOSITORY_ROOT / ".github" / "scripts" / "gitleaks_range.py"
 
 
+@pytest.mark.parametrize("ecosystem", ["github-actions", "uv", "docker"])
+def test_dependabot_schedules_weekly_root_dependency_updates(ecosystem: str) -> None:
+    config = yaml.safe_load((REPOSITORY_ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8"))
+    assert config["version"] == 2
+    # uv is required here: pip does not maintain this project's uv.lock.
+    updates = [entry for entry in config["updates"] if entry["package-ecosystem"] == ecosystem]
+    assert len(updates) == 1, f"Expected one scheduled update entry for {ecosystem}"
+    assert updates[0]["directory"] == "/"
+    assert updates[0]["schedule"]["interval"] == "weekly"
+
+
 def _release_workflow() -> dict[str, Any]:
     workflow_path = REPOSITORY_ROOT / ".github" / "workflows" / "release.yml"
     loaded = yaml.load(workflow_path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
