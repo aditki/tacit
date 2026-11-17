@@ -42,7 +42,7 @@ tacit = "tacit.cli:main"
 release-build = ["hatchling==1.32.0"]
 # Binary jobs add this group to the runtime plus Bedrock environment without
 # installing the development group.
-release-binary = ["pyinstaller==6.22.1"]
+release-binary = ["pyinstaller==6.22.3"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
