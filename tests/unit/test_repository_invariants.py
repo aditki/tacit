@@ -2576,7 +2576,7 @@ exec "$@"
 
 def test_frozen_binaries_use_release_only_locked_dependencies_and_archive_audit() -> None:
     pyproject = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["dependency-groups"]["release-binary"] == ["pyinstaller==6.22.1"]
+    assert pyproject["dependency-groups"]["release-binary"] == ["pyinstaller==6.22.3"]
 
     binary_job = _release_workflow()["jobs"]["build-binaries"]
     assert _job_needs(binary_job) == {"validate-release", "build-dist"}
