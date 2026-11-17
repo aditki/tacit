@@ -2508,7 +2508,7 @@ def test_release_builds_verified_binaries_on_exact_runners() -> None:
     assert "tacit-macos-arm64.tar.gz" not in verify
     assert "sha256sum --check ./*.sha256" in verify
     publish = _step(release, "Publish GitHub release binaries")
-    assert publish["uses"] == "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228"
+    assert publish["uses"] == "softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3"
     assert publish["with"]["overwrite_files"] == "false"
 
 
