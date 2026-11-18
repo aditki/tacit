@@ -13,6 +13,14 @@ logger = structlog.get_logger()
 
 class InfluxDBAdapter(DatasourceAdapter):
 
+    supports_acquisition_inventory_phase = True
+
+    async def discover_metrics_with_metadata(self, client, datasource, keywords, work_budget, *, enrich=True):
+        """Return bounded per-search metadata without consulting legacy caches."""
+        from tacit.acquisition import discover_adapter_metrics
+
+        return await discover_adapter_metrics(client, datasource, keywords, work_budget, enrich=enrich)
+
     @property
     def query_language(self) -> str:
         return "influxql"

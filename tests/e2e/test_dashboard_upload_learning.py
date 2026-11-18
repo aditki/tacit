@@ -295,6 +295,177 @@ async def test_manual_teach_signal_mapping_is_used_before_dashboard_creation(
     assert len(compilation_usage) == 1
     assert compilation_usage[0].score_delta == 0
 
+    snapshot = history_store.get_snapshot(response.investigation_id)
+    assert snapshot is not None
+    acquisition = snapshot.model_inputs["catalog_acquisition_v1"]
+    assert acquisition["version"] == "catalog-acquisition/1"
+    assert acquisition["entries"]
+    assert acquisition["selections"]
+    assert any("legacy_unknown" in source["reasons"] for source in acquisition["sources"])
+    assert snapshot.additional_decisions and snapshot.additional_provenance
+    assert {item.id for item in snapshot.additional_decisions} <= {item.id for item in contract.decision_log}
+    assert {item.id for item in snapshot.additional_provenance} <= {item.id for item in contract.provenance}
+
+    def forbid_refetch(*_args, **_kwargs):
+        pytest.fail("exact replay must use the persisted acquisition inputs")
+
+    monkeypatch.setattr(pipeline_mod, "get_active_backends", forbid_refetch)
+    monkeypatch.setattr(provider_registry, "create_provider", forbid_refetch)
+    replayed = history_store.replay_contract(response.investigation_id)
+    assert replayed is not None
+    assert replayed.runtime.input_fingerprint == contract.runtime.input_fingerprint
+    assert replayed.runtime.output_fingerprint == contract.runtime.output_fingerprint
+    assert replayed.decision_log == contract.decision_log
+    assert replayed.provenance == contract.provenance
+    assert replayed.model_dump(mode="json") == contract.model_dump(mode="json")
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("dimension", ["tree", "text", "key", "duplicate_id"])
+async def test_acquisition_admission_failure_finishes_run_without_publication(
+    isolated_learning_runtime, monkeypatch, dimension
+):
+    import tacit.pipeline.runner as runner
+    from tacit.models.schemas import ContextChunk
+
+    _signals, history, _feedback, archetypes_path, _quarantine = isolated_learning_runtime
+    _install_taught_latency_archetype(archetypes_path)
+    _teach_taught_latency_mapping()
+    backend = _configure_taught_latency_pipeline(monkeypatch)
+    prepare = runner.prepare_acquisition_completion
+
+    def inadmissible_inputs(**kwargs):
+        metadata = {}
+        if dimension == "tree":
+            nested = []
+            for _ in range(33):
+                nested = [nested]
+            metadata["nested"] = nested
+        elif dimension == "text":
+            metadata["text"] = "x" * 65_537
+        elif dimension == "key":
+            metadata[0] = "invalid"
+        else:
+            metadata["provenance_id"] = kwargs["assembly_inputs"]["investigation_id"]
+        kwargs["assembly_inputs"]["context_chunks"] = [
+            ContextChunk.model_construct(source="runbook", content="test", metadata=metadata)
+        ]
+        return prepare(**kwargs)
+
+    monkeypatch.setattr(runner, "prepare_acquisition_completion", inadmissible_inputs)
+    response = await pipeline_mod.run_pipeline(DashRequest(prompt="checkout-api p95 latency is high"))
+    assert response.investigation_status == "failed"
+    assert not response.dashboard_uid
+    assert backend.published_specs == []
+    assert history.get_contract(response.investigation_id) is None
+    assert history.list_runs(response.investigation_id)[-1]["status"] == "failed"
+
+
+@pytest.mark.e2e
+async def test_acquisition_completion_replays_pinned_knowledge_reference(isolated_learning_runtime, monkeypatch):
+    import tacit.pipeline.runner as runner
+
+    _signals, history, _feedback, archetypes_path, _quarantine = isolated_learning_runtime
+    _install_taught_latency_archetype(archetypes_path)
+    _teach_taught_latency_mapping()
+    _configure_taught_latency_pipeline(monkeypatch)
+    complete = runner.complete_pipeline
+
+    async def mutate_original(**kwargs):
+        assert kwargs["knowledge_snapshot"] is not None
+        kwargs["knowledge_snapshot"].id = "knowledge_snapshot_mutated_after_preparation"
+        return await complete(**kwargs)
+
+    monkeypatch.setattr(runner, "complete_pipeline", mutate_original)
+    response = await pipeline_mod.run_pipeline(DashRequest(prompt="checkout-api p95 latency is high"))
+    contract = history.get_contract(response.investigation_id)
+    snapshot = history.get_snapshot(response.investigation_id)
+    assert contract is not None and snapshot is not None
+    assert snapshot.knowledge_snapshot_ref == contract.knowledge_snapshot_ref
+    replayed = history.replay_contract(response.investigation_id)
+    assert replayed is not None
+    assert replayed.runtime.output_fingerprint == contract.runtime.output_fingerprint
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "histogram_quantile(0.95, sum(rate(requests_bucket{{}}[5m])) by (le))",
+        'sum(rate(requests{{status=~"5.."}}[5m]))',
+        "sum(rate(requests{{}}[5m])) * 100",
+    ],
+)
+async def test_unsupported_signalflow_slot_fails_entire_mixed_investigation(
+    isolated_learning_runtime, monkeypatch, expression
+):
+    from dataclasses import replace
+
+    import yaml
+
+    _signals, history, _feedback, archetypes_path, _quarantine = isolated_learning_runtime
+    definition = yaml.safe_load(TAUGHT_LATENCY_ARCHETYPE)
+    archetype = definition["archetypes"][0]
+    archetype["required_metrics"] = ["requests"]
+    archetype["required_signals"] = []
+    archetype["signal_bindings"] = {}
+    archetype["panels"] = [
+        {"title": "Supported", "queries": [{"expr": "requests"}]},
+        {"title": "Unsupported", "queries": [{"expr": expression}]},
+    ]
+    archetypes_path.write_text(yaml.safe_dump(definition), encoding="utf-8")
+    templates.reload_archetypes()
+    _configure_taught_latency_pipeline(monkeypatch)
+    monkeypatch.setattr(settings, "signalfx_enabled", True)
+    monkeypatch.setattr(settings, "signalfx_api_token", "hermetic-fixture-token")
+
+    class SingleRemoteBackend(CapturingBackend):
+        @property
+        def runtime_ownership(self):
+            descriptor = super().runtime_ownership
+            return replace(
+                descriptor, remotes=tuple(remote for remote in descriptor.remotes if remote.provider == self.name)
+            )
+
+    class SignalFlowBackend(SingleRemoteBackend):
+        @property
+        def name(self):
+            return "signalfx"
+
+        @property
+        def query_language(self):
+            return "signalflow"
+
+    signalfx = SignalFlowBackend(
+        catalog=[
+            MetricEntry(
+                name="requests",
+                datasource_uid="sfx-e2e",
+                datasource_name="SignalFx E2E",
+                datasource_type="signalfx",
+                query_language="signalflow",
+            )
+        ]
+    )
+    grafana = SingleRemoteBackend(catalog=[])
+    monkeypatch.setattr(pipeline_mod, "get_active_backends", lambda: [signalfx, grafana])
+    response = await pipeline_mod.run_pipeline(DashRequest(prompt="checkout-api p95 latency is high"))
+    assert response.investigation_status == "failed"
+    assert not response.dashboard_uid
+    assert signalfx.published_specs == grafana.published_specs == []
+    assert history.get_contract(response.investigation_id) is None
+    run = history.list_runs(response.investigation_id)[-1]
+    assert run["status"] == "failed"
+    assert run["error_code"] == "pipeline_failed"
+    assert run["error_detail"] == "signalflow_translation_unsupported"
+    events = history.list_events(response.investigation_id, response.investigation_run_id)
+    assert any(
+        event["event_type"] == "stage_completed"
+        and event["payload"].get("stage") == "acquisition"
+        and event["payload"].get("reason_code") == "signalflow_translation_unsupported"
+        for event in events
+    )
+
 
 @pytest.mark.e2e
 async def test_read_only_pipeline_is_rejected_before_history_or_publish(

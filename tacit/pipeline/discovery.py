@@ -10,7 +10,7 @@ from typing import Any
 import structlog
 
 from tacit.backends.base import DashboardBackend
-from tacit.catalog import catalog_for_services
+from tacit.catalog import CatalogSourceStatus, MetricCatalogResult, catalog_for_services
 from tacit.errors import AUTHORITY_BOUNDARY_ERRORS, safe_failure_diagnostics
 from tacit.knowledge.usage import KnowledgeRevisionRef
 from tacit.models.schemas import Intent, MetricEntry
@@ -79,6 +79,7 @@ class DiscoveryResult:
     metric_catalog: list[MetricEntry]
     datasource_catalog: list[MetricEntry]
     datasource_types: list[str]
+    catalog_result: MetricCatalogResult | None = None
 
     @property
     def catalog_for_compile(self) -> list[MetricEntry]:
@@ -161,34 +162,64 @@ def discovery_keywords(intent: Intent) -> list[str]:
     return keywords
 
 
-async def discover_catalogs(backends: Iterable[DashboardBackend], intent: Intent) -> DiscoveryResult:
-    """Collect metric and datasource-target catalogs from every active backend."""
+async def discover_catalogs(
+    backends: Iterable[DashboardBackend],
+    intent: Intent,
+    *,
+    work_budget: SignalResolutionWorkBudget | None = None,
+) -> DiscoveryResult:
+    """Collect per-call metadata under one run budget, never mutable status hints."""
+    from tacit.acquisition import legacy_acquisition_catalog
+
     keywords = discovery_keywords(intent)
-    metric_catalog: list[MetricEntry] = []
-    datasource_catalog: list[MetricEntry] = []
-    datasource_types: list[str] = []
-
-    for backend in backends:
-        entries = await backend.discover_metrics(keywords, intent)
-        metric_catalog.extend(entries)
+    budget = work_budget or SignalResolutionWorkBudget(10_000, 8_000_000, 100_000)
+    metrics: list[MetricEntry] = []
+    targets: list[MetricEntry] = []
+    sources: list[CatalogSourceStatus] = []
+    types: list[str] = []
+    owners = list(backends)
+    if len(owners) > 32:
+        raise ColloquialConfirmationWorkLimitError("backends", len(owners), 32)
+    for backend in owners:
+        typed = getattr(backend, "discover_metrics_with_metadata", None)
+        if callable(typed):
+            result = await typed(keywords, intent, budget)
+            if not isinstance(result, MetricCatalogResult):
+                raise ValueError("typed discovery must return MetricCatalogResult")
+        else:
+            result = legacy_acquisition_catalog(
+                await backend.discover_metrics(keywords, intent),
+                backend=backend.name,
+                terms=keywords,
+                work_budget=budget,
+            )
+        entries = result.as_list()
+        metrics.extend(entries)
+        if len(metrics) > budget.max_acquisition_entries:
+            raise ColloquialConfirmationWorkLimitError("catalog_entries", len(metrics), budget.max_acquisition_entries)
+        sources.extend(result.sources)
         if entries:
-            datasource_types.append(backend.name)
-            continue
-        if not getattr(getattr(backend, "last_discovery_status", None), "available", True):
-            continue
-        target_discovery = getattr(backend, "discover_datasource_targets", None)
-        if target_discovery is None:
-            continue
-        targets = await target_discovery(keywords, intent)
-        datasource_catalog.extend(targets)
-        if targets and backend.name not in datasource_types:
-            datasource_types.append(backend.name)
-
-    return DiscoveryResult(
-        metric_catalog=metric_catalog,
-        datasource_catalog=datasource_catalog,
-        datasource_types=datasource_types,
-    )
+            types.append(backend.name)
+        elif callable(typed):
+            for source in result.sources:
+                if source.datasource_uid and source.disposition != "unavailable":
+                    targets.append(
+                        MetricEntry(
+                            name="",
+                            datasource_uid=source.datasource_uid,
+                            datasource_name=source.datasource_uid,
+                            datasource_type=source.datasource_type,
+                            query_language=source.query_language,
+                        )
+                    )
+        else:
+            discovery = getattr(backend, "discover_datasource_targets", None)
+            if callable(discovery):
+                targets.extend(await discovery(keywords, intent))
+        if targets and backend.name not in types:
+            types.append(backend.name)
+    result = MetricCatalogResult(metrics, sources)
+    return DiscoveryResult(result.as_list(), targets, list(dict.fromkeys(types)), result)
 
 
 def semantic_mapping_diagnostics(metric_catalog: list[MetricEntry]) -> tuple[str, str, dict]:

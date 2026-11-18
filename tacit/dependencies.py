@@ -22,7 +22,7 @@ import structlog
 from tacit.agents.providers.base import LLMProvider
 from tacit.backends.base import DashboardBackend
 from tacit.cache import make_cache_key
-from tacit.config import Settings, settings
+from tacit.config import Settings, settings, validate_acquisition_settings
 from tacit.context.base import ContextProvider
 from tacit.errors import PipelineAdmissionRejected, RuntimeOwnershipError
 from tacit.pipeline_admission import (
@@ -556,6 +556,9 @@ class _OwnedDashboardBackend:
 
     async def discover_metrics(self, keywords: list[str], intent: Any) -> Any:
         return await self._invoke("discover_metrics", keywords, intent)
+
+    async def discover_metrics_with_metadata(self, keywords, intent, work_budget):
+        return await self._invoke("discover_metrics_with_metadata", keywords, intent, work_budget)
 
     async def discover_datasource_targets(self, keywords: list[str], intent: Any) -> Any:
         return await self._invoke("discover_datasource_targets", keywords, intent)
@@ -1139,7 +1142,15 @@ class _RuntimeAsyncResourceOwner:
             if not 0 <= index < len(record.products):
                 raise RuntimeOwnershipError("Backend proxy index is invalid")
             product = record.products[index]
+            if method == "discover_metrics_with_metadata":
+                from tacit.config import validate_acquisition_budget
+
+                validate_acquisition_budget(self._host._settings, args[2])
+            legacy_discovery = False
             target = getattr(product, method, None)
+            if method == "discover_metrics_with_metadata" and not callable(target):
+                target = getattr(product, "discover_metrics", None)
+                legacy_discovery = True
             if not callable(target):
                 raise RuntimeOwnershipError(f"Backend does not support {method}")
             operation_task = asyncio.current_task()
@@ -1147,9 +1158,15 @@ class _RuntimeAsyncResourceOwner:
                 raise RuntimeOwnershipError("Backend operation has no owner task")
             record.active_operations.add(operation_task)
             try:
-                result = target(*args, **kwargs)
+                result = target(*args[:2], **kwargs) if legacy_discovery else target(*args, **kwargs)
                 if inspect.isawaitable(result):
                     result = await result
+                if legacy_discovery:
+                    from tacit.acquisition import legacy_acquisition_catalog
+
+                    result = legacy_acquisition_catalog(
+                        result, backend=product.name, terms=args[0], work_budget=args[2]
+                    )
                 status = (
                     getattr(product, "last_discovery_status", None),
                     bool(getattr(product, "last_alert_list_complete", False)),
@@ -6103,6 +6120,7 @@ class PipelineDependencies:
     )
 
     def __post_init__(self) -> None:
+        validate_acquisition_settings(self.settings)
         admission_value: object = self.pipeline_admission
         if not isinstance(admission_value, PipelineAdmissionController):
             raise ValueError(

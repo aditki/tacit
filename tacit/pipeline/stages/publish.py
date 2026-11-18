@@ -33,8 +33,13 @@ class PublicationState:
 def preflight_publish_backends(
     backends: list[DashboardBackend],
     runtime_settings: Settings | None,
+    dashboard_spec: DashboardSpec | None = None,
 ) -> None:
     """Validate every realized backend owner before the first remote write."""
+    if dashboard_spec is not None and any(backend.name == "signalfx" for backend in backends):
+        from tacit.signalfx.publisher import validate_signalflow_publication
+
+        validate_signalflow_publication(dashboard_spec)
     if runtime_settings is None:
         return
     settings_owner = runtime_descriptor_from_settings(
@@ -92,7 +97,7 @@ async def publish_dashboard(
     state: PublicationState | None = None,
 ) -> dict[str, PublishResult]:
     """Publish the dashboard to every active backend."""
-    preflight_publish_backends(backends, runtime_settings)
+    preflight_publish_backends(backends, runtime_settings, dashboard_spec)
     publication_state = state or PublicationState()
     publication_state.commit_started = True
     publish_coro = _publish_all(

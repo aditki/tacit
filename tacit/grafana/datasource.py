@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 
 import structlog
 
@@ -56,9 +57,15 @@ def _cap_metric_results(results: list[list[MetricEntry]], max_total: int) -> lis
     return capped
 
 
-async def list_datasources(client: GrafanaClient) -> list[DatasourceInfo]:
+async def list_datasources(client: GrafanaClient, work_budget=None) -> list[DatasourceInfo]:
     """Fetch all datasources from Grafana and return typed info objects."""
-    raw = await client.list_datasources()
+    raw = (
+        await client.list_datasources()
+        if work_budget is None
+        else await client.acquisition_request("GET", "/api/datasources", work_budget)
+    )
+    if not isinstance(raw, list) or len(raw) > 5000:
+        raise ValueError("datasource catalog cardinality limit")
     out: list[DatasourceInfo] = []
     for ds in raw:
         out.append(
@@ -161,3 +168,133 @@ async def discover_all_metrics(
         types_searched=list({ds.type for ds in datasources}),
     )
     return all_entries
+
+
+async def discover_all_metrics_with_metadata(client, datasources, keywords, work_budget, *, runtime_settings=None):
+    """Typed cache-free route with bounded scheduling and shared retention."""
+    from tacit.catalog import CatalogSourceStatus, MetricCatalogResult
+    from tacit.config import validate_acquisition_runtime
+    from tacit.signals.resolution import AcquisitionWorkLimitError
+
+    active_settings = resolve_remote_runtime_settings(
+        boundary="grafana_metric_discovery",
+        owner=client,
+        provider="grafana",
+        explicit_settings=runtime_settings,
+    )
+    validate_acquisition_runtime(active_settings)
+    if len(datasources) > 5000:
+        raise ValueError("datasource catalog cardinality limit")
+    entries: list[MetricEntry] = []
+    sources: list[CatalogSourceStatus] = []
+    enrichments = []
+    source_slots = max(0, work_budget.max_acquisition_calls - work_budget.acquisition_calls)
+    admitted_sources = 0
+    # Sequential admission is deliberately a stricter scheduling bound than the
+    # configured adapter maximum; no unbounded population of waiting tasks.
+    for ds in sorted(datasources, key=lambda source: (source.uid, source.type)):
+        if work_budget.acquisition_calls >= work_budget.max_acquisition_calls:
+            sources.append(
+                CatalogSourceStatus(
+                    backend="grafana",
+                    terms=(),
+                    summary=True,
+                    disposition="incomplete",
+                    reasons=("work_limit",),
+                )
+            )
+            break
+        adapter = get_adapter(ds)
+        if adapter is None:
+            continue
+        if admitted_sources >= source_slots:
+            sources.append(CatalogSourceStatus(backend="grafana", summary=True, reasons=("work_limit",)))
+            break
+        admitted_sources += 1
+        try:
+            typed = getattr(adapter, "discover_metrics_with_metadata", None)
+            if callable(typed):
+                phased = bool(getattr(adapter, "supports_acquisition_inventory_phase", False))
+                phase_kwargs = {"enrich": False} if phased else {}
+                result = await asyncio.wait_for(
+                    typed(client, ds, keywords, work_budget, **phase_kwargs),
+                    timeout=active_settings.adapter_timeout_seconds,
+                )
+                if phased:
+                    enrichments.append((ds, result.as_list()))
+            else:
+                from tacit.acquisition import legacy_acquisition_catalog
+
+                result = legacy_acquisition_catalog(
+                    await asyncio.wait_for(
+                        adapter.discover_metrics(client, ds, keywords), timeout=active_settings.adapter_timeout_seconds
+                    ),
+                    backend="grafana",
+                    terms=keywords,
+                    work_budget=work_budget,
+                )
+            from tacit.acquisition import retain_acquisition_facts
+
+            additions = [entry.model_copy(update={"datasource_is_default": ds.is_default}) for entry in result.entries]
+            entries, limited = retain_acquisition_facts(additions, work_budget, previous=entries)
+            if limited:
+                sources.append(
+                    CatalogSourceStatus(backend="grafana", summary=True, reasons=("work_limit", "local_cap"))
+                )
+            sources.extend(result.sources)
+        except AUTHORITY_BOUNDARY_ERRORS:
+            raise
+        except AcquisitionWorkLimitError:
+            sources.append(
+                CatalogSourceStatus(
+                    backend="grafana",
+                    datasource_uid=ds.uid,
+                    datasource_type=ds.type,
+                    query_language=adapter.query_language,
+                    terms=tuple(keywords),
+                    disposition="incomplete",
+                    reasons=("work_limit",),
+                )
+            )
+        except Exception:
+            sources.append(
+                CatalogSourceStatus(
+                    backend="grafana",
+                    datasource_uid=ds.uid,
+                    datasource_type=ds.type,
+                    query_language=adapter.query_language,
+                    terms=tuple(keywords),
+                    disposition="unavailable",
+                    reasons=("provider_failed",),
+                )
+            )
+    from tacit.acquisition import enrich_adapter_metrics
+
+    updates: dict[tuple[str, str, str, str], list[MetricEntry]] = {}
+    for ds, retained in enrichments:
+        if work_budget.acquisition_calls >= work_budget.max_acquisition_calls:
+            sources.append(CatalogSourceStatus(backend="grafana", summary=True, reasons=("work_limit",)))
+            break
+        enriched = await enrich_adapter_metrics(client, ds, retained, work_budget)
+        sources.extend(enriched.sources)
+        for entry in enriched.entries:
+            updates.setdefault((entry.datasource_uid, entry.query_language, entry.name, entry.namespace), []).append(
+                entry
+            )
+    expanded = []
+    for entry in entries:
+        expanded.extend(updates.get((entry.datasource_uid, entry.query_language, entry.name, entry.namespace), [entry]))
+        if len(expanded) > 5000:
+            raise ValueError("catalog raw metadata fact limit")
+    from tacit.acquisition import retain_acquisition_facts
+
+    entries, _ = retain_acquisition_facts(expanded, work_budget)
+    summaries = [source for source in sources if source.summary]
+    sources = [source for source in sources if not source.summary]
+    if summaries:
+        reasons = tuple(sorted({reason for source in summaries for reason in source.reasons}))
+        disposition: Literal["unavailable", "incomplete"] = (
+            "unavailable" if all(source.disposition == "unavailable" for source in summaries) else "incomplete"
+        )
+        sources.append(CatalogSourceStatus(backend="grafana", summary=True, reasons=reasons, disposition=disposition))
+    return MetricCatalogResult(entries=tuple(entries), sources=tuple(sources))

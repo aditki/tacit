@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from tacit.catalog import catalog_for_services
+from tacit.catalog import catalog_for_services, record_query_selection, select_query_target
 from tacit.errors import (
     AUTHORITY_BOUNDARY_ERRORS,
     EvidenceResolutionError,
@@ -671,7 +671,17 @@ def _resolve_direct_symptom_evidence(
     if len(best_owners) > 1:
         return None
     selected = best[0]
-    entry, score = selected.entry, selected.confidence
+    entry, score = (selected.entry, selected.confidence)
+    owner = select_query_target(catalog, {entry.name}, entry.query_language)
+    record_query_selection(
+        owner,
+        consumer="symptom_rescue",
+        subject_ref=requirement.id,
+        required_metrics={entry.name},
+        query_language=entry.query_language,
+    )
+    if owner.target is None:
+        return None
     if applied_governance_refs is not None:
         if inferred_by:
             applied_governance_refs.add(inferred_by.knowledge_ref)
@@ -766,6 +776,16 @@ def _resolve_evidence_gap_observation(
         return None
     selected = best[0]
     entry, score = selected.entry, selected.confidence
+    owner = select_query_target(catalog, {entry.name}, entry.query_language)
+    record_query_selection(
+        owner,
+        consumer="gap_rescue",
+        subject_ref=requirement.id,
+        required_metrics={entry.name},
+        query_language=entry.query_language,
+    )
+    if owner.target is None:
+        return None
     if applied_governance_refs is not None:
         if inferred_by:
             applied_governance_refs.add(inferred_by.knowledge_ref)

@@ -13,7 +13,6 @@ from tacit.config import Settings
 from tacit.errors import (
     AUTHORITY_BOUNDARY_ERRORS,
     RuntimeOwnershipError,
-    safe_failure_diagnostics,
 )
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
 from tacit.runtime_ownership import (
@@ -25,7 +24,7 @@ from tacit.runtime_ownership import (
     snapshot_runtime_settings,
 )
 from tacit.signalfx.client import SignalFxClient
-from tacit.signalfx.discovery import discover_metrics as sfx_discover
+from tacit.signalfx.discovery import discover_metrics_with_metadata as sfx_discover
 from tacit.signalfx.publisher import publish_dashboard as sfx_publish
 from tacit.validation import validate_signalflow_queries
 
@@ -90,31 +89,40 @@ class SignalFxBackend:
 
     # ── Discovery ─────────────────────────────────────────────────────
 
-    async def discover_metrics(
-        self,
-        keywords: list[str],
-        intent: Intent,
-    ) -> list[MetricEntry]:
+    async def discover_metrics(self, keywords: list[str], intent: Intent) -> list[MetricEntry]:
+        from tacit.acquisition import standalone_acquisition_budget
+
+        result = await self.discover_metrics_with_metadata(
+            keywords, intent, standalone_acquisition_budget(self._settings)
+        )
+        return result.as_list()[: self._settings.max_metric_catalog_size]
+
+    async def discover_metrics_with_metadata(self, keywords, intent, work_budget):
+        from tacit.config import validate_acquisition_runtime
+
+        validate_acquisition_runtime(self._settings)
+        from tacit.catalog import CatalogSourceStatus, MetricCatalogResult
+        from tacit.signals.resolution import AcquisitionWorkLimitError
+
         try:
-            entries = await sfx_discover(
-                self._client,
-                keywords,
-                runtime_settings=self._settings,
-            )
-            self.last_discovery_status = DiscoveryStatus(available=True)
-            return entries
+            result = await sfx_discover(self._client, keywords, work_budget, runtime_settings=self._settings)
         except AUTHORITY_BOUNDARY_ERRORS:
             raise
         except Exception as exc:
-            self.last_discovery_status = DiscoveryStatus(
-                available=False,
-                error="signalfx_discover_failed",
+            result = MetricCatalogResult(
+                sources=(
+                    CatalogSourceStatus(
+                        backend="signalfx",
+                        summary=True,
+                        disposition="incomplete" if isinstance(exc, AcquisitionWorkLimitError) else "unavailable",
+                        reasons=("work_limit",) if isinstance(exc, AcquisitionWorkLimitError) else ("provider_failed",),
+                    ),
+                )
             )
-            logger.warning(
-                "signalfx_discover_failed",
-                **safe_failure_diagnostics(exc, reason_code="signalfx_discover_failed"),
-            )
-            return []
+        self.last_discovery_status = DiscoveryStatus(
+            available=any(source.disposition != "unavailable" for source in result.sources)
+        )
+        return result
 
     async def discover_datasource_targets(
         self,

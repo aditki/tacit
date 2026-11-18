@@ -41,7 +41,7 @@ async def run_discovery_stage(
     from tacit.pipeline.discovery import confirm_colloquial_keywords
 
     t0 = time.monotonic()
-    discovery = await discover_catalogs(backends, intent)
+    discovery = await discover_catalogs(backends, intent, work_budget=signal_resolution_work_budget)
     timings["metrics_fetch"] = time.monotonic() - t0
     stage_log(
         "metrics_fetch",

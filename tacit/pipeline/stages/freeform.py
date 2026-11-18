@@ -13,13 +13,14 @@ from tacit import __version__
 from tacit.agents.metrics_discovery import SYSTEM_PROMPT, discover_metrics
 from tacit.agents.providers.base import TokenUsage
 from tacit.agents.query_builder import build_dashboard
+from tacit.catalog import freeform_selection_subject, record_query_selection, select_query_target
 from tacit.dependencies import PipelineDependencies
 from tacit.errors import RuntimeOwnershipError
 from tacit.logging import stage_log
 from tacit.models.schemas import DashboardSpec, DashResponse, Intent, MetricEntry
 from tacit.pipeline.failures import PipelineFailureFactory
 from tacit.pipeline.recording import PipelineRecorder
-from tacit.ranking import prerank_metrics
+from tacit.ranking import MAX_LLM_CANDIDATES, prerank_metrics
 
 logger = structlog.get_logger()
 
@@ -64,6 +65,7 @@ class FreeformBuildResult:
     dashboard_spec: DashboardSpec | None
     token_usage: TokenUsage
     failure: DashResponse | None = None
+    selection_subjects: tuple[str, ...] = ()
 
 
 async def build_freeform_dashboard(
@@ -96,6 +98,7 @@ async def build_freeform_dashboard(
     ranked_catalog = prerank_metrics(
         intent,
         metric_catalog,
+        max_candidates=max(0, min(MAX_LLM_CANDIDATES, deps.settings.max_metric_catalog_size)),
         feedback_store_factory=deps.feedback_store_factory,
         tenant_id=tenant_id,
     )
@@ -163,9 +166,26 @@ async def build_freeform_dashboard(
         )
         return FreeformBuildResult(dashboard_spec=None, token_usage=total_usage, failure=failure)
 
-    valid_uids = {entry.datasource_uid for entry in metric_catalog}
     original_count = len(discovery.metrics)
-    discovery.metrics = [metric for metric in discovery.metrics if metric.datasource_uid in valid_uids]
+    selected_metrics = []
+    subjects = []
+    for metric in discovery.metrics:
+        names = {metric.metric_name}
+        # The model's proposed UID cannot break an ownership tie.
+        selected = select_query_target(metric_catalog, names, metric.query_language)
+        subject = freeform_selection_subject(names, metric.query_language)
+        subjects.append(subject)
+        record_query_selection(
+            selected,
+            consumer="freeform_selected",
+            subject_ref=subject,
+            required_metrics=names,
+            query_language=metric.query_language,
+        )
+        target = selected.target
+        if target is not None and target.datasource_uid == metric.datasource_uid:
+            selected_metrics.append(metric)
+    discovery.metrics = selected_metrics
     dropped = original_count - len(discovery.metrics)
     if dropped:
         logger.warning("llm_hallucinated_uids_dropped", dropped=dropped)
@@ -191,4 +211,6 @@ async def build_freeform_dashboard(
         metrics_input=len(discovery.metrics),
         panels_generated=len(dashboard_spec.panels),
     )
-    return FreeformBuildResult(dashboard_spec=dashboard_spec, token_usage=total_usage)
+    return FreeformBuildResult(
+        dashboard_spec=dashboard_spec, token_usage=total_usage, selection_subjects=tuple(sorted(set(subjects)))
+    )

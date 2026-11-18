@@ -120,6 +120,14 @@ class GrafanaClient:
             trust_env=trust_env,
         )
 
+    async def acquisition_request(self, method, path, work_budget, **kwargs) -> dict | list:
+        """Bounded discovery HTTP on this client's existing owned transport."""
+        from tacit.acquisition import bounded_acquisition_request
+        from tacit.config import validate_acquisition_budget
+
+        validate_acquisition_budget(self._runtime_settings, work_budget)
+        return await bounded_acquisition_request(self._client, method, path, work_budget, **kwargs)
+
     # ── Low-level helpers ────────────────────────────────────────────────
 
     async def _get(self, path: str, **kwargs) -> dict | list:

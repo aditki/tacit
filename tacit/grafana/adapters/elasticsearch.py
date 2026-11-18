@@ -13,6 +13,14 @@ logger = structlog.get_logger()
 
 class ElasticsearchAdapter(DatasourceAdapter):
 
+    supports_acquisition_inventory_phase = True
+
+    async def discover_metrics_with_metadata(self, client, datasource, keywords, work_budget, *, enrich=True):
+        """Return bounded per-search metadata without consulting legacy caches."""
+        from tacit.acquisition import discover_adapter_metrics
+
+        return await discover_adapter_metrics(client, datasource, keywords, work_budget, enrich=enrich)
+
     @property
     def query_language(self) -> str:
         return "elasticsearch"
@@ -75,21 +83,51 @@ class ElasticsearchAdapter(DatasourceAdapter):
         return entries
 
 
-def _extract_fields(mapping_response: dict | list) -> dict[str, str]:
-    """Walk ES mapping JSON and extract {field_name: field_type}."""
-    fields: dict[str, str] = {}
+def _iter_fields(mapping_response: dict | list):
+    """Yield normalized fields without retaining a full mapping catalog."""
 
-    def _walk(obj: dict, prefix: str = ""):
-        if "properties" in obj:
-            for fname, fdef in obj["properties"].items():
-                full = f"{prefix}.{fname}" if prefix else fname
-                if "type" in fdef:
-                    fields[full] = fdef["type"]
-                if "properties" in fdef:
-                    _walk(fdef, full)
+    def walk(obj: dict, prefix: str = ""):
+        properties = obj.get("properties", {})
+        if not isinstance(properties, dict):
+            return
+        for name, definition in sorted(properties.items()):
+            if not isinstance(definition, dict):
+                continue
+            from tacit.signals.resolution import (
+                ResolutionInputTextLimits,
+                ResolutionInputWorkLimitError,
+                admit_resolution_input_text,
+            )
+
+            limits = ResolutionInputTextLimits()
+            counts = admit_resolution_input_text((prefix, name))
+            separators = int(bool(prefix))
+            characters = counts["input_character_count"] + separators
+            utf8_bytes = counts["input_utf8_byte_count"] + separators
+            if characters > limits.max_scalar_characters:
+                raise ResolutionInputWorkLimitError(
+                    "derived_scalar_characters", characters, limits.max_scalar_characters
+                )
+            if utf8_bytes > limits.max_scalar_utf8_bytes:
+                raise ResolutionInputWorkLimitError(
+                    "derived_scalar_utf8_bytes", utf8_bytes, limits.max_scalar_utf8_bytes
+                )
+            full = f"{prefix}.{name}" if prefix else name
+            if isinstance(definition.get("type"), str):
+                yield full, definition["type"]
+            if "properties" in definition:
+                yield from walk(definition, full)
 
     if isinstance(mapping_response, dict):
-        for index_data in mapping_response.values():
-            mappings = index_data.get("mappings", index_data)
-            _walk(mappings)
+        for _, index_data in sorted(mapping_response.items()):
+            if isinstance(index_data, dict):
+                yield from walk(index_data.get("mappings", index_data))
+
+
+def _extract_fields(mapping_response: dict | list, *, max_fields: int | None = None) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for name, kind in _iter_fields(mapping_response):
+        if max_fields is not None and len(fields) >= max_fields:
+            break
+        fields[name] = kind
     return fields

@@ -978,6 +978,96 @@ work limit.
   must match the expected HTTPS origin, and workflow jobs execute that exact
   helper before and after publication.
 
+## Acquisition implementation gate
+
+Applicable existing rows: entry-point parity; exact runtime/generation/lease ownership;
+tenant/permission denial before I/O; bounded collections and multi-stage work;
+side-effect ordering; provenance/replay/fingerprints; concurrency fault injection.
+Write failing discovery, binding, response-limit and capture/publication matrix
+cases before production changes. All Grafana adapters, direct/proxied SignalFx,
+archetype/evidence/rescue/freeform consumers are in the shared boundary inventory.
+
+Lifecycle gate: existing execution graph is runtime owner; canonical admission
+controller is admission authority; worker/service-owner finalization releases
+capacity only after actual settlement; adopted backend/transport owner cleans up.
+Cancellation or caller-loop loss may detach delivery but never owns retirement.
+Exact generation/resource leases govern dispatch and close. Work counters use
+nonblocking owner reservations and are not permits. No second controller, thread,
+executor or cleanup authority. Test stale leases, lock contention, before/after
+dispatch cancellation and lost-loop cleanup through the real proxy.
+
+Publication requires one bounded capture admission with pinned base IDs and
+references before completion begins any publication side effect. Unsupported
+selected SignalFlow translations fail the whole investigation without fallback
+or partial publication. Old exact fingerprints and offline replay stay intact.
+
+Acquisition shared-boundary amendment: Grafana source enumeration plus every
+built-in Grafana adapter and direct SignalFx discovery enter the common
+`tacit/acquisition.py` bounded raw-read/search boundary through their already
+owned clients. Applicable tests: acquisition response limits (call/byte/entry
+limit plus one, identity encoding, closure, lock contention), typed discovery
+retention/cache bypass and exact backend proxy lifecycle. This module owns no
+lifecycle authority; the existing owner, admission, retirement and cleanup gate
+above remains authoritative. Adapters create bounded batches, never one task per
+unbounded source or metric.
+
+Acquisition owner-selection inventory amendment: `tacit/evidence_artifacts.py`
+symptom/gap rescue joins engine and evidence ownership consumers under the same
+pure selector and binding-parity matrix. No consumer-local fallback policy.
+
+SignalFlow translation inventory amendment: `tacit/signalfx/publisher.py` query
+publication is a second entry point to the same translator boundary. It must
+use the guarded archetype translator and preflight every selected chart before
+publication. Direct publish/freeform, engine archetype compilation and evidence
+consumers share rejection of histogram-base guessing, regex widening and
+synthetic expression fallbacks. The required-survival gate forbids publishing a
+supported subset. Focused publisher tests assert zero remote writes on any
+rejected selected query. This is a narrow allowlist amendment, not a new compiler.
+
+Publication ordering amendment: `tacit/pipeline/stages/publish.py` performs the
+same pure SignalFlow preflight before the first backend publication, including
+Grafana-first fallback order. Standalone SignalFx preflight runs before group
+creation. Neither path moves publication authority or introduces a compiler.
+Matrix tests require zero remote writes across every backend when any selected
+SignalFlow translation is unsupported.
+
+Source count clarification: source statuses describe metric-search identities.
+Successful datasource enumeration contributes only call/byte counters; its
+source count is never a metric total and no fake UID is created. Enumeration
+failure is one zero-count backend summary. Legacy return adaptation groups real
+UID/type/language identities and retains `legacy_unknown` transport limitations.
+
+Duplicate-fact boundary escalation: legacy backend adaptation, Grafana aggregation
+and Prometheus metadata definition expansion must preserve conflicting facts
+until shared catalog normalization. Budget identities reserve once; equivalent
+facts may deduplicate. Retention cannot select the first unit/type or drop a
+conflicting duplicate. Existing raw-fact admission limits fail closed rather
+than erasing conflicts. Reversed-definition and list/adapter parity tests prove
+ambiguous ownership and audited conflicts.
+
+Acquisition allocation evidence: isolated child-process adversarial tests cover
+8 MB many-small values, 8 MB scalar, depth 33, and five simultaneously retained
+5000-fact/55000-dimension raw+decode+catalog+capture graphs with near-limit
+completion text/tree, private preparation and preflight contract graphs.
+2026-11-18 measured high-water: 183612775 traced bytes / 408190976 RSS bytes on
+CPython 3.12 macOS. Conservative static ceiling 512 MiB/pipeline, at most five
+acquisition pipelines, serial adapter scheduling; larger effective concurrency
+is rejected before typed acquisition I/O. See engineering notes for the bounded
+component worksheet and conservative final-EOF accounting.
+
+
+Derived-text owner inventory: matching/fallback streaming name heaps,
+`_bounded_names`, normalized `_append_inventory` tuples and
+`AcquisitionSearches.inventory` memberships share output text admission before
+growth. Elasticsearch path concatenation checks scalar bounds before allocation;
+CloudWatch namespace-qualified names enter the same text boundary. Required
+matrix probes cover Unicode shared-prefix amplification, filter-before-cap in
+Prometheus/CloudWatch/InfluxDB/Elasticsearch, strict JSON duplicate/nonfinite
+rejection and retained metadata conflicts after capacity loss/lock contention.
+Final isolated allocation record: 180074 nodes/1890564 characters; private
+completion input: 192947 nodes/1985684 characters. Derived-prefix rejection
+high-water: 16240351 traced bytes. No new lifecycle or accounting authority.
+
 ## Quality gates
 
 | Change area | Minimum additional gate |

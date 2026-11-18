@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -67,6 +68,201 @@ from tacit.runtime_stores import RuntimeStores
 from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE, resolve_signal_store
 from tacit.signals.store import SignalStore
 from tacit.tenancy import TenantBoundaryError
+
+
+@pytest.mark.parametrize(
+    "expression,reason",
+    [
+        ('sum(rate(requests{status=~"5.."}[5m]))', "regex_widening"),
+        ('histogram_quantile(0.95, sum(rate(latency_bucket{service="api"}[5m])) by (le))', "histogram_bucket_guess"),
+        ("unsupported_function(up)", "synthetic_fallback"),
+        ("sum(rate(requests{}[5m])) * 100", "synthetic_fallback"),
+        ("sum(rate(requests{}[5m])) > 0", "synthetic_fallback"),
+        ("rate(requests{}[5m]) + 3", "synthetic_fallback"),
+        ("sum(rate(requests{badlabel}[5m]))", "synthetic_fallback"),
+        ('sum(rate(requests{host="kafka*"}[5m]))', "synthetic_fallback"),
+        (
+            'topk(3, histogram_quantile(0.95, sum(rate(latency_bucket{service="api"}[5m])) by (le)))',
+            "histogram_bucket_guess",
+        ),
+    ],
+)
+def test_acquisition_unsupported_signalflow_never_returns_executable_query(expression, reason):
+    from tacit.archetypes.engine import _promql_template_to_signalflow
+
+    with pytest.raises(ValueError, match=reason):
+        _promql_template_to_signalflow(expression, "", "", "unsafe")
+
+
+def test_acquisition_compound_metric_owner_cannot_use_default_tie_break():
+    from tacit.archetypes.engine import _resolve_promql_query_target
+    from tacit.models.schemas import QueryTarget
+
+    catalog = [
+        MetricEntry(
+            name=name,
+            datasource_uid=uid,
+            datasource_name=uid,
+            datasource_type="prometheus",
+            query_language="promql",
+            datasource_is_default=uid == "default",
+        )
+        for uid in ("default", "other")
+        for name in ("requests", "errors")
+    ]
+    target = _resolve_promql_query_target(
+        catalog, "errors / requests", QueryTarget.from_metric(catalog[0]), Intent(summary="api", domain="test")
+    )
+    assert target.datasource_uid == ""
+
+
+def test_acquisition_native_owner_requires_all_operands():
+    from tacit.archetypes.engine import _resolve_native_query_target
+
+    catalog = [
+        MetricEntry(
+            name="a",
+            datasource_uid="partial",
+            datasource_name="partial",
+            datasource_type="signalfx",
+            query_language="signalflow",
+        )
+    ]
+    target = _resolve_native_query_target(catalog, "signalfx", "signalflow", {"a", "b"})
+    assert target.datasource_uid == ""
+
+
+def _acquisition_assembly_inputs(context_chunks=None):
+    from tacit.models.schemas import CulpritRanking
+
+    return dict(
+        investigation_id="inv_acquisition",
+        revision=0,
+        parent_revision=None,
+        request=DashRequest(prompt="inspect api"),
+        intent=Intent(summary="api", domain="test"),
+        dashboard_spec=DashboardSpec(title="Test", panels=[]),
+        evidence_requirements=[],
+        evidence_resolutions=[],
+        evidence_observations=[],
+        culprit_ranking=CulpritRanking(),
+        context_chunks=context_chunks or [],
+        warnings=[],
+        knowledge_usage=[],
+    )
+
+
+def test_acquisition_preparation_pins_context_before_completion():
+    from tacit.catalog import build_acquisition_capture
+    from tacit.pipeline.completion import prepare_acquisition_completion
+
+    chunks = [ContextChunk(source="runbook", content="old", metadata={})]
+    prepared = prepare_acquisition_completion(
+        assembly_inputs=_acquisition_assembly_inputs(chunks),
+        acquisition_record=build_acquisition_capture([]),
+    )
+    chunks[0].content = "changed"
+    assert prepared.assembly_inputs["context_chunks"][0].content == "old"
+
+
+def test_acquisition_preparation_rejects_context_collision_before_publication():
+    from tacit.catalog import CatalogSourceStatus, build_acquisition_capture, capture_extensions
+    from tacit.pipeline.completion import prepare_acquisition_completion
+
+    record = build_acquisition_capture([], sources=[CatalogSourceStatus(backend="grafana", summary=True)])
+    _, provenance = capture_extensions(record)
+    chunks = [ContextChunk(source="runbook", content="evidence", metadata={"provenance_id": provenance[0].id})]
+    with pytest.raises(ValueError, match="acquisition_capture_invalid"):
+        prepare_acquisition_completion(
+            assembly_inputs=_acquisition_assembly_inputs(chunks),
+            acquisition_record=record,
+        )
+
+
+@pytest.mark.parametrize("dimension", ["key", "type", "tree", "text", "unicode", "duplicate_id"])
+def test_acquisition_preparation_reports_typed_admission_failures(dimension):
+    from tacit.catalog import AcquisitionCaptureInvalidError, AcquisitionCaptureLimitError, build_acquisition_capture
+    from tacit.pipeline.completion import prepare_acquisition_completion
+
+    inputs = _acquisition_assembly_inputs()
+    metadata = {}
+    if dimension == "key":
+        metadata[0] = "invalid"
+    elif dimension == "type":
+        metadata["invalid"] = object()
+    elif dimension == "tree":
+        nested = []
+        for _ in range(33):
+            nested = [nested]
+        metadata["invalid"] = nested
+    elif dimension == "text":
+        metadata["invalid"] = "x" * 65_537
+    elif dimension == "unicode":
+        metadata["invalid"] = "\ud800"
+    else:
+        metadata["provenance_id"] = "inv_acquisition"
+    inputs["context_chunks"] = [ContextChunk.model_construct(source="runbook", content="test", metadata=metadata)]
+    expected = AcquisitionCaptureLimitError if dimension in {"tree", "text"} else AcquisitionCaptureInvalidError
+    with pytest.raises(expected):
+        prepare_acquisition_completion(assembly_inputs=inputs, acquisition_record=build_acquisition_capture([]))
+
+
+def test_acquisition_publisher_cannot_restore_rejected_translation():
+    from tacit.signalfx.publisher import _promql_to_signalflow
+
+    with pytest.raises(ValueError, match="histogram_bucket_guess"):
+        _promql_to_signalflow('histogram_quantile(0.95, sum(rate(latency_bucket{service="api"}[5m])) by (le))')
+
+
+def test_acquisition_translation_preserves_literal_values_and_bucket_grouping():
+    from tacit.archetypes.engine import _promql_template_to_signalflow
+
+    expression = """sum(rate(requests_bucket{region="us,east",service="a'b"}[5m])) by (le)"""
+    converted = _promql_template_to_signalflow(expression, "", "", "A")
+    assert "filter('region', 'us,east')" in converted
+    assert """filter('service', "a'b")""" in converted
+    assert ".sum(by=['le'])" in converted
+
+
+def test_acquisition_evidence_owner_rejects_conflicting_metadata():
+    from tacit.evidence import _unique_owner
+
+    entries = [
+        MetricEntry(
+            name="memory",
+            datasource_uid="one",
+            datasource_name="one",
+            datasource_type="prometheus",
+            query_language="promql",
+            unit=unit,
+        )
+        for unit in ("bytes", "seconds")
+    ]
+    assert _unique_owner(entries) is None
+
+
+async def test_acquisition_translation_preflight_precedes_every_backend_publish():
+    runtime_settings = Settings(_env_file=None)
+    backends = [_OwnedPublishingBackend(name, runtime_settings) for name in ("grafana", "signalfx")]
+    spec = DashboardSpec(
+        title="Unsafe",
+        panels=[
+            PanelSpec(
+                title="Latency",
+                queries=[
+                    PanelQuery(
+                        expr='histogram_quantile(0.95, sum(rate(latency_bucket{service="api"}[5m])) by (le))',
+                        datasource_uid="signalfx-direct",
+                        datasource_type="signalfx",
+                        query_language="signalflow",
+                    )
+                ],
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="histogram_bucket_guess"):
+        await publish_dashboard(backends=backends, dashboard_spec=spec, timings={}, runtime_settings=runtime_settings)
+    assert [backend.publish_calls for backend in backends] == [0, 0]
 
 
 def _owned_test_factory(factory, *, runtime_settings: Settings, factory_kind: str):
@@ -1032,6 +1228,72 @@ async def test_build_freeform_dashboard_no_metrics_returns_failure():
     assert result.failure is not None
     assert result.token_usage == TokenUsage()
     assert recorder.finished[0]["error"] == "No metrics found for freeform generation"
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+async def test_freeform_prompt_projection_keeps_full_catalog_owner_check(monkeypatch, ambiguous):
+    from tacit.models.schemas import MetricsDiscoveryResult
+
+    metric = MetricEntry(
+        name="latency_seconds",
+        datasource_uid="one",
+        datasource_name="One",
+        datasource_type="prometheus",
+        query_language="promql",
+    )
+    catalog = [metric] + [metric.model_copy(update={"name": f"irrelevant_{i}"}) for i in range(587)]
+    if ambiguous:
+        catalog[-1] = metric.model_copy(update={"datasource_uid": "other", "datasource_name": "Other"})
+    discovery = MetricsDiscoveryResult.model_validate(
+        {
+            "metrics": [
+                {
+                    "metric_name": metric.name,
+                    "datasource_uid": "one",
+                    "datasource_name": "One",
+                    "datasource_type": "prometheus",
+                    "query_language": "promql",
+                }
+            ]
+        }
+    )
+    prompt_sizes = []
+    query_sizes = []
+
+    async def discover(_intent, projection, _context, **_kwargs):
+        prompt_sizes.append(len(projection))
+        return discovery, TokenUsage()
+
+    async def build(_intent, _discovery, projection, **_kwargs):
+        query_sizes.append(len(projection))
+        return _dashboard(), TokenUsage()
+
+    monkeypatch.setattr("tacit.pipeline.stages.freeform.discover_metrics", discover)
+    monkeypatch.setattr("tacit.pipeline.stages.freeform.build_dashboard", build)
+    deps = SimpleNamespace(
+        settings=Settings(_env_file=None, max_metric_catalog_size=2),
+        feedback_store_factory=lambda: None,
+        llm_provider_factory=lambda: object(),
+        llm_cache=SimpleNamespace(get=lambda _key: None, set=lambda *_args: None),
+        cache_key_factory=lambda *parts: ":".join(str(part) for part in parts),
+    )
+    result = await build_freeform_dashboard(
+        intent=_intent(),
+        metric_catalog=catalog,
+        context_chunks=[],
+        deps=deps,
+        recorder=FakeRecorder(),
+        timings={},
+        started_at=0,
+    )
+    assert prompt_sizes == [2]
+    assert len(catalog) == 588
+    if ambiguous:
+        assert result.failure is not None
+        assert query_sizes == []
+    else:
+        assert result.dashboard_spec is not None
+        assert query_sizes == [2]
 
 
 def test_discovery_cache_identity_includes_tenant_and_complete_ranked_catalog():
