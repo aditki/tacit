@@ -246,3 +246,11 @@ in 26.19 seconds. Across the full run and targeted retry, 4,517 unit tests passe
 and 12 were skipped. No production provider or model was contacted. Full-project
 Ruff, Black and mypy passed; Grounding passed 40 cases with zero unsafe assertions
 and Operational Learning passed 18/18. Focused experiment tests passed 65/65.
+
+### Local container verification
+
+The Docker build of implementation commit `00b4ec6` passed on Linux ARM64 as
+`tacit:offline-eval-local`, with the configured `tacit` user. Disposable
+network-disabled containers passed `tacit --version` and
+`python -m tests.eval.evidence_decisions --help`, exposing the `prepare` and
+`score` commands. No inference, model collection or production startup occurred.
