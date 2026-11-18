@@ -2124,3 +2124,33 @@ usefulness.
 - [ADR-021: Generated archetype scope](adr/021-generated-archetype-scope-context.md)
 - [ADR-022: Operational Knowledge lifecycle](adr/022-operational-knowledge-lifecycle.md)
 - [Generated archetype evaluation roadmap](generated-archetype-evaluation-roadmap.md)
+
+## File-only decision experiments
+
+A recorded priority-choice experiment has one synchronous local-file owner.
+Import, preparation, scoring and failure paths must stay independent of runtime
+composition, provider factories, databases, subprocesses and network access.
+Collection has separate operator authorization and external spend/deadline/
+cleanup owners; receipt validation cannot attest unrecorded external activity.
+
+Derive candidate and reference identities from original captured facts before
+redaction, independent of rank/order. Approve text using those stable identities
+and frozen subordinate-array positions. Replacements may coincide without
+collapsing approved leaves. A field omitted from approvals as a structural enum
+must validate its exact closed vocabulary; accepting arbitrary text there is an
+unapproved prompt-content bypass. Unsupported historical enum values fail the
+case rather than receiving guessed semantics.
+
+Use the same descriptor-bound path, archive, lexical JSON and counted output
+boundaries for prepare and score. Physical tar extension headers are input,
+including headers a convenience archive iterator would consume invisibly.
+Reject them before interpretation. Never infer experiment labels from bundle
+expected outcomes or synthesize a historical baseline with the current engine.
+
+Quality uses one frozen primary attempt per independent incident. Variants and
+additional attempts stay visible for robustness, receipt completeness, usage and
+unsafe-attempt accounting. Bind every declared receipt's exact bytes or explicit
+absence into semantic replay identity, including attempts excluded from quality.
+Failures earn zero quality; resource errors do not become successful abstention.
+Synthetic conformance is neither vendor-version attestation nor evidence of
+improved model quality. See [experiment instructions](evidence-decision-experiment.md).

@@ -1015,3 +1015,16 @@ Remaining risks and observability gaps:
 
 An empty field must be written as `Not applicable` with a reason. It must not be
 silently omitted.
+
+## File-only evidence-decision experiment gate
+
+Applicable rows: import/no-side-effect entry-point parity; descriptor-bound
+file/tenant/ID validation; bounded archive/JSON/output work; deterministic replay
+and semantic hashing; fixed denominators and independent incident sampling.
+Write failing tests before driver implementation. Driver, direct reader, prepare
+and score share one synchronous file-only owner and bounded validators. No
+application database, provider factory, network, subprocess, worker, new event
+loop or production registration is admitted. Trap those operations in tests.
+All declared receipt attempts bind semantic hashes; only primary attempt-1 rows
+supply arm quality and recommendation estimates. Variants are paired views, not
+new incidents. Failures score zero; policy abstention is never a model call.
