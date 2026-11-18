@@ -2163,3 +2163,27 @@ counter, keeps Jev's envelope unchanged and shares identity checks between
 manifest loading and direct receipt validation. Preserve exact receipt bytes in
 semantic identity even when metadata does not affect quality. This is file-only
 protocol admission, with no new runtime or external collection owner.
+
+Scenario capture must establish freshness for the actual validation query, not
+just successful historical ingestion. A long serial cohort can age past an
+instant/rate query's window. Freeze the source selection and rebase rule first,
+then freeze each timestamp-only resolved replay immediately before its baseline
+call. Require fresh instant and short-window readiness. Retain and exclude a
+timing-invalid cohort as a whole; do not patch the production validator to make
+an expired fixture pass.
+
+Availability evidence is not a measured abnormal condition. The ClickStack/GAMMA
+baseline exercise preserved query validity/nonemptiness and observation links,
+but the eight GAMMA fault/healthy projections were identical. Replacing a
+ranker cannot recover numeric facts absent from its input. Inspect actual
+choice-point counts and distinct visible states before investing in classifier
+comparisons. Keep deterministic zero/one-candidate no-calls intact. Any separate
+single-candidate abstention diagnostic needs its own frozen protocol and report;
+its results cannot establish paired ranking quality or authorize production use.
+
+A bounded request in bytes may still exceed a model's token limit. Preserve
+the original rejection and count it as failed coverage; do not truncate captured
+facts or shrink a frozen packet after seeing its result. HTTP submissions,
+successful model responses and distinct model-visible inputs are different
+counts. Cached-prompt metadata and repeated responses do not create independent
+examples. Record each explicitly when reporting a local experiment.

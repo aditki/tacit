@@ -1039,3 +1039,44 @@ unknown fields, bool/negative/noninteger counters, mismatched server identities,
 file-only prepare/score parity, exact receipt-byte hash binding and stable score
 replay. A new profile is part of the frozen corpus digest, not an implicit repair
 of historical inputs. No new runtime, collector or resource owner is introduced.
+
+Scenario-corpus gate: ClickStack/GAMMA source hashes, distinct recording IDs,
+family grouping, replay windows and label rules freeze before baseline capture.
+Only the dedicated local evaluation stack may receive imports or deletion;
+bind its project/endpoints/container ownership before admitting either action.
+Each serial baseline uses the existing `cold_isolation` RuntimeStores root,
+canonical admission and backend/provider owners. Those owners retain capacity
+and cleanup authority; the calling coroutine only transports results. Close
+dependencies and reach terminal zero before restoring evaluation state or
+advancing to the next recording. No new production runtime owner is introduced.
+Export existing public assessment bundles; failed/no-contract runs remain
+failed coverage, never synthesized contracts or reordered baseline candidates.
+Write corpus-artifact tests before creating captures: verify source/label freeze,
+actual baseline/contract identity, no label or hidden injection metadata in model
+packets, exact offline replay and truthful zero/one-candidate no-calls. Label
+mapping uses actual observation links and predeclared next-inspection roles,
+never baseline score/order or dataset fault labels as causal truth. Preserve
+source-coverage failures separately from conditional priority-choice quality.
+The file-only evaluator remains independent of the external capture/collection
+operator and the production runtime; Tev cannot override grounding or publish.
+
+Replay-clock clarification: source windows, samples and the rebase rule freeze
+before a cohort; each resolved absolute replay is hash-bound before its model
+call. Instant/rate validation requires fresh samples, so a one-hour import probe
+cannot establish validity for a five-minute query. Preserve invalid timing
+attempts, version the clock profile, and rerun the whole cohort without tuning
+cases or labels. Test that only timestamps shift, other values/labels remain
+identical, stale admission fails before inference, and resolved inputs never
+change after capture. Do not override the production validator or synthesize
+observations to compensate for an expired fixture clock.
+
+If actual captures yield no two-candidate choice, keep the paired protocol's
+no-call policy. A separately versioned, explicitly authorized abstention probe
+may compare the single real captured candidate with `insufficient` offline.
+Freeze its distinct task, approved projections, labels, packet hashes and exact
+model identity before collection. Never add a distractor, reuse paired-ranking
+metrics for the probe, or feed its answer into production. Tests must preserve
+the original no-call counts and verify exact probe replay with network, database
+and subprocess capabilities denied. Report repeated visible states as
+correlated inputs and one-sided labels as an abstention diagnostic, not evidence
+of ranking improvement, calibration, or generalization.

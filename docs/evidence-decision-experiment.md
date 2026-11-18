@@ -206,6 +206,12 @@ Inspect exit status, receipt counts, failures and comparison gates. A Tev-only
 collection leaves the Jev receipts missing and returns nonzero while preserving
 the Tev scores. Missing Jev responses must not be replaced with Tev answers.
 
+The [recorded ClickStack/GAMMA exercise](reviews/scenario-tev-corpus-2026-11-18.md)
+is a separate development corpus with actual Tacit captures. Its nine valid
+captures have one admissible candidate each, so this paired protocol makes no
+model calls. Its separately versioned, local single-candidate abstention probe
+does not relax this policy or contribute to the paired adoption gate.
+
 ## Implementation validation, 2026-11-18
 
 Implementation was isolated on `issue/offline-jev-tev-evaluation` from base
