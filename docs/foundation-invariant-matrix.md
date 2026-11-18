@@ -1028,3 +1028,14 @@ loop or production registration is admitted. Trap those operations in tests.
 All declared receipt attempts bind semantic hashes; only primary attempt-1 rows
 supply arm quality and recommendation estimates. Variants are paired views, not
 new incidents. Failures score zero; policy abstention is never a model call.
+
+Ollama 0.40.15 conformance amendment: before adapting the receipt envelope,
+freeze the actual synthetic local Choice response and write failing tests.
+Keep `choice-wire-v1` and its exact goldens unchanged. The explicitly selected
+`choice-wire-ollama-0.40.15-v1` envelope may admit only Tev's optional nonnegative
+integer `prompt_eval_cached_count`; the Tev server identity must equal 0.40.15.
+Jev retains the original closed response envelope. Test old-profile rejection,
+unknown fields, bool/negative/noninteger counters, mismatched server identities,
+file-only prepare/score parity, exact receipt-byte hash binding and stable score
+replay. A new profile is part of the frozen corpus digest, not an implicit repair
+of historical inputs. No new runtime, collector or resource owner is introduced.

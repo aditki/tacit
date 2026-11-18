@@ -4,8 +4,10 @@ This file-only experiment compares the captured historical baseline with recorde
 Jev and Tev priority Choices. It asks which already-admissible suspect merits
 attention next. It neither establishes numeric conditions or root cause nor
 changes Tacit's production ranking, grounding, providers, stores or CLI.
-The checked-in corpus is fictional conformance data. No real model result or
-140-incident labeled corpus is supplied, and no inference was performed.
+The original checked-in corpus is fictional conformance data. A subsequent
+[local Tev diagnostic](reviews/tev-ollama-2026-11-18.md) records actual Ollama
+responses on 14 fictional cases. It does not supply the independently adjudicated
+40-development/100-held-out incident corpus or establish production quality.
 
 ## Freeze a corpus before collection
 
@@ -130,6 +132,34 @@ identity/hash disagreement and executable extension fields are rejected.
 Probabilities are not renormalized. Confidence describes concentration, not the
 chance an answer is correct. Each arm fails independently.
 
+### Explicit Ollama 0.40.15 envelope
+
+The historical `choice-wire-v1` profile keeps its exact closed response schema.
+An authorized local synthetic probe against Ollama 0.40.15 returned the extra
+root field `prompt_eval_cached_count`. Its exact response bytes are frozen in
+[`evidence_decisions_ollama_04015_response.json`](../tests/eval/fixtures/evidence_decisions_ollama_04015_response.json),
+with SHA-256 `07c73334bc652572bf068915744db5d7d41eda991997a957f0f7755d073a4a77`.
+This is a live serving conformance example on fictional state, not investigation
+quality evidence or a model-artifact attestation.
+
+To collect that envelope, freeze a new manifest with
+`protocol.wire: "choice-wire-ollama-0.40.15-v1"` and Tev's exact
+`server_version: "0.40.15"`. The remaining protocol versions, request bytes,
+rubric, decisions and scoring stay unchanged. This profile permits Tev's optional
+`prompt_eval_cached_count` only as a nonnegative JSON integer; bools, null,
+negative/fractional values and other extensions fail. Jev continues to use the
+original closed envelope even in this manifest. A different server identity
+requires its own conformance assessment, rather than this profile's automatic
+acceptance.
+
+Preserve the actual raw response, including the cache counter. Do not remove it
+to make an old manifest pass. A changed wire profile changes the frozen corpus
+digest; prepare and score verify it before output. Exact recorded receipt bytes
+bind the semantic digest even when changing only the cache counter leaves
+quality metrics unchanged. Missing cache metadata remains absent, not an
+invented zero. The shared profile admission adds no network or collection
+capability to this file-only driver.
+
 ## Score and replay recorded files
 
 ```bash
@@ -168,7 +198,13 @@ result or recorded external error. Invalid protocol, missing requested receipts,
 unreadable inputs or exceeded budgets return nonzero. Bounded failed rows and
 reports are retained when possible. Over-limit or interrupted runs never publish
 a completion marker. Inspect `comparisons.*.gate_passed` independently of exit
-status. No live quality results have been measured for this implementation.
+status. The local fictional diagnostic is separate from this recommendation gate.
+
+A score directory's `complete.json` means the bounded computation finalized its
+artifacts; it does not establish receipt completeness or a positive result.
+Inspect exit status, receipt counts, failures and comparison gates. A Tev-only
+collection leaves the Jev receipts missing and returns nonzero while preserving
+the Tev scores. Missing Jev responses must not be replaced with Tev answers.
 
 ## Implementation validation, 2026-11-18
 
@@ -177,7 +213,8 @@ Implementation was isolated on `issue/offline-jev-tev-evaluation` from base
 added (driver, synthetic fixture, unit tests and these instructions), with three
 existing guidance documents updated. The only new command interface is the
 standalone file driver's `prepare`/`score` pair. No production code was removed
-or changed, no package was installed, and no real inference was run. A resulting
+or changed, no package was installed, and no real inference was run during that
+initial implementation validation. A resulting
 implementation commit is assigned after review; this evidence does not invent a
 commit SHA before that point.
 

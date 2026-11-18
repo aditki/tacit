@@ -2154,3 +2154,12 @@ absence into semantic replay identity, including attempts excluded from quality.
 Failures earn zero quality; resource errors do not become successful abstention.
 Synthetic conformance is neither vendor-version attestation nor evidence of
 improved model quality. See [experiment instructions](evidence-decision-experiment.md).
+
+A real serving envelope may add metadata without changing a decision. Bind that
+compatibility to an explicit frozen wire profile and exact server identity;
+never strip response fields or silently broaden the historical schema. The
+Ollama 0.40.15 profile admits Tev's optional nonnegative integer cache-token
+counter, keeps Jev's envelope unchanged and shares identity checks between
+manifest loading and direct receipt validation. Preserve exact receipt bytes in
+semantic identity even when metadata does not affect quality. This is file-only
+protocol admission, with no new runtime or external collection owner.

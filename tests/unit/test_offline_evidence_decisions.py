@@ -20,6 +20,8 @@ import pytest
 
 FIXTURE = Path(__file__).parents[1] / "eval/fixtures/evidence_decisions_v1.json"
 GOLDENS = json.loads(FIXTURE.read_text())
+OLLAMA_RESPONSE = FIXTURE.with_name("evidence_decisions_ollama_04015_response.json")
+OLLAMA_WIRE = "choice-wire-ollama-0.40.15-v1"
 VARIANTS = ("primary", "rotate", "wording")
 PRIMARY = (
     "Using only recorded facts, choose which admissible suspect merits attention next. Choose insufficient "
@@ -817,6 +819,140 @@ def test_fixed_synthetic_report_semantic_digest(tmp_path):
     assert run(tmp_path, "score") == 0
     report = json.loads((tmp_path / "out/report.json").read_bytes())
     assert report["semantic_sha256"] == GOLDENS["synthetic_report_sha256"]
+
+
+def ollama_receipt():
+    """Actual synthetic probe bytes in an explicitly fictional receipt identity."""
+    body = OLLAMA_RESPONSE.read_bytes()
+    assert sha(body) == "07c73334bc652572bf068915744db5d7d41eda991997a957f0f7755d073a4a77"
+    record = copy.deepcopy(GOLDENS["wire_example"]["receipt"])
+    record.update(arm="tev", raw=json.loads(body), usage=None)
+    model = {
+        "arm": "tev",
+        "request_model": "tev1:4b",
+        "returned_model": "tev1:4b",
+        "artifact_sha256": "1" * 64,
+        "server_version": "0.40.15",
+    }
+    record["identity"] = {key: model[key] for key in ("returned_model", "artifact_sha256", "server_version")}
+    options = set(record["raw"]["answers"]["priority"]["probabilities"])
+    return record, model, options
+
+
+def ollama_manifest(tmp_path):
+    manifest, packets = build_manifest(tmp_path)
+    previous_digest = manifest["corpus_sha256"]
+    manifest["protocol"]["wire"] = OLLAMA_WIRE
+    manifest["models"][1].update(request_model="tev1:4b", returned_model="tev1:4b", server_version="0.40.15")
+    for key, body in list(packets.items()):
+        if key.startswith("tev."):
+            packet = json.loads(body)
+            packet["model"] = "tev1:4b"
+            body = (json.dumps(packet, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode()
+            packets[key] = body
+            manifest["cases"][0]["request_hashes"][key] = sha(body)
+    freeze(tmp_path / "manifest.json", manifest)
+    assert manifest["corpus_sha256"] != previous_digest
+    return manifest, packets
+
+
+def test_actual_ollama_response_requires_explicit_profile_and_preserves_raw():
+    d = driver()
+    record, model, options = ollama_receipt()
+    before = copy.deepcopy(record)
+    with pytest.raises(d.ValidationError):
+        d.validate_receipt(record, model, options, record["request_sha256"])
+    result = d.validate_receipt(record, model, options, record["request_sha256"], wire_profile=OLLAMA_WIRE)
+    assert result["valid"] and result["choice"] == "insufficient"
+    assert result["usage"] == {"input_tokens": 436, "output_tokens": 0}
+    assert record == before
+    record["raw"].pop("prompt_eval_cached_count")
+    assert d.validate_receipt(record, model, options, record["request_sha256"], wire_profile=OLLAMA_WIRE)["valid"]
+
+
+@pytest.mark.parametrize("value", [-1, True, False, 0.5, "0", None])
+def test_ollama_profile_rejects_noninteger_or_negative_cache_count(value):
+    d = driver()
+    record, model, options = ollama_receipt()
+    record["raw"]["prompt_eval_cached_count"] = value
+    with pytest.raises(d.ValidationError):
+        d.validate_receipt(record, model, options, record["request_sha256"], wire_profile=OLLAMA_WIRE)
+
+
+@pytest.mark.parametrize("mutation", ["unknown_field", "wrong_server", "unknown_profile", "jev_extension"])
+def test_ollama_profile_keeps_envelope_and_identity_closed(mutation):
+    d = driver()
+    record, model, options = ollama_receipt()
+    profile = OLLAMA_WIRE
+    if mutation == "unknown_field":
+        record["raw"]["future_extension"] = 0
+    elif mutation == "wrong_server":
+        model["server_version"] = record["identity"]["server_version"] = "0.40.16"
+    elif mutation == "unknown_profile":
+        profile = "choice-wire-ollama-unpinned"
+    else:
+        record = copy.deepcopy(GOLDENS["wire_example"]["receipt"])
+        model.update(
+            arm="jev",
+            request_model="jev-fixture-v1",
+            returned_model="jev-fixture-v1",
+            artifact_sha256=None,
+            server_version=None,
+        )
+        record["raw"]["prompt_eval_cached_count"] = 0
+    with pytest.raises(d.ValidationError):
+        d.validate_receipt(record, model, options, record["request_sha256"], wire_profile=profile)
+
+
+def test_ollama_profile_pins_manifest_server_before_output(tmp_path):
+    manifest, _ = ollama_manifest(tmp_path)
+    assert driver().load_manifest(tmp_path / "manifest.json")["protocol"]["wire"] == OLLAMA_WIRE
+    manifest["models"][1]["server_version"] = "0.40.16"
+    freeze(tmp_path / "manifest.json", manifest)
+    assert run(tmp_path, "prepare") != 0
+    assert not (tmp_path / "out").exists()
+
+
+def test_ollama_profile_external_error_status_is_unchanged():
+    d = driver()
+    record, model, options = ollama_receipt()
+    record.update(status="error", raw=None, usage=None, error_code="external_timeout")
+    result = d.validate_receipt(record, model, options, record["request_sha256"], wire_profile=OLLAMA_WIRE)
+    assert not result["valid"] and result["reason"] == "external_error"
+
+
+def test_ollama_profile_prepare_score_replays_and_binds_exact_receipt_bytes(tmp_path, monkeypatch):
+    manifest, packets = ollama_manifest(tmp_path)
+    directory = receipts(tmp_path, manifest, packets)
+    for path in directory.glob("case_a.tev.*.json"):
+        record = json.loads(path.read_bytes())
+        record["raw"]["prompt_eval_cached_count"] = 0
+        path.write_bytes(canonical(record))
+
+    def denied(*args, **kwargs):
+        raise AssertionError("external capability opened")
+
+    monkeypatch.setattr(socket, "socket", denied)
+    monkeypatch.setattr(sqlite3, "connect", denied)
+    monkeypatch.setattr(subprocess, "Popen", denied)
+    assert run(tmp_path, "prepare") == 0
+    for key, body in packets.items():
+        assert (tmp_path / "out/requests" / ("case_a." + key + ".json")).read_bytes() == body
+    assert run(tmp_path, "score", out="score1") == 0
+    assert run(tmp_path, "score", out="score2") == 0
+    before = json.loads((tmp_path / "score1/report.json").read_bytes())
+    assert (tmp_path / "score1/report.json").read_bytes() == (tmp_path / "score2/report.json").read_bytes()
+    assert before["counts"]["valid_receipts"] == 6
+    selected = directory / "case_a.tev.primary.a1.json"
+    original = selected.read_bytes()
+    record = json.loads(original)
+    record["raw"]["prompt_eval_cached_count"] = 1
+    selected.write_bytes(canonical(record))
+    assert run(tmp_path, "score", out="score3") == 0
+    after = json.loads((tmp_path / "score3/report.json").read_bytes())
+    assert before["arms"] == after["arms"]
+    assert before["semantic_sha256"] != after["semantic_sha256"]
+    assert sha(original) != sha(selected.read_bytes())
 
 
 def test_synthetic_inputs_match_existing_bundle_schemas():

@@ -48,6 +48,7 @@ WORDING = (
 )
 MEMBERS = {"contract.json", "captured_inputs.json", "expected_outcomes.json", "revisions.json", "comparison.json"}
 PROTOCOL = {"rubric": "priority-v1", "projection": "projection-v1", "scorer": "scorer-v1", "wire": "choice-wire-v1"}
+OLLAMA_04015_WIRE = "choice-wire-ollama-0.40.15-v1"
 LINK_FIELDS = ("supporting_requirement_ids", "contradicting_requirement_ids", "missing_requirement_ids")
 REASON_FIELDS = ("contextual_reasons", "runtime_evidence", "missing_evidence")
 
@@ -64,6 +65,12 @@ def require(condition: Any, reason: str = "invalid_manifest") -> None:
 def closed(value: Any, keys: str, reason: str = "invalid_manifest") -> dict:
     require(isinstance(value, dict) and set(value) == set(keys.split()), reason)
     return value
+
+
+def validate_wire_identity(model: dict, wire_profile: str, *, reason: str = "invalid_manifest") -> None:
+    require(wire_profile in (PROTOCOL["wire"], OLLAMA_04015_WIRE), reason)
+    if wire_profile == OLLAMA_04015_WIRE and model["arm"] == "tev":
+        require(model["server_version"] == "0.40.15", reason)
 
 
 def text(value: Any, limit: int = 256, *, nonempty: bool = False) -> str:
@@ -382,8 +389,9 @@ def load_manifest(path: Path):
     closed(m, "schema_version experiment_id split corpus_sha256 protocol models cases")
     require(m["schema_version"] == "evidence-decisions-manifest/1")
     identifier(m["experiment_id"])
-    require(m["split"] in ("development", "held_out") and m["protocol"] == PROTOCOL)
-    closed(m["protocol"], "rubric projection scorer wire")
+    require(m["split"] in ("development", "held_out"))
+    protocol = closed(m["protocol"], "rubric projection scorer wire")
+    require(all(protocol[key] == PROTOCOL[key] for key in ("rubric", "projection", "scorer")))
     digest(m["corpus_sha256"])
     require(isinstance(m["models"], list) and len(m["models"]) == 2)
     for arm, model in zip(ARMS, m["models"], strict=True):
@@ -397,6 +405,7 @@ def load_manifest(path: Path):
         else:
             digest(model["artifact_sha256"])
             text(model["server_version"], nonempty=True)
+        validate_wire_identity(model, protocol["wire"])
     require(isinstance(m["cases"], list) and 1 <= len(m["cases"]) <= 100)
     incidents, cases, strata = set(), set(), set()
     for c in m["cases"]:
@@ -969,7 +978,8 @@ def usage_record(value):
     return value
 
 
-def validate_receipt(record, model, options, request_hash):
+def validate_receipt(record, model, options, request_hash, *, wire_profile=PROTOCOL["wire"]):
+    validate_wire_identity(model, wire_profile, reason="invalid_response")
     closed(
         record,
         "schema_version experiment_id case_id arm variant attempt request_sha256 identity status raw "
@@ -1003,7 +1013,17 @@ def validate_receipt(record, model, options, request_hash):
             "reason": "external_error",
         }
     require(record["status"] == "ok" and record["error_code"] is None, "invalid_response")
-    raw = closed(record["raw"], "model answers usage", "invalid_response")
+    raw_fields = "model answers usage"
+    if (
+        wire_profile == OLLAMA_04015_WIRE
+        and model["arm"] == "tev"
+        and isinstance(record["raw"], dict)
+        and "prompt_eval_cached_count" in record["raw"]
+    ):
+        raw_fields += " prompt_eval_cached_count"
+        cached = record["raw"]["prompt_eval_cached_count"]
+        require(type(cached) is int and cached >= 0, "invalid_response")
+    raw = closed(record["raw"], raw_fields, "invalid_response")
     require(raw["model"] == model["returned_model"], "invalid_response")
     answers = closed(raw["answers"], "priority", "invalid_response")
     answer = closed(answers["priority"], "type choice probabilities confidence", "invalid_response")
@@ -1288,7 +1308,13 @@ def score(manifest, path, responses, output):
                         try:
                             record = decode_json(body)
                             unsafe = unsafe_choice(attempted_choice(record), case, p["menu"])
-                            result = validate_receipt(record, model, set(p["menu"]) | {"insufficient"}, request_hash)
+                            result = validate_receipt(
+                                record,
+                                model,
+                                set(p["menu"]) | {"insufficient"},
+                                request_hash,
+                                wire_profile=manifest["protocol"]["wire"],
+                            )
                             require(
                                 record["experiment_id"] == manifest["experiment_id"]
                                 and record["case_id"] == case["case_id"]
