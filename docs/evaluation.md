@@ -237,9 +237,14 @@ The response/allocation gate passed 45 tests, including an isolated five-graph
 high-water measurement of 183,612,775 traced bytes / 408,190,976 RSS bytes after
 the strict parser and derived-text guards. Independent acquisition transport
 security and integration architecture reviews cleared all reported findings;
-the final repository run followed the dependency repairs. Local container
-build was attempted but could not connect because the Docker daemon was not
-running. The build and protected release evidence remain outstanding checks.
+the final repository run followed the dependency repairs.
+
+After Docker became available, the local container build of implementation
+commit `4d296f9` passed on Linux ARM64 as `tacit:acquisition-local`. Disposable
+network-disabled, read-only containers passed the installed CLI version check,
+acquisition imports, packaged resource checks and UID-999 assertion. The image
+uses the configured `tacit` user. This completes the local container gate;
+protected release evidence remains outstanding.
 
 ## Real Telemetry Roadmap
 
