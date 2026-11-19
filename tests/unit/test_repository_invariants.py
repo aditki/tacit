@@ -30,6 +30,7 @@ from urllib.request import HTTPSHandler, ProxyHandler, build_opener
 import pytest
 import truststore._api as truststore_api
 import yaml
+from packaging.version import Version
 
 from tacit.config import DEFAULT_API_REQUEST_BODY_MAX_BUFFERED_BYTES
 
@@ -47,6 +48,20 @@ RELEASE_GITHUB_ASSET_VERIFIER = REPOSITORY_ROOT / ".github" / "scripts" / "verif
 RELEASE_PYPI_VERIFIER = REPOSITORY_ROOT / ".github" / "scripts" / "verify_pypi_release.py"
 PYPI_PUBLISH_ACTION = REPOSITORY_ROOT / ".github" / "actions" / "pypi-publish" / "action.yml"
 GITLEAKS_RANGE_SELECTOR = REPOSITORY_ROOT / ".github" / "scripts" / "gitleaks_range.py"
+
+
+@pytest.mark.parametrize(
+    ("package_name", "minimum_safe_version"),
+    [
+        ("certifi", "2026.10.19"),  # GHSA-6q48-6c7w-9gw2; retain the unaffected emSign roots.
+        ("setuptools", "84.1.0"),  # GHSA-xmj3-9gf7-h52w.
+    ],
+)
+def test_locked_dependencies_meet_security_advisory_floors(package_name: str, minimum_safe_version: str) -> None:
+    lock = tomllib.loads((REPOSITORY_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    versions = [Version(package["version"]) for package in lock["package"] if package["name"] == package_name]
+    assert versions, f"Expected {package_name} in the locked dependency closure"
+    assert all(version >= Version(minimum_safe_version) for version in versions)
 
 
 @pytest.mark.parametrize("ecosystem", ["github-actions", "uv", "docker"])
@@ -2508,7 +2523,7 @@ def test_release_builds_verified_binaries_on_exact_runners() -> None:
     assert "tacit-macos-arm64.tar.gz" not in verify
     assert "sha256sum --check ./*.sha256" in verify
     publish = _step(release, "Publish GitHub release binaries")
-    assert publish["uses"] == "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228"
+    assert publish["uses"] == "softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3"
     assert publish["with"]["overwrite_files"] == "false"
 
 
@@ -2576,7 +2591,7 @@ exec "$@"
 
 def test_frozen_binaries_use_release_only_locked_dependencies_and_archive_audit() -> None:
     pyproject = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["dependency-groups"]["release-binary"] == ["pyinstaller==6.22.1"]
+    assert pyproject["dependency-groups"]["release-binary"] == ["pyinstaller==6.22.3"]
 
     binary_job = _release_workflow()["jobs"]["build-binaries"]
     assert _job_needs(binary_job) == {"validate-release", "build-dist"}
@@ -6209,7 +6224,7 @@ def test_release_build_inputs_are_immutable() -> None:
         == "# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e"
     )
     assert (
-        "FROM ghcr.io/astral-sh/uv:0.5.31@sha256:7bff3c3776ec467fc1437960f2c469d8beb30f536a6465a3350c647ccd260ec2 AS uv"
+        "FROM ghcr.io/astral-sh/uv:0.13.9@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678445e0254284eecf84db79a7d AS uv"
     ) in dockerfile
     assert (
         "FROM python:3.12.14-alpine3.24@sha256:"
