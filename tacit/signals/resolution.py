@@ -151,6 +151,11 @@ class SignalResolutionWorkBudget:
     max_acquisition_calls: int = 32
     max_acquisition_response_bytes: int = 8 * 1024 * 1024
     max_acquisition_entries: int = 5000
+    max_measurement_samples: int = 512
+    max_measurement_bytes: int = 256 * 1024
+    measurement_samples: int = field(default=0, init=False)
+    measurement_bytes: int = field(default=0, init=False)
+    _measurement_stopped: bool = field(default=False, init=False, repr=False)
     acquisition_calls: int = field(default=0, init=False)
     acquisition_response_bytes: int = field(default=0, init=False)
     acquisition_entries: int = field(default=0, init=False)
@@ -176,6 +181,8 @@ class SignalResolutionWorkBudget:
             "max_acquisition_calls",
             "max_acquisition_response_bytes",
             "max_acquisition_entries",
+            "max_measurement_samples",
+            "max_measurement_bytes",
         ):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -184,6 +191,8 @@ class SignalResolutionWorkBudget:
             ("max_acquisition_calls", 32),
             ("max_acquisition_response_bytes", 8 * 1024 * 1024),
             ("max_acquisition_entries", 5000),
+            ("max_measurement_samples", 512),
+            ("max_measurement_bytes", 256 * 1024),
         ):
             if getattr(self, field_name) > ceiling:
                 raise ValueError(f"{field_name} exceeds acquisition ceiling")
@@ -254,6 +263,38 @@ class SignalResolutionWorkBudget:
     def reserve_acquisition_entry(self, identity: object = None) -> None:
         self._reserve_acquisition("acquisition_entries", 1, self.max_acquisition_entries, identity)
 
+    def reserve_measurements(self, samples: int, content_bytes: int) -> None:
+        """Atomically admit numeric retention on this investigation's authority.
+
+        Parsing performs a bounded validation/counting pass first. Both totals
+        commit together before retained samples or their typed copies grow.
+        Contention and exhaustion stop subsequent numeric retention; callers
+        may still emit a bounded unavailable disposition without source values.
+        """
+        for amount in (samples, content_bytes):
+            if type(amount) is not int or amount < 0:
+                raise ValueError("measurement increments must be non-negative integers")
+        for name, ceiling in (("max_measurement_samples", 512), ("max_measurement_bytes", 256 * 1024)):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= ceiling:
+                raise ValueError("invalid measurement budget")
+        if not self._lock.acquire(blocking=False):
+            self._measurement_stopped = True
+            raise AcquisitionWorkLimitError("contention")
+        try:
+            if self._measurement_stopped:
+                raise AcquisitionWorkLimitError("measurement_stopped")
+            if self.measurement_samples + samples > self.max_measurement_samples:
+                self._measurement_stopped = True
+                raise AcquisitionWorkLimitError("measurement_samples")
+            if self.measurement_bytes + content_bytes > self.max_measurement_bytes:
+                self._measurement_stopped = True
+                raise AcquisitionWorkLimitError("measurement_bytes")
+            self.measurement_samples += samples
+            self.measurement_bytes += content_bytes
+        finally:
+            self._lock.release()
+
     def reserve_acquisition_read_allowance(self, maximum: int) -> int:
         """Charge allowance before asking the stream for another bounded chunk."""
         if not self._lock.acquire(blocking=False):
@@ -303,6 +344,11 @@ class SignalResolutionWorkBudget:
         """Return bounded, payload-free observability counters."""
         with self._lock:
             return {
+                "measurement_sample_count": self.measurement_samples,
+                "measurement_content_bytes": self.measurement_bytes,
+                "measurement_sample_limit": self.max_measurement_samples,
+                "measurement_content_byte_limit": self.max_measurement_bytes,
+                "measurement_work_limit_exhausted": int(self._measurement_stopped),
                 "acquisition_call_count": self.acquisition_calls,
                 "acquisition_response_bytes": self.acquisition_response_bytes,
                 "acquisition_entry_count": self.acquisition_entries,

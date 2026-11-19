@@ -19,6 +19,7 @@ from tacit.investigation_contract import (
 from tacit.knowledge.enums import KnowledgeUsageDisposition
 from tacit.knowledge.models import KnowledgeUsage
 from tacit.knowledge.normalization import candidate_ref_from_entity_ref
+from tacit.measurements import QueryMeasurement, admit_measurements, query_identity
 from tacit.models.schemas import (
     ContextChunk,
     CulpritRanking,
@@ -87,12 +88,18 @@ class InvestigationReplaySnapshot(BaseModel):
     model_inputs: dict[str, Any] = Field(default_factory=dict)
     model_outputs: dict[str, Any] = Field(default_factory=dict)
     query_results: list[dict[str, Any]] = Field(default_factory=list)
+    query_measurements: tuple[QueryMeasurement, ...] | None = None
     runtime: RuntimeManifest = Field(default_factory=RuntimeManifest)
     corrections: list[CorrectionReference] = Field(default_factory=list)
     additional_provenance: list[ProvenanceRecord] = Field(default_factory=list)
     additional_decisions: list[DecisionLogEntry] = Field(default_factory=list)
     knowledge_snapshot_ref: str = ""
     knowledge_usage: list[KnowledgeUsage] = Field(default_factory=list)
+
+    @field_validator("query_measurements", mode="before")
+    @classmethod
+    def admit_numeric_capture(cls, value):
+        return None if value is None else admit_measurements(value)
 
 
 def rebuild_contract(
@@ -137,6 +144,7 @@ def rebuild_contract(
         runtime_manifest=runtime,
         knowledge_snapshot_ref=snapshot.knowledge_snapshot_ref,
         knowledge_usage=snapshot.knowledge_usage,
+        query_measurements=snapshot.query_measurements,
     )
     if snapshot.corrections or snapshot.additional_provenance or snapshot.additional_decisions:
         contract = contract.model_copy(
@@ -420,6 +428,29 @@ def apply_counterfactual(
             next_context_index += 1
         used_context_refs.add(provenance_id)
         context_chunks.append(chunk.model_copy(update={"metadata": {**chunk.metadata, "provenance_id": provenance_id}}))
+    query_measurements = snapshot.query_measurements
+    if query_measurements is not None and removed_evidence_requirement_ids:
+        removed_query_pairs = {
+            (observation.query, observation.datasource_uid)
+            for observation in snapshot.evidence_observations
+            if observation.requirement_id in removed_evidence_requirement_ids and observation.query
+        }
+        surviving_query_pairs = {
+            (observation.query, observation.datasource_uid)
+            for observation in observations
+            if observation.query and observation.survived and observation.valid_query
+        }
+        removed_query_ids = {
+            query_identity(query)
+            for panel in snapshot.dashboard_spec.panels
+            for query in panel.queries
+            if (query.expr, query.datasource_uid) in removed_query_pairs - surviving_query_pairs
+        }
+        query_measurements = tuple(
+            record
+            for record in admit_measurements(query_measurements, snapshot.dashboard_spec)
+            if record.query_fingerprint not in removed_query_ids
+        )
     return snapshot.model_copy(
         update={
             "evidence_resolutions": resolutions,
@@ -427,5 +458,6 @@ def apply_counterfactual(
             "culprit_ranking": culprit_ranking,
             "context_chunks": context_chunks,
             "knowledge_usage": knowledge_usage,
+            "query_measurements": query_measurements,
         }
     )

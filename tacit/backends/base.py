@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from tacit.catalog import MetricCatalogResult
+from tacit.measurements import QueryMeasurement
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
 from tacit.runtime_ownership import RuntimeOwnershipDescriptor
 from tacit.signals.resolution import SignalResolutionWorkBudget
@@ -22,6 +23,27 @@ class MetricDiscoveryWithMetadata(Protocol):
     async def discover_metrics_with_metadata(
         self, keywords: list[str], intent: Intent, work_budget: SignalResolutionWorkBudget
     ) -> MetricCatalogResult: ...
+
+
+@dataclass(frozen=True)
+class MeasuredValidationResult:
+    """Validation verdicts and separately admitted, source-bound numeric facts."""
+
+    spec: DashboardSpec
+    warnings: list[str]
+    measurements: tuple[QueryMeasurement, ...] = ()
+
+
+@runtime_checkable
+class MeasuredQueryValidation(Protocol):
+    """Optional numeric capture; legacy backends retain their tuple interface."""
+
+    async def validate_queries_with_measurements(
+        self,
+        spec: DashboardSpec,
+        catalog: list[MetricEntry] | None,
+        work_budget: SignalResolutionWorkBudget,
+    ) -> MeasuredValidationResult: ...
 
 
 @dataclass

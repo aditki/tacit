@@ -28,6 +28,7 @@ from tacit.investigation_contract import (
 from tacit.investigation_replay import InvestigationReplaySnapshot
 from tacit.knowledge.models import KnowledgeSnapshot, KnowledgeUsage
 from tacit.logging import stage_log
+from tacit.measurements import QueryMeasurement, admit_measurements
 from tacit.models.schemas import (
     ContextChunk,
     CulpritRanking,
@@ -123,6 +124,13 @@ def prepare_acquisition_completion(
     """Validate IDs, references and byte bounds before completion can publish."""
     from tacit.catalog import BaseReferenceIndex, admit_acquisition_capture, capture_extensions
 
+    if assembly_inputs.get("query_measurements") is not None:
+        assembly_inputs = {
+            **assembly_inputs,
+            "query_measurements": admit_measurements(
+                assembly_inputs["query_measurements"], assembly_inputs["dashboard_spec"]
+            ),
+        }
     _admit_completion_inputs({**assembly_inputs, "baseline_culprit_ranking": baseline_culprit_ranking})
     inputs = deepcopy(dict(assembly_inputs))
     created_at = utc_now()
@@ -182,6 +190,7 @@ async def complete_pipeline(
     evidence_requirements: list[EvidenceRequirement],
     evidence_resolutions: list[EvidenceResolution],
     evidence_observations: list[EvidenceObservation],
+    query_measurements: list[QueryMeasurement] | tuple[QueryMeasurement, ...] | None = None,
     culprit_ranking: CulpritRanking,
     baseline_culprit_ranking: CulpritRanking | None = None,
     prepared_acquisition: PreparedAcquisitionCompletion | None = None,
@@ -210,6 +219,9 @@ async def complete_pipeline(
         knowledge_usage = pinned["knowledge_usage"]
         validation_warnings = pinned["warnings"]
         baseline_culprit_ranking = deepcopy(prepared_acquisition._baseline)
+        query_measurements = pinned.get("query_measurements")
+    if query_measurements is not None:
+        query_measurements = admit_measurements(query_measurements, dashboard_spec)
     runtime_settings = deps.settings if isinstance(deps.settings, Settings) else None
     preflight_publish_backends(backends, runtime_settings, dashboard_spec)
     recorder.required_event(
@@ -309,6 +321,7 @@ async def complete_pipeline(
                 ),
                 knowledge_snapshot_ref=knowledge_snapshot.id if knowledge_snapshot else "",
                 knowledge_usage=knowledge_usage,
+                query_measurements=query_measurements,
             )
         else:
             draft_contract = InvestigationContractAssembler().from_pipeline(
@@ -372,6 +385,7 @@ async def complete_pipeline(
                 for panel in dashboard_spec.panels
                 for query in panel.queries
             ],
+            query_measurements=query_measurements,
             runtime=draft_contract.runtime,
             knowledge_snapshot_ref=knowledge_snapshot.id if knowledge_snapshot else "",
             knowledge_usage=knowledge_usage or [],
@@ -406,8 +420,16 @@ async def complete_pipeline(
         for resolution in draft_contract.evidence_resolutions:
             recorder.event("resolution_selected", resolution.model_dump(mode="json"))
         for query in draft_contract.queries:
-            recorder.event("query_validated", query.model_dump(mode="json"))
-            recorder.event("query_executed", {"query_ref": query.id, **query.execution})
+            query_audit = query.model_dump(mode="json")
+            execution_audit = {key: value for key, value in query.execution.items() if key != "measurement"}
+            measured = query.execution.get("measurement")
+            if measured is not None:
+                execution_audit["measurement_disposition"] = measured["disposition"]
+                execution_audit["measurement_fingerprint"] = measured["fact_fingerprint"]
+                execution_audit["measurement_sample_count"] = len(measured["samples"])
+            query_audit["execution"] = execution_audit
+            recorder.event("query_validated", query_audit)
+            recorder.event("query_executed", {"query_ref": query.id, **execution_audit})
         for observation in draft_contract.observations:
             recorder.event("observation_created", observation.model_dump(mode="json"))
         for candidate in draft_contract.candidate_rankings:

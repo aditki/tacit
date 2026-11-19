@@ -13,8 +13,25 @@ from urllib.parse import quote
 import httpx
 import structlog
 
+from tacit.backends.base import DashboardBackend, MeasuredValidationResult
+from tacit.errors import AUTHORITY_BOUNDARY_ERRORS
 from tacit.grafana.client import GrafanaClient
-from tacit.models.schemas import DashboardSpec, MetricEntry, PanelQuery, PanelSpec
+from tacit.measurements import (
+    MeasurementReason,
+    QueryMeasurement,
+    admit_measurements,
+    normalize_prometheus_measurement,
+    query_identity,
+    unavailable_measurement,
+)
+from tacit.models.schemas import (
+    DashboardSpec,
+    MetricEntry,
+    PanelQuery,
+    PanelSpec,
+    validate_dashboard_spec_work_limits,
+)
+from tacit.signals.resolution import AcquisitionWorkLimitError, SignalResolutionWorkBudget
 
 if TYPE_CHECKING:
     from tacit.signalfx.client import SignalFxClient
@@ -92,6 +109,83 @@ async def _probe_query(
         return QUERY_ERROR
 
 
+async def _probe_query_with_measurements(
+    client: GrafanaClient,
+    query: PanelQuery,
+    work_budget: SignalResolutionWorkBudget,
+) -> tuple[str, QueryMeasurement]:
+    """Read the existing instant query through bounded, already-owned transport."""
+    normalized_type = query.datasource_type.lower()
+    normalized_language = query.query_language.lower()
+    if (normalized_type and normalized_type not in _PROMETHEUS_PROBE_TYPES) or (
+        normalized_language and normalized_language != "promql"
+    ):
+        return QUERY_SKIPPED, unavailable_measurement(query, "unsupported_datasource", disposition="unsupported")
+    try:
+        uid = quote(query.datasource_uid, safe="")
+        expression = quote(query.expr, safe="")
+        payload = await client.acquisition_request(
+            "GET", f"/api/datasources/proxy/uid/{uid}/api/v1/query?query={expression}", work_budget
+        )
+        measurement = normalize_prometheus_measurement(query, payload, work_budget)
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            error_type = payload.get("errorType")
+            verdict = QUERY_SYNTAX if error_type in ("bad_data", "parse", "execution") else QUERY_ERROR
+            return verdict, measurement
+        result = payload.get("data", {}).get("result", []) if isinstance(payload, dict) else []
+        verdict = QUERY_OK if isinstance(result, list) and result else QUERY_EMPTY
+        return verdict, measurement
+    except AUTHORITY_BOUNDARY_ERRORS:
+        raise
+    except AcquisitionWorkLimitError:
+        logger.warning("query_measurement_unavailable", reason_code="query_work_limit")
+        return QUERY_ERROR, unavailable_measurement(query, "measurement_limit", disposition="limited")
+    except httpx.HTTPStatusError as error:
+        # Error bodies may contain source values. Neither log nor decode them.
+        verdict = QUERY_SYNTAX if error.response.status_code in (400, 422) else QUERY_ERROR
+        reason: MeasurementReason = "query_syntax_error" if verdict == QUERY_SYNTAX else "query_error"
+        logger.warning("query_measurement_unavailable", reason_code=reason)
+        return verdict, unavailable_measurement(query, reason, disposition="invalid")
+    except Exception:
+        logger.warning("query_measurement_unavailable", reason_code="query_error")
+        return QUERY_ERROR, unavailable_measurement(query, "query_error", disposition="invalid")
+
+
+async def validate_queries_with_measurements(
+    backend: DashboardBackend,
+    spec: DashboardSpec,
+    catalog: list[MetricEntry] | None,
+    work_budget: SignalResolutionWorkBudget | None,
+) -> MeasuredValidationResult:
+    """One optional capability selection shared by main and rescue validation.
+
+    Service-owned proxies dispatch this helper on their existing owner when the
+    underlying product is legacy. No client, budget or execution owner is made.
+    """
+    validate_dashboard_spec_work_limits(spec)
+    for panel in spec.panels:
+        for query in panel.queries:
+            query_identity(query)
+    method = getattr(backend, "validate_queries_with_measurements", None)
+    if work_budget is not None and callable(method):
+        result = await method(spec, catalog, work_budget)
+        if not isinstance(result, MeasuredValidationResult):
+            raise ValueError("invalid measured validation result")
+    else:
+        validated, warnings = await backend.validate_queries(spec, catalog)
+        result = MeasuredValidationResult(
+            validated,
+            warnings,
+            tuple(
+                unavailable_measurement(query, "legacy_validation") for panel in spec.panels for query in panel.queries
+            ),
+        )
+    validate_dashboard_spec_work_limits(result.spec)
+    # Rejected queries still have diagnostic dispositions at this boundary.
+    # Final pipeline capture restricts records to the surviving query set.
+    return MeasuredValidationResult(result.spec, result.warnings, admit_measurements(result.measurements, spec))
+
+
 def _referenced_metrics(expr: str, query_language: str) -> set[str]:
     """Best-effort metric names referenced by a query (PromQL only)."""
     if query_language and query_language.lower() not in ("", "promql"):
@@ -104,13 +198,14 @@ def _referenced_metrics(expr: str, query_language: str) -> set[str]:
         return set()
 
 
-async def validate_dashboard_queries(
+async def _validate_dashboard_queries(
     client: GrafanaClient,
     spec: DashboardSpec,
     catalog: list[MetricEntry] | None = None,
     *,
     catalog_authoritative: bool = False,
-) -> tuple[DashboardSpec, list[str]]:
+    work_budget: SignalResolutionWorkBudget | None = None,
+) -> MeasuredValidationResult:
     """Validate dashboard queries independently. Returns (filtered_spec, warnings).
 
     Each query is judged on three independent axes — *exists* (in the routed
@@ -125,9 +220,16 @@ async def validate_dashboard_queries(
     """
     valid_panels: list[PanelSpec] = []
     warnings: list[str] = []
+    if work_budget is not None:
+        validate_dashboard_spec_work_limits(spec)
+        # Validate every identity before the first remote call, not lazily as
+        # each response arrives. Oversized identities have no safe fallback.
+        for panel in spec.panels:
+            for query in panel.queries:
+                query_identity(query)
 
     if not any(panel.queries for panel in spec.panels):
-        return spec, ["No queries to validate"]
+        return MeasuredValidationResult(spec, ["No queries to validate"])
 
     catalog_names_by_uid: dict[str, set[str]] = {}
     if catalog:
@@ -143,7 +245,7 @@ async def validate_dashboard_queries(
         (panel_idx, q) for panel_idx, panel in enumerate(spec.panels) for q in panel.queries
     ]
 
-    async def _validate_query(query: PanelQuery) -> str:
+    def _static_verdict(query: PanelQuery) -> str | None:
         if catalog:
             if query.datasource_uid not in catalog_names_by_uid:
                 return QUERY_BAD_UID
@@ -160,6 +262,12 @@ async def validate_dashboard_queries(
                 refs = _referenced_metrics(query.expr, "promql")
                 if refs and not refs.issubset(owned_names):
                     return QUERY_ABSENT
+        return None
+
+    async def _validate_query(query: PanelQuery) -> str:
+        static = _static_verdict(query)
+        if static is not None:
+            return static
         return await _probe_query(
             client,
             query.datasource_uid,
@@ -168,7 +276,23 @@ async def validate_dashboard_queries(
             query.query_language,
         )
 
-    probe_results = await asyncio.gather(*[_validate_query(q) for _, q in flat], return_exceptions=True)
+    measurements: tuple[QueryMeasurement, ...] = ()
+    if work_budget is None:
+        probe_results = await asyncio.gather(*[_validate_query(q) for _, q in flat], return_exceptions=True)
+    else:
+        measured: dict[str, tuple[str, QueryMeasurement]] = {}
+        probe_results = []
+        for _, query in flat:
+            identity = query_identity(query)
+            if identity not in measured:
+                static = _static_verdict(query)
+                if static is None:
+                    measured[identity] = await _probe_query_with_measurements(client, query, work_budget)
+                else:
+                    reason: MeasurementReason = "query_absent" if static == QUERY_ABSENT else "query_bad_uid"
+                    measured[identity] = static, unavailable_measurement(query, reason, disposition="invalid")
+            probe_results.append(measured[identity][0])
+        measurements = admit_measurements((item[1] for item in measured.values()), spec)
 
     # Resolve a verdict per query.
     verdicts: dict[int, str] = {}
@@ -227,7 +351,28 @@ async def validate_dashboard_queries(
         warnings=len(warnings),
     )
 
-    return spec, warnings
+    return MeasuredValidationResult(spec, warnings, measurements)
+
+
+async def validate_dashboard_queries(
+    client: GrafanaClient,
+    spec: DashboardSpec,
+    catalog: list[MetricEntry] | None = None,
+    *,
+    catalog_authoritative: bool = False,
+) -> tuple[DashboardSpec, list[str]]:
+    """Legacy tuple validation without hidden numeric capture or a new budget."""
+    result = await _validate_dashboard_queries(client, spec, catalog, catalog_authoritative=catalog_authoritative)
+    return result.spec, result.warnings
+
+
+async def validate_dashboard_queries_with_measurements(
+    client: GrafanaClient,
+    spec: DashboardSpec,
+    catalog: list[MetricEntry] | None,
+    work_budget: SignalResolutionWorkBudget,
+) -> MeasuredValidationResult:
+    return await _validate_dashboard_queries(client, spec, catalog, work_budget=work_budget)
 
 
 # ── SignalFx validation ──────────────────────────────────────────────────────

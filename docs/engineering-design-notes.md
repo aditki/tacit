@@ -2195,6 +2195,27 @@ validated only on typed activation; general Settings and unrelated operations
 remain usable. Typed acquisition itself schedules serially under the already
 adopted runtime owner and shared budget.
 
+## Measured query facts
+
+Validation availability and numerical facts are different evidence. The shared
+measurement boundary retains bounded instant values and exact query/source
+identities from the response already being validated. Unsupported, partial,
+invalid or over-limit data stays explicitly unavailable. Query output units and
+comparative conditions require semantic proof; raw metric units and nonempty
+queries do not provide it. Keep the typed sidecar outside generated dashboards,
+ordinary diagnostics and automatic model inputs.
+
+Revalidate serialized and copied models before copying their nested graph. A
+closed Pydantic schema alone does not protect a preceding `model_dump` from a
+forged `model_copy` field. Admit fixed scalar shapes and aggregate sample/byte
+work first. Count physical measurement copies before query expansion and raw
+contract parsing: deduplicated identities do not bound duplicated output work.
+Snapshots, completion preflight, contract construction and contract loading use
+the same pure admission boundary. Historical absent measurements add no contract
+keys and retain exact fingerprints. Lifecycle events retain only disposition,
+counts and fingerprints; sensitive sample values and scope labels belong in the
+authorized immutable revision/capture. See [ADR-026](adr/026-bounded-measured-query-facts.md).
+
 ## Validation expectations
 
 Cross-runtime tests should wait on the specific transition they assert. A
