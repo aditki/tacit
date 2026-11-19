@@ -145,6 +145,263 @@ Near-term evaluation work:
 
 The evaluation goal is not to prove Tacit is done. It is to make progress measurable.
 
+## Acquisition implementation evidence
+
+The acquisition workstream retains admitted catalog facts independently from the
+configured prompt projection (300 by default, with the existing freeform ranking
+ceiling of 60). Stricter configured prompt limits also apply after ranking.
+The shared selector requires every exact operand at
+one datasource and preserves conflicts and ambiguity; defaults and sampled
+service labels do not establish ownership. Source completeness describes the
+search, not absence of telemetry or a measured incident condition. External
+list-only integrations remain explicitly `legacy_unknown` because their hidden
+transport cannot be accounted for by first-party post-return guards.
+
+One investigation work budget bounds first-party calls, identity response reads,
+retained entries, enrichment and resolution. Effective defaults are 32 attempts,
+8 MiB response allowance and 5,000 catalog identities. Local retained facts still
+undergo text/tree/physical-fact admission. Names generated from provider prefixes
+must pass derived-text admission as well as raw-response limits. Typed discovery
+uses existing runtime-owned operations and bypasses legacy catalog caches.
+Acquisition adds no worker, controller, capacity-release owner or cleanup owner.
+
+Before publication, copied assembly inputs and base identifiers admit the bounded
+capture and its existing replay extensions. The completed contract and snapshot
+use the same pinned facts and knowledge reference. Historical snapshots do not
+gain new defaults. Exact replay uses the persisted extensions and makes no
+remote or model calls. Admission failures finish a failed run before publishing
+or committing a successful revision.
+
+The existing SignalFlow translator is also the publisher's translation boundary.
+It rejects regex widening, bucket-base inference, unparsed fallbacks, expressions
+with unconsumed operators and unsupported literal syntax. Exact matchers cannot
+silently become wildcard filters: Splunk documents `filter('host', 'kafka*')` as
+a prefix filter, so such PromQL literals are rejected. See the
+[vendor filter limits](https://help.splunk.com/en/splunk-observability-cloud/administer/org-reference-info/per-product-system-limits-in-splunk-observability-cloud/infrastructure-system-limits-details).
+Every backend is preflighted before the first publication. A selected unsupported
+slot fails the entire investigation, including otherwise supported panels.
+Native SignalFlow support is not expanded by this change.
+
+The source-bound inventory fixture contains 228 slots (198 YAML and 30 Python),
+including 103 affected slots. The committed gate binds slot identities and
+expression/source hashes to unchanged template definitions, reaches every
+affected compiler slot and checks its bounded rejection reason. Supported YAML
+and Python baseline paths survive. Public mixed-backend pipeline tests assert
+zero publication and no successful contract on rejection; admission tests also
+verify failed-run audit. A successful public investigation verifies persisted
+capture, extension equality and exact replay, including mutation of the original
+knowledge snapshot after preparation.
+
+The frozen 588-entry diagnostic keeps six requested categories separate from
+seven historical critical metrics. Availability alone earns no observation
+credit. A supported observation requires correct datasource ownership, a valid
+non-empty query, survival and the existing typed observation outcome. The old
+first-300 projection loses all six requested categories in this fixture. These
+synthetic checks measure this regression; they do not establish production
+incident usefulness or classifier quality.
+
+The foundation matrix records the test-first cases and cross-runtime lifecycle
+gate. Narrow implementation inventory amendments cover the shared
+`tacit/acquisition.py` transport, rescue consumers, publication preflight and
+their integration/inventory fixtures. Two existing stabilization fixtures now
+use valid metric names present in their catalog so they continue testing safe
+store-failure logging rather than accidental owner fallback. ADR-025 records the
+proposed compatibility decision; ADR-024 is reserved by separate work. No
+archetype recipes, dependency framework, LangGraph, grounding/ranking arithmetic,
+tenant policy or database schema change is included.
+
+The duplicated publisher translator and consumer-local owner policies were
+removed. Bounded transport, metadata and replay admission add maintained code;
+this workstream does not claim a net code reduction. Offline Jev/Tev evaluation
+is delivered separately and has no production imports or decision authority.
+
+The measured allocation worksheet and isolated adversarial evidence are in
+the engineering notes and foundation matrix. Typed activation is restricted to
+the documented five-pipeline configuration before I/O; the generic Settings
+concurrency range remains available for unrelated operations. Protected release
+evidence still requires the existing authorized clean/long-lived-state
+100-prompt workflow at the release's exact main tip. No live vendor mutation,
+model spending or protected release evidence was performed for this branch.
+
+Verification on 2026-11-18: repository default suite 4,708 passed / 12 skipped;
+hermetic vendor integration 25 passed; public upload/learning/acquisition
+pipelines 17 passed. Ruff, Black (357 files), mypy (170 source files) and diff
+checks passed. Grounding passed all 40 cases (trustworthy rate 1.0, unsafe rate
+0.0); Operational Learning passed 18/18. The actual typed 588-entry pipeline
+fixture scored six of six requested categories and seven of seven historical
+critical metrics, with two complete sources, no ambiguous selections, zero
+routing errors and zero unsafe assertions under its finite query-result oracle.
+These counts remain separate from the 100-prompt release evidence.
+
+The response/allocation gate passed 45 tests, including an isolated five-graph
+high-water measurement of 183,612,775 traced bytes / 408,190,976 RSS bytes after
+the strict parser and derived-text guards. Independent acquisition transport
+security and integration architecture reviews cleared all reported findings;
+the final repository run followed the dependency repairs.
+
+After Docker became available, the local container build of implementation
+commit `4d296f9` passed on Linux ARM64 as `tacit:acquisition-local`. Disposable
+network-disabled, read-only containers passed the installed CLI version check,
+acquisition imports, packaged resource checks and UID-999 assertion. The image
+uses the configured `tacit` user. This completes the local container gate;
+protected release evidence remains outstanding.
+
+### PR review follow-up, 2026-11-18
+
+PR #105's first CI run reached 4,719 passing tests and two skips, then failed
+because the isolated five-graph tracemalloc workload exceeded its 60-second
+child guard on shared Linux. The fixed workload and memory assertions remain
+unchanged; its bounded measurement guard is now 180 seconds. This is not a
+production query or pipeline timeout change.
+
+Automated review also exposed two gaps in the original test coverage. Ordinary
+unrelated Prometheus names could displace a lexically late keyword match at the
+entry limit; the prior noise-suffix fixture did not exercise that case. Native
+keyword priority now survives both selection and entry admission with bounded
+backfill and an actual exhaustion witness. Separate inventory and enrichment
+phases now share one absolute adapter deadline, including direct SignalFx and
+standalone native adapters through the same acquisition helper. Metadata timeout
+retains admitted names and records incomplete provider metadata; cancellation
+continues to propagate after the owned operation settles.
+
+The ordinary-name and phased-deadline matrix first reproduced 12 failures; its
+14 focused cases then passed. A direct SignalFx deadline case separately ran
+red before the shared-boundary repair. The final acquisition/capture/replay
+focused suite passed 118 tests in 47.01 seconds, including the unchanged
+allocation workload. Ruff, Black, mypy (170 files), Grounding (40 cases) and
+Operational Learning (18 cases) passed. CI revalidates the complete final merge.
+
+### Native syntax and catalog-identity review follow-up, 2026-11-18
+
+Four subsequent PR #105 findings were reproduced before production changes.
+Graphite compilation now extracts all concrete operands from the documented
+bounded native subset instead of treating the full expression as a metric name.
+Native and learned expressions remain verbatim; missing, split and ambiguous
+ownership still abstain. The shared compiler/publisher ratio scanner preserves
+slashes inside quoted selectors without accepting previously unsupported
+translation syntax or allowing partial publication.
+
+Discovery aggregation independently enforces canonical identity capacity and
+the 5,000-physical-fact ceiling. Capture admission and selection share the same
+language-scoped complete-owner identities, preserving unrelated cross-language
+selections while rejecting same-scope conflicts. Independent review additionally
+reproduced a fabricated candidate UID passing the metadata-conflict branch;
+candidate owners are now recomputed for every captured decision. Capture
+schemas, identity hashes, historical fingerprints and runtime owners are
+unchanged.
+
+The two new regression modules contain 43 cases. Their initial runs reproduced
+24 query-syntax failures, five identity failures and one forged-candidate failure.
+The repaired query-focused suite passed 110 cases and the final catalog/capture
+suite passed 243. Independent review found no remaining actionable issue in
+this repair scope. The hermetic cold/taught resolution and learned-ranking gate
+passed separately; it is not live investigation quality evidence. The live
+100-prompt clean/representative long-lived gates were not run: this environment
+does not supply an identified isolated matching fixture and admitted
+representative state. Protected release evidence remains a separate gate.
+
+Final repair validation: repository default suite 4,768 passed / 12 skipped;
+hermetic integration 25 passed; browser/public end-to-end 56 passed. Ruff,
+Black (360 files), mypy (171 source files), Grounding (40/40), Operational
+Learning (18/18) and diff checks passed. The Linux ARM64 Docker build and
+network-disabled, read-only, UID-999 installed-parser/translator/resource smoke
+also passed. CI revalidates the pushed commit and its stacked measured-evidence
+integration independently.
+
+### Additional acquisition review repairs
+
+Three further PR #105 findings exposed completed-fact loss, a native fallback
+compatibility gap and repeated synchronous normalization. The shared enrichment
+operation now retains completed metadata definitions and dimensions when a later
+request expires. Raw direct-helper inputs reserve identity capacity once;
+already-retained inventory uses its existing reservation. Phased aggregation
+preserves complete conflicting fact groups, rejects foreign identities and
+checks physical growth before retention. Timeout joins existing cancellation
+settlement; caller cancellation still propagates and later I/O does not run.
+
+Typed Loki acquisition restores a bounded available-labels fallback whenever
+custom labels exist, including mixed standard/custom sources. Failed or empty
+enumeration creates no usable fallback. Recognized labels are filtered before
+retention, requested custom labels receive bounded priority, truncated results
+remain incomplete, and the fallback consumes none of the six stream-value
+probes.
+
+Compilation/blending, declared evidence, both rescue builders, freeform selection
+and capture validation reuse one explicitly owned admitted lookup view per
+operation. The index preserves full-catalog conflicts and exact ownership while
+avoiding whole-catalog copying, validation and hashing on each query. Ordinary
+construction derives normalization from raw facts; fabricated/mismatched views
+are rejected. Private snapshots and defensive targets isolate mutations and
+concurrent operations. No cache spans investigations and no new runtime owner,
+worker, permit or cleanup authority is introduced.
+
+The two new test modules contain 39 regression cases, with failures recorded
+before their fixes. Acquisition-focused validation passed 259 cases; lookup
+validation passed its 15 new cases plus existing capture, evidence, routing and
+work-limit suites. Independent architecture/security review cleared the complete
+repair diff. On the same CPython 3.12 macOS environment, the identical 5,000-fact,
+ten-query bare-PromQL compilation took 1.6725 seconds before and 0.1731 seconds
+after. That timing is illustrative; deterministic work-count regressions enforce
+one normalization per public operation and no full-catalog copies/validation per
+lookup. These checks do not claim live incident-quality improvement.
+
+The isolated allocation probe additionally co-retained one indexed catalog with
+each of the five adversarial completion graphs, measuring 219,789,099 traced
+bytes and 462,094,336 RSS bytes under the unchanged limits. Historical capture
+schemas, identity hashes and replay formats remain unchanged. The live
+100-prompt clean/representative long-lived and protected release gates remain
+separate from these hermetic regressions.
+
+Final validation of these repairs: default suite 4,807 passed / 12 skipped;
+hermetic vendor integration 25 passed; complete browser/public end-to-end suite
+56 passed. Ruff, Black (362 files), mypy (171 source files), Grounding (40/40),
+Operational Learning (18/18), the deterministic cold/taught gate and diff checks
+passed. Linux ARM64 Docker build and a network-disabled, read-only UID-999
+installed-index/enrichment smoke passed. CI validates the pushed acquisition
+commit and the separate measured-evidence integration.
+
+### Exact-name selectors and cached discovery: attribution and repair
+
+Both new review findings are observable regressions from this changeset, rather
+than unrelated pre-existing issues. Against PR base `cd5396329`, the same valid
+`{__name__="http_requests_total",job="checkout"}` query compiles one panel; on
+`701ef5b`, it compiles none because the strict selector receives no operands.
+The older parser omission alone predates this PR, but the newly introduced
+exact-owner boundary makes it a compatibility regression. AST-proven metric
+names such as `sum`, `rate` and `__internal_total` have the same attribution.
+
+The shared extractor now preserves literal AST metric names and consistent
+exact `__name__` equality matchers, including learned queries. Additional
+constraints cannot expand an exact name; regexes are not evaluated to infer
+names. Conflicting literal name constraints or unproved selectors invalidate the
+complete operand set rather than allowing partial binding. Parse-failed
+name-matcher syntax abstains
+instead of introducing another query parser or restoring datasource defaults.
+Ingestion, compilation, validation and diagnostics retain their shared helper.
+
+The base freeform stage aliases cached discovery objects, but its permissive UID
+filter does not empty the cache in the reported ambiguous-then-unique scenario.
+The new ownership check correctly abstains on ambiguity, then mutates the
+cached candidates and prevents the later unique-owner run from recovering.
+A common deep working copy after cache hit/miss resolution isolates ownership
+filtering and query-builder mutations. Generic cache semantics, tenant/key
+partitioning, empty-result policy and token accounting remain unchanged.
+
+The two new modules contain 46 test-first regressions: 37 parser/owner cases
+and nine cache cases. Before/after reproductions establish the changeset
+attribution. Parser consumer validation passed 533 cases and cache-focused
+validation passed 181; independent architecture/security review cleared the
+complete repair diff. Historical capture formats and runtime ownership are
+unchanged. These are hermetic regression checks; live clean/representative
+long-lived 100-prompt and protected release evidence remain separate gates.
+
+Final validation: default suite 4,853 passed / 12 skipped; hermetic vendor
+integration 25 passed; complete browser/public end-to-end suite 56 passed.
+Ruff, Black (364 files), mypy (171 sources), Grounding (40/40), Operational
+Learning (18/18), deterministic cold/taught resolution and diff checks passed.
+Linux ARM64 Docker build and the installed exact-name/partial-operand rejection
+smoke passed as UID 999 with a read-only filesystem and networking disabled.
+
 ## Real Telemetry Roadmap
 
 The synthetic benchmark remains the fast regression layer. The staged plan for evaluating Tacit with public metrics, logs, and traces is documented in [Real Telemetry Dataset Testing Roadmap](telemetry-dataset-testing-roadmap.md). Its first milestone is attached to the checkout demo; later datasets are isolated in separate branches and evaluated against source-specific ground truth.

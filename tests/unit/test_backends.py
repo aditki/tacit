@@ -14,6 +14,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from tacit.catalog import MetricCatalogResult
 from tacit.models.schemas import (
     ArchetypeMatch,
     DashboardSpec,
@@ -215,7 +216,7 @@ def test_grafana_backend_passes_app_scoped_discovery_settings():
         patch("tacit.backends.grafana.discover_all_metrics", new_callable=AsyncMock) as discover,
     ):
         select.return_value = ([MagicMock()], [MagicMock()])
-        discover.return_value = []
+        discover.return_value = MetricCatalogResult()
         asyncio.run(backend.discover_metrics([], _make_intent()))
 
     assert discover.call_args.kwargs["runtime_settings"].max_metric_catalog_size == 1
@@ -586,7 +587,7 @@ def test_grafana_backend_discover_metrics():
         mock_list.return_value = [MagicMock(type="prometheus")]
         mock_filter.return_value = [MagicMock(type="prometheus")]
         mock_searchable.return_value = [MagicMock(type="prometheus")]
-        mock_discover.return_value = fake_entries
+        mock_discover.return_value = MetricCatalogResult(entries=fake_entries)
 
         intent = _make_intent()
         result = asyncio.run(backend.discover_metrics(intent.keywords, intent))
@@ -701,7 +702,7 @@ def test_signalfx_backend_discover_metrics():
     ]
 
     with patch("tacit.backends.signalfx.sfx_discover", new_callable=AsyncMock) as mock_disc:
-        mock_disc.return_value = fake_entries
+        mock_disc.return_value = MetricCatalogResult(entries=fake_entries)
         intent = _make_intent()
         result = asyncio.run(backend.discover_metrics(intent.keywords, intent))
         assert len(result) == 1
@@ -709,6 +710,7 @@ def test_signalfx_backend_discover_metrics():
         mock_disc.assert_called_once_with(
             mock_client,
             intent.keywords,
+            mock_disc.call_args.args[2],
             runtime_settings=backend.runtime_settings,
         )
 

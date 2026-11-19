@@ -90,6 +90,11 @@ AGG_PATTERN = re.compile(
 )
 HISTOGRAM_PATTERN = re.compile(r"histogram_quantile\(\s*([\d.]+)")
 PROMQL_LABEL_LIST_RE = re.compile(r"\b(by|without|on|ignoring|group_left|group_right)\s*\(([^)]*)\)")
+_METRIC_NAME_MATCHER_RE = re.compile(r"(?<![A-Za-z0-9_:])__name__[\"'`]?\s*(?:=|!)")
+
+
+class _UnprovenPromQLOperands(ValueError):
+    """One selector cannot attest a complete concrete metric operand set."""
 
 
 def strip_promql_label_lists(expr: str) -> str:
@@ -98,6 +103,10 @@ def strip_promql_label_lists(expr: str) -> str:
 
 
 def extract_metrics_from_promql_regex(expr: str) -> list[str]:
+    # A failed parse cannot prove exact-name constraints or contradictions. Do
+    # not recover a partial named operand while ignoring another name matcher.
+    if _METRIC_NAME_MATCHER_RE.search(expr):
+        return []
     candidates = PROMQL_METRIC_RE.findall(strip_promql_label_lists(expr))
     metrics = []
     for name in candidates:
@@ -115,8 +124,28 @@ def walk_promql_ast(node: Any, metrics: list[str]) -> None:
 
     if node_type == "VectorSelector":
         name = getattr(node, "name", None)
-        if isinstance(name, str) and name and name.lower() not in PROMQL_FUNCS and not name.startswith("__"):
+        if isinstance(name, str) and name:
             metrics.append(name)
+            return
+        matchers = getattr(node, "matchers", None)
+        if matchers is None or getattr(matchers, "or_matchers", []):
+            raise _UnprovenPromQLOperands
+        names: set[str] = set()
+        excluded_names: set[str] = set()
+        for matcher in getattr(matchers, "matchers", []):
+            if matcher.name != "__name__":
+                continue
+            if matcher.op == promql_parser.MatchOp.Equal:
+                if not isinstance(matcher.value, str) or not matcher.value:
+                    raise _UnprovenPromQLOperands
+                names.add(matcher.value)
+            elif matcher.op == promql_parser.MatchOp.NotEqual:
+                excluded_names.add(matcher.value)
+        if len(names) != 1 or names & excluded_names:
+            raise _UnprovenPromQLOperands
+        # Additional filters can restrict this exact name, never add operands.
+        # Do not evaluate regexes or infer names from them.
+        metrics.append(next(iter(names)))
         return
 
     if node_type == "MatrixSelector":
@@ -147,14 +176,17 @@ def walk_promql_ast(node: Any, metrics: list[str]) -> None:
 
 
 def extract_metrics_from_promql(expr: str) -> list[str]:
-    """Extract metric names from a PromQL expression."""
+    """Extract metric names, abstaining when an AST selector is unproven."""
     try:
         ast = promql_parser.parse(expr)
     except Exception:
         return extract_metrics_from_promql_regex(expr)
 
     metrics: list[str] = []
-    walk_promql_ast(ast, metrics)
+    try:
+        walk_promql_ast(ast, metrics)
+    except _UnprovenPromQLOperands:
+        return []
     return list(dict.fromkeys(metrics))
 
 

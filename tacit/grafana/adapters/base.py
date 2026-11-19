@@ -42,3 +42,14 @@ class DatasourceAdapter(ABC):
         Returns:
             List of normalized MetricEntry objects.
         """
+
+    async def discover_metrics_with_metadata(self, client, datasource, keywords, work_budget):
+        """Optional compatibility capability for registered list-only adapters."""
+        from tacit.acquisition import legacy_acquisition_catalog
+
+        return legacy_acquisition_catalog(
+            await self.discover_metrics(client, datasource, keywords),
+            backend="grafana",
+            terms=keywords,
+            work_budget=work_budget,
+        )

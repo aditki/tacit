@@ -92,17 +92,34 @@ def new_investigation_signal_resolution_work_budget(
     signal_store: Any,
     *,
     limits: InvestigationSignalResolutionWorkLimits | None = None,
-) -> SignalResolutionWorkBudget | None:
-    """Create one resolver budget at the investigation orchestration boundary."""
-    factory = getattr(signal_store, "new_signal_resolution_work_budget", None)
-    if not bool(getattr(signal_store, "supports_signal_resolution_work_budget", False)) or not callable(factory):
-        return None
+    runtime_settings: Any = None,
+) -> SignalResolutionWorkBudget:
+    """One run authority exists even without an optional signal store."""
     active_limits = limits or InvestigationSignalResolutionWorkLimits()
-    return factory(
+    factory = getattr(signal_store, "new_signal_resolution_work_budget", None)
+    kwargs = dict(
         max_calls=active_limits.max_calls,
         max_mapping_catalog_comparisons=active_limits.max_mapping_catalog_comparisons,
         max_results=active_limits.max_results,
     )
+    budget = (
+        factory(**kwargs)
+        if bool(getattr(signal_store, "supports_signal_resolution_work_budget", False)) and callable(factory)
+        else SignalResolutionWorkBudget(**kwargs)
+    )
+    if not isinstance(budget, SignalResolutionWorkBudget):
+        raise ValueError("signal store returned an invalid investigation budget")
+    budget.max_acquisition_calls = int(getattr(runtime_settings, "max_acquisition_calls", 32))
+    budget.max_acquisition_response_bytes = int(
+        getattr(runtime_settings, "max_acquisition_response_bytes", 8 * 1024 * 1024)
+    )
+    budget.max_acquisition_entries = min(
+        5000,
+        int(getattr(runtime_settings, "max_acquisition_entries", 5000)),
+        int(getattr(runtime_settings, "signal_resolution_catalog_limit", 5000)),
+    )
+    budget.__post_init__()
+    return budget
 
 
 @dataclass(frozen=True)

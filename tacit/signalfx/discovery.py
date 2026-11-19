@@ -204,3 +204,17 @@ async def discover_metrics(
         search_queries=len(search_queries),
     )
     return entries
+
+
+async def discover_metrics_with_metadata(client, keywords, work_budget, *, runtime_settings=None):
+    """Bounded direct SignalFx discovery with explicit per-search status."""
+    from tacit.acquisition import discover_adapter_metrics
+    from tacit.config import validate_acquisition_runtime
+    from tacit.models.schemas import DatasourceInfo
+
+    active_settings = resolve_remote_runtime_settings(
+        boundary="signalfx_metric_discovery", owner=client, provider="signalfx", explicit_settings=runtime_settings
+    )
+    validate_acquisition_runtime(active_settings)
+    datasource = DatasourceInfo(uid="signalfx-direct", name="SignalFx Direct", type="signalfx")
+    return await discover_adapter_metrics(client, datasource, keywords, work_budget, backend="signalfx")

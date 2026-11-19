@@ -9,6 +9,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from tacit.archetypes.engine import UnsupportedSignalFlowTranslation
+from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
 from tacit.models.schemas import (
     ArchetypeMatch,
     DashboardSpec,
@@ -274,10 +276,12 @@ def test_signalflow_sum_rate_by():
     from tacit.archetypes.engine import _promql_template_to_signalflow
 
     sf = "filter('service', 'checkout-service')"
-    expr = f'sum(rate(http_requests_total{{{sf}, status=~"5.."}}[5m])) by (status)'
+    expr = f'sum(rate(http_requests_total{{{sf}, status="500"}}[5m])) by (status)'
     result = _promql_template_to_signalflow(expr, sf, "", "by_status")
     assert ".sum(by=" in result
     assert "'status'" in result
+    assert "filter('service', 'checkout-service')" in result
+    assert "filter('status', '500')" in result
     assert ".publish(" in result
     print("[PASS] test_signalflow_sum_rate_by")
 
@@ -287,11 +291,10 @@ def test_signalflow_histogram_quantile():
 
     sf = "filter('service', 'checkout-service')"
     expr = f"histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{{{sf}}}[5m])) by (le))"
-    result = _promql_template_to_signalflow(expr, sf, "", "p95")
-    assert "data('http_request_duration_seconds'" in result
-    assert ".percentile(pct=95)" in result
-    assert ".publish(" in result
-    print("[PASS] test_signalflow_histogram_quantile")
+    with pytest.raises(UnsupportedSignalFlowTranslation) as rejected:
+        _promql_template_to_signalflow(expr, sf, "", "p95")
+    assert rejected.value.reason == "histogram_bucket_guess"
+    assert rejected.value.reason_code == "signalflow_translation_unsupported"
 
 
 def test_signalflow_ratio():
@@ -299,9 +302,7 @@ def test_signalflow_ratio():
 
     sf = "filter('service', 'checkout-service')"
     expr = (
-        f'sum(rate(http_requests_total{{{sf}, status=~"5.."}}[5m]))'
-        f" / "
-        f"sum(rate(http_requests_total{{{sf}}}[5m]))"
+        f'sum(rate(http_requests_total{{{sf}, status="500"}}[5m]))' f" / " f"sum(rate(http_requests_total{{{sf}}}[5m]))"
     )
     result = _promql_template_to_signalflow(expr, sf, "", "ratio")
     assert " / " in result
@@ -346,25 +347,50 @@ def test_signalflow_bare_metric():
 
 def test_compile_archetype_signalflow():
     from tacit.archetypes.engine import compile_archetype
-    from tacit.archetypes.templates import get_archetype
 
     intent = _make_intent()
-    catalog = _make_catalog(dims=["service={checkout-service}"])
-    arch = get_archetype("error_spike")
-    assert arch is not None, "error_spike archetype not found"
+    catalog = _make_catalog(ds_type="signalfx", query_lang="signalflow")
+    arch = InvestigationArchetype(
+        id="supported-request-rate",
+        name="Request rate",
+        problem_types=["error_spike"],
+        required_metrics=["http_requests_total"],
+        panels=[
+            PanelTemplate(
+                title="Request rate",
+                queries=[QueryTemplate(expr="sum(rate(http_requests_total{{{service_filter}}}[5m]))")],
+            )
+        ],
+    )
 
     spec = compile_archetype(arch, intent, catalog, target_language="signalflow")
-    assert len(spec.panels) > 0
 
-    for panel in spec.panels:
-        for q in panel.queries:
-            assert q.datasource_type == "signalfx", f"Expected signalfx, got {q.datasource_type}"
-            assert "data(" in q.expr, f"Expected SignalFlow data() call, got: {q.expr[:80]}"
-            assert ".publish(" in q.expr, f"Missing .publish() in: {q.expr[:80]}"
-            # Should NOT have PromQL patterns
-            assert "rate(" not in q.expr, f"PromQL rate() found in SignalFlow: {q.expr[:80]}"
-            assert "sum(" not in q.expr or ".sum(" in q.expr, f"PromQL sum() found: {q.expr[:80]}"
-    print("[PASS] test_compile_archetype_signalflow")
+    assert len(spec.panels) == 1
+    query = spec.panels[0].queries[0]
+    assert query.datasource_uid == "ds1"
+    assert query.datasource_type == "signalfx"
+    assert query.query_language == "signalflow"
+    assert query.expr == (
+        "data('http_requests_total', filter=filter('service', 'checkout-service'), "
+        "rollup='rate').sum().publish(label='Request rate')"
+    )
+
+
+def test_compile_archetype_signalflow_rejects_selected_unsupported_slot():
+    from tacit.archetypes.engine import compile_archetype
+    from tacit.archetypes.templates import get_archetype
+
+    arch = get_archetype("error_spike")
+    assert arch is not None
+    with pytest.raises(UnsupportedSignalFlowTranslation) as rejected:
+        compile_archetype(
+            arch,
+            _make_intent(),
+            _make_catalog(ds_type="signalfx", query_lang="signalflow"),
+            target_language="signalflow",
+        )
+    assert rejected.value.reason == "regex_widening"
+    assert rejected.value.slot.startswith("error_spike/")
 
 
 def test_compile_archetype_promql():
@@ -389,33 +415,73 @@ def test_compile_archetype_promql():
 
 def test_blend_archetypes_signalflow():
     from tacit.archetypes.engine import blend_archetypes
-    from tacit.archetypes.templates import get_archetype
 
-    intent = _make_intent(
-        archetypes=[
-            ArchetypeMatch(type="error_spike", confidence=0.9),
-            ArchetypeMatch(type="latency_investigation", confidence=0.6),
-        ]
-    )
-    catalog = _make_catalog(dims=["service={checkout-service}"])
-    arch1 = get_archetype("error_spike")
-    arch2 = get_archetype("latency_investigation")
-    if not arch1 or not arch2:
-        print("[SKIP] test_blend_archetypes_signalflow — archetypes not found")
-        return
+    archetypes = [
+        InvestigationArchetype(
+            id=f"supported-{metric}",
+            name=title,
+            problem_types=["error_spike"],
+            required_metrics=[metric],
+            panels=[
+                PanelTemplate(
+                    title=title,
+                    queries=[QueryTemplate(expr=metric + "{{{service_filter}}}")],
+                )
+            ],
+        )
+        for metric, title in [("http_requests_total", "Requests"), ("errors_total", "Errors")]
+    ]
+    catalog = _make_catalog(["http_requests_total", "errors_total"], ds_type="signalfx", query_lang="signalflow")
 
     spec = blend_archetypes(
-        [(arch1, 0.9), (arch2, 0.6)],
-        intent,
+        [(archetypes[0], 0.9), (archetypes[1], 0.6)],
+        _make_intent(),
         catalog,
         target_language="signalflow",
     )
-    assert len(spec.panels) > 0
+
+    assert len(spec.panels) == 2
+    assert {panel.title for panel in spec.panels} == {"Requests", "Errors"}
     for panel in spec.panels:
-        for q in panel.queries:
-            assert q.datasource_type == "signalfx"
-            assert "data(" in q.expr
-    print("[PASS] test_blend_archetypes_signalflow")
+        query = panel.queries[0]
+        assert query.datasource_uid == "ds1"
+        assert query.datasource_type == "signalfx"
+        assert "filter('service', 'checkout-service')" in query.expr
+        assert ".publish(" in query.expr
+
+
+def test_blend_archetypes_signalflow_rejects_supported_subset():
+    from tacit.archetypes.engine import blend_archetypes
+
+    supported = InvestigationArchetype(
+        id="supported",
+        name="Requests",
+        problem_types=["error_spike"],
+        required_metrics=["http_requests_total"],
+        panels=[PanelTemplate(title="Requests", queries=[QueryTemplate(expr="http_requests_total")])],
+    )
+    unsupported = InvestigationArchetype(
+        id="unsupported",
+        name="Error regex",
+        problem_types=["error_spike"],
+        required_metrics=["http_requests_total"],
+        panels=[
+            PanelTemplate(
+                title="Errors",
+                queries=[QueryTemplate(expr='http_requests_total{{status=~"5.."}}')],
+            )
+        ],
+    )
+
+    with pytest.raises(UnsupportedSignalFlowTranslation) as rejected:
+        blend_archetypes(
+            [(supported, 0.9), (unsupported, 0.6)],
+            _make_intent(),
+            _make_catalog(ds_type="signalfx", query_lang="signalflow"),
+            target_language="signalflow",
+        )
+    assert rejected.value.reason == "regex_widening"
+    assert rejected.value.slot == "unsupported/1/1"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -457,6 +523,16 @@ def test_publisher_promql_to_signalflow_simple():
     print("[PASS] test_publisher_promql_to_signalflow_simple")
 
 
+def test_publisher_promql_to_signalflow_preserves_joint_equality_filters():
+    from tacit.signalfx.publisher import _promql_to_signalflow
+
+    result = _promql_to_signalflow('http_requests_total{service="web",env="prod"}', "requests")
+    assert result == (
+        "data('http_requests_total', filter=filter('service', 'web') and "
+        "filter('env', 'prod')).publish(label='requests')"
+    )
+
+
 def test_publisher_promql_to_signalflow_rate():
     from tacit.signalfx.publisher import _promql_to_signalflow
 
@@ -471,22 +547,20 @@ def test_publisher_promql_to_signalflow_histogram():
     from tacit.signalfx.publisher import _promql_to_signalflow
 
     expr = 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service="web"}[5m])) by (le))'
-    result = _promql_to_signalflow(expr, "p95")
-    assert ".percentile(pct=95)" in result
-    assert "data('http_request_duration_seconds'" in result
-    print("[PASS] test_publisher_promql_to_signalflow_histogram")
+    with pytest.raises(UnsupportedSignalFlowTranslation) as rejected:
+        _promql_to_signalflow(expr, "p95")
+    assert rejected.value.reason == "histogram_bucket_guess"
 
 
 def test_publisher_promql_to_signalflow_ratio():
     from tacit.signalfx.publisher import _promql_to_signalflow
 
-    # No-space label format (matches the ratio regex)
-    expr = 'sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total{service="web"}[5m]))'
+    expr = 'sum(rate(http_requests_total{status="500"}[5m])) / sum(rate(http_requests_total{service="web"}[5m]))'
     result = _promql_to_signalflow(expr, "ratio")
-    assert ".publish(" in result
-    # The publisher translator should produce something valid
-    assert "data(" in result
-    print("[PASS] test_publisher_promql_to_signalflow_ratio")
+    assert result == (
+        "(data('http_requests_total', filter=filter('status', '500'), rollup='rate').sum() / "
+        "data('http_requests_total', filter=filter('service', 'web'), rollup='rate').sum()).publish(label='ratio')"
+    )
 
 
 def test_publisher_promql_to_signalflow_bare():
@@ -669,50 +743,49 @@ def test_config_sfx_backend_routing():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 9. Publisher — label parsing helpers
+# 9. Shared guarded translation boundary
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def test_parse_labels():
-    from tacit.signalfx.publisher import _parse_labels
+@pytest.mark.parametrize(
+    "expr,reason",
+    [
+        ('http_requests_total{status=~"5.."}', "regex_widening"),
+        ('http_requests_total{status=~"5..|4.."}', "regex_widening"),
+        ('http_requests_total{status=~"[45].."}', "regex_widening"),
+        ('topk(5, sum(rate(http_requests_total{status=~"5.."}[5m])))', "regex_widening"),
+        ('sum(rate(http_requests_total{status=~"5.."}[5m])) / http_requests_total', "regex_widening"),
+        ("histogram_quantile(0.95, sum(rate(latency_bucket{}[5m])) by (le))", "histogram_bucket_guess"),
+        ("http_requests_total / histogram_quantile(0.95, latency_bucket{})", "histogram_bucket_guess"),
+        ("topk(5, histogram_quantile(0.95, latency_bucket{}))", "histogram_bucket_guess"),
+        ('http_requests_total{method!="OPTIONS"}', "synthetic_fallback"),
+        ('http_requests_total{method!~"OPTIONS|HEAD"}', "synthetic_fallback"),
+        ("abs(http_requests_total)", "synthetic_fallback"),
+        ("http_requests_total + 1", "synthetic_fallback"),
+    ],
+)
+def test_shared_translator_rejects_unsupported_expressions(expr, reason):
+    from tacit.archetypes.engine import _promql_template_to_signalflow
+    from tacit.signalfx.publisher import _promql_to_signalflow
 
-    labels = _parse_labels('service="web", status=~"5..", method!="OPTIONS"')
-    assert len(labels) == 3
-    assert labels[0] == ("service", "=", "web")
-    assert labels[1] == ("status", "=~", "5..")
-    assert labels[2] == ("method", "!=", "OPTIONS")
-    print("[PASS] test_parse_labels")
+    for translate in (
+        lambda: _promql_template_to_signalflow(expr, "", "", "requests"),
+        lambda: _promql_to_signalflow(expr, "requests"),
+    ):
+        with pytest.raises(UnsupportedSignalFlowTranslation) as rejected:
+            translate()
+        assert rejected.value.reason == reason
+        assert rejected.value.reason_code == "signalflow_translation_unsupported"
+        assert len(str(rejected.value)) < 100
+        assert expr not in str(rejected.value)
 
 
-def test_labels_to_filter():
-    from tacit.signalfx.publisher import _labels_to_filter
+def test_publisher_delegates_to_guarded_engine_translator():
+    from tacit.signalfx.publisher import _promql_to_signalflow
 
-    # Simple regex (no [ or |) keeps the value
-    labels = [("service", "=", "web"), ("status", "=~", "5..")]
-    result = _labels_to_filter(labels)
-    assert "filter('service', 'web')" in result
-    assert "filter('status', '5..')" in result
-    assert " and " in result
-
-    # Regex with alternation gets wildcarded
-    labels2 = [("status", "=~", "5..|4..")]
-    result2 = _labels_to_filter(labels2)
-    assert "filter('status', '*')" in result2
-
-    # Regex with character class gets wildcarded
-    labels3 = [("code", "=~", "[45]..")]
-    result3 = _labels_to_filter(labels3)
-    assert "filter('code', '*')" in result3
-    print("[PASS] test_labels_to_filter")
-
-
-def test_labels_to_filter_not_equal():
-    from tacit.signalfx.publisher import _labels_to_filter
-
-    labels = [("method", "!=", "OPTIONS")]
-    result = _labels_to_filter(labels)
-    assert "not filter('method', 'OPTIONS')" in result
-    print("[PASS] test_labels_to_filter_not_equal")
+    with patch("tacit.archetypes.engine._promql_template_to_signalflow", return_value="guarded") as translate:
+        assert _promql_to_signalflow('http_requests_total{service="web"}', "requests") == "guarded"
+    translate.assert_called_once_with('http_requests_total{service="web"}', "", "", "requests")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1060,11 +1133,6 @@ if __name__ == "__main__":
     test_config_grafana_enabled()
     test_config_grafana_disabled()
     test_config_sfx_backend_routing()
-
-    # 9. Publisher — label helpers
-    test_parse_labels()
-    test_labels_to_filter()
-    test_labels_to_filter_not_equal()
 
     # 10. Engine — top-level slash
     test_find_top_level_slash()

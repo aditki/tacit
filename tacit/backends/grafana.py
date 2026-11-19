@@ -18,7 +18,9 @@ from tacit.grafana.adapters.registry import get_adapter
 from tacit.grafana.client import GrafanaClient
 from tacit.grafana.dashboard import publish_dashboard as publish_dashboard_fn
 from tacit.grafana.datasource import (
-    discover_all_metrics,
+    discover_all_metrics_with_metadata as discover_all_metrics,
+)
+from tacit.grafana.datasource import (
     filter_datasources_by_signal,
     filter_searchable_datasources,
     list_datasources,
@@ -103,47 +105,46 @@ class GrafanaBackend:
 
     # ── Discovery ─────────────────────────────────────────────────────
 
-    async def discover_metrics(
-        self,
-        keywords: list[str],
-        intent: Intent,
-    ) -> list[MetricEntry]:
+    async def discover_metrics(self, keywords: list[str], intent: Intent) -> list[MetricEntry]:
+        from tacit.acquisition import standalone_acquisition_budget
+
+        result = await self.discover_metrics_with_metadata(
+            keywords, intent, standalone_acquisition_budget(self._settings)
+        )
+        return result.as_list()[: self._settings.max_metric_catalog_size]
+
+    async def discover_metrics_with_metadata(self, keywords, intent, work_budget):
+        from tacit.acquisition import canonical_terms
+        from tacit.catalog import CatalogSourceStatus, MetricCatalogResult
+        from tacit.config import validate_acquisition_runtime
+        from tacit.signals.resolution import AcquisitionWorkLimitError
+
+        validate_acquisition_runtime(self._settings)
+        terms = canonical_terms(keywords)
         try:
-            all_ds, searchable_ds = await self._select_searchable_datasources(intent)
-
-            if not searchable_ds:
-                logger.warning("grafana_no_searchable_datasources")
-                self.last_discovery_status = DiscoveryStatus(
-                    available=True,
-                    datasource_count=len(all_ds),
-                    searchable_datasource_count=0,
-                )
-                return []
-
-            entries = await discover_all_metrics(
-                self._client,
-                searchable_ds,
-                keywords,
-                runtime_settings=self._settings,
-            )
-            self.last_discovery_status = DiscoveryStatus(
-                available=True,
-                datasource_count=len(all_ds),
-                searchable_datasource_count=len(searchable_ds),
-            )
-            return entries
+            all_ds, searchable = await self._select_searchable_datasources(intent, work_budget)
         except AUTHORITY_BOUNDARY_ERRORS:
             raise
         except Exception as exc:
-            self.last_discovery_status = DiscoveryStatus(
-                available=False,
-                error="grafana_discover_failed",
+            work_limit = isinstance(exc, AcquisitionWorkLimitError)
+            self.last_discovery_status = DiscoveryStatus(available=work_limit, error="grafana_discover_failed")
+            return MetricCatalogResult(
+                sources=(
+                    CatalogSourceStatus(
+                        backend="grafana",
+                        summary=True,
+                        disposition="incomplete" if work_limit else "unavailable",
+                        reasons=("work_limit",) if work_limit else ("provider_failed",),
+                    ),
+                )
             )
-            logger.warning(
-                "grafana_discover_failed",
-                **safe_failure_diagnostics(exc, reason_code="grafana_discover_failed"),
-            )
-            return []
+        result = await discover_all_metrics(
+            self._client, searchable, list(terms), work_budget, runtime_settings=self._settings
+        )
+        self.last_discovery_status = DiscoveryStatus(
+            available=True, datasource_count=len(all_ds), searchable_datasource_count=len(searchable)
+        )
+        return result
 
     async def discover_datasource_targets(
         self,
@@ -192,8 +193,12 @@ class GrafanaBackend:
             )
         return targets
 
-    async def _select_searchable_datasources(self, intent: Intent):
-        all_ds = await list_datasources(self._client)
+    async def _select_searchable_datasources(self, intent: Intent, work_budget=None):
+        all_ds = (
+            await list_datasources(self._client, work_budget)
+            if work_budget is not None
+            else await list_datasources(self._client)
+        )
 
         signal_types = [s.value for s in intent.signals]
         relevant_ds = filter_datasources_by_signal(all_ds, signal_types)

@@ -1,13 +1,25 @@
 import time
 
+import pytest
+
 from tacit.archetypes.engine import _legacy_metric_signal_details, compile_archetype
 from tacit.archetypes.schema import InvestigationArchetype, PanelTemplate, QueryTemplate
+from tacit.catalog import begin_selection_audit, end_selection_audit, recorded_selections
 from tacit.models.schemas import ArchetypeMatch, Intent, MetricEntry, SignalType
 from tacit.signals import SignalStore
 from tacit.signals.availability import SIGNAL_STORE_UNAVAILABLE
 
 
-def test_unavailable_injected_store_does_not_use_global_signal_mappings(monkeypatch):
+@pytest.fixture
+def source_selections():
+    token = begin_selection_audit()
+    try:
+        yield recorded_selections
+    finally:
+        end_selection_audit(token)
+
+
+def test_unavailable_injected_store_does_not_use_global_signal_mappings(monkeypatch, source_selections):
     monkeypatch.setattr(
         "tacit.signals.get_signal_store",
         lambda: (_ for _ in ()).throw(AssertionError("global signal store was consulted")),
@@ -48,7 +60,11 @@ def test_unavailable_injected_store_does_not_use_global_signal_mappings(monkeypa
         signal_store=SIGNAL_STORE_UNAVAILABLE,
     )
 
-    assert dashboard.panels[0].queries[0].expr == "rate(container_cpu_usage_seconds_total[5m])"
+    assert dashboard.panels == []
+    decisions = source_selections()
+    assert len(decisions) == 1
+    assert decisions[0]["status"] == "missing"
+    assert decisions[0]["reason"] == "no_owner"
 
 
 def test_promql_query_routes_to_datasource_that_owns_metric():
@@ -97,7 +113,7 @@ def test_promql_query_routes_to_datasource_that_owns_metric():
     assert dashboard.panels[0].queries[0].datasource_uid == "real-telemetry"
 
 
-def test_shared_promql_metric_routes_to_datasource_with_requested_service():
+def test_shared_promql_metric_abstains_despite_requested_service_sample(source_selections):
     archetype = InvestigationArchetype(
         id="shared-metric-test",
         name="Shared metric test",
@@ -141,7 +157,11 @@ def test_shared_promql_metric_routes_to_datasource_with_requested_service():
 
     dashboard = compile_archetype(archetype, intent, catalog)
 
-    assert dashboard.panels[0].queries[0].datasource_uid == "checkout-prom"
+    assert dashboard.panels == []
+    decisions = source_selections()
+    assert len(decisions) == 1
+    assert decisions[0]["status"] == "ambiguous"
+    assert decisions[0]["reason"] == "multiple_owners"
 
 
 def test_multi_metric_query_routes_when_one_datasource_owns_all_metrics():
@@ -196,7 +216,7 @@ def test_multi_metric_query_routes_when_one_datasource_owns_all_metrics():
     assert dashboard.panels[0].queries[0].datasource_uid == "service-prom"
 
 
-def test_shared_promql_metric_prefers_grafana_default_datasource():
+def test_shared_promql_metric_abstains_despite_grafana_default_datasource(source_selections):
     archetype = InvestigationArchetype(
         id="resource-saturation",
         name="Resource saturation",
@@ -239,10 +259,14 @@ def test_shared_promql_metric_prefers_grafana_default_datasource():
 
     dashboard = compile_archetype(archetype, intent, catalog)
 
-    assert dashboard.panels[0].queries[0].datasource_uid == "default-prom"
+    assert dashboard.panels == []
+    decisions = source_selections()
+    assert len(decisions) == 1
+    assert decisions[0]["status"] == "ambiguous"
+    assert decisions[0]["reason"] == "multiple_owners"
 
 
-def test_shared_promql_metric_does_not_route_to_unrelated_default_datasource():
+def test_shared_promql_metric_does_not_route_to_unrelated_default_datasource(source_selections):
     archetype = InvestigationArchetype(
         id="resource-saturation",
         name="Resource saturation",
@@ -292,10 +316,14 @@ def test_shared_promql_metric_does_not_route_to_unrelated_default_datasource():
 
     dashboard = compile_archetype(archetype, intent, catalog)
 
-    assert dashboard.panels[0].queries[0].datasource_uid == "tenant-a-prom"
+    assert dashboard.panels == []
+    decisions = source_selections()
+    assert len(decisions) == 1
+    assert decisions[0]["status"] == "ambiguous"
+    assert decisions[0]["reason"] == "multiple_owners"
 
 
-def test_split_multi_metric_query_stays_on_fallback_target():
+def test_split_multi_metric_query_abstains_without_a_common_owner(source_selections):
     archetype = InvestigationArchetype(
         id="split-ratio",
         name="Split ratio",
@@ -345,7 +373,11 @@ def test_split_multi_metric_query_stays_on_fallback_target():
 
     dashboard = compile_archetype(archetype, intent, catalog)
 
-    assert dashboard.panels[0].queries[0].datasource_uid == "default-prom"
+    assert dashboard.panels == []
+    decisions = source_selections()
+    assert len(decisions) == 1
+    assert decisions[0]["status"] == "missing"
+    assert decisions[0]["reason"] == "no_owner"
 
 
 def test_native_query_routes_to_metric_owner_before_unrelated_default_datasource():
@@ -403,7 +435,7 @@ def test_native_query_routes_to_metric_owner_before_unrelated_default_datasource
     assert query.datasource_type == "cloudwatch"
 
 
-def test_service_owner_must_cover_every_metric_in_query():
+def test_service_owner_must_cover_every_metric_in_query(source_selections):
     archetype = InvestigationArchetype(
         id="cache-ratio",
         name="Cache ratio",
@@ -447,10 +479,14 @@ def test_service_owner_must_cover_every_metric_in_query():
 
     dashboard = compile_archetype(archetype, intent, catalog)
 
-    assert dashboard.panels[0].queries[0].datasource_uid == "default-prom"
+    assert dashboard.panels == []
+    decisions = source_selections()
+    assert len(decisions) == 1
+    assert decisions[0]["status"] == "missing"
+    assert decisions[0]["reason"] == "no_owner"
 
 
-def test_single_discovered_operand_does_not_reroute_multi_metric_query():
+def test_single_discovered_operand_abstains_for_multi_metric_query(source_selections):
     archetype = InvestigationArchetype(
         id="partial-ratio",
         name="Partial ratio",
@@ -492,7 +528,11 @@ def test_single_discovered_operand_does_not_reroute_multi_metric_query():
 
     dashboard = compile_archetype(archetype, intent, catalog)
 
-    assert dashboard.panels[0].queries[0].datasource_uid == "default-prom"
+    assert dashboard.panels == []
+    decisions = source_selections()
+    assert len(decisions) == 1
+    assert decisions[0]["status"] == "missing"
+    assert decisions[0]["reason"] == "missing_operand"
 
 
 def test_legacy_required_metrics_bind_through_live_semantic_signals(tmp_path, monkeypatch):
@@ -680,7 +720,7 @@ def test_legacy_binding_uses_requested_service_before_tie_abstention(tmp_path, m
     assert "checkout_container_cpu_usage_seconds_total" in dashboard.panels[0].queries[0].expr
 
 
-def test_legacy_binding_abstains_when_multiple_services_are_equally_plausible(tmp_path, monkeypatch):
+def test_legacy_binding_abstains_when_multiple_services_are_equally_plausible(tmp_path, monkeypatch, source_selections):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
     monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
@@ -720,10 +760,14 @@ def test_legacy_binding_abstains_when_multiple_services_are_equally_plausible(tm
 
     dashboard = compile_archetype(archetype, intent, catalog)
 
-    assert dashboard.panels[0].queries[0].expr == "rate(container_cpu_usage_seconds_total[5m])"
+    assert dashboard.panels == []
+    decisions = source_selections()
+    assert len(decisions) == 1
+    assert decisions[0]["status"] == "missing"
+    assert decisions[0]["reason"] == "no_owner"
 
 
-def test_legacy_binding_rejects_gauge_for_histogram_template(tmp_path, monkeypatch):
+def test_legacy_binding_rejects_gauge_for_histogram_template(tmp_path, monkeypatch, source_selections):
     store = SignalStore(db_path=tmp_path / "signals.db")
     store.load_from_yaml()
     monkeypatch.setattr("tacit.signals.get_signal_store", lambda: store)
@@ -768,4 +812,8 @@ def test_legacy_binding_rejects_gauge_for_histogram_template(tmp_path, monkeypat
 
     dashboard = compile_archetype(archetype, intent, catalog)
 
-    assert "http_request_duration_seconds_bucket" in dashboard.panels[0].queries[0].expr
+    assert dashboard.panels == []
+    decisions = source_selections()
+    assert len(decisions) == 1
+    assert decisions[0]["status"] == "missing"
+    assert decisions[0]["reason"] == "no_owner"

@@ -2140,3 +2140,175 @@ async def test_backend_lease_is_explicit_and_not_a_legacy_sequence_adapter(tmp_p
         await _stop_root(dependencies, root, tolerate_fatal=True)
 
     assert products[0].close_calls == 1
+
+
+@pytest.mark.parametrize("cancel_requester", (False, True))
+@pytest.mark.asyncio
+async def test_typed_discovery_uses_exact_owner_and_retains_capacity_until_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_requester: bool
+) -> None:
+    from tacit.catalog import MetricCatalogResult
+    from tacit.signals.resolution import SignalResolutionWorkBudget
+
+    async def typed(self, keywords, intent, work_budget):
+        work_budget.reserve_acquisition_call()
+        await self.discover_metrics(keywords, intent)
+        return MetricCatalogResult()
+
+    monkeypatch.setattr(_BackendProbe, "discover_metrics_with_metadata", typed, raising=False)
+    gate = _CrossThreadAsyncGate()
+    dependencies, products, _ = _dependencies(tmp_path, operation_gate=gate)
+    root = dependencies.start_runtime_root()
+    lease = _require_backend_lease(await dependencies.realize_backends())
+    proxy = lease.backends[0]
+    work = SignalResolutionWorkBudget(10, 100, 100)
+    caller_thread = threading.get_ident()
+    operation = asyncio.create_task(proxy.discover_metrics_with_metadata([], None, work))
+    release = None
+    try:
+        await _wait_for_event(products[0].operation_started)
+        assert products[0].operation_threads != [caller_thread]
+        if cancel_requester:
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+        release = asyncio.create_task(dependencies.close_backends(lease))
+        await asyncio.sleep(0.02)
+        assert not products[0].close_started.is_set()
+        assert dependencies.pipeline_admission.health_snapshot().retained == 1
+        gate.release()
+        if not cancel_requester:
+            assert isinstance(await operation, MetricCatalogResult)
+        await asyncio.wait_for(release, 1)
+        assert work.acquisition_calls == 1
+        assert products[0].close_calls == 1
+        with pytest.raises(RuntimeOwnershipError):
+            await proxy.discover_metrics_with_metadata([], None, work)
+        assert work.acquisition_calls == 1
+    finally:
+        gate.release()
+        if not operation.done():
+            operation.cancel()
+            with suppress(BaseException):
+                await operation
+        if release is not None:
+            with suppress(BaseException):
+                await release
+        with suppress(BaseException):
+            await dependencies.close_backends(lease)
+        await _stop_root(dependencies, root, tolerate_fatal=True)
+
+
+@pytest.mark.asyncio
+async def test_typed_discovery_budget_contention_cannot_block_real_owner_loop(tmp_path: Path, monkeypatch) -> None:
+    from tacit.catalog import MetricCatalogResult
+    from tacit.signals.resolution import AcquisitionWorkLimitError, SignalResolutionWorkBudget
+
+    async def typed(self, keywords, intent, work_budget):
+        work_budget.reserve_acquisition_call()
+        return MetricCatalogResult()
+
+    monkeypatch.setattr(_BackendProbe, "discover_metrics_with_metadata", typed, raising=False)
+    dependencies, _, _ = _dependencies(tmp_path)
+    root = dependencies.start_runtime_root()
+    lease = _require_backend_lease(await dependencies.realize_backends())
+    work = SignalResolutionWorkBudget(10, 100, 100)
+    work._lock.acquire()
+    try:
+        with pytest.raises(AcquisitionWorkLimitError, match="contention"):
+            await asyncio.wait_for(lease.backends[0].discover_metrics_with_metadata([], None, work), 0.3)
+        assert await _owner_loop_responds(lease.backends[0]._generation)
+    finally:
+        work._lock.release()
+        await dependencies.close_backends(lease)
+        await _stop_root(dependencies, root, tolerate_fatal=True)
+
+
+@pytest.mark.asyncio
+async def test_typed_proxy_cancellation_before_dispatch_and_failed_close_keep_owner_authority(tmp_path: Path):
+    from tacit.signals.resolution import SignalResolutionWorkBudget
+
+    dependencies, products, _ = _dependencies(tmp_path, fail_close=True)
+    root = dependencies.start_runtime_root()
+    lease = _require_backend_lease(await dependencies.realize_backends())
+    work = SignalResolutionWorkBudget(10, 100, 100)
+    try:
+        cancelled = asyncio.create_task(lease.backends[0].discover_metrics_with_metadata([], None, work))
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        assert not products[0].operation_started.is_set()
+        result = await lease.backends[0].discover_metrics_with_metadata([], None, work)
+        assert result.sources[0].reasons == ("legacy_unknown",)
+        with pytest.raises(RuntimeOwnershipError, match="cleanup|close"):
+            await dependencies.close_backends(lease)
+        assert 1 <= products[0].close_calls <= 2
+        assert dependencies.pipeline_admission.runtime_fatal_circuit is not None
+        with pytest.raises(RuntimeOwnershipError):
+            await lease.backends[0].discover_metrics_with_metadata([], None, work)
+        assert len(products[0].operation_threads) == 1
+    finally:
+        await _stop_root(dependencies, root, tolerate_fatal=True)
+
+
+def test_typed_proxy_requester_loop_loss_cannot_release_active_owner_capacity(tmp_path: Path, monkeypatch):
+    from tacit.catalog import MetricCatalogResult
+    from tacit.signals.resolution import SignalResolutionWorkBudget
+
+    async def typed(self, keywords, intent, work_budget):
+        work_budget.reserve_acquisition_call()
+        await self.discover_metrics(keywords, intent)
+        return MetricCatalogResult()
+
+    monkeypatch.setattr(_BackendProbe, "discover_metrics_with_metadata", typed, raising=False)
+    gate = _CrossThreadAsyncGate()
+    dependencies, products, _ = _dependencies(tmp_path, operation_gate=gate)
+    root = dependencies.start_runtime_root()
+    holder = {}
+    caller_done = threading.Event()
+    work = SignalResolutionWorkBudget(10, 100, 100)
+
+    def requester():
+        loop = asyncio.new_event_loop()
+        holder["loop"] = loop
+        loop.set_exception_handler(lambda *_: None)
+
+        async def run():
+            lease = await dependencies.realize_backends()
+            holder["lease"] = lease
+            return await lease.backends[0].discover_metrics_with_metadata([], None, work)
+
+        task = loop.create_task(run())
+        holder["task"] = task
+        setattr(task, "_log_destroy_pending", False)
+        try:
+            loop.run_forever()
+        finally:
+            loop.close()
+            caller_done.set()
+
+    thread = threading.Thread(target=requester)
+    thread.start()
+    try:
+        assert gate.started.wait(2)
+        holder["loop"].call_soon_threadsafe(holder["loop"].stop)
+        assert caller_done.wait(1)
+        thread.join(1)
+        assert not thread.is_alive()
+        assert dependencies.pipeline_admission.health_snapshot().retained == 1
+        assert not products[0].close_started.is_set()
+        gate.release()
+        asyncio.run(_stop_root(dependencies, root))
+        assert products[0].operation_finished.is_set()
+        assert products[0].close_calls == 1
+        assert dependencies.pipeline_admission.health_snapshot().retained == 0
+        assert work.acquisition_calls == 1
+    finally:
+        gate.release()
+        if thread.is_alive():
+            holder["loop"].call_soon_threadsafe(holder["loop"].stop)
+            thread.join(1)
+        with suppress(BaseException):
+            asyncio.run(_stop_root(dependencies, root, tolerate_fatal=True))
+        if "task" in holder and not holder["task"].done():
+            holder["task"].get_coro().close()
