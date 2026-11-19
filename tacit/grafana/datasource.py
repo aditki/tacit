@@ -173,7 +173,13 @@ async def discover_all_metrics(
 
 async def discover_all_metrics_with_metadata(client, datasources, keywords, work_budget, *, runtime_settings=None):
     """Typed cache-free route with bounded scheduling and shared retention."""
-    from tacit.catalog import CatalogSourceStatus, MetricCatalogResult
+    from tacit.catalog import (
+        CatalogSourceStatus,
+        MetricCatalogResult,
+        acquisition_entry_id,
+        admit_catalog_facts,
+        canonical_acquisition_bytes,
+    )
     from tacit.config import validate_acquisition_runtime
     from tacit.signals.resolution import AcquisitionWorkLimitError
 
@@ -214,6 +220,7 @@ async def discover_all_metrics_with_metadata(client, datasources, keywords, work
         admitted_sources += 1
         adapter_deadline = time.monotonic() + active_settings.adapter_timeout_seconds
         try:
+            phased = False
             typed = getattr(adapter, "discover_metrics_with_metadata", None)
             if callable(typed):
                 phased = bool(getattr(adapter, "supports_acquisition_inventory_phase", False))
@@ -222,8 +229,6 @@ async def discover_all_metrics_with_metadata(client, datasources, keywords, work
                     typed(client, ds, keywords, work_budget, **phase_kwargs),
                     timeout=active_settings.adapter_timeout_seconds,
                 )
-                if phased:
-                    enrichments.append((ds, result.as_list(), adapter_deadline))
             else:
                 from tacit.acquisition import legacy_acquisition_catalog
 
@@ -239,6 +244,10 @@ async def discover_all_metrics_with_metadata(client, datasources, keywords, work
 
             additions = [entry.model_copy(update={"datasource_is_default": ds.is_default}) for entry in result.entries]
             entries, limited = retain_acquisition_facts(additions, work_budget, previous=entries)
+            if phased:
+                identities = {acquisition_entry_id(entry) for entry in additions}
+                retained = [entry for entry in entries if acquisition_entry_id(entry) in identities]
+                enrichments.append((ds, retained, adapter_deadline))
             if limited:
                 sources.append(
                     CatalogSourceStatus(backend="grafana", summary=True, reasons=("work_limit", "local_cap"))
@@ -272,27 +281,43 @@ async def discover_all_metrics_with_metadata(client, datasources, keywords, work
             )
     from tacit.acquisition import enrich_adapter_metrics_before_deadline
 
-    updates: dict[tuple[str, str, str, str], list[MetricEntry]] = {}
+    updates: dict[str, dict[bytes, MetricEntry]] = {}
+    update_fact_count = 0
     for ds, retained, adapter_deadline in enrichments:
         if work_budget.acquisition_calls >= work_budget.max_acquisition_calls:
             sources.append(CatalogSourceStatus(backend="grafana", summary=True, reasons=("work_limit",)))
             break
         enriched = await enrich_adapter_metrics_before_deadline(
-            client, ds, retained, work_budget, deadline=adapter_deadline
+            client, ds, retained, work_budget, deadline=adapter_deadline, _retained_admitted=True
         )
         sources.extend(enriched.sources)
+        owned_identities = {acquisition_entry_id(entry) for entry in retained}
         for entry in enriched.entries:
-            updates.setdefault((entry.datasource_uid, entry.query_language, entry.name, entry.namespace), []).append(
-                entry
-            )
-    expanded = []
+            identity = acquisition_entry_id(entry)
+            if identity not in owned_identities:
+                raise ValueError("enrichment introduced catalog identity")
+            facts = updates.setdefault(identity, {})
+            fingerprint = canonical_acquisition_bytes(entry.model_dump())
+            if fingerprint not in facts:
+                if update_fact_count >= 5000:
+                    raise ValueError("catalog raw metadata fact limit")
+                facts[fingerprint] = entry
+                update_fact_count += 1
+    expanded: list[MetricEntry] = []
+    emitted: set[str] = set()
     for entry in entries:
-        expanded.extend(updates.get((entry.datasource_uid, entry.query_language, entry.name, entry.namespace), [entry]))
-        if len(expanded) > 5000:
+        identity = acquisition_entry_id(entry)
+        if identity in updates:
+            if identity in emitted:
+                continue
+            emitted.add(identity)
+            additions = list(updates[identity].values())
+        else:
+            additions = [entry]
+        if len(expanded) + len(additions) > 5000:
             raise ValueError("catalog raw metadata fact limit")
-    from tacit.acquisition import retain_acquisition_facts
-
-    entries, _ = retain_acquisition_facts(expanded, work_budget)
+        expanded.extend(additions)
+    entries = list(admit_catalog_facts(expanded))
     summaries = [source for source in sources if source.summary]
     sources = [source for source in sources if not source.summary]
     if summaries:

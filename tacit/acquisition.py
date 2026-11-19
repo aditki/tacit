@@ -8,7 +8,7 @@ import json
 import math
 import time
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import quote
 
@@ -311,6 +311,57 @@ class AcquisitionSearches:
         return MetricCatalogResult(entries=tuple(entries), sources=tuple(sources))
 
 
+@dataclass(slots=True)
+class _EnrichmentProgress:
+    """Completed facts inside one adopted operation, not a second work owner."""
+
+    tracker: AcquisitionSearches
+    initial_facts: tuple[MetricEntry, ...]
+    entries: dict[str, MetricEntry]
+    metadata_facts: list[MetricEntry] | None = None
+    completed_dimensions: set[str] = field(default_factory=set)
+
+    @classmethod
+    def start(
+        cls,
+        ds: DatasourceInfo,
+        retained: list[MetricEntry],
+        work_budget: SignalResolutionWorkBudget,
+        backend: str,
+        *,
+        retained_admitted: bool = False,
+    ) -> _EnrichmentProgress:
+        from tacit.catalog import admit_catalog_facts
+
+        if retained_admitted:
+            facts, limited = list(admit_catalog_facts(retained)), False
+        else:
+            facts, limited = retain_acquisition_facts(retained, work_budget)
+        tracker = AcquisitionSearches(backend, work_budget, ds)
+        if limited:
+            tracker.skipped = True
+            tracker.skip_reasons.update({"local_cap", "work_limit"})
+        return cls(tracker, tuple(facts), {acquisition_entry_id(entry): entry for entry in facts})
+
+    def finish(self) -> MetricCatalogResult:
+        from tacit.catalog import admit_catalog_facts
+
+        facts = self.metadata_facts if self.metadata_facts is not None else self.initial_facts
+        output = []
+        for entry in facts:
+            identity = acquisition_entry_id(entry)
+            if identity not in self.entries:
+                raise ValueError("enrichment introduced catalog identity")
+            output.append(
+                entry.model_copy(update={"dimensions": self.entries[identity].dimensions})
+                if identity in self.completed_dimensions
+                else entry
+            )
+        # Enrichment cannot introduce new identities. Admit the completed facts
+        # once without re-reserving identities already owned by the inventory.
+        return self.tracker.finish(list(admit_catalog_facts(output)))
+
+
 def _query_language(ds: DatasourceInfo) -> str:
     if ds.type in {"prometheus", "mimir", "cortex", "thanos"}:
         return "promql"
@@ -507,7 +558,13 @@ async def discover_adapter_metrics(
     if not enrich:
         return result
     enriched = await enrich_adapter_metrics_before_deadline(
-        client, datasource, result.as_list(), work_budget, deadline=adapter_deadline, backend=backend
+        client,
+        datasource,
+        result.as_list(),
+        work_budget,
+        deadline=adapter_deadline,
+        backend=backend,
+        _retained_admitted=True,
     )
     return MetricCatalogResult(
         entries=enriched.entries, sources=merge_search_sources((*result.sources, *enriched.sources))
@@ -666,7 +723,6 @@ async def _discover_adapter_inventory(
         )
     elif ds.type == "loki":
         data = await get("loki/api/v1/labels", ("labels", *terms))
-        labels = _names(data)
         interesting = {
             "app",
             "service",
@@ -680,7 +736,20 @@ async def _discover_adapter_inventory(
             "severity",
             "status_code",
         }
-        inventory = [(f"log_stream:{label}", "", []) for label in labels if label in interesting]
+        recognized: set[str] = set()
+        has_custom = False
+        for label in _iter_names(data):
+            if label in interesting:
+                recognized.add(label)
+            else:
+                has_custom = True
+        inventory = [(f"log_stream:{label}", "", []) for label in sorted(recognized)]
+        if has_custom:
+            available, label_cap = _select_inventory_names(
+                _iter_names(data), terms, 128, fallback_limit=128, backfill=True
+            )
+            local_cap |= label_cap
+            local_cap |= _append_inventory(inventory, (("loki:available_labels", "", available),), inventory_limit)
         if data is not None:
             tracker.inventory(name for name, _, _ in inventory)
 
@@ -723,31 +792,30 @@ async def enrich_adapter_metrics_before_deadline(
     *,
     deadline: float,
     backend: str = "grafana",
+    _retained_admitted: bool = False,
 ) -> MetricCatalogResult:
-    """One existing-operation deadline; timeout never erases admitted inventory."""
+    """One deadline; only first-party retained inputs may skip identity reservation."""
+    progress = _EnrichmentProgress.start(ds, retained, work_budget, backend, retained_admitted=_retained_admitted)
     try:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError
         return await asyncio.wait_for(
-            enrich_adapter_metrics(client, ds, retained, work_budget, backend=backend), timeout=remaining
+            enrich_adapter_metrics(client, ds, retained, work_budget, backend=backend, _progress=progress),
+            timeout=remaining,
         )
     except TimeoutError:
-        logger.info("metric_enrichment_incomplete", reason_code="adapter_timeout", retained_count=len(retained))
-        return MetricCatalogResult(
-            entries=retained,
-            sources=(
-                CatalogSourceStatus(
-                    backend=backend,
-                    datasource_uid=ds.uid,
-                    datasource_type=ds.type,
-                    query_language=_query_language(ds),
-                    terms=("metadata", "enrichment"),
-                    disposition="incomplete",
-                    reasons=("provider_failed",),
-                ),
-            ),
+        progress.tracker.sources.append(
+            progress.tracker.status(("metadata", "enrichment"), disposition="incomplete", reasons=("provider_failed",))
         )
+        result = progress.finish()
+        logger.info(
+            "metric_enrichment_incomplete",
+            reason_code="adapter_timeout",
+            retained_count=len(progress.entries),
+            completed_fact_count=len(result.entries),
+        )
+        return result
 
 
 async def enrich_adapter_metrics(
@@ -757,10 +825,11 @@ async def enrich_adapter_metrics(
     work_budget: SignalResolutionWorkBudget,
     *,
     backend: str = "grafana",
+    _progress: _EnrichmentProgress | None = None,
 ) -> MetricCatalogResult:
     """Enrich retained identities only after all source inventory admission."""
-    tracker = AcquisitionSearches(backend, work_budget, ds)
-    entries = {(entry.name, entry.namespace): entry for entry in retained}
+    progress = _progress or _EnrichmentProgress.start(ds, retained, work_budget, backend)
+    tracker, entries = progress.tracker, progress.entries
 
     async def get(path: str, terms: tuple[str, ...]) -> Any:
         target = "/" + path if backend == "signalfx" else f"/api/datasources/proxy/uid/{ds.uid}/{path}"
@@ -773,7 +842,7 @@ async def enrich_adapter_metrics(
         from tacit.catalog import expand_metric_metadata_facts
 
         metadata_facts: list[MetricEntry] = []
-        for entry in entries.values():
+        for entry in progress.initial_facts:
             definitions = payload.get(entry.name) if isinstance(payload, dict) else None
             if definitions is None and isinstance(payload, dict):
                 for suffix in ("_bucket", "_sum", "_count", "_total"):
@@ -783,9 +852,11 @@ async def enrich_adapter_metrics(
             definitions = (
                 definitions if isinstance(definitions, list) else [definitions] if isinstance(definitions, dict) else []
             )
-            metadata_facts.extend(expand_metric_metadata_facts(entry, definitions))
-            if len(metadata_facts) > 5000:
+            expanded = expand_metric_metadata_facts(entry, definitions)
+            if len(metadata_facts) + len(expanded) > 5000:
                 raise ValueError("catalog raw metadata fact limit")
+            metadata_facts.extend(expanded)
+        progress.metadata_facts = metadata_facts
         for entry in list(entries.values())[:50]:
             data = await get(f"api/v1/series?match[]={quote(entry.name)}", ("dimensions", entry.name))
             if data is None:
@@ -801,6 +872,7 @@ async def enrich_adapter_metrics(
             entry.dimensions = [
                 f"{key}={{{','.join(sorted(values)[:10])}}}" for key, values in sorted(dims.items())[:15]
             ]
+            progress.completed_dimensions.add(acquisition_entry_id(entry))
     elif entries and _query_language(ds) == "signalflow":
         for entry in list(entries.values())[:50]:
             data = await get(
@@ -825,6 +897,7 @@ async def enrich_adapter_metrics(
             entry.dimensions = [
                 f"{key}={{{','.join(sorted(values)[:10])}}}" for key, values in sorted(mts_dims.items())[:15]
             ]
+            progress.completed_dimensions.add(acquisition_entry_id(entry))
     elif entries and ds.type == "cloudwatch":
         region = ds.json_data.get("defaultRegion", "us-east-1")
 
@@ -853,10 +926,10 @@ async def enrich_adapter_metrics(
             from tacit.grafana.adapters.cloudwatch import _coerce_dimension_keys
 
             entry.dimensions = _coerce_dimension_keys(data)[:128]
+            progress.completed_dimensions.add(acquisition_entry_id(entry))
     elif entries and ds.type == "loki":
-        for entry in list(entries.values())[:6]:
-            if not entry.name.startswith("log_stream:"):
-                continue
+        streams = (entry for entry in entries.values() if entry.name.startswith("log_stream:"))
+        for entry in list(streams)[:6]:
             label = entry.name.partition(":")[2]
             data = await get(f"loki/api/v1/label/{quote(label)}/values", ("dimensions", label))
             if data is None:
@@ -864,11 +937,5 @@ async def enrich_adapter_metrics(
                     break
                 continue
             entry.dimensions = _names(data)[:50]
-    output = list(entries.values())
-    if entries and _query_language(ds) == "promql":
-        output = [
-            entry.model_copy(update={"dimensions": entries[(entry.name, entry.namespace)].dimensions})
-            for entry in metadata_facts
-        ]
-    output, _ = retain_acquisition_facts(output, work_budget)
-    return tracker.finish(output)
+            progress.completed_dimensions.add(acquisition_entry_id(entry))
+    return progress.finish()

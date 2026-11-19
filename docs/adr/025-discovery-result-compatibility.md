@@ -28,10 +28,20 @@ All first-party transport uses one bounded-read path and the same investigation
 work budget through the existing runtime-owned backend operation. No additional
 controller, worker, permit owner or cleanup authority is created.
 
+Repeated exact-owner lookups use one explicitly owned admitted catalog view per
+operation, shared by nested compiler, evidence and rescue calls. Its private
+bounded index retains full-catalog conflict semantics and exposes no mutable
+facts. Public construction always derives normalization from raw admitted
+facts; a supplied normalization cannot attest its own conflict completeness.
+No process-wide, context-local or object-identity cache is introduced. Capture
+construction and admission continue to reconstruct their own trust boundaries.
+
 Preserve conflicting metadata facts until shared normalization. Identical
 duplicates may share one retained identity; conflicting units/types cannot be
 discarded by legacy adaptation, aggregation or enrichment. Native provider
 envelopes count normalized metric rows rather than wrapper objects.
+Completed admitted enrichment facts survive a later phase timeout; unfinished
+enrichment is incomplete rather than grounds to erase a discovered conflict.
 
 Use the existing guarded compiler at publication as well as compilation.
 Unsupported selected SignalFlow translation fails the investigation before any

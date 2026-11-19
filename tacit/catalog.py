@@ -9,6 +9,7 @@ import re
 from collections.abc import Iterable, Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal
 
 from tacit.investigation_contract import DecisionLogEntry, ProvenanceRecord
@@ -431,6 +432,48 @@ def _provider(provider: str) -> str:
     }.get(lowered, lowered)
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class QueryTargetCatalog:
+    """One admitted ownership snapshot for a synchronous compilation/resolution operation.
+
+    Construction always derives normalization from raw facts. The private index
+    shares only this snapshot's owned facts; public results never expose them.
+    The source reference binds nested operations, not a cache or runtime owner.
+    """
+
+    _source: object = field(repr=False)
+    _normalized: CatalogNormalization = field(repr=False)
+    _by_metric: Mapping[tuple[str, str], tuple[MetricEntry, ...]] = field(repr=False)
+
+    def __init__(self, catalog: Iterable[MetricEntry] | MetricCatalogResult) -> None:
+        normalized = normalize_catalog(catalog)
+        by_metric: dict[tuple[str, str], list[MetricEntry]] = {}
+        for entry in normalized.catalog._entries:
+            by_metric.setdefault((_language(entry.query_language), entry.name), []).append(entry)
+        object.__setattr__(self, "_source", catalog)
+        object.__setattr__(self, "_normalized", normalized)
+        object.__setattr__(
+            self, "_by_metric", MappingProxyType({key: tuple(value) for key, value in by_metric.items()})
+        )
+
+    @property
+    def conflicts(self) -> tuple[CatalogConflict, ...]:
+        return self._normalized.conflicts
+
+
+def query_target_catalog(
+    catalog: Iterable[MetricEntry] | MetricCatalogResult | QueryTargetCatalog,
+    *,
+    _prepared: QueryTargetCatalog | None = None,
+) -> QueryTargetCatalog:
+    """Prepare once, or reuse the exact same operation's admitted ownership view."""
+    if _prepared is not None:
+        if not isinstance(_prepared, QueryTargetCatalog) or _prepared._source is not catalog:
+            raise AcquisitionCaptureInvalidError("ownership_catalog_source")
+        return _prepared
+    return catalog if isinstance(catalog, QueryTargetCatalog) else QueryTargetCatalog(catalog)
+
+
 @dataclass(frozen=True, slots=True)
 class QueryTargetSelection:
     status: Literal["selected", "missing", "ambiguous"]
@@ -445,7 +488,7 @@ class QueryTargetSelection:
 
 
 def select_query_target(
-    catalog: Iterable[MetricEntry] | MetricCatalogResult,
+    catalog: Iterable[MetricEntry] | MetricCatalogResult | QueryTargetCatalog,
     required_metric_names: Iterable[str],
     query_language: str,
     requested_uid: str | None = None,
@@ -460,21 +503,22 @@ def select_query_target(
     _text((*operands, query_language, *(() if requested_uid is None else (requested_uid,))))
     if not operands:
         return QueryTargetSelection("missing", None, reason="no_owner")
-    normalized = normalize_catalog(catalog)
-    return _select_normalized_target(normalized, operands, query_language, requested_uid)
+    admitted = query_target_catalog(catalog)
+    return _select_normalized_target(admitted, operands, query_language, requested_uid)
 
 
 def _select_normalized_target(
-    normalized: CatalogNormalization, operands: set[str], query_language: str, requested_uid: str | None
+    normalized: QueryTargetCatalog, operands: set[str], query_language: str, requested_uid: str | None
 ) -> QueryTargetSelection:
     language = _language(query_language)
     by_owner: dict[str, dict[str, list[MetricEntry]]] = {}
     available: set[str] = set()
-    for entry in normalized.entries:
-        if _language(entry.query_language) != language or entry.name not in operands or not entry.datasource_uid:
-            continue
-        available.add(entry.name)
-        by_owner.setdefault(entry.datasource_uid, {}).setdefault(entry.name, []).append(entry)
+    for name in operands:
+        for entry in normalized._by_metric.get((language, name), ()):
+            if not entry.datasource_uid:
+                continue
+            available.add(entry.name)
+            by_owner.setdefault(entry.datasource_uid, {}).setdefault(entry.name, []).append(entry)
     complete = {uid: entries for uid, entries in by_owner.items() if operands <= entries.keys()}
     if requested_uid is not None:
         complete = {uid: entries for uid, entries in complete.items() if uid == requested_uid}
@@ -1052,7 +1096,7 @@ def _validate_record(record: Mapping[str, Any]) -> None:
             raise AcquisitionCaptureInvalidError("conflict_entry_reference")
         if conflict["id"] != CatalogConflict(conflict["entry_id"], conflict["field"], tuple(conflict["values"])).id:
             raise AcquisitionCaptureInvalidError("conflict_id")
-    normalized = normalize_catalog(metrics) if record["selections"] else None
+    normalized = query_target_catalog(metrics) if record["selections"] else None
     selection_cache: dict[tuple[Any, ...], QueryTargetSelection] = {}
     for selection in record["selections"]:
         _validate_selection(selection)

@@ -13,7 +13,7 @@ from tacit import __version__
 from tacit.agents.metrics_discovery import SYSTEM_PROMPT, discover_metrics
 from tacit.agents.providers.base import TokenUsage
 from tacit.agents.query_builder import build_dashboard
-from tacit.catalog import freeform_selection_subject, record_query_selection, select_query_target
+from tacit.catalog import freeform_selection_subject, query_target_catalog, record_query_selection, select_query_target
 from tacit.dependencies import PipelineDependencies
 from tacit.errors import RuntimeOwnershipError
 from tacit.logging import stage_log
@@ -167,12 +167,13 @@ async def build_freeform_dashboard(
         return FreeformBuildResult(dashboard_spec=None, token_usage=total_usage, failure=failure)
 
     original_count = len(discovery.metrics)
+    ownership_catalog = query_target_catalog(metric_catalog)
     selected_metrics = []
     subjects = []
     for metric in discovery.metrics:
         names = {metric.metric_name}
         # The model's proposed UID cannot break an ownership tie.
-        selected = select_query_target(metric_catalog, names, metric.query_language)
+        selected = select_query_target(ownership_catalog, names, metric.query_language)
         subject = freeform_selection_subject(names, metric.query_language)
         subjects.append(subject)
         record_query_selection(
