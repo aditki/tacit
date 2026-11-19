@@ -566,6 +566,9 @@ class _OwnedDashboardBackend:
     async def validate_queries(self, spec: Any, catalog: Any = None) -> Any:
         return await self._invoke("validate_queries", spec, catalog)
 
+    async def validate_queries_with_measurements(self, spec, catalog, work_budget):
+        return await self._invoke("validate_queries_with_measurements", spec, catalog, work_budget)
+
     async def publish(self, spec: Any) -> Any:
         return await self._invoke("publish", spec)
 
@@ -1142,12 +1145,21 @@ class _RuntimeAsyncResourceOwner:
             if not 0 <= index < len(record.products):
                 raise RuntimeOwnershipError("Backend proxy index is invalid")
             product = record.products[index]
-            if method == "discover_metrics_with_metadata":
+            if method in {"discover_metrics_with_metadata", "validate_queries_with_measurements"}:
                 from tacit.config import validate_acquisition_budget
 
                 validate_acquisition_budget(self._host._settings, args[2])
             legacy_discovery = False
             target = getattr(product, method, None)
+            if method == "validate_queries_with_measurements":
+                from tacit.validation import validate_queries_with_measurements
+
+                # Selecting the optional capability or legacy fallback is work
+                # of this same owned operation, never of the requester loop.
+                async def measured_validation(spec, catalog, work_budget):
+                    return await validate_queries_with_measurements(product, spec, catalog, work_budget)
+
+                target = measured_validation
             if method == "discover_metrics_with_metadata" and not callable(target):
                 target = getattr(product, "discover_metrics", None)
                 legacy_discovery = True

@@ -36,3 +36,4 @@ architecture decisions are maintained in the
 | [ADR-022](022-operational-knowledge-lifecycle.md) | Operational Knowledge is governed, scoped, and revisioned | Accepted | Implemented through product milestone |
 | [ADR-023](023-contain-blocking-bedrock-before-native-async.md) | Contain blocking Bedrock before native async migration | Accepted | Blocking bridge contained; provider/backend runtime ownership implemented; native async deferred |
 | [ADR-025](025-discovery-result-compatibility.md) | Preserve discovery facts through existing investigation owners | Proposed | Acquisition implementation; activation gated by matrix and quality evidence |
+| [ADR-026](026-bounded-measured-query-facts.md) | Retain bounded measured query facts in investigation revisions | Proposed | Measured-evidence implementation; bounded instant capture, historical replay preserved |

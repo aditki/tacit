@@ -308,6 +308,12 @@ network-disabled, read-only, UID-999 installed-parser/translator/resource smoke
 also passed. CI revalidates the pushed commit and its stacked measured-evidence
 integration independently.
 
+The stacked PR #107 integration retains both acquisition and measured-evidence
+invariant gates. Its combined acquisition/measurement/capture/replay suite passed
+349 tests and its complete browser/public end-to-end suite passed 57. Ruff,
+Black (364 files), mypy (172 source files) and diff checks passed after the
+integration. This introduces no measured-evidence schema or runtime change.
+
 ### Additional acquisition review repairs
 
 Three further PR #105 findings exposed completed-fact loss, a native fallback
@@ -360,6 +366,12 @@ passed. Linux ARM64 Docker build and a network-disabled, read-only UID-999
 installed-index/enrichment smoke passed. CI validates the pushed acquisition
 commit and the separate measured-evidence integration.
 
+The new stacked integration passed 388 combined acquisition, measured-evidence,
+capture and replay tests, all 57 end-to-end tests, Ruff, Black (366 files), mypy
+(172 source files) and diff checks. Independent review confirmed that shared
+production files match the acquisition repair and that measured capture,
+provenance and replay production code is unchanged.
+
 ### Exact-name selectors and cached discovery: attribution and repair
 
 Both new review findings are observable regressions from this changeset, rather
@@ -401,6 +413,12 @@ Ruff, Black (364 files), mypy (171 sources), Grounding (40/40), Operational
 Learning (18/18), deterministic cold/taught resolution and diff checks passed.
 Linux ARM64 Docker build and the installed exact-name/partial-operand rejection
 smoke passed as UID 999 with a read-only filesystem and networking disabled.
+
+The stacked selector/cache integration passed 434 combined acquisition,
+measurement, capture and replay tests and all 57 end-to-end tests. Ruff, Black
+(368 files), mypy (172 sources) and diff checks passed. Independent integration
+review confirmed that the two shared production files match the acquisition
+repair and measured capture, provenance and replay production code is unchanged.
 
 ## Real Telemetry Roadmap
 

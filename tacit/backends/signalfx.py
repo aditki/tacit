@@ -152,6 +152,28 @@ class SignalFxBackend:
         del catalog  # SignalFlow validation checks metric existence via its own API
         return await validate_signalflow_queries(self._client, spec)
 
+    async def validate_queries_with_measurements(self, spec, catalog, work_budget):
+        from tacit.backends.base import MeasuredValidationResult
+        from tacit.config import validate_acquisition_budget
+        from tacit.measurements import query_identity, unavailable_measurement
+        from tacit.models.schemas import validate_dashboard_spec_work_limits
+
+        validate_acquisition_budget(self._settings, work_budget)
+        validate_dashboard_spec_work_limits(spec)
+        for panel in spec.panels:
+            for query in panel.queries:
+                query_identity(query)
+        validated, warnings = await self.validate_queries(spec, catalog)
+        return MeasuredValidationResult(
+            validated,
+            warnings,
+            tuple(
+                unavailable_measurement(query, "unsupported_datasource", disposition="unsupported")
+                for panel in spec.panels
+                for query in panel.queries
+            ),
+        )
+
     # ── Publish ───────────────────────────────────────────────────────
 
     async def publish(

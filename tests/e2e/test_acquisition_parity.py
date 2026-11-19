@@ -11,9 +11,11 @@ import tacit.archetypes.templates as templates
 import tacit.pipeline as pipeline_mod
 from tacit.agents.providers import registry as provider_registry
 from tacit.agents.providers.base import LLMProvider, TokenUsage
+from tacit.backends.base import MeasuredValidationResult
 from tacit.catalog import CatalogSourceStatus, MetricCatalogResult, acquisition_entry_id
 from tacit.config import settings
 from tacit.dashboard_ingest import extract_metrics_from_promql
+from tacit.measurements import normalize_prometheus_measurement
 from tacit.models.schemas import ArchetypeMatch, DashRequest, Intent, MetricEntry
 from tacit.ranking import MAX_LLM_CANDIDATES, prerank_metrics
 from tests.e2e.framework import CapturingBackend
@@ -91,9 +93,37 @@ class TypedParityBackend(CapturingBackend):
         return validated, []
 
 
+class MeasuredParityBackend(TypedParityBackend):
+    async def validate_queries_with_measurements(self, spec, catalog, work_budget):
+        assert work_budget is self.work_budget
+        validated, warnings = await self.validate_queries(spec, catalog)
+        measurements = tuple(
+            normalize_prometheus_measurement(
+                query,
+                {
+                    "status": "success",
+                    "data": {
+                        "resultType": "vector",
+                        "result": [
+                            {
+                                "metric": {"service": "payments", "secret_id": "excluded-value"},
+                                "value": [1700000000, "0.25"],
+                            }
+                        ],
+                    },
+                },
+                work_budget,
+            )
+            for panel in validated.panels
+            for query in panel.queries
+        )
+        return MeasuredValidationResult(validated, warnings, measurements)
+
+
 @pytest.mark.e2e
+@pytest.mark.parametrize("measured", [False, True])
 async def test_typed_588_catalog_preserves_six_requests_and_seven_fixture_metrics(
-    isolated_learning_runtime, monkeypatch
+    isolated_learning_runtime, monkeypatch, measured
 ):
     _signals, history, _feedback, archetypes_path, _quarantine = isolated_learning_runtime
     fixture = acquisition_parity.load_fixture()
@@ -164,7 +194,7 @@ async def test_typed_588_catalog_preserves_six_requests_and_seven_fixture_metric
         )
         for expression in query_templates.values()
     }
-    backend = TypedParityBackend(catalog, expected_queries)
+    backend = (MeasuredParityBackend if measured else TypedParityBackend)(catalog, expected_queries)
 
     async def classify(_prompt):
         return intent.model_copy(deep=True), TokenUsage()
@@ -191,6 +221,18 @@ async def test_typed_588_catalog_preserves_six_requests_and_seven_fixture_metric
     contract = history.get_contract(response.investigation_id)
     snapshot = history.get_snapshot(response.investigation_id)
     assert contract is not None and snapshot is not None
+    if measured:
+        assert len(snapshot.query_measurements) == len(published_queries)
+        assert all(query.execution["measurement"]["samples"][0]["value"] == 0.25 for query in contract.queries)
+        assert "excluded-value" not in snapshot.model_dump_json()
+        assert "excluded-value" not in contract.model_dump_json()
+        query_events = [
+            event
+            for event in history.list_events(response.investigation_id)
+            if event["event_type"] in {"query_validated", "query_executed"}
+        ]
+        assert query_events
+        assert all('"samples"' not in json.dumps(event["payload"]) for event in query_events)
     capture = snapshot.model_inputs["catalog_acquisition_v1"]
     retained = [MetricEntry.model_validate(item["metric"]) for item in capture["entries"]]
     assert len(retained) == 588
