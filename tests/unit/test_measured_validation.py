@@ -207,13 +207,13 @@ async def test_unrepresentable_query_identity_fails_before_remote_io():
 async def test_measurement_values_and_raw_errors_never_enter_diagnostics(failed):
     from structlog.testing import capture_logs
 
-    secret = "private-measurement-918273645.125"
+    private_value = "private-measurement-918273645.125"
 
     def handle(request):
         if failed:
-            raise ValueError(secret)
+            raise ValueError(private_value)
         payload = _payload("918273645.125")
-        payload["data"]["result"][0]["metric"]["customer_identifier"] = secret
+        payload["data"]["result"][0]["metric"]["customer_identifier"] = private_value
         return httpx.Response(200, stream=_Chunks(json.dumps(payload).encode()))
 
     client, backend = _grafana(handle)
@@ -221,7 +221,7 @@ async def test_measurement_values_and_raw_errors_never_enter_diagnostics(failed)
         with capture_logs() as events:
             result = await backend.validate_queries_with_measurements(_spec(), _catalog("requests_total"), _budget())
         rendered = json.dumps(events)
-        assert secret not in rendered and "918273645.125" not in rendered
+        assert private_value not in rendered and "918273645.125" not in rendered
         assert "customer_identifier" not in rendered
         assert result.measurements[0].disposition == ("invalid" if failed else "captured")
     finally:

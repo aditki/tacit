@@ -91,6 +91,14 @@ These checks verify capture, bounds, packaging and compatibility. They do not
 measure improvement on production incidents or provide new classifier quality
 evidence.
 
+PR CI identified one synthetic privacy-test marker as a generic API key. The
+test variable was renamed without changing its value or assertions, and
+`.gitleaksignore` exempts only the exact original commit/path/rule/line
+fingerprint. The pinned CI scanner verified clean current-tree/history scans;
+a disposable new commit with the same marker at the same path/line was still
+detected by both scans. The exception does not suppress future findings or
+disable a rule. The two affected privacy gates, Ruff and Black passed again.
+
 ## Implementation boundaries
 
 The applicable matrix rows cover runtime ownership, entry points, tenant and
