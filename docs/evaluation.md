@@ -360,6 +360,48 @@ passed. Linux ARM64 Docker build and a network-disabled, read-only UID-999
 installed-index/enrichment smoke passed. CI validates the pushed acquisition
 commit and the separate measured-evidence integration.
 
+### Exact-name selectors and cached discovery: attribution and repair
+
+Both new review findings are observable regressions from this changeset, rather
+than unrelated pre-existing issues. Against PR base `cd5396329`, the same valid
+`{__name__="http_requests_total",job="checkout"}` query compiles one panel; on
+`701ef5b`, it compiles none because the strict selector receives no operands.
+The older parser omission alone predates this PR, but the newly introduced
+exact-owner boundary makes it a compatibility regression. AST-proven metric
+names such as `sum`, `rate` and `__internal_total` have the same attribution.
+
+The shared extractor now preserves literal AST metric names and consistent
+exact `__name__` equality matchers, including learned queries. Additional
+constraints cannot expand an exact name; regexes are not evaluated to infer
+names. Conflicting literal name constraints or unproved selectors invalidate the
+complete operand set rather than allowing partial binding. Parse-failed
+name-matcher syntax abstains
+instead of introducing another query parser or restoring datasource defaults.
+Ingestion, compilation, validation and diagnostics retain their shared helper.
+
+The base freeform stage aliases cached discovery objects, but its permissive UID
+filter does not empty the cache in the reported ambiguous-then-unique scenario.
+The new ownership check correctly abstains on ambiguity, then mutates the
+cached candidates and prevents the later unique-owner run from recovering.
+A common deep working copy after cache hit/miss resolution isolates ownership
+filtering and query-builder mutations. Generic cache semantics, tenant/key
+partitioning, empty-result policy and token accounting remain unchanged.
+
+The two new modules contain 46 test-first regressions: 37 parser/owner cases
+and nine cache cases. Before/after reproductions establish the changeset
+attribution. Parser consumer validation passed 533 cases and cache-focused
+validation passed 181; independent architecture/security review cleared the
+complete repair diff. Historical capture formats and runtime ownership are
+unchanged. These are hermetic regression checks; live clean/representative
+long-lived 100-prompt and protected release evidence remain separate gates.
+
+Final validation: default suite 4,853 passed / 12 skipped; hermetic vendor
+integration 25 passed; complete browser/public end-to-end suite 56 passed.
+Ruff, Black (364 files), mypy (171 sources), Grounding (40/40), Operational
+Learning (18/18), deterministic cold/taught resolution and diff checks passed.
+Linux ARM64 Docker build and the installed exact-name/partial-operand rejection
+smoke passed as UID 999 with a read-only filesystem and networking disabled.
+
 ## Real Telemetry Roadmap
 
 The synthetic benchmark remains the fast regression layer. The staged plan for evaluating Tacit with public metrics, logs, and traces is documented in [Real Telemetry Dataset Testing Roadmap](telemetry-dataset-testing-roadmap.md). Its first milestone is attached to the checkout demo; later datasets are isolated in separate branches and evaluated against source-specific ground truth.
