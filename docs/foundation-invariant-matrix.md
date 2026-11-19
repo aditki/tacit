@@ -1068,6 +1068,22 @@ Final isolated allocation record: 180074 nodes/1890564 characters; private
 completion input: 192947 nodes/1985684 characters. Derived-prefix rejection
 high-water: 16240351 traced bytes. No new lifecycle or accounting authority.
 
+Review regression amendment: Prometheus-compatible inventory retention must
+prioritize actual keyword matches over ordinary unrelated names, then retain
+bounded backfill; excluded `_created`/`_info` noise alone does not test this
+invariant. Cover normal-name limit-plus-one, reverse ordering and below-cap
+backfill across Prometheus, Mimir, Cortex and Thanos. The shared adapter
+coordinator assigns one absolute deadline before inventory and carries its
+remaining time into enrichment for every phased adapter. Expiry preserves
+admitted names and records incomplete metadata, without restarting the timeout
+or converting cancellation/authority loss into success. Inventory and
+enrichment remain inside the existing adopted backend operation; its service
+owner retains cancellation settlement, capacity release and cleanup authority.
+Direct SignalFx and standalone native adapter acquisition use that same
+deadline-aware enrichment boundary, with their own pinned client settings.
+No path may bypass the deadline merely because it does not use Grafana's
+multi-datasource coordinator.
+
 ## Measured evidence implementation gate
 
 One measured-query boundary preserves bounded finite values from already-issued

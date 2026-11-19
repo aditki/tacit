@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Literal
 
 import structlog
@@ -211,6 +212,7 @@ async def discover_all_metrics_with_metadata(client, datasources, keywords, work
             sources.append(CatalogSourceStatus(backend="grafana", summary=True, reasons=("work_limit",)))
             break
         admitted_sources += 1
+        adapter_deadline = time.monotonic() + active_settings.adapter_timeout_seconds
         try:
             typed = getattr(adapter, "discover_metrics_with_metadata", None)
             if callable(typed):
@@ -221,7 +223,7 @@ async def discover_all_metrics_with_metadata(client, datasources, keywords, work
                     timeout=active_settings.adapter_timeout_seconds,
                 )
                 if phased:
-                    enrichments.append((ds, result.as_list()))
+                    enrichments.append((ds, result.as_list(), adapter_deadline))
             else:
                 from tacit.acquisition import legacy_acquisition_catalog
 
@@ -268,14 +270,16 @@ async def discover_all_metrics_with_metadata(client, datasources, keywords, work
                     reasons=("provider_failed",),
                 )
             )
-    from tacit.acquisition import enrich_adapter_metrics
+    from tacit.acquisition import enrich_adapter_metrics_before_deadline
 
     updates: dict[tuple[str, str, str, str], list[MetricEntry]] = {}
-    for ds, retained in enrichments:
+    for ds, retained, adapter_deadline in enrichments:
         if work_budget.acquisition_calls >= work_budget.max_acquisition_calls:
             sources.append(CatalogSourceStatus(backend="grafana", summary=True, reasons=("work_limit",)))
             break
-        enriched = await enrich_adapter_metrics(client, ds, retained, work_budget)
+        enriched = await enrich_adapter_metrics_before_deadline(
+            client, ds, retained, work_budget, deadline=adapter_deadline
+        )
         sources.extend(enriched.sources)
         for entry in enriched.entries:
             updates.setdefault((entry.datasource_uid, entry.query_language, entry.name, entry.namespace), []).append(

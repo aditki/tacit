@@ -246,6 +246,31 @@ acquisition imports, packaged resource checks and UID-999 assertion. The image
 uses the configured `tacit` user. This completes the local container gate;
 protected release evidence remains outstanding.
 
+### PR review follow-up, 2026-11-18
+
+PR #105's first CI run reached 4,719 passing tests and two skips, then failed
+because the isolated five-graph tracemalloc workload exceeded its 60-second
+child guard on shared Linux. The fixed workload and memory assertions remain
+unchanged; its bounded measurement guard is now 180 seconds. This is not a
+production query or pipeline timeout change.
+
+Automated review also exposed two gaps in the original test coverage. Ordinary
+unrelated Prometheus names could displace a lexically late keyword match at the
+entry limit; the prior noise-suffix fixture did not exercise that case. Native
+keyword priority now survives both selection and entry admission with bounded
+backfill and an actual exhaustion witness. Separate inventory and enrichment
+phases now share one absolute adapter deadline, including direct SignalFx and
+standalone native adapters through the same acquisition helper. Metadata timeout
+retains admitted names and records incomplete provider metadata; cancellation
+continues to propagate after the owned operation settles.
+
+The ordinary-name and phased-deadline matrix first reproduced 12 failures; its
+14 focused cases then passed. A direct SignalFx deadline case separately ran
+red before the shared-boundary repair. The final acquisition/capture/replay
+focused suite passed 118 tests in 47.01 seconds, including the unchanged
+allocation workload. Ruff, Black, mypy (170 files), Grounding (40 cases) and
+Operational Learning (18 cases) passed. CI revalidates the complete final merge.
+
 ## Real Telemetry Roadmap
 
 The synthetic benchmark remains the fast regression layer. The staged plan for evaluating Tacit with public metrics, logs, and traces is documented in [Real Telemetry Dataset Testing Roadmap](telemetry-dataset-testing-roadmap.md). Its first milestone is attached to the checkout demo; later datasets are isolated in separate branches and evaluated against source-specific ground truth.

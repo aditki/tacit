@@ -401,7 +401,9 @@ assert peaks["five_pipeline_graphs"] < 5 * 512 * 1024 * 1024
         capture_output=True,
         text=True,
         check=True,
-        timeout=60,
+        # This child measures a fixed allocation workload, not a latency SLO.
+        # Tracemalloc is materially slower on shared Linux CI than native macOS.
+        timeout=180,
     )
     measurements = json.loads(completed.stdout.strip().splitlines()[-1])
     assert measurements["five_pipeline_graphs"] > 0
@@ -765,6 +767,235 @@ async def test_native_inventory_filters_before_bounded_retention(provider):
         )
         assert any(entry.name.endswith("z_required_metric") for entry in result.entries)
         assert len(result.entries) == 1
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["prometheus", "mimir", "cortex", "thanos"])
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_prometheus_keyword_matches_survive_ordinary_name_cap_with_backfill(provider, reverse):
+    import json
+
+    from tacit.acquisition import discover_adapter_metrics
+    from tacit.models.schemas import DatasourceInfo
+
+    names = [*[f"a_unrelated_{i:04}" for i in range(5001)], "z_required_requests_total"]
+    if reverse:
+        names.reverse()
+    client = GrafanaClient()
+    await client.close()
+    client._http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=Chunks([json.dumps({"data": names}).encode()]))
+        ),
+        base_url=client.base_url,
+    )
+    try:
+        result = await discover_adapter_metrics(
+            client,
+            DatasourceInfo(uid="source", name=provider, type=provider),
+            ["required"],
+            budget(),
+            enrich=False,
+        )
+        retained = {entry.name for entry in result.entries}
+        assert "z_required_requests_total" in retained
+        assert len(retained) == 5000
+        inventory = next(source for source in result.sources if "metric_names" in source.terms)
+        assert inventory.returned_count == 5002 and inventory.retained_count == 5000
+        assert inventory.disposition == "incomplete" and "local_cap" in inventory.reasons
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_prometheus_matching_does_not_discard_below_cap_backfill():
+    import json
+
+    from tacit.acquisition import discover_adapter_metrics
+    from tacit.models.schemas import DatasourceInfo
+
+    names = ["a_other", "z_required", "b_other"]
+    client = GrafanaClient()
+    await client.close()
+    client._http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=Chunks([json.dumps({"data": names}).encode()]))
+        ),
+        base_url=client.base_url,
+    )
+    try:
+        result = await discover_adapter_metrics(
+            client, DatasourceInfo(uid="source", name="Prom", type="prometheus"), ["required"], budget(), enrich=False
+        )
+        assert {entry.name for entry in result.entries} == set(names)
+        assert result.sources[0].disposition == "complete"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["prometheus", "signalfx", "cloudwatch", "loki"])
+async def test_phased_adapter_deadline_covers_inventory_and_enrichment(provider, monkeypatch):
+    import asyncio
+
+    from tacit.catalog import CatalogSourceStatus, MetricCatalogResult
+    from tacit.config import Settings
+    from tacit.grafana.datasource import discover_all_metrics_with_metadata
+    from tacit.models.schemas import DatasourceInfo, MetricEntry
+
+    enrichment_settled = asyncio.Event()
+    entry = MetricEntry(
+        name="requested_metric",
+        datasource_uid="source",
+        datasource_name="Source",
+        datasource_type=provider,
+        query_language="promql",
+    )
+
+    class Adapter:
+        supports_acquisition_inventory_phase = True
+        query_language = "promql"
+
+        async def discover_metrics_with_metadata(self, client, datasource, keywords, work_budget, *, enrich):
+            assert enrich is False
+            await asyncio.sleep(0.2)
+            return MetricCatalogResult(
+                entries=[entry],
+                sources=[
+                    CatalogSourceStatus(
+                        backend="grafana", datasource_uid="source", datasource_type=provider, query_language="promql"
+                    )
+                ],
+            )
+
+    async def enrich(client, datasource, retained, work_budget, *, backend="grafana"):
+        try:
+            await asyncio.sleep(0.9)
+            return MetricCatalogResult(entries=retained)
+        finally:
+            enrichment_settled.set()
+
+    monkeypatch.setattr("tacit.grafana.datasource.get_adapter", lambda datasource: Adapter())
+    monkeypatch.setattr("tacit.acquisition.enrich_adapter_metrics", enrich)
+    settings = Settings(_env_file=None, adapter_timeout_seconds=1)
+    client = GrafanaClient(runtime_settings=settings)
+    try:
+        result = await asyncio.wait_for(
+            discover_all_metrics_with_metadata(
+                client,
+                [DatasourceInfo(uid="source", name="Source", type=provider)],
+                ["requested"],
+                budget(),
+                runtime_settings=settings,
+            ),
+            timeout=3,
+        )
+        assert enrichment_settled.is_set()
+        assert [item.name for item in result.entries] == ["requested_metric"]
+        assert any(
+            source.datasource_uid == "source"
+            and source.disposition == "incomplete"
+            and "enrichment" in source.terms
+            and "provider_failed" in source.reasons
+            for source in result.sources
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_phased_enrichment_cancellation_settles_and_is_not_partial_success(monkeypatch):
+    import asyncio
+
+    from tacit.catalog import MetricCatalogResult
+    from tacit.grafana.datasource import discover_all_metrics_with_metadata
+    from tacit.models.schemas import DatasourceInfo, MetricEntry
+
+    started, settled = asyncio.Event(), asyncio.Event()
+    entry = MetricEntry(
+        name="requested",
+        datasource_uid="source",
+        datasource_name="Source",
+        datasource_type="prometheus",
+        query_language="promql",
+    )
+
+    class Adapter:
+        supports_acquisition_inventory_phase = True
+        query_language = "promql"
+
+        async def discover_metrics_with_metadata(self, *args, **kwargs):
+            return MetricCatalogResult(entries=[entry])
+
+    async def enrich(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            settled.set()
+
+    monkeypatch.setattr("tacit.grafana.datasource.get_adapter", lambda datasource: Adapter())
+    monkeypatch.setattr("tacit.acquisition.enrich_adapter_metrics", enrich)
+    client = GrafanaClient()
+    task = asyncio.create_task(
+        discover_all_metrics_with_metadata(
+            client, [DatasourceInfo(uid="source", name="Source", type="prometheus")], [], budget()
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert settled.is_set()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_signalfx_shares_inventory_enrichment_deadline_and_retains_names():
+    import asyncio
+    import json
+
+    from tacit.config import Settings
+    from tacit.signalfx.discovery import discover_metrics_with_metadata
+
+    settled = asyncio.Event()
+    paths = []
+
+    async def handle(request):
+        paths.append(request.url.path)
+        if request.url.path.endswith("/metric"):
+            await asyncio.sleep(0.2)
+            body = {"count": 1, "results": [{"name": "requested_metric"}]}
+        else:
+            try:
+                await asyncio.sleep(0.9)
+                body = {"results": []}
+            finally:
+                settled.set()
+        return httpx.Response(200, stream=Chunks([json.dumps(body).encode()]))
+
+    settings = Settings(_env_file=None, adapter_timeout_seconds=1)
+    client = SignalFxClient(runtime_settings=settings)
+    await client.close()
+    client._http_client = httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="https://test.invalid")
+    try:
+        result = await asyncio.wait_for(discover_metrics_with_metadata(client, ["requested"], budget()), timeout=3)
+        assert settled.is_set()
+        assert [entry.name for entry in result.entries] == ["requested_metric"]
+        assert len(paths) == 2
+        assert any(
+            source.backend == "signalfx"
+            and source.disposition == "incomplete"
+            and "enrichment" in source.terms
+            and "provider_failed" in source.reasons
+            for source in result.sources
+        )
     finally:
         await client.close()
 
