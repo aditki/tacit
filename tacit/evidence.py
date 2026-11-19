@@ -19,7 +19,13 @@ from typing import Any
 import structlog
 
 from tacit.archetypes.schema import InvestigationArchetype
-from tacit.catalog import catalog_for_services, record_query_selection, select_query_target
+from tacit.catalog import (
+    QueryTargetCatalog,
+    catalog_for_services,
+    query_target_catalog,
+    record_query_selection,
+    select_query_target,
+)
 from tacit.knowledge.usage import KnowledgeRevisionRef
 from tacit.models.schemas import (
     DashboardSpec,
@@ -522,12 +528,16 @@ def contributing_archetypes(
     return contributed
 
 
-def _unique_owner(entries: list[MetricEntry]) -> MetricEntry | None:
+def _unique_owner(
+    entries: list[MetricEntry], ownership_catalog: QueryTargetCatalog | None = None
+) -> MetricEntry | None:
     names = {entry.name for entry in entries if entry.name}
     languages = {entry.query_language for entry in entries}
     if len(names) != 1 or len(languages) != 1:
         return None
-    selected = select_query_target(entries, names, next(iter(languages)))
+    selected = select_query_target(
+        ownership_catalog if ownership_catalog is not None else entries, names, next(iter(languages))
+    )
     target = selected.target
     if target is None:
         return None
@@ -552,6 +562,7 @@ def resolve_declared_requirements_for_archetype(
     work_budget: EvidenceObservationWorkBudget | None = None,
     signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
     _work_admitted: bool = False,
+    _ownership_catalog: QueryTargetCatalog | None = None,
 ) -> list[EvidenceResolution]:
     """Bind already-declared evidence needs for one archetype."""
     from tacit.archetypes.engine import (
@@ -573,6 +584,7 @@ def resolve_declared_requirements_for_archetype(
             catalog,
             intent,
         )
+    ownership_catalog = query_target_catalog(catalog, _prepared=_ownership_catalog)
 
     query_languages = _archetype_query_languages(archetype, target_language)
     target_catalog = [
@@ -596,7 +608,7 @@ def resolve_declared_requirements_for_archetype(
         semantic_score: float = 1.0,
         ownership_score: float = 1.0,
     ) -> EvidenceResolution:
-        selected = select_query_target(target_catalog, {entry.name}, entry.query_language)
+        selected = select_query_target(ownership_catalog, {entry.name}, entry.query_language)
         record_query_selection(
             selected,
             consumer="declared_evidence",
@@ -604,7 +616,8 @@ def resolve_declared_requirements_for_archetype(
             required_metrics={entry.name},
             query_language=entry.query_language,
         )
-        if selected.target is None:
+        target = selected.target
+        if target is None:
             return EvidenceResolution(
                 requirement_id=requirement.id, status=EvidenceResolutionStatus.UNRESOLVED, reason_code=selected.reason
             )
@@ -613,9 +626,9 @@ def resolve_declared_requirements_for_archetype(
             status=EvidenceResolutionStatus.RESOLVED,
             reason_code=reason_code,
             metric=entry.name,
-            datasource_uid=entry.datasource_uid,
-            datasource_type=entry.datasource_type,
-            query_language=entry.query_language,
+            datasource_uid=target.datasource_uid,
+            datasource_type=target.datasource_type,
+            query_language=target.query_language,
             semantic_score=semantic_score,
             ownership_score=ownership_score,
         )
@@ -623,9 +636,9 @@ def resolve_declared_requirements_for_archetype(
     for requirement in requirements:
         default_metric = requirement.default_metric
         if default_metric and default_metric in catalog_by_name:
-            owner = _unique_owner(catalog_by_name[default_metric])
+            owner = _unique_owner(catalog_by_name[default_metric], ownership_catalog)
             if owner is None:
-                choice = select_query_target(target_catalog, {default_metric}, target_language)
+                choice = select_query_target(ownership_catalog, {default_metric}, target_language)
                 record_query_selection(
                     choice,
                     consumer="declared_evidence",
@@ -834,6 +847,7 @@ def resolve_declared_requirements_for_archetypes(
     """Bind a frozen declaration set for the selected archetypes."""
     budget = work_budget or EvidenceObservationWorkBudget(work_limits or EvidenceObservationWorkLimits())
     budget.validate_resolution_plan(ranked_archetypes, requirements, catalog, intent)
+    ownership_catalog = query_target_catalog(catalog)
     requirements_by_source: dict[str, list[EvidenceRequirement]] = defaultdict(list)
     for requirement in requirements:
         requirements_by_source[requirement.source].append(requirement)
@@ -858,6 +872,7 @@ def resolve_declared_requirements_for_archetypes(
                 work_budget=budget,
                 signal_resolution_work_budget=signal_resolution_work_budget,
                 _work_admitted=True,
+                _ownership_catalog=ownership_catalog,
             )
         )
     return resolutions

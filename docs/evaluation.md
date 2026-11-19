@@ -308,6 +308,58 @@ network-disabled, read-only, UID-999 installed-parser/translator/resource smoke
 also passed. CI revalidates the pushed commit and its stacked measured-evidence
 integration independently.
 
+### Additional acquisition review repairs
+
+Three further PR #105 findings exposed completed-fact loss, a native fallback
+compatibility gap and repeated synchronous normalization. The shared enrichment
+operation now retains completed metadata definitions and dimensions when a later
+request expires. Raw direct-helper inputs reserve identity capacity once;
+already-retained inventory uses its existing reservation. Phased aggregation
+preserves complete conflicting fact groups, rejects foreign identities and
+checks physical growth before retention. Timeout joins existing cancellation
+settlement; caller cancellation still propagates and later I/O does not run.
+
+Typed Loki acquisition restores a bounded available-labels fallback whenever
+custom labels exist, including mixed standard/custom sources. Failed or empty
+enumeration creates no usable fallback. Recognized labels are filtered before
+retention, requested custom labels receive bounded priority, truncated results
+remain incomplete, and the fallback consumes none of the six stream-value
+probes.
+
+Compilation/blending, declared evidence, both rescue builders, freeform selection
+and capture validation reuse one explicitly owned admitted lookup view per
+operation. The index preserves full-catalog conflicts and exact ownership while
+avoiding whole-catalog copying, validation and hashing on each query. Ordinary
+construction derives normalization from raw facts; fabricated/mismatched views
+are rejected. Private snapshots and defensive targets isolate mutations and
+concurrent operations. No cache spans investigations and no new runtime owner,
+worker, permit or cleanup authority is introduced.
+
+The two new test modules contain 39 regression cases, with failures recorded
+before their fixes. Acquisition-focused validation passed 259 cases; lookup
+validation passed its 15 new cases plus existing capture, evidence, routing and
+work-limit suites. Independent architecture/security review cleared the complete
+repair diff. On the same CPython 3.12 macOS environment, the identical 5,000-fact,
+ten-query bare-PromQL compilation took 1.6725 seconds before and 0.1731 seconds
+after. That timing is illustrative; deterministic work-count regressions enforce
+one normalization per public operation and no full-catalog copies/validation per
+lookup. These checks do not claim live incident-quality improvement.
+
+The isolated allocation probe additionally co-retained one indexed catalog with
+each of the five adversarial completion graphs, measuring 219,789,099 traced
+bytes and 462,094,336 RSS bytes under the unchanged limits. Historical capture
+schemas, identity hashes and replay formats remain unchanged. The live
+100-prompt clean/representative long-lived and protected release gates remain
+separate from these hermetic regressions.
+
+Final validation of these repairs: default suite 4,807 passed / 12 skipped;
+hermetic vendor integration 25 passed; complete browser/public end-to-end suite
+56 passed. Ruff, Black (362 files), mypy (171 source files), Grounding (40/40),
+Operational Learning (18/18), the deterministic cold/taught gate and diff checks
+passed. Linux ARM64 Docker build and a network-disabled, read-only UID-999
+installed-index/enrichment smoke passed. CI validates the pushed acquisition
+commit and the separate measured-evidence integration.
+
 ## Real Telemetry Roadmap
 
 The synthetic benchmark remains the fast regression layer. The staged plan for evaluating Tacit with public metrics, logs, and traces is documented in [Real Telemetry Dataset Testing Roadmap](telemetry-dataset-testing-roadmap.md). Its first milestone is attached to the checkout demo; later datasets are isolated in separate branches and evaluated against source-specific ground truth.

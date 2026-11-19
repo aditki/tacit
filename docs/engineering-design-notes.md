@@ -2137,6 +2137,37 @@ quoted strings and nested delimiters, so selector values containing slashes
 remain literal data. Unsupported translation still fails publication preflight
 before any backend writes.
 
+An enrichment deadline must preserve completed admitted work, not merely the
+initial inventory. The existing operation keeps bounded completed metadata and
+dimensions locally, then finalizes them after normal completion or joined
+timeout cancellation. A later series/label timeout cannot erase a known unit or
+type conflict. Caller cancellation still propagates; the service owner and
+original deadline retain their existing lifecycle authority.
+Raw direct-helper inputs reserve identity capacity before enrichment. Internal
+inventory paths skip that reservation only for their actual admitted subset;
+the coordinator rejects new identities and applies complete fact groups once.
+Finalization uses bounded fact admission rather than re-reserving known facts,
+so budget contention cannot turn conflicting evidence into a unique owner.
+
+Loki's label inventory also feeds freeform query construction. Custom labels
+need a bounded `loki:available_labels` entry even when recognized stream labels
+are present. That entry describes admitted available labels, not observed log
+values, and does not consume one of the six stream-value probes. Failed/empty
+enumeration supplies no synthetic usable fallback; truncated labels remain
+explicitly incomplete.
+
+Repeated exact-owner checks need one admitted indexed view per operation.
+Reusing normalization alone is insufficient if a public `entries` property
+still deep-copies every metric on every lookup. Keep full-catalog conflicts and
+private immutable indices, return defensive targets, and explicitly share the
+view with nested compiler/evidence/rescue calls. Ordinary view construction
+must derive its own normalization rather than trusting a caller's conflict
+tuple. No global, context-local or object-identity cache may span investigations.
+Raw-input mutation and returned-target mutation cannot change the admitted
+snapshot; fresh public calls admit fresh facts. Capture construction/admission
+remain independent checks. The bounded view expires with its operation and
+adds no runtime resource, scheduling or cleanup owner.
+
 ### Acquisition allocation evidence (2026-11-18)
 
 Typed acquisition currently schedules one adapter/search operation at a time in
@@ -2177,6 +2208,16 @@ response decode/derived-name phase retires before completion preparation; the
 static ceiling applies to each phase's live objects, not their historical sum.
 These measurements support this declared configuration, not a generic decoder
 memory multiplier or the former maximum of 1,000 simultaneous acquisitions.
+
+The lookup-reuse amendment retains one bounded normalized catalog and index
+inside each compilation/resolution operation, within the existing bounded-model
+allowance; it replaces per-query normalization and whole-catalog output copies.
+The view does not survive the operation into completion preparation. The stress
+fixture nevertheless retains one 5,000-fact indexed view alongside each of the
+five complete graphs above. This stronger co-residency probe measured
+219,789,099 traced bytes and 462,094,336 process RSS bytes on the same CPython
+3.12 macOS environment, with all existing admission and memory assertions intact.
+The declared 512 MiB/pipeline ceiling and five-pipeline maximum remain unchanged.
 
 Read accounting conservatively charges a whole bounded raw-chunk allowance
 before requesting it, including the final EOF probe. Unused allowances are not

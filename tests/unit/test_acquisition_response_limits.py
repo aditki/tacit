@@ -254,7 +254,7 @@ def test_effective_acquisition_configuration_rejects_unmeasured_concurrency_and_
 
 
 def test_isolated_adversarial_allocation_envelope():
-    """Retain five concurrent raw/decoded/catalog/capture graphs in a child."""
+    """Retain five raw/catalog/index/capture graphs in an isolated child."""
     import json
     import subprocess
     import sys
@@ -266,6 +266,7 @@ from tacit.acquisition import _admit_json_body, _select_inventory_names
 from tacit.grafana.adapters.elasticsearch import _iter_fields
 from tacit.catalog import (
     MetricCatalogResult,
+    QueryTargetCatalog,
     CatalogSourceStatus,
     acquisition_entry_id,
     build_acquisition_capture,
@@ -357,6 +358,7 @@ for pipeline in range(5):
         retained_entry_ids=tuple(acquisition_entry_id(entry) for entry in entries),
     )
     result = MetricCatalogResult(entries=entries, sources=(source,))
+    ownership = QueryTargetCatalog(result)
     record = build_acquisition_capture(result)
     encoded = canonical_acquisition_bytes(record)
     contexts = [ContextChunk(source="runbook", content="x" * 15500, metadata={"tree": [0] * 1500}) for _ in range(128)]
@@ -384,7 +386,7 @@ for pipeline in range(5):
     preflight_contract = InvestigationContractAssembler().from_pipeline(
         **prepared.assembly_inputs, dashboard_url="", dashboard_uid="", signalfx_url="", signalfx_dashboard_id=""
     )
-    retained.append((raw, decoded, entries, result, record, encoded, inputs, prepared, preflight_contract))
+    retained.append((raw, decoded, entries, result, ownership, record, encoded, inputs, prepared, preflight_contract))
 peaks["five_pipeline_graphs"] = tracemalloc.get_traced_memory()[1]
 peaks["record_nodes"] = record_nodes
 peaks["record_characters"] = record_characters
@@ -870,7 +872,7 @@ async def test_phased_adapter_deadline_covers_inventory_and_enrichment(provider,
                 ],
             )
 
-    async def enrich(client, datasource, retained, work_budget, *, backend="grafana"):
+    async def enrich(client, datasource, retained, work_budget, *, backend="grafana", _progress=None):
         try:
             await asyncio.sleep(0.9)
             return MetricCatalogResult(entries=retained)

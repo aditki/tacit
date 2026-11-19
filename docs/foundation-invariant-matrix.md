@@ -1111,6 +1111,44 @@ UIDs are rejected rather than becoming replay authority.
 These are pure parsing/identity repairs: the existing runtime, work-budget,
 publication, cancellation and cleanup owners remain unchanged.
 
+Completed-fact and lookup-reuse review amendment: the shared adapter enrichment
+deadline boundary retains completed admitted metadata definitions, dimensions
+and search statuses when later enrichment expires. It marks unfinished work
+incomplete without reverting discovered conflicts to inventory-only facts.
+Cover Grafana coordinator, standalone Prometheus-family adapters and direct
+SignalFx entry points, deadline-before-start, later-request timeout, cancellation,
+caps and zero later I/O. Checkpoints are local to the existing adopted operation;
+its service owner still owns cancellation settlement, capacity and cleanup.
+No detached task, new timeout, permit, worker or cleanup owner is introduced.
+Raw direct-helper inputs reserve identities once before enrichment; proven
+retained inputs use their existing reservation. The phased coordinator queues
+only globally admitted identities, applies updates once per identity and uses
+the same bounded fact admission at finalization. Re-reserving completed known
+facts after deadline or budget-lock contention must not erase them; arbitrary
+raw inputs cannot use that internal path to bypass identity capacity.
+
+Typed Loki inventory preserves a bounded available-labels fallback for custom
+labels through the shared acquisition path. Source membership and completeness
+must describe retained facts; failed or empty enumeration cannot fabricate a
+usable stream. Cover adapter/coordinator/freeform use, name/dimension/text and
+entry bounds, truncation and no custom-label value fetches.
+
+Owner lookups share one explicitly owned admitted catalog view across repeated
+queries in compiler, declared evidence, symptom/gap rescue and freeform stages.
+Capture construction/admission remain independent trust boundaries. Reuse may
+not discard conflicts, bypass admission, expose mutable retained facts, retain
+unbounded results, or create an implicit global/identity cache across runs or
+tenants. Test normalization, whole-catalog copying and hashing counts through
+public multi-query operations; merely caching normalization while copying the
+full catalog per lookup is insufficient. Mutation, conflict/order/UID/language
+parity, representative 5,000-fact workloads, independent/concurrent operations
+and exact capture/replay remain required. Existing runtime and work-budget
+owners are unchanged: no new lifecycle or cleanup authority is involved.
+The isolated five-graph allocation probe additionally co-retains one indexed
+5,000-fact view per operation: 219789099 traced bytes / 462094336 RSS bytes
+on CPython 3.12 macOS, under the unchanged 512 MiB/pipeline envelope. This
+adversarial co-residency exceeds the view's actual operation-local lifetime.
+
 ## Quality gates
 
 | Change area | Minimum additional gate |

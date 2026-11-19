@@ -26,7 +26,13 @@ from tacit.archetypes.schema import (
     PanelTemplate,
     QueryTemplate,
 )
-from tacit.catalog import catalog_for_services, record_query_selection, select_query_target
+from tacit.catalog import (
+    QueryTargetCatalog,
+    catalog_for_services,
+    query_target_catalog,
+    record_query_selection,
+    select_query_target,
+)
 from tacit.errors import AUTHORITY_BOUNDARY_ERRORS, safe_failure_diagnostics
 from tacit.knowledge.usage import (
     KnowledgeRevisionRef,
@@ -681,7 +687,7 @@ def _resolve_query_target(
 
 
 def _bound_query_target(
-    catalog: list[MetricEntry],
+    catalog: list[MetricEntry] | QueryTargetCatalog,
     names: set[str],
     language: str,
     *,
@@ -710,7 +716,7 @@ def _bound_query_target(
 
 
 def _resolve_promql_query_target(
-    catalog: list[MetricEntry],
+    catalog: list[MetricEntry] | QueryTargetCatalog,
     expr: str,
     default_target: QueryTarget,
     intent: Intent,
@@ -724,7 +730,7 @@ def _resolve_promql_query_target(
 
 
 def _resolve_native_query_target(
-    catalog: list[MetricEntry],
+    catalog: list[MetricEntry] | QueryTargetCatalog,
     datasource_type: str,
     query_language: str,
     metric_names: set[str],
@@ -1365,6 +1371,7 @@ def compile_archetype(
     knowledge_scope: Any | None = None,
     resolution_work_budget: SignalResolutionWorkBudget | None = None,
     work_limits: ArchetypeCoverageWorkLimits | None = None,
+    _ownership_catalog: QueryTargetCatalog | None = None,
 ) -> DashboardSpec:
     """Compile an archetype template into a concrete DashboardSpec.
 
@@ -1385,6 +1392,7 @@ def compile_archetype(
         services=intent.services,
         work_limits=limits,
     )
+    ownership_catalog = query_target_catalog(catalog, _prepared=_ownership_catalog)
 
     # Resolve signals → actual metrics before compiling templates
     governance_refs_by_template_query: dict[tuple[int, int], set[KnowledgeRevisionRef]] = {}
@@ -1456,14 +1464,14 @@ def compile_archetype(
                     from tacit.dashboard_ingest.signalflow import extract_metrics_from_signalflow
 
                     query_target = _bound_query_target(
-                        catalog,
+                        ownership_catalog,
                         set(extract_metrics_from_signalflow(expr)),
                         "signalflow",
                         subject_ref=f"{archetype.id}/{panel_index + 1}/{query_index + 1}",
                     )
                 else:
                     query_target = _resolve_promql_query_target(
-                        catalog,
+                        ownership_catalog,
                         expr,
                         default_target,
                         intent,
@@ -1489,7 +1497,7 @@ def compile_archetype(
                 elif qt.cloudwatch_namespace and not expr.startswith(f"{qt.cloudwatch_namespace}/"):
                     native_metric_names = {f"{qt.cloudwatch_namespace}/{expr}"}
                 query_target = _resolve_native_query_target(
-                    catalog,
+                    ownership_catalog,
                     query_datasource_type,
                     qt_language,
                     native_metric_names,
@@ -2017,6 +2025,7 @@ def blend_archetypes(
     learned_archetype_min_coverage: float = 0.75,
     learned_archetype_boost: float = 0.15,
     max_dashboard_panels: int = 10,
+    _ownership_catalog: QueryTargetCatalog | None = None,
 ) -> DashboardSpec:
     """Blend panels from multiple archetypes into a single dashboard.
 
@@ -2056,6 +2065,7 @@ def blend_archetypes(
         knowledge_scope=knowledge_scope,
     )
     max_panels = max_dashboard_panels
+    ownership_catalog = query_target_catalog(catalog, _prepared=_ownership_catalog)
 
     primary_arch, primary_conf = ranked_archetypes[0]
     compiled_query_uses: list[KnowledgeQueryUse] = []
@@ -2068,6 +2078,7 @@ def blend_archetypes(
         tenant_id=tenant_id,
         knowledge_query_uses=compiled_query_uses,
         knowledge_scope=knowledge_scope,
+        _ownership_catalog=ownership_catalog,
     )
 
     # De-dup on the panel's *query signature* (the set of normalized query
@@ -2095,6 +2106,7 @@ def blend_archetypes(
             tenant_id=tenant_id,
             knowledge_query_uses=compiled_query_uses,
             knowledge_scope=knowledge_scope,
+            _ownership_catalog=ownership_catalog,
         )
         added = 0
         for panel in secondary_spec.panels:
