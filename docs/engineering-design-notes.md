@@ -2118,6 +2118,25 @@ declarations remain separate bounded facts until shared normalization records a
 conflict. Legacy adaptation, adapter aggregation and metadata enrichment share
 that boundary; selecting the first definition can falsely prove unique ownership.
 
+Backend aggregation must also count canonical identities rather than physical
+facts against the configured retained-entry limit. The independent 5,000-fact
+ceiling still applies before aggregate growth. Selection and capture admission
+use the same complete-owner, query-language-scoped identity set for conflicts;
+equal UIDs and metric names in another language do not make its metadata
+applicable to the selected query. Identity hashes and replay formats stay stable.
+Capture admission recomputes candidate owners even for metadata-conflict
+decisions, so a valid conflict cannot authorize a fabricated candidate UID.
+
+Native expressions need language-specific operand extraction before exact-owner
+selection. Graphite supports concrete paths and bounded `alias`, `scale`,
+`divideSeries` and `sumSeries` expressions; labels are not operands, and unknown
+functions, dynamic paths and malformed expressions abstain. The original query
+is preserved. This does not establish support for other native expression
+grammars. The shared SignalFlow translator recognizes division only outside
+quoted strings and nested delimiters, so selector values containing slashes
+remain literal data. Unsupported translation still fails publication preflight
+before any backend writes.
+
 ### Acquisition allocation evidence (2026-11-18)
 
 Typed acquisition currently schedules one adapter/search operation at a time in

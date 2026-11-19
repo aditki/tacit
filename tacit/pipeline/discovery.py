@@ -10,7 +10,7 @@ from typing import Any
 import structlog
 
 from tacit.backends.base import DashboardBackend
-from tacit.catalog import CatalogSourceStatus, MetricCatalogResult, catalog_for_services
+from tacit.catalog import CatalogSourceStatus, MetricCatalogResult, acquisition_entry_ids, catalog_for_services
 from tacit.errors import AUTHORITY_BOUNDARY_ERRORS, safe_failure_diagnostics
 from tacit.knowledge.usage import KnowledgeRevisionRef
 from tacit.models.schemas import Intent, MetricEntry
@@ -174,6 +174,7 @@ async def discover_catalogs(
     keywords = discovery_keywords(intent)
     budget = work_budget or SignalResolutionWorkBudget(10_000, 8_000_000, 100_000)
     metrics: list[MetricEntry] = []
+    identities: set[str] = set()
     targets: list[MetricEntry] = []
     sources: list[CatalogSourceStatus] = []
     types: list[str] = []
@@ -194,9 +195,15 @@ async def discover_catalogs(
                 work_budget=budget,
             )
         entries = result.as_list()
+        fact_count = len(metrics) + len(entries)
+        if fact_count > MAX_COLLOQUIAL_CATALOG_ENTRIES:
+            raise ColloquialConfirmationWorkLimitError("catalog_entries", fact_count, MAX_COLLOQUIAL_CATALOG_ENTRIES)
+        identities.update(acquisition_entry_ids(entries))
+        if len(identities) > budget.max_acquisition_entries:
+            raise ColloquialConfirmationWorkLimitError(
+                "catalog_entries", len(identities), budget.max_acquisition_entries
+            )
         metrics.extend(entries)
-        if len(metrics) > budget.max_acquisition_entries:
-            raise ColloquialConfirmationWorkLimitError("catalog_entries", len(metrics), budget.max_acquisition_entries)
         sources.extend(result.sources)
         if entries:
             types.append(backend.name)

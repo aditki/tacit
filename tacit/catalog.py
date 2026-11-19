@@ -130,6 +130,15 @@ def acquisition_entry_id(entry: MetricEntry | Mapping[str, Any]) -> str:
     )
 
 
+def acquisition_entry_ids(entries: Iterable[MetricEntry]) -> frozenset[str]:
+    """Collect canonical identities independently of their bounded metadata facts."""
+    identities: set[str] = set()
+    for count, entry in enumerate(entries, 1):
+        _limit("entries", count, ACQUISITION_LIMITS["entries"])
+        identities.add(acquisition_entry_id(entry))
+    return frozenset(identities)
+
+
 @dataclass(frozen=True, slots=True)
 class CatalogSourceStatus:
     """Immutable facts for one admitted search, before repeated-search aggregation."""
@@ -314,7 +323,7 @@ def legacy_metric_catalog(
     statuses = []
     search_terms = tuple(terms)
     for (uid, datasource_type, language), group in sorted(groups.items()):
-        retained_ids = tuple(sorted({acquisition_entry_id(entry) for entry in group}))
+        retained_ids = tuple(sorted(acquisition_entry_ids(group)))
         statuses.append(
             CatalogSourceStatus(
                 backend=backend,
@@ -471,12 +480,12 @@ def _select_normalized_target(
         complete = {uid: entries for uid, entries in complete.items() if uid == requested_uid}
     candidates = tuple(sorted(complete))
     _limit("candidate_uids", len(candidates), 64)
-    relevant_ids = {
-        acquisition_entry_id(entry)
-        for entries in complete.values()
-        for matches in entries.values()
-        for entry in matches
-    }
+    relevant_ids = _selection_entry_ids(
+        (entry for entries in complete.values() for matches in entries.values() for entry in matches),
+        operands,
+        language,
+        candidates,
+    )
     conflicts = tuple(conflict for conflict in normalized.conflicts if conflict.entry_id in relevant_ids)
     _limit("selection_conflicts", len(conflicts), 64)
     if conflicts:
@@ -495,6 +504,20 @@ def _select_normalized_target(
         else ("missing_operand" if available and available < operands else "no_owner")
     )
     return QueryTargetSelection("missing", None, reason=reason)
+
+
+def _selection_entry_ids(
+    entries: Iterable[MetricEntry], operands: set[str], query_language: str, candidate_uids: tuple[str, ...]
+) -> frozenset[str]:
+    """Scope conflicts to the exact language and complete owners used by selection."""
+    language = _language(query_language)
+    return acquisition_entry_ids(
+        entry
+        for entry in entries
+        if entry.datasource_uid in candidate_uids
+        and entry.name in operands
+        and _language(entry.query_language) == language
+    )
 
 
 def freeform_selection_subject(
@@ -1043,12 +1066,12 @@ def _validate_record(record: Mapping[str, Any]) -> None:
                 normalized, set(selection["required_metrics"]), selection["query_language"], selection["requested_uid"]
             )
         expected = selection_cache[cache_key]
-        relevant = {
-            conflict["id"]
-            for conflict in record["conflicts"]
-            if indexes["entries"][conflict["entry_id"]]["metric"]["datasource_uid"] in expected.candidate_uids
-            and indexes["entries"][conflict["entry_id"]]["metric"]["name"] in selection["required_metrics"]
-        }
+        if selection["candidate_uids"] != list(expected.candidate_uids):
+            raise AcquisitionCaptureInvalidError("selection_owner")
+        relevant_ids = _selection_entry_ids(
+            metrics, set(selection["required_metrics"]), selection["query_language"], expected.candidate_uids
+        )
+        relevant = {conflict["id"] for conflict in record["conflicts"] if conflict["entry_id"] in relevant_ids}
         if relevant:
             if (
                 selection["status"] != "ambiguous"
@@ -1057,11 +1080,7 @@ def _validate_record(record: Mapping[str, Any]) -> None:
             ):
                 raise AcquisitionCaptureInvalidError("selection_owner_conflict")
         else:
-            if (
-                selection["status"] != expected.status
-                or selection["reason"] != expected.reason
-                or selection["candidate_uids"] != list(expected.candidate_uids)
-            ):
+            if selection["status"] != expected.status or selection["reason"] != expected.reason:
                 raise AcquisitionCaptureInvalidError("selection_owner")
             if selection["target"] != (expected.target.model_dump() if expected.target is not None else None):
                 raise AcquisitionCaptureInvalidError("selection_target")

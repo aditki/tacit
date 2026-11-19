@@ -1084,6 +1084,33 @@ deadline-aware enrichment boundary, with their own pinned client settings.
 No path may bypass the deadline merely because it does not use Grafana's
 multi-datasource coordinator.
 
+Parser and catalog-identity review amendment: native archetype compilation and
+learned verbatim native queries resolve extracted operands through the same
+exact-owner boundary. Cover bounded native expressions, multiple operands,
+missing/ambiguous owners and labels that resemble metric names; unsupported
+syntax cannot fall back to an arbitrary default source. SignalFlow compilation,
+evidence/rescue, pipeline publication and standalone publisher translation share
+one quote/escape/bracket-aware division splitter. Slashes inside selector/string
+literals are data, while actual top-level division still uses the guarded
+translation rules. Tests cover both successful selectors and zero publication
+effects for unsupported expressions.
+
+Typed and legacy discovery aggregation, metadata expansion, source membership,
+ownership selection and capture validation share canonical metric identities
+(name, UID, datasource type, query language and namespace). Configured retained
+identity limits and the independent physical-fact ceiling are checked separately
+before aggregate growth. Conflicting metadata facts consume no extra identity,
+but still consume physical-fact work. Capture conflict applicability uses the
+same language-scoped complete-owner candidate identities as selection; a UID
+collision in another query language cannot import its conflicts. Red/green tests
+must cover lower configured identity limits, limit-plus-one identities/facts,
+ordering and same-UID cross-language captures without hiding same-scope conflicts.
+Capture admission must also recompute candidate owners for every decision,
+including metadata-conflict decisions; forged, omitted or substituted candidate
+UIDs are rejected rather than becoming replay authority.
+These are pure parsing/identity repairs: the existing runtime, work-budget,
+publication, cancellation and cleanup owners remain unchanged.
+
 ## Measured evidence implementation gate
 
 One measured-query boundary preserves bounded finite values from already-issued
