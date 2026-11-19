@@ -2168,6 +2168,20 @@ snapshot; fresh public calls admit fresh facts. Capture construction/admission
 remain independent checks. The bounded view expires with its operation and
 adds no runtime resource, scheduling or cleanup owner.
 
+Exact metric ownership includes PromQL selectors whose name is supplied by an
+exact `__name__` matcher rather than the selector's name field. Extract literal
+names through the shared parser, including learned queries; an unresolved
+selector in a compound expression cannot be ignored while other operands
+produce a complete-looking owner proof. Unsupported matcher syntax abstains
+rather than restoring a default datasource.
+
+Cached LLM discovery results describe unfiltered candidates. The freeform stage
+must copy a hit or newly cached result before ownership filtering and query
+building, including nested metric fields. A run-specific abstention must not
+poison a later run with a changed full catalog but identical prompt projection.
+The generic TTL cache remains reference-based; its discovery consumer owns this
+working-copy boundary without changing tenant keys, TTL or token accounting.
+
 ### Acquisition allocation evidence (2026-11-18)
 
 Typed acquisition currently schedules one adapter/search operation at a time in

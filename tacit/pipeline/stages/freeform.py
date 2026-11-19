@@ -143,6 +143,10 @@ async def build_freeform_dashboard(
             deps.llm_cache.set(discovery_cache_key, discovery)
         discovery_cached = False
 
+    # Cached candidates are shared; source authority and query building belong
+    # to this run and must not mutate the reusable LLM result or nested metrics.
+    discovery = discovery.model_copy(deep=True)
+
     stage_log(
         "metrics_discovery",
         (time.monotonic() - t_disc) * 1000,

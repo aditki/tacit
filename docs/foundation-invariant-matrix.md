@@ -1149,6 +1149,27 @@ The isolated five-graph allocation probe additionally co-retains one indexed
 on CPython 3.12 macOS, under the unchanged 512 MiB/pipeline envelope. This
 adversarial co-residency exceeds the view's actual operation-local lifetime.
 
+Exact-name and cached-discovery compatibility amendment: shared PromQL operand
+extraction must recognize exact `__name__` equality selectors before the new
+exact-owner boundary. Cover AST and conservative fallback parsing, learned
+query preservation, nested/multiple operands, missing/ambiguous owners and
+conflicting literal name constraints and unproved dynamic selectors. A partially
+understood selector must not supply a complete-looking operand set or restore
+arbitrary datasource defaults. The
+same parser feeds ingestion, compiler, validation, Grafana diagnostics and
+compiled-query recording; test these shared consumers where applicable.
+
+Freeform discovery cache values are reusable unfiltered model results, never
+run-specific ownership decisions. Cache hit and miss paths share one defensive
+run-local copy before filtering or passing mutable discovery to the query
+builder. Prove ambiguous/unavailable ownership followed by unique/present
+ownership recovers with an unchanged prompt projection/cache key, cached
+metrics and nested fields remain intact, denied runs make no builder/publication
+call, and tenant/key/token-usage/cache policy remain unchanged. No generic cache
+semantics, runtime resource, admission controller or cleanup authority changes.
+Attribute regressions against the PR base's observable behavior, rather than
+the age of the helper line, before deciding a review finding is out of scope.
+
 ## Measured evidence implementation gate
 
 One measured-query boundary preserves bounded finite values from already-issued
