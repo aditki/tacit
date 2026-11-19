@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import heapq
 import json
 import math
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import replace
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+import structlog
 
 from tacit.catalog import CatalogSourceStatus, MetricCatalogResult, acquisition_entry_id
 from tacit.errors import AUTHORITY_BOUNDARY_ERRORS
@@ -27,6 +30,7 @@ RAW_CHUNK_BYTES = 65_536
 MAX_JSON_NODES = 100_000
 MAX_JSON_DEPTH = 32
 MAX_DATASOURCES = 5000
+logger = structlog.get_logger()
 
 
 def standalone_acquisition_budget(settings: Any) -> SignalResolutionWorkBudget:
@@ -421,6 +425,7 @@ def _select_inventory_names(
     *,
     fallback_limit: int = 0,
     excluded_suffixes: tuple[str, ...] = (),
+    backfill: bool = False,
 ) -> tuple[list[str], bool]:
     """Filter each streamed candidate before bounded matching/fallback heaps."""
     matches: set[str] = set()
@@ -436,6 +441,12 @@ def _select_inventory_names(
             fallback_cap |= _offer_name(fallback_heap, fallback, name, fallback_limit, fallback_totals)
         if not terms or any(term in name.lower() for term in terms):
             match_cap |= _offer_name(match_heap, matches, name, limit, match_totals)
+    if backfill:
+        # Keep both match and backfill heaps bounded. Final admission likewise
+        # prioritizes matches, so the limit-plus-one witness cannot displace one.
+        remainder = sorted(fallback - matches)
+        selected = [*sorted(matches), *remainder[: max(0, limit - len(matches))]]
+        return sorted(selected), match_cap or fallback_cap or len(matches) + len(remainder) > limit
     return (sorted(matches), match_cap) if matches else (sorted(fallback), fallback_cap)
 
 
@@ -469,6 +480,49 @@ async def discover_adapter_metrics(
     enrich: bool = True,
 ) -> MetricCatalogResult:
     """Built-in adapter searches; bounded inventory precedes enrichment."""
+    from tacit.runtime_ownership import resolve_remote_runtime_settings
+
+    settings = resolve_remote_runtime_settings(boundary="metric_acquisition", owner=client, provider=backend)
+    adapter_deadline = time.monotonic() + settings.adapter_timeout_seconds
+    try:
+        result = await asyncio.wait_for(
+            _discover_adapter_inventory(client, datasource, keywords, work_budget, backend=backend),
+            timeout=max(0, adapter_deadline - time.monotonic()),
+        )
+    except TimeoutError:
+        logger.info("metric_inventory_incomplete", reason_code="adapter_timeout")
+        return MetricCatalogResult(
+            sources=(
+                CatalogSourceStatus(
+                    backend=backend,
+                    datasource_uid=datasource.uid,
+                    datasource_type=datasource.type,
+                    query_language=_query_language(datasource),
+                    terms=("inventory", *canonical_terms(keywords)),
+                    disposition="incomplete",
+                    reasons=("provider_failed",),
+                ),
+            )
+        )
+    if not enrich:
+        return result
+    enriched = await enrich_adapter_metrics_before_deadline(
+        client, datasource, result.as_list(), work_budget, deadline=adapter_deadline, backend=backend
+    )
+    return MetricCatalogResult(
+        entries=enriched.entries, sources=merge_search_sources((*result.sources, *enriched.sources))
+    )
+
+
+async def _discover_adapter_inventory(
+    client: Any,
+    datasource: DatasourceInfo,
+    keywords: list[str],
+    work_budget: SignalResolutionWorkBudget,
+    *,
+    backend: str,
+) -> MetricCatalogResult:
+    """Shared inventory phase; its admitted caller owns the deadline."""
     ds = datasource
     terms = canonical_terms(keywords)
     tracker = AcquisitionSearches(backend, work_budget, ds)
@@ -500,7 +554,12 @@ async def discover_adapter_metrics(
     if _query_language(ds) == "promql":
         data = await get("api/v1/label/__name__/values", ("metric_names", *terms), terminal=True)
         names, name_cap = _select_inventory_names(
-            _iter_names(data), (), inventory_limit, excluded_suffixes=("_created", "_info")
+            _iter_names(data),
+            terms,
+            inventory_limit,
+            fallback_limit=inventory_limit,
+            excluded_suffixes=("_created", "_info"),
+            backfill=True,
         )
         local_cap |= name_cap
         inventory = [(name, "", []) for name in names]
@@ -628,7 +687,10 @@ async def discover_adapter_metrics(
     if len(inventory) > inventory_limit:
         local_cap = True
     inventory = inventory[:inventory_limit]
-    for name, namespace, dimensions in sorted(set((name, ns, tuple(dims)) for name, ns, dims in inventory)):
+    for name, namespace, dimensions in sorted(
+        set((name, ns, tuple(dims)) for name, ns, dims in inventory),
+        key=lambda item: (bool(terms) and not any(term in item[0].lower() for term in terms), item),
+    ):
         key = (name, namespace)
         if key in entries:
             continue
@@ -650,13 +712,42 @@ async def discover_adapter_metrics(
             dimensions=list(dimensions),
         )
 
-    result = tracker.finish(list(entries.values()), local_cap=local_cap)
-    if enrich:
-        enriched = await enrich_adapter_metrics(client, ds, result.as_list(), work_budget, backend=backend)
-        return MetricCatalogResult(
-            entries=enriched.entries, sources=merge_search_sources((*result.sources, *enriched.sources))
+    return tracker.finish(list(entries.values()), local_cap=local_cap)
+
+
+async def enrich_adapter_metrics_before_deadline(
+    client: Any,
+    ds: DatasourceInfo,
+    retained: list[MetricEntry],
+    work_budget: SignalResolutionWorkBudget,
+    *,
+    deadline: float,
+    backend: str = "grafana",
+) -> MetricCatalogResult:
+    """One existing-operation deadline; timeout never erases admitted inventory."""
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        return await asyncio.wait_for(
+            enrich_adapter_metrics(client, ds, retained, work_budget, backend=backend), timeout=remaining
         )
-    return result
+    except TimeoutError:
+        logger.info("metric_enrichment_incomplete", reason_code="adapter_timeout", retained_count=len(retained))
+        return MetricCatalogResult(
+            entries=retained,
+            sources=(
+                CatalogSourceStatus(
+                    backend=backend,
+                    datasource_uid=ds.uid,
+                    datasource_type=ds.type,
+                    query_language=_query_language(ds),
+                    terms=("metadata", "enrichment"),
+                    disposition="incomplete",
+                    reasons=("provider_failed",),
+                ),
+            ),
+        )
 
 
 async def enrich_adapter_metrics(

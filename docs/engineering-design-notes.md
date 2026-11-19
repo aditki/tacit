@@ -2195,6 +2195,23 @@ validated only on typed activation; general Settings and unrelated operations
 remain usable. Typed acquisition itself schedules serially under the already
 adopted runtime owner and shared budget.
 
+Keyword priority must survive both bounded name selection and final entry
+admission. A second lexical sort before reserving the entry budget can evict a
+late relevant metric even when the first heap selected it. Test ordinary
+unrelated names as well as excluded suffix noise, retain below-cap backfill,
+and keep the real limit-plus-one witness so exhaustion still stops later I/O.
+
+Phased inventory and enrichment share one absolute adapter deadline, including
+time spent waiting for other source inventories. Direct SignalFx and native
+standalone adapter calls use the same deadline-aware enrichment boundary as
+Grafana's coordinator. Timeout keeps the admitted inventory and reports
+incomplete metadata through the existing closed failure vocabulary; it never
+restarts a phase timeout or converts caller cancellation into a successful
+partial result. The existing adopted backend operation owns cancellation
+settlement and cleanup. The isolated allocation fixture measures a fixed memory
+envelope rather than a latency target, so its child guard allows 180 seconds on
+shared CI while preserving the workload and every memory assertion.
+
 ## Validation expectations
 
 Cross-runtime tests should wait on the specific transition they assert. A
