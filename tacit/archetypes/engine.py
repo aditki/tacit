@@ -908,14 +908,27 @@ def _promql_template_to_signalflow(
 
 
 def _find_top_level_slash(expr: str) -> int | None:
-    """Find position of top-level '/' operator (not inside parens)."""
-    depth = 0
+    """Find division outside parentheses, selectors, ranges, and quoted text."""
+    delimiters: list[str] = []
+    closing = {"(": ")", "{": "}", "[": "]"}
+    quote = ""
+    escaped = False
     for i, ch in enumerate(expr):
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        elif ch == "/" and depth == 0 and i > 0:
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\" and quote != "`":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'`":
+            quote = ch
+        elif ch in closing:
+            delimiters.append(closing[ch])
+        elif ch in ")}]":
+            if not delimiters or delimiters.pop() != ch:
+                return None
+        elif ch == "/" and not delimiters and i > 0:
             return i
     return None
 
@@ -1469,6 +1482,10 @@ def compile_archetype(
                     from tacit.dashboard_ingest.signalflow import extract_metrics_from_signalflow
 
                     native_metric_names = set(extract_metrics_from_signalflow(expr))
+                elif qt_language == "graphite":
+                    from tacit.query_parsing.graphite import extract_metrics_from_graphite
+
+                    native_metric_names = extract_metrics_from_graphite(expr)
                 elif qt.cloudwatch_namespace and not expr.startswith(f"{qt.cloudwatch_namespace}/"):
                     native_metric_names = {f"{qt.cloudwatch_namespace}/{expr}"}
                 query_target = _resolve_native_query_target(

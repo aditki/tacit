@@ -271,6 +271,43 @@ focused suite passed 118 tests in 47.01 seconds, including the unchanged
 allocation workload. Ruff, Black, mypy (170 files), Grounding (40 cases) and
 Operational Learning (18 cases) passed. CI revalidates the complete final merge.
 
+### Native syntax and catalog-identity review follow-up, 2026-11-18
+
+Four subsequent PR #105 findings were reproduced before production changes.
+Graphite compilation now extracts all concrete operands from the documented
+bounded native subset instead of treating the full expression as a metric name.
+Native and learned expressions remain verbatim; missing, split and ambiguous
+ownership still abstain. The shared compiler/publisher ratio scanner preserves
+slashes inside quoted selectors without accepting previously unsupported
+translation syntax or allowing partial publication.
+
+Discovery aggregation independently enforces canonical identity capacity and
+the 5,000-physical-fact ceiling. Capture admission and selection share the same
+language-scoped complete-owner identities, preserving unrelated cross-language
+selections while rejecting same-scope conflicts. Independent review additionally
+reproduced a fabricated candidate UID passing the metadata-conflict branch;
+candidate owners are now recomputed for every captured decision. Capture
+schemas, identity hashes, historical fingerprints and runtime owners are
+unchanged.
+
+The two new regression modules contain 43 cases. Their initial runs reproduced
+24 query-syntax failures, five identity failures and one forged-candidate failure.
+The repaired query-focused suite passed 110 cases and the final catalog/capture
+suite passed 243. Independent review found no remaining actionable issue in
+this repair scope. The hermetic cold/taught resolution and learned-ranking gate
+passed separately; it is not live investigation quality evidence. The live
+100-prompt clean/representative long-lived gates were not run: this environment
+does not supply an identified isolated matching fixture and admitted
+representative state. Protected release evidence remains a separate gate.
+
+Final repair validation: repository default suite 4,768 passed / 12 skipped;
+hermetic integration 25 passed; browser/public end-to-end 56 passed. Ruff,
+Black (360 files), mypy (171 source files), Grounding (40/40), Operational
+Learning (18/18) and diff checks passed. The Linux ARM64 Docker build and
+network-disabled, read-only, UID-999 installed-parser/translator/resource smoke
+also passed. CI revalidates the pushed commit and its stacked measured-evidence
+integration independently.
+
 ## Real Telemetry Roadmap
 
 The synthetic benchmark remains the fast regression layer. The staged plan for evaluating Tacit with public metrics, logs, and traces is documented in [Real Telemetry Dataset Testing Roadmap](telemetry-dataset-testing-roadmap.md). Its first milestone is attached to the checkout demo; later datasets are isolated in separate branches and evaluated against source-specific ground truth.
