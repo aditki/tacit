@@ -2182,6 +2182,24 @@ poison a later run with a changed full catalog but identical prompt projection.
 The generic TTL cache remains reference-based; its discovery consumer owns this
 working-copy boundary without changing tenant keys, TTL or token accounting.
 
+Translation guards must distinguish syntax from quoted label data. One shared
+quote/escape-aware lexical iterator feeds unsupported-operator/function checks
+and division scanning, preserving source offsets and token boundaries. Existing
+exact-matcher admission still decides supported literal syntax; quoted operators
+do not relax rejection of real regex/negative matchers or histogram inference.
+The full-expression guard runs once before recursive translation, and its
+temporary mask expires before recursion rather than amplifying work or retention.
+
+Inventory and enrichment retain different bounded intermediate states, but both
+preserve completed work when their own adapter deadline expires. Inventory keeps
+one candidate/tracker state across searches and admits identities once after
+timeout cancellation settles; reserving fallback identities per search could
+starve later relevant matches. Pending-search status remains incomplete and no
+later I/O is dispatched. Caller cancellation continues to propagate. The
+coordinator's pre-existing outer timeout can still cancel the operation before
+the helper's own deadline; changing that behavior is separate from repairing
+the newly introduced direct/standalone inventory fallback.
+
 ### Acquisition allocation evidence (2026-11-18)
 
 Typed acquisition currently schedules one adapter/search operation at a time in

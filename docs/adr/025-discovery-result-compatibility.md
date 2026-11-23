@@ -40,8 +40,11 @@ Preserve conflicting metadata facts until shared normalization. Identical
 duplicates may share one retained identity; conflicting units/types cannot be
 discarded by legacy adaptation, aggregation or enrichment. Native provider
 envelopes count normalized metric rows rather than wrapper objects.
-Completed admitted enrichment facts survive a later phase timeout; unfinished
-enrichment is incomplete rather than grounds to erase a discovered conflict.
+Completed admitted enrichment facts and bounded inventory candidates survive a
+later search or phase reaching its own deadline, subject to final identity
+admission. Unfinished work is incomplete rather than grounds to erase completed
+facts or conflicts. Caller cancellation still propagates; the legacy
+coordinator's outer timeout behavior is unchanged.
 
 Use the existing guarded compiler at publication as well as compilation.
 Unsupported selected SignalFlow translation fails the investigation before any

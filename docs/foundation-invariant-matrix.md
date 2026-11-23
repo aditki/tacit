@@ -1155,8 +1155,8 @@ exact-owner boundary. Cover AST and conservative fallback parsing, learned
 query preservation, nested/multiple operands, missing/ambiguous owners and
 conflicting literal name constraints and unproved dynamic selectors. A partially
 understood selector must not supply a complete-looking operand set or restore
-arbitrary datasource defaults. The
-same parser feeds ingestion, compiler, validation, Grafana diagnostics and
+arbitrary datasource defaults. The same parser feeds ingestion, compiler,
+validation, Grafana diagnostics and
 compiled-query recording; test these shared consumers where applicable.
 
 Freeform discovery cache values are reusable unfiltered model results, never
@@ -1169,6 +1169,37 @@ call, and tenant/key/token-usage/cache policy remain unchanged. No generic cache
 semantics, runtime resource, admission controller or cleanup authority changes.
 Attribute regressions against the PR base's observable behavior, rather than
 the age of the helper line, before deciding a review finding is out of scope.
+
+Quoted translation and partial-inventory review amendment: shared SignalFlow
+translation inspects operators and function syntax outside quoted literal data.
+Exact label values containing `!=`, `!~`, `=~`, slashes or function-like text
+retain their meaning; real unsupported matcher operators still reject before
+any backend writes. Compiler, evidence/rescue and standalone/pipeline publisher
+preflight use this one lexical boundary and the existing matcher allowlist.
+Cover quote/escape handling, literal/operator mixtures and mixed-panel rejection.
+The full-expression lexical guard runs once per translation; recursive ratio or
+topk translation must not multiply whole-expression masking work.
+
+Completed bounded inventory candidates survive a later search's own adapter
+deadline through direct SignalFx and the shared standalone first-party helper,
+subject to final identity admission. Keep one operation-local candidate/tracker
+state, finalize entry admission once after joined timeout settlement, preserve
+completed source statuses and mark unfinished searches incomplete. Checkpoints
+cannot reserve
+fallback identities early and starve later keyword matches. Call/byte/entry,
+physical-fact and text limits, deterministic source membership and conflict
+retention remain authoritative. Test first-success/later-timeout, original
+absolute deadline, cancellation propagation, cap/contention, no later I/O and
+unchanged caller-cancellation semantics. The existing RuntimeStores/execution
+graph remains the runtime owner; canonical admission and the investigation work
+budget remain the sole admission authorities. The adopted backend operation
+retains capacity through settlement, and existing client/backend
+owners close transports. No task population, worker, permit, retry, runtime
+manager or cleanup authority is added. Optional third-party/legacy adapter
+compatibility must be preserved explicitly. The Grafana coordinator's outer
+caller-timeout discard behavior also exists on the PR base and is outside this
+repair: it remains a cancellation boundary, not permission to suppress caller
+cancellation and return partial success. No adapter protocol change is required.
 
 ## Measured evidence implementation gate
 
