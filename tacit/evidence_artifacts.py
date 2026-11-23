@@ -5,7 +5,13 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from tacit.catalog import catalog_for_services
+from tacit.catalog import (
+    QueryTargetCatalog,
+    catalog_for_services,
+    query_target_catalog,
+    record_query_selection,
+    select_query_target,
+)
 from tacit.errors import (
     AUTHORITY_BOUNDARY_ERRORS,
     EvidenceResolutionError,
@@ -336,6 +342,7 @@ def build_symptom_evidence_dashboard(
     """Build direct, validation-gated panels for observed application symptoms."""
     budget = work_budget or EvidenceObservationWorkBudget(EvidenceObservationWorkLimits())
     budget.validate_rescue_plan(requirements, resolutions, catalog, intent)
+    ownership_catalog = query_target_catalog(catalog)
     resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
     panels: list[PanelSpec] = []
     rescue_resolutions: list[EvidenceResolution] = []
@@ -355,6 +362,7 @@ def build_symptom_evidence_dashboard(
                 knowledge_scope=knowledge_scope,
                 applied_governance_revision_refs=resolution_refs,
                 signal_resolution_work_budget=signal_resolution_work_budget,
+                _ownership_catalog=ownership_catalog,
             )
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             continue
@@ -442,6 +450,7 @@ def build_evidence_gap_dashboard(
     """Build validation-gated panels for supported observations found while closing evidence gaps."""
     budget = work_budget or EvidenceObservationWorkBudget(EvidenceObservationWorkLimits())
     budget.validate_rescue_plan(requirements, resolutions, catalog, intent)
+    ownership_catalog = query_target_catalog(catalog)
     resolutions_by_id = {resolution.requirement_id: resolution for resolution in resolutions}
     panels: list[PanelSpec] = []
     gap_resolutions: list[EvidenceResolution] = []
@@ -469,6 +478,7 @@ def build_evidence_gap_dashboard(
                 knowledge_scope=knowledge_scope,
                 applied_governance_revision_refs=resolution_refs,
                 signal_resolution_work_budget=signal_resolution_work_budget,
+                _ownership_catalog=ownership_catalog,
             )
         if resolution is None or resolution.status != EvidenceResolutionStatus.RESOLVED or not resolution.metric:
             continue
@@ -615,6 +625,7 @@ def _resolve_direct_symptom_evidence(
     applied_governance_refs: set[str] | None = None,
     applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
     signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
+    _ownership_catalog: QueryTargetCatalog | None = None,
 ) -> EvidenceResolution | None:
     """Resolve symptom evidence for direct observation panels."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal_details
@@ -623,6 +634,7 @@ def _resolve_direct_symptom_evidence(
     store = resolve_signal_store(signal_store, get_signal_store)
     if store is None:
         return None
+    ownership_catalog = query_target_catalog(catalog, _prepared=_ownership_catalog)
 
     target_catalog = [
         entry for entry in catalog if (entry.query_language or "").lower() in {"", target_language.lower()}
@@ -671,7 +683,18 @@ def _resolve_direct_symptom_evidence(
     if len(best_owners) > 1:
         return None
     selected = best[0]
-    entry, score = selected.entry, selected.confidence
+    entry, score = (selected.entry, selected.confidence)
+    owner = select_query_target(ownership_catalog, {entry.name}, entry.query_language)
+    record_query_selection(
+        owner,
+        consumer="symptom_rescue",
+        subject_ref=requirement.id,
+        required_metrics={entry.name},
+        query_language=entry.query_language,
+    )
+    target = owner.target
+    if target is None:
+        return None
     if applied_governance_refs is not None:
         if inferred_by:
             applied_governance_refs.add(inferred_by.knowledge_ref)
@@ -687,9 +710,9 @@ def _resolve_direct_symptom_evidence(
         status=EvidenceResolutionStatus.RESOLVED,
         reason_code="direct_symptom_signal_resolved",
         metric=entry.name,
-        datasource_uid=entry.datasource_uid,
-        datasource_type=entry.datasource_type,
-        query_language=entry.query_language,
+        datasource_uid=target.datasource_uid,
+        datasource_type=target.datasource_type,
+        query_language=target.query_language,
         semantic_score=score,
         ownership_score=1.0,
     )
@@ -707,6 +730,7 @@ def _resolve_evidence_gap_observation(
     applied_governance_refs: set[str] | None = None,
     applied_governance_revision_refs: set[KnowledgeRevisionRef] | None = None,
     signal_resolution_work_budget: SignalResolutionWorkBudget | None = None,
+    _ownership_catalog: QueryTargetCatalog | None = None,
 ) -> EvidenceResolution | None:
     """Resolve an evidence gap only when ownership is specific enough to observe safely."""
     from tacit.archetypes.engine import _datasource_type_for_language, _legacy_metric_signal_details
@@ -715,6 +739,7 @@ def _resolve_evidence_gap_observation(
     store = resolve_signal_store(signal_store, get_signal_store)
     if store is None:
         return None
+    ownership_catalog = query_target_catalog(catalog, _prepared=_ownership_catalog)
 
     target_catalog = [
         entry for entry in catalog if (entry.query_language or "").lower() in {"", target_language.lower()}
@@ -766,6 +791,17 @@ def _resolve_evidence_gap_observation(
         return None
     selected = best[0]
     entry, score = selected.entry, selected.confidence
+    owner = select_query_target(ownership_catalog, {entry.name}, entry.query_language)
+    record_query_selection(
+        owner,
+        consumer="gap_rescue",
+        subject_ref=requirement.id,
+        required_metrics={entry.name},
+        query_language=entry.query_language,
+    )
+    target = owner.target
+    if target is None:
+        return None
     if applied_governance_refs is not None:
         if inferred_by:
             applied_governance_refs.add(inferred_by.knowledge_ref)
@@ -781,9 +817,9 @@ def _resolve_evidence_gap_observation(
         status=EvidenceResolutionStatus.RESOLVED,
         reason_code="evidence_gap_supported_observation",
         metric=entry.name,
-        datasource_uid=entry.datasource_uid,
-        datasource_type=entry.datasource_type,
-        query_language=entry.query_language,
+        datasource_uid=target.datasource_uid,
+        datasource_type=target.datasource_type,
+        query_language=target.query_language,
         semantic_score=score,
         ownership_score=1.0,
     )

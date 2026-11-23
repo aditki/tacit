@@ -14,9 +14,19 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from tacit.agents.intent import classify_intent
+from tacit.archetypes.engine import UnsupportedSignalFlowTranslation
 from tacit.archetypes.templates import get_archetype, get_archetypes_by_confidence
 from tacit.backends import get_active_backends
-from tacit.config import Settings, settings
+from tacit.catalog import (
+    AcquisitionCaptureInvalidError,
+    AcquisitionCaptureLimitError,
+    begin_selection_audit,
+    build_acquisition_capture,
+    end_selection_audit,
+    legacy_metric_catalog,
+    recorded_selections,
+)
+from tacit.config import AcquisitionConfigurationError, Settings, settings
 from tacit.context.enrichment import enrich_context
 from tacit.culprit_ranking import rank_culprits
 from tacit.dependencies import (
@@ -48,7 +58,7 @@ from tacit.models.schemas import (
     DashRequest,
     DashResponse,
 )
-from tacit.pipeline.completion import complete_pipeline
+from tacit.pipeline.completion import complete_pipeline, prepare_acquisition_completion
 from tacit.pipeline.context import PipelineRunContext
 from tacit.pipeline.discovery import (
     discovery_keywords,
@@ -1051,12 +1061,15 @@ async def _run_pipeline_inner(
     knowledge_pin_token: Any | None = None
     knowledge_preflight_diagnostics: dict[str, str | int] | None = None
     resources_cleaned = False
+    acquisition_audit_token = begin_selection_audit()
 
     try:
         if isinstance(runtime_settings, Settings):
             preflight_publish_backends(backends, runtime_settings)
         signal_store = _initialize_signal_store(deps, runtime.recorder, runtime.timings)
-        signal_resolution_work_budget = new_investigation_signal_resolution_work_budget(signal_store)
+        signal_resolution_work_budget = new_investigation_signal_resolution_work_budget(
+            signal_store, runtime_settings=runtime.settings
+        )
         if signal_store is not SIGNAL_STORE_UNAVAILABLE:
             try:
                 enforce_knowledge_action(runtime.settings, KnowledgeAction.APPLY)
@@ -1385,6 +1398,13 @@ async def _run_pipeline_inner(
             selection.shadow_archetypes,
         )
 
+        slot_subjects = tuple(
+            f"{archetype.id}/{panel_index}/{query_index}"
+            for archetype, _ in ranked_archetypes
+            for panel_index, panel in enumerate(archetype.panels, 1)
+            for query_index, _ in enumerate(panel.queries, 1)
+        )
+        freeform_subjects: tuple[str, ...] = ()
         compilation = compile_selected_archetypes(
             selection=selection,
             intent=intent,
@@ -1414,6 +1434,7 @@ async def _run_pipeline_inner(
                 return freeform.failure
             assert freeform.dashboard_spec is not None
             dashboard_spec = freeform.dashboard_spec
+            freeform_subjects = freeform.selection_subjects
 
         evidence_stage = run_evidence_stage(
             ranked_archetypes=ranked_archetypes,
@@ -1633,6 +1654,77 @@ async def _run_pipeline_inner(
 
         lifecycle.ensure_side_effects_allowed()
 
+        from tacit.investigation_contract import RuntimeManifest
+
+        acquired = catalog_discovery.catalog_result
+        if acquired is None:
+            acquired = legacy_metric_catalog(metric_catalog, backend=primary.name, terms=intent.keywords)
+        acquisition_record = build_acquisition_capture(
+            acquired,
+            selections=recorded_selections(),
+            limits={
+                "calls": signal_resolution_work_budget.max_acquisition_calls,
+                "response_bytes": signal_resolution_work_budget.max_acquisition_response_bytes,
+                "entries": signal_resolution_work_budget.max_acquisition_entries,
+            },
+            counters={
+                "calls_reserved": signal_resolution_work_budget.acquisition_calls,
+                "response_bytes_reserved": signal_resolution_work_budget.acquisition_response_bytes,
+            },
+        )
+        prepared_acquisition = prepare_acquisition_completion(
+            assembly_inputs=dict(
+                investigation_id=runtime.recorder.investigation_id,
+                revision=0,
+                parent_revision=None,
+                request=runtime.request,
+                intent=intent,
+                dashboard_spec=dashboard_spec,
+                evidence_requirements=evidence_requirements,
+                evidence_resolutions=evidence_resolutions,
+                evidence_observations=validation_result.evidence_observations,
+                culprit_ranking=culprit_ranking,
+                context_chunks=context_chunks or [],
+                warnings=validation_warnings,
+                runtime_manifest=RuntimeManifest(
+                    model={
+                        "provider": str(getattr(runtime.settings, "llm_provider", "")),
+                        "name": str(getattr(runtime.settings, "llm_model", "")),
+                        "prompt_version": "intent-v1",
+                    }
+                ),
+                knowledge_snapshot_ref=knowledge_snapshot.id if knowledge_snapshot else "",
+                knowledge_usage=knowledge_usage,
+            ),
+            acquisition_record=acquisition_record,
+            slot_subjects=slot_subjects,
+            freeform_subjects=freeform_subjects,
+            baseline_culprit_ranking=baseline_culprit_ranking,
+        )
+        runtime.recorder.stage(
+            "acquisition_capture",
+            "passed",
+            "acquisition_capture_admitted",
+            source_count=len(acquisition_record["sources"]),
+            complete_source_count=sum(source["disposition"] == "complete" for source in acquisition_record["sources"]),
+            incomplete_source_count=sum(
+                source["disposition"] == "incomplete" for source in acquisition_record["sources"]
+            ),
+            unavailable_source_count=sum(
+                source["disposition"] == "unavailable" for source in acquisition_record["sources"]
+            ),
+            returned_metric_count=sum(source["returned_count"] for source in acquisition_record["sources"]),
+            retained_metric_count=len(acquisition_record["entries"]),
+            selection_count=len(acquisition_record["selections"]),
+            ambiguous_selection_count=sum(
+                selection["status"] == "ambiguous" for selection in acquisition_record["selections"]
+            ),
+            missing_selection_count=sum(
+                selection["status"] == "missing" for selection in acquisition_record["selections"]
+            ),
+            **signal_resolution_work_budget.counters(),
+        )
+
         def mark_provider_released() -> None:
             nonlocal provider_lease
             provider_lease = None
@@ -1656,6 +1748,7 @@ async def _run_pipeline_inner(
                 evidence_observations=validation_result.evidence_observations,
                 culprit_ranking=culprit_ranking,
                 baseline_culprit_ranking=baseline_culprit_ranking,
+                prepared_acquisition=prepared_acquisition,
                 context_chunks=context_chunks,
                 knowledge_snapshot=knowledge_snapshot,
                 knowledge_usage=knowledge_usage,
@@ -1670,6 +1763,25 @@ async def _run_pipeline_inner(
             on_released=mark_provider_released,
         )
 
+    except (
+        UnsupportedSignalFlowTranslation,
+        AcquisitionCaptureInvalidError,
+        AcquisitionCaptureLimitError,
+        AcquisitionConfigurationError,
+    ) as exc:
+        code = exc.reason_code
+        runtime.recorder.stage("acquisition", "failed", code)
+        return PipelineFailureFactory.finish_failure(
+            recorder=runtime.recorder,
+            error=code,
+            summary=(
+                "This investigation requires an unsupported SignalFlow translation. No dashboard was published."
+                if isinstance(exc, UnsupportedSignalFlowTranslation)
+                else "The investigation could not admit its acquisition data safely. No dashboard was published."
+            ),
+            timings=runtime.timings,
+            started_at=runtime.started_at,
+        )
     except asyncio.CancelledError:
         cancellation = cancellation or _PipelineCancellation()
         runtime.recorder.finish(
@@ -1719,6 +1831,7 @@ async def _run_pipeline_inner(
             _attach_pipeline_resource_cleanup_metadata(failure, cleanup_failure)
         raise failure from exc
     finally:
+        end_selection_audit(acquisition_audit_token)
         if knowledge_pin_token is not None and signal_store is not SIGNAL_STORE_UNAVAILABLE:
             reset_pin = getattr(signal_store, "reset_pinned_governed_mappings", None)
             if reset_pin is not None:

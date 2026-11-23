@@ -2078,6 +2078,232 @@ capacity nor manufacture a scheduling partition.
   compare clean BuildKit digests before upload, verify the pushed image's config
   against the scanned archive, and then pin the actual registry manifest digest.
 
+## Acquisition transport and retention
+
+First-party discovery uses `tacit/acquisition.py` as the shared bounded HTTP and
+search-normalization boundary for both existing clients. It owns no runtime,
+permit, transport, thread or executor. The adopted backend operation retains all
+lifecycle authority. One investigation budget admits attempts and raw identity
+response chunks before dispatch or growth; nonblocking reservations fail closed
+on contention. Typed searches bypass legacy caches and retain a separate catalog
+from the prompt projection. Search failures and caps remain explicit per-call
+metadata, including partial successes; empty results never attest absent metrics.
+
+Acquisition ownership consumers include archetype engine resolvers, evidence
+planning, and `tacit/evidence_artifacts.py` symptom/gap rescue. They share the
+pure catalog selector; native aliases are resolved before selection and no
+consumer can pick an owner from defaults or sampled entity labels.
+
+SignalFx publisher translation is another consumer of the guarded engine
+translator, alongside engine/evidence compilation and symptom/gap rescue in
+`evidence_artifacts.py`. Repeated histogram-base guesses and synthetic expression
+fallbacks require one shared rejection boundary. Publisher preflight validates
+all selected chart translations before the first remote publication; a mixed
+supported/unsupported set cannot publish a supported subset.
+
+Pipeline publication ordering is part of translation safety: the pure shared
+SignalFlow publication preflight runs in `pipeline/stages/publish.py` before any
+backend is called, and in standalone SignalFx publication before group creation.
+A Grafana-first fallback order cannot publish before a later SignalFx rejection.
+
+Metric-search source statuses do not represent datasource enumeration totals.
+Successful enumeration appears in acquisition call/byte counters; failed
+enumeration is a zero-count backend summary. Legacy results group the actual
+UID/type/language identities and retain `legacy_unknown`, because first-party
+post-return guards cannot attest third-party transport accounting.
+
+Catalog identity deduplication and metadata-fact deduplication differ. One metric
+identity consumes one retained budget slot, while distinct units/types/source
+declarations remain separate bounded facts until shared normalization records a
+conflict. Legacy adaptation, adapter aggregation and metadata enrichment share
+that boundary; selecting the first definition can falsely prove unique ownership.
+
+Backend aggregation must also count canonical identities rather than physical
+facts against the configured retained-entry limit. The independent 5,000-fact
+ceiling still applies before aggregate growth. Selection and capture admission
+use the same complete-owner, query-language-scoped identity set for conflicts;
+equal UIDs and metric names in another language do not make its metadata
+applicable to the selected query. Identity hashes and replay formats stay stable.
+Capture admission recomputes candidate owners even for metadata-conflict
+decisions, so a valid conflict cannot authorize a fabricated candidate UID.
+
+Native expressions need language-specific operand extraction before exact-owner
+selection. Graphite supports concrete paths and bounded `alias`, `scale`,
+`divideSeries` and `sumSeries` expressions; labels are not operands, and unknown
+functions, dynamic paths and malformed expressions abstain. The original query
+is preserved. This does not establish support for other native expression
+grammars. The shared SignalFlow translator recognizes division only outside
+quoted strings and nested delimiters, so selector values containing slashes
+remain literal data. Unsupported translation still fails publication preflight
+before any backend writes.
+
+An enrichment deadline must preserve completed admitted work, not merely the
+initial inventory. The existing operation keeps bounded completed metadata and
+dimensions locally, then finalizes them after normal completion or joined
+timeout cancellation. A later series/label timeout cannot erase a known unit or
+type conflict. Caller cancellation still propagates; the service owner and
+original deadline retain their existing lifecycle authority.
+Raw direct-helper inputs reserve identity capacity before enrichment. Internal
+inventory paths skip that reservation only for their actual admitted subset;
+the coordinator rejects new identities and applies complete fact groups once.
+Finalization uses bounded fact admission rather than re-reserving known facts,
+so budget contention cannot turn conflicting evidence into a unique owner.
+
+Loki's label inventory also feeds freeform query construction. Custom labels
+need a bounded `loki:available_labels` entry even when recognized stream labels
+are present. That entry describes admitted available labels, not observed log
+values, and does not consume one of the six stream-value probes. Failed/empty
+enumeration supplies no synthetic usable fallback; truncated labels remain
+explicitly incomplete.
+
+Repeated exact-owner checks need one admitted indexed view per operation.
+Reusing normalization alone is insufficient if a public `entries` property
+still deep-copies every metric on every lookup. Keep full-catalog conflicts and
+private immutable indices, return defensive targets, and explicitly share the
+view with nested compiler/evidence/rescue calls. Ordinary view construction
+must derive its own normalization rather than trusting a caller's conflict
+tuple. No global, context-local or object-identity cache may span investigations.
+Raw-input mutation and returned-target mutation cannot change the admitted
+snapshot; fresh public calls admit fresh facts. Capture construction/admission
+remain independent checks. The bounded view expires with its operation and
+adds no runtime resource, scheduling or cleanup owner.
+
+Exact metric ownership includes PromQL selectors whose name is supplied by an
+exact `__name__` matcher rather than the selector's name field. Extract literal
+names through the shared parser, including learned queries; an unresolved
+selector in a compound expression cannot be ignored while other operands
+produce a complete-looking owner proof. Unsupported matcher syntax abstains
+rather than restoring a default datasource.
+
+Cached LLM discovery results describe unfiltered candidates. The freeform stage
+must copy a hit or newly cached result before ownership filtering and query
+building, including nested metric fields. A run-specific abstention must not
+poison a later run with a changed full catalog but identical prompt projection.
+The generic TTL cache remains reference-based; its discovery consumer owns this
+working-copy boundary without changing tenant keys, TTL or token accounting.
+
+Translation guards must distinguish syntax from quoted label data. One shared
+quote/escape-aware lexical iterator feeds unsupported-operator/function checks
+and division scanning, preserving source offsets and token boundaries. Existing
+exact-matcher admission still decides supported literal syntax; quoted operators
+do not relax rejection of real regex/negative matchers or histogram inference.
+The full-expression guard runs once before recursive translation, and its
+temporary mask expires before recursion rather than amplifying work or retention.
+
+Inventory and enrichment retain different bounded intermediate states, but both
+preserve completed work when their own adapter deadline expires. Inventory keeps
+one candidate/tracker state across searches and admits identities once after
+timeout cancellation settles; reserving fallback identities per search could
+starve later relevant matches. Pending-search status remains incomplete and no
+later I/O is dispatched. Caller cancellation continues to propagate. The
+coordinator's pre-existing outer timeout can still cancel the operation before
+the helper's own deadline; changing that behavior is separate from repairing
+the newly introduced direct/standalone inventory fallback.
+
+### Acquisition allocation evidence (2026-11-18)
+
+Typed acquisition currently schedules one adapter/search operation at a time in
+each admitted investigation, a stricter bound than `adapter_max_concurrent`.
+`validate_acquisition_runtime` rejects activation above five simultaneous
+pipelines before source enumeration or HTTP. General Settings/admission still
+supports its existing range for unrelated operations. New acquisition counters
+also validate supplied budgets against the owning runtime's stricter settings.
+No memory claim is made for an unmeasured concurrency configuration.
+
+The conservative acquisition allocation ceiling is 512 MiB per active pipeline
+(2.5 GiB at five), excluding the already separately bounded ordinary request and
+provider resources. The worksheet admits 8 MiB cumulative raw body allowance,
+UTF-8/Unicode decoder scratch, at most 100,000 lexical/decoded nodes per live
+response (1 KiB structural overhead per node), bounded inventory/name heaps,
+5,000 physical metric facts plus 100,000 sampled dimensions, at most 32 admitted
+HTTP searches and their retained identity memberships, six bounded model/graph
+copies, a 4 MiB record plus 2 MiB extensions and serialization scratch, and the
+pre-publication pinned assembly/preflight graph (200,000 nodes and 2,000,000 text
+characters). Conservative structural, copy, text and serialization components
+fit within that 512 MiB ceiling; the allowance is a bound, not an assertion that
+a particular container has that memory available.
+
+`test_isolated_adversarial_allocation_envelope` measured five simultaneously
+retained raw/decoded/catalog/status/capture graphs, including private prepared
+completion inputs and a public preflight contract. Each catalog has 5,000 facts
+and 55,000 dimensions; completion inputs contain 1,984,000 content characters
+and 192,000 nested metadata values, near the independent text/tree admission
+limits. On the shared CPython 3.12 macOS environment the high-water values were
+183,612,775 traced bytes and 408,190,976 process RSS bytes. Independent adversarial
+8 MB many-small-value and 8 MB scalar bodies plus depth-33 input were rejected;
+their traced peaks were 24,000,993, 40,003,028 and 16,001,057 bytes respectively.
+The test runs in an isolated child and retains all five graphs before measuring.
+Its admitted acquisition record contains 180,074 nodes and 1,890,564 text
+characters; each completion graph contains 192,947 nodes and 1,985,684 text
+characters. Derived-prefix rejection peaks at 16,240,351 traced bytes. The
+response decode/derived-name phase retires before completion preparation; the
+static ceiling applies to each phase's live objects, not their historical sum.
+These measurements support this declared configuration, not a generic decoder
+memory multiplier or the former maximum of 1,000 simultaneous acquisitions.
+
+The lookup-reuse amendment retains one bounded normalized catalog and index
+inside each compilation/resolution operation, within the existing bounded-model
+allowance; it replaces per-query normalization and whole-catalog output copies.
+The view does not survive the operation into completion preparation. The stress
+fixture nevertheless retains one 5,000-fact indexed view alongside each of the
+five complete graphs above. This stronger co-residency probe measured
+219,789,099 traced bytes and 462,094,336 process RSS bytes on the same CPython
+3.12 macOS environment, with all existing admission and memory assertions intact.
+The declared 512 MiB/pipeline ceiling and five-pipeline maximum remain unchanged.
+
+Read accounting conservatively charges a whole bounded raw-chunk allowance
+before requesting it, including the final EOF probe. Unused allowances are not
+refunded, so a body exactly consuming all remaining allowance cannot be accepted
+without room to observe its terminal EOF. Byte/entry/call exhaustion and budget
+lock contention stop later remote acquisition; retained local matching and the
+existing independent resolver counters remain available.
+
+
+Native search filtering precedes bounded retention: shared streaming selection
+admits matching names and the existing small fallback sample separately. A
+lexically early set of irrelevant/noise names cannot hide a later required
+metric while retained capacity is available. Full provider-returned counts are
+kept separately from retained identities and metadata-fact deduplication.
+
+Derived names need output admission as well as raw response admission. Both
+matching/fallback heaps, bounded-name helpers, normalized inventory tuples and
+search membership sets apply the existing scalar/aggregate character and UTF-8
+guards before growth. Elasticsearch checks concatenated path bounds before
+allocating the path; CloudWatch namespace prefixes pass the same shared output
+text boundary. Heap replacements subtract the retired value before admitting a
+replacement. This is bounded text admission, not a second work/memory authority.
+The shared JSON path rejects duplicate keys and non-finite constants/numbers.
+
+After retention exhaustion or budget-lock contention, local metadata facts for
+already admitted identities remain available for conflict detection. Those facts
+need no second slot reservation. One denied new identity stops further new
+identity reservations for that return, so contention is not retried as each
+metadata duplicate arrives. Acquisition exhaustion never makes an existing
+seconds/bytes conflict look like a unique owner.
+
+Legacy adapter concurrency configuration zero retains its existing sampling
+semantics outside typed acquisition. Positive supported adapter scheduling is
+validated only on typed activation; general Settings and unrelated operations
+remain usable. Typed acquisition itself schedules serially under the already
+adopted runtime owner and shared budget.
+
+Keyword priority must survive both bounded name selection and final entry
+admission. A second lexical sort before reserving the entry budget can evict a
+late relevant metric even when the first heap selected it. Test ordinary
+unrelated names as well as excluded suffix noise, retain below-cap backfill,
+and keep the real limit-plus-one witness so exhaustion still stops later I/O.
+
+Phased inventory and enrichment share one absolute adapter deadline, including
+time spent waiting for other source inventories. Direct SignalFx and native
+standalone adapter calls use the same deadline-aware enrichment boundary as
+Grafana's coordinator. Timeout keeps the admitted inventory and reports
+incomplete metadata through the existing closed failure vocabulary; it never
+restarts a phase timeout or converts caller cancellation into a successful
+partial result. The existing adopted backend operation owns cancellation
+settlement and cleanup. The isolated allocation fixture measures a fixed memory
+envelope rather than a latency target, so its child guard allows 180 seconds on
+shared CI while preserving the workload and every memory assertion.
+
 ## Validation expectations
 
 Cross-runtime tests should wait on the specific transition they assert. A

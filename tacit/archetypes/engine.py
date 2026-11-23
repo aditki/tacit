@@ -8,6 +8,7 @@ target backend. No LLM needed for query generation.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
@@ -26,7 +27,13 @@ from tacit.archetypes.schema import (
     PanelTemplate,
     QueryTemplate,
 )
-from tacit.catalog import catalog_for_services, metric_matches_services
+from tacit.catalog import (
+    QueryTargetCatalog,
+    catalog_for_services,
+    query_target_catalog,
+    record_query_selection,
+    select_query_target,
+)
 from tacit.errors import AUTHORITY_BOUNDARY_ERRORS, safe_failure_diagnostics
 from tacit.knowledge.usage import (
     KnowledgeRevisionRef,
@@ -57,6 +64,18 @@ _PROMETHEUS_HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
 _ARCHETYPE_SIGNAL_RESOLUTION_FAILED = "archetype_signal_resolution_failed"
 _ARCHETYPE_COVERAGE_SIGNAL_RESOLUTION_FAILED = "archetype_coverage_signal_resolution_failed"
 _ARCHETYPE_COVERAGE_WORK_LIMIT_EXCEEDED = "archetype_coverage_work_limit_exceeded"
+
+
+class UnsupportedSignalFlowTranslation(ValueError):
+    """A selected translation cannot preserve the original query meaning."""
+
+    reason_code = "signalflow_translation_unsupported"
+
+    def __init__(self, reason: str, slot: str = "") -> None:
+        self.reason = reason
+        self.slot = slot[:256]
+        super().__init__(f"{self.reason_code}: {reason}")
+
 
 # Characters that are special in RE2 (used by PromQL) and need escaping.
 # Note: dash `-` is NOT special in RE2 outside character classes.
@@ -656,123 +675,70 @@ def _resolve_query_target(
     query_language: str = "",
     fallback_uid: str = "",
 ) -> QueryTarget:
-    """Resolve datasource identity as one object, preferring matching catalog entries."""
-    query_language = query_language.lower()
-    datasource_type = datasource_type.lower()
-    matched_entries: list[MetricEntry] = []
-    for entry in catalog:
-        if datasource_type and not _datasource_type_matches(entry.datasource_type, datasource_type):
-            continue
-        if query_language and (entry.query_language or "").lower() != query_language:
-            continue
-        matched_entries.append(entry)
-    for entry in matched_entries:
-        if entry.datasource_is_default:
-            return QueryTarget.from_metric(entry)
-    if matched_entries:
-        return QueryTarget.from_metric(matched_entries[0])
-    type_matched_entries: list[MetricEntry] = []
-    for entry in catalog:
-        if datasource_type and _datasource_type_matches(entry.datasource_type, datasource_type):
-            type_matched_entries.append(entry)
-    for entry in type_matched_entries:
-        if entry.datasource_is_default:
-            return QueryTarget.from_metric(entry)
-    if type_matched_entries:
-        return QueryTarget.from_metric(type_matched_entries[0])
-    if datasource_type or query_language:
-        return QueryTarget(
-            datasource_uid=fallback_uid,
-            datasource_type=datasource_type or _datasource_type_for_language(query_language, ""),
-            query_language=query_language,
+    """Return only unambiguous metadata; metric ownership is selected per query."""
+    candidates = {
+        (entry.datasource_uid, entry.datasource_type, entry.query_language): entry
+        for entry in catalog
+        if (not datasource_type or _datasource_type_matches(entry.datasource_type, datasource_type))
+        and (not query_language or entry.query_language.lower() == query_language.lower())
+    }
+    if len(candidates) == 1:
+        return QueryTarget.from_metric(next(iter(candidates.values())))
+    return QueryTarget(datasource_uid="", datasource_type=datasource_type, query_language=query_language)
+
+
+def _bound_query_target(
+    catalog: list[MetricEntry] | QueryTargetCatalog,
+    names: set[str],
+    language: str,
+    *,
+    subject_ref: str = "",
+    requested_uid: str | None = None,
+) -> QueryTarget:
+    selection = select_query_target(catalog, names, language, requested_uid)
+    if names and subject_ref:
+        record_query_selection(
+            selection,
+            consumer="archetype",
+            subject_ref=subject_ref,
+            required_metrics=names,
+            query_language=language,
+            requested_uid=requested_uid,
         )
-    for entry in catalog:
-        if entry.datasource_is_default:
-            return QueryTarget.from_metric(entry)
-    if catalog:
-        return QueryTarget.from_metric(catalog[0])
-    return QueryTarget(
-        datasource_uid=fallback_uid,
-        datasource_type=datasource_type,
-        query_language=query_language,
-    )
+    target = selection.target
+    if target is None:
+        logger.warning(
+            "query_source_not_selected", reason_code=selection.reason, candidate_count=len(selection.candidate_uids)
+        )
+        return QueryTarget(
+            datasource_uid="", datasource_type=_datasource_type_for_language(language), query_language=language
+        )
+    return target
 
 
 def _resolve_promql_query_target(
-    catalog: list[MetricEntry],
+    catalog: list[MetricEntry] | QueryTargetCatalog,
     expr: str,
     default_target: QueryTarget,
     intent: Intent,
+    *,
+    subject_ref: str = "",
 ) -> QueryTarget:
-    """Route a PromQL query to the datasource that actually owns its metrics."""
+    """Select the same exact all-operand owner used by evidence and rescue."""
     from tacit.dashboard_ingest import extract_metrics_from_promql
 
-    metric_names = set(extract_metrics_from_promql(expr))
-    if metric_names:
-        candidates = [
-            entry
-            for entry in catalog
-            if entry.name in metric_names
-            and _datasource_type_matches(entry.datasource_type, "prometheus")
-            and (not entry.query_language or entry.query_language.lower() == "promql")
-        ]
-        if len(metric_names) == 1 and len(candidates) == 1:
-            return QueryTarget.from_metric(candidates[0])
-
-        owners_by_metric = {
-            metric: {entry.datasource_uid for entry in candidates if entry.name == metric} for metric in metric_names
-        }
-        if owners_by_metric and all(owners_by_metric.values()):
-            common_owners = set.intersection(*owners_by_metric.values())
-            if len(common_owners) == 1:
-                owner = next(iter(common_owners))
-                return QueryTarget.from_metric(next(entry for entry in candidates if entry.datasource_uid == owner))
-
-        service_candidates = [entry for entry in candidates if metric_matches_services(entry, intent.services)]
-        service_owners = {entry.datasource_uid for entry in service_candidates}
-        complete_service_owners = {
-            owner
-            for owner in service_owners
-            if all(owner in owners_by_metric.get(metric, set()) for metric in metric_names)
-        }
-        if len(complete_service_owners) == 1:
-            owner = next(iter(complete_service_owners))
-            return QueryTarget.from_metric(next(entry for entry in service_candidates if entry.datasource_uid == owner))
-        if owners_by_metric and all(owners_by_metric.values()):
-            common_owners = set.intersection(*owners_by_metric.values())
-            for entry in candidates:
-                if entry.datasource_is_default and entry.datasource_uid in common_owners:
-                    return QueryTarget.from_metric(entry)
-            if common_owners:
-                owner_entry = next(entry for entry in candidates if entry.datasource_uid in common_owners)
-                return QueryTarget.from_metric(owner_entry)
-    return default_target
+    return _bound_query_target(catalog, set(extract_metrics_from_promql(expr)), "promql", subject_ref=subject_ref)
 
 
 def _resolve_native_query_target(
-    catalog: list[MetricEntry],
+    catalog: list[MetricEntry] | QueryTargetCatalog,
     datasource_type: str,
     query_language: str,
     metric_names: set[str],
+    *,
+    subject_ref: str = "",
 ) -> QueryTarget:
-    """Route native datasource queries to a datasource that owns the metric."""
-    candidates = [
-        entry
-        for entry in catalog
-        if entry.name in metric_names
-        and _datasource_type_matches(entry.datasource_type, datasource_type)
-        and (not query_language or (entry.query_language or "").lower() == query_language)
-    ]
-    for entry in candidates:
-        if entry.datasource_is_default:
-            return QueryTarget.from_metric(entry)
-    if candidates:
-        return QueryTarget.from_metric(candidates[0])
-    return _resolve_query_target(
-        catalog,
-        datasource_type,
-        query_language,
-    )
+    return _bound_query_target(catalog, metric_names, query_language, subject_ref=subject_ref)
 
 
 def _resolve_rate_interval(intent: Intent) -> str:
@@ -812,6 +778,17 @@ def _resolve_sfx_container_filter(intent: Intent, catalog: list[MetricEntry]) ->
     return f"filter('container', '*{target}*')"
 
 
+def _validate_signalflow_translation_syntax(expr: str) -> None:
+    """Reject unsupported syntax using a view that expires before recursion."""
+    syntax = "".join(character for _, character in _unquoted_query_syntax(expr))
+    if "=~" in syntax:
+        raise UnsupportedSignalFlowTranslation("regex_widening")
+    if "!=" in syntax or "!~" in syntax:
+        raise UnsupportedSignalFlowTranslation("synthetic_fallback")
+    if "histogram_quantile(" in syntax:
+        raise UnsupportedSignalFlowTranslation("histogram_bucket_guess")
+
+
 def _promql_template_to_signalflow(
     expr_template: str,
     service_filter: str,
@@ -821,8 +798,8 @@ def _promql_template_to_signalflow(
     """Convert a PromQL archetype template expression directly to SignalFlow.
 
     Handles the archetype patterns deterministically:
-    - histogram_quantile(X, sum(rate(metric_bucket{filter}[interval])) by (le))
-      → data('metric', filter=...).percentile(pct=X*100)
+    Regex widening, histogram bucket inference and unsupported expressions
+    are rejected rather than translated to a different measurement.
     - sum(rate(metric{filter}[interval])) by (dim)
       → data('metric', filter=..., rollup='rate').sum(by=['dim'])
     - rate(metric{filter}[interval])
@@ -835,96 +812,61 @@ def _promql_template_to_signalflow(
       → (A / B)
     """
     expr = expr_template.strip()
+    _validate_signalflow_translation_syntax(expr)
+    return _translate_admitted_promql(expr, service_filter, container_filter, legend)
 
-    # Helper: extract filter string from {service_filter} or {container_filter}
-    def _filter_for(content: str) -> str:
-        """Map placeholder content to the resolved SignalFlow filter."""
-        content = content.strip()
-        if not content:
-            return ""
-        if "container_filter" in expr_template and content == container_filter.replace("filter(", "").rstrip(")"):
-            return container_filter
-        return service_filter
+
+def _translate_admitted_promql(expr: str, service_filter: str, container_filter: str, legend: str) -> str:
+    """Translate substrings of one syntax-admitted, immutable expression."""
 
     def _build_sfx_filter(label_block: str) -> str:
-        """Parse a PromQL label block and return a SignalFlow filter."""
-        # The label block has already had {service_filter} etc. substituted
-        # with the SignalFlow filter() strings. We just need to join them.
-        parts = []
-        # Split on comma, but respect nested parens
-        depth = 0
-        current = ""
-        for ch in label_block:
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            if ch == "," and depth == 0:
-                current = current.strip()
-                if current:
-                    parts.append(current)
-                current = ""
-            else:
-                current += ch
-        current = current.strip()
-        if current:
-            parts.append(current)
-
-        filters = []
-        for p in parts:
-            p = p.strip()
-            if p.startswith("filter("):
-                filters.append(p)
-            elif "=~" in p:
-                # status=~"5.." → filter('status', '*')
-                k, _ = p.split("=~", 1)
-                filters.append(f"filter('{k.strip()}', '*')")
-            elif "=" in p:
-                k, v = p.split("=", 1)
-                v = v.strip().strip('"')
-                filters.append(f"filter('{k.strip()}', '{v}')")
-        return " and ".join(filters) if filters else ""
+        """Consume every exact matcher; unsupported syntax cannot disappear."""
+        # Generated filter(...) clauses have a deliberately small literal grammar.
+        # PromQL values containing escapes are rejected rather than reinterpreted.
+        literal = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"\\\r\n]*)"')
+        generated = re.compile(r"filter\(\s*'([^'\\\r\n]*)'\s*,\s*'([^'\\\r\n]*)'\s*\)")
+        remaining = label_block.strip()
+        filters: list[str] = []
+        while remaining:
+            match = literal.match(remaining)
+            if match is not None and "*" in match.group(2):
+                raise UnsupportedSignalFlowTranslation("synthetic_fallback")
+            match = match or generated.match(remaining)
+            if match is None:
+                raise UnsupportedSignalFlowTranslation("synthetic_fallback")
+            key, value = match.groups()
+            filters.append(f"filter({key!r}, {value!r})")
+            remaining = remaining[match.end() :].strip()
+            if remaining:
+                if not remaining.startswith(","):
+                    raise UnsupportedSignalFlowTranslation("synthetic_fallback")
+                remaining = remaining[1:].strip()
+                if not remaining:
+                    raise UnsupportedSignalFlowTranslation("synthetic_fallback")
+        return " and ".join(filters)
 
     # ── ratio: expr / expr ──
     # Split on top-level /
     slash_pos = _find_top_level_slash(expr)
     if slash_pos is not None:
-        left = _promql_template_to_signalflow(expr[:slash_pos].strip(), service_filter, container_filter, "_num")
-        right = _promql_template_to_signalflow(expr[slash_pos + 1 :].strip(), service_filter, container_filter, "_den")
+        left = _translate_admitted_promql(expr[:slash_pos].strip(), service_filter, container_filter, "_num")
+        right = _translate_admitted_promql(expr[slash_pos + 1 :].strip(), service_filter, container_filter, "_den")
         # Strip .publish() from sub-expressions
         left = re.sub(r"\.publish\([^)]*\)$", "", left)
         right = re.sub(r"\.publish\([^)]*\)$", "", right)
         return f"({left} / {right}).publish(label='{legend}')"
 
-    # ── histogram_quantile ──
-    hq = re.match(
-        r"histogram_quantile\(([\d.]+),\s*sum\(rate\(([\w.:]+?)_bucket\{(.*?)\}\[.*?\]\)\)\s*by\s*\(le(?:,\s*(\w+))?\)\)",
-        expr,
-    )
-    if hq:
-        pct = int(float(hq.group(1)) * 100)
-        metric = hq.group(2)
-        filt = _build_sfx_filter(hq.group(3))
-        base = f"data('{metric}'"
-        if filt:
-            base += f", filter={filt}"
-        base += ")"
-        by_dim = hq.group(4)
-        if by_dim and by_dim != "le":
-            return f"{base}.percentile(pct={pct}, by=['{by_dim}']).publish(label='{legend}')"
-        return f"{base}.percentile(pct={pct}).publish(label='{legend}')"
-
     # ── topk ──
     topk = re.match(r"topk\((\d+),\s*(.+)\)$", expr, re.DOTALL)
     if topk:
         k = topk.group(1)
-        inner = _promql_template_to_signalflow(topk.group(2), service_filter, container_filter, legend)
+        inner = _translate_admitted_promql(topk.group(2), service_filter, container_filter, legend)
         inner = re.sub(r"\.publish\([^)]*\)$", "", inner)
         return f"{inner}.top(count={k}).publish(label='{legend}')"
 
     # ── agg(rate/increase(metric{labels}[interval])) by (dims) ──
-    agg = re.match(
-        r"(sum|avg|count|min|max)\((rate|increase)\(([\w.:]+)\{(.*?)\}\[.*?\]\)\)(?:\s*by\s*\(([^)]+)\))?",
+    agg = re.fullmatch(
+        r"(sum|avg|count|min|max)\((rate|increase)\(([\w.:]+)\{(.*?)\}\[(?:\d+(?:ms|[smhdwy]))+\]\)\)(?:\s*by\s*\(([^)]+)\))?",
         expr,
     )
     if agg:
@@ -939,7 +881,9 @@ def _promql_template_to_signalflow(
             base += f", filter={filt}"
         base += f", rollup='{rollup}')"
         if by_dims:
-            dims = [d.strip() for d in by_dims.split(",") if d.strip() != "le"]
+            dims = [d.strip() for d in by_dims.split(",")]
+            if not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", dim) for dim in dims):
+                raise UnsupportedSignalFlowTranslation("synthetic_fallback")
             if dims:
                 base += f".{agg_fn}(by={dims})"
             else:
@@ -949,7 +893,7 @@ def _promql_template_to_signalflow(
         return f"{base}.publish(label='{legend}')"
 
     # ── bare rate/increase ──
-    rate = re.match(r"(rate|increase)\(([\w.:]+)\{(.*?)\}\[.*?\]\)", expr)
+    rate = re.fullmatch(r"(rate|increase)\(([\w.:]+)\{(.*?)\}\[(?:\d+(?:ms|[smhdwy]))+\]\)", expr)
     if rate:
         func = rate.group(1)
         metric = rate.group(2)
@@ -978,19 +922,40 @@ def _promql_template_to_signalflow(
         return f"data('{bare.group(1)}').publish(label='{legend}')"
 
     # Fallback
-    logger.warning("signalflow_compile_fallback", expr=expr[:100])
-    return f"data('{expr}').publish(label='{legend}')"
+    raise UnsupportedSignalFlowTranslation("synthetic_fallback")
+
+
+def _unquoted_query_syntax(expr: str) -> Iterator[tuple[int, str]]:
+    """Mask literal data while preserving source offsets and token boundaries."""
+    quote = ""
+    escaped = False
+    for i, ch in enumerate(expr):
+        if quote:
+            yield i, " "
+            if escaped:
+                escaped = False
+            elif ch == "\\" and quote != "`":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'`":
+            quote = ch
+            yield i, " "
+        else:
+            yield i, ch
 
 
 def _find_top_level_slash(expr: str) -> int | None:
-    """Find position of top-level '/' operator (not inside parens)."""
-    depth = 0
-    for i, ch in enumerate(expr):
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        elif ch == "/" and depth == 0 and i > 0:
+    """Find division outside parentheses, selectors, ranges, and quoted text."""
+    delimiters: list[str] = []
+    closing = {"(": ")", "{": "}", "[": "]"}
+    for i, ch in _unquoted_query_syntax(expr):
+        if ch in closing:
+            delimiters.append(closing[ch])
+        elif ch in ")}]":
+            if not delimiters or delimiters.pop() != ch:
+                return None
+        elif ch == "/" and not delimiters and i > 0:
             return i
     return None
 
@@ -1427,6 +1392,7 @@ def compile_archetype(
     knowledge_scope: Any | None = None,
     resolution_work_budget: SignalResolutionWorkBudget | None = None,
     work_limits: ArchetypeCoverageWorkLimits | None = None,
+    _ownership_catalog: QueryTargetCatalog | None = None,
 ) -> DashboardSpec:
     """Compile an archetype template into a concrete DashboardSpec.
 
@@ -1447,6 +1413,7 @@ def compile_archetype(
         services=intent.services,
         work_limits=limits,
     )
+    ownership_catalog = query_target_catalog(catalog, _prepared=_ownership_catalog)
 
     # Resolve signals → actual metrics before compiling templates
     governance_refs_by_template_query: dict[tuple[int, int], set[KnowledgeRevisionRef]] = {}
@@ -1509,10 +1476,28 @@ def compile_archetype(
                 if target_language == "signalflow":
                     # Compile the resolved PromQL template directly to SignalFlow.
                     legend = qt.legend_format or pt.title
-                    expr = _promql_template_to_signalflow(expr, service_filter, container_filter, legend)
-                    query_target = default_target
+                    try:
+                        expr = _promql_template_to_signalflow(expr, service_filter, container_filter, legend)
+                    except UnsupportedSignalFlowTranslation as exc:
+                        raise UnsupportedSignalFlowTranslation(
+                            exc.reason, f"{archetype.id}/{panel_index + 1}/{query_index + 1}"
+                        ) from exc
+                    from tacit.dashboard_ingest.signalflow import extract_metrics_from_signalflow
+
+                    query_target = _bound_query_target(
+                        ownership_catalog,
+                        set(extract_metrics_from_signalflow(expr)),
+                        "signalflow",
+                        subject_ref=f"{archetype.id}/{panel_index + 1}/{query_index + 1}",
+                    )
                 else:
-                    query_target = _resolve_promql_query_target(catalog, expr, default_target, intent)
+                    query_target = _resolve_promql_query_target(
+                        ownership_catalog,
+                        expr,
+                        default_target,
+                        intent,
+                        subject_ref=f"{archetype.id}/{panel_index + 1}/{query_index + 1}",
+                    )
             else:
                 # Non-PromQL queries are honored verbatim — no PromQL
                 # format/escaping or PromQL→SignalFlow conversion.
@@ -1522,15 +1507,26 @@ def compile_archetype(
                 else:
                     query_datasource_type = qt.datasource_type
                 native_metric_names = {expr}
-                if qt.cloudwatch_namespace and not expr.startswith(f"{qt.cloudwatch_namespace}/"):
-                    native_metric_names.add(f"{qt.cloudwatch_namespace}/{expr}")
+                if qt_language == "signalflow":
+                    from tacit.dashboard_ingest.signalflow import extract_metrics_from_signalflow
+
+                    native_metric_names = set(extract_metrics_from_signalflow(expr))
+                elif qt_language == "graphite":
+                    from tacit.query_parsing.graphite import extract_metrics_from_graphite
+
+                    native_metric_names = extract_metrics_from_graphite(expr)
+                elif qt.cloudwatch_namespace and not expr.startswith(f"{qt.cloudwatch_namespace}/"):
+                    native_metric_names = {f"{qt.cloudwatch_namespace}/{expr}"}
                 query_target = _resolve_native_query_target(
-                    catalog,
+                    ownership_catalog,
                     query_datasource_type,
                     qt_language,
                     native_metric_names,
+                    subject_ref=f"{archetype.id}/{panel_index + 1}/{query_index + 1}",
                 )
 
+            if not query_target.datasource_uid:
+                continue
             compiled_query = PanelQuery(
                 expr=expr,
                 legend_format=qt.legend_format,
@@ -2050,6 +2046,7 @@ def blend_archetypes(
     learned_archetype_min_coverage: float = 0.75,
     learned_archetype_boost: float = 0.15,
     max_dashboard_panels: int = 10,
+    _ownership_catalog: QueryTargetCatalog | None = None,
 ) -> DashboardSpec:
     """Blend panels from multiple archetypes into a single dashboard.
 
@@ -2089,6 +2086,7 @@ def blend_archetypes(
         knowledge_scope=knowledge_scope,
     )
     max_panels = max_dashboard_panels
+    ownership_catalog = query_target_catalog(catalog, _prepared=_ownership_catalog)
 
     primary_arch, primary_conf = ranked_archetypes[0]
     compiled_query_uses: list[KnowledgeQueryUse] = []
@@ -2101,6 +2099,7 @@ def blend_archetypes(
         tenant_id=tenant_id,
         knowledge_query_uses=compiled_query_uses,
         knowledge_scope=knowledge_scope,
+        _ownership_catalog=ownership_catalog,
     )
 
     # De-dup on the panel's *query signature* (the set of normalized query
@@ -2128,6 +2127,7 @@ def blend_archetypes(
             tenant_id=tenant_id,
             knowledge_query_uses=compiled_query_uses,
             knowledge_scope=knowledge_scope,
+            _ownership_catalog=ownership_catalog,
         )
         added = 0
         for panel in secondary_spec.panels:

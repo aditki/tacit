@@ -9,8 +9,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+from tacit.catalog import MetricCatalogResult
 from tacit.models.schemas import DashboardSpec, Intent, MetricEntry
 from tacit.runtime_ownership import RuntimeOwnershipDescriptor
+from tacit.signals.resolution import SignalResolutionWorkBudget
+
+
+@runtime_checkable
+class MetricDiscoveryWithMetadata(Protocol):
+    """Optional per-call discovery facts; list-only DashboardBackend products remain valid."""
+
+    async def discover_metrics_with_metadata(
+        self, keywords: list[str], intent: Intent, work_budget: SignalResolutionWorkBudget
+    ) -> MetricCatalogResult: ...
 
 
 @dataclass

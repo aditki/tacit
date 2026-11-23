@@ -1,0 +1,37 @@
+{
+  "schema": "acquisition-parity/1",
+  "original_count": 588,
+  "legacy_projection_count": 300,
+  "datasource_uid": "real-telemetry",
+  "categories": {
+    "visa_cache_size": [
+      "visa_validation_cache_size_entries"
+    ],
+    "payment_transaction_rate": [
+      "app_payment_transactions_total"
+    ],
+    "redis_memory": [
+      "redis_memory_used_bytes"
+    ],
+    "hit_ratio": [
+      "redis_keyspace_hits_total",
+      "redis_keyspace_misses_total"
+    ],
+    "evictions": [
+      "redis_keys_evicted_total"
+    ],
+    "client_pressure": [
+      "redis_clients_connected"
+    ]
+  },
+  "fixture_critical": [
+    "visa_validation_cache_size_entries",
+    "redis_keyspace_hits_total",
+    "redis_keyspace_misses_total",
+    "redis_keys_evicted_total",
+    "redis_memory_used_bytes",
+    "redis_clients_connected",
+    "http_server_request_duration_seconds_bucket"
+  ],
+  "critical_offset": 400
+}

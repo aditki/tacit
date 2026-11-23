@@ -125,6 +125,16 @@ class SignalResolutionWorkLimitError(RuntimeError):
         super().__init__(f"{self.reason_code}: {dimension} exceeds {limit}")
 
 
+class AcquisitionWorkLimitError(RuntimeError):
+    """Acquisition admission failed without blocking its runtime owner."""
+
+    reason_code = "work_limit"
+
+    def __init__(self, dimension: str) -> None:
+        self.dimension = dimension
+        super().__init__(f"work_limit: {dimension}")
+
+
 @dataclass(slots=True)
 class SignalResolutionWorkBudget:
     """Mutable aggregate admission budget shared by one investigation.
@@ -138,6 +148,15 @@ class SignalResolutionWorkBudget:
     max_calls: int
     max_mapping_catalog_comparisons: int
     max_results: int
+    max_acquisition_calls: int = 32
+    max_acquisition_response_bytes: int = 8 * 1024 * 1024
+    max_acquisition_entries: int = 5000
+    acquisition_calls: int = field(default=0, init=False)
+    acquisition_response_bytes: int = field(default=0, init=False)
+    acquisition_entries: int = field(default=0, init=False)
+    _acquisition_identities: set[object] = field(default_factory=set, init=False, repr=False)
+    _acquisition_stops: set[str] = field(default_factory=set, init=False, repr=False)
+    _acquisition_contention: bool = field(default=False, init=False, repr=False)
     calls: int = field(default=0, init=False)
     mapping_catalog_comparisons: int = field(default=0, init=False)
     results_constructed: int = field(default=0, init=False)
@@ -154,10 +173,20 @@ class SignalResolutionWorkBudget:
             "max_calls",
             "max_mapping_catalog_comparisons",
             "max_results",
+            "max_acquisition_calls",
+            "max_acquisition_response_bytes",
+            "max_acquisition_entries",
         ):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{field_name} must be a positive integer")
+        for field_name, ceiling in (
+            ("max_acquisition_calls", 32),
+            ("max_acquisition_response_bytes", 8 * 1024 * 1024),
+            ("max_acquisition_entries", 5000),
+        ):
+            if getattr(self, field_name) > ceiling:
+                raise ValueError(f"{field_name} exceeds acquisition ceiling")
 
     def _reserve(
         self,
@@ -181,6 +210,64 @@ class SignalResolutionWorkBudget:
                 self._exhaustion = (dimension, observed, limit)
                 raise SignalResolutionWorkLimitError(dimension, observed, limit)
             setattr(self, dimension, observed)
+
+    def _reserve_acquisition(self, dimension: str, amount: int, limit: int, identity: object = None) -> None:
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+            raise ValueError("acquisition increments must be non-negative integers")
+        if identity is not None and not (
+            (type(identity) is str and len(identity) <= 65536)
+            or (
+                type(identity) is tuple
+                and len(identity) <= 8
+                and all(type(value) is str and len(value) <= 65536 for value in identity)
+            )
+        ):
+            raise ValueError("acquisition identity must contain only plain strings")
+        if not self._lock.acquire(blocking=False):
+            self._acquisition_contention = True
+            raise AcquisitionWorkLimitError("contention")
+        try:
+            if dimension == "acquisition_calls":
+                if self._acquisition_contention or self._acquisition_stops:
+                    raise AcquisitionWorkLimitError("acquisition_stopped")
+                if self.acquisition_response_bytes >= self.max_acquisition_response_bytes:
+                    self._acquisition_stops.add("acquisition_response_bytes")
+                    raise AcquisitionWorkLimitError("acquisition_response_bytes")
+            if identity is not None and identity in self._acquisition_identities:
+                return
+            observed = int(getattr(self, dimension)) + amount
+            if observed > limit:
+                self._acquisition_stops.add(dimension)
+                raise AcquisitionWorkLimitError(dimension)
+            setattr(self, dimension, observed)
+            if identity is not None:
+                self._acquisition_identities.add(identity)
+        finally:
+            self._lock.release()
+
+    def reserve_acquisition_call(self) -> None:
+        self._reserve_acquisition("acquisition_calls", 1, self.max_acquisition_calls)
+
+    def reserve_acquisition_bytes(self, amount: int) -> None:
+        self._reserve_acquisition("acquisition_response_bytes", amount, self.max_acquisition_response_bytes)
+
+    def reserve_acquisition_entry(self, identity: object = None) -> None:
+        self._reserve_acquisition("acquisition_entries", 1, self.max_acquisition_entries, identity)
+
+    def reserve_acquisition_read_allowance(self, maximum: int) -> int:
+        """Charge allowance before asking the stream for another bounded chunk."""
+        if not self._lock.acquire(blocking=False):
+            self._acquisition_contention = True
+            raise AcquisitionWorkLimitError("contention")
+        try:
+            allowance = min(maximum, self.max_acquisition_response_bytes - self.acquisition_response_bytes)
+            if allowance < 1:
+                self._acquisition_stops.add("acquisition_response_bytes")
+                raise AcquisitionWorkLimitError("acquisition_response_bytes")
+            self.acquisition_response_bytes += allowance
+            return allowance
+        finally:
+            self._lock.release()
 
     def begin_call(self) -> None:
         """Reserve one first-party resolver invocation."""
@@ -216,6 +303,13 @@ class SignalResolutionWorkBudget:
         """Return bounded, payload-free observability counters."""
         with self._lock:
             return {
+                "acquisition_call_count": self.acquisition_calls,
+                "acquisition_response_bytes": self.acquisition_response_bytes,
+                "acquisition_entry_count": self.acquisition_entries,
+                "acquisition_call_limit": self.max_acquisition_calls,
+                "acquisition_response_byte_limit": self.max_acquisition_response_bytes,
+                "acquisition_entry_limit": self.max_acquisition_entries,
+                "acquisition_work_limit_exhausted": int(bool(self._acquisition_stops) or self._acquisition_contention),
                 "resolution_call_count": self.calls,
                 "mapping_catalog_comparison_count": self.mapping_catalog_comparisons,
                 "result_construction_count": self.results_constructed,

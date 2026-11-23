@@ -439,7 +439,7 @@ def test_archetype_signal_fallback_logs_only_safe_bounded_diagnostics() -> None:
 
     archetype = _archetype(
         "sensitive-archetype-id",
-        "sensitive-default-query",
+        "sensitive_default_query",
         signal_type="request_latency",
     )
 
@@ -447,7 +447,7 @@ def test_archetype_signal_fallback_logs_only_safe_bounded_diagnostics() -> None:
         dashboard = compile_archetype(
             archetype,
             _intent(),
-            [_metric("checkout_latency_seconds")],
+            [_metric("sensitive_default_query")],
             signal_store=FailingStore(),
             tenant_id="tenant-secret",
         )
@@ -458,7 +458,7 @@ def test_archetype_signal_fallback_logs_only_safe_bounded_diagnostics() -> None:
     assert "payload-secret" not in serialized_failure
     assert "tenant-secret" not in serialized_failure
     assert "sensitive-archetype-id" not in serialized_failure
-    assert "sensitive-default-query" not in serialized_failure
+    assert "sensitive_default_query" not in serialized_failure
     assert "traceback" not in serialized_failure.casefold()
     assert failure["reason_code"] == "archetype_signal_resolution_failed"
     assert failure["error_type"] == "RuntimeError"
@@ -621,7 +621,7 @@ def test_archetype_engine_degrades_ordinary_store_acquisition_failure(
     monkeypatch.setattr("tacit.signals.get_signal_store", fail_store_acquisition)
     archetype = _archetype(
         "sensitive-archetype-id",
-        "sensitive-default-query",
+        "sensitive_default_query",
         signal_type="request_latency",
     )
 
@@ -630,7 +630,7 @@ def test_archetype_engine_degrades_ordinary_store_acquisition_failure(
             dashboard = compile_archetype(
                 archetype,
                 _intent(),
-                [_metric("checkout_latency_seconds")],
+                [_metric("sensitive_default_query")],
                 tenant_id="tenant-secret",
             )
             assert dashboard.panels

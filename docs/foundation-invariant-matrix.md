@@ -978,6 +978,229 @@ work limit.
   must match the expected HTTPS origin, and workflow jobs execute that exact
   helper before and after publication.
 
+## Acquisition implementation gate
+
+Applicable existing rows: entry-point parity; exact runtime/generation/lease ownership;
+tenant/permission denial before I/O; bounded collections and multi-stage work;
+side-effect ordering; provenance/replay/fingerprints; concurrency fault injection.
+Write failing discovery, binding, response-limit and capture/publication matrix
+cases before production changes. All Grafana adapters, direct/proxied SignalFx,
+archetype/evidence/rescue/freeform consumers are in the shared boundary inventory.
+
+Lifecycle gate: existing execution graph is runtime owner; canonical admission
+controller is admission authority; worker/service-owner finalization releases
+capacity only after actual settlement; adopted backend/transport owner cleans up.
+Cancellation or caller-loop loss may detach delivery but never owns retirement.
+Exact generation/resource leases govern dispatch and close. Work counters use
+nonblocking owner reservations and are not permits. No second controller, thread,
+executor or cleanup authority. Test stale leases, lock contention, before/after
+dispatch cancellation and lost-loop cleanup through the real proxy.
+
+Publication requires one bounded capture admission with pinned base IDs and
+references before completion begins any publication side effect. Unsupported
+selected SignalFlow translations fail the whole investigation without fallback
+or partial publication. Old exact fingerprints and offline replay stay intact.
+
+Acquisition shared-boundary amendment: Grafana source enumeration plus every
+built-in Grafana adapter and direct SignalFx discovery enter the common
+`tacit/acquisition.py` bounded raw-read/search boundary through their already
+owned clients. Applicable tests: acquisition response limits (call/byte/entry
+limit plus one, identity encoding, closure, lock contention), typed discovery
+retention/cache bypass and exact backend proxy lifecycle. This module owns no
+lifecycle authority; the existing owner, admission, retirement and cleanup gate
+above remains authoritative. Adapters create bounded batches, never one task per
+unbounded source or metric.
+
+Acquisition owner-selection inventory amendment: `tacit/evidence_artifacts.py`
+symptom/gap rescue joins engine and evidence ownership consumers under the same
+pure selector and binding-parity matrix. No consumer-local fallback policy.
+
+SignalFlow translation inventory amendment: `tacit/signalfx/publisher.py` query
+publication is a second entry point to the same translator boundary. It must
+use the guarded archetype translator and preflight every selected chart before
+publication. Direct publish/freeform, engine archetype compilation and evidence
+consumers share rejection of histogram-base guessing, regex widening and
+synthetic expression fallbacks. The required-survival gate forbids publishing a
+supported subset. Focused publisher tests assert zero remote writes on any
+rejected selected query. This is a narrow allowlist amendment, not a new compiler.
+
+Publication ordering amendment: `tacit/pipeline/stages/publish.py` performs the
+same pure SignalFlow preflight before the first backend publication, including
+Grafana-first fallback order. Standalone SignalFx preflight runs before group
+creation. Neither path moves publication authority or introduces a compiler.
+Matrix tests require zero remote writes across every backend when any selected
+SignalFlow translation is unsupported.
+
+Source count clarification: source statuses describe metric-search identities.
+Successful datasource enumeration contributes only call/byte counters; its
+source count is never a metric total and no fake UID is created. Enumeration
+failure is one zero-count backend summary. Legacy return adaptation groups real
+UID/type/language identities and retains `legacy_unknown` transport limitations.
+
+Duplicate-fact boundary escalation: legacy backend adaptation, Grafana aggregation
+and Prometheus metadata definition expansion must preserve conflicting facts
+until shared catalog normalization. Budget identities reserve once; equivalent
+facts may deduplicate. Retention cannot select the first unit/type or drop a
+conflicting duplicate. Existing raw-fact admission limits fail closed rather
+than erasing conflicts. Reversed-definition and list/adapter parity tests prove
+ambiguous ownership and audited conflicts.
+
+Acquisition allocation evidence: isolated child-process adversarial tests cover
+8 MB many-small values, 8 MB scalar, depth 33, and five simultaneously retained
+5000-fact/55000-dimension raw+decode+catalog+capture graphs with near-limit
+completion text/tree, private preparation and preflight contract graphs.
+2026-11-18 measured high-water: 183612775 traced bytes / 408190976 RSS bytes on
+CPython 3.12 macOS. Conservative static ceiling 512 MiB/pipeline, at most five
+acquisition pipelines, serial adapter scheduling; larger effective concurrency
+is rejected before typed acquisition I/O. See engineering notes for the bounded
+component worksheet and conservative final-EOF accounting.
+
+
+Derived-text owner inventory: matching/fallback streaming name heaps,
+`_bounded_names`, normalized `_append_inventory` tuples and
+`AcquisitionSearches.inventory` memberships share output text admission before
+growth. Elasticsearch path concatenation checks scalar bounds before allocation;
+CloudWatch namespace-qualified names enter the same text boundary. Required
+matrix probes cover Unicode shared-prefix amplification, filter-before-cap in
+Prometheus/CloudWatch/InfluxDB/Elasticsearch, strict JSON duplicate/nonfinite
+rejection and retained metadata conflicts after capacity loss/lock contention.
+Final isolated allocation record: 180074 nodes/1890564 characters; private
+completion input: 192947 nodes/1985684 characters. Derived-prefix rejection
+high-water: 16240351 traced bytes. No new lifecycle or accounting authority.
+
+Review regression amendment: Prometheus-compatible inventory retention must
+prioritize actual keyword matches over ordinary unrelated names, then retain
+bounded backfill; excluded `_created`/`_info` noise alone does not test this
+invariant. Cover normal-name limit-plus-one, reverse ordering and below-cap
+backfill across Prometheus, Mimir, Cortex and Thanos. The shared adapter
+coordinator assigns one absolute deadline before inventory and carries its
+remaining time into enrichment for every phased adapter. Expiry preserves
+admitted names and records incomplete metadata, without restarting the timeout
+or converting cancellation/authority loss into success. Inventory and
+enrichment remain inside the existing adopted backend operation; its service
+owner retains cancellation settlement, capacity release and cleanup authority.
+Direct SignalFx and standalone native adapter acquisition use that same
+deadline-aware enrichment boundary, with their own pinned client settings.
+No path may bypass the deadline merely because it does not use Grafana's
+multi-datasource coordinator.
+
+Parser and catalog-identity review amendment: native archetype compilation and
+learned verbatim native queries resolve extracted operands through the same
+exact-owner boundary. Cover bounded native expressions, multiple operands,
+missing/ambiguous owners and labels that resemble metric names; unsupported
+syntax cannot fall back to an arbitrary default source. SignalFlow compilation,
+evidence/rescue, pipeline publication and standalone publisher translation share
+one quote/escape/bracket-aware division splitter. Slashes inside selector/string
+literals are data, while actual top-level division still uses the guarded
+translation rules. Tests cover both successful selectors and zero publication
+effects for unsupported expressions.
+
+Typed and legacy discovery aggregation, metadata expansion, source membership,
+ownership selection and capture validation share canonical metric identities
+(name, UID, datasource type, query language and namespace). Configured retained
+identity limits and the independent physical-fact ceiling are checked separately
+before aggregate growth. Conflicting metadata facts consume no extra identity,
+but still consume physical-fact work. Capture conflict applicability uses the
+same language-scoped complete-owner candidate identities as selection; a UID
+collision in another query language cannot import its conflicts. Red/green tests
+must cover lower configured identity limits, limit-plus-one identities/facts,
+ordering and same-UID cross-language captures without hiding same-scope conflicts.
+Capture admission must also recompute candidate owners for every decision,
+including metadata-conflict decisions; forged, omitted or substituted candidate
+UIDs are rejected rather than becoming replay authority.
+These are pure parsing/identity repairs: the existing runtime, work-budget,
+publication, cancellation and cleanup owners remain unchanged.
+
+Completed-fact and lookup-reuse review amendment: the shared adapter enrichment
+deadline boundary retains completed admitted metadata definitions, dimensions
+and search statuses when later enrichment expires. It marks unfinished work
+incomplete without reverting discovered conflicts to inventory-only facts.
+Cover Grafana coordinator, standalone Prometheus-family adapters and direct
+SignalFx entry points, deadline-before-start, later-request timeout, cancellation,
+caps and zero later I/O. Checkpoints are local to the existing adopted operation;
+its service owner still owns cancellation settlement, capacity and cleanup.
+No detached task, new timeout, permit, worker or cleanup owner is introduced.
+Raw direct-helper inputs reserve identities once before enrichment; proven
+retained inputs use their existing reservation. The phased coordinator queues
+only globally admitted identities, applies updates once per identity and uses
+the same bounded fact admission at finalization. Re-reserving completed known
+facts after deadline or budget-lock contention must not erase them; arbitrary
+raw inputs cannot use that internal path to bypass identity capacity.
+
+Typed Loki inventory preserves a bounded available-labels fallback for custom
+labels through the shared acquisition path. Source membership and completeness
+must describe retained facts; failed or empty enumeration cannot fabricate a
+usable stream. Cover adapter/coordinator/freeform use, name/dimension/text and
+entry bounds, truncation and no custom-label value fetches.
+
+Owner lookups share one explicitly owned admitted catalog view across repeated
+queries in compiler, declared evidence, symptom/gap rescue and freeform stages.
+Capture construction/admission remain independent trust boundaries. Reuse may
+not discard conflicts, bypass admission, expose mutable retained facts, retain
+unbounded results, or create an implicit global/identity cache across runs or
+tenants. Test normalization, whole-catalog copying and hashing counts through
+public multi-query operations; merely caching normalization while copying the
+full catalog per lookup is insufficient. Mutation, conflict/order/UID/language
+parity, representative 5,000-fact workloads, independent/concurrent operations
+and exact capture/replay remain required. Existing runtime and work-budget
+owners are unchanged: no new lifecycle or cleanup authority is involved.
+The isolated five-graph allocation probe additionally co-retains one indexed
+5,000-fact view per operation: 219789099 traced bytes / 462094336 RSS bytes
+on CPython 3.12 macOS, under the unchanged 512 MiB/pipeline envelope. This
+adversarial co-residency exceeds the view's actual operation-local lifetime.
+
+Exact-name and cached-discovery compatibility amendment: shared PromQL operand
+extraction must recognize exact `__name__` equality selectors before the new
+exact-owner boundary. Cover AST and conservative fallback parsing, learned
+query preservation, nested/multiple operands, missing/ambiguous owners and
+conflicting literal name constraints and unproved dynamic selectors. A partially
+understood selector must not supply a complete-looking operand set or restore
+arbitrary datasource defaults. The same parser feeds ingestion, compiler,
+validation, Grafana diagnostics and
+compiled-query recording; test these shared consumers where applicable.
+
+Freeform discovery cache values are reusable unfiltered model results, never
+run-specific ownership decisions. Cache hit and miss paths share one defensive
+run-local copy before filtering or passing mutable discovery to the query
+builder. Prove ambiguous/unavailable ownership followed by unique/present
+ownership recovers with an unchanged prompt projection/cache key, cached
+metrics and nested fields remain intact, denied runs make no builder/publication
+call, and tenant/key/token-usage/cache policy remain unchanged. No generic cache
+semantics, runtime resource, admission controller or cleanup authority changes.
+Attribute regressions against the PR base's observable behavior, rather than
+the age of the helper line, before deciding a review finding is out of scope.
+
+Quoted translation and partial-inventory review amendment: shared SignalFlow
+translation inspects operators and function syntax outside quoted literal data.
+Exact label values containing `!=`, `!~`, `=~`, slashes or function-like text
+retain their meaning; real unsupported matcher operators still reject before
+any backend writes. Compiler, evidence/rescue and standalone/pipeline publisher
+preflight use this one lexical boundary and the existing matcher allowlist.
+Cover quote/escape handling, literal/operator mixtures and mixed-panel rejection.
+The full-expression lexical guard runs once per translation; recursive ratio or
+topk translation must not multiply whole-expression masking work.
+
+Completed bounded inventory candidates survive a later search's own adapter
+deadline through direct SignalFx and the shared standalone first-party helper,
+subject to final identity admission. Keep one operation-local candidate/tracker
+state, finalize entry admission once after joined timeout settlement, preserve
+completed source statuses and mark unfinished searches incomplete. Checkpoints
+cannot reserve
+fallback identities early and starve later keyword matches. Call/byte/entry,
+physical-fact and text limits, deterministic source membership and conflict
+retention remain authoritative. Test first-success/later-timeout, original
+absolute deadline, cancellation propagation, cap/contention, no later I/O and
+unchanged caller-cancellation semantics. The existing RuntimeStores/execution
+graph remains the runtime owner; canonical admission and the investigation work
+budget remain the sole admission authorities. The adopted backend operation
+retains capacity through settlement, and existing client/backend
+owners close transports. No task population, worker, permit, retry, runtime
+manager or cleanup authority is added. Optional third-party/legacy adapter
+compatibility must be preserved explicitly. The Grafana coordinator's outer
+caller-timeout discard behavior also exists on the PR base and is outside this
+repair: it remains a cancellation boundary, not permission to suppress caller
+cancellation and return partial success. No adapter protocol change is required.
+
 ## Quality gates
 
 | Change area | Minimum additional gate |

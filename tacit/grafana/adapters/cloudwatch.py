@@ -96,7 +96,7 @@ def _select_namespaces(keywords: list[str], available: list[str]) -> list[str]:
     available_set = set(available)
 
     if matched:
-        result = [ns for ns in matched if ns in available_set]
+        result = sorted(ns for ns in matched if ns in available_set)
         if result:
             return result[:10]
 
@@ -130,6 +130,14 @@ def _coerce_dimension_keys(response: object) -> list[str]:
 
 
 class CloudWatchAdapter(DatasourceAdapter):
+
+    supports_acquisition_inventory_phase = True
+
+    async def discover_metrics_with_metadata(self, client, datasource, keywords, work_budget, *, enrich=True):
+        """Return bounded per-search metadata without consulting legacy caches."""
+        from tacit.acquisition import discover_adapter_metrics
+
+        return await discover_adapter_metrics(client, datasource, keywords, work_budget, enrich=enrich)
 
     @property
     def query_language(self) -> str:

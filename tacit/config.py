@@ -419,6 +419,49 @@ def _load_yaml_config() -> dict[str, Any]:
     return flat
 
 
+def validate_acquisition_settings(runtime_settings: object) -> None:
+    """Recheck copied/mutated settings before any acquisition or composition."""
+    for name, ceiling in (
+        ("max_acquisition_calls", 32),
+        ("max_acquisition_response_bytes", 8 * 1024 * 1024),
+        ("max_acquisition_entries", 5000),
+    ):
+        value = getattr(runtime_settings, name)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
+            raise ValueError(f"{name} exceeds acquisition admission limits")
+
+
+class AcquisitionConfigurationError(ValueError):
+    """Effective acquisition settings exceed the measured supported envelope."""
+
+    reason_code = "acquisition_configuration_unsupported"
+
+
+def validate_acquisition_runtime(runtime_settings: object) -> None:
+    """Admit only measured simultaneous acquisition settings before remote I/O."""
+    validate_acquisition_settings(runtime_settings)
+    adapter_limit = getattr(runtime_settings, "adapter_max_concurrent")
+    if isinstance(adapter_limit, bool) or not isinstance(adapter_limit, int) or not 1 <= adapter_limit <= 1000:
+        raise AcquisitionConfigurationError("adapter concurrency exceeds supported acquisition configuration")
+    simultaneous = getattr(runtime_settings, "pipeline_max_concurrent")
+    if isinstance(simultaneous, bool) or not isinstance(simultaneous, int) or not 1 <= simultaneous <= 5:
+        raise AcquisitionConfigurationError(
+            "acquisition simultaneous response memory envelope permits at most 5 pipelines"
+        )
+
+
+def validate_acquisition_budget(runtime_settings: object, work_budget: object) -> None:
+    """A supplied shared budget cannot weaken the owning runtime's limits."""
+    validate_acquisition_runtime(runtime_settings)
+    for field_name in ("max_acquisition_calls", "max_acquisition_response_bytes", "max_acquisition_entries"):
+        maximum = getattr(runtime_settings, field_name)
+        if field_name == "max_acquisition_entries":
+            maximum = min(maximum, getattr(runtime_settings, "signal_resolution_catalog_limit"))
+        value = getattr(work_budget, field_name)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+            raise AcquisitionConfigurationError(f"supplied {field_name} exceeds runtime limits")
+
+
 class Settings(BaseSettings):
     """Tacit configuration.
 
@@ -506,6 +549,9 @@ class Settings(BaseSettings):
     adapter_max_concurrent: int = 5  # max simultaneous datasource adapter calls
     adapter_timeout_seconds: int = 30  # per-adapter timeout
     max_metric_catalog_size: int = 300  # total metrics across all datasources sent to LLM
+    max_acquisition_calls: int = Field(default=32, ge=1, le=32)
+    max_acquisition_response_bytes: int = Field(default=8 * 1024 * 1024, ge=1, le=8 * 1024 * 1024)
+    max_acquisition_entries: int = Field(default=5000, ge=1, le=5000)
 
     # Archetype blending caps — bound the irrelevant-panel explosion from
     # blending many loosely-matched archetypes.
@@ -776,6 +822,11 @@ class Settings(BaseSettings):
         )
         if retained_request_memory > self.api_request_body_max_buffered_bytes:
             raise ValueError("api_request_body_max_buffered_bytes must cover pipeline retained request memory")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_acquisition_capacity(self) -> Settings:
+        validate_acquisition_settings(self)
         return self
 
     @model_validator(mode="after")

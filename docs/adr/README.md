@@ -35,3 +35,4 @@ architecture decisions are maintained in the
 | [ADR-021](021-generated-archetype-scope-context.md) | Generated-archetype evaluation uses explicit request scope and fails closed | Accepted | Not implemented |
 | [ADR-022](022-operational-knowledge-lifecycle.md) | Operational Knowledge is governed, scoped, and revisioned | Accepted | Implemented through product milestone |
 | [ADR-023](023-contain-blocking-bedrock-before-native-async.md) | Contain blocking Bedrock before native async migration | Accepted | Blocking bridge contained; provider/backend runtime ownership implemented; native async deferred |
+| [ADR-025](025-discovery-result-compatibility.md) | Preserve discovery facts through existing investigation owners | Proposed | Acquisition implementation; activation gated by matrix and quality evidence |
