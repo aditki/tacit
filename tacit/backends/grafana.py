@@ -34,7 +34,7 @@ from tacit.runtime_ownership import (
     runtime_descriptor_from_settings,
     snapshot_runtime_settings,
 )
-from tacit.validation import validate_dashboard_queries
+from tacit.validation import validate_dashboard_queries, validate_dashboard_queries_with_measurements
 
 logger = structlog.get_logger()
 PROMQL_DATASOURCE_TYPES = {"prometheus", "promql", "mimir", "cortex", "thanos"}
@@ -219,6 +219,12 @@ class GrafanaBackend:
         catalog: list[MetricEntry] | None = None,
     ) -> tuple[DashboardSpec, list[str]]:
         return await validate_dashboard_queries(self._client, spec, catalog)
+
+    async def validate_queries_with_measurements(self, spec, catalog, work_budget):
+        from tacit.config import validate_acquisition_budget
+
+        validate_acquisition_budget(self._settings, work_budget)
+        return await validate_dashboard_queries_with_measurements(self._client, spec, catalog, work_budget)
 
     # ── Publish ───────────────────────────────────────────────────────
 

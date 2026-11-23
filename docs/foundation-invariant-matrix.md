@@ -1201,6 +1201,41 @@ caller-timeout discard behavior also exists on the PR base and is outside this
 repair: it remains a cancellation boundary, not permission to suppress caller
 cancellation and return partial success. No adapter protocol change is required.
 
+## Measured evidence implementation gate
+
+One measured-query boundary preserves bounded finite values from already-issued
+instant validation responses. Query identity binds exact datasource/type/language
+and expression; observation links cannot borrow a same-expression foreign owner.
+Generated/public dashboard inputs cannot inject verified numeric facts. Retain
+only declared bounded scope labels and exclude raw values/labels from logs,
+diagnostics and model inputs. Availability does not establish an abnormality,
+comparison, priority or cause.
+
+Main, symptom-rescue and gap-rescue validation share the exact existing runtime
+owner, adopted backend operation and investigation work budget. Bounded response
+admission precedes buffering/decode; no cap failure falls back to an unbounded
+read. Per-query series/label and aggregate run sample/byte limits apply before
+retention. Invalid, partial, unsupported and limit outcomes are explicit and
+contain no complete-looking prefix. No extra query, worker, cache, retry,
+controller or cleanup authority is introduced.
+
+Physical measurement expansion is admitted by that same boundary before query
+records or contract children are materialized. Repeated query identities count
+for every embedded sample/byte copy; sidecar deduplication is not an output-work
+limit. Lifecycle event payloads retain only bounded measurement counts,
+dispositions and fingerprints, not numeric values or scope-label payloads.
+
+Tests written before production changes cover real numeric distinction,
+zero/negative/invalid/partial samples, shape and limit-plus-one cases, bounded
+transport/cancellation, zero calls after denial, proxy fallback, all validation
+paths, pre-publication private-copy admission, tenant/source linkage, changed
+fact fingerprints, historical absent-field exact replay, counterfactual removal,
+bundles and unchanged grounding/ranking. The existing RuntimeStores root owns
+the runtime; canonical admission admits work; service-owned operations retain
+capacity through settlement and existing provider/backend owners close streams
+on cancellation or loop loss. Independent architecture/security reviews precede
+dependent integration, with one final whole-diff review.
+
 ## Quality gates
 
 | Change area | Minimum additional gate |

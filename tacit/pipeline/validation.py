@@ -25,6 +25,7 @@ from tacit.evidence_artifacts import (
     missing_critical_symptom_requirements,
 )
 from tacit.knowledge.usage import KnowledgeRevisionRef
+from tacit.measurements import QueryMeasurement, admit_measurements, query_identity
 from tacit.models.schemas import (
     DashboardSpec,
     EvidenceObservation,
@@ -36,6 +37,7 @@ from tacit.models.schemas import (
     validate_dashboard_spec_work_limits,
 )
 from tacit.signals.resolution import SignalResolutionWorkBudget, SignalResolutionWorkLimitError
+from tacit.validation import validate_queries_with_measurements
 
 logger = structlog.get_logger()
 _SYMPTOM_RESCUE_RESOLUTION_FAILED = "symptom_evidence_resolution_failed"
@@ -53,6 +55,7 @@ class ValidationEvidenceResult:
     panels_before: int
     evidence_observations: list[EvidenceObservation]
     evidence_summary: dict[str, object]
+    query_measurements: tuple[QueryMeasurement, ...] = ()
     applied_knowledge_refs: frozenset[str] = frozenset()
     applied_knowledge_revision_refs: frozenset[KnowledgeRevisionRef] = frozenset()
     knowledge_revision_refs_by_requirement: dict[str, frozenset[KnowledgeRevisionRef]] = field(default_factory=dict)
@@ -117,6 +120,7 @@ async def _preserve_symptom_evidence(
     knowledge_query_uses: list[Any] | None = None,
     observation_work_budget: EvidenceObservationWorkBudget,
     signal_resolution_work_budget: SignalResolutionWorkBudget | None,
+    query_measurements: list[QueryMeasurement],
 ) -> tuple[DashboardSpec, DashboardSpec, int]:
     initial_observations = observe_evidence(
         evidence_requirements,
@@ -194,7 +198,10 @@ async def _preserve_symptom_evidence(
         )
 
     try:
-        symptom_spec, symptom_warnings = await primary.validate_queries(symptom_pre_validation_spec, catalog)
+        validated = await validate_queries_with_measurements(
+            primary, symptom_pre_validation_spec, catalog, signal_resolution_work_budget
+        )
+        symptom_spec, symptom_warnings = validated.spec, validated.warnings
     except EVIDENCE_AUTHORITY_ERRORS:
         raise
     except Exception as exc:
@@ -216,6 +223,7 @@ async def _preserve_symptom_evidence(
         )
         return pre_validation_spec, dashboard_spec, panels_before
     validate_dashboard_spec_work_limits(symptom_spec)
+    query_measurements[:] = admit_measurements((*query_measurements, *validated.measurements))
     if original_panels_after:
         validate_dashboard_composition_work_limits(dashboard_spec, symptom_spec)
     validation_warnings.extend(symptom_warnings)
@@ -271,6 +279,7 @@ async def _preserve_gap_evidence(
     knowledge_query_uses: list[Any] | None = None,
     observation_work_budget: EvidenceObservationWorkBudget,
     signal_resolution_work_budget: SignalResolutionWorkBudget | None,
+    query_measurements: list[QueryMeasurement],
 ) -> tuple[DashboardSpec, DashboardSpec, int]:
     gap_observations = observe_evidence(
         evidence_requirements,
@@ -347,7 +356,10 @@ async def _preserve_gap_evidence(
     validate_dashboard_composition_work_limits(pre_validation_spec, gap_pre_validation_spec)
 
     try:
-        gap_spec, gap_warnings = await primary.validate_queries(gap_pre_validation_spec, catalog)
+        validated = await validate_queries_with_measurements(
+            primary, gap_pre_validation_spec, catalog, signal_resolution_work_budget
+        )
+        gap_spec, gap_warnings = validated.spec, validated.warnings
     except EVIDENCE_AUTHORITY_ERRORS:
         raise
     except Exception as exc:
@@ -369,6 +381,7 @@ async def _preserve_gap_evidence(
         )
         return pre_validation_spec, dashboard_spec, panels_before
     validate_dashboard_spec_work_limits(gap_spec)
+    query_measurements[:] = admit_measurements((*query_measurements, *validated.measurements))
     validate_dashboard_composition_work_limits(dashboard_spec, gap_spec)
     validation_warnings.extend(gap_warnings)
     record_stage(
@@ -488,7 +501,11 @@ async def validate_dashboard_and_evidence(
     validate_dashboard_spec_work_limits(dashboard_spec)
     panels_before = len(dashboard_spec.panels)
     pre_validation_spec = dashboard_spec.model_copy(deep=True)
-    dashboard_spec, validation_warnings = await primary.validate_queries(dashboard_spec, catalog)
+    validated = await validate_queries_with_measurements(
+        primary, dashboard_spec, catalog, signal_resolution_work_budget
+    )
+    dashboard_spec, validation_warnings = validated.spec, validated.warnings
+    query_measurements = list(validated.measurements)
     validate_dashboard_spec_work_limits(dashboard_spec)
     rescue_knowledge_query_uses: list[Any] = []
 
@@ -511,6 +528,7 @@ async def validate_dashboard_and_evidence(
             knowledge_query_uses=rescue_knowledge_query_uses,
             observation_work_budget=observation_work_budget,
             signal_resolution_work_budget=signal_resolution_work_budget,
+            query_measurements=query_measurements,
         )
         pre_validation_spec, dashboard_spec, panels_before = await _preserve_gap_evidence(
             primary=primary,
@@ -530,6 +548,7 @@ async def validate_dashboard_and_evidence(
             knowledge_query_uses=rescue_knowledge_query_uses,
             observation_work_budget=observation_work_budget,
             signal_resolution_work_budget=signal_resolution_work_budget,
+            query_measurements=query_measurements,
         )
 
     validation_status, validation_reason = _validation_status(panels_before, len(dashboard_spec.panels))
@@ -550,6 +569,11 @@ async def validate_dashboard_and_evidence(
         observation_work_budget=observation_work_budget,
         signal_resolution_work_budget=signal_resolution_work_budget,
     )
+    evidence_summary.update(
+        measurement_query_count=len(query_measurements),
+        measurement_captured_count=sum(record.disposition == "captured" for record in query_measurements),
+        measurement_unavailable_count=sum(record.disposition != "captured" for record in query_measurements),
+    )
     _record_evidence_stage(
         evidence_summary=evidence_summary,
         evidence_status=evidence_status,
@@ -559,6 +583,7 @@ async def validate_dashboard_and_evidence(
     from tacit.archetypes.engine import dashboard_query_identities
 
     surviving_query_ids = dashboard_query_identities(dashboard_spec)
+    surviving_measurement_ids = {query_identity(query) for panel in dashboard_spec.panels for query in panel.queries}
     applied_knowledge_refs = frozenset(
         use.knowledge_ref for use in rescue_knowledge_query_uses if use.query_identity() in surviving_query_ids
     )
@@ -579,6 +604,10 @@ async def validate_dashboard_and_evidence(
         panels_before=panels_before,
         evidence_observations=evidence_observations,
         evidence_summary=evidence_summary,
+        query_measurements=admit_measurements(
+            (record for record in query_measurements if record.query_fingerprint in surviving_measurement_ids),
+            dashboard_spec,
+        ),
         applied_knowledge_refs=applied_knowledge_refs,
         applied_knowledge_revision_refs=applied_knowledge_revision_refs,
         knowledge_revision_refs_by_requirement={

@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, model_validator
 from tacit import __version__
 from tacit.knowledge.enums import KnowledgeUsageDisposition
 from tacit.knowledge.models import KnowledgeUsage
+from tacit.measurements import QueryMeasurement, admit_measurements, query_identity
 from tacit.models.schemas import (
     ContextChunk,
     CulpritRanking,
@@ -29,6 +30,7 @@ from tacit.models.schemas import (
     EvidenceResolution,
     EvidenceResolutionStatus,
     Intent,
+    PanelQuery,
 )
 
 SCHEMA_NAME = "tacit.investigation"
@@ -176,6 +178,26 @@ class QueryRecord(BaseModel):
     execution: dict[str, Any] = Field(default_factory=dict)
     provenance_refs: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def validate_measured_source(self) -> QueryRecord:
+        if "measurement" not in self.execution:
+            return self
+        measured = admit_measurements([self.execution["measurement"]])[0]
+        source = PanelQuery(
+            expr=self.expression,
+            datasource_uid=measured.datasource_uid,
+            datasource_type=measured.datasource_type,
+            query_language=measured.query_language,
+        )
+        if (
+            measured.query_fingerprint != query_identity(source)
+            or self.backend != measured.datasource_type
+            or self.language != (measured.query_language or measured.datasource_type)
+        ):
+            raise ValueError("measurement query source mismatch")
+        self.execution = {**self.execution, "measurement": measured.model_dump(mode="json")}
+        return self
+
 
 class ObservationContract(BaseModel):
     id: str
@@ -294,6 +316,23 @@ class InvestigationContract(BaseModel):
     runtime: RuntimeManifest = Field(default_factory=RuntimeManifest)
 
     model_config = {"populate_by_name": True}
+
+    @model_validator(mode="before")
+    @classmethod
+    def admit_query_measurement_collection(cls, data):
+        if not isinstance(data, dict) or not isinstance(data.get("queries"), (list, tuple)):
+            return data
+
+        def recorded_measurements():
+            for query in data["queries"]:
+                execution = query.get("execution") if isinstance(query, dict) else getattr(query, "execution", None)
+                if isinstance(execution, dict) and "measurement" in execution:
+                    yield execution["measurement"]
+
+        # The same aggregate admission used for snapshots precedes individual
+        # QueryRecord validators and their typed numeric copies on contract load.
+        admit_measurements(recorded_measurements(), count_duplicates=True)
+        return data
 
     @model_validator(mode="after")
     def validate_reference_integrity(self) -> InvestigationContract:
@@ -630,6 +669,7 @@ class InvestigationContractAssembler:
         runtime_manifest: RuntimeManifest | None = None,
         knowledge_snapshot_ref: str = "",
         knowledge_usage: list[KnowledgeUsage] | None = None,
+        query_measurements: list[QueryMeasurement] | tuple[QueryMeasurement, ...] | None = None,
     ) -> InvestigationContract:
         now = utc_now()
         created_at = created_at or now
@@ -641,7 +681,7 @@ class InvestigationContractAssembler:
             observed_at=completed_at,
             context_chunks=context_chunks,
         )
-        queries = self._queries(dashboard_spec, provenance[1].id)
+        queries = self._queries(dashboard_spec, provenance[1].id, query_measurements)
         requirements = self._requirements(evidence_requirements, evidence_resolutions, provenance[1].id)
         resolutions = self._resolutions(evidence_resolutions, provenance[1].id)
         observations = self._observations(
@@ -868,8 +908,28 @@ class InvestigationContractAssembler:
             )
         return records
 
-    def _queries(self, dashboard_spec: DashboardSpec, provenance_ref: str) -> list[QueryRecord]:
+    def _queries(
+        self,
+        dashboard_spec: DashboardSpec,
+        provenance_ref: str,
+        query_measurements: list[QueryMeasurement] | tuple[QueryMeasurement, ...] | None = None,
+    ) -> list[QueryRecord]:
         records: list[QueryRecord] = []
+        measured = (
+            {record.query_fingerprint: record for record in admit_measurements(query_measurements, dashboard_spec)}
+            if query_measurements
+            else {}
+        )
+        if measured:
+            admit_measurements(
+                (
+                    measured[identity]
+                    for panel in dashboard_spec.panels
+                    for query in panel.queries
+                    if (identity := query_identity(query)) in measured
+                ),
+                count_duplicates=True,
+            )
         counter = 1
         for panel in dashboard_spec.panels:
             for query in panel.queries:
@@ -882,6 +942,14 @@ class InvestigationContractAssembler:
                     execution_status = "empty"
                 else:
                     execution_status = "not_captured"
+                result = {"validation_status": status, "has_data": query.validation_has_data}
+                execution: dict[str, Any] = {"status": execution_status}
+                if measured:
+                    measurement = measured.get(query_identity(query))
+                    if measurement is not None:
+                        execution["measurement"] = measurement.model_dump(mode="json")
+                        result["measurement"] = execution["measurement"]
+                execution["result_fingerprint"] = fingerprint(result)
                 records.append(
                     QueryRecord(
                         id=f"query_{counter:02d}",
@@ -889,15 +957,7 @@ class InvestigationContractAssembler:
                         language=query.query_language or query.datasource_type,
                         expression=query.expr,
                         validation={"status": status},
-                        execution={
-                            "status": execution_status,
-                            "result_fingerprint": fingerprint(
-                                {
-                                    "validation_status": status,
-                                    "has_data": query.validation_has_data,
-                                }
-                            ),
-                        },
+                        execution=execution,
                         provenance_refs=[provenance_ref],
                     )
                 )
@@ -946,7 +1006,14 @@ class InvestigationContractAssembler:
                 matched_ref = exact_query_refs.get(
                     (observation.panel_title, expression, observation.datasource_uid)
                 ) or datasource_query_refs.get((expression, observation.datasource_uid))
-                matched_ref = matched_ref or expression_query_refs.get(expression)
+                if not matched_ref:
+                    legacy_ref = expression_query_refs.get(expression)
+                    # Preserve legacy references, but measured facts cannot be
+                    # borrowed by a same-expression observation at another owner.
+                    if legacy_ref is not None and not any(
+                        query.id == legacy_ref and "measurement" in query.execution for query in queries
+                    ):
+                        matched_ref = legacy_ref
                 if matched_ref:
                     query_ref = [matched_ref]
             records.append(

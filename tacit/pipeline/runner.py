@@ -1685,6 +1685,7 @@ async def _run_pipeline_inner(
                 evidence_observations=validation_result.evidence_observations,
                 culprit_ranking=culprit_ranking,
                 context_chunks=context_chunks or [],
+                query_measurements=validation_result.query_measurements,
                 warnings=validation_warnings,
                 runtime_manifest=RuntimeManifest(
                     model={
@@ -1748,6 +1749,7 @@ async def _run_pipeline_inner(
                 evidence_observations=validation_result.evidence_observations,
                 culprit_ranking=culprit_ranking,
                 baseline_culprit_ranking=baseline_culprit_ranking,
+                query_measurements=validation_result.query_measurements,
                 prepared_acquisition=prepared_acquisition,
                 context_chunks=context_chunks,
                 knowledge_snapshot=knowledge_snapshot,

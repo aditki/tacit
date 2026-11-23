@@ -1,0 +1,4 @@
+# Exact known synthetic privacy fixture in this historical commit only.
+# The value proves that measurement labels and raw errors never enter diagnostics;
+# it is not a credential. Current and future findings remain subject to scanning.
+6d2fcd19e0b42cb4fe62a118758d1e58ff3086ff:tests/unit/test_measured_validation.py:generic-api-key:210
