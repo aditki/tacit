@@ -476,3 +476,31 @@ measured capture, provenance and replay production code is unchanged.
 ## Real Telemetry Roadmap
 
 The synthetic benchmark remains the fast regression layer. The staged plan for evaluating Tacit with public metrics, logs, and traces is documented in [Real Telemetry Dataset Testing Roadmap](telemetry-dataset-testing-roadmap.md). Its first milestone is attached to the checkout demo; later datasets are isolated in separate branches and evaluated against source-specific ground truth.
+
+## Offline priority-choice experiment
+
+The [Jev/Tev experiment](evidence-decision-experiment.md) prepares approved local
+assessment-bundle projections and scores externally recorded Choices without
+constructing a runtime, database or provider. Its checked-in synthetic fixtures
+verify protocol conformance, identity/redaction, file safety, scoring and replay;
+they do not measure real vendor quality or imply that inference was authorized.
+
+The task is prioritizing one already-admissible suspect, with `insufficient`
+available. Captured policy abstention and deterministic no-calls apply equally
+to baseline and model arms. Labels are independently adjudicated and may admit
+several suspects. Missing/invalid responses and resource exclusions earn zero
+quality. Metrics show explicit denominators, model-call coverage, abstention
+precision/recall, unsafe attempts, singleton-only Brier calibration and known
+usage with unknown cost visible. These reuse the benchmark convention that
+failures stay in frozen case denominators; the fixed five-candidate, top-3 and
+MRR assumptions in the contextual ranking benchmark do not apply to one Choice.
+
+Primary attempt-1 responses alone supply quality and paired held-out intervals.
+Rotation, wording variants and predeclared additional attempts never increase
+independent incident count. They have separate sensitivity/quality summaries;
+all declared receipt bytes bind replay hashes and all unsafe attempts affect the
+safety gate. Separate 40-incident development and 100-incident held-out manifests
+must be family-disjoint and independently frozen before real collection. Do not
+pool pre-/post-acquisition strata or select a winning arm after inspection.
+There are no real held-out results, maintenance savings or deployment approval
+from the synthetic implementation checks.

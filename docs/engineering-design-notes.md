@@ -2371,3 +2371,66 @@ usefulness.
 - [ADR-021: Generated archetype scope](adr/021-generated-archetype-scope-context.md)
 - [ADR-022: Operational Knowledge lifecycle](adr/022-operational-knowledge-lifecycle.md)
 - [Generated archetype evaluation roadmap](generated-archetype-evaluation-roadmap.md)
+
+## File-only decision experiments
+
+A recorded priority-choice experiment has one synchronous local-file owner.
+Import, preparation, scoring and failure paths must stay independent of runtime
+composition, provider factories, databases, subprocesses and network access.
+Collection has separate operator authorization and external spend/deadline/
+cleanup owners; receipt validation cannot attest unrecorded external activity.
+
+Derive candidate and reference identities from original captured facts before
+redaction, independent of rank/order. Approve text using those stable identities
+and frozen subordinate-array positions. Replacements may coincide without
+collapsing approved leaves. A field omitted from approvals as a structural enum
+must validate its exact closed vocabulary; accepting arbitrary text there is an
+unapproved prompt-content bypass. Unsupported historical enum values fail the
+case rather than receiving guessed semantics.
+
+Use the same descriptor-bound path, archive, lexical JSON and counted output
+boundaries for prepare and score. Physical tar extension headers are input,
+including headers a convenience archive iterator would consume invisibly.
+Reject them before interpretation. Never infer experiment labels from bundle
+expected outcomes or synthesize a historical baseline with the current engine.
+
+Quality uses one frozen primary attempt per independent incident. Variants and
+additional attempts stay visible for robustness, receipt completeness, usage and
+unsafe-attempt accounting. Bind every declared receipt's exact bytes or explicit
+absence into semantic replay identity, including attempts excluded from quality.
+Failures earn zero quality; resource errors do not become successful abstention.
+Synthetic conformance is neither vendor-version attestation nor evidence of
+improved model quality. See [experiment instructions](evidence-decision-experiment.md).
+
+A real serving envelope may add metadata without changing a decision. Bind that
+compatibility to an explicit frozen wire profile and exact server identity;
+never strip response fields or silently broaden the historical schema. The
+Ollama 0.40.15 profile admits Tev's optional nonnegative integer cache-token
+counter, keeps Jev's envelope unchanged and shares identity checks between
+manifest loading and direct receipt validation. Preserve exact receipt bytes in
+semantic identity even when metadata does not affect quality. This is file-only
+protocol admission, with no new runtime or external collection owner.
+
+Scenario capture must establish freshness for the actual validation query, not
+just successful historical ingestion. A long serial cohort can age past an
+instant/rate query's window. Freeze the source selection and rebase rule first,
+then freeze each timestamp-only resolved replay immediately before its baseline
+call. Require fresh instant and short-window readiness. Retain and exclude a
+timing-invalid cohort as a whole; do not patch the production validator to make
+an expired fixture pass.
+
+Availability evidence is not a measured abnormal condition. The ClickStack/GAMMA
+baseline exercise preserved query validity/nonemptiness and observation links,
+but the eight GAMMA fault/healthy projections were identical. Replacing a
+ranker cannot recover numeric facts absent from its input. Inspect actual
+choice-point counts and distinct visible states before investing in classifier
+comparisons. Keep deterministic zero/one-candidate no-calls intact. Any separate
+single-candidate abstention diagnostic needs its own frozen protocol and report;
+its results cannot establish paired ranking quality or authorize production use.
+
+A bounded request in bytes may still exceed a model's token limit. Preserve
+the original rejection and count it as failed coverage; do not truncate captured
+facts or shrink a frozen packet after seeing its result. HTTP submissions,
+successful model responses and distinct model-visible inputs are different
+counts. Cached-prompt metadata and repeated responses do not create independent
+examples. Record each explicitly when reporting a local experiment.
