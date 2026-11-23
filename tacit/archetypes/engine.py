@@ -8,6 +8,7 @@ target backend. No LLM needed for query generation.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
@@ -777,6 +778,17 @@ def _resolve_sfx_container_filter(intent: Intent, catalog: list[MetricEntry]) ->
     return f"filter('container', '*{target}*')"
 
 
+def _validate_signalflow_translation_syntax(expr: str) -> None:
+    """Reject unsupported syntax using a view that expires before recursion."""
+    syntax = "".join(character for _, character in _unquoted_query_syntax(expr))
+    if "=~" in syntax:
+        raise UnsupportedSignalFlowTranslation("regex_widening")
+    if "!=" in syntax or "!~" in syntax:
+        raise UnsupportedSignalFlowTranslation("synthetic_fallback")
+    if "histogram_quantile(" in syntax:
+        raise UnsupportedSignalFlowTranslation("histogram_bucket_guess")
+
+
 def _promql_template_to_signalflow(
     expr_template: str,
     service_filter: str,
@@ -800,12 +812,12 @@ def _promql_template_to_signalflow(
       → (A / B)
     """
     expr = expr_template.strip()
-    if "=~" in expr:
-        raise UnsupportedSignalFlowTranslation("regex_widening")
-    if "!=" in expr or "!~" in expr:
-        raise UnsupportedSignalFlowTranslation("synthetic_fallback")
-    if "histogram_quantile(" in expr:
-        raise UnsupportedSignalFlowTranslation("histogram_bucket_guess")
+    _validate_signalflow_translation_syntax(expr)
+    return _translate_admitted_promql(expr, service_filter, container_filter, legend)
+
+
+def _translate_admitted_promql(expr: str, service_filter: str, container_filter: str, legend: str) -> str:
+    """Translate substrings of one syntax-admitted, immutable expression."""
 
     def _build_sfx_filter(label_block: str) -> str:
         """Consume every exact matcher; unsupported syntax cannot disappear."""
@@ -837,8 +849,8 @@ def _promql_template_to_signalflow(
     # Split on top-level /
     slash_pos = _find_top_level_slash(expr)
     if slash_pos is not None:
-        left = _promql_template_to_signalflow(expr[:slash_pos].strip(), service_filter, container_filter, "_num")
-        right = _promql_template_to_signalflow(expr[slash_pos + 1 :].strip(), service_filter, container_filter, "_den")
+        left = _translate_admitted_promql(expr[:slash_pos].strip(), service_filter, container_filter, "_num")
+        right = _translate_admitted_promql(expr[slash_pos + 1 :].strip(), service_filter, container_filter, "_den")
         # Strip .publish() from sub-expressions
         left = re.sub(r"\.publish\([^)]*\)$", "", left)
         right = re.sub(r"\.publish\([^)]*\)$", "", right)
@@ -848,7 +860,7 @@ def _promql_template_to_signalflow(
     topk = re.match(r"topk\((\d+),\s*(.+)\)$", expr, re.DOTALL)
     if topk:
         k = topk.group(1)
-        inner = _promql_template_to_signalflow(topk.group(2), service_filter, container_filter, legend)
+        inner = _translate_admitted_promql(topk.group(2), service_filter, container_filter, legend)
         inner = re.sub(r"\.publish\([^)]*\)$", "", inner)
         return f"{inner}.top(count={k}).publish(label='{legend}')"
 
@@ -913,14 +925,13 @@ def _promql_template_to_signalflow(
     raise UnsupportedSignalFlowTranslation("synthetic_fallback")
 
 
-def _find_top_level_slash(expr: str) -> int | None:
-    """Find division outside parentheses, selectors, ranges, and quoted text."""
-    delimiters: list[str] = []
-    closing = {"(": ")", "{": "}", "[": "]"}
+def _unquoted_query_syntax(expr: str) -> Iterator[tuple[int, str]]:
+    """Mask literal data while preserving source offsets and token boundaries."""
     quote = ""
     escaped = False
     for i, ch in enumerate(expr):
         if quote:
+            yield i, " "
             if escaped:
                 escaped = False
             elif ch == "\\" and quote != "`":
@@ -929,7 +940,17 @@ def _find_top_level_slash(expr: str) -> int | None:
                 quote = ""
         elif ch in "\"'`":
             quote = ch
-        elif ch in closing:
+            yield i, " "
+        else:
+            yield i, ch
+
+
+def _find_top_level_slash(expr: str) -> int | None:
+    """Find division outside parentheses, selectors, ranges, and quoted text."""
+    delimiters: list[str] = []
+    closing = {"(": ")", "{": "}", "[": "]"}
+    for i, ch in _unquoted_query_syntax(expr):
+        if ch in closing:
             delimiters.append(closing[ch])
         elif ch in ")}]":
             if not delimiters or delimiters.pop() != ch:

@@ -362,6 +362,53 @@ class _EnrichmentProgress:
         return self.tracker.finish(list(admit_catalog_facts(output)))
 
 
+@dataclass(slots=True)
+class _InventoryProgress:
+    """Bounded completed candidates inside the existing inventory operation."""
+
+    tracker: AcquisitionSearches
+    datasource: DatasourceInfo
+    terms: tuple[str, ...]
+    inventory: list[tuple[str, str, list[str]]] = field(default_factory=list)
+    local_cap: bool = False
+    pending_terms: tuple[str, ...] | None = None
+
+    def finish(self) -> MetricCatalogResult:
+        # Reserve once, after all completed searches, so a first batch cannot
+        # consume capacity before a later keyword match is considered.
+        work_budget = self.tracker.budget
+        inventory_limit = work_budget.max_acquisition_entries + 1
+        if len(self.inventory) > inventory_limit:
+            self.local_cap = True
+        ds = self.datasource
+        entries: dict[tuple[str, str], MetricEntry] = {}
+        for name, namespace, dimensions in sorted(
+            set((name, ns, tuple(dims)) for name, ns, dims in self.inventory[:inventory_limit]),
+            key=lambda item: (bool(self.terms) and not any(term in item[0].lower() for term in self.terms), item),
+        ):
+            key = (name, namespace)
+            if key in entries:
+                continue
+            try:
+                work_budget.reserve_acquisition_entry((ds.uid, _query_language(ds), name, namespace))
+            except AcquisitionWorkLimitError:
+                self.local_cap = True
+                self.tracker.skipped = True
+                self.tracker.skip_reasons.update({"local_cap", "work_limit"})
+                continue
+            entries[key] = MetricEntry(
+                name=name,
+                datasource_uid=ds.uid,
+                datasource_name=ds.name,
+                datasource_type=ds.type,
+                query_language=_query_language(ds),
+                datasource_is_default=ds.is_default,
+                namespace=namespace,
+                dimensions=list(dimensions),
+            )
+        return self.tracker.finish(list(entries.values()), local_cap=self.local_cap)
+
+
 def _query_language(ds: DatasourceInfo) -> str:
     if ds.type in {"prometheus", "mimir", "cortex", "thanos"}:
         return "promql"
@@ -535,26 +582,29 @@ async def discover_adapter_metrics(
 
     settings = resolve_remote_runtime_settings(boundary="metric_acquisition", owner=client, provider=backend)
     adapter_deadline = time.monotonic() + settings.adapter_timeout_seconds
+    progress = _InventoryProgress(
+        AcquisitionSearches(backend, work_budget, datasource), datasource, canonical_terms(keywords)
+    )
     try:
         result = await asyncio.wait_for(
-            _discover_adapter_inventory(client, datasource, keywords, work_budget, backend=backend),
+            _discover_adapter_inventory(client, datasource, keywords, work_budget, backend=backend, _progress=progress),
             timeout=max(0, adapter_deadline - time.monotonic()),
         )
     except TimeoutError:
-        logger.info("metric_inventory_incomplete", reason_code="adapter_timeout")
-        return MetricCatalogResult(
-            sources=(
-                CatalogSourceStatus(
-                    backend=backend,
-                    datasource_uid=datasource.uid,
-                    datasource_type=datasource.type,
-                    query_language=_query_language(datasource),
-                    terms=("inventory", *canonical_terms(keywords)),
-                    disposition="incomplete",
-                    reasons=("provider_failed",),
-                ),
+        logger.info(
+            "metric_inventory_incomplete",
+            reason_code="adapter_timeout",
+            finished_search_count=len(progress.tracker.sources),
+            candidate_count=len(progress.inventory),
+        )
+        progress.tracker.sources.append(
+            progress.tracker.status(
+                progress.pending_terms or ("inventory", *progress.terms),
+                disposition="incomplete",
+                reasons=("provider_failed",),
             )
         )
+        return progress.finish()
     if not enrich:
         return result
     enriched = await enrich_adapter_metrics_before_deadline(
@@ -578,18 +628,20 @@ async def _discover_adapter_inventory(
     work_budget: SignalResolutionWorkBudget,
     *,
     backend: str,
+    _progress: _InventoryProgress | None = None,
 ) -> MetricCatalogResult:
     """Shared inventory phase; its admitted caller owns the deadline."""
     ds = datasource
-    terms = canonical_terms(keywords)
-    tracker = AcquisitionSearches(backend, work_budget, ds)
-    entries: dict[tuple[str, str], MetricEntry] = {}
-    local_cap = False
-    inventory: list[tuple[str, str, list[str]]] = []
+    progress = _progress or _InventoryProgress(
+        AcquisitionSearches(backend, work_budget, ds), ds, canonical_terms(keywords)
+    )
+    terms, tracker = progress.terms, progress.tracker
+    inventory = progress.inventory
     inventory_limit = work_budget.max_acquisition_entries + 1
 
     async def get(path: str, search_terms: tuple[str, ...], *, cap: int | None = None, terminal: bool = False) -> Any:
-        return await tracker.fetch(
+        progress.pending_terms = search_terms
+        data = await tracker.fetch(
             search_terms,
             lambda: client.acquisition_request(
                 "GET",
@@ -599,14 +651,19 @@ async def _discover_adapter_inventory(
             cap=cap,
             terminal=terminal,
         )
+        progress.pending_terms = None
+        return data
 
     async def resource(path: str, body: dict[str, Any], search_terms: tuple[str, ...]) -> Any:
-        return await tracker.fetch(
+        progress.pending_terms = search_terms
+        data = await tracker.fetch(
             search_terms,
             lambda: client.acquisition_request(
                 "POST", f"/api/datasources/uid/{ds.uid}/resources/{path}", work_budget, json=body
             ),
         )
+        progress.pending_terms = None
+        return data
 
     if _query_language(ds) == "promql":
         data = await get("api/v1/label/__name__/values", ("metric_names", *terms), terminal=True)
@@ -618,7 +675,7 @@ async def _discover_adapter_inventory(
             excluded_suffixes=("_created", "_info"),
             backfill=True,
         )
-        local_cap |= name_cap
+        progress.local_cap |= name_cap
         inventory = [(name, "", []) for name in names]
         tracker.inventory(names)
     elif _query_language(ds) == "signalflow":
@@ -630,7 +687,7 @@ async def _discover_adapter_inventory(
                 if pattern in term or term in pattern:
                     searches.update(f"name:{prefix}*" for prefix in prefixes)
         if len(searches) > 10:
-            local_cap = True
+            progress.local_cap = True
             tracker.skipped = True
             tracker.skip_reasons.add("local_cap")
         for search in sorted(searches or {"*"})[:10]:
@@ -638,11 +695,11 @@ async def _discover_adapter_inventory(
             names = _names(data)
             tracker.inventory(names)
             if len(inventory) + len(names) > inventory_limit:
-                local_cap = True
-            local_cap |= _append_inventory(inventory, ((name, "", []) for name in names), inventory_limit)
+                progress.local_cap = True
+            progress.local_cap |= _append_inventory(inventory, ((name, "", []) for name in names), inventory_limit)
     elif ds.type == "graphite":
         if len(terms) > 5:
-            local_cap = True
+            progress.local_cap = True
             tracker.skipped = True
             tracker.skip_reasons.add("local_cap")
         for pattern in sorted({f"*{term}*" for term in terms} or {"*"})[:5]:
@@ -650,8 +707,8 @@ async def _discover_adapter_inventory(
             names = _names(data)
             tracker.inventory(names)
             if len(inventory) + len(names) > inventory_limit:
-                local_cap = True
-            local_cap |= _append_inventory(
+                progress.local_cap = True
+            progress.local_cap |= _append_inventory(
                 inventory,
                 ((name, name.partition(".")[0] if "." in name else "", []) for name in names),
                 inventory_limit,
@@ -668,9 +725,9 @@ async def _discover_adapter_inventory(
             )
             values = data.keys() if isinstance(data, dict) else _iter_names(data)
             selected, name_cap = _select_inventory_names(values, terms, inventory_limit, fallback_limit=20)
-            local_cap |= name_cap
+            progress.local_cap |= name_cap
             tracker.inventory(f"{namespace}/{name}" for name in selected)
-            local_cap |= _append_inventory(
+            progress.local_cap |= _append_inventory(
                 inventory, ((f"{namespace}/{name}", namespace, []) for name in selected), inventory_limit
             )
     elif ds.type == "influxdb":
@@ -691,11 +748,11 @@ async def _discover_adapter_inventory(
                                     yield value[0]
 
         selected, name_cap = _select_inventory_names(measurement_names(), terms, inventory_limit, fallback_limit=100)
-        local_cap |= name_cap
+        progress.local_cap |= name_cap
         if tracker.sources and data is not None:
             tracker.sources[-1] = replace(tracker.sources[-1], returned_count=normalized_measurement_count)
         tracker.inventory(selected)
-        local_cap |= _append_inventory(inventory, ((name, "", []) for name in selected), inventory_limit)
+        progress.local_cap |= _append_inventory(inventory, ((name, "", []) for name in selected), inventory_limit)
     elif ds.type in {"elasticsearch", "opensearch"}:
         from tacit.grafana.adapters.elasticsearch import _iter_fields
 
@@ -710,7 +767,7 @@ async def _discover_adapter_inventory(
                 yield name
 
         selected, name_cap = _select_inventory_names(field_names(), terms, inventory_limit, fallback_limit=100)
-        local_cap |= name_cap
+        progress.local_cap |= name_cap
         selected_set = set(selected)
         fields = {
             name: kind for name, kind in _iter_fields(data if isinstance(data, dict) else {}) if name in selected_set
@@ -718,7 +775,7 @@ async def _discover_adapter_inventory(
         if tracker.sources and data is not None:
             tracker.sources[-1] = replace(tracker.sources[-1], returned_count=returned_fields)
         tracker.inventory(selected)
-        local_cap |= _append_inventory(
+        progress.local_cap |= _append_inventory(
             inventory, ((name, index, [kind]) for name, kind in sorted(fields.items())), inventory_limit
         )
     elif ds.type == "loki":
@@ -748,40 +805,15 @@ async def _discover_adapter_inventory(
             available, label_cap = _select_inventory_names(
                 _iter_names(data), terms, 128, fallback_limit=128, backfill=True
             )
-            local_cap |= label_cap
-            local_cap |= _append_inventory(inventory, (("loki:available_labels", "", available),), inventory_limit)
+            progress.local_cap |= label_cap
+            progress.local_cap |= _append_inventory(
+                inventory, (("loki:available_labels", "", available),), inventory_limit
+            )
         if data is not None:
             tracker.inventory(name for name, _, _ in inventory)
 
-    if len(inventory) > inventory_limit:
-        local_cap = True
-    inventory = inventory[:inventory_limit]
-    for name, namespace, dimensions in sorted(
-        set((name, ns, tuple(dims)) for name, ns, dims in inventory),
-        key=lambda item: (bool(terms) and not any(term in item[0].lower() for term in terms), item),
-    ):
-        key = (name, namespace)
-        if key in entries:
-            continue
-        try:
-            work_budget.reserve_acquisition_entry((ds.uid, _query_language(ds), name, namespace))
-        except AcquisitionWorkLimitError:
-            local_cap = True
-            tracker.skipped = True
-            tracker.skip_reasons.update({"local_cap", "work_limit"})
-            continue
-        entries[key] = MetricEntry(
-            name=name,
-            datasource_uid=ds.uid,
-            datasource_name=ds.name,
-            datasource_type=ds.type,
-            query_language=_query_language(ds),
-            datasource_is_default=ds.is_default,
-            namespace=namespace,
-            dimensions=list(dimensions),
-        )
-
-    return tracker.finish(list(entries.values()), local_cap=local_cap)
+    progress.inventory = inventory
+    return progress.finish()
 
 
 async def enrich_adapter_metrics_before_deadline(

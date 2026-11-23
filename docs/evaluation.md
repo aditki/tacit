@@ -402,6 +402,53 @@ Learning (18/18), deterministic cold/taught resolution and diff checks passed.
 Linux ARM64 Docker build and the installed exact-name/partial-operand rejection
 smoke passed as UID 999 with a read-only filesystem and networking disabled.
 
+### Quoted syntax and partial inventory: changeset attribution
+
+Both reported cases reproduce as regressions from PR base `cd5396329` to
+`8972e18`. The base standalone SignalFx publisher preserves `!=`, `!~` and `=~`
+inside exact label values, while the shared expression-wide guards newly reject
+them. Base direct discovery retains a successful search when another request
+times out; the new whole-inventory deadline fallback returns an empty catalog.
+These findings are in scope even though the code was intended to strengthen
+translation and acquisition safety.
+
+One quote/escape-aware iterator now supplies syntax masking and division
+scanning. Literal operators, slashes and function-like text remain data; actual
+unsupported matchers and histogram inference still reject before publication.
+The full expression is guarded once, then its immutable substrings are
+translated privately without repeating or retaining the syntax mask per frame.
+A 100-operand ratio changes from 199 guard calls over 164,171 characters to one
+guard call over the original 3,197 characters. This contains work introduced by
+the new lexical guard; the existing recursive query grammar is unchanged.
+
+Inventory keeps one bounded operation-local candidate/tracker state across
+searches. Its own timeout joins pending-request cancellation, records the
+unfinished search as incomplete and admits completed candidates once using the
+existing keyword priority and identity/text/fact limits. After timeout settlement,
+no later search or enrichment request is dispatched. Caller cancellation
+propagates normally.
+
+The related Grafana coordinator outer-timeout discard behavior also exists on
+the PR base. It remains outside this repair, as requested for pre-existing
+behavior; no new adapter protocol or cancellation-to-success conversion was
+introduced. Standalone helper recovery and caller cancellation are tested as
+different authority boundaries. Runtime, admission, cleanup, grounding and
+replay owners/formats are unchanged.
+
+The two new modules contain 57 test-first cases: 40 translation and 17 inventory
+cases. Translation-focused validation passed 259 cases and inventory-focused
+validation passed 261. Independent architecture/security review cleared the
+whole repair diff. These are hermetic regression checks; live 100-prompt
+clean/representative long-lived and protected release evidence remain separate.
+
+Final validation: default suite 4,910 passed / 12 skipped; hermetic integration
+25 passed; complete browser/public end-to-end suite 56 passed. Ruff, Black
+(366 files), mypy (171 sources), Grounding (40/40), Operational Learning
+(18/18), deterministic cold/taught resolution and diff checks passed. Linux
+ARM64 Docker build and a network-disabled, read-only, UID-999 installed
+translation/inventory smoke passed. CI revalidates the pushed acquisition head
+and its separate measured-evidence integration.
+
 ## Real Telemetry Roadmap
 
 The synthetic benchmark remains the fast regression layer. The staged plan for evaluating Tacit with public metrics, logs, and traces is documented in [Real Telemetry Dataset Testing Roadmap](telemetry-dataset-testing-roadmap.md). Its first milestone is attached to the checkout demo; later datasets are isolated in separate branches and evaluated against source-specific ground truth.
